@@ -5,6 +5,12 @@ struct DrainBarView: View {
     let percent: Double       // 0-100 remaining
     let resetsAt: Date?
 
+    private static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "h:mma"
+        return f
+    }()
+
     private var fillFraction: CGFloat { CGFloat(max(0, min(100, percent))) / 100 }
 
     private var barColor: Color {
@@ -23,9 +29,7 @@ struct DrainBarView: View {
         let hours = Int(remaining) / 3600
         let mins = (Int(remaining) % 3600) / 60
         let timeStr = hours > 0 ? "\(hours)h\(mins)m" : "\(mins)m"
-        let formatter = DateFormatter()
-        formatter.dateFormat = "h:mma"
-        let clockStr = formatter.string(from: resetsAt).lowercased()
+        let clockStr = Self.clockFormatter.string(from: resetsAt).lowercased()
         return "\u{21BB} \(timeStr) (\(clockStr))"
     }
 

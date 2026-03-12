@@ -12,6 +12,14 @@ struct AccountCardView: View {
         return .gray.opacity(0.4)
     }
 
+    private var statusDotLabel: String {
+        if account.isActive { return "Active" }
+        guard let snapshot = account.quotaSnapshot else { return "No data" }
+        if snapshot.fiveHour.isExhausted { return "Exhausted" }
+        if snapshot.fiveHour.remainingPercent < 20 { return "Low quota" }
+        return "Idle"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -22,6 +30,7 @@ struct AccountCardView: View {
                 Circle()
                     .fill(statusDot)
                     .frame(width: 8, height: 8)
+                    .accessibilityLabel(statusDotLabel)
             }
 
             if let snapshot = account.quotaSnapshot {

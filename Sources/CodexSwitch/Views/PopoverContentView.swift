@@ -6,6 +6,8 @@ struct PopoverContentView: View {
     var onForceSwap: (UUID) -> Void
     var onOpenSettings: () -> Void
 
+    private static let relativeFormatter = RelativeDateTimeFormatter()
+
     private let columns = [
         GridItem(.flexible(), spacing: 8),
         GridItem(.flexible(), spacing: 8),
@@ -29,6 +31,7 @@ struct PopoverContentView: View {
                         .font(.system(size: 12))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Settings")
             }
             .padding(.horizontal, 12)
             .padding(.top, 10)
@@ -49,8 +52,7 @@ struct PopoverContentView: View {
 
             HStack {
                 if let lastSwap = manager.swapHistory.last {
-                    let ago = RelativeDateTimeFormatter()
-                    Text("Last swap: \(ago.localizedString(for: lastSwap.timestamp, relativeTo: Date()))")
+                    Text("Last swap: \(Self.relativeFormatter.localizedString(for: lastSwap.timestamp, relativeTo: Date()))")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 } else {

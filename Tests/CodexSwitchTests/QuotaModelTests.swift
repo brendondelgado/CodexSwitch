@@ -42,7 +42,7 @@ struct QuotaModelTests {
     }
 
     @Test("AccountManager active account")
-    func activeAccount() {
+    @MainActor func activeAccount() {
         let manager = AccountManager()
         let a1 = CodexAccount(email: "a@test.com", accessToken: "t1", refreshToken: "r1", idToken: "i1", accountId: "acc1", isActive: true)
         let a2 = CodexAccount(email: "b@test.com", accessToken: "t2", refreshToken: "r2", idToken: "i2", accountId: "acc2", isActive: false)
@@ -54,7 +54,7 @@ struct QuotaModelTests {
     }
 
     @Test("AccountManager deduplicates by accountId")
-    func deduplication() {
+    @MainActor func deduplication() {
         let manager = AccountManager()
         let a1 = CodexAccount(email: "a@test.com", accessToken: "old", refreshToken: "r1", idToken: "i1", accountId: "same-id")
         let a2 = CodexAccount(email: "a@test.com", accessToken: "new", refreshToken: "r1", idToken: "i1", accountId: "same-id")

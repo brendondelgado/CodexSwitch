@@ -1,7 +1,8 @@
 import AppKit
 import SwiftUI
 
-final class StatusBarController: @unchecked Sendable {
+@MainActor
+final class StatusBarController {
     private let statusItem: NSStatusItem
     private let manager: AccountManager
 

@@ -1,8 +1,8 @@
 import Foundation
 import Observation
 
-@Observable
-final class AccountManager: @unchecked Sendable {
+@MainActor @Observable
+final class AccountManager {
     var accounts: [CodexAccount] = []
     var swapHistory: [SwapEvent] = []
 
