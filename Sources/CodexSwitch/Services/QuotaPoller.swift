@@ -57,11 +57,13 @@ actor QuotaPoller {
         stopPolling(for: accountId)
 
         pollTasks[accountId] = Task {
-            // Get initial interval from current account state
+            // First poll: fetch immediately (small random delay to stagger multiple accounts)
             let initialAccount = await accountProvider(accountId)
-            var interval = Self.pollInterval(
-                forRemainingPercent: initialAccount?.quotaSnapshot?.fiveHour.remainingPercent ?? 100
-            )
+            let hasData = initialAccount?.quotaSnapshot != nil
+            var interval: TimeInterval = hasData
+                ? Self.pollInterval(forRemainingPercent: initialAccount?.quotaSnapshot?.fiveHour.remainingPercent ?? 100)
+                : TimeInterval.random(in: 5...15)
+
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled else { return }
