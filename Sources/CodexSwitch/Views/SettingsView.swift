@@ -1,10 +1,17 @@
 import SwiftUI
 import ServiceManagement
+import os
+
+private let logger = Logger(subsystem: "com.codexswitch", category: "Settings")
 
 struct SettingsView: View {
     @AppStorage("launchAtLogin") private var launchAtLogin = false
     @AppStorage("notificationsEnabled") private var notificationsEnabled = true
     @AppStorage("pollMultiplier") private var pollMultiplier = 1.0
+
+    var onRemoveAllAccounts: (() -> Void)?
+
+    @State private var showingRemoveConfirmation = false
 
     var body: some View {
         Form {
@@ -31,7 +38,18 @@ struct SettingsView: View {
 
             Section("Data") {
                 Button("Remove All Accounts", role: .destructive) {
-                    // Will be wired in integration
+                    showingRemoveConfirmation = true
+                }
+                .confirmationDialog(
+                    "Remove all accounts?",
+                    isPresented: $showingRemoveConfirmation,
+                    titleVisibility: .visible
+                ) {
+                    Button("Remove All", role: .destructive) {
+                        onRemoveAllAccounts?()
+                    }
+                } message: {
+                    Text("This will delete all stored tokens from Keychain. You'll need to re-import accounts from Codex CLI.")
                 }
                 Text("This removes all stored tokens from Keychain.")
                     .font(.caption)
@@ -39,7 +57,7 @@ struct SettingsView: View {
             }
 
             Section("About") {
-                LabeledContent("Version", value: "1.0.0")
+                LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")
                 LabeledContent("Auth file", value: "~/.codex/auth.json")
             }
         }
@@ -55,7 +73,8 @@ struct SettingsView: View {
                 try SMAppService.mainApp.unregister()
             }
         } catch {
-            print("Launch at login toggle failed: \(error)")
+            launchAtLogin = !enabled
+            logger.error("Launch at login toggle failed: \(error.localizedDescription)")
         }
     }
 }

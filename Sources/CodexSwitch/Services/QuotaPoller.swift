@@ -10,9 +10,13 @@ actor QuotaPoller {
         self.session = session
     }
 
-    /// Calculate poll interval based on remaining percent
+    /// Calculate poll interval based on remaining percent, scaled by user's poll multiplier
     static func pollInterval(forRemainingPercent remaining: Double) -> TimeInterval {
-        QuotaUrgency(remainingPercent: remaining).pollInterval
+        let base = QuotaUrgency(remainingPercent: remaining).pollInterval
+        let raw = UserDefaults.standard.double(forKey: "pollMultiplier")
+        // UserDefaults.double returns 0.0 when unset — treat as default 1.0
+        let multiplier = raw > 0 ? max(0.5, min(2.0, raw)) : 1.0
+        return base * multiplier
     }
 
     /// Fetch quota snapshot for a single account

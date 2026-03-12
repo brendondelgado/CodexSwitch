@@ -226,9 +226,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func removeAllAccounts() {
+        Task {
+            await quotaPoller.stopAll()
+        }
+        accountManager.accounts.removeAll()
+        accountManager.swapHistory.removeAll()
+        do {
+            try keychainStore.deleteAll()
+        } catch {
+            logger.error("Failed to clear Keychain: \(error.localizedDescription)")
+        }
+        statusBarController.updateIcon()
+        updatePopoverContent()
+    }
+
     private func openSettings() {
         if settingsWindow == nil {
-            let hostingController = NSHostingController(rootView: SettingsView())
+            let settingsView = SettingsView(
+                onRemoveAllAccounts: { [weak self] in self?.removeAllAccounts() }
+            )
+            let hostingController = NSHostingController(rootView: settingsView)
             let window = NSWindow(contentViewController: hostingController)
             window.title = "CodexSwitch Settings"
             window.styleMask = [.titled, .closable]

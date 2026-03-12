@@ -1,4 +1,5 @@
 import Foundation
+import Darwin.POSIX
 
 enum SwapEngine {
     private static let codexAuthPath = NSString("~/.codex/auth.json").expandingTildeInPath
@@ -61,15 +62,13 @@ enum SwapEngine {
 
         try data.write(to: URL(fileURLWithPath: tmpPath), options: .atomic)
 
-        // Atomic rename
-        let fm = FileManager.default
-        if fm.fileExists(atPath: targetPath) {
-            try fm.removeItem(atPath: targetPath)
+        // Atomic rename — single syscall, no gap where file doesn't exist
+        guard Darwin.rename(tmpPath, targetPath) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
-        try fm.moveItem(atPath: tmpPath, toPath: targetPath)
 
         // Restore permissions (600)
-        try fm.setAttributes(
+        try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: targetPath
         )

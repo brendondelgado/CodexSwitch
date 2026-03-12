@@ -2,11 +2,18 @@ import Foundation
 import UserNotifications
 
 enum NotificationManager {
+    private static var isEnabled: Bool {
+        // @AppStorage defaults to true in SettingsView; UserDefaults.bool returns false when unset
+        UserDefaults.standard.object(forKey: "notificationsEnabled") == nil
+            || UserDefaults.standard.bool(forKey: "notificationsEnabled")
+    }
+
     static func requestPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
     static func notifySwap(from: CodexAccount, to: CodexAccount) {
+        guard isEnabled else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: Account Swapped"
         content.subtitle = "Now using \(to.email)"
@@ -33,6 +40,7 @@ enum NotificationManager {
     }
 
     static func notifyAllExhausted() {
+        guard isEnabled else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: All Accounts Exhausted"
         content.body = "No accounts have remaining quota. Waiting for earliest reset."
@@ -47,6 +55,7 @@ enum NotificationManager {
     }
 
     static func notifyTokenRefreshFailed(account: CodexAccount) {
+        guard isEnabled else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: Token Refresh Failed"
         content.body = "Account \(account.email) needs re-authentication. Import again from Codex CLI."

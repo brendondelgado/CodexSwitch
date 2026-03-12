@@ -64,7 +64,16 @@ enum TokenRefresher {
     }
 }
 
-enum TokenRefreshError: Error, Sendable {
+enum TokenRefreshError: Error, LocalizedError, Sendable {
     case refreshFailed(statusCode: Int, body: String)
     case invalidResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .refreshFailed(let code, _):
+            return "Token refresh failed (HTTP \(code))"
+        case .invalidResponse:
+            return "Invalid response from auth server"
+        }
+    }
 }
