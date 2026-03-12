@@ -14,6 +14,22 @@ struct PopoverContentView: View {
         GridItem(.flexible(), spacing: 8),
     ]
 
+    private func swapReason(for candidate: CodexAccount) -> String {
+        let score = SwapEngine.score(candidate)
+        guard let snapshot = candidate.quotaSnapshot else {
+            return "Score: \(String(format: "%.0f", score))"
+        }
+        let fiveHr = snapshot.fiveHour
+        var parts: [String] = []
+        parts.append("\(Int(fiveHr.remainingPercent))% 5h quota")
+        if fiveHr.isExhausted && fiveHr.timeUntilReset < 1800 {
+            let mins = Int(fiveHr.timeUntilReset / 60)
+            parts.append("resets in \(mins)m")
+        }
+        parts.append("score \(String(format: "%.0f", score))")
+        return parts.joined(separator: " · ")
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -47,6 +63,31 @@ struct PopoverContentView: View {
                 }
             }
             .padding(10)
+
+            // Next swap preview
+            if let nextUp = SwapEngine.selectOptimalAccount(from: manager.accounts) {
+                Divider()
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.right.circle.fill")
+                        .foregroundStyle(.blue)
+                        .font(.system(size: 11))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Next up: **\(nextUp.email)**")
+                            .font(.system(size: 10))
+                        Text(swapReason(for: nextUp))
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if let snapshot = nextUp.quotaSnapshot {
+                        Text("\(Int(snapshot.fiveHour.remainingPercent))%")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
 
             Divider()
 

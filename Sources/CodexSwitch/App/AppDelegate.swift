@@ -178,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func executeSwap(from: CodexAccount, to: CodexAccount, reason: SwapEvent.SwapReason) {
         do {
             try SwapEngine.writeAuthFile(for: to)
+            SwapEngine.signalCodexReload()
             accountManager.setActive(to.id)
 
             let event = SwapEvent(

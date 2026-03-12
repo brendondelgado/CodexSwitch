@@ -54,6 +54,28 @@ enum SwapEngine {
         return try encoder.encode(authFile)
     }
 
+    /// Send SIGHUP to all running Codex CLI processes so they reload auth.json.
+    /// Requires the forked codex with SIGHUP handler (brendondelgado/codex feat/sighup-auth-reload).
+    static func signalCodexReload() {
+        let pipe = Pipe()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-f", "codex"]
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        try? process.run()
+        process.waitUntilExit()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let pids = String(data: data, encoding: .utf8)?
+            .split(separator: "\n")
+            .compactMap { Int32($0) } ?? []
+
+        for pid in pids {
+            kill(pid, SIGHUP)
+        }
+    }
+
     /// Atomically write auth.json for the given account
     static func writeAuthFile(for account: CodexAccount, path: String? = nil) throws {
         let targetPath = path ?? codexAuthPath
