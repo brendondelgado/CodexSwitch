@@ -210,9 +210,10 @@ actor OAuthLoginManager {
                 continue
             }
 
-            // Extract query string
-            guard let urlPart = firstLine.split(separator: " ").dropFirst(0).first?.split(separator: " ").first,
-                  let components = URLComponents(string: String(urlPart)) else {
+            // Extract query string from "GET /auth/callback?... HTTP/1.1"
+            let requestParts = firstLine.split(separator: " ")
+            guard requestParts.count >= 2,
+                  let components = URLComponents(string: String(requestParts[1])) else {
                 let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
                 _ = response.withCString { write(clientSock, $0, strlen($0)) }
                 continue
