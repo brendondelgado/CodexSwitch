@@ -1,12 +1,16 @@
 import AppKit
 import SwiftUI
+import os
+
+private let logger = Logger(subsystem: "com.codexswitch", category: "AppDelegate")
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    // Set in applicationDidFinishLaunching before any other access
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
-    private var settingsWindow: NSWindow?
     private var statusBarController: StatusBarController!
+    private var settingsWindow: NSWindow?
 
     let accountManager = AccountManager()
     private let keychainStore = KeychainStore()
@@ -53,7 +57,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         monitorTask?.cancel()
         iconUpdateTimer?.invalidate()
-        Task { await quotaPoller.stopAll() }
+        let poller = quotaPoller
+        let semaphore = DispatchSemaphore(value: 0)
+        Task {
+            await poller.stopAll()
+            semaphore.signal()
+        }
+        semaphore.wait()
     }
 
     // MARK: - Account Management
@@ -68,7 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 accountManager.setActive(first.id)
             }
         } catch {
-            print("Failed to load accounts: \(error)")
+            logger.error("Failed to load accounts: \(error.localizedDescription)")
         }
     }
 
@@ -83,7 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startPollingForAccount(account.id)
             updatePopoverContent()
         } catch {
-            print("Import failed: \(error)")
+            logger.error("Import failed: \(error.localizedDescription)")
         }
     }
 
@@ -101,7 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await quotaPoller.startPolling(
                 for: accountId,
                 accountProvider: { @Sendable id in
-                    MainActor.assumeIsolated {
+                    await MainActor.run {
                         manager.accounts.first { $0.id == id }
                     }
                 },
@@ -127,7 +137,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let updated = try await TokenRefresher.refresh(account)
             accountManager.addAccount(updated)
-            try? keychainStore.save(updated)
+            do {
+                try keychainStore.save(updated)
+            } catch {
+                logger.warning("Failed to persist refreshed token for \(accountId): \(error.localizedDescription)")
+            }
             startPollingForAccount(accountId)
         } catch {
             NotificationManager.notifyTokenRefreshFailed(account: account)
@@ -158,10 +172,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        performSwap(from: active, to: best)
+        executeSwap(from: active, to: best, reason: .quotaExhausted)
     }
 
-    private func performSwap(from: CodexAccount, to: CodexAccount) {
+    private func executeSwap(from: CodexAccount, to: CodexAccount, reason: SwapEvent.SwapReason) {
         do {
             try SwapEngine.writeAuthFile(for: to)
             accountManager.setActive(to.id)
@@ -169,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let event = SwapEvent(
                 fromAccountId: from.id,
                 toAccountId: to.id,
-                reason: .quotaExhausted,
+                reason: reason,
                 timestamp: Date()
             )
             accountManager.recordSwap(event)
@@ -178,32 +192,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusBarController.updateIcon()
             updatePopoverContent()
         } catch {
-            print("Swap failed: \(error)")
+            logger.error("Swap failed (\(String(describing: reason))): \(error.localizedDescription)")
         }
     }
 
     private func forceSwap(to accountId: UUID) {
         guard let active = accountManager.activeAccount,
               let target = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
-
-        do {
-            try SwapEngine.writeAuthFile(for: target)
-            accountManager.setActive(target.id)
-
-            let event = SwapEvent(
-                fromAccountId: active.id,
-                toAccountId: target.id,
-                reason: .manual,
-                timestamp: Date()
-            )
-            accountManager.recordSwap(event)
-
-            NotificationManager.notifySwap(from: active, to: target)
-            statusBarController.updateIcon()
-            updatePopoverContent()
-        } catch {
-            print("Force swap failed: \(error)")
-        }
+        executeSwap(from: active, to: target, reason: .manual)
     }
 
     // MARK: - Popover
@@ -226,7 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             updatePopoverContent()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
         }
     }
 
@@ -240,6 +236,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
     }
 }

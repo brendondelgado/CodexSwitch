@@ -46,24 +46,23 @@ actor QuotaPoller {
     /// Uses accountProvider to get current account state (fresh tokens after refresh).
     func startPolling(
         for accountId: UUID,
-        accountProvider: @escaping @Sendable (UUID) -> CodexAccount?,
+        accountProvider: @escaping @Sendable (UUID) async -> CodexAccount?,
         onUpdate: @escaping @Sendable (UUID, QuotaSnapshot) -> Void,
         onError: @escaping @Sendable (UUID, PollerError) -> Void
     ) {
         stopPolling(for: accountId)
 
-        let initialAccount = accountProvider(accountId)
-        let initialInterval = Self.pollInterval(
-            forRemainingPercent: initialAccount?.quotaSnapshot?.fiveHour.remainingPercent ?? 100
-        )
-
         pollTasks[accountId] = Task {
-            var interval = initialInterval
+            // Get initial interval from current account state
+            let initialAccount = await accountProvider(accountId)
+            var interval = Self.pollInterval(
+                forRemainingPercent: initialAccount?.quotaSnapshot?.fiveHour.remainingPercent ?? 100
+            )
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled else { return }
 
-                guard let currentAccount = accountProvider(accountId) else {
+                guard let currentAccount = await accountProvider(accountId) else {
                     onError(accountId, .invalidResponse)
                     return
                 }
