@@ -42,36 +42,44 @@ actor QuotaPoller {
         }
     }
 
-    /// Start adaptive polling for an account, calling onUpdate with each new snapshot
+    /// Start adaptive polling for an account, calling onUpdate with each new snapshot.
+    /// Uses accountProvider to get current account state (fresh tokens after refresh).
     func startPolling(
-        for account: CodexAccount,
+        for accountId: UUID,
+        accountProvider: @escaping @Sendable (UUID) -> CodexAccount?,
         onUpdate: @escaping @Sendable (UUID, QuotaSnapshot) -> Void,
         onError: @escaping @Sendable (UUID, PollerError) -> Void
     ) {
-        stopPolling(for: account.id)
+        stopPolling(for: accountId)
 
-        let accountId = account.id
+        let initialAccount = accountProvider(accountId)
         let initialInterval = Self.pollInterval(
-            forRemainingPercent: account.quotaSnapshot?.fiveHour.remainingPercent ?? 100
+            forRemainingPercent: initialAccount?.quotaSnapshot?.fiveHour.remainingPercent ?? 100
         )
 
-        pollTasks[accountId] = Task { [weak self] in
+        pollTasks[accountId] = Task {
             var interval = initialInterval
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(interval))
-                guard !Task.isCancelled, let self else { return }
+                guard !Task.isCancelled else { return }
+
+                guard let currentAccount = accountProvider(accountId) else {
+                    onError(accountId, .invalidResponse)
+                    return
+                }
 
                 do {
-                    let snapshot = try await self.fetchQuota(for: account)
+                    let snapshot = try await self.fetchQuota(for: currentAccount)
                     onUpdate(accountId, snapshot)
                     interval = Self.pollInterval(
                         forRemainingPercent: snapshot.fiveHour.remainingPercent
                     )
                 } catch let error as PollerError {
                     onError(accountId, error)
+                    if case .tokenExpired = error { return }
                     interval = 60 // Back off on error
                 } catch {
-                    onError(accountId, .networkError(error))
+                    onError(accountId, .networkError(error.localizedDescription))
                     interval = 60
                 }
             }
@@ -94,5 +102,5 @@ enum PollerError: Error, Sendable {
     case tokenExpired
     case rateLimited
     case httpError(Int)
-    case networkError(Error)
+    case networkError(String)
 }

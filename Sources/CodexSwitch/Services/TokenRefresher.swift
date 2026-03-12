@@ -25,19 +25,28 @@ enum TokenRefresher {
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
 
-        let body = [
-            "grant_type=refresh_token",
-            "client_id=\(clientId)",
-            "refresh_token=\(account.refreshToken)"
-        ].joined(separator: "&")
+        let params: [(String, String)] = [
+            ("grant_type", "refresh_token"),
+            ("client_id", clientId),
+            ("refresh_token", account.refreshToken)
+        ]
+        let body = params
+            .map { "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.1)" }
+            .joined(separator: "&")
         request.httpBody = body.data(using: .utf8)
         request.timeoutInterval = 15
 
         let (data, response) = try await session.data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw TokenRefreshError.refreshFailed
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TokenRefreshError.invalidResponse
+        }
+        guard httpResponse.statusCode == 200 else {
+            let responseBody = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+            throw TokenRefreshError.refreshFailed(
+                statusCode: httpResponse.statusCode,
+                body: String(responseBody.prefix(500))
+            )
         }
 
         let tokenResponse = try JSONDecoder().decode(TokenResponse.self, from: data)
@@ -56,5 +65,6 @@ enum TokenRefresher {
 }
 
 enum TokenRefreshError: Error, Sendable {
-    case refreshFailed
+    case refreshFailed(statusCode: Int, body: String)
+    case invalidResponse
 }
