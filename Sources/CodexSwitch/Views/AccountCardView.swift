@@ -45,9 +45,14 @@ struct AccountCardView: View {
                     resetsAt: snapshot.weekly.resetsAt
                 )
             } else {
-                Text("No quota data")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Waiting for data...")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Text("Polling quota API")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
         .padding(8)

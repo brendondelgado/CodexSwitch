@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let accountManager = AccountManager()
     private let keychainStore = KeychainStore()
     private let quotaPoller = QuotaPoller()
+    private let oauthManager = OAuthLoginManager()
 
     private var monitorTask: Task<Void, Never>?
     private var iconUpdateTimer: Timer?
@@ -35,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Popover
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 500, height: 420)
+        popover.contentSize = NSSize(width: 540, height: 480)
         popover.behavior = .transient
         updatePopoverContent()
 
@@ -82,18 +83,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func importCurrentAccount() {
-        do {
-            var account = try AccountImporter.importCurrentAccount()
-            if accountManager.accounts.isEmpty {
-                account.isActive = true
+    private func addAccount() {
+        Task {
+            do {
+                var account = try await oauthManager.performLogin()
+                if accountManager.accounts.isEmpty {
+                    account.isActive = true
+                }
+                accountManager.addAccount(account)
+                try keychainStore.save(account)
+                startPollingForAccount(account.id)
+                statusBarController.updateIcon()
+                updatePopoverContent()
+
+                // Show popover to confirm the account was added
+                if let button = statusItem.button {
+                    popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+                    NSApp.activate()
+                }
+
+                logger.info("Account added: \(account.email)")
+            } catch {
+                logger.error("Login failed: \(error.localizedDescription)")
             }
-            accountManager.addAccount(account)
-            try keychainStore.save(account)
-            startPollingForAccount(account.id)
-            updatePopoverContent()
-        } catch {
-            logger.error("Import failed: \(error.localizedDescription)")
         }
     }
 
@@ -209,7 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = NSHostingController(
             rootView: PopoverContentView(
                 manager: accountManager,
-                onImportAccount: { [weak self] in self?.importCurrentAccount() },
+                onAddAccount: { [weak self] in self?.addAccount() },
                 onForceSwap: { [weak self] id in self?.forceSwap(to: id) },
                 onOpenSettings: { [weak self] in self?.openSettings() }
             )

@@ -18,8 +18,17 @@ final class StatusBarController {
         let symbolName: String
         let tintColor: NSColor
 
+        if manager.accounts.isEmpty {
+            // No accounts imported — show disconnected
+            symbolName = "bolt.slash.fill"
+            tintColor = .secondaryLabelColor
+            applyIcon(button: button, symbolName: symbolName, tintColor: tintColor)
+            return
+        }
+
         guard let active = manager.activeAccount,
               let snapshot = active.quotaSnapshot else {
+            // Accounts exist but no quota data yet — waiting for first poll
             symbolName = "bolt.fill"
             tintColor = .secondaryLabelColor
             applyIcon(button: button, symbolName: symbolName, tintColor: tintColor)

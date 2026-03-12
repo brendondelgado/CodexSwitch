@@ -2,7 +2,7 @@ import SwiftUI
 
 struct PopoverContentView: View {
     @Bindable var manager: AccountManager
-    var onImportAccount: () -> Void
+    var onAddAccount: () -> Void
     var onForceSwap: (UUID) -> Void
     var onOpenSettings: () -> Void
 
@@ -30,6 +30,18 @@ struct PopoverContentView: View {
         return parts.joined(separator: " · ")
     }
 
+    private var connectionStatus: (icon: String, label: String, color: Color) {
+        if manager.accounts.isEmpty {
+            return ("bolt.slash.fill", "No accounts — tap + to add one", .secondary)
+        }
+        let hasQuotaData = manager.accounts.contains { $0.quotaSnapshot != nil }
+        if !hasQuotaData {
+            return ("bolt.badge.clock.fill", "Connecting — waiting for quota data...", .orange)
+        }
+        let connectedCount = manager.accounts.filter { $0.quotaSnapshot != nil }.count
+        return ("bolt.fill", "\(connectedCount)/\(manager.accounts.count) accounts connected", .green)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -53,16 +65,54 @@ struct PopoverContentView: View {
             .padding(.top, 10)
             .padding(.bottom, 6)
 
+            // Connection status banner
+            let status = connectionStatus
+            HStack(spacing: 6) {
+                Image(systemName: status.icon)
+                    .font(.system(size: 10))
+                    .foregroundStyle(status.color)
+                Text(status.label)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .background(status.color.opacity(0.08))
+
             Divider()
 
-            LazyVGrid(columns: columns, spacing: 8) {
-                ForEach(manager.sortedAccounts) { account in
-                    AccountCardView(account: account) {
-                        onForceSwap(account.id)
+            if manager.accounts.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "bolt.slash.fill")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.tertiary)
+                    Text("No accounts imported")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("Sign in with your ChatGPT account to get started")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                    Button(action: onAddAccount) {
+                        Label("Add Account", systemImage: "plus.circle.fill")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                .padding(.vertical, 30)
+                .padding(.horizontal, 20)
+            } else {
+                LazyVGrid(columns: columns, spacing: 8) {
+                    ForEach(manager.sortedAccounts) { account in
+                        AccountCardView(account: account) {
+                            onForceSwap(account.id)
+                        }
                     }
                 }
+                .padding(10)
             }
-            .padding(10)
 
             // Next swap preview
             if let nextUp = SwapEngine.selectOptimalAccount(from: manager.accounts) {
@@ -104,8 +154,8 @@ struct PopoverContentView: View {
 
                 Spacer()
 
-                Button(action: onImportAccount) {
-                    Label("Import Account", systemImage: "plus.circle")
+                Button(action: onAddAccount) {
+                    Label("Add Account", systemImage: "plus.circle")
                         .font(.system(size: 11))
                 }
                 .buttonStyle(.plain)
@@ -113,6 +163,6 @@ struct PopoverContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
-        .frame(width: 500)
+        .frame(width: 540)
     }
 }
