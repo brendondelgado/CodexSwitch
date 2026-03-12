@@ -14,15 +14,13 @@ actor QuotaPoller {
     }
 
     /// Calculate poll interval based on remaining percent, scaled by user's poll multiplier.
-    /// Active accounts are capped at 30s max so the UI stays responsive.
+    /// Active account polls every 5s for near-realtime UI (~500 byte response, negligible overhead).
     static func pollInterval(forRemainingPercent remaining: Double, isActive: Bool = false) -> TimeInterval {
+        if isActive { return 5 }
         let base = QuotaUrgency(remainingPercent: remaining).pollInterval
         let raw = UserDefaults.standard.double(forKey: "pollMultiplier")
-        // UserDefaults.double returns 0.0 when unset — treat as default 1.0
         let multiplier = raw > 0 ? max(0.5, min(2.0, raw)) : 1.0
-        let interval = base * multiplier
-        // Active account: never wait more than 30s — user is consuming quota in real time
-        return isActive ? min(interval, 30) : interval
+        return base * multiplier
     }
 
     struct FetchResult: Sendable {
