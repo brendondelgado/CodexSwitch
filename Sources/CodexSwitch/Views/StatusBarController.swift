@@ -44,15 +44,17 @@ final class StatusBarController: @unchecked Sendable {
 
     private func applyIcon(button: NSStatusBarButton, symbolName: String, tintColor: NSColor) {
         let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "CodexSwitch") {
-            let configured = image.withSymbolConfiguration(config) ?? image
-            let tinted = configured.copy() as! NSImage
-            tinted.isTemplate = false
-            tinted.lockFocus()
+        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "CodexSwitch") else { return }
+        let configured = image.withSymbolConfiguration(config) ?? image
+        let size = configured.size
+
+        let tinted = NSImage(size: size, flipped: false) { rect in
+            configured.draw(in: rect)
             tintColor.set()
-            NSRect(origin: .zero, size: tinted.size).fill(using: .sourceAtop)
-            tinted.unlockFocus()
-            button.image = tinted
+            rect.fill(using: .sourceAtop)
+            return true
         }
+        tinted.isTemplate = false
+        button.image = tinted
     }
 }
