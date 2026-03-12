@@ -18,13 +18,14 @@ struct QuotaWindow: Codable, Sendable {
     var urgency: QuotaUrgency { QuotaUrgency(remainingPercent: remainingPercent) }
 }
 
+/// Urgency levels ordered by increasing severity (Comparable uses declaration order).
 enum QuotaUrgency: Sendable, Comparable {
-    case relaxed
-    case moderate
-    case elevated
-    case high
-    case critical
-    case imminent    // < 7% — agents can drain fast, poll every second
+    case relaxed     // >= 50%
+    case moderate    // 20–50%
+    case elevated    // 10–20%
+    case high        // 7–10%
+    case imminent    // 1–7% — agents can drain fast, poll every second
+    case critical    // < 1% — about to hit the wall
 
     var pollInterval: TimeInterval {
         switch self {
@@ -32,8 +33,8 @@ enum QuotaUrgency: Sendable, Comparable {
         case .moderate: return 300
         case .elevated: return 120
         case .high:     return 60
-        case .critical: return 10
         case .imminent: return 1
+        case .critical: return 1
         }
     }
 

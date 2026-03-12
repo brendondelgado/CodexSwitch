@@ -8,6 +8,7 @@ struct DrainBarView: View {
 
     private static let resetFormatter: DateFormatter = {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "EEE M/d @ h:mma"
         f.amSymbol = "am"
         f.pmSymbol = "pm"

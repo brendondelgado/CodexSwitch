@@ -16,6 +16,7 @@ struct SettingsView: View {
 
     private static let lastCheckedFormatter: DateFormatter = {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "M/d @ h:mma"
         f.amSymbol = "am"
         f.pmSymbol = "pm"
@@ -119,7 +120,7 @@ struct SettingsView: View {
                 if let result = versionChecker.updateResult {
                     Text(result)
                         .font(.caption)
-                        .foregroundStyle(result.hasPrefix("Updated") ? .green : .red)
+                        .foregroundStyle(versionChecker.updateSucceeded ? .green : .red)
                         .lineLimit(3)
                 }
 

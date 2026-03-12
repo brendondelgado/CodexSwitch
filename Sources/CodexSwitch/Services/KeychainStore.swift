@@ -112,13 +112,8 @@ struct KeychainStore: Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(accounts)
 
-        // Atomic write via tmp + rename
-        let tmpPath = Self.storePath + ".tmp"
-        try data.write(to: URL(fileURLWithPath: tmpPath), options: .atomic)
-        if FileManager.default.fileExists(atPath: Self.storePath) {
-            try FileManager.default.removeItem(atPath: Self.storePath)
-        }
-        try FileManager.default.moveItem(atPath: tmpPath, toPath: Self.storePath)
+        // .atomic already writes to tmp + renames internally
+        try data.write(to: URL(fileURLWithPath: Self.storePath), options: .atomic)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: Self.storePath

@@ -9,6 +9,7 @@ enum SwapStatistics {
         let swapsThisMonth: Int
         let averageSwapsPerDay: Double
         let mostSwappedFromEmail: String?
+        let mostSwappedFromCount: Int
         let mostSwappedToEmail: String?
         let totalAccounts: Int
     }
@@ -35,7 +36,8 @@ enum SwapStatistics {
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: logDir) else {
             return Stats(swapsToday: 0, swapsThisWeek: 0, swapsThisMonth: 0,
                          averageSwapsPerDay: 0, mostSwappedFromEmail: nil,
-                         mostSwappedToEmail: nil, totalAccounts: accountCount)
+                         mostSwappedFromCount: 0, mostSwappedToEmail: nil,
+                         totalAccounts: accountCount)
         }
 
         for file in files where file.hasPrefix("codexswitch-") && file.hasSuffix(".log") {
@@ -80,12 +82,14 @@ enum SwapStatistics {
             daysSinceFirst = 1
         }
 
+        let topFrom = fromCounts.max(by: { $0.value < $1.value })
         return Stats(
             swapsToday: swapsToday,
             swapsThisWeek: swapsThisWeek,
             swapsThisMonth: swapsThisMonth,
             averageSwapsPerDay: Double(totalSwaps) / daysSinceFirst,
-            mostSwappedFromEmail: fromCounts.max(by: { $0.value < $1.value })?.key,
+            mostSwappedFromEmail: topFrom?.key,
+            mostSwappedFromCount: topFrom?.value ?? 0,
             mostSwappedToEmail: toCounts.max(by: { $0.value < $1.value })?.key,
             totalAccounts: accountCount
         )
@@ -103,10 +107,14 @@ enum SwapStatistics {
             return "Low usage (\(stats.swapsThisWeek) swaps/week). You could save $\(20 * (stats.totalAccounts - 3))/mo by dropping \(stats.totalAccounts - 3) account\(stats.totalAccounts - 3 == 1 ? "" : "s")."
         }
 
-        // One account getting exhausted way more than others
-        if let mostFrom = stats.mostSwappedFromEmail, stats.swapsThisWeek > 5 {
-            let prefix = mostFrom.components(separatedBy: "@").first ?? mostFrom
-            return "\(prefix)@... exhausts most often. Consider using it less for heavy sessions."
+        // One account getting exhausted way more than others (top must be >2x average)
+        if stats.swapsThisWeek > 5 && stats.totalAccounts > 1,
+           let mostFrom = stats.mostSwappedFromEmail {
+            let avgCount = Double(stats.swapsThisWeek) / Double(stats.totalAccounts)
+            if Double(stats.mostSwappedFromCount) > 2 * avgCount {
+                let prefix = mostFrom.components(separatedBy: "@").first ?? mostFrom
+                return "\(prefix)@... exhausts most often. Consider using it less for heavy sessions."
+            }
         }
 
         return nil

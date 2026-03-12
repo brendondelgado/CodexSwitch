@@ -27,10 +27,15 @@ private func installCrashHandlers() {
         writeCrashLog("UNCAUGHT EXCEPTION: \(exception.name.rawValue) — \(exception.reason ?? "no reason")")
         writeCrashLog("STACK: \(exception.callStackSymbols.joined(separator: "\n"))")
     }
+    // Signal handlers use only async-signal-safe POSIX write(2).
+    // Foundation APIs (heap alloc, formatters, FileManager) are NOT safe here.
     for sig: Int32 in [SIGABRT, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP] {
         signal(sig) { sigNum in
-            writeCrashLog("FATAL SIGNAL: \(sigNum)")
-            // Re-raise to get default behavior (crash report)
+            // Only raw POSIX write to stderr — no Foundation, no heap alloc
+            var msg = "FATAL SIGNAL: \(sigNum)\n"
+            msg.withUTF8 { buf in
+                _ = Darwin.write(STDERR_FILENO, buf.baseAddress, buf.count)
+            }
             Darwin.signal(sigNum, SIG_DFL)
             Darwin.raise(sigNum)
         }
@@ -93,7 +98,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CLIStatusChecker.refresh(activeAccountId: accountManager.activeAccount?.accountId)
         iconUpdateTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.accountManager.syncWithAuthJson()
+                // If auth.json changed externally, restart polling for new active account
+                if let newActiveId = self?.accountManager.syncWithAuthJson() {
+                    self?.startPollingForAccount(newActiveId)
+                }
                 self?.statusBarController.updateIcon()
                 self?.updatePopoverContent()
                 CLIStatusChecker.refresh(activeAccountId: self?.accountManager.activeAccount?.accountId)
@@ -300,6 +308,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             accountManager.setActive(to.id)
+            // Restart polling for new active account — clears old sleep, fetches immediately
+            startPollingForAccount(to.id)
 
             let event = SwapEvent(
                 fromAccountId: from.id,

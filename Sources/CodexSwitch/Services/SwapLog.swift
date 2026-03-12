@@ -5,14 +5,17 @@ private let logger = Logger(subsystem: "com.codexswitch", category: "SwapLog")
 
 /// Diagnostic event log for CodexSwitch.
 /// Records swap decisions, SIGHUP signaling, errors, and CLI status changes.
-/// No user data is collected — only operational diagnostics for debugging.
+/// Logs contain account email addresses for debugging — stored locally at ~/.codexswitch/logs/.
 enum SwapLog {
     private static let logDir = NSString("~/.codexswitch/logs").expandingTildeInPath
-    private nonisolated(unsafe) static let isoFormatter: ISO8601DateFormatter = {
+
+    /// Create a fresh formatter per call to avoid thread-safety issues
+    /// (Foundation formatters are not safe to share across threads).
+    private static func makeISOFormatter() -> ISO8601DateFormatter {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
-    }()
+    }
 
     enum Event: CustomStringConvertible {
         // Swap lifecycle
@@ -88,7 +91,7 @@ enum SwapLog {
 
     /// Append an event to today's log file.
     static func append(_ event: Event) {
-        let timestamp = isoFormatter.string(from: Date())
+        let timestamp = makeISOFormatter().string(from: Date())
         let line = "[\(timestamp)] \(event.description)\n"
 
         // Ensure log directory exists
@@ -117,7 +120,7 @@ enum SwapLog {
 
     /// Read the last N lines from today's log.
     static func recentEntries(count: Int = 50) -> [String] {
-        let dateStr = isoFormatter.string(from: Date()).prefix(10)
+        let dateStr = makeISOFormatter().string(from: Date()).prefix(10)
         let logPath = "\(logDir)/codexswitch-\(String(dateStr)).log"
         guard let content = try? String(contentsOfFile: logPath, encoding: .utf8) else {
             return []

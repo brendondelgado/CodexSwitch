@@ -65,28 +65,31 @@ final class AccountManager {
         if let first = accounts.first { setActive(first.id) }
     }
 
-    /// Read the account_id from ~/.codex/auth.json (nonisolated, file I/O only)
-    private static func readAuthJsonAccountId() -> String? {
+    /// Read the account_id from ~/.codex/auth.json using the shared AuthFile model.
+    /// Marked nonisolated to avoid blocking MainActor with file I/O.
+    private nonisolated static func readAuthJsonAccountId() -> String? {
         let path = NSString("~/.codex/auth.json").expandingTildeInPath
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tokens = json["tokens"] as? [String: Any],
-              let accountId = tokens["account_id"] as? String else {
+              let authFile = try? JSONDecoder().decode(AuthFile.self, from: data) else {
             return nil
         }
-        return accountId
+        return authFile.tokens.accountId
     }
 
     /// Sync active account with auth.json if it changed externally.
     /// Call periodically (e.g. every 5s) to detect CLI or manual changes.
-    func syncWithAuthJson() {
-        guard let authAccountId = Self.readAuthJsonAccountId() else { return }
+    /// Returns the UUID of the newly active account if it changed, nil otherwise.
+    @discardableResult
+    func syncWithAuthJson() -> UUID? {
+        guard let authAccountId = Self.readAuthJsonAccountId() else { return nil }
         // Already in sync
-        if activeAccount?.accountId == authAccountId { return }
+        if activeAccount?.accountId == authAccountId { return nil }
         // Find matching account and switch
         if let match = accounts.first(where: { $0.accountId == authAccountId }) {
             setActive(match.id)
+            return match.id
         }
+        return nil
     }
 
     func addAccount(_ account: CodexAccount) {

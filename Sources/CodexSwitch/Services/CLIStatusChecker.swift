@@ -42,7 +42,7 @@ struct DesktopAppStatus: Sendable {
     }
 
     var icon: String {
-        isRunning ? "desktopcomputer" : "desktopcomputer"
+        isRunning ? "desktopcomputer" : "desktopcomputer.trianglebadge.exclamationmark"
     }
 
     var isHealthy: Bool { isRunning }
@@ -101,8 +101,8 @@ enum CLIStatusChecker {
         process.standardOutput = pipe
         process.standardError = Pipe()
         try? process.run()
-        process.waitUntilExit()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
         if !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return DesktopAppStatus(isRunning: true, port: nil)
@@ -118,19 +118,17 @@ enum CLIStatusChecker {
         process.standardOutput = pipe
         process.standardError = Pipe()
         try? process.run()
-        process.waitUntilExit()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
         return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private nonisolated static func _readAuthAccountId() -> String? {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tokens = json["tokens"] as? [String: Any],
-              let accountId = tokens["account_id"] as? String else {
+              let authFile = try? JSONDecoder().decode(AuthFile.self, from: data) else {
             return nil
         }
-        return accountId
+        return authFile.tokens.accountId
     }
 }

@@ -13,13 +13,16 @@ actor QuotaPoller {
         self.session = session
     }
 
-    /// Calculate poll interval based on remaining percent, scaled by user's poll multiplier
-    static func pollInterval(forRemainingPercent remaining: Double) -> TimeInterval {
+    /// Calculate poll interval based on remaining percent, scaled by user's poll multiplier.
+    /// Active accounts are capped at 30s max so the UI stays responsive.
+    static func pollInterval(forRemainingPercent remaining: Double, isActive: Bool = false) -> TimeInterval {
         let base = QuotaUrgency(remainingPercent: remaining).pollInterval
         let raw = UserDefaults.standard.double(forKey: "pollMultiplier")
         // UserDefaults.double returns 0.0 when unset — treat as default 1.0
         let multiplier = raw > 0 ? max(0.5, min(2.0, raw)) : 1.0
-        return base * multiplier
+        let interval = base * multiplier
+        // Active account: never wait more than 30s — user is consuming quota in real time
+        return isActive ? min(interval, 30) : interval
     }
 
     struct FetchResult: Sendable {
@@ -37,16 +40,16 @@ actor QuotaPoller {
         request.setValue("codex-cli", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 15
 
-        logger.info("Fetching quota for accountId=\(account.accountId, privacy: .public) email=\(account.email, privacy: .public)")
+        logger.info("Fetching quota for accountId=\(account.accountId, privacy: .public) email=\(account.email, privacy: .private)")
 
         let (data, response) = try await session.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
-            logger.error("Invalid response (not HTTP) for \(account.email, privacy: .public)")
+            logger.error("Invalid response (not HTTP) for \(account.email, privacy: .private)")
             throw PollerError.invalidResponse
         }
 
-        logger.info("Quota API response: HTTP \(httpResponse.statusCode) for \(account.email, privacy: .public)")
+        logger.info("Quota API response: HTTP \(httpResponse.statusCode) for \(account.email, privacy: .private)")
 
         switch httpResponse.statusCode {
         case 200:
@@ -54,14 +57,14 @@ actor QuotaPoller {
             logger.info("Quota parsed: 5h=\(String(format: "%.1f", result.snapshot.fiveHour.remainingPercent))% weekly=\(String(format: "%.1f", result.snapshot.weekly.remainingPercent))% plan=\(result.planType, privacy: .public)")
             return FetchResult(snapshot: result.snapshot, planType: result.planType)
         case 401:
-            logger.warning("Token expired (401) for \(account.email, privacy: .public)")
+            logger.warning("Token expired (401) for \(account.email, privacy: .private)")
             throw PollerError.tokenExpired
         case 429:
-            logger.warning("Rate limited (429) for \(account.email, privacy: .public)")
+            logger.warning("Rate limited (429) for \(account.email, privacy: .private)")
             throw PollerError.rateLimited
         default:
             let body = String(data: data, encoding: .utf8) ?? "<non-utf8>"
-            logger.error("HTTP \(httpResponse.statusCode) for \(account.email, privacy: .public): \(body.prefix(500), privacy: .public)")
+            logger.error("HTTP \(httpResponse.statusCode) for \(account.email, privacy: .private): \(body.prefix(500), privacy: .private)")
             throw PollerError.httpError(httpResponse.statusCode)
         }
     }
@@ -106,9 +109,10 @@ actor QuotaPoller {
                     onUpdate(accountId, result.snapshot, result.planType)
 
                     if currentAccount.isActive {
-                        // Active account: poll at urgency-based intervals
+                        // Active account: poll at urgency-based intervals (capped at 30s)
                         interval = Self.pollInterval(
-                            forRemainingPercent: result.snapshot.fiveHour.remainingPercent
+                            forRemainingPercent: result.snapshot.fiveHour.remainingPercent,
+                            isActive: true
                         )
                     } else {
                         // Inactive account: sleep until next reset, then recheck
@@ -118,7 +122,7 @@ actor QuotaPoller {
                         if result.snapshot.fiveHour.isExhausted && fhReset > 0 {
                             // Exhausted — wake up 2s after 5h reset
                             interval = fhReset + 2
-                            logger.info("Inactive \(currentAccount.email, privacy: .public) exhausted — sleeping \(String(format: "%.0f", interval))s until 5h reset")
+                            logger.info("Inactive \(currentAccount.email, privacy: .private) exhausted — sleeping \(String(format: "%.0f", interval))s until 5h reset")
                         } else if result.snapshot.fiveHour.remainingPercent > 50 {
                             // Plenty of quota — check again in 10 minutes
                             interval = 600
@@ -134,14 +138,14 @@ actor QuotaPoller {
                         }
                     }
 
-                    logger.info("Poll success for \(currentAccount.email, privacy: .public) [active=\(currentAccount.isActive)] — next in \(String(format: "%.0f", interval))s")
+                    logger.info("Poll success for \(currentAccount.email, privacy: .private) [active=\(currentAccount.isActive)] — next in \(String(format: "%.0f", interval))s")
                 } catch let error as PollerError {
-                    logger.error("Poll error for \(currentAccount.email, privacy: .public): \(String(describing: error), privacy: .public)")
+                    logger.error("Poll error for \(currentAccount.email, privacy: .private): \(String(describing: error), privacy: .public)")
                     onError(accountId, error)
                     if case .tokenExpired = error { return }
                     interval = 60 // Back off on error
                 } catch {
-                    logger.error("Poll network error for \(currentAccount.email, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                    logger.error("Poll network error for \(currentAccount.email, privacy: .private): \(error.localizedDescription, privacy: .public)")
                     onError(accountId, .networkError(error.localizedDescription))
                     interval = 60
                 }

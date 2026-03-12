@@ -18,13 +18,14 @@ enum DesktopAppConnector {
         process.standardError = Pipe()
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             logger.error("lsof failed: \(error.localizedDescription)")
             return nil
         }
 
+        // Read pipe data BEFORE waitUntilExit to avoid deadlock if output fills buffer
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
         guard let output = String(data: data, encoding: .utf8) else { return nil }
 
         // Look for Codex desktop app listening on 127.0.0.1.
@@ -61,6 +62,7 @@ enum DesktopAppConnector {
     ) async -> Bool {
         let url = URL(string: "ws://127.0.0.1:\(port)")!
         let session = URLSession(configuration: .default)
+        defer { session.finishTasksAndInvalidate() }
         let wsTask = session.webSocketTask(with: url)
         wsTask.resume()
 

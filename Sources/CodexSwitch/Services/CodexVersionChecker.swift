@@ -13,6 +13,7 @@ final class CodexVersionChecker {
     var updateAvailable = false
     var isUpdating = false
     var updateResult: String?
+    var updateSucceeded: Bool = false
     var forkInstalled = false
     var forkRebuilding = false
 
@@ -46,6 +47,7 @@ final class CodexVersionChecker {
     func runUpdate() {
         isUpdating = true
         updateResult = nil
+        updateSucceeded = false
 
         Task.detached {
             // Step 1: npm update
@@ -53,6 +55,7 @@ final class CodexVersionChecker {
             guard npmResult.success else {
                 await MainActor.run { [weak self] in
                     self?.isUpdating = false
+                    self?.updateSucceeded = false
                     self?.updateResult = npmResult.message
                 }
                 return
@@ -79,6 +82,7 @@ final class CodexVersionChecker {
                     self?.isUpdating = false
                     self?.forkRebuilding = false
                     self?.updateAvailable = (installed != latest && latest != "?" && installed != "?")
+                    self?.updateSucceeded = forkResult.success
                     self?.updateResult = forkResult.success
                         ? "Updated to v\(newNpmVersion) with SIGHUP fork"
                         : "npm updated but fork rebuild failed: \(forkResult.message). Run `codex` manually to use stock binary."
@@ -93,6 +97,7 @@ final class CodexVersionChecker {
                     self?.latestVersion = latest
                     self?.isUpdating = false
                     self?.updateAvailable = (installed != latest && latest != "?" && installed != "?")
+                    self?.updateSucceeded = true
                     self?.updateResult = "Updated to v\(newNpmVersion)"
                     self?.lastChecked = Date()
                 }
@@ -112,8 +117,8 @@ final class CodexVersionChecker {
         process.standardError = Pipe()
         do {
             try process.run()
-            process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let version = output.replacingOccurrences(of: "codex-cli ", with: "")
             return version.isEmpty ? "?" : version
@@ -149,8 +154,8 @@ final class CodexVersionChecker {
         process.standardError = Pipe()
         do {
             try process.run()
-            process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return output.isEmpty ? "?" : output
         } catch {
@@ -177,11 +182,12 @@ final class CodexVersionChecker {
 
         do {
             try process.run()
+            // Read pipes before waitUntilExit to avoid deadlock
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             if process.terminationStatus == 0 {
                 return ActionResult(success: true, message: "npm update succeeded")
             } else {
-                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 let errStr = String(data: errData, encoding: .utf8) ?? "Unknown error"
                 return ActionResult(success: false, message: "npm update failed: \(String(errStr.prefix(200)))")
             }
@@ -216,24 +222,25 @@ final class CodexVersionChecker {
         pullProcess.waitUntilExit()
 
         // Step 3: Rebuild
-        let buildPipe = Pipe()
         let buildErrPipe = Pipe()
         let buildProcess = Process()
-        buildProcess.executableURL = URL(fileURLWithPath: "/Users/brendondelgado/.cargo/bin/cargo")
+        buildProcess.executableURL = URL(fileURLWithPath: NSString("~/.cargo/bin/cargo").expandingTildeInPath)
         buildProcess.arguments = ["build", "--release", "-p", "codex-cli"]
         buildProcess.currentDirectoryURL = URL(fileURLWithPath: forkSourcePath)
-        buildProcess.standardOutput = buildPipe
+        buildProcess.standardOutput = FileHandle.nullDevice
         buildProcess.standardError = buildErrPipe
         var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/Users/brendondelgado/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let cargoDir = NSString("~/.cargo/bin").expandingTildeInPath
+        env["PATH"] = "\(cargoDir):/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         buildProcess.environment = env
 
         do {
             try buildProcess.run()
+            // Read pipe before waitUntilExit to avoid deadlock
+            let errData = buildErrPipe.fileHandleForReading.readDataToEndOfFile()
             buildProcess.waitUntilExit()
 
             guard buildProcess.terminationStatus == 0 else {
-                let errData = buildErrPipe.fileHandleForReading.readDataToEndOfFile()
                 let errStr = String(data: errData, encoding: .utf8) ?? "Unknown"
                 return ActionResult(success: false, message: "Cargo build failed: \(String(errStr.suffix(300)))")
             }
