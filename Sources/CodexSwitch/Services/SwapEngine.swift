@@ -120,15 +120,25 @@ enum SwapEngine {
     }
 
     /// Send SIGHUP to running Codex CLI processes so they reload auth.json.
-    /// Safety filters:
-    ///   1. Only signals processes started AFTER the SIGHUP fork was installed
-    ///      (pre-fork binaries would be KILLED by unhandled SIGHUP).
-    ///   2. Only signals processes running for >10 seconds (newly-started processes
-    ///      haven't registered their SIGHUP handler yet and would be killed).
+    ///
+    /// DISABLED: The Codex CLI binary does not have a SIGHUP handler.
+    /// Sending SIGHUP to stock Codex kills the process (default POSIX behavior).
+    /// This method is a no-op until a fork binary with actual SIGHUP handling exists.
+    /// The marker file (~/.codexswitch/sighup-enabled) alone is NOT sufficient —
+    /// the binary must be verified to handle the signal.
     static func signalCodexReload() {
+        // Hard gate: verify the binary actually exports a SIGHUP handler.
+        // The marker file was previously trusted but the fork never implemented
+        // signal handling, causing SIGHUP to kill running sessions.
+        guard verifySighupSupport() else {
+            logger.info("SIGHUP not supported by installed codex binary — skipping (auth.json was still updated)")
+            SwapLog.append(.sighupSkipped(reason: "binary does not support SIGHUP"))
+            return
+        }
+
         guard let forkInstallTime = forkInstallDate() else {
-            logger.info("SIGHUP fork not installed — skipping signal (auth.json was still updated)")
-            SwapLog.append(.sighupSkipped(reason: "fork not installed"))
+            logger.info("SIGHUP fork marker not found — skipping signal (auth.json was still updated)")
+            SwapLog.append(.sighupSkipped(reason: "fork marker not found"))
             return
         }
 
@@ -205,6 +215,17 @@ enum SwapEngine {
             SwapLog.append(.sighupSkipped(reason: "no codex processes found"))
         }
         logger.info("SIGHUP summary: signaled=\(signaled) skippedOld=\(skippedOld) skippedTooNew=\(skippedTooNew)")
+    }
+
+    /// Verify the installed codex binary actually handles SIGHUP.
+    /// Checks for a canary file that a SIGHUP-capable fork writes on startup.
+    /// The marker file alone is NOT sufficient — the binary must prove it handles the signal.
+    private static func verifySighupSupport() -> Bool {
+        // A SIGHUP-capable fork writes ~/.codexswitch/sighup-verified on startup
+        // after registering its signal handler. This file is written by the binary
+        // itself, not by the build process, so it can't be a false positive.
+        let verifiedPath = NSString("~/.codexswitch/sighup-verified").expandingTildeInPath
+        return FileManager.default.fileExists(atPath: verifiedPath)
     }
 
     /// Get the install date of the SIGHUP fork from the marker file's modification time.
