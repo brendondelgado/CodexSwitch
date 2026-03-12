@@ -9,11 +9,13 @@ enum NotificationManager {
     }
 
     static func requestPermission() {
+        // UNUserNotificationCenter crashes if no app bundle exists (e.g. running raw binary)
+        guard Bundle.main.bundleIdentifier != nil else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
     static func notifySwap(from: CodexAccount, to: CodexAccount) {
-        guard isEnabled else { return }
+        guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: Account Swapped"
         content.subtitle = "Now using \(to.email)"
@@ -25,8 +27,10 @@ enum NotificationManager {
             let resetMins = Int(snapshot.fiveHour.timeUntilReset / 60)
             body = "5hr: \(fiveHr)% remaining | Weekly: \(weekly)% | Resets in \(resetMins)m"
         }
-        if let fromSnapshot = from.quotaSnapshot, fromSnapshot.fiveHour.isExhausted {
-            body += "\nPrevious account (\(from.displayName)) exhausted."
+        if let fromSnapshot = from.quotaSnapshot,
+           (fromSnapshot.fiveHour.isExhausted || fromSnapshot.weekly.isExhausted) {
+            body += "\nPrevious account (\(from.email)) exhausted."
+            body += "\nCLI sessions refreshed — new conversations use \(to.email)."
         }
         content.body = body
         content.sound = .default
@@ -40,7 +44,7 @@ enum NotificationManager {
     }
 
     static func notifyAllExhausted() {
-        guard isEnabled else { return }
+        guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: All Accounts Exhausted"
         content.body = "No accounts have remaining quota. Waiting for earliest reset."
@@ -55,7 +59,7 @@ enum NotificationManager {
     }
 
     static func notifyTokenRefreshFailed(account: CodexAccount) {
-        guard isEnabled else { return }
+        guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: Token Refresh Failed"
         content.body = "Account \(account.email) needs re-authentication. Import again from Codex CLI."

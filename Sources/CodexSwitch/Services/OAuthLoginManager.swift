@@ -61,6 +61,18 @@ actor OAuthLoginManager {
         let email = Self.extractEmail(from: tokens.idToken) ?? "unknown@imported"
         let accountId = Self.extractAccountId(from: tokens.accessToken) ?? UUID().uuidString
 
+        logger.info("OAuth login complete — email: \(email, privacy: .public)")
+        logger.info("Extracted accountId: \(accountId, privacy: .public)")
+
+        // Log JWT claims for debugging quota API issues
+        if let claims = Self.extractAllClaims(from: tokens.accessToken) {
+            let keys = claims.keys.sorted().joined(separator: ", ")
+            logger.info("Access token claims: \(keys, privacy: .public)")
+            if let auth = claims["https://api.openai.com/auth"] as? [String: Any] {
+                logger.info("Auth claims: \(String(describing: auth), privacy: .public)")
+            }
+        }
+
         return CodexAccount(
             email: email,
             accessToken: tokens.accessToken,
@@ -316,6 +328,10 @@ actor OAuthLoginManager {
     }
 
     private static func extractClaim(from jwt: String, key: String) -> Any? {
+        extractAllClaims(from: jwt)?[key]
+    }
+
+    private static func extractAllClaims(from jwt: String) -> [String: Any]? {
         let parts = jwt.split(separator: ".")
         guard parts.count >= 2 else { return nil }
         var base64 = String(parts[1])
@@ -328,7 +344,7 @@ actor OAuthLoginManager {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        return json[key]
+        return json
     }
 
     // MARK: - HTML Responses

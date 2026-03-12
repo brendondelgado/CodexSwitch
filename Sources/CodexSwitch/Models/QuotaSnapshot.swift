@@ -13,7 +13,7 @@ struct QuotaWindow: Codable, Sendable {
 
     var remainingPercent: Double { max(0, 100 - usedPercent) }
     var timeUntilReset: TimeInterval { resetsAt.timeIntervalSinceNow }
-    var isExhausted: Bool { usedPercent >= 100 }
+    var isExhausted: Bool { remainingPercent < 1 }
 
     var urgency: QuotaUrgency { QuotaUrgency(remainingPercent: remainingPercent) }
 }
@@ -24,6 +24,7 @@ enum QuotaUrgency: Sendable, Comparable {
     case elevated
     case high
     case critical
+    case imminent    // < 7% — agents can drain fast, poll every second
 
     var pollInterval: TimeInterval {
         switch self {
@@ -32,6 +33,7 @@ enum QuotaUrgency: Sendable, Comparable {
         case .elevated: return 120
         case .high:     return 60
         case .critical: return 10
+        case .imminent: return 1
         }
     }
 
@@ -40,7 +42,8 @@ enum QuotaUrgency: Sendable, Comparable {
         case 50...: self = .relaxed
         case 20..<50: self = .moderate
         case 10..<20: self = .elevated
-        case 5..<10: self = .high
+        case 7..<10: self = .high
+        case 1..<7: self = .imminent
         default: self = .critical
         }
     }

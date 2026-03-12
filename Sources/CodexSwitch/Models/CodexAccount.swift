@@ -8,12 +8,13 @@ struct CodexAccount: Codable, Identifiable, Sendable {
     var idToken: String
     var accountId: String
     var quotaSnapshot: QuotaSnapshot?
+    var planType: String?
     var lastRefreshed: Date?
     var isActive: Bool
 
-    var displayName: String {
-        let local = email.components(separatedBy: "@").first ?? email
-        return local.count > 12 ? String(local.prefix(10)) + ".." : local
+    var planLabel: String {
+        guard let plan = planType else { return "" }
+        return plan.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
     init(
@@ -24,6 +25,7 @@ struct CodexAccount: Codable, Identifiable, Sendable {
         idToken: String,
         accountId: String,
         quotaSnapshot: QuotaSnapshot? = nil,
+        planType: String? = nil,
         lastRefreshed: Date? = nil,
         isActive: Bool = false
     ) {
@@ -34,6 +36,7 @@ struct CodexAccount: Codable, Identifiable, Sendable {
         self.idToken = idToken
         self.accountId = accountId
         self.quotaSnapshot = quotaSnapshot
+        self.planType = planType
         self.lastRefreshed = lastRefreshed
         self.isActive = isActive
     }

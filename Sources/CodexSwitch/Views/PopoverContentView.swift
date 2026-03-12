@@ -14,20 +14,13 @@ struct PopoverContentView: View {
         GridItem(.flexible(), spacing: 8),
     ]
 
-    private func swapReason(for candidate: CodexAccount) -> String {
-        let score = SwapEngine.score(candidate)
-        guard let snapshot = candidate.quotaSnapshot else {
-            return "Score: \(String(format: "%.0f", score))"
+    private static func quotaColor(for percent: Double) -> Color {
+        switch percent {
+        case 50...: return .green
+        case 20..<50: return .yellow
+        case 5..<20: return .orange
+        default: return .red
         }
-        let fiveHr = snapshot.fiveHour
-        var parts: [String] = []
-        parts.append("\(Int(fiveHr.remainingPercent))% 5h quota")
-        if fiveHr.isExhausted && fiveHr.timeUntilReset < 1800 {
-            let mins = Int(fiveHr.timeUntilReset / 60)
-            parts.append("resets in \(mins)m")
-        }
-        parts.append("score \(String(format: "%.0f", score))")
-        return parts.joined(separator: " · ")
     }
 
     private var connectionStatus: (icon: String, label: String, color: Color) {
@@ -35,10 +28,18 @@ struct PopoverContentView: View {
             return ("bolt.slash.fill", "No accounts — tap + to add one", .secondary)
         }
         let hasQuotaData = manager.accounts.contains { $0.quotaSnapshot != nil }
+        let hasErrors = manager.accounts.contains { manager.pollingErrors[$0.id] != nil }
+        if hasErrors && !hasQuotaData {
+            let firstError = manager.accounts.compactMap { manager.pollingErrors[$0.id] }.first ?? "Unknown error"
+            return ("exclamationmark.triangle.fill", firstError, .red)
+        }
         if !hasQuotaData {
             return ("bolt.badge.clock.fill", "Connecting — waiting for quota data...", .orange)
         }
         let connectedCount = manager.accounts.filter { $0.quotaSnapshot != nil }.count
+        if hasErrors {
+            return ("exclamationmark.triangle.fill", "\(connectedCount)/\(manager.accounts.count) connected — some errors", .orange)
+        }
         return ("bolt.fill", "\(connectedCount)/\(manager.accounts.count) accounts connected", .green)
     }
 
@@ -106,7 +107,10 @@ struct PopoverContentView: View {
             } else {
                 LazyVGrid(columns: columns, spacing: 8) {
                     ForEach(manager.sortedAccounts) { account in
-                        AccountCardView(account: account) {
+                        AccountCardView(
+                            account: account,
+                            pollingError: manager.pollingErrors[account.id]
+                        ) {
                             onForceSwap(account.id)
                         }
                     }
@@ -114,29 +118,113 @@ struct PopoverContentView: View {
                 .padding(10)
             }
 
+            // Pooled usage meter — aggregate capacity vs Pro
+            if manager.accounts.count > 1 {
+                Divider()
+                PooledUsageMeterView(accounts: manager.accounts)
+            }
+
+            // Current account + CLI status + Next up
+            if let active = manager.activeAccount {
+                Divider()
+
+                // Current account
+                HStack(spacing: 6) {
+                    Image(systemName: "person.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.system(size: 11))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Current Account")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Text(active.email)
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    Spacer()
+                    if let snapshot = active.quotaSnapshot {
+                        let fhPct = snapshot.fiveHour.remainingPercent
+                        let wkPct = snapshot.weekly.remainingPercent
+                        VStack(alignment: .trailing, spacing: 1) {
+                            Text("\(Int(fhPct))% 5h")
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundStyle(Self.quotaColor(for: fhPct))
+                            Text("\(Int(wkPct))% wk")
+                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                .foregroundStyle(Self.quotaColor(for: wkPct))
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+                .padding(.bottom, 2)
+
+                // CLI connection status (read from cache, never block main thread)
+                let cliStatus = CLIStatusChecker.cachedCLIStatus
+                HStack(spacing: 4) {
+                    Image(systemName: cliStatus.icon)
+                        .font(.system(size: 9))
+                        .foregroundStyle(cliStatus.isHealthy ? .green : .orange)
+                    Text(cliStatus.label)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(cliStatus.isHealthy ? .green : .orange)
+                }
+                .padding(.horizontal, 12)
+                .padding(.leading, 17)
+                .padding(.bottom, 1)
+
+                // Desktop app connection status (read from cache)
+                let desktopStatus = CLIStatusChecker.cachedDesktopStatus
+                HStack(spacing: 4) {
+                    Image(systemName: desktopStatus.icon)
+                        .font(.system(size: 9))
+                        .foregroundStyle(desktopStatus.isHealthy ? .green : .secondary)
+                    Text(desktopStatus.label)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(desktopStatus.isHealthy ? .green : .secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.leading, 17)
+                .padding(.bottom, 2)
+            }
+
             // Next swap preview
             if let nextUp = SwapEngine.selectOptimalAccount(from: manager.accounts) {
-                Divider()
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.right.circle.fill")
                         .foregroundStyle(.blue)
                         .font(.system(size: 11))
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("Next up: **\(nextUp.email)**")
-                            .font(.system(size: 10))
-                        Text(swapReason(for: nextUp))
+                        Text("Next Up")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 0) {
+                            Text(nextUp.email)
+                                .font(.system(size: 10, weight: .semibold))
+                            if let snapshot = nextUp.quotaSnapshot {
+                                let pct = snapshot.fiveHour.remainingPercent
+                                Spacer()
+                                Text("\(Int(pct))%")
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(Self.quotaColor(for: pct))
+                            }
+                        }
+                        // Swap reasoning inline
+                        Text(SwapEngine.explainSelection(candidate: nextUp, allAccounts: manager.accounts))
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
+                            .padding(.top, 2)
                     }
-                    Spacer()
-                    if let snapshot = nextUp.quotaSnapshot {
-                        Text("\(Int(snapshot.fiveHour.remainingPercent))%")
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
+                    Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .padding(.top, 4)
+                .padding(.bottom, 6)
+            }
+
+            // Swap statistics
+            if !manager.swapHistory.isEmpty || manager.accounts.count > 1 {
+                Divider()
+                SwapStatsView(accountCount: manager.accounts.count)
             }
 
             Divider()

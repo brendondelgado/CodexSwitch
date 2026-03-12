@@ -12,6 +12,15 @@ struct SettingsView: View {
     var onRemoveAllAccounts: (() -> Void)?
 
     @State private var showingRemoveConfirmation = false
+    @State private var versionChecker = CodexVersionChecker()
+
+    private static let lastCheckedFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "M/d @ h:mma"
+        f.amSymbol = "am"
+        f.pmSymbol = "pm"
+        return f
+    }()
 
     var body: some View {
         Form {
@@ -36,6 +45,95 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Codex CLI") {
+                HStack {
+                    Text("Installed")
+                    Spacer()
+                    Text("v\(versionChecker.installedVersion)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Latest")
+                    Spacer()
+                    if versionChecker.updateAvailable {
+                        Text("v\(versionChecker.latestVersion)")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    } else {
+                        Text("v\(versionChecker.latestVersion)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack {
+                    Button {
+                        versionChecker.checkVersions()
+                    } label: {
+                        if versionChecker.isChecking {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Checking...")
+                        } else {
+                            Label("Check for Updates", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(versionChecker.isChecking || versionChecker.isUpdating)
+
+                    if versionChecker.updateAvailable {
+                        Button {
+                            versionChecker.runUpdate()
+                        } label: {
+                            if versionChecker.isUpdating {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Updating...")
+                            } else {
+                                Label("Update Now", systemImage: "arrow.down.circle.fill")
+                            }
+                        }
+                        .disabled(versionChecker.isUpdating)
+                    }
+                }
+
+                if versionChecker.forkInstalled {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.seal.fill")
+                            .foregroundStyle(.green)
+                            .font(.caption)
+                        Text("SIGHUP fork installed")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                        if versionChecker.forkRebuilding {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("Rebuilding...")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+
+                if let result = versionChecker.updateResult {
+                    Text(result)
+                        .font(.caption)
+                        .foregroundStyle(result.hasPrefix("Updated") ? .green : .red)
+                        .lineLimit(3)
+                }
+
+                if let lastChecked = versionChecker.lastChecked {
+                    Text("Last checked: \(Self.lastCheckedFormatter.string(from: lastChecked))")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    Text("Not checked yet")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
             Section("Data") {
                 Button("Remove All Accounts", role: .destructive) {
                     showingRemoveConfirmation = true
@@ -49,20 +147,24 @@ struct SettingsView: View {
                         onRemoveAllAccounts?()
                     }
                 } message: {
-                    Text("This will delete all stored tokens from Keychain. You'll need to re-import accounts from Codex CLI.")
+                    Text("This will delete all stored account data. You'll need to re-import accounts.")
                 }
-                Text("This removes all stored tokens from Keychain.")
+                Text("Removes all stored tokens and account data.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             Section("About") {
-                LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")
+                LabeledContent("CodexSwitch", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")
                 LabeledContent("Auth file", value: "~/.codex/auth.json")
+                LabeledContent("Accounts", value: "~/.codexswitch/accounts.json")
             }
         }
         .formStyle(.grouped)
-        .frame(width: 350, height: 320)
+        .frame(width: 380, height: 480)
+        .onAppear {
+            versionChecker.checkVersions()
+        }
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {

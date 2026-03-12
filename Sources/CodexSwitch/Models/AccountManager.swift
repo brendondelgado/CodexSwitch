@@ -5,6 +5,7 @@ import Observation
 final class AccountManager {
     var accounts: [CodexAccount] = []
     var swapHistory: [SwapEvent] = []
+    var pollingErrors: [UUID: String] = [:]
 
     var activeAccount: CodexAccount? {
         accounts.first(where: \.isActive)
@@ -13,20 +14,78 @@ final class AccountManager {
     var sortedAccounts: [CodexAccount] {
         accounts.sorted { a, b in
             if a.isActive != b.isActive { return a.isActive }
+            // Unusable accounts (weekly exhausted or overall bad score) sort to end
+            let aUsable = SwapEngine.score(a) > 0
+            let bUsable = SwapEngine.score(b) > 0
+            if aUsable != bUsable { return aUsable }
             let aRemaining = a.quotaSnapshot?.fiveHour.remainingPercent ?? 0
             let bRemaining = b.quotaSnapshot?.fiveHour.remainingPercent ?? 0
             return aRemaining > bRemaining
         }
     }
 
-    func updateQuota(for accountId: UUID, snapshot: QuotaSnapshot) {
+    func updateQuota(for accountId: UUID, snapshot: QuotaSnapshot, planType: String) {
         guard let idx = accounts.firstIndex(where: { $0.id == accountId }) else { return }
         accounts[idx].quotaSnapshot = snapshot
+        accounts[idx].planType = planType
+        pollingErrors[accountId] = nil // Clear error on success
+    }
+
+    func updatePollingError(for accountId: UUID, error: String) {
+        pollingErrors[accountId] = error
     }
 
     func setActive(_ accountId: UUID) {
         for i in accounts.indices {
             accounts[i].isActive = (accounts[i].id == accountId)
+        }
+        // Persist across restarts
+        UserDefaults.standard.set(accountId.uuidString, forKey: "activeAccountId")
+    }
+
+    /// Restore the last active account after loading from Keychain.
+    /// Priority: auth.json (CLI truth) → UserDefaults (persisted) → first account.
+    func restoreActiveAccount() {
+        // 1. Check auth.json — this is what Codex CLI actually uses
+        if let authAccountId = Self.readAuthJsonAccountId(),
+           let match = accounts.first(where: { $0.accountId == authAccountId }) {
+            setActive(match.id)
+            return
+        }
+
+        // 2. Fall back to UserDefaults
+        if let stored = UserDefaults.standard.string(forKey: "activeAccountId"),
+           let savedId = UUID(uuidString: stored),
+           accounts.contains(where: { $0.id == savedId }) {
+            setActive(savedId)
+            return
+        }
+
+        // 3. Last resort: first account
+        if let first = accounts.first { setActive(first.id) }
+    }
+
+    /// Read the account_id from ~/.codex/auth.json (nonisolated, file I/O only)
+    private static func readAuthJsonAccountId() -> String? {
+        let path = NSString("~/.codex/auth.json").expandingTildeInPath
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = json["tokens"] as? [String: Any],
+              let accountId = tokens["account_id"] as? String else {
+            return nil
+        }
+        return accountId
+    }
+
+    /// Sync active account with auth.json if it changed externally.
+    /// Call periodically (e.g. every 5s) to detect CLI or manual changes.
+    func syncWithAuthJson() {
+        guard let authAccountId = Self.readAuthJsonAccountId() else { return }
+        // Already in sync
+        if activeAccount?.accountId == authAccountId { return }
+        // Find matching account and switch
+        if let match = accounts.first(where: { $0.accountId == authAccountId }) {
+            setActive(match.id)
         }
     }
 

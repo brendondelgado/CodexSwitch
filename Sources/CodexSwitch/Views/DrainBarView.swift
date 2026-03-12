@@ -4,10 +4,13 @@ struct DrainBarView: View {
     let label: String
     let percent: Double       // 0-100 remaining
     let resetsAt: Date?
+    var boostedContrast: Bool = false
 
-    private static let clockFormatter: DateFormatter = {
+    private static let resetFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "h:mma"
+        f.dateFormat = "EEE M/d @ h:mma"
+        f.amSymbol = "am"
+        f.pmSymbol = "pm"
         return f
     }()
 
@@ -28,9 +31,9 @@ struct DrainBarView: View {
         if remaining <= 0 { return "resetting..." }
         let hours = Int(remaining) / 3600
         let mins = (Int(remaining) % 3600) / 60
-        let timeStr = hours > 0 ? "\(hours)h\(mins)m" : "\(mins)m"
-        let clockStr = Self.clockFormatter.string(from: resetsAt).lowercased()
-        return "\u{21BB} \(timeStr) (\(clockStr))"
+        let countdown = hours > 0 ? "\(hours)h \(mins)m" : "\(mins)m"
+        let dateStr = Self.resetFormatter.string(from: resetsAt)
+        return "\(dateStr) (\(countdown))"
     }
 
     var body: some View {
@@ -38,7 +41,7 @@ struct DrainBarView: View {
             HStack(spacing: 4) {
                 Text(label)
                     .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(boostedContrast ? .primary : .secondary)
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         RoundedRectangle(cornerRadius: 3)
@@ -57,7 +60,7 @@ struct DrainBarView: View {
             if resetsAt != nil {
                 Text(resetText)
                     .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(boostedContrast ? .primary : .secondary)
             }
         }
     }

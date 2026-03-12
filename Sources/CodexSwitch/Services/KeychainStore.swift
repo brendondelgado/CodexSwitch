@@ -1,9 +1,21 @@
 import Foundation
 import Security
+import os
 
+private let logger = Logger(subsystem: "com.codexswitch", category: "AccountStore")
+
+/// File-based account storage at ~/.codexswitch/accounts.json (600 permissions).
+/// Migrates from legacy Keychain on first load.
 struct KeychainStore: Sendable {
     let service: String
     private static let allAccountsKey = "all-accounts"
+    private static let storePath: String = {
+        let dir = NSString("~/.codexswitch").expandingTildeInPath
+        return (dir as NSString).appendingPathComponent("accounts.json")
+    }()
+    private static let storeDir: String = {
+        NSString("~/.codexswitch").expandingTildeInPath
+    }()
 
     init(service: String = "com.codexswitch.accounts") {
         self.service = service
@@ -11,7 +23,8 @@ struct KeychainStore: Sendable {
 
     func save(_ account: CodexAccount) throws {
         var accounts = try loadAll()
-        if let idx = accounts.firstIndex(where: { $0.id == account.id }) {
+        // Deduplicate by accountId (OpenAI account UUID), not local id
+        if let idx = accounts.firstIndex(where: { $0.accountId == account.accountId }) {
             accounts[idx] = account
         } else {
             accounts.append(account)
@@ -20,25 +33,44 @@ struct KeychainStore: Sendable {
     }
 
     func loadAll() throws -> [CodexAccount] {
-        let query: [String: Any] = [
+        // Try file store first
+        if FileManager.default.fileExists(atPath: Self.storePath) {
+            let data = try Data(contentsOf: URL(fileURLWithPath: Self.storePath))
+            return try JSONDecoder().decode([CodexAccount].self, from: data)
+        }
+
+        // Migrate from legacy Keychain if present
+        let legacyQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: Self.allAccountsKey,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        var legacyResult: AnyObject?
+        let status = SecItemCopyMatching(legacyQuery as CFDictionary, &legacyResult)
 
         if status == errSecItemNotFound {
             return []
         }
-        guard status == errSecSuccess,
-              let data = result as? Data else {
-            throw KeychainError.loadFailed(status)
+        if status != errSecSuccess {
+            // Keychain denied — may be a fresh build with no ACL.
+            // Return empty rather than throw, so app still launches.
+            logger.warning("Keychain read failed (status: \(status)) — returning empty. Re-add accounts to migrate.")
+            return []
+        }
+        guard let data = legacyResult as? Data else {
+            return []
         }
 
-        return try JSONDecoder().decode([CodexAccount].self, from: data)
+        let accounts = try JSONDecoder().decode([CodexAccount].self, from: data)
+        logger.info("Migrating \(accounts.count) accounts from Keychain to file store")
+
+        // Save to file, then clean up Keychain
+        try saveAll(accounts)
+        SecItemDelete(legacyQuery as CFDictionary)
+
+        return accounts
     }
 
     func delete(_ accountId: UUID) throws {
@@ -52,42 +84,45 @@ struct KeychainStore: Sendable {
     }
 
     func deleteAll() throws {
-        let query: [String: Any] = [
+        if FileManager.default.fileExists(atPath: Self.storePath) {
+            try FileManager.default.removeItem(atPath: Self.storePath)
+        }
+        // Also clean up legacy Keychain if present
+        let legacyQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: Self.allAccountsKey,
         ]
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainError.deleteFailed(status)
-        }
+        SecItemDelete(legacyQuery as CFDictionary)
     }
 
     // MARK: - Private
 
     private func saveAll(_ accounts: [CodexAccount]) throws {
-        let data = try JSONEncoder().encode(accounts)
-
-        let updateQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: Self.allAccountsKey,
-        ]
-        let updateAttrs: [String: Any] = [
-            kSecValueData as String: data,
-        ]
-        let updateStatus = SecItemUpdate(updateQuery as CFDictionary, updateAttrs as CFDictionary)
-
-        if updateStatus == errSecItemNotFound {
-            var addQuery = updateQuery
-            addQuery[kSecValueData as String] = data
-            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            guard addStatus == errSecSuccess else {
-                throw KeychainError.saveFailed(addStatus)
-            }
-        } else if updateStatus != errSecSuccess {
-            throw KeychainError.saveFailed(updateStatus)
+        // Ensure directory exists
+        if !FileManager.default.fileExists(atPath: Self.storeDir) {
+            try FileManager.default.createDirectory(
+                atPath: Self.storeDir,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
         }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(accounts)
+
+        // Atomic write via tmp + rename
+        let tmpPath = Self.storePath + ".tmp"
+        try data.write(to: URL(fileURLWithPath: tmpPath), options: .atomic)
+        if FileManager.default.fileExists(atPath: Self.storePath) {
+            try FileManager.default.removeItem(atPath: Self.storePath)
+        }
+        try FileManager.default.moveItem(atPath: tmpPath, toPath: Self.storePath)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: Self.storePath
+        )
     }
 }
 
@@ -98,9 +133,9 @@ enum KeychainError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .saveFailed(let s): return "Keychain save failed: \(s)"
-        case .loadFailed(let s): return "Keychain load failed: \(s)"
-        case .deleteFailed(let s): return "Keychain delete failed: \(s)"
+        case .saveFailed(let s): return "Save failed: \(s)"
+        case .loadFailed(let s): return "Load failed: \(s)"
+        case .deleteFailed(let s): return "Delete failed: \(s)"
         }
     }
 }

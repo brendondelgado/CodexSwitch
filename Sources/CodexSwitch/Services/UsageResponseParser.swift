@@ -1,105 +1,104 @@
 import Foundation
 
 enum UsageResponseParser {
+    /// Top-level response from GET /wham/usage
     struct UsageResponse: Decodable {
-        let rateLimit: RateLimitInfo?
+        let planType: String
+        let rateLimit: RateLimitDetails?
         let additionalRateLimits: [AdditionalRateLimit]?
 
         enum CodingKeys: String, CodingKey {
+            case planType = "plan_type"
             case rateLimit = "rate_limit"
             case additionalRateLimits = "additional_rate_limits"
         }
     }
 
-    struct RateLimitInfo: Decodable {
+    struct RateLimitDetails: Decodable {
         let allowed: Bool?
         let limitReached: Bool?
-        let primaryWindow: WindowInfo?
+        let primaryWindow: WindowSnapshot?
+        let secondaryWindow: WindowSnapshot?
 
         enum CodingKeys: String, CodingKey {
             case allowed
             case limitReached = "limit_reached"
             case primaryWindow = "primary_window"
+            case secondaryWindow = "secondary_window"
         }
     }
 
     struct AdditionalRateLimit: Decodable {
+        let limitName: String?
         let meteredFeature: String?
-        let primaryWindow: WindowInfo?
+        let rateLimit: RateLimitDetails?
 
         enum CodingKeys: String, CodingKey {
+            case limitName = "limit_name"
             case meteredFeature = "metered_feature"
-            case primaryWindow = "primary_window"
+            case rateLimit = "rate_limit"
         }
     }
 
-    struct WindowInfo: Decodable {
-        let limitWindowSeconds: Int?
+    struct WindowSnapshot: Decodable {
+        let usedPercent: Double
+        let limitWindowSeconds: Int
         let resetAfterSeconds: Int?
-        let remainingSeconds: Int?
-        let usedPercent: Double?
+        let resetAt: Int
 
         enum CodingKeys: String, CodingKey {
+            case usedPercent = "used_percent"
             case limitWindowSeconds = "limit_window_seconds"
             case resetAfterSeconds = "reset_after_seconds"
-            case remainingSeconds = "remaining_seconds"
-            case usedPercent = "used_percent"
+            case resetAt = "reset_at"
         }
     }
 
-    static func parse(_ data: Data) throws -> QuotaSnapshot {
-        let response = try JSONDecoder().decode(UsageResponse.self, from: data)
-        let now = Date()
-
-        let fiveHour = parseWindow(
-            response.rateLimit?.primaryWindow,
-            fallbackWindowSeconds: 18000,
-            now: now
-        )
-
-        let weeklyWindow = response.additionalRateLimits?
-            .first(where: { $0.meteredFeature == "weekly" })?
-            .primaryWindow
-
-        let weekly = parseWindow(
-            weeklyWindow,
-            fallbackWindowSeconds: 604800,
-            now: now
-        )
-
-        return QuotaSnapshot(fiveHour: fiveHour, weekly: weekly, fetchedAt: now)
+    struct ParseResult {
+        let snapshot: QuotaSnapshot
+        let planType: String
     }
 
-    private static func parseWindow(
-        _ info: WindowInfo?,
-        fallbackWindowSeconds: Int,
-        now: Date
+    static func parse(_ data: Data) throws -> ParseResult {
+        let response = try JSONDecoder().decode(UsageResponse.self, from: data)
+
+        // primary_window = 5-hour window, secondary_window = weekly window
+        let fiveHour = mapWindow(
+            response.rateLimit?.primaryWindow,
+            fallbackWindowMins: 300
+        )
+
+        let weekly = mapWindow(
+            response.rateLimit?.secondaryWindow,
+            fallbackWindowMins: 10080
+        )
+
+        let snapshot = QuotaSnapshot(fiveHour: fiveHour, weekly: weekly, fetchedAt: Date())
+        return ParseResult(snapshot: snapshot, planType: response.planType)
+    }
+
+    private static func mapWindow(
+        _ window: WindowSnapshot?,
+        fallbackWindowMins: Int
     ) -> QuotaWindow {
-        guard let info else {
+        guard let window else {
             return QuotaWindow(
                 usedPercent: 0,
-                windowDurationMins: fallbackWindowSeconds / 60,
-                resetsAt: now.addingTimeInterval(TimeInterval(fallbackWindowSeconds))
+                windowDurationMins: fallbackWindowMins,
+                resetsAt: Date().addingTimeInterval(TimeInterval(fallbackWindowMins * 60))
             )
         }
 
-        let windowSeconds = info.limitWindowSeconds ?? fallbackWindowSeconds
-        let resetAfter = info.resetAfterSeconds ?? windowSeconds
+        let windowMins = window.limitWindowSeconds > 0
+            ? (window.limitWindowSeconds + 59) / 60
+            : fallbackWindowMins
 
-        let usedPercent: Double
-        if let explicit = info.usedPercent {
-            usedPercent = explicit
-        } else {
-            // Estimate: if reset_after is close to window, we haven't used much
-            let fractionRemaining = Double(resetAfter) / Double(windowSeconds)
-            usedPercent = (1.0 - fractionRemaining) * 100.0
-        }
-
-        let resetsAt = now.addingTimeInterval(TimeInterval(resetAfter))
+        // reset_at is a Unix timestamp
+        let resetsAt = Date(timeIntervalSince1970: TimeInterval(window.resetAt))
 
         return QuotaWindow(
-            usedPercent: max(0, min(100, usedPercent)),
-            windowDurationMins: windowSeconds / 60,
+            usedPercent: max(0, min(100, Double(window.usedPercent))),
+            windowDurationMins: windowMins,
             resetsAt: resetsAt
         )
     }
