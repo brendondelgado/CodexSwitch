@@ -141,11 +141,19 @@ enum SwapEngine {
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
         process.arguments = ["-eo", "pid,lstart,comm"]
         process.standardOutput = pipe
-        process.standardError = Pipe()
-        try? process.run()
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            logger.error("Failed to run ps: \(error.localizedDescription)")
+            SwapLog.append(.sighupSkipped(reason: "ps failed: \(error.localizedDescription)"))
+            return
+        }
+        // Read pipe BEFORE waitUntilExit — ps output with full paths can exceed
+        // the 64KB pipe buffer (~80KB on this machine), causing a deadlock.
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
 
         let dateFormatter = DateFormatter()
@@ -192,6 +200,10 @@ enum SwapEngine {
             }
         }
 
+        if signaled == 0 && skippedOld == 0 && skippedTooNew == 0 {
+            logger.info("No codex CLI processes found to signal")
+            SwapLog.append(.sighupSkipped(reason: "no codex processes found"))
+        }
         logger.info("SIGHUP summary: signaled=\(signaled) skippedOld=\(skippedOld) skippedTooNew=\(skippedTooNew)")
     }
 
