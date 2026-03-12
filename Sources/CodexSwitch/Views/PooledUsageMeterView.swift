@@ -194,6 +194,7 @@ struct PooledUsageMeterView: View {
     private var meterContent: some View {
         let fh = pooled5h
         let wk = pooledWeekly
+        let estTime = estimatedTimeRemaining
 
         return VStack(alignment: .leading, spacing: 6) {
             // Header
@@ -209,7 +210,7 @@ struct PooledUsageMeterView: View {
                         .font(.system(size: 10, weight: .semibold))
                 }
                 Spacer()
-                if let est = estimatedTimeRemaining {
+                if let est = estTime {
                     HStack(spacing: 2) {
                         Image(systemName: "timer")
                             .font(.system(size: 8))
@@ -223,7 +224,7 @@ struct PooledUsageMeterView: View {
             }
 
             // Time estimate explanation (inline, small)
-            if estimatedTimeRemaining != nil {
+            if estTime != nil {
                 Text("Est. pool runway at current pace (includes upcoming resets)")
                     .font(.system(size: 8))
                     .foregroundStyle(.tertiary)

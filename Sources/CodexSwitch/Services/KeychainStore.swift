@@ -33,10 +33,12 @@ struct KeychainStore: Sendable {
     }
 
     func loadAll() throws -> [CodexAccount] {
-        // Try file store first
-        if FileManager.default.fileExists(atPath: Self.storePath) {
+        // Try file store first (no fileExists check — avoids TOCTOU race)
+        do {
             let data = try Data(contentsOf: URL(fileURLWithPath: Self.storePath))
             return try JSONDecoder().decode([CodexAccount].self, from: data)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            // File doesn't exist — fall through to Keychain migration
         }
 
         // Migrate from legacy Keychain if present

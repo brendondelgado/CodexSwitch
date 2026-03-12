@@ -169,12 +169,11 @@ final class CodexVersionChecker {
     }
 
     private nonisolated static func _performNpmUpdate() -> ActionResult {
-        let pipe = Pipe()
         let errPipe = Pipe()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/npm")
         process.arguments = ["install", "-g", "@openai/codex@latest"]
-        process.standardOutput = pipe
+        process.standardOutput = FileHandle.nullDevice  // stdout unused — discard to avoid pipe deadlock
         process.standardError = errPipe
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -200,7 +199,16 @@ final class CodexVersionChecker {
     private nonisolated static func _rebuildFork(version: String) -> ActionResult {
         let cargoTomlPath = "\(forkSourcePath)/Cargo.toml"
 
-        // Step 1: Update version in workspace Cargo.toml
+        // Step 1: git pull FIRST so Cargo.toml version update isn't clobbered by rebase
+        let pullProcess = Process()
+        pullProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        pullProcess.arguments = ["-C", forkSourcePath, "pull", "--rebase"]
+        pullProcess.standardOutput = FileHandle.nullDevice  // discard to avoid pipe deadlock
+        pullProcess.standardError = FileHandle.nullDevice
+        try? pullProcess.run()
+        pullProcess.waitUntilExit()
+
+        // Step 2: Update version in workspace Cargo.toml (after pull so it persists)
         do {
             var content = try String(contentsOfFile: cargoTomlPath, encoding: .utf8)
             // Replace version line in [workspace.package]
@@ -211,15 +219,6 @@ final class CodexVersionChecker {
         } catch {
             return ActionResult(success: false, message: "Failed to update Cargo.toml: \(error.localizedDescription)")
         }
-
-        // Step 2: git pull to get latest code
-        let pullProcess = Process()
-        pullProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        pullProcess.arguments = ["-C", forkSourcePath, "pull", "--rebase"]
-        pullProcess.standardOutput = Pipe()
-        pullProcess.standardError = Pipe()
-        try? pullProcess.run()
-        pullProcess.waitUntilExit()
 
         // Step 3: Rebuild
         let buildErrPipe = Pipe()

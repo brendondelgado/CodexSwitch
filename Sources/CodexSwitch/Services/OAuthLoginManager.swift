@@ -61,7 +61,7 @@ actor OAuthLoginManager {
         let email = Self.extractEmail(from: tokens.idToken) ?? "unknown@imported"
         let accountId = Self.extractAccountId(from: tokens.accessToken) ?? UUID().uuidString
 
-        logger.info("OAuth login complete — email: \(email, privacy: .public)")
+        logger.info("OAuth login complete — email: \(email, privacy: .private)")
         logger.info("Extracted accountId: \(accountId, privacy: .public)")
 
         // Log JWT claims for debugging quota API issues
@@ -69,7 +69,7 @@ actor OAuthLoginManager {
             let keys = claims.keys.sorted().joined(separator: ", ")
             logger.info("Access token claims: \(keys, privacy: .public)")
             if let auth = claims["https://api.openai.com/auth"] as? [String: Any] {
-                logger.info("Auth claims: \(String(describing: auth), privacy: .public)")
+                logger.info("Auth claims: \(String(describing: auth), privacy: .private)")
             }
         }
 

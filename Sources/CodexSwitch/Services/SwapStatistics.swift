@@ -25,7 +25,7 @@ enum SwapStatistics {
         var swapsToday = 0
         var swapsThisWeek = 0
         var swapsThisMonth = 0
-        var fromCounts: [String: Int] = [:]
+        var fromCountsWeekly: [String: Int] = [:]
         var toCounts: [String: Int] = [:]
         var earliestSwap: Date?
         var totalSwaps = 0
@@ -61,11 +61,14 @@ enum SwapStatistics {
                 if timestamp >= weekStart { swapsThisWeek += 1 }
                 if timestamp >= monthStart { swapsThisMonth += 1 }
 
-                // Parse from= and to=
+                // Parse from= and to= (fromCounts filtered to weekly window
+                // so the recommendation compares apples-to-apples with swapsThisWeek)
                 if let fromRange = line.range(of: "from="),
                    let toRange = line.range(of: " to=") {
                     let fromEmail = String(line[fromRange.upperBound..<toRange.lowerBound])
-                    fromCounts[fromEmail, default: 0] += 1
+                    if timestamp >= weekStart {
+                        fromCountsWeekly[fromEmail, default: 0] += 1
+                    }
                 }
                 if let toRange = line.range(of: " to="),
                    let reasonRange = line.range(of: " reason=") {
@@ -82,7 +85,7 @@ enum SwapStatistics {
             daysSinceFirst = 1
         }
 
-        let topFrom = fromCounts.max(by: { $0.value < $1.value })
+        let topFrom = fromCountsWeekly.max(by: { $0.value < $1.value })
         return Stats(
             swapsToday: swapsToday,
             swapsThisWeek: swapsThisWeek,

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import os
 
 private let logger = Logger(subsystem: "com.codexswitch", category: "SwapLog")
@@ -90,6 +91,8 @@ enum SwapLog {
     }
 
     /// Append an event to today's log file.
+    /// Uses POSIX O_APPEND for atomic concurrent writes — the kernel guarantees
+    /// seek+write is a single operation, so no lock is needed.
     static func append(_ event: Event) {
         let timestamp = makeISOFormatter().string(from: Date())
         let line = "[\(timestamp)] \(event.description)\n"
@@ -105,16 +108,14 @@ enum SwapLog {
         let dateStr = String(timestamp.prefix(10)) // YYYY-MM-DD
         let logPath = "\(logDir)/codexswitch-\(dateStr).log"
 
-        if let handle = FileHandle(forWritingAtPath: logPath) {
-            handle.seekToEndOfFile()
-            handle.write(line.data(using: .utf8) ?? Data())
-            handle.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: logPath, contents: line.data(using: .utf8))
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: logPath
-            )
+        guard let lineData = line.data(using: .utf8) else { return }
+
+        // O_WRONLY | O_CREAT | O_APPEND — atomic append, creates file if missing
+        let fd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+        guard fd >= 0 else { return }
+        defer { Darwin.close(fd) }
+        lineData.withUnsafeBytes { buf in
+            _ = Darwin.write(fd, buf.baseAddress, buf.count)
         }
     }
 

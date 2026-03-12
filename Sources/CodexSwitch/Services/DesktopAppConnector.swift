@@ -29,13 +29,19 @@ enum DesktopAppConnector {
         guard let output = String(data: data, encoding: .utf8) else { return nil }
 
         // Look for Codex desktop app listening on 127.0.0.1.
-        // The Electron-based Codex app shows as "Electron" in lsof, not "codex".
-        // We also check for "codex" in case a native build is used.
+        // The Electron-based Codex app shows as "Codex" or "Electron" process names
+        // with a Codex-related path in the lsof output.
         for line in output.components(separatedBy: "\n") {
             let lower = line.lowercased()
-            guard lower.contains("codex") || lower.contains("electron") else { continue }
             // Skip our own CodexSwitch and CLI processes
             guard !lower.contains("codexswitch") else { continue }
+            // Match "codex" directly, or "electron" only if the line also
+            // references a Codex-specific path (avoids matching other Electron apps)
+            let isCodexProcess = lower.contains("codex")
+            let isCodexElectron = lower.contains("electron") && (
+                lower.contains("codex.app") || lower.contains("/codex/")
+            )
+            guard isCodexProcess || isCodexElectron else { continue }
             // Format: "Electron 1234 user  12u  IPv4 ... TCP 127.0.0.1:PORT (LISTEN)"
             if let portMatch = line.range(of: #"127\.0\.0\.1:(\d+)"#, options: .regularExpression) {
                 let portStr = line[portMatch]

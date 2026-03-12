@@ -29,15 +29,15 @@ private func installCrashHandlers() {
     }
     // Signal handlers use only async-signal-safe POSIX write(2).
     // Foundation APIs (heap alloc, formatters, FileManager) are NOT safe here.
+    // Pre-built static message — no heap allocation or string interpolation.
     for sig: Int32 in [SIGABRT, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP] {
-        signal(sig) { sigNum in
-            // Only raw POSIX write to stderr — no Foundation, no heap alloc
-            var msg = "FATAL SIGNAL: \(sigNum)\n"
-            msg.withUTF8 { buf in
+        signal(sig) { _ in
+            let msg: StaticString = "FATAL SIGNAL\n"
+            msg.withUTF8Buffer { buf in
                 _ = Darwin.write(STDERR_FILENO, buf.baseAddress, buf.count)
             }
-            Darwin.signal(sigNum, SIG_DFL)
-            Darwin.raise(sigNum)
+            Darwin.signal(SIGABRT, SIG_DFL)
+            Darwin.raise(SIGABRT)
         }
     }
 }
@@ -82,29 +82,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .transient
         updatePopoverContent()
 
-        // Load accounts from Keychain
-        loadAccounts()
+        // Load accounts from Keychain (async for file I/O), then start services
+        Task { @MainActor in
+            await loadAccounts()
 
-        // Prune old diagnostic logs (>7 days)
-        SwapLog.pruneOldLogs()
+            // Prune old diagnostic logs (>7 days)
+            SwapLog.pruneOldLogs()
 
-        // Start polling + monitoring
-        startAllPolling()
-        startSwapMonitor()
+            // Start polling + monitoring
+            startAllPolling()
+            startSwapMonitor()
 
-        // Update icon + status checks periodically
-        writeCrashLog("LAUNCH: all services started, \(accountManager.accounts.count) accounts loaded, active=\(accountManager.activeAccount?.email ?? "none")")
+            // Update icon + status checks periodically
+            writeCrashLog("LAUNCH: all services started, \(accountManager.accounts.count) accounts loaded, active=\(accountManager.activeAccount?.email ?? "none")")
 
-        CLIStatusChecker.refresh(activeAccountId: accountManager.activeAccount?.accountId)
-        iconUpdateTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                // If auth.json changed externally, restart polling for new active account
-                if let newActiveId = self?.accountManager.syncWithAuthJson() {
-                    self?.startPollingForAccount(newActiveId)
+            CLIStatusChecker.refresh(activeAccountId: accountManager.activeAccount?.accountId)
+            iconUpdateTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    // If auth.json changed externally, restart polling for new active account
+                    if let newActiveId = await self?.accountManager.syncWithAuthJson() {
+                        self?.startPollingForAccount(newActiveId)
+                    }
+                    self?.statusBarController.updateIcon()
+                    self?.updatePopoverContent()
+                    CLIStatusChecker.refresh(activeAccountId: self?.accountManager.activeAccount?.accountId)
                 }
-                self?.statusBarController.updateIcon()
-                self?.updatePopoverContent()
-                CLIStatusChecker.refresh(activeAccountId: self?.accountManager.activeAccount?.accountId)
             }
         }
     }
@@ -123,13 +125,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Account Management
 
-    private func loadAccounts() {
+    private func loadAccounts() async {
         do {
             let accounts = try keychainStore.loadAll()
             for account in accounts {
                 accountManager.addAccount(account)
             }
-            accountManager.restoreActiveAccount()
+            await accountManager.restoreActiveAccount()
         } catch {
             logger.error("Failed to load accounts: \(error.localizedDescription)")
         }

@@ -45,9 +45,9 @@ final class AccountManager {
 
     /// Restore the last active account after loading from Keychain.
     /// Priority: auth.json (CLI truth) → UserDefaults (persisted) → first account.
-    func restoreActiveAccount() {
+    func restoreActiveAccount() async {
         // 1. Check auth.json — this is what Codex CLI actually uses
-        if let authAccountId = Self.readAuthJsonAccountId(),
+        if let authAccountId = await Self.readAuthJsonAccountId(),
            let match = accounts.first(where: { $0.accountId == authAccountId }) {
             setActive(match.id)
             return
@@ -66,22 +66,24 @@ final class AccountManager {
     }
 
     /// Read the account_id from ~/.codex/auth.json using the shared AuthFile model.
-    /// Marked nonisolated to avoid blocking MainActor with file I/O.
-    private nonisolated static func readAuthJsonAccountId() -> String? {
-        let path = NSString("~/.codex/auth.json").expandingTildeInPath
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let authFile = try? JSONDecoder().decode(AuthFile.self, from: data) else {
-            return nil
-        }
-        return authFile.tokens.accountId
+    /// Runs on a detached task to avoid blocking MainActor with file I/O.
+    private static func readAuthJsonAccountId() async -> String? {
+        await Task.detached {
+            let path = NSString("~/.codex/auth.json").expandingTildeInPath
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let authFile = try? JSONDecoder().decode(AuthFile.self, from: data) else {
+                return nil
+            }
+            return authFile.tokens.accountId
+        }.value
     }
 
     /// Sync active account with auth.json if it changed externally.
     /// Call periodically (e.g. every 5s) to detect CLI or manual changes.
     /// Returns the UUID of the newly active account if it changed, nil otherwise.
     @discardableResult
-    func syncWithAuthJson() -> UUID? {
-        guard let authAccountId = Self.readAuthJsonAccountId() else { return nil }
+    func syncWithAuthJson() async -> UUID? {
+        guard let authAccountId = await Self.readAuthJsonAccountId() else { return nil }
         // Already in sync
         if activeAccount?.accountId == authAccountId { return nil }
         // Find matching account and switch

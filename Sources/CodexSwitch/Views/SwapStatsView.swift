@@ -3,13 +3,15 @@ import SwiftUI
 struct SwapStatsView: View {
     let accountCount: Int
 
-    private var stats: SwapStatistics.Stats {
-        SwapStatistics.compute(accountCount: accountCount)
-    }
+    @State private var stats: SwapStatistics.Stats?
 
     var body: some View {
-        let s = stats
+        if let s = stats {
+            statsContent(s)
+        }
+    }
 
+    private func statsContent(_ s: SwapStatistics.Stats) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Image(systemName: "arrow.triangle.swap")
@@ -45,6 +47,13 @@ struct SwapStatsView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color.purple.opacity(0.04))
+        .task {
+            let count = accountCount
+            let result = await Task.detached {
+                SwapStatistics.compute(accountCount: count)
+            }.value
+            stats = result
+        }
     }
 
     @ViewBuilder

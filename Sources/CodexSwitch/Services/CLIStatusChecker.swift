@@ -99,8 +99,12 @@ enum CLIStatusChecker {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
         process.arguments = ["-f", "Codex.app/Contents"]
         process.standardOutput = pipe
-        process.standardError = Pipe()
-        try? process.run()
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return DesktopAppStatus(isRunning: false, port: nil)
+        }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
@@ -116,8 +120,12 @@ enum CLIStatusChecker {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
         process.arguments = ["-x", "codex"]
         process.standardOutput = pipe
-        process.standardError = Pipe()
-        try? process.run()
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
