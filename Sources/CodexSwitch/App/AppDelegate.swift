@@ -93,6 +93,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startAllPolling()
             startSwapMonitor()
 
+            // Ensure CLI is in sync — write auth.json + SIGHUP on every launch
+            // so the CLI picks up the current account even after a CodexSwitch restart
+            if let active = accountManager.activeAccount {
+                try? SwapEngine.writeAuthFile(for: active)
+                Task.detached { SwapEngine.signalCodexReload() }
+            }
+
             // Update icon + status checks periodically
             writeCrashLog("LAUNCH: all services started, \(accountManager.accounts.count) accounts loaded, active=\(accountManager.activeAccount?.email ?? "none")")
 
@@ -188,8 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self?.statusBarController.updateIcon()
                         // Immediate swap check if active account is approaching exhaustion
                         if self?.accountManager.activeAccount?.id == id,
-                           (snapshot.fiveHour.remainingPercent < Self.preemptiveSwapPercent
-                            || snapshot.weekly.remainingPercent < Self.preemptiveSwapPercent) {
+                           (snapshot.fiveHour.isExhausted || snapshot.weekly.isExhausted) {
                             self?.checkAndSwapIfNeeded()
                         }
                     }
@@ -260,24 +266,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Pre-emptive swap threshold — swap BEFORE hitting 0% so the user's
-    /// next message goes through on the fresh account without interruption.
-    /// 1% maximizes usage per account while still swapping before the wall.
-    private static let preemptiveSwapPercent: Double = 1
-
     private func checkAndSwapIfNeeded() {
         guard let active = accountManager.activeAccount,
               let snapshot = active.quotaSnapshot else { return }
 
-        let needsSwap = snapshot.fiveHour.remainingPercent < Self.preemptiveSwapPercent
-            || snapshot.weekly.remainingPercent < Self.preemptiveSwapPercent
+        let fhLow = snapshot.fiveHour.isExhausted
+        let wkLow = snapshot.weekly.isExhausted
 
-        guard needsSwap else { return }
+        guard fhLow || wkLow else { return }
 
-        guard let best = SwapEngine.selectOptimalAccount(from: accountManager.accounts) else {
+        guard let best = SwapEngine.selectOptimalAccount(from: accountManager.accounts),
+              let bestSnapshot = best.quotaSnapshot else {
             NotificationManager.notifyAllExhausted()
             return
         }
+
+        // Only swap if the candidate can actually serve requests right now
+        // (has usable 5h AND weekly). This prevents all ping-pong scenarios:
+        // - Both accounts 5h-exhausted → neither can serve, don't swap
+        // - Active has 5h but low weekly, candidate has no 5h → stay put
+        let candidateReady = !bestSnapshot.fiveHour.isExhausted
+            && !bestSnapshot.weekly.isExhausted
+        guard candidateReady else { return }
 
         executeSwap(from: active, to: best, reason: .quotaExhausted)
     }

@@ -28,7 +28,8 @@ struct PooledUsageMeterView: View {
         }.count
     }
 
-    /// Pooled 5h remaining across all accounts with data
+    /// Pooled 5h remaining across ALL accounts. Shows real 5h capacity even when
+    /// weekly is exhausted — the weekly bar separately shows that constraint.
     private var pooled5h: PooledMetric {
         let withData = accountsWithData
         guard !withData.isEmpty else { return .empty(totalAccounts: accounts.count) }
@@ -78,59 +79,89 @@ struct PooledUsageMeterView: View {
         )
     }
 
-    /// Estimated time until pooled 5h capacity runs out at current burn rate,
-    /// factoring in accounts that will reset and add capacity back to the pool.
-    private var estimatedTimeRemaining: String? {
+    /// Time until nearest weekly reset (when capacity returns)
+    private var nextWeeklyResetTime: String? {
+        let nextReset = accountsWithData.compactMap { $0.quotaSnapshot?.weekly.resetsAt }.min()
+        guard let reset = nextReset else { return nil }
+        let seconds = reset.timeIntervalSinceNow
+        guard seconds > 0 else { return nil }
+        return formatTime(seconds)
+    }
+
+    /// Whether ALL accounts have weekly exhausted (pool is fully locked)
+    private var allWeeklyExhausted: Bool {
         let withData = accountsWithData
-        guard withData.count >= 2 else { return nil }
+        guard !withData.isEmpty else { return false }
+        return withData.allSatisfy { $0.quotaSnapshot!.weekly.isExhausted }
+    }
 
-        // Calculate current aggregate burn rate (percent per second across all accounts)
-        var totalBurnRatePerSec = 0.0
-        for account in withData {
+    /// Estimated time until usable pooled capacity runs out.
+    /// Uses min(5h estimate, weekly estimate) — weekly is the hard ceiling since
+    /// once weekly hits 0% on all accounts, 5h capacity is worthless.
+    /// When all weekly is exhausted, returns nil (caller shows reset countdown instead).
+    private var estimatedTimeRemaining: String? {
+        let usable = accountsWithData.filter { !$0.quotaSnapshot!.weekly.isExhausted }
+        guard !usable.isEmpty else { return nil }
+
+        // --- Weekly ceiling ---
+        let active = usable.first { $0.isActive } ?? usable.first!
+        let activeWk = active.quotaSnapshot!.weekly
+        let wkElapsed = max(60, Double(activeWk.windowDurationMins * 60) - max(0, activeWk.timeUntilReset))
+        let wkBurnPerSec = activeWk.usedPercent / wkElapsed
+
+        let totalWeeklyRemaining = usable.reduce(0.0) { $0 + $1.quotaSnapshot!.weekly.remainingPercent }
+        let weeklyCeiling: TimeInterval = wkBurnPerSec > 0
+            ? totalWeeklyRemaining / wkBurnPerSec
+            : .greatestFiniteMagnitude
+
+        // --- 5h estimate with reset simulation ---
+        var fhBurnPerSec = 0.0
+        for account in usable {
             let fh = account.quotaSnapshot!.fiveHour
-            let elapsed = max(1, Double(fh.windowDurationMins * 60) - max(0, fh.timeUntilReset))
+            let elapsed = max(60, Double(fh.windowDurationMins * 60) - max(0, fh.timeUntilReset))
             let rate = fh.usedPercent / elapsed
-            if rate > 0 { totalBurnRatePerSec += rate }
+            if rate > 0 { fhBurnPerSec += rate }
         }
 
-        guard totalBurnRatePerSec > 0 else { return nil }
+        guard fhBurnPerSec > 0 || wkBurnPerSec > 0 else { return nil }
 
-        // Current remaining percent across all accounts
-        var poolRemaining = withData.reduce(0.0) { $0 + $1.quotaSnapshot!.fiveHour.remainingPercent }
+        var fhEstimate: TimeInterval = .greatestFiniteMagnitude
+        if fhBurnPerSec > 0 {
+            var poolRemaining = usable.reduce(0.0) { $0 + $1.quotaSnapshot!.fiveHour.remainingPercent }
 
-        // Collect upcoming resets — each adds 100% back to the pool
-        var resets: [(secondsFromNow: TimeInterval, accountEmail: String)] = []
-        for account in withData {
-            let fh = account.quotaSnapshot!.fiveHour
-            let resetIn = fh.timeUntilReset
-            if resetIn > 0 && resetIn < 86400 {
-                resets.append((resetIn, account.email))
+            var resets: [(secondsFromNow: TimeInterval, email: String)] = []
+            for account in usable {
+                let fh = account.quotaSnapshot!.fiveHour
+                let resetIn = fh.timeUntilReset
+                if resetIn > 0 && resetIn < 86400 {
+                    resets.append((resetIn, account.email))
+                }
+            }
+            resets.sort { $0.secondsFromNow < $1.secondsFromNow }
+
+            var elapsedSec: TimeInterval = 0
+            var foundEmpty = false
+            for reset in resets {
+                let timeToReset = reset.secondsFromNow - elapsedSec
+                let burned = fhBurnPerSec * timeToReset
+                if burned >= poolRemaining {
+                    fhEstimate = elapsedSec + poolRemaining / fhBurnPerSec
+                    foundEmpty = true
+                    break
+                }
+                poolRemaining -= burned
+                poolRemaining += 100.0
+                elapsedSec = reset.secondsFromNow
+            }
+            if !foundEmpty {
+                fhEstimate = elapsedSec + poolRemaining / fhBurnPerSec
             }
         }
-        resets.sort { $0.secondsFromNow < $1.secondsFromNow }
 
-        // Simulate forward: burn down pool, add 100% at each reset
-        var elapsedSec: TimeInterval = 0
-        for reset in resets {
-            let timeToReset = reset.secondsFromNow - elapsedSec
-            let burnedByReset = totalBurnRatePerSec * timeToReset
-            if burnedByReset >= poolRemaining {
-                // Pool runs out before this reset
-                let secondsToEmpty = poolRemaining / totalBurnRatePerSec
-                let totalSeconds = elapsedSec + secondsToEmpty
-                return formatTime(totalSeconds)
-            }
-            // Survive to this reset — subtract burn, add 100% back
-            poolRemaining -= burnedByReset
-            poolRemaining += 100.0
-            elapsedSec = reset.secondsFromNow
-        }
+        let estimate = min(fhEstimate, weeklyCeiling)
+        guard estimate < .greatestFiniteMagnitude else { return nil }
 
-        // After all resets, how long does the remaining pool last?
-        let remainingSeconds = poolRemaining / totalBurnRatePerSec
-        let totalSeconds = elapsedSec + remainingSeconds
-
-        return formatTime(totalSeconds)
+        return formatTime(estimate)
     }
 
     private func formatTime(_ seconds: TimeInterval) -> String {
@@ -195,6 +226,8 @@ struct PooledUsageMeterView: View {
         let fh = pooled5h
         let wk = pooledWeekly
         let estTime = estimatedTimeRemaining
+        let weeklyLocked = allWeeklyExhausted
+        let resetTime = nextWeeklyResetTime
 
         return VStack(alignment: .leading, spacing: 6) {
             // Header
@@ -219,15 +252,30 @@ struct PooledUsageMeterView: View {
                             .font(.system(size: 10, weight: .medium, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
-                    .help("Estimated time until combined 5h pool runs out at current usage rate")
+                    .help("Estimated time until combined pool runs out at current usage rate")
+                } else if weeklyLocked, let reset = resetTime {
+                    HStack(spacing: 2) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.orange)
+                        Text(reset)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    }
+                    .help("Time until earliest weekly reset restores capacity")
                 }
             }
 
-            // Time estimate explanation (inline, small)
+            // Context line
             if estTime != nil {
                 Text("Est. pool runway at current pace (includes upcoming resets)")
                     .font(.system(size: 8))
                     .foregroundStyle(.tertiary)
+                    .padding(.leading, 16)
+            } else if weeklyLocked {
+                Text("Weekly exhausted on all accounts — 5h capacity locked until weekly resets")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.orange)
                     .padding(.leading, 16)
             }
 

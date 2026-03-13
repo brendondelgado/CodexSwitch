@@ -1,6 +1,5 @@
 import Foundation
 import CryptoKit
-import Network
 import AppKit
 import os
 
@@ -17,8 +16,6 @@ actor OAuthLoginManager {
     private static let authBaseURL = "https://auth.openai.com"
     private static let port: UInt16 = 1455
     private static let scope = "openid profile email offline_access api.connectors.read api.connectors.invoke"
-
-    private var listener: NWListener?
 
     struct OAuthTokens: Sendable {
         let accessToken: String

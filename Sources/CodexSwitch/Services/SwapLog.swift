@@ -33,12 +33,9 @@ enum SwapLog {
         case sighupSkipped(reason: String)
 
         // Desktop app connector
-        case desktopAppFound(port: UInt16)
         case desktopAppInjected(port: UInt16)
-        case desktopAppFailed(error: String)
 
         // Polling
-        case pollResult(accountEmail: String, fiveHrRemaining: Double, weeklyRemaining: Double)
         case pollError(accountEmail: String, error: String)
 
         // CLI status changes
@@ -49,6 +46,9 @@ enum SwapLog {
         case accountRemoved(email: String)
         case tokenRefreshed(email: String)
         case tokenRefreshFailed(email: String, error: String)
+
+        // Debug
+        case debug(String)
 
         var description: String {
             switch self {
@@ -66,14 +66,8 @@ enum SwapLog {
                 return "SIGHUP_SENT pid=\(pid) process_started=\(started)"
             case .sighupSkipped(let reason):
                 return "SIGHUP_SKIPPED reason=\(reason)"
-            case .desktopAppFound(let port):
-                return "DESKTOP_FOUND port=\(port)"
             case .desktopAppInjected(let port):
                 return "DESKTOP_INJECTED port=\(port)"
-            case .desktopAppFailed(let error):
-                return "DESKTOP_FAILED error=\(error)"
-            case .pollResult(let email, let fh, let wk):
-                return "POLL_OK email=\(email) 5h_remaining=\(String(format: "%.1f", fh))% weekly=\(String(format: "%.1f", wk))%"
             case .pollError(let email, let error):
                 return "POLL_ERR email=\(email) error=\(error)"
             case .cliStatusChanged(let from, let to):
@@ -86,6 +80,8 @@ enum SwapLog {
                 return "TOKEN_REFRESHED email=\(email)"
             case .tokenRefreshFailed(let email, let error):
                 return "TOKEN_REFRESH_FAILED email=\(email) error=\(error)"
+            case .debug(let msg):
+                return "DEBUG \(msg)"
             }
         }
     }

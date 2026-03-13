@@ -23,6 +23,26 @@ struct PopoverContentView: View {
         }
     }
 
+    /// Find the non-active account whose weekly resets soonest (for "Next Available" fallback)
+    private static func nextWeeklyResetAccount(from accounts: [CodexAccount]) -> (account: CodexAccount, formattedTime: String)? {
+        let candidates = accounts
+            .filter { !$0.isActive && $0.quotaSnapshot != nil }
+            .compactMap { account -> (CodexAccount, TimeInterval)? in
+                guard let resetTime = account.quotaSnapshot?.weekly.resetsAt else { return nil }
+                let seconds = resetTime.timeIntervalSinceNow
+                guard seconds > 0 else { return nil }
+                return (account, seconds)
+            }
+            .sorted { $0.1 < $1.1 }
+
+        guard let best = candidates.first else { return nil }
+        let secs = best.1
+        let hours = Int(secs) / 3600
+        let mins = (Int(secs) % 3600) / 60
+        let formatted = hours > 0 ? "\(hours)h \(mins)m" : "\(mins)m"
+        return (best.0, formatted)
+    }
+
     private var connectionStatus: (icon: String, label: String, color: Color) {
         if manager.accounts.isEmpty {
             return ("bolt.slash.fill", "No accounts — tap + to add one", .secondary)
@@ -210,6 +230,34 @@ struct PopoverContentView: View {
                         }
                         // Swap reasoning inline
                         Text(SwapEngine.explainSelection(candidate: nextUp, allAccounts: manager.accounts))
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 2)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 4)
+                .padding(.bottom, 6)
+            } else if let nextReset = Self.nextWeeklyResetAccount(from: manager.accounts) {
+                // All accounts weekly-exhausted — show which resets first
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .foregroundStyle(.orange)
+                        .font(.system(size: 11))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Next Available")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 0) {
+                            Text(nextReset.account.email)
+                                .font(.system(size: 10, weight: .semibold))
+                            Spacer()
+                            Text(nextReset.formattedTime)
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.orange)
+                        }
+                        Text("Weekly resets — will have \(Int(nextReset.account.quotaSnapshot?.fiveHour.remainingPercent ?? 0))% 5h ready")
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
                             .padding(.top, 2)
