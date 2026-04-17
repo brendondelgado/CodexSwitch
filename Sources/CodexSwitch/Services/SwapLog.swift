@@ -22,6 +22,7 @@ enum SwapLog {
         // Swap lifecycle
         case swapTriggered(from: String, to: String, reason: String)
         case swapCompleted(to: String, durationMs: Int)
+        case swapPending(to: String, durationMs: Int, reason: String)
         case swapFailed(error: String)
 
         // Auth file operations
@@ -47,6 +48,25 @@ enum SwapLog {
         case tokenRefreshed(email: String)
         case tokenRefreshFailed(email: String, error: String)
 
+        // App lifecycle
+        case appLaunched(accountCount: Int, activeEmail: String?)
+        case appShutdown(uptimeSeconds: Int)
+
+        // Poller lifecycle
+        case pollerStarted(email: String, intervalSeconds: Int)
+        case pollerStopped(email: String, reason: String)
+
+        // Swap decision telemetry
+        case swapDecisionSkipped(reason: String)
+
+        // Account state changes (source: setActive, syncWithAuthJson, restore_from_defaults, etc.)
+        case activeAccountChanged(from: String?, to: String, source: String)
+
+        // OAuth flow
+        case oauthFlowStarted
+        case oauthFlowCompleted(email: String)
+        case oauthFlowFailed(error: String)
+
         // Debug
         case debug(String)
 
@@ -56,6 +76,8 @@ enum SwapLog {
                 return "SWAP_TRIGGERED from=\(from) to=\(to) reason=\(reason)"
             case .swapCompleted(let to, let ms):
                 return "SWAP_COMPLETED to=\(to) duration_ms=\(ms)"
+            case .swapPending(let to, let ms, let reason):
+                return "SWAP_PENDING to=\(to) duration_ms=\(ms) reason=\(reason)"
             case .swapFailed(let error):
                 return "SWAP_FAILED error=\(error)"
             case .authFileWritten(let id):
@@ -80,6 +102,24 @@ enum SwapLog {
                 return "TOKEN_REFRESHED email=\(email)"
             case .tokenRefreshFailed(let email, let error):
                 return "TOKEN_REFRESH_FAILED email=\(email) error=\(error)"
+            case .appLaunched(let count, let email):
+                return "LAUNCH accounts=\(count) active=\(email ?? "none")"
+            case .appShutdown(let uptime):
+                return "SHUTDOWN uptime_s=\(uptime)"
+            case .pollerStarted(let email, let interval):
+                return "POLLER_STARTED email=\(email) interval_s=\(interval)"
+            case .pollerStopped(let email, let reason):
+                return "POLLER_STOPPED email=\(email) reason=\(reason)"
+            case .swapDecisionSkipped(let reason):
+                return "SWAP_SKIPPED reason=\(reason)"
+            case .activeAccountChanged(let from, let to, let source):
+                return "ACTIVE_CHANGED from=\(from ?? "none") to=\(to) source=\(source)"
+            case .oauthFlowStarted:
+                return "OAUTH_STARTED"
+            case .oauthFlowCompleted(let email):
+                return "OAUTH_COMPLETED email=\(email)"
+            case .oauthFlowFailed(let error):
+                return "OAUTH_FAILED error=\(error)"
             case .debug(let msg):
                 return "DEBUG \(msg)"
             }

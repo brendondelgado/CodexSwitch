@@ -14,6 +14,16 @@ enum NotificationManager {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
+    static func notify(title: String, body: String) {
+        guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
     static func notifySwap(from: CodexAccount, to: CodexAccount) {
         guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
@@ -51,7 +61,7 @@ enum NotificationManager {
         content.sound = .defaultCritical
 
         let request = UNNotificationRequest(
-            identifier: "exhausted-\(UUID().uuidString)",
+            identifier: "all-exhausted",
             content: content,
             trigger: nil
         )

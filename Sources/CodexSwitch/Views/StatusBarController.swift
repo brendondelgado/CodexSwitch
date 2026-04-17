@@ -11,32 +11,21 @@ final class StatusBarController {
         self.manager = manager
     }
 
-    /// Determine which limit is more urgent: 5h or weekly.
-    /// Uses depletion rate to estimate which hits zero first.
+    /// Determine which limit to display in the menu bar.
+    /// Show 5h when weekly >= 31% (one 5h window uses ~30% of weekly, so weekly
+    /// isn't the binding constraint). Show weekly when < 31% (weekly is the real limit).
     private func urgentWindow(from snapshot: QuotaSnapshot) -> QuotaWindow {
         let fh = snapshot.fiveHour
         let wk = snapshot.weekly
 
-        // If either is already exhausted, it's the urgent one
         if fh.isExhausted { return fh }
         if wk.isExhausted { return wk }
 
-        let fhTimeLeft = max(0, fh.timeUntilReset)
-        let wkTimeLeft = max(0, wk.timeUntilReset)
+        // Below 31% weekly, one full 5h window could exhaust it — weekly is the constraint
+        if wk.remainingPercent < 31 { return wk }
 
-        // Estimate time until each hits 0% based on current depletion rate
-        // rate = usedPercent / (windowDuration - timeUntilReset)
-        let fhElapsed = max(1, Double(fh.windowDurationMins * 60) - fhTimeLeft)
-        let wkElapsed = max(1, Double(wk.windowDurationMins * 60) - wkTimeLeft)
-
-        let fhRate = fh.usedPercent / fhElapsed  // percent per second
-        let wkRate = wk.usedPercent / wkElapsed
-
-        // Time until each would hit 100% used (0% remaining)
-        let fhTTZ = fhRate > 0 ? fh.remainingPercent / fhRate : .infinity
-        let wkTTZ = wkRate > 0 ? wk.remainingPercent / wkRate : .infinity
-
-        return fhTTZ <= wkTTZ ? fh : wk
+        // Otherwise 5h is what matters
+        return fh
     }
 
     /// Update the menu bar icon — circular ring with percentage

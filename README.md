@@ -32,7 +32,7 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 
 **🔄 Automatic Switching** — When the active account's 5-hour or weekly quota hits 0%, CodexSwitch scores all alternatives and atomically swaps `~/.codex/auth.json`. Anti-ping-pong logic ensures candidates must have usable capacity on both windows before swapping.
 
-**⚡ SIGHUP Hot-Swap** — Sends SIGHUP to running Codex CLI processes after every swap and on app launch, so the CLI reloads tokens instantly. Uses `pgrep` + `proc_pidinfo` to find processes and skip those younger than 10 seconds (still initializing).
+**⚡ Guarded SIGHUP Hot-Swap** — Sends SIGHUP only to verified native Codex CLI processes during swap events, never on app launch. Excludes detached desktop app-server processes and disables signaling automatically if the Codex binary changed after the last SIGHUP verification.
 
 **🖥 Desktop App Token Injection** — Detects the Codex desktop app via WebSocket and injects new tokens directly, keeping desktop sessions in sync.
 

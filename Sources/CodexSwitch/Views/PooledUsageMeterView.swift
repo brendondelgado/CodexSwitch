@@ -6,8 +6,8 @@ import SwiftUI
 struct PooledUsageMeterView: View {
     let accounts: [CodexAccount]
 
-    // Pro plan has ~6.7x the usage of Plus per window
-    private static let proMultiplier = 6.7
+    // Pro plan has 6x the usage limits of Plus (per OpenAI's Codex page)
+    private static let proMultiplier = 6.0
 
     private var accountsWithData: [CodexAccount] {
         accounts.filter { $0.quotaSnapshot != nil }
@@ -362,14 +362,6 @@ struct PooledUsageMeterView: View {
                     RoundedRectangle(cornerRadius: 3)
                         .fill(Self.barColor(for: percent))
                         .frame(width: geo.size.width * CGFloat(max(0, min(100, percent))) / 100)
-
-                    // Pro equivalent marker (orange line)
-                    if proPercent < 100 {
-                        Rectangle()
-                            .fill(.orange.opacity(0.6))
-                            .frame(width: 1.5)
-                            .offset(x: geo.size.width * CGFloat(proPercent) / 100)
-                    }
                 }
             }
             .frame(height: 8)

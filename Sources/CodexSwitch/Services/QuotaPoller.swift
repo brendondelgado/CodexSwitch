@@ -83,14 +83,18 @@ actor QuotaPoller {
         stopPolling(for: accountId)
 
         pollTasks[accountId] = Task {
-            // First poll: fetch immediately (small random delay to stagger multiple accounts)
-            let initialAccount = await accountProvider(accountId)
-            let hasData = initialAccount?.quotaSnapshot != nil
-            var interval: TimeInterval = hasData
-                ? Self.pollInterval(forRemainingPercent: initialAccount?.quotaSnapshot?.fiveHour.remainingPercent ?? 100)
-                : TimeInterval.random(in: 5...15)
+            // First poll: always fetch quickly (small random delay to stagger accounts).
+            // Never use a long interval for the first fetch — persisted data may be stale.
+            var interval: TimeInterval = TimeInterval.random(in: 2...8)
+            var previousInterval: TimeInterval = interval
 
-            logger.info("Starting poll for \(accountId) — initial interval: \(String(format: "%.0f", interval))s, hasData: \(hasData)")
+            logger.info("Starting poll for \(accountId) — initial interval: \(String(format: "%.0f", interval))s")
+
+            defer {
+                let reason = Task.isCancelled ? "cancelled" : "exited"
+                logger.info("Poll loop ended for \(accountId) (\(reason))")
+                SwapLog.append(.debug("POLLER_DIED id=\(accountId) reason=\(reason)"))
+            }
 
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(interval))
@@ -98,6 +102,7 @@ actor QuotaPoller {
 
                 guard let currentAccount = await accountProvider(accountId) else {
                     logger.error("Account \(accountId) not found in provider — stopping poll")
+                    SwapLog.append(.debug("POLLER_DIED id=\(accountId) reason=account_not_found"))
                     onError(accountId, .invalidResponse)
                     return
                 }
@@ -136,11 +141,18 @@ actor QuotaPoller {
                         }
                     }
 
+                    if abs(interval - previousInterval) > 1 {
+                        logger.info("Poll interval for \(currentAccount.email, privacy: .private): \(String(format: "%.0f", previousInterval))s → \(String(format: "%.0f", interval))s")
+                        previousInterval = interval
+                    }
                     logger.info("Poll success for \(currentAccount.email, privacy: .private) [active=\(currentAccount.isActive)] — next in \(String(format: "%.0f", interval))s")
                 } catch let error as PollerError {
                     logger.error("Poll error for \(currentAccount.email, privacy: .private): \(String(describing: error), privacy: .public)")
                     onError(accountId, error)
-                    if case .tokenExpired = error { return }
+                    if case .tokenExpired = error {
+                        SwapLog.append(.debug("POLLER_DIED id=\(accountId) reason=token_expired"))
+                        return
+                    }
                     interval = 60 // Back off on error
                 } catch {
                     logger.error("Poll network error for \(currentAccount.email, privacy: .private): \(error.localizedDescription, privacy: .public)")

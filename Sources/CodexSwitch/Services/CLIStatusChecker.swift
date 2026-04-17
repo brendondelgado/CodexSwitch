@@ -1,6 +1,6 @@
 import Foundation
 
-enum CLIStatus: Sendable {
+enum CLIStatus: Sendable, Equatable {
     case ready          // CLI running + auth.json matches active account
     case authMismatch   // CLI running but auth.json doesn't match
     case cliNotRunning  // No codex processes found
@@ -9,7 +9,7 @@ enum CLIStatus: Sendable {
     var label: String {
         switch self {
         case .ready: return "CLI Status — Connected: Auto-swap ready"
-        case .authMismatch: return "CLI Status — Connected: Auth mismatch — swap pending"
+        case .authMismatch: return "CLI Status — Connected: Live session differs from auth target"
         case .cliNotRunning: return "CLI Status — Disconnected: Auto-swap disconnected"
         case .noActiveAccount: return "CLI Status — Disconnected: No active account"
         }
@@ -61,10 +61,17 @@ enum CLIStatusChecker {
     /// Refresh cached statuses in the background. Call from a timer, not view body.
     static func refresh(activeAccountId: String?) {
         let accountId = activeAccountId
+        let previousCLI = cachedCLIStatus
         Task.detached {
             let cliStatus = _checkCLI(activeAccountId: accountId)
             let desktopStatus = _checkDesktopApp()
             await MainActor.run {
+                if cliStatus != previousCLI {
+                    SwapLog.append(.cliStatusChanged(
+                        from: String(describing: previousCLI),
+                        to: String(describing: cliStatus)
+                    ))
+                }
                 cachedCLIStatus = cliStatus
                 cachedDesktopStatus = desktopStatus
             }
@@ -72,6 +79,10 @@ enum CLIStatusChecker {
     }
 
     // MARK: - Background checks (never call from main thread directly)
+
+    nonisolated static func isCodexRunning() -> Bool {
+        _isCodexRunning()
+    }
 
     private nonisolated static func _checkCLI(activeAccountId: String?) -> CLIStatus {
         guard let activeAccountId else { return .noActiveAccount }

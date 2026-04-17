@@ -116,7 +116,7 @@ struct QuotaPollerTests {
         #expect(QuotaPoller.pollInterval(forRemainingPercent: 75) == 600)
         #expect(QuotaPoller.pollInterval(forRemainingPercent: 35) == 300)
         #expect(QuotaPoller.pollInterval(forRemainingPercent: 15) == 120)
-        #expect(QuotaPoller.pollInterval(forRemainingPercent: 7) == 60)
-        #expect(QuotaPoller.pollInterval(forRemainingPercent: 3) == 10)
+        #expect(QuotaPoller.pollInterval(forRemainingPercent: 8) == 60)
+        #expect(QuotaPoller.pollInterval(forRemainingPercent: 3) == 1)
     }
 }

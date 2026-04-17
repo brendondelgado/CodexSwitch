@@ -60,12 +60,13 @@ struct SwapEngineTests {
         #expect(best == nil)
     }
 
-    @Test("Tiebreaker uses weekly remaining")
+    @Test("Tiebreaker prefers lower weekly — drain constrained accounts first")
     func tiebreaker() {
         let a = makeAccount(fiveHourRemaining: 50, weeklyRemaining: 30)
         let b = makeAccount(fiveHourRemaining: 50, weeklyRemaining: 80)
         let best = SwapEngine.selectOptimalAccount(from: [a, b])
-        #expect(best?.id == b.id)
+        // Scoring prefers lower weekly: use constrained accounts first, save fresh ones
+        #expect(best?.id == a.id)
     }
 
     @Test("Bonus for accounts about to reset")
@@ -149,5 +150,83 @@ struct SwapEngineTests {
         let other = makeAccount(fiveHourRemaining: 50, weeklyRemaining: 50)
         let best = SwapEngine.selectOptimalAccount(from: [active, other])
         #expect(best?.id == other.id)
+    }
+
+    @Test("SIGHUP candidates include only interactive CLI sessions")
+    func sighupCandidatesOnlyIncludeInteractiveCli() {
+        let output = """
+        2561 node /opt/homebrew/bin/codex resume --yolo
+        2562 /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex resume --yolo
+        29201 /Applications/Codex.app/Contents/Resources/codex
+        29203 /Users/brendondelgado/Library/Caches/com.openai.codex/org.sparkle-project.Sparkle/Launcher/WgQvClht4/Updater.app/Contents/MacOS/Updater /Applications/Codex.app 0
+        """
+
+        let ttyByPid: [Int32: String] = [
+            2561: "ttys003",
+            2562: "ttys003",
+            29201: "??",
+            29203: "??"
+        ]
+
+        let pids = SwapEngine.signalableCodexProcessIDs(from: output) { pid in
+            ttyByPid[pid]
+        }
+
+        #expect(pids == [2562])
+    }
+
+    @Test("SIGHUP candidates skip detached codex app-server even if command matches")
+    func sighupCandidatesSkipDetachedAppServer() {
+        let output = """
+        99517 /Applications/Codex.app/Contents/Resources/codex
+        """
+
+        let pids = SwapEngine.signalableCodexProcessIDs(from: output) { _ in
+            "??"
+        }
+
+        #expect(pids.isEmpty)
+    }
+
+    @Test("SIGHUP candidates skip node launcher even when codex script path is present")
+    func sighupCandidatesSkipNodeLauncher() {
+        let output = """
+        2561 node /opt/homebrew/bin/codex resume --yolo
+        """
+
+        let pids = SwapEngine.signalableCodexProcessIDs(from: output) { _ in
+            "ttys003"
+        }
+
+        #expect(pids.isEmpty)
+    }
+
+    @Test("SIGHUP verification requires marker at or after binary update")
+    func sighupVerificationRequiresFreshMarker() {
+        let binaryDate = Date(timeIntervalSince1970: 200)
+        let freshMarkerDate = Date(timeIntervalSince1970: 200)
+        let newerMarkerDate = Date(timeIntervalSince1970: 250)
+        let staleMarkerDate = Date(timeIntervalSince1970: 150)
+
+        #expect(SwapEngine.isSighupVerificationCurrent(
+            markerModificationDate: freshMarkerDate,
+            binaryModificationDate: binaryDate
+        ))
+        #expect(SwapEngine.isSighupVerificationCurrent(
+            markerModificationDate: newerMarkerDate,
+            binaryModificationDate: binaryDate
+        ))
+        #expect(!SwapEngine.isSighupVerificationCurrent(
+            markerModificationDate: staleMarkerDate,
+            binaryModificationDate: binaryDate
+        ))
+        #expect(!SwapEngine.isSighupVerificationCurrent(
+            markerModificationDate: nil,
+            binaryModificationDate: binaryDate
+        ))
+        #expect(!SwapEngine.isSighupVerificationCurrent(
+            markerModificationDate: freshMarkerDate,
+            binaryModificationDate: nil
+        ))
     }
 }

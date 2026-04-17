@@ -2,8 +2,10 @@ import SwiftUI
 
 struct PopoverContentView: View {
     @Bindable var manager: AccountManager
+    var versionChecker: CodexVersionChecker
     var onAddAccount: () -> Void
     var onForceSwap: (UUID) -> Void
+    var onRelogin: (UUID) -> Void = { _ in }
     var onOpenSettings: () -> Void
 
     private static let relativeFormatter = RelativeDateTimeFormatter()
@@ -14,6 +16,15 @@ struct PopoverContentView: View {
         GridItem(.flexible(), spacing: 8),
     ]
 
+    private func forkStatusColor(_ status: ForkBuildStatus) -> Color {
+        switch status {
+        case .active: return .green
+        case .rebuilding, .stale: return .orange
+        case .failed: return .red
+        case .unavailable, .unknown: return .secondary
+        }
+    }
+
     private static func quotaColor(for percent: Double) -> Color {
         switch percent {
         case 50...: return .green
@@ -23,24 +34,43 @@ struct PopoverContentView: View {
         }
     }
 
-    /// Find the non-active account whose weekly resets soonest (for "Next Available" fallback)
-    private static func nextWeeklyResetAccount(from accounts: [CodexAccount]) -> (account: CodexAccount, formattedTime: String)? {
-        let candidates = accounts
-            .filter { !$0.isActive && $0.quotaSnapshot != nil }
-            .compactMap { account -> (CodexAccount, TimeInterval)? in
-                guard let resetTime = account.quotaSnapshot?.weekly.resetsAt else { return nil }
-                let seconds = resetTime.timeIntervalSinceNow
-                guard seconds > 0 else { return nil }
-                return (account, seconds)
-            }
-            .sorted { $0.1 < $1.1 }
+    /// Find the account that will next have usable capacity (for "Next Available" fallback).
+    /// Considers non-active accounts' weekly resets AND the active account's 5h reset
+    /// (when its weekly still has capacity — it will regain full 5h when the window resets).
+    private static func nextAvailableAccount(from accounts: [CodexAccount]) -> (account: CodexAccount, formattedTime: String, resetKind: String)? {
+        var candidates: [(CodexAccount, TimeInterval, String)] = []
 
+        for account in accounts {
+            guard let snapshot = account.quotaSnapshot else { continue }
+
+            if account.isActive {
+                // Active account: if 5h exhausted but weekly has capacity,
+                // it will regain full 5h when the 5h window resets
+                if snapshot.fiveHour.isExhausted && !snapshot.weekly.isExhausted {
+                    let seconds = snapshot.fiveHour.timeUntilReset
+                    if seconds > 0 {
+                        candidates.append((account, seconds, "5h"))
+                    }
+                }
+            } else {
+                // Non-active with weekly exhausted: wait for weekly reset
+                if snapshot.weekly.isExhausted {
+                    let seconds = snapshot.weekly.timeUntilReset
+                    if seconds > 0 {
+                        candidates.append((account, seconds, "Weekly"))
+                    }
+                }
+            }
+        }
+
+        candidates.sort { $0.1 < $1.1 }
         guard let best = candidates.first else { return nil }
+
         let secs = best.1
         let hours = Int(secs) / 3600
         let mins = (Int(secs) % 3600) / 60
         let formatted = hours > 0 ? "\(hours)h \(mins)m" : "\(mins)m"
-        return (best.0, formatted)
+        return (best.0, formatted, best.2)
     }
 
     private var connectionStatus: (icon: String, label: String, color: Color) {
@@ -129,10 +159,12 @@ struct PopoverContentView: View {
                     ForEach(manager.sortedAccounts) { account in
                         AccountCardView(
                             account: account,
-                            pollingError: manager.pollingErrors[account.id]
-                        ) {
-                            onForceSwap(account.id)
-                        }
+                            pollingError: manager.pollingErrors[account.id],
+                            isPrimed: manager.primedAccountIds.contains(account.id),
+                            isDeadToken: manager.deadTokenAccountIds.contains(account.id),
+                            onForceSwap: { onForceSwap(account.id) },
+                            onRelogin: { onRelogin(account.id) }
+                        )
                     }
                 }
                 .padding(10)
@@ -204,6 +236,20 @@ struct PopoverContentView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.leading, 17)
+                .padding(.bottom, 1)
+
+                // Fork build status
+                let forkStatus = versionChecker.forkBuildStatus
+                HStack(spacing: 4) {
+                    Image(systemName: forkStatus.icon)
+                        .font(.system(size: 9))
+                        .foregroundStyle(forkStatusColor(forkStatus))
+                    Text(forkStatus.label)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(forkStatusColor(forkStatus))
+                }
+                .padding(.horizontal, 12)
+                .padding(.leading, 17)
                 .padding(.bottom, 2)
             }
 
@@ -239,8 +285,8 @@ struct PopoverContentView: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 4)
                 .padding(.bottom, 6)
-            } else if let nextReset = Self.nextWeeklyResetAccount(from: manager.accounts) {
-                // All accounts weekly-exhausted — show which resets first
+            } else if let nextReset = Self.nextAvailableAccount(from: manager.accounts) {
+                // No swap candidate — show which account resets soonest
                 HStack(spacing: 6) {
                     Image(systemName: "clock.arrow.circlepath")
                         .foregroundStyle(.orange)
@@ -257,7 +303,7 @@ struct PopoverContentView: View {
                                 .font(.system(size: 10, weight: .medium, design: .monospaced))
                                 .foregroundStyle(.orange)
                         }
-                        Text("Weekly resets — will have \(Int(nextReset.account.quotaSnapshot?.fiveHour.remainingPercent ?? 0))% 5h ready")
+                        Text("\(nextReset.resetKind) resets — will have 100% 5h ready")
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
                             .padding(.top, 2)
