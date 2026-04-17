@@ -1,0 +1,25 @@
+Sources/CodexNative/App/CodexNativeApp.swift
+  10ea22953ca45d80 1-86
+Sources/CodexNative/App/AppDelegate.swift
+  10ea22953ca45d80 1-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "e0e8e0ad5aae808d452c50e28ac6a21c59803628",
+  "prompts": {
+    "10ea22953ca45d80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4f378cf-8706-424b-8059-f5f34db95dd7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "brendondelgado",
+      "messages": [],
+      "total_additions": 109,
+      "total_deletions": 0,
+      "accepted_lines": 722,
+      "overriden_lines": 0
+    }
+  }
+}
