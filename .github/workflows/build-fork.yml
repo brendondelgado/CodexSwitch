@@ -1,0 +1,379 @@
+# -----------------------------------------------------------------------
+# build-fork.yml -- Automated Codex CLI fork builder
+#
+# Checks daily whether a new @openai/codex version has been published to
+# npm.  When a new version is detected (or a manual build is triggered),
+# it rebases the fork branch onto upstream/main, builds the patched
+# arm64-darwin binary, and publishes a GitHub Release.
+#
+# Fork patches (feat/sighup-v2):
+#   - SIGHUP signal handler for CLI sessions (reloads auth.json)
+#   - File watcher in app-server (polls auth.json every 2s)
+#   - Auth generation counter for WebSocket session invalidation
+#   - React Query cache invalidation notifications to Electron
+#
+# Required secrets:
+#   FORK_PUSH_TOKEN - PAT with push access to brendondelgado/codex
+# -----------------------------------------------------------------------
+
+name: Build Codex Fork
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: "0 6 * * *"
+
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: "Force build for a specific version (e.g. 0.117.0). Leave empty to auto-detect from npm."
+        required: false
+        type: string
+      skip_version_check:
+        description: "Skip the version check and always build"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  FORK_REPO: brendondelgado/codex
+  FORK_BRANCH: feat/sighup-v2
+  UPSTREAM_REPO: https://github.com/openai/codex.git
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # -------------------------------------------------------------------
+  # 1. Detect whether a new upstream version exists
+  # -------------------------------------------------------------------
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Query npm for latest @openai/codex version
+        id: npm
+        run: |
+          NPM_VERSION=$(npm view @openai/codex version 2>/dev/null || echo "")
+          if [ -z "$NPM_VERSION" ]; then
+            echo "::error::Failed to query npm registry for @openai/codex"
+            exit 1
+          fi
+          echo "npm_version=$NPM_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Latest npm version: $NPM_VERSION"
+
+      - name: Check existing releases
+        id: releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 100 \
+            --json tagName \
+            --jq '.[].tagName' 2>/dev/null || echo "")
+          echo "Existing release tags:"
+          echo "$EXISTING"
+          echo "existing_tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$EXISTING" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version and decide whether to build
+        id: resolve
+        run: |
+          OVERRIDE="${{ inputs.version_override }}"
+          SKIP_CHECK="${{ inputs.skip_version_check }}"
+          NPM_VERSION="${{ steps.npm.outputs.npm_version }}"
+          EXISTING_TAGS="${{ steps.releases.outputs.existing_tags }}"
+
+          if [ -n "$OVERRIDE" ]; then
+            VERSION="$OVERRIDE"
+            echo "Using manual version override: $VERSION"
+          else
+            VERSION="$NPM_VERSION"
+            echo "Using npm version: $VERSION"
+          fi
+
+          TAG="fork-v${VERSION}"
+
+          if echo "$EXISTING_TAGS" | grep -qx "$TAG"; then
+            if [ "$SKIP_CHECK" = "true" ]; then
+              echo "Version $VERSION already released, but skip_version_check=true -- rebuilding"
+              SHOULD_BUILD="true"
+            elif [ -n "$OVERRIDE" ]; then
+              echo "Version $VERSION already released, but override provided -- rebuilding"
+              SHOULD_BUILD="true"
+            else
+              echo "Version $VERSION already released as $TAG -- skipping"
+              SHOULD_BUILD="false"
+            fi
+          else
+            echo "New version $VERSION detected (no existing $TAG release)"
+            SHOULD_BUILD="true"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "--- Decision ---"
+          echo "Version:      $VERSION"
+          echo "Tag:          $TAG"
+          echo "Should build: $SHOULD_BUILD"
+
+  # -------------------------------------------------------------------
+  # 2. Rebase fork, build binary, publish release
+  # -------------------------------------------------------------------
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: macos-14
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - name: Log build parameters
+        run: |
+          echo "========================================="
+          echo "  Building Codex fork v${VERSION}"
+          echo "  Runner: $(uname -m) / $(sw_vers -productVersion)"
+          echo "========================================="
+
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.FORK_PUSH_TOKEN }}
+          path: codex-fork
+
+      - name: Rebase fork onto upstream
+        id: rebase
+        working-directory: codex-fork
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "Adding upstream remote..."
+          git remote add upstream "${{ env.UPSTREAM_REPO }}"
+          git fetch upstream main --no-tags
+
+          echo "Current HEAD: $(git log --oneline -1)"
+          echo "Upstream HEAD: $(git log --oneline -1 upstream/main)"
+
+          # Stash any uncommitted changes (defensive -- fresh checkout should be clean)
+          STASH_RESULT=$(git stash 2>&1) || true
+          HAS_STASH="false"
+          if [[ "$STASH_RESULT" != *"No local changes"* ]]; then
+            HAS_STASH="true"
+            echo "Stashed local changes"
+          fi
+
+          if git rebase upstream/main; then
+            echo "Rebase succeeded"
+            echo "rebase_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Rebase failed -- manual intervention required"
+            git rebase --abort || true
+            echo "rebase_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$HAS_STASH" = "true" ]; then
+            git stash pop || echo "::warning::Stash pop failed"
+          fi
+
+      - name: Create issue on rebase failure
+        if: steps.rebase.outputs.rebase_ok == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Codex fork rebase failed for upstream v${VERSION}"
+          BODY="## Rebase Failure
+
+          The automated rebase of \`${{ env.FORK_BRANCH }}\` onto \`upstream/main\` failed for upstream version **v${VERSION}**.
+
+          ### Action Required
+          1. Checkout \`${{ env.FORK_BRANCH }}\` from \`${{ env.FORK_REPO }}\`
+          2. \`git fetch upstream && git rebase upstream/main\`
+          3. Resolve conflicts and force-push
+          4. Re-run this workflow manually with **skip_version_check** enabled
+
+          ### Workflow Run
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Check for duplicate open issues before creating
+          EXISTING_ISSUE=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --search "Codex fork rebase failed" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty' 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_ISSUE" ]; then
+            echo "Existing open rebase issue #${EXISTING_ISSUE} -- adding comment instead"
+            gh issue comment "$EXISTING_ISSUE" \
+              --repo "${{ github.repository }}" \
+              --body "New rebase failure for v${VERSION}: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            gh issue create \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "rebase-conflict"
+          fi
+          exit 1
+
+      - name: Update version in Cargo.toml
+        if: steps.rebase.outputs.rebase_ok == 'true'
+        working-directory: codex-fork
+        run: |
+          CARGO_FILE="codex-rs/cli/Cargo.toml"
+          if [ ! -f "$CARGO_FILE" ]; then
+            CARGO_FILE="Cargo.toml"
+          fi
+
+          echo "Patching version in $CARGO_FILE to ${VERSION}"
+          sed -i '' -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"/version = \"${VERSION}\"/" "$CARGO_FILE"
+
+          grep '^version' "$CARGO_FILE" | head -3
+          echo "Version patched successfully"
+
+      - name: Install Rust toolchain
+        if: steps.rebase.outputs.rebase_ok == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo registry and build artifacts
+        if: steps.rebase.outputs.rebase_ok == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            codex-fork/target/
+          key: macos-arm64-cargo-${{ hashFiles('codex-fork/**/Cargo.lock') }}
+          restore-keys: |
+            macos-arm64-cargo-
+
+      - name: Build codex-cli (fork-release profile)
+        if: steps.rebase.outputs.rebase_ok == 'true'
+        working-directory: codex-fork
+        run: |
+          echo "Building codex-cli with fork-release profile..."
+          echo "Target: aarch64-apple-darwin (native on this runner)"
+
+          if [ -f "codex-rs/Cargo.toml" ]; then
+            cd codex-rs
+          fi
+
+          cargo build --profile fork-release -p codex-cli 2>&1
+
+          echo ""
+          echo "Build complete. Locating binary..."
+
+          # Search both possible target locations (depends on where cargo was invoked)
+          BINARY_PATH=$(find ../target/fork-release -name "codex" -type f -not -path "*/deps/*" -not -path "*/build/*" 2>/dev/null | head -1)
+          if [ -z "$BINARY_PATH" ]; then
+            BINARY_PATH=$(find ./target/fork-release -name "codex" -type f -not -path "*/deps/*" -not -path "*/build/*" 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$BINARY_PATH" ]; then
+            echo "::error::Binary not found in target/fork-release/"
+            echo "Contents of target/fork-release/:"
+            find . -path "*/fork-release/*" -type f -name "codex*" 2>/dev/null || echo "(empty)"
+            exit 1
+          fi
+
+          echo "Binary: $BINARY_PATH"
+          file "$BINARY_PATH"
+          ls -lh "$BINARY_PATH"
+
+          if ! file "$BINARY_PATH" | grep -q "arm64"; then
+            echo "::error::Binary is not arm64 -- architecture mismatch"
+            exit 1
+          fi
+
+          # Stage binary outside the working-directory for the release step
+          cp "$BINARY_PATH" "$GITHUB_WORKSPACE/codex-fork-binary"
+
+      - name: Create GitHub Release
+        if: steps.rebase.outputs.rebase_ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: codex-fork
+        run: |
+          TAG="fork-v${VERSION}"
+          BINARY_NAME="codex-fork-${VERSION}-arm64-darwin"
+          UPSTREAM_SHA=$(git log --oneline -1 upstream/main | cut -d' ' -f1)
+          FORK_SHA=$(git log --oneline -1 HEAD)
+
+          cp "$GITHUB_WORKSPACE/codex-fork-binary" "$BINARY_NAME"
+          chmod +x "$BINARY_NAME"
+
+          # Write release notes to a temp file
+          cat > /tmp/release-notes.md <<EOF
+          ## Codex CLI Fork v${VERSION}
+
+          Patched build of \`@openai/codex\` v${VERSION} with CodexSwitch extensions.
+
+          ### Upstream
+          - **npm version**: ${VERSION}
+          - **upstream commit**: \`${UPSTREAM_SHA}\`
+          - **fork commit**: \`${FORK_SHA}\`
+
+          ### Fork Patches (feat/sighup-v2)
+          - SIGHUP signal handler for CLI sessions (reloads auth.json on signal)
+          - File watcher in app-server (polls auth.json every 2s for desktop app)
+          - Auth generation counter for WebSocket session invalidation
+          - React Query cache invalidation notifications to Electron
+
+          ### Binary Details
+          - **Architecture**: arm64 (Apple Silicon)
+          - **Platform**: macOS (darwin)
+          - **Build profile**: fork-release (thin LTO, codegen-units=8)
+          - **Runner**: macos-14
+
+          ### Installation
+          \`\`\`bash
+          cp ${BINARY_NAME} /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex
+          chmod +x /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex
+          \`\`\`
+          EOF
+
+          # Delete existing release if rebuilding the same version
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          git tag -d "$TAG" 2>/dev/null || true
+          git push origin --delete "$TAG" 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Codex Fork v${VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            "$BINARY_NAME"
+
+          echo "Release published: $TAG"
+          echo "release_tag=$TAG" >> "$GITHUB_ENV"
+
+      - name: Push rebased fork branch
+        if: steps.rebase.outputs.rebase_ok == 'true'
+        working-directory: codex-fork
+        run: |
+          echo "Pushing rebased ${{ env.FORK_BRANCH }} to origin..."
+          git push origin "${{ env.FORK_BRANCH }}" --force-with-lease
+          echo "Fork branch updated successfully"
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Version | \`${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tag | \`${release_tag:-n/a}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Rebase | \`${{ steps.rebase.outputs.rebase_ok }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Runner | \`$(uname -m)\` |" >> "$GITHUB_STEP_SUMMARY"

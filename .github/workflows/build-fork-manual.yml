@@ -1,0 +1,258 @@
+# -----------------------------------------------------------------------
+# build-fork-manual.yml -- On-demand Codex CLI fork builder
+#
+# Lightweight single-job workflow for manual builds.  Useful for:
+#   - Rebuilding after a rebase conflict is manually resolved
+#   - Testing fork patches against a specific upstream version
+#   - Emergency rebuilds when the scheduled job is not soon enough
+#
+# Required secrets:
+#   FORK_PUSH_TOKEN - PAT with push access to brendondelgado/codex
+# -----------------------------------------------------------------------
+
+name: Build Codex Fork (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Target version to build (e.g. 0.117.0). Leave empty to auto-detect from npm."
+        required: false
+        type: string
+      skip_rebase:
+        description: "Skip rebase onto upstream (build current branch as-is)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  FORK_REPO: brendondelgado/codex
+  FORK_BRANCH: feat/sighup-v2
+  UPSTREAM_REPO: https://github.com/openai/codex.git
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Resolve target version
+        id: version
+        run: |
+          INPUT_VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+            echo "Using provided version: $VERSION"
+          else
+            VERSION=$(npm view @openai/codex version 2>/dev/null || echo "")
+            if [ -z "$VERSION" ]; then
+              echo "::error::Failed to query npm for @openai/codex version"
+              exit 1
+            fi
+            echo "Auto-detected npm version: $VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Log build parameters
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          echo "========================================="
+          echo "  Manual build: Codex fork v${VERSION}"
+          echo "  Skip rebase: ${{ inputs.skip_rebase }}"
+          echo "  Runner: $(uname -m) / $(sw_vers -productVersion)"
+          echo "========================================="
+
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.FORK_PUSH_TOKEN }}
+          path: codex-fork
+
+      - name: Rebase fork onto upstream
+        if: inputs.skip_rebase != true
+        id: rebase
+        working-directory: codex-fork
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "Adding upstream remote..."
+          git remote add upstream "${{ env.UPSTREAM_REPO }}"
+          git fetch upstream main --no-tags
+
+          echo "Current HEAD: $(git log --oneline -1)"
+          echo "Upstream HEAD: $(git log --oneline -1 upstream/main)"
+
+          STASH_RESULT=$(git stash 2>&1) || true
+          HAS_STASH="false"
+          if [[ "$STASH_RESULT" != *"No local changes"* ]]; then
+            HAS_STASH="true"
+          fi
+
+          if git rebase upstream/main; then
+            echo "Rebase succeeded"
+            echo "rebase_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Rebase failed -- resolve conflicts manually and retry with skip_rebase=true"
+            git rebase --abort || true
+            echo "rebase_ok=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          if [ "$HAS_STASH" = "true" ]; then
+            git stash pop || echo "::warning::Stash pop failed"
+          fi
+
+      - name: Update version in Cargo.toml
+        working-directory: codex-fork
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          CARGO_FILE="codex-rs/cli/Cargo.toml"
+          if [ ! -f "$CARGO_FILE" ]; then
+            CARGO_FILE="Cargo.toml"
+          fi
+
+          echo "Patching version in $CARGO_FILE to ${VERSION}"
+          sed -i '' -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"/version = \"${VERSION}\"/" "$CARGO_FILE"
+          grep '^version' "$CARGO_FILE" | head -3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            codex-fork/target/
+          key: macos-arm64-cargo-${{ hashFiles('codex-fork/**/Cargo.lock') }}
+          restore-keys: |
+            macos-arm64-cargo-
+
+      - name: Build codex-cli (fork-release profile)
+        working-directory: codex-fork
+        run: |
+          echo "Building codex-cli with fork-release profile..."
+
+          if [ -f "codex-rs/Cargo.toml" ]; then
+            cd codex-rs
+          fi
+
+          cargo build --profile fork-release -p codex-cli 2>&1
+
+          echo ""
+          echo "Build complete. Locating binary..."
+
+          BINARY_PATH=$(find ../target/fork-release -name "codex" -type f -not -path "*/deps/*" -not -path "*/build/*" 2>/dev/null | head -1)
+          if [ -z "$BINARY_PATH" ]; then
+            BINARY_PATH=$(find ./target/fork-release -name "codex" -type f -not -path "*/deps/*" -not -path "*/build/*" 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$BINARY_PATH" ]; then
+            echo "::error::Binary not found in target/fork-release/"
+            echo "Contents of target/fork-release/:"
+            find . -path "*/fork-release/*" -type f -name "codex*" 2>/dev/null || echo "(empty)"
+            exit 1
+          fi
+
+          echo "Binary: $BINARY_PATH"
+          file "$BINARY_PATH"
+          ls -lh "$BINARY_PATH"
+
+          if ! file "$BINARY_PATH" | grep -q "arm64"; then
+            echo "::error::Binary is not arm64 -- architecture mismatch"
+            exit 1
+          fi
+
+          cp "$BINARY_PATH" "$GITHUB_WORKSPACE/codex-fork-binary"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        working-directory: codex-fork
+        run: |
+          TAG="fork-v${VERSION}"
+          BINARY_NAME="codex-fork-${VERSION}-arm64-darwin"
+          FORK_SHA=$(git log --oneline -1 HEAD)
+          UPSTREAM_SHA=$(git log --oneline -1 upstream/main 2>/dev/null | cut -d' ' -f1 || echo "n/a")
+
+          cp "$GITHUB_WORKSPACE/codex-fork-binary" "$BINARY_NAME"
+          chmod +x "$BINARY_NAME"
+
+          cat > /tmp/release-notes.md <<EOF
+          ## Codex CLI Fork v${VERSION}
+
+          Patched build of \`@openai/codex\` v${VERSION} with CodexSwitch extensions.
+
+          > **Manual build** triggered via workflow_dispatch.
+
+          ### Upstream
+          - **npm version**: ${VERSION}
+          - **upstream commit**: \`${UPSTREAM_SHA}\`
+          - **fork commit**: \`${FORK_SHA}\`
+
+          ### Fork Patches (feat/sighup-v2)
+          - SIGHUP signal handler for CLI sessions (reloads auth.json on signal)
+          - File watcher in app-server (polls auth.json every 2s for desktop app)
+          - Auth generation counter for WebSocket session invalidation
+          - React Query cache invalidation notifications to Electron
+
+          ### Binary Details
+          - **Architecture**: arm64 (Apple Silicon)
+          - **Platform**: macOS (darwin)
+          - **Build profile**: fork-release (thin LTO, codegen-units=8)
+
+          ### Installation
+          \`\`\`bash
+          cp ${BINARY_NAME} /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex
+          chmod +x /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex
+          \`\`\`
+          EOF
+
+          # Delete existing release if rebuilding same version
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          git tag -d "$TAG" 2>/dev/null || true
+          git push origin --delete "$TAG" 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Codex Fork v${VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            "$BINARY_NAME"
+
+          echo "Release published: $TAG"
+
+      - name: Push rebased fork branch
+        if: inputs.skip_rebase != true
+        working-directory: codex-fork
+        run: |
+          echo "Pushing rebased ${{ env.FORK_BRANCH }} to origin..."
+          git push origin "${{ env.FORK_BRANCH }}" --force-with-lease
+          echo "Fork branch updated"
+
+      - name: Build summary
+        if: always()
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          echo "## Manual Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Version | \`${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tag | \`fork-v${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Skip Rebase | \`${{ inputs.skip_rebase }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Runner | \`$(uname -m)\` |" >> "$GITHUB_STEP_SUMMARY"
