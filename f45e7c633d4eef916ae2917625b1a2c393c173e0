@@ -1,0 +1,23 @@
+Sources/CodexNative/WebView/ElectronBridge.swift
+  10ea22953ca45d80 114-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "f45e7c633d4eef916ae2917625b1a2c393c173e0",
+  "prompts": {
+    "10ea22953ca45d80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4f378cf-8706-424b-8059-f5f34db95dd7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "brendondelgado",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 617,
+      "overriden_lines": 0
+    }
+  }
+}
