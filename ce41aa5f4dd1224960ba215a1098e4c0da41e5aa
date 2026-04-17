@@ -1,0 +1,25 @@
+Package.swift
+  10ea22953ca45d80 13-21,27-31
+Sources/CodexNative/Resources/preload-shim.js
+  10ea22953ca45d80 1-3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "ce41aa5f4dd1224960ba215a1098e4c0da41e5aa",
+  "prompts": {
+    "10ea22953ca45d80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4f378cf-8706-424b-8059-f5f34db95dd7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "brendondelgado",
+      "messages": [],
+      "total_additions": 637,
+      "total_deletions": 6,
+      "accepted_lines": 631,
+      "overriden_lines": 4
+    }
+  }
+}
