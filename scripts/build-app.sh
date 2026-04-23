@@ -137,9 +137,57 @@ result = subprocess.run(
 if result.stdout:
     print(result.stdout, end='')
 if result.returncode != 0:
-    print(f"Warning: Icon generation failed: {result.stderr}", file=sys.stderr)
-    # Create a minimal icon fallback
-    sys.exit(0)
+    print(f"Warning: AppKit icon generation failed, using fallback icon: {result.stderr}", file=sys.stderr)
+
+    import struct
+    import zlib
+
+    def write_png(path, width, height):
+        rows = []
+        for y in range(height):
+            row = bytearray()
+            for x in range(width):
+                dx = (x + 0.5 - width / 2) / (width / 2)
+                dy = (y + 0.5 - height / 2) / (height / 2)
+                inside = dx * dx + dy * dy <= 0.82
+                if inside:
+                    row.extend((54, 211, 92, 255))
+                else:
+                    row.extend((35, 36, 43, 255))
+            rows.append(b"\x00" + bytes(row))
+
+        raw = b"".join(rows)
+
+        def chunk(kind, data):
+            return (
+                struct.pack(">I", len(data))
+                + kind
+                + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+            )
+
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b"")
+        )
+        with open(path, "wb") as f:
+            f.write(png)
+
+    fallback_sizes = [
+        (16, 1), (16, 2),
+        (32, 1), (32, 2),
+        (128, 1), (128, 2),
+        (256, 1), (256, 2),
+        (512, 1), (512, 2),
+    ]
+    for size, scale in fallback_sizes:
+        px = int(size * scale)
+        suffix = f"_{size}x{size}@2x.png" if scale == 2 else f"_{size}x{size}.png"
+        name = f"icon{suffix}"
+        write_png(os.path.join(iconset, name), px, px)
+        print(f"  Generated fallback {name}")
 
 # Convert iconset to icns
 result = subprocess.run(

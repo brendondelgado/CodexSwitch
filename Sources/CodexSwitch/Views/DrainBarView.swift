@@ -17,6 +17,17 @@ struct DrainBarView: View {
 
     private var fillFraction: CGFloat { CGFloat(max(0, min(100, percent))) / 100 }
 
+    static func resetText(now: Date, resetsAt: Date?) -> String {
+        guard let resetsAt else { return "" }
+        let remaining = resetsAt.timeIntervalSince(now)
+        if remaining <= 0 { return "resetting..." }
+        let hours = Int(remaining) / 3600
+        let mins = (Int(remaining) % 3600) / 60
+        let countdown = hours > 0 ? "\(hours)h \(mins)m" : "\(mins)m"
+        let dateStr = resetFormatter.string(from: resetsAt)
+        return "\(dateStr) (\(countdown))"
+    }
+
     private var barColor: Color {
         switch percent {
         case 50...: return .green
@@ -24,17 +35,6 @@ struct DrainBarView: View {
         case 5..<20: return .orange
         default: return .red
         }
-    }
-
-    private var resetText: String {
-        guard let resetsAt else { return "" }
-        let remaining = resetsAt.timeIntervalSinceNow
-        if remaining <= 0 { return "resetting..." }
-        let hours = Int(remaining) / 3600
-        let mins = (Int(remaining) % 3600) / 60
-        let countdown = hours > 0 ? "\(hours)h \(mins)m" : "\(mins)m"
-        let dateStr = Self.resetFormatter.string(from: resetsAt)
-        return "\(dateStr) (\(countdown))"
     }
 
     var body: some View {
@@ -59,9 +59,11 @@ struct DrainBarView: View {
                     .frame(width: 32, alignment: .trailing)
             }
             if resetsAt != nil {
-                Text(resetText)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(boostedContrast ? .primary : .secondary)
+                TimelineView(.periodic(from: .now, by: 15)) { context in
+                    Text(Self.resetText(now: context.date, resetsAt: resetsAt))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(boostedContrast ? .primary : .secondary)
+                }
             }
         }
     }

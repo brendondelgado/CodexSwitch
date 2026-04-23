@@ -62,7 +62,7 @@ enum NotificationManager {
         guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: Token Refresh Failed"
-        content.body = "Account \(account.email) needs re-authentication. Import again from Codex CLI."
+        content.body = "Account \(account.email) needs re-authentication. Use the Re-authenticate button on its account card in CodexSwitch."
         content.sound = .default
 
         let request = UNNotificationRequest(

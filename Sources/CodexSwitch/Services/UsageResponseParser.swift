@@ -59,42 +59,58 @@ enum UsageResponseParser {
         let planType: String
     }
 
-    static func parse(_ data: Data) throws -> ParseResult {
+    static func parse(_ data: Data, now: Date = Date()) throws -> ParseResult {
         let response = try JSONDecoder().decode(UsageResponse.self, from: data)
 
         // primary_window = 5-hour window, secondary_window = weekly window
         let fiveHour = mapWindow(
             response.rateLimit?.primaryWindow,
-            fallbackWindowMins: 300
+            fallbackWindowMins: 300,
+            now: now
         )
 
         let weekly = mapWindow(
             response.rateLimit?.secondaryWindow,
-            fallbackWindowMins: 10080
+            fallbackWindowMins: 10080,
+            now: now
         )
 
-        let snapshot = QuotaSnapshot(fiveHour: fiveHour, weekly: weekly, fetchedAt: Date())
+        let snapshot = QuotaSnapshot(fiveHour: fiveHour, weekly: weekly, fetchedAt: now)
         return ParseResult(snapshot: snapshot, planType: response.planType)
     }
 
     private static func mapWindow(
         _ window: WindowSnapshot?,
-        fallbackWindowMins: Int
+        fallbackWindowMins: Int,
+        now: Date
     ) -> QuotaWindow {
         guard let window else {
             return QuotaWindow(
                 usedPercent: 0,
                 windowDurationMins: fallbackWindowMins,
-                resetsAt: Date().addingTimeInterval(TimeInterval(fallbackWindowMins * 60))
+                resetsAt: now.addingTimeInterval(TimeInterval(fallbackWindowMins * 60))
             )
         }
 
+        let windowSeconds = window.limitWindowSeconds > 0
+            ? window.limitWindowSeconds
+            : fallbackWindowMins * 60
+
         let windowMins = window.limitWindowSeconds > 0
-            ? (window.limitWindowSeconds + 59) / 60
+            ? (windowSeconds + 59) / 60
             : fallbackWindowMins
 
-        // reset_at is a Unix timestamp
-        let resetsAt = Date(timeIntervalSince1970: TimeInterval(window.resetAt))
+        let resetAt = Date(timeIntervalSince1970: TimeInterval(window.resetAt))
+        let resetsAt: Date
+        if let resetAfterSeconds = window.resetAfterSeconds, resetAfterSeconds > 0 {
+            resetsAt = now.addingTimeInterval(TimeInterval(resetAfterSeconds))
+        } else if resetAt > now {
+            resetsAt = resetAt
+        } else {
+            // OpenAI sometimes reports a stale reset_at for a freshly reset window.
+            // Keep the UI and poll scheduling moving by projecting a full window ahead.
+            resetsAt = now.addingTimeInterval(TimeInterval(windowSeconds))
+        }
 
         return QuotaWindow(
             usedPercent: max(0, min(100, Double(window.usedPercent))),

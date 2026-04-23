@@ -71,7 +71,7 @@ struct SettingsView: View {
 
                 HStack {
                     Button {
-                        versionChecker.checkVersions()
+                        versionChecker.checkVersions(force: true)
                     } label: {
                         if versionChecker.isChecking {
                             ProgressView()
@@ -92,7 +92,10 @@ struct SettingsView: View {
                                     .controlSize(.small)
                                 Text("Updating...")
                             } else {
-                                Label("Update Now", systemImage: "arrow.down.circle.fill")
+                                Label(
+                                    versionChecker.forkInstalled ? "Update and Patch Now" : "Update Now",
+                                    systemImage: "arrow.down.circle.fill"
+                                )
                             }
                         }
                         .disabled(versionChecker.isUpdating)
@@ -135,6 +138,102 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Codex Desktop App") {
+                HStack {
+                    Text("Installed")
+                    Spacer()
+                    Text(versionChecker.desktopInstalledVersionLabel)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Latest")
+                    Spacer()
+                    Text(versionChecker.desktopLatestVersionLabel)
+                        .font(.system(size: 11, weight: versionChecker.desktopUpdateAvailable ? .medium : .regular, design: .monospaced))
+                        .foregroundStyle(versionChecker.desktopUpdateAvailable ? .orange : .secondary)
+                }
+
+                HStack(alignment: .top) {
+                    Text("Runtime")
+                    Spacer()
+                    Text(versionChecker.desktopRuntimeLabel)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                }
+
+                HStack(alignment: .top) {
+                    Text("Auto-Swap")
+                    Spacer()
+                    Text(versionChecker.desktopAutoSwapLabel)
+                        .font(.system(size: 11, weight: versionChecker.desktopAutoSwapReady ? .regular : .medium, design: .monospaced))
+                        .foregroundStyle(versionChecker.desktopAutoSwapReady ? .green : .orange)
+                        .multilineTextAlignment(.trailing)
+                }
+
+                HStack(alignment: .top) {
+                    Text("Patch")
+                    Spacer()
+                    Text(versionChecker.desktopPatchLabel)
+                        .font(.system(size: 11, weight: versionChecker.desktopPatchHealthy ? .regular : .medium, design: .monospaced))
+                        .foregroundStyle(versionChecker.desktopPatchHealthy ? .green : .orange)
+                        .multilineTextAlignment(.trailing)
+                }
+
+                HStack {
+                    Button {
+                        versionChecker.checkVersions(force: true)
+                    } label: {
+                        Label("Refresh Desktop Status", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(versionChecker.isChecking || versionChecker.desktopPatchInFlight || versionChecker.desktopUpdateInFlight)
+
+                    if versionChecker.desktopUpdateAvailable {
+                        Button {
+                            versionChecker.installLatestDesktopNow()
+                        } label: {
+                            if versionChecker.desktopUpdateInFlight {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Updating...")
+                            } else {
+                                Label("Install Latest Stock App", systemImage: "arrow.down.circle.fill")
+                            }
+                        }
+                        .disabled(versionChecker.desktopUpdateInFlight || versionChecker.desktopPatchInFlight)
+                    } else if versionChecker.desktopCanPatchNow || !versionChecker.desktopPatchHealthy {
+                        Button {
+                            versionChecker.restoreDesktopAppNow()
+                        } label: {
+                            if versionChecker.desktopPatchInFlight {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Restoring...")
+                            } else {
+                                Label("Restore Stock App", systemImage: "arrow.triangle.2.circlepath")
+                            }
+                        }
+                        .disabled(versionChecker.desktopPatchInFlight)
+                    }
+                }
+
+                if let result = versionChecker.desktopPatchResult {
+                    Text(result)
+                        .font(.caption)
+                        .foregroundStyle(versionChecker.desktopPatchSucceeded ? .green : .red)
+                        .lineLimit(4)
+                }
+
+                if let result = versionChecker.desktopUpdateResult {
+                    Text(result)
+                        .font(.caption)
+                        .foregroundStyle(versionChecker.desktopUpdateSucceeded ? .green : .red)
+                        .lineLimit(4)
+                }
+            }
+
             Section("Data") {
                 Button("Remove All Accounts", role: .destructive) {
                     showingRemoveConfirmation = true
@@ -162,9 +261,16 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 380, height: 480)
+        .frame(width: 400, height: 620)
         .onAppear {
             versionChecker.checkVersions()
+        }
+        .task {
+            versionChecker.refreshDesktopRuntimeStatus()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                versionChecker.refreshDesktopRuntimeStatus()
+            }
         }
     }
 

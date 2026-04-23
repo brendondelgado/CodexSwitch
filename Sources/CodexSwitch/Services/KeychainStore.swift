@@ -8,17 +8,19 @@ private let logger = Logger(subsystem: "com.codexswitch", category: "AccountStor
 /// Migrates from legacy Keychain on first load.
 struct KeychainStore: Sendable {
     let service: String
+    private let storeURL: URL
     private static let allAccountsKey = "all-accounts"
-    private static let storePath: String = {
-        let dir = NSString("~/.codexswitch").expandingTildeInPath
-        return (dir as NSString).appendingPathComponent("accounts.json")
-    }()
-    private static let storeDir: String = {
-        NSString("~/.codexswitch").expandingTildeInPath
+    private static let defaultStoreURL: URL = {
+        let dir = URL(fileURLWithPath: NSString("~/.codexswitch").expandingTildeInPath, isDirectory: true)
+        return dir.appendingPathComponent("accounts.json")
     }()
 
-    init(service: String = "com.codexswitch.accounts") {
+    init(
+        service: String = "com.codexswitch.accounts",
+        storeURL: URL = Self.defaultStoreURL
+    ) {
         self.service = service
+        self.storeURL = storeURL
     }
 
     func save(_ account: CodexAccount) throws {
@@ -32,10 +34,14 @@ struct KeychainStore: Sendable {
         try saveAll(accounts)
     }
 
+    func replaceAll(_ accounts: [CodexAccount]) throws {
+        try saveAll(accounts)
+    }
+
     func loadAll() throws -> [CodexAccount] {
         // Try file store first (no fileExists check — avoids TOCTOU race)
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: Self.storePath))
+            let data = try Data(contentsOf: storeURL)
             return try JSONDecoder().decode([CodexAccount].self, from: data)
         } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
             // File doesn't exist — fall through to Keychain migration
@@ -86,8 +92,8 @@ struct KeychainStore: Sendable {
     }
 
     func deleteAll() throws {
-        if FileManager.default.fileExists(atPath: Self.storePath) {
-            try FileManager.default.removeItem(atPath: Self.storePath)
+        if FileManager.default.fileExists(atPath: storeURL.path) {
+            try FileManager.default.removeItem(at: storeURL)
         }
         // Also clean up legacy Keychain if present
         let legacyQuery: [String: Any] = [
@@ -101,10 +107,13 @@ struct KeychainStore: Sendable {
     // MARK: - Private
 
     private func saveAll(_ accounts: [CodexAccount]) throws {
+        let normalizedAccounts = normalized(accounts)
+
         // Ensure directory exists
-        if !FileManager.default.fileExists(atPath: Self.storeDir) {
+        let storeDir = storeURL.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: storeDir.path) {
             try FileManager.default.createDirectory(
-                atPath: Self.storeDir,
+                at: storeDir,
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
@@ -112,14 +121,28 @@ struct KeychainStore: Sendable {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(accounts)
+        let data = try encoder.encode(normalizedAccounts)
 
         // .atomic already writes to tmp + renames internally
-        try data.write(to: URL(fileURLWithPath: Self.storePath), options: .atomic)
+        try data.write(to: storeURL, options: .atomic)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
-            ofItemAtPath: Self.storePath
+            ofItemAtPath: storeURL.path
         )
+    }
+
+    private func normalized(_ accounts: [CodexAccount]) -> [CodexAccount] {
+        let activeIndices = accounts.indices.filter { accounts[$0].isActive }
+        guard activeIndices.count > 1, let indexToKeep = activeIndices.last else {
+            return accounts
+        }
+
+        var normalizedAccounts = accounts
+        for index in normalizedAccounts.indices {
+            normalizedAccounts[index].isActive = (index == indexToKeep)
+        }
+        logger.warning("Normalized \(activeIndices.count) active accounts down to one in file store")
+        return normalizedAccounts
     }
 }
 

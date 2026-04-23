@@ -13,8 +13,8 @@ struct QuotaModelTests {
         #expect(QuotaUrgency(remainingPercent: 19) == .elevated)
         #expect(QuotaUrgency(remainingPercent: 10) == .elevated)
         #expect(QuotaUrgency(remainingPercent: 9) == .high)
-        #expect(QuotaUrgency(remainingPercent: 5) == .high)
-        #expect(QuotaUrgency(remainingPercent: 4) == .critical)
+        #expect(QuotaUrgency(remainingPercent: 5) == .imminent)
+        #expect(QuotaUrgency(remainingPercent: 4) == .imminent)
         #expect(QuotaUrgency(remainingPercent: 0) == .critical)
     }
 
@@ -24,7 +24,8 @@ struct QuotaModelTests {
         #expect(QuotaUrgency.moderate.pollInterval == 300)
         #expect(QuotaUrgency.elevated.pollInterval == 120)
         #expect(QuotaUrgency.high.pollInterval == 60)
-        #expect(QuotaUrgency.critical.pollInterval == 10)
+        #expect(QuotaUrgency.imminent.pollInterval == 1)
+        #expect(QuotaUrgency.critical.pollInterval == 1)
     }
 
     @Test("QuotaWindow computed properties")

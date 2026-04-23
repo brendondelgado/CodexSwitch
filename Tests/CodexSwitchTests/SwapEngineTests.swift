@@ -4,12 +4,31 @@ import Foundation
 
 @Suite("SwapEngine")
 struct SwapEngineTests {
+    private func makeSighupProcess(
+        pid: Int32 = 123,
+        commandLine: String,
+        executablePath: String,
+        controllingTTYDevice: UInt32 = 1,
+        terminalProcessGroup: UInt32 = 1,
+        startedSecondsAgo: TimeInterval = 60
+    ) -> SwapEngine.SighupProcessSnapshot {
+        SwapEngine.SighupProcessSnapshot(
+            pid: pid,
+            commandLine: commandLine,
+            executablePath: executablePath,
+            controllingTTYDevice: controllingTTYDevice,
+            terminalProcessGroup: terminalProcessGroup,
+            startTime: Date().addingTimeInterval(-startedSecondsAgo)
+        )
+    }
+
     private func makeAccount(
         id: UUID = UUID(),
         fiveHourRemaining: Double,
         weeklyRemaining: Double,
         resetsInSeconds: TimeInterval = 3600,
-        isActive: Bool = false
+        isActive: Bool = false,
+        planType: String? = nil
     ) -> CodexAccount {
         CodexAccount(
             id: id,
@@ -31,6 +50,7 @@ struct SwapEngineTests {
                 ),
                 fetchedAt: Date()
             ),
+            planType: planType,
             isActive: isActive
         )
     }
@@ -66,6 +86,76 @@ struct SwapEngineTests {
         let b = makeAccount(fiveHourRemaining: 50, weeklyRemaining: 80)
         let best = SwapEngine.selectOptimalAccount(from: [a, b])
         #expect(best?.id == b.id)
+    }
+
+    @Test("Pro accounts outrank Plus when effective 5h capacity is higher")
+    func prioritizesProAccounts() {
+        let plus = makeAccount(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 50,
+            planType: "plus"
+        )
+        let pro = makeAccount(
+            fiveHourRemaining: 20,
+            weeklyRemaining: 50,
+            planType: "pro"
+        )
+
+        let best = SwapEngine.selectOptimalAccount(from: [plus, pro])
+
+        #expect(best?.id == pro.id)
+    }
+
+    @Test("Nearly empty Pro does not outrank a full Plus account")
+    func lowProDoesNotBeatHealthyPlus() {
+        let plus = makeAccount(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 50,
+            planType: "plus"
+        )
+        let pro = makeAccount(
+            fiveHourRemaining: 5,
+            weeklyRemaining: 50,
+            planType: "pro"
+        )
+
+        let best = SwapEngine.selectOptimalAccount(from: [plus, pro])
+
+        #expect(best?.id == plus.id)
+    }
+
+    @Test("Higher-value Pro candidate preempts an active Plus account")
+    func proCandidatePreemptsActivePlus() {
+        let activePlus = makeAccount(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 50,
+            isActive: true,
+            planType: "plus"
+        )
+        let pro = makeAccount(
+            fiveHourRemaining: 20,
+            weeklyRemaining: 50,
+            planType: "pro"
+        )
+
+        #expect(SwapEngine.shouldSwap(from: activePlus, to: pro))
+    }
+
+    @Test("Healthy Plus stays active when Pro candidate is too depleted")
+    func depletedProDoesNotPreemptHealthyPlus() {
+        let activePlus = makeAccount(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 50,
+            isActive: true,
+            planType: "plus"
+        )
+        let pro = makeAccount(
+            fiveHourRemaining: 5,
+            weeklyRemaining: 50,
+            planType: "pro"
+        )
+
+        #expect(!SwapEngine.shouldSwap(from: activePlus, to: pro))
     }
 
     @Test("Bonus for accounts about to reset")
@@ -149,5 +239,58 @@ struct SwapEngineTests {
         let other = makeAccount(fiveHourRemaining: 50, weeklyRemaining: 50)
         let best = SwapEngine.selectOptimalAccount(from: [active, other])
         #expect(best?.id == other.id)
+    }
+
+    @Test("SIGHUP targeting includes an interactive Codex CLI session")
+    func sighupIncludesInteractiveCliSession() {
+        let process = makeSighupProcess(
+            commandLine: "/opt/homebrew/bin/codex",
+            executablePath: "/opt/homebrew/Caskroom/codex/0.120.0/codex-aarch64-apple-darwin"
+        )
+
+        #expect(SwapEngine.shouldSignalCodexProcess(process, now: Date()))
+    }
+
+    @Test("SIGHUP targeting excludes Codex desktop app bundle processes")
+    func sighupExcludesDesktopAppProcesses() {
+        let process = makeSighupProcess(
+            commandLine: "/Applications/Codex.app/Contents/MacOS/Codex",
+            executablePath: "/Applications/Codex.app/Contents/MacOS/Codex"
+        )
+
+        #expect(!SwapEngine.shouldSignalCodexProcess(process, now: Date()))
+    }
+
+    @Test("SIGHUP targeting excludes cargo or rustc jobs that merely mention codex in argv")
+    func sighupExcludesBuildProcesses() {
+        let process = makeSighupProcess(
+            commandLine: "/Users/brendondelgado/.rustup/toolchains/1.93.0-aarch64-apple-darwin/bin/cargo build --release -p codex-cli",
+            executablePath: "/Users/brendondelgado/.rustup/toolchains/1.93.0-aarch64-apple-darwin/bin/cargo"
+        )
+
+        #expect(!SwapEngine.shouldSignalCodexProcess(process, now: Date()))
+    }
+
+    @Test("SIGHUP targeting excludes processes without a controlling TTY")
+    func sighupExcludesNonInteractiveProcesses() {
+        let process = makeSighupProcess(
+            commandLine: "/opt/homebrew/bin/codex app-server",
+            executablePath: "/opt/homebrew/Caskroom/codex/0.120.0/codex-aarch64-apple-darwin",
+            controllingTTYDevice: 0,
+            terminalProcessGroup: 0
+        )
+
+        #expect(!SwapEngine.shouldSignalCodexProcess(process, now: Date()))
+    }
+
+    @Test("SIGHUP targeting excludes freshly started Codex CLI processes")
+    func sighupExcludesTooNewProcesses() {
+        let process = makeSighupProcess(
+            commandLine: "/opt/homebrew/bin/codex",
+            executablePath: "/opt/homebrew/Caskroom/codex/0.120.0/codex-aarch64-apple-darwin",
+            startedSecondsAgo: 2
+        )
+
+        #expect(!SwapEngine.shouldSignalCodexProcess(process, now: Date()))
     }
 }

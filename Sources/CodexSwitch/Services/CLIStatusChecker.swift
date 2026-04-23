@@ -28,24 +28,39 @@ enum CLIStatus: Sendable {
 }
 
 struct DesktopAppStatus: Sendable {
+    let usageState: CodexDesktopAppUsageState
     let isRunning: Bool
     let port: UInt16?
 
     var label: String {
-        if isRunning, let port {
-            return "Codex desktop app connected (port \(port))"
+        usageState.runtimeLabel
+    }
+
+    var autoSwapReady: Bool { usageState == .appRunning }
+
+    var autoSwapLabel: String {
+        switch usageState {
+        case .appRunning:
+            return "Desktop auto-swap ready"
+        case .backgroundServiceOnly:
+            return "Desktop auto-swap unavailable: Codex.app UI is not running"
+        case .notRunning:
+            return "Desktop auto-swap disconnected"
         }
-        if isRunning {
-            return "Codex desktop app running"
-        }
-        return "Codex desktop app not running"
     }
 
     var icon: String {
-        isRunning ? "desktopcomputer" : "desktopcomputer.trianglebadge.exclamationmark"
+        switch usageState {
+        case .appRunning:
+            return "desktopcomputer"
+        case .backgroundServiceOnly:
+            return "desktopcomputer.and.arrow.down"
+        case .notRunning:
+            return "desktopcomputer.trianglebadge.exclamationmark"
+        }
     }
 
-    var isHealthy: Bool { isRunning }
+    var isHealthy: Bool { autoSwapReady }
 }
 
 /// Cached status checker — runs checks on a background queue and caches results.
@@ -53,17 +68,32 @@ struct DesktopAppStatus: Sendable {
 @MainActor
 enum CLIStatusChecker {
     private nonisolated static let authPath = NSString("~/.codex/auth.json").expandingTildeInPath
+    private nonisolated static let refreshGate = SingleFlightGate()
 
     // Cached values — safe to read from view body without blocking
     private(set) static var cachedCLIStatus: CLIStatus = .noActiveAccount
-    private(set) static var cachedDesktopStatus: DesktopAppStatus = DesktopAppStatus(isRunning: false, port: nil)
+    private(set) static var cachedDesktopStatus = DesktopAppStatus(
+        usageState: .notRunning,
+        isRunning: false,
+        port: nil
+    )
+
+    static func setCachedDesktopStatusForTesting(_ status: DesktopAppStatus) {
+        cachedDesktopStatus = status
+    }
 
     /// Refresh cached statuses in the background. Call from a timer, not view body.
     static func refresh(activeAccountId: String?) {
         let accountId = activeAccountId
         Task.detached {
+            guard await refreshGate.begin() else { return }
+            defer {
+                Task {
+                    await refreshGate.end()
+                }
+            }
             let cliStatus = _checkCLI(activeAccountId: accountId)
-            let desktopStatus = _checkDesktopApp()
+            let desktopStatus = currentDesktopStatus()
             await MainActor.run {
                 cachedCLIStatus = cliStatus
                 cachedDesktopStatus = desktopStatus
@@ -88,48 +118,27 @@ enum CLIStatusChecker {
         return .authMismatch
     }
 
-    private nonisolated static func _checkDesktopApp() -> DesktopAppStatus {
-        // Check WebSocket port first
-        if let port = DesktopAppConnector.discoverPort() {
-            return DesktopAppStatus(isRunning: true, port: port)
-        }
-        // Fall back to checking if Codex.app process exists
-        let pipe = Pipe()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-f", "Codex.app/Contents"]
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            return DesktopAppStatus(isRunning: false, port: nil)
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        if !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return DesktopAppStatus(isRunning: true, port: nil)
-        }
-        return DesktopAppStatus(isRunning: false, port: nil)
+    nonisolated static func currentDesktopStatus() -> DesktopAppStatus {
+        let usageState = CodexDesktopAppProcessClassifier.usageState(appPath: "/Applications/Codex.app")
+
+        return DesktopAppStatus(
+            usageState: usageState,
+            isRunning: usageState != .notRunning,
+            port: nil
+        )
     }
 
     private nonisolated static func _isCodexRunning() -> Bool {
-        let pipe = Pipe()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-x", "codex"]
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
+        guard let output = ProcessRunner.run(
+            executablePath: "/usr/bin/pgrep",
+            arguments: ["-x", "codex"],
+            timeout: 1,
+            captureStderr: false
+        ) else {
             return false
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !output.timedOut else { return false }
+        return !output.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private nonisolated static func _readAuthAccountId() -> String? {

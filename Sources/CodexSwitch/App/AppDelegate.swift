@@ -53,10 +53,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let accountManager = AccountManager()
     private let keychainStore = KeychainStore()
     private let quotaPoller = QuotaPoller()
+    private let weeklyPrimer = WeeklyPrimer()
     private let oauthManager = OAuthLoginManager()
+    private let codexAutoPatchMonitor = CodexAutoPatchMonitor()
 
     private var monitorTask: Task<Void, Never>?
     private var iconUpdateTimer: Timer?
+    private var lastAutoSwapAt: Date?
+    private let autoSwapCooldown: TimeInterval = 30
+
+    private func persistAccounts() {
+        do {
+            try keychainStore.replaceAll(accountManager.accounts)
+        } catch {
+            logger.warning("Failed to persist account state: \(error.localizedDescription)")
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installCrashHandlers()
@@ -93,12 +105,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startAllPolling()
             startSwapMonitor()
 
-            // Ensure CLI is in sync — write auth.json + SIGHUP on every launch
-            // so the CLI picks up the current account even after a CodexSwitch restart
+            // Ensure CLI is in sync on launch, but don't SIGHUP existing sessions.
+            // Launch-time auth alignment should never disrupt an active terminal run.
             if let active = accountManager.activeAccount {
                 try? SwapEngine.writeAuthFile(for: active)
-                Task.detached { SwapEngine.signalCodexReload() }
             }
+
+            codexAutoPatchMonitor.start()
 
             // Update icon + status checks periodically
             writeCrashLog("LAUNCH: all services started, \(accountManager.accounts.count) accounts loaded, active=\(accountManager.activeAccount?.email ?? "none")")
@@ -107,8 +120,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             iconUpdateTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
                 Task { @MainActor in
                     // If auth.json changed externally, restart polling for new active account
-                    if let newActiveId = await self?.accountManager.syncWithAuthJson() {
-                        self?.startPollingForAccount(newActiveId)
+                    if let syncResult = await self?.accountManager.syncWithAuthJson() {
+                        self?.persistAccounts()
+                        if syncResult.activeAccountChanged {
+                            self?.startPollingForAccount(syncResult.activeAccountId)
+                            self?.checkAndSwapIfNeeded()
+                        }
                     }
                     self?.statusBarController.updateIcon()
                     self?.updatePopoverContent()
@@ -121,13 +138,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         monitorTask?.cancel()
         iconUpdateTimer?.invalidate()
-        let poller = quotaPoller
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
-            await poller.stopAll()
-            semaphore.signal()
+        codexAutoPatchMonitor.stop()
+        Task { [quotaPoller] in
+            await quotaPoller.stopAll()
         }
-        semaphore.wait()
     }
 
     // MARK: - Account Management
@@ -135,25 +149,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func loadAccounts() async {
         do {
             let accounts = try keychainStore.loadAll()
-            for account in accounts {
-                accountManager.addAccount(account)
-            }
+            accountManager.accounts = accounts
             await accountManager.restoreActiveAccount()
+            persistAccounts()
         } catch {
             logger.error("Failed to load accounts: \(error.localizedDescription)")
         }
     }
 
-    private func addAccount() {
+    private func addAccount(replacingLocalId: UUID? = nil) {
         Task {
             do {
                 var account = try await oauthManager.performLogin()
-                if accountManager.accounts.isEmpty {
+                let hadNoAccounts = accountManager.accounts.isEmpty
+                if hadNoAccounts {
                     account.isActive = true
                 }
-                accountManager.addAccount(account)
-                try keychainStore.save(account)
-                startPollingForAccount(account.id)
+
+                let preferredLocalId: UUID?
+                if let replacingLocalId,
+                   let existing = accountManager.accounts.first(where: { $0.id == replacingLocalId }),
+                   existing.accountId == account.accountId
+                    || existing.email.caseInsensitiveCompare(account.email) == .orderedSame {
+                    preferredLocalId = replacingLocalId
+                } else {
+                    preferredLocalId = nil
+                }
+
+                let upsert = accountManager.addAccount(account, preferredLocalId: preferredLocalId)
+                persistAccounts()
+
+                guard let storedAccount = accountManager.accounts.first(where: { $0.id == upsert.localId }) else {
+                    return
+                }
+
+                if hadNoAccounts {
+                    accountManager.setActive(storedAccount.id)
+                    persistAccounts()
+                }
+
+                startPollingForAccount(storedAccount.id)
+
+                if storedAccount.isActive {
+                    try? SwapEngine.writeAuthFile(for: storedAccount)
+                    Task.detached {
+                        _ = await DesktopAppConnector.tryInjectTokens(for: storedAccount)
+                    }
+                }
+
                 statusBarController.updateIcon()
                 updatePopoverContent()
 
@@ -163,8 +206,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     NSApp.activate()
                 }
 
-                SwapLog.append(.accountAdded(email: account.email))
-                logger.info("Account added: \(account.email)")
+                switch upsert.action {
+                case .inserted:
+                    SwapLog.append(.accountAdded(email: storedAccount.email))
+                    logger.info("Account added: \(storedAccount.email)")
+                case .updated:
+                    SwapLog.append(.debug("ACCOUNT_REAUTHED email=\(storedAccount.email)"))
+                    logger.info("Account tokens updated: \(storedAccount.email)")
+                }
             } catch {
                 logger.error("Login failed: \(error.localizedDescription)")
             }
@@ -192,12 +241,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onUpdate: { [weak self] id, snapshot, planType in
                     Task { @MainActor in
                         self?.accountManager.updateQuota(for: id, snapshot: snapshot, planType: planType)
+                        self?.persistAccounts()
                         self?.statusBarController.updateIcon()
-                        // Immediate swap check if active account is approaching exhaustion
-                        if self?.accountManager.activeAccount?.id == id,
-                           (snapshot.fiveHour.isExhausted || snapshot.weekly.isExhausted) {
-                            self?.checkAndSwapIfNeeded()
-                        }
+                        self?.checkAndSwapIfNeeded()
+                        self?.primeIdleAccountsIfNeeded()
                     }
                 },
                 onError: { [weak self] id, error in
@@ -232,23 +279,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
         do {
             let updated = try await TokenRefresher.refresh(account)
-            accountManager.addAccount(updated)
-            do {
-                try keychainStore.save(updated)
-            } catch {
-                logger.warning("Failed to persist refreshed token for \(accountId): \(error.localizedDescription)")
-            }
-            // Same-account refresh — SIGHUP is safe here since the conversation
-            // thread is still valid (same account, just new tokens)
-            if account.isActive {
-                try? SwapEngine.writeAuthFile(for: updated)
-                Task.detached { SwapEngine.signalCodexReload() }
+            let upsert = accountManager.addAccount(updated, preferredLocalId: accountId)
+            persistAccounts()
+            // Preserve current CLI sessions. Future launches pick up the fresh auth file.
+            if let storedAccount = accountManager.accounts.first(where: { $0.id == upsert.localId }),
+               storedAccount.isActive {
+                try? SwapEngine.writeAuthFile(for: storedAccount)
             }
             SwapLog.append(.tokenRefreshed(email: account.email))
-            startPollingForAccount(accountId)
+            startPollingForAccount(upsert.localId)
         } catch {
             SwapLog.append(.tokenRefreshFailed(email: account.email, error: error.localizedDescription))
+            accountManager.markReauthenticationRequired(
+                for: accountId,
+                detail: "refresh token rejected — click Re-authenticate"
+            )
+            persistAccounts()
             NotificationManager.notifyTokenRefreshFailed(account: account)
+            statusBarController.updateIcon()
+            updatePopoverContent()
+        }
+    }
+
+    private func primeIdleAccountsIfNeeded() {
+        let accounts = accountManager.accounts
+        guard accounts.contains(where: { account in
+            guard !account.isActive, let snapshot = account.quotaSnapshot else { return false }
+            return snapshot.fiveHour.remainingPercent >= 99.5 || snapshot.weekly.remainingPercent >= 99.5
+        }) else {
+            return
+        }
+
+        let manager = accountManager
+        let pollRestart: @Sendable (UUID) -> Void = { [weak self] id in
+            Task { @MainActor in
+                self?.startPollingForAccount(id)
+            }
+        }
+
+        Task.detached { [weeklyPrimer] in
+            await weeklyPrimer.primeIfNeeded(
+                accounts: accounts,
+                accountProvider: { @Sendable id in
+                    await MainActor.run {
+                        manager.accounts.first { $0.id == id }
+                    }
+                },
+                onPrimed: pollRestart
+            )
         }
     }
 
@@ -267,27 +345,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func checkAndSwapIfNeeded() {
-        guard let active = accountManager.activeAccount,
-              let snapshot = active.quotaSnapshot else { return }
-
-        let fhLow = snapshot.fiveHour.isExhausted
-        let wkLow = snapshot.weekly.isExhausted
-
-        guard fhLow || wkLow else { return }
-
-        guard let best = SwapEngine.selectOptimalAccount(from: accountManager.accounts),
-              let bestSnapshot = best.quotaSnapshot else {
-            NotificationManager.notifyAllExhausted()
+        if let lastAutoSwapAt,
+           Date().timeIntervalSince(lastAutoSwapAt) < autoSwapCooldown {
             return
         }
 
-        // Only swap if the candidate can actually serve requests right now
-        // (has usable 5h AND weekly). This prevents all ping-pong scenarios:
-        // - Both accounts 5h-exhausted → neither can serve, don't swap
-        // - Active has 5h but low weekly, candidate has no 5h → stay put
-        let candidateReady = !bestSnapshot.fiveHour.isExhausted
-            && !bestSnapshot.weekly.isExhausted
-        guard candidateReady else { return }
+        guard let active = accountManager.activeAccount,
+              let activeSnapshot = active.quotaSnapshot else { return }
+
+        let activeNeedsRelief = activeSnapshot.fiveHour.isExhausted
+            || activeSnapshot.weekly.isExhausted
+
+        guard let best = SwapEngine.selectOptimalAccount(from: accountManager.accounts) else {
+            if activeNeedsRelief {
+                NotificationManager.notifyAllExhausted()
+            }
+            return
+        }
+        guard SwapEngine.shouldSwap(from: active, to: best) else { return }
 
         executeSwap(from: active, to: best, reason: .quotaExhausted)
     }
@@ -305,14 +380,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try SwapEngine.writeAuthFile(for: to)
             SwapLog.append(.authFileWritten(accountId: to.accountId))
 
-            // 2. SIGHUP + desktop injection — run off main thread
-            let shouldSighup = reason == .quotaExhausted
+            // 2. Hot-reload eligible live CLI sessions and update the desktop app.
+            // SwapEngine gates SIGHUP on verified patched installs and filters out
+            // Codex.app bundled/background processes, so this is safe for manual clicks.
             Task.detached {
-                if shouldSighup {
-                    SwapEngine.signalCodexReload()
-                } else {
-                    SwapLog.append(.sighupSkipped(reason: "manual swap — session continuity"))
-                }
+                SwapEngine.signalCodexReload()
                 let injected = await DesktopAppConnector.tryInjectTokens(for: to)
                 if injected {
                     SwapLog.append(.desktopAppInjected(port: 0))
@@ -320,6 +392,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             accountManager.setActive(to.id)
+            if reason == .quotaExhausted {
+                lastAutoSwapAt = Date()
+            }
+            persistAccounts()
             // Restart polling for new active account — clears old sleep, fetches immediately
             startPollingForAccount(to.id)
 
@@ -357,6 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 manager: accountManager,
                 onAddAccount: { [weak self] in self?.addAccount() },
                 onForceSwap: { [weak self] id in self?.forceSwap(to: id) },
+                onReauthenticate: { [weak self] id in self?.addAccount(replacingLocalId: id) },
                 onOpenSettings: { [weak self] in self?.openSettings() }
             )
         )

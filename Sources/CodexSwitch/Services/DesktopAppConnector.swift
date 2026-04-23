@@ -10,28 +10,29 @@ enum DesktopAppConnector {
     /// Discover the WebSocket port of a running Codex app-server.
     /// The app-server binds to 127.0.0.1 on a dynamic port.
     nonisolated static func discoverPort() -> UInt16? {
-        let pipe = Pipe()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        process.arguments = ["-iTCP", "-sTCP:LISTEN", "-P", "-n"]
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-        } catch {
-            logger.error("lsof failed: \(error.localizedDescription)")
+        guard let output = ProcessRunner.run(
+            executablePath: "/usr/sbin/lsof",
+            arguments: ["-iTCP", "-sTCP:LISTEN", "-P", "-n"],
+            timeout: 1.5
+        ) else {
+            logger.error("lsof failed to launch")
             return nil
         }
-
-        // Read pipe data BEFORE waitUntilExit to avoid deadlock if output fills buffer
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
+        guard !output.timedOut else {
+            logger.error("lsof timed out while probing Codex app-server")
+            return nil
+        }
+        guard output.terminationStatus == 0 else {
+            if !output.stderr.isEmpty {
+                logger.error("lsof failed: \(output.stderr.prefix(200), privacy: .public)")
+            }
+            return nil
+        }
 
         // Look for Codex desktop app listening on 127.0.0.1.
         // The Electron-based Codex app shows as "Codex" or "Electron" process names
         // with a Codex-related path in the lsof output.
-        for line in output.components(separatedBy: "\n") {
+        for line in output.stdout.components(separatedBy: "\n") {
             let lower = line.lowercased()
             // Skip our own CodexSwitch and CLI processes
             guard !lower.contains("codexswitch") else { continue }

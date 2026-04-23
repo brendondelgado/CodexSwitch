@@ -23,6 +23,46 @@ actor QuotaPoller {
         return base * multiplier
     }
 
+    static func initialPollDelay(
+        hasCachedSnapshot: Bool,
+        randomDelay: TimeInterval = TimeInterval.random(in: 5...15)
+    ) -> TimeInterval {
+        _ = hasCachedSnapshot
+        _ = randomDelay
+        return 0
+    }
+
+    static func inactivePollInterval(
+        for snapshot: QuotaSnapshot,
+        now: Date = Date()
+    ) -> TimeInterval {
+        let fhReset = snapshot.fiveHour.resetsAt.timeIntervalSince(now)
+        let wkReset = snapshot.weekly.resetsAt.timeIntervalSince(now)
+        let bothWindowsFresh = snapshot.fiveHour.usedPercent == 0
+            && snapshot.weekly.usedPercent == 0
+            && fhReset > 0
+            && wkReset > 0
+
+        let interval: TimeInterval
+        if bothWindowsFresh {
+            // Freshly reset idle accounts look dead if we only revisit them every 5-10 minutes.
+            // Keep them warm enough that the UI and swap logic see the countdown move.
+            interval = 60
+        } else if snapshot.fiveHour.isExhausted && fhReset > 0 {
+            interval = fhReset + 2
+        } else if snapshot.fiveHour.remainingPercent > 50 {
+            interval = 600
+        } else {
+            interval = 300
+        }
+
+        let nearestReset = min(fhReset, wkReset)
+        if nearestReset > 0 && nearestReset + 2 < interval {
+            return nearestReset + 2
+        }
+        return interval
+    }
+
     struct FetchResult: Sendable {
         let snapshot: QuotaSnapshot
         let planType: String
@@ -83,12 +123,11 @@ actor QuotaPoller {
         stopPolling(for: accountId)
 
         pollTasks[accountId] = Task {
-            // First poll: fetch immediately (small random delay to stagger multiple accounts)
+            // First poll: fetch immediately so fresh/idle accounts get a real window snapshot
+            // instead of looking inert until the next scheduled pass.
             let initialAccount = await accountProvider(accountId)
             let hasData = initialAccount?.quotaSnapshot != nil
-            var interval: TimeInterval = hasData
-                ? Self.pollInterval(forRemainingPercent: initialAccount?.quotaSnapshot?.fiveHour.remainingPercent ?? 100)
-                : TimeInterval.random(in: 5...15)
+            var interval = Self.initialPollDelay(hasCachedSnapshot: hasData)
 
             logger.info("Starting poll for \(accountId) — initial interval: \(String(format: "%.0f", interval))s, hasData: \(hasData)")
 
@@ -113,27 +152,10 @@ actor QuotaPoller {
                             isActive: true
                         )
                     } else {
-                        // Inactive account: sleep until next reset, then recheck
-                        let fhReset = result.snapshot.fiveHour.timeUntilReset
-                        let wkReset = result.snapshot.weekly.timeUntilReset
-
-                        if result.snapshot.fiveHour.isExhausted && fhReset > 0 {
-                            // Exhausted — wake up 2s after 5h reset
-                            interval = fhReset + 2
-                            logger.info("Inactive \(currentAccount.email, privacy: .private) exhausted — sleeping \(String(format: "%.0f", interval))s until 5h reset")
-                        } else if result.snapshot.fiveHour.remainingPercent > 50 {
-                            // Plenty of quota — check again in 10 minutes
-                            interval = 600
-                        } else {
-                            // Moderate quota — check every 5 minutes
-                            interval = 300
-                        }
-
-                        // But never sleep longer than the nearest reset window
-                        let nearestReset = min(fhReset, wkReset)
-                        if nearestReset > 0 && nearestReset + 2 < interval {
-                            interval = nearestReset + 2
-                        }
+                        interval = Self.inactivePollInterval(
+                            for: result.snapshot,
+                            now: result.snapshot.fetchedAt
+                        )
                     }
 
                     logger.info("Poll success for \(currentAccount.email, privacy: .private) [active=\(currentAccount.isActive)] — next in \(String(format: "%.0f", interval))s")

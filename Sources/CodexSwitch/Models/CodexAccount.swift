@@ -10,6 +10,7 @@ struct CodexAccount: Codable, Identifiable, Sendable {
     var quotaSnapshot: QuotaSnapshot?
     var planType: String?
     var lastRefreshed: Date?
+    var reauthenticationError: String?
     var isActive: Bool
 
     var planLabel: String {
@@ -27,6 +28,7 @@ struct CodexAccount: Codable, Identifiable, Sendable {
         quotaSnapshot: QuotaSnapshot? = nil,
         planType: String? = nil,
         lastRefreshed: Date? = nil,
+        reauthenticationError: String? = nil,
         isActive: Bool = false
     ) {
         self.id = id
@@ -38,6 +40,7 @@ struct CodexAccount: Codable, Identifiable, Sendable {
         self.quotaSnapshot = quotaSnapshot
         self.planType = planType
         self.lastRefreshed = lastRefreshed
+        self.reauthenticationError = reauthenticationError
         self.isActive = isActive
     }
 }

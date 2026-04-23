@@ -4,6 +4,7 @@ struct PopoverContentView: View {
     @Bindable var manager: AccountManager
     var onAddAccount: () -> Void
     var onForceSwap: (UUID) -> Void
+    var onReauthenticate: (UUID) -> Void
     var onOpenSettings: () -> Void
 
     private static let relativeFormatter = RelativeDateTimeFormatter()
@@ -46,6 +47,13 @@ struct PopoverContentView: View {
     private var connectionStatus: (icon: String, label: String, color: Color) {
         if manager.accounts.isEmpty {
             return ("bolt.slash.fill", "No accounts — tap + to add one", .secondary)
+        }
+        let staleCount = manager.accounts.filter { manager.requiresReauthentication(for: $0.id) }.count
+        if staleCount > 0 {
+            let label = staleCount == 1
+                ? "1 account needs re-authentication"
+                : "\(staleCount) accounts need re-authentication"
+            return ("key.slash.fill", label, .red)
         }
         let hasQuotaData = manager.accounts.contains { $0.quotaSnapshot != nil }
         let hasErrors = manager.accounts.contains { manager.pollingErrors[$0.id] != nil }
@@ -127,12 +135,17 @@ struct PopoverContentView: View {
             } else {
                 LazyVGrid(columns: columns, spacing: 8) {
                     ForEach(manager.sortedAccounts) { account in
+                        let displayError = manager.reauthenticationError(for: account.id) ?? manager.pollingErrors[account.id]
                         AccountCardView(
                             account: account,
-                            pollingError: manager.pollingErrors[account.id]
-                        ) {
-                            onForceSwap(account.id)
-                        }
+                            pollingError: displayError,
+                            onForceSwap: {
+                                onForceSwap(account.id)
+                            },
+                            onReauthenticate: {
+                                onReauthenticate(account.id)
+                            }
+                        )
                     }
                 }
                 .padding(10)
@@ -198,7 +211,7 @@ struct PopoverContentView: View {
                     Image(systemName: desktopStatus.icon)
                         .font(.system(size: 9))
                         .foregroundStyle(desktopStatus.isHealthy ? .green : .secondary)
-                    Text(desktopStatus.label)
+                    Text(desktopStatus.autoSwapLabel)
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(desktopStatus.isHealthy ? .green : .secondary)
                 }

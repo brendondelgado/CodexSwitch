@@ -34,6 +34,8 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 
 **⚡ SIGHUP Hot-Swap** — Sends SIGHUP to running Codex CLI processes after every swap and on app launch, so the CLI reloads tokens instantly. Uses `pgrep` + `proc_pidinfo` to find processes and skip those younger than 10 seconds (still initializing).
 
+**🛠 Lightweight Fork Auto-Repair** — When a Codex CLI update replaces the live binary, CodexSwitch detects the new install surface on launch and reapplies the lightweight SIGHUP fork to the active `codex` install instead of waiting for a manual settings action.
+
 **🖥 Desktop App Token Injection** — Detects the Codex desktop app via WebSocket and injects new tokens directly, keeping desktop sessions in sync.
 
 **📊 Pooled Usage Meter** — Aggregated view of all accounts' 5-hour and weekly capacity with Pro plan equivalence comparison. Shows estimated pool runway using `min(5h estimate, weekly ceiling)`. When all weekly is exhausted, shows countdown to nearest weekly reset.
@@ -124,7 +126,7 @@ Inactive accounts with plenty of quota (> 50%) check every 10 minutes. Exhausted
 - macOS 15+
 - Swift 6.3+ (Xcode 26+)
 - One or more ChatGPT Plus accounts with Codex CLI access
-- A SIGHUP-capable Codex CLI binary (writes `~/.codexswitch/sighup-verified` on startup)
+- A SIGHUP-capable Codex CLI binary (writes one of `~/.codexswitch/sighup-verified`, `~/.codexswitch/sighup-verified-tui`, or `~/.codexswitch/sighup-verified-exec` on startup)
 
 ### Build & Run
 
@@ -167,6 +169,8 @@ Sources/CodexSwitch/
 ├── Services/
 │   ├── AccountImporter.swift       # Import from ~/.codex/auth.json
 │   ├── CLIStatusChecker.swift      # Verify CLI can read current auth
+│   ├── CodexInstallLocator.swift   # Resolve active codex install + patch target
+│   ├── CodexPatchState.swift       # Persist patched install state + marker checks
 │   ├── CodexVersionChecker.swift   # Detect SIGHUP-capable binary
 │   ├── DesktopAppConnector.swift   # WebSocket token injection for desktop app
 │   ├── KeychainStore.swift         # Keychain CRUD operations

@@ -27,6 +27,14 @@ private func keychainAvailable() -> Bool {
 
 @Suite("KeychainStore")
 struct KeychainStoreTests {
+    private func makeTempStore() throws -> (KeychainStore, URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexSwitch-KeychainStoreTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let storeURL = dir.appendingPathComponent("accounts.json")
+        return (KeychainStore(service: "CodexSwitch-Test-\(UUID().uuidString)", storeURL: storeURL), dir)
+    }
+
     // Use unique service names per test to avoid polluting real Keychain
     @Test("Store and retrieve account credentials")
     func storeAndRetrieve() throws {
@@ -113,5 +121,57 @@ struct KeychainStoreTests {
         #expect(account.accessToken == "act_def")
         #expect(account.accountId == "df3c3241-56e1-4dfb-b6aa-dd0f6e3286a1")
         #expect(account.email.contains("@")) // Extracted from JWT or fallback
+    }
+
+    @Test("Replacing all accounts persists only one active account")
+    func replaceAllNormalizesActiveFlags() throws {
+        let (store, dir) = try makeTempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let plus = CodexAccount(
+            email: "plus@test.com",
+            accessToken: "t1",
+            refreshToken: "r1",
+            idToken: "i1",
+            accountId: "plus-account",
+            isActive: true
+        )
+        let pro = CodexAccount(
+            email: "pro@test.com",
+            accessToken: "t2",
+            refreshToken: "r2",
+            idToken: "i2",
+            accountId: "pro-account",
+            isActive: true
+        )
+
+        try store.replaceAll([plus, pro])
+
+        let loaded = try store.loadAll()
+        let activeAccounts = loaded.filter(\.isActive)
+        #expect(activeAccounts.count == 1)
+        #expect(activeAccounts.first?.accountId == "pro-account")
+    }
+
+    @Test("Re-authentication state survives file round-trip")
+    func reauthenticationStateRoundTrips() throws {
+        let (store, dir) = try makeTempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let account = CodexAccount(
+            email: "stale@test.com",
+            accessToken: "t1",
+            refreshToken: "r1",
+            idToken: "i1",
+            accountId: "stale-account",
+            reauthenticationError: "Re-authentication required — refresh token rejected",
+            isActive: false
+        )
+
+        try store.replaceAll([account])
+
+        let loaded = try store.loadAll()
+        #expect(loaded.count == 1)
+        #expect(loaded[0].reauthenticationError == "Re-authentication required — refresh token rejected")
     }
 }
