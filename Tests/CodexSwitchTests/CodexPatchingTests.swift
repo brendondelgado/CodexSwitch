@@ -87,7 +87,7 @@ struct CodexPatchingTests {
         let summary = CodexDesktopAppStatusSummary(
             installedVersionLabel: "26.417.41555 (1858)",
             runtimeLabel: "stale runtime",
-            patchLabel: "Desktop compatibility will be verified automatically",
+            patchLabel: "Desktop hot-swap patch will be applied automatically",
             patchHealthy: false,
             canPatchNow: true
         )
@@ -130,8 +130,8 @@ struct CodexPatchingTests {
         #expect(decision == .repairNeeded)
     }
 
-    @Test("Desktop repair decider accepts a valid stock bundle with matching state")
-    func desktopRepairDeciderAcceptsStockBundleWithMatchingState() {
+    @Test("Desktop repair decider does not accept stock bundles as patched")
+    func desktopRepairDeciderDoesNotAcceptStockBundleWithMatchingState() {
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
             asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
@@ -151,6 +151,32 @@ struct CodexPatchingTests {
             usageState: .notRunning,
             bundleIsValid: true,
             signatureStatus: .officialOpenAI
+        )
+
+        #expect(decision == .repairNeeded)
+    }
+
+    @Test("Desktop repair decider accepts a patched ad-hoc bundle with matching state")
+    func desktopRepairDeciderAcceptsPatchedAdHocBundleWithMatchingState() {
+        let install = CodexDesktopAppInstall(
+            appPath: "/Applications/Codex.app",
+            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
+            bundleVersion: "1858",
+            shortVersion: "26.417.41555"
+        )
+        let savedState = CodexDesktopPatchedAppState(
+            bundleVersion: "1858",
+            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
+        )
+
+        let decision = CodexDesktopAppPatchRepairDecider.decision(
+            currentInstall: install,
+            savedState: savedState,
+            patchMarkerPresent: true,
+            legacyPatchMarkerPresent: false,
+            usageState: .notRunning,
+            bundleIsValid: true,
+            signatureStatus: .adHoc
         )
 
         #expect(decision == .noRepairNeeded)
@@ -449,7 +475,7 @@ struct CodexPatchingTests {
         )
 
         #expect(result?.success == false)
-        #expect(result?.message == "Failed to stop the detached Codex app-server before restoring the desktop bundle")
+        #expect(result?.message == "Failed to stop the detached Codex app-server before patching the desktop bundle")
     }
 
     @Test("Desktop app process classifier ignores detached app-server as a patch blocker")
@@ -470,6 +496,34 @@ struct CodexPatchingTests {
             appPath: "/Applications/Codex.app",
             processCommands: [
                 "/Applications/Codex.app/Contents/MacOS/Codex"
+            ]
+        )
+
+        #expect(usageState == .appRunning)
+    }
+
+    @Test("Desktop app process classifier treats detached app-server children as stoppable")
+    func desktopProcessClassifierTreatsDetachedAppServerChildrenAsStoppable() {
+        let usageState = CodexDesktopAppProcessClassifier.usageState(
+            appPath: "/Applications/Codex.app",
+            processCommands: [
+                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+                "/Applications/Codex.app/Contents/Resources/codex_chronicle",
+                "/Applications/Codex.app/Contents/Resources/node_repl",
+                "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient mcp"
+            ]
+        )
+
+        #expect(usageState == .backgroundServiceOnly)
+    }
+
+    @Test("Desktop app process classifier blocks Electron helpers")
+    func desktopProcessClassifierBlocksElectronHelpers() {
+        let usageState = CodexDesktopAppProcessClassifier.usageState(
+            appPath: "/Applications/Codex.app",
+            processCommands: [
+                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+                "/Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=gpu-process"
             ]
         )
 
@@ -502,8 +556,8 @@ struct CodexPatchingTests {
         #expect(decision == .repairNeeded)
     }
 
-    @Test("Desktop app repair defers while an ad-hoc bundle is still running")
-    func desktopRepairDefersForRunningAdHocBundle() {
+    @Test("Desktop app repair defers while Codex.app is still running")
+    func desktopRepairDefersForRunningBundle() {
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
             asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
@@ -524,8 +578,8 @@ struct CodexPatchingTests {
         #expect(decision == .deferWhileRunning)
     }
 
-    @Test("Desktop app repair records a clean running stock bundle when the build changed")
-    func desktopRepairRecordsRunningCleanStockBundleWhenBuildChanged() {
+    @Test("Desktop app repair defers a running clean stock bundle when the build changed")
+    func desktopRepairDefersRunningCleanStockBundleWhenBuildChanged() {
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
             asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
@@ -547,6 +601,6 @@ struct CodexPatchingTests {
             signatureStatus: .officialOpenAI
         )
 
-        #expect(decision == .repairNeeded)
+        #expect(decision == .deferWhileRunning)
     }
 }

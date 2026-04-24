@@ -218,6 +218,46 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn("),l()};return e.addAuthStatusCallback(d)", patched)
             self.assertEqual(patched, expected)
 
+    def test_apply_desktop_request_patch_adds_login_helpers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-server-manager-signals-test.js"
+            target.write_text(
+                "class R{"
+                "writeSkillConfig(e){return this.sendRequest(`skills/config/write`,e)}"
+                "async getAccount(){return this.sendRequest(`account/read`,{refreshToken:!1})}"
+                "}"
+            )
+
+            ok = patch_asar.apply_desktop_request_patch(target)
+
+            patched = target.read_text()
+            self.assertTrue(ok)
+            self.assertIn("codexSwitchReadHostFile", patched)
+            self.assertIn("codexSwitchLoginWithChatGptAuthTokens", patched)
+            self.assertIn("account/login/start", patched)
+
+    def test_apply_desktop_auth_sync_patch_adds_auth_file_watcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "use-auth-test.js"
+            target.write_text(
+                "var p=e(t(),1),m=(0,p.createContext)(void 0),g=2e3,_=new WeakMap;"
+                "function y(e,t){let n=(0,u.c)(14),h;"
+                "h=()=>{if(e==null)return;let t=!1,n=!1,s=null,l=()=>{S(e)}};"
+                "return h}"
+            )
+
+            ok = patch_asar.apply_desktop_auth_sync_patch(
+                target,
+                "/Users/test/.codex/auth.json",
+            )
+
+            patched = target.read_text()
+            self.assertTrue(ok)
+            self.assertIn("_codexSwitchEnsureDesktopAuthSync", patched)
+            self.assertIn("_codexSwitchDesktopAuthPath", patched)
+            self.assertIn("/Users/test/.codex/auth.json", patched)
+            self.assertIn("if(e==null)return;_codexSwitchEnsureDesktopAuthSync(e);let", patched)
+
     def test_list_codesign_targets_orders_nested_code_before_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = (Path(tmp) / "Codex.app").resolve()

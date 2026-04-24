@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Apply the minimal safe Codex desktop patch used by CodexSwitch.
+"""Apply the minimal Codex desktop hot-swap patch used by CodexSwitch.
 
-This keeps the official OpenAI Codex macOS bundle as stock as possible. It only
-removes legacy or unstable CodexSwitch desktop patches that mutated the renderer
-on a timer or added app-server request helpers.
-
-Desktop hot-swapping now happens through CodexSwitch's direct app-server login
-injection, not by polling `~/.codex/auth.json` from inside Codex.app.
+The desktop app keeps auth in renderer/app-server memory, so writing
+~/.codex/auth.json is not enough for in-place account swaps. This patch adds a
+small renderer-side bridge that watches the local auth file and asks Codex.app's
+own app-server to load changed ChatGPT tokens. It also removes the older query
+invalidation-only patch when present.
 """
 
 from __future__ import annotations
@@ -53,9 +52,6 @@ RESOURCE_EXECUTABLE_NAMES = {
 
 LEGACY_PATCH_MARKERS = (
     LEGACY_AUTH_PATCH_MARKER,
-    DESKTOP_AUTH_SYNC_MARKER,
-    DESKTOP_AUTH_REQUEST_MARKER,
-    "codexSwitchReadHostFile",
 )
 
 
@@ -204,26 +200,25 @@ def find_auth_file(assets_dir: Path) -> Path | None:
     if not assets_dir.exists():
         return None
 
-    content_markers = ("addAuthStatusCallback", "getAccount")
-    stronger_markers = ("authMethod", "function C(")
+    content_markers = (
+        "addAuthStatusCallback",
+        "getAccount",
+        "useAuth must be used within AuthProvider",
+    )
 
     for pattern in (
-        "invalidate-queries-and-broadcast-*.js",
         "use-auth-*.js",
         "app-server-manager-hooks-*.js",
+        "invalidate-queries-and-broadcast-*.js",
     ):
         for f in assets_dir.glob(pattern):
             content = f.read_text()
-            if all(m in content for m in content_markers) and all(
-                m in content for m in stronger_markers
-            ):
+            if all(m in content for m in content_markers):
                 return f
 
     for f in assets_dir.glob("*.js"):
         content = f.read_text()
-        if all(m in content for m in content_markers) and all(
-            m in content for m in stronger_markers
-        ):
+        if all(m in content for m in content_markers):
             return f
     return None
 
@@ -295,6 +290,87 @@ def migrate_legacy_auth_patch(file_path: Path) -> bool:
 
     file_path.write_text(patched)
     print(f"  Removed legacy auth patch: {file_path.name}")
+    return True
+
+
+def apply_desktop_request_patch(file_path: Path) -> bool:
+    content = file_path.read_text()
+
+    if DESKTOP_AUTH_REQUEST_MARKER in content and "codexSwitchReadHostFile" in content:
+        print(f"  Desktop request helper patch already present: {file_path.name}")
+        return True
+
+    anchor = 'writeSkillConfig(e){return this.sendRequest(`skills/config/write`,e)}'
+    injected = (
+        anchor
+        + 'codexSwitchReadHostFile(e){return this.sendRequest(`fs/readFile`,{path:e})}'
+        + 'async codexSwitchLoginWithChatGptAuthTokens(e,t,n=null){return this.sendRequest(`account/login/start`,{type:`chatgptAuthTokens`,accessToken:e,chatgptAccountId:t,chatgptPlanType:n})}'
+    )
+    if anchor not in content:
+        print("ERROR: Cannot find request helper anchor in send-app-server-request bundle")
+        return False
+
+    patched = content.replace(anchor, injected, 1)
+    if DESKTOP_AUTH_REQUEST_MARKER not in patched or "codexSwitchReadHostFile" not in patched:
+        print("ERROR: Desktop request helper patch did not apply cleanly")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Added desktop request helpers: {file_path.name}")
+    return True
+
+
+def apply_desktop_auth_sync_patch(file_path: Path, auth_path: str) -> bool:
+    content = file_path.read_text()
+
+    if DESKTOP_AUTH_SYNC_MARKER in content:
+        print(f"  Desktop auth sync patch already present: {file_path.name}")
+        return True
+
+    weak_map_anchor = re.search(
+        r"var [^;]*=new WeakMap;(?=function)",
+        content,
+    )
+    if not weak_map_anchor:
+        print("ERROR: Cannot find auth module WeakMap anchor")
+        return False
+
+    auth_path_literal = json.dumps(auth_path)
+    module_patch = (
+        f"var _codexSwitchDesktopAuthPath={auth_path_literal},"
+        "_codexSwitchDesktopAuthSig=null,"
+        "_codexSwitchDesktopAuthInflight=null,"
+        "_codexSwitchDesktopAuthPrimed=!1,"
+        "_codexSwitchDesktopAuthTimerStarted=!1;"
+        "function _codexSwitchDecodeBase64(e){let t=atob(e),n=new Uint8Array(t.length);for(let e=0;e<t.length;e++)n[e]=t.charCodeAt(e);return new TextDecoder().decode(n)}"
+        "async function _codexSwitchSyncDesktopAuth(e){let t=await e.codexSwitchReadHostFile(_codexSwitchDesktopAuthPath),n=JSON.parse(_codexSwitchDecodeBase64(t.dataBase64)),r=n?.tokens?.account_id,i=n?.tokens?.access_token;if(!(typeof r==`string`&&r.length>0&&typeof i==`string`&&i.length>0))return;let a=`${r}:${i.slice(-32)}`;if(a===_codexSwitchDesktopAuthSig)return;if(!_codexSwitchDesktopAuthPrimed){_codexSwitchDesktopAuthPrimed=!0,_codexSwitchDesktopAuthSig=a;return}await e.codexSwitchLoginWithChatGptAuthTokens(i,r,null),_codexSwitchDesktopAuthSig=a}"
+        "function _codexSwitchEnsureDesktopAuthSync(e){if(_codexSwitchDesktopAuthTimerStarted||typeof e.codexSwitchReadHostFile!=`function`||typeof e.codexSwitchLoginWithChatGptAuthTokens!=`function`)return;_codexSwitchDesktopAuthTimerStarted=!0;let t=()=>{_codexSwitchDesktopAuthInflight??=Promise.resolve().then(()=>_codexSwitchSyncDesktopAuth(e)).catch(()=>{}).finally(()=>{_codexSwitchDesktopAuthInflight=null})};t(),setInterval(t,2e3)}"
+    )
+    patched = (
+        content[: weak_map_anchor.end()]
+        + module_patch
+        + content[weak_map_anchor.end() :]
+    )
+
+    effect_pattern = re.compile(
+        r"(\(\)\=>\{if\(([A-Za-z_$][\w$]*)==null\)return;)let ",
+        flags=re.M,
+    )
+    patched, replacements = effect_pattern.subn(
+        r"\1_codexSwitchEnsureDesktopAuthSync(\2);let ",
+        patched,
+        count=1,
+    )
+    if replacements != 1:
+        print("ERROR: Cannot find auth effect anchor for desktop sync patch")
+        return False
+
+    if DESKTOP_AUTH_SYNC_MARKER not in patched or "_codexSwitchDesktopAuthPrimed" not in patched:
+        print("ERROR: Desktop auth sync patch marker missing after patch")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Added desktop auth sync: {file_path.name}")
     return True
 
 
@@ -384,9 +460,14 @@ def bundle_is_valid() -> bool:
     return verify.returncode == 0
 
 
-def asar_contains_legacy_patch() -> bool:
+def asar_contains_hot_swap_patch() -> bool:
     data = ASAR_PATH.read_bytes()
-    return any(marker.encode() in data for marker in LEGACY_PATCH_MARKERS)
+    return (
+        DESKTOP_AUTH_SYNC_MARKER.encode() in data
+        and DESKTOP_AUTH_REQUEST_MARKER.encode() in data
+        and b"codexSwitchReadHostFile" in data
+        and not any(marker.encode() in data for marker in LEGACY_PATCH_MARKERS)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -501,12 +582,12 @@ def main():
         print(f"Codex.app not found at {APP_PATH}")
         sys.exit(2)
 
-    if not asar_contains_legacy_patch():
+    if asar_contains_hot_swap_patch():
         if bundle_is_valid():
-            print("Codex desktop bundle is already hot-swap compatible and signed.")
+            print("Codex desktop bundle is already hot-swap patched and signed.")
             sys.exit(0)
 
-        print("Bundle has no legacy desktop patch, but the signature is invalid; refreshing signatures.")
+        print("Bundle is hot-swap patched, but the signature is invalid; refreshing signatures.")
         if not refresh_signature_state():
             sys.exit(1)
         print("Done! Codex desktop app signatures were refreshed.")
@@ -533,6 +614,13 @@ def main():
     auth_file = find_auth_file(assets_dir)
     request_file = find_request_file(assets_dir)
 
+    if not auth_file:
+        print("ERROR: Could not find Codex desktop auth bundle")
+        sys.exit(2)
+    if not request_file:
+        print("ERROR: Could not find Codex desktop app-server request bundle")
+        sys.exit(2)
+
     needs_repack = False
 
     if auth_file and LEGACY_AUTH_PATCH_MARKER in auth_file.read_text():
@@ -542,26 +630,23 @@ def main():
             sys.exit(1)
         needs_repack = True
 
-    if auth_file and DESKTOP_AUTH_SYNC_MARKER in auth_file.read_text():
-        print("Removing unstable desktop auth sync patch...")
-        if not remove_desktop_auth_sync_patch(auth_file, str(AUTH_JSON_PATH)):
-            print("ERROR: Desktop auth sync patch removal failed")
+    if DESKTOP_AUTH_REQUEST_MARKER not in request_file.read_text() or "codexSwitchReadHostFile" not in request_file.read_text():
+        print("Applying desktop request helper patch...")
+        if not apply_desktop_request_patch(request_file):
+            print("ERROR: Desktop request helper patch failed")
             sys.exit(1)
         needs_repack = True
 
-    if request_file and (
-        DESKTOP_AUTH_REQUEST_MARKER in request_file.read_text()
-        or "codexSwitchReadHostFile" in request_file.read_text()
-    ):
-        print("Removing now-unused desktop request helper patch...")
-        if not remove_desktop_request_patch(request_file):
-            print("ERROR: Desktop request helper patch removal failed")
+    if DESKTOP_AUTH_SYNC_MARKER not in auth_file.read_text():
+        print("Applying desktop auth hot-swap patch...")
+        if not apply_desktop_auth_sync_patch(auth_file, str(AUTH_JSON_PATH)):
+            print("ERROR: Desktop auth hot-swap patch failed")
             sys.exit(1)
         needs_repack = True
 
     if not needs_repack:
         if bundle_is_valid():
-            print("Codex desktop bundle is already hot-swap compatible and signed.")
+            print("Codex desktop bundle is already hot-swap patched and signed.")
             sys.exit(0)
 
         print("Bundle needs signature refresh; updating integrity and signatures.")
@@ -587,7 +672,7 @@ def main():
     else:
         print("Backup already exists: app.asar.bak")
 
-    print("Installing cleaned asar...")
+    print("Installing patched asar...")
     shutil.copy2(repacked_asar, ASAR_PATH)
     print("Preserving existing app.asar.unpacked contents from installed Codex.app")
 

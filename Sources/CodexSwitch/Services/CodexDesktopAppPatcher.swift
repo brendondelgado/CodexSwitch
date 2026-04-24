@@ -104,21 +104,13 @@ enum CodexDesktopAppPatchRepairDecider {
     ) -> CodexDesktopAppPatchRepairDecision {
         let savedStateMatches = savedState?.bundleVersion == currentInstall.bundleVersion
             && savedState?.asarPath == currentInstall.asarPath
-        let signatureAllowsHotSwap = signatureStatus == .officialOpenAI
-            || signatureStatus == .adHoc
-        _ = patchMarkerPresent
 
         if bundleIsValid,
+           patchMarkerPresent,
            !legacyPatchMarkerPresent,
            savedStateMatches,
-           signatureAllowsHotSwap {
+           signatureStatus == .adHoc {
             return .noRepairNeeded
-        }
-
-        if bundleIsValid,
-           !legacyPatchMarkerPresent,
-           signatureAllowsHotSwap {
-            return .repairNeeded
         }
 
         if usageState == .appRunning {
@@ -130,6 +122,8 @@ enum CodexDesktopAppPatchRepairDecider {
 }
 
 enum CodexDesktopAppProcessClassifier {
+    private static let scanFailedSentinel = "<codexswitch-process-scan-unavailable>"
+
     static func usageState(
         appPath: String,
         processCommands: [String]? = nil
@@ -143,7 +137,7 @@ enum CodexDesktopAppProcessClassifier {
         }
 
         let isBackgroundOnly = relevantCommands.allSatisfy {
-            $0.contains("\(appPath)/Contents/Resources/codex app-server")
+            isDetachedAppServerProcess(command: $0, appPath: appPath)
         }
         if isBackgroundOnly {
             return .backgroundServiceOnly
@@ -154,27 +148,32 @@ enum CodexDesktopAppProcessClassifier {
 
     static func runningCommands(appPath: String) -> [String] {
         guard let output = ProcessRunner.run(
-            executablePath: "/usr/bin/pgrep",
-            arguments: ["-af", "\(appPath)/Contents"],
-            timeout: 1.5
+            executablePath: "/bin/ps",
+            arguments: ["axww", "-o", "command="],
+            timeout: 2.5
         ) else {
-            return []
+            desktopPatchLogger.warning("Unable to scan Codex.app processes; deferring desktop patch")
+            return ["\(appPath)/Contents/MacOS/Codex \(scanFailedSentinel)"]
         }
         guard !output.timedOut, output.terminationStatus == 0 else {
-            return []
+            desktopPatchLogger.warning("Codex.app process scan failed or timed out; deferring desktop patch")
+            return ["\(appPath)/Contents/MacOS/Codex \(scanFailedSentinel)"]
         }
 
         return output.stdout
             .split(separator: "\n")
             .map { line in
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard let splitIndex = trimmed.firstIndex(of: " ") else {
-                    return trimmed
-                }
-                return trimmed[trimmed.index(after: splitIndex)...]
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                line.trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            .filter { !$0.isEmpty }
+            .filter { $0.contains("\(appPath)/Contents/") }
+    }
+
+    private static func isDetachedAppServerProcess(command: String, appPath: String) -> Bool {
+        let resourcesPath = "\(appPath)/Contents/Resources"
+        return command.contains("\(resourcesPath)/codex app-server")
+            || command.contains("\(resourcesPath)/codex_chronicle")
+            || command.contains("\(resourcesPath)/node_repl")
+            || command.contains("\(resourcesPath)/plugins/")
     }
 
     static func stopDetachedAppServer(appPath: String) -> Bool {
@@ -210,11 +209,13 @@ enum CodexDesktopAppProcessClassifier {
 enum CodexDesktopAppLocator {
     static let appBundleIdentifier = "com.openai.codex"
     private static let defaultAppPath = "/Applications/Codex.app"
-    private static let legacyPatchMarkers = [
-        "_invalidateAccountQueries",
+    private static let requiredPatchMarkers = [
         "_codexSwitchEnsureDesktopAuthSync",
         "codexSwitchLoginWithChatGptAuthTokens",
         "codexSwitchReadHostFile",
+    ]
+    private static let legacyPatchMarkers = [
+        "_invalidateAccountQueries",
     ]
 
     static func locate(appPath: String = defaultAppPath) -> CodexDesktopAppInstall? {
@@ -247,10 +248,13 @@ enum CodexDesktopAppLocator {
             return false
         }
 
+        let hasAllRequiredMarkers = requiredPatchMarkers.allSatisfy { marker in
+            data.range(of: Data(marker.utf8)) != nil
+        }
         let hasLegacyMarkers = legacyPatchMarkers.contains { marker in
             data.range(of: Data(marker.utf8)) != nil
         }
-        return !hasLegacyMarkers
+        return hasAllRequiredMarkers && !hasLegacyMarkers
     }
 
     static func legacyPatchMarkerPresent(install: CodexDesktopAppInstall) -> Bool {
@@ -504,6 +508,7 @@ enum CodexDesktopAppPatcher {
         }
 
         guard let patchedInstall = CodexDesktopAppLocator.locate(appPath: install.appPath),
+              CodexDesktopAppLocator.patchMarkerPresent(install: patchedInstall),
               !CodexDesktopAppLocator.legacyPatchMarkerPresent(install: patchedInstall),
               CodexDesktopAppLocator.bundleIsValid(appPath: patchedInstall.appPath) else {
             return CodexDesktopAppPatchResult(
@@ -512,11 +517,10 @@ enum CodexDesktopAppPatcher {
             )
         }
 
-        let signatureStatus = CodexDesktopAppLocator.signatureStatus(appPath: patchedInstall.appPath)
-        guard signatureStatus == .officialOpenAI || signatureStatus == .adHoc else {
+        guard CodexDesktopAppLocator.signatureStatus(appPath: patchedInstall.appPath) == .adHoc else {
             return CodexDesktopAppPatchResult(
                 success: false,
-                message: "Desktop patch completed but bundle signature is not trusted"
+                message: "Desktop patch completed but bundle was not ad-hoc signed"
             )
         }
 
@@ -529,8 +533,7 @@ enum CodexDesktopAppPatcher {
         guard inspection.patchMarkerPresent,
               !inspection.legacyPatchMarkerPresent,
               inspection.bundleIsValid,
-              inspection.signatureStatus == .officialOpenAI
-                || inspection.signatureStatus == .adHoc else {
+              inspection.signatureStatus == .adHoc else {
             return nil
         }
 
@@ -550,13 +553,13 @@ enum CodexDesktopAppPatcher {
         } catch {
             return CodexDesktopAppPatchResult(
                 success: false,
-                message: "Desktop compatibility verified but state save failed: \(error.localizedDescription)"
+                message: "Desktop hot-swap patch verified but state save failed: \(error.localizedDescription)"
             )
         }
 
         return CodexDesktopAppPatchResult(
             success: true,
-            message: "Verified Codex.app \(install.versionLabel) for CodexSwitch desktop hot-swap compatibility"
+            message: "Verified Codex.app \(install.versionLabel) desktop hot-swap patch"
         )
     }
 
@@ -627,18 +630,29 @@ enum CodexDesktopAppPatcher {
     ) -> String {
         switch inspection.decision {
         case .noRepairNeeded:
-            return "Desktop hot-swap ready"
+            return "Desktop hot-swap patch applied"
         case .deferWhileRunning:
             if inspection.legacyPatchMarkerPresent {
                 return "Quit Codex.app to repair the legacy desktop patch"
             }
+            if !inspection.patchMarkerPresent {
+                return "Quit Codex.app to apply the desktop hot-swap patch"
+            }
             if inspection.signatureStatus == .nonOpenAISigned {
                 return "Quit Codex.app to repair the desktop bundle signature"
             }
-            return "Quit Codex.app to verify the latest desktop build"
+            return "Quit Codex.app to verify the desktop hot-swap patch"
         case .repairNeeded:
             if inspection.legacyPatchMarkerPresent {
                 return "Legacy desktop patch found — auto-repair required"
+            }
+            if inspection.patchMarkerPresent,
+               inspection.signatureStatus == .adHoc,
+               !inspection.bundleIsValid {
+                return "Desktop hot-swap patch signature is invalid — repair required"
+            }
+            if inspection.patchMarkerPresent {
+                return "Desktop hot-swap patch state is stale — auto-repair required"
             }
             if inspection.signatureStatus == .nonOpenAISigned {
                 return "Desktop bundle signature is not from OpenAI — repair required"
@@ -649,7 +663,7 @@ enum CodexDesktopAppPatcher {
             if !inspection.bundleIsValid {
                 return "Desktop bundle signature is invalid — repair required"
             }
-            return "Desktop compatibility will be verified automatically"
+            return "Desktop hot-swap patch will be applied automatically"
         }
     }
 }
