@@ -56,6 +56,25 @@ struct AccountManagerTests {
         #expect(manager.sortedAccounts.first?.id == pro.id)
     }
 
+    @Test("Sorted accounts keep Free accounts behind paid accounts")
+    func sortedAccountsDeprioritizeFree() {
+        let manager = AccountManager()
+        let free = makeAccount(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 100,
+            planType: "free"
+        )
+        let plus = makeAccount(
+            fiveHourRemaining: 20,
+            weeklyRemaining: 50,
+            planType: "plus"
+        )
+
+        manager.accounts = [free, plus]
+
+        #expect(manager.sortedAccounts.first?.id == plus.id)
+    }
+
     @Test("Auth sync imports rotated tokens for the currently active account")
     func syncImportsRotatedTokens() {
         let manager = AccountManager()

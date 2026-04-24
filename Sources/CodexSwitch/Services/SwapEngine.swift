@@ -8,6 +8,8 @@ enum SwapEngine {
     private static let codexAuthPath = NSString("~/.codex/auth.json").expandingTildeInPath
     private static let proCapacityMultiplier = 6.7
     private static let proThroughputBonus = 15.0
+    private static let freeCapacityMultiplier = 0.1
+    private static let freeThroughputPenalty = -20.0
 
     struct SighupProcessSnapshot: Equatable {
         let pid: Int32
@@ -28,6 +30,8 @@ enum SwapEngine {
         switch normalizedPlanType(for: account) {
         case "pro":
             return proCapacityMultiplier
+        case "free":
+            return freeCapacityMultiplier
         default:
             return 1.0
         }
@@ -37,6 +41,8 @@ enum SwapEngine {
         switch normalizedPlanType(for: account) {
         case "pro":
             return proThroughputBonus
+        case "free":
+            return freeThroughputPenalty
         default:
             return 0
         }
@@ -84,7 +90,7 @@ enum SwapEngine {
             s *= 0.5
         }
 
-        return s
+        return max(0.1, s)
     }
 
     /// Select the best account to swap to from candidates (excluding currently active)
@@ -99,7 +105,11 @@ enum SwapEngine {
     /// We still swap immediately for exhausted/invalid active accounts, but we
     /// also allow a better Pro account to reclaim the active slot from a Plus
     /// account because Pro offers materially better throughput and runway.
-    static func shouldSwap(from active: CodexAccount, to candidate: CodexAccount) -> Bool {
+    static func shouldSwap(
+        from active: CodexAccount,
+        to candidate: CodexAccount,
+        manualOverrideAccountId: UUID? = nil
+    ) -> Bool {
         guard active.id != candidate.id else { return false }
         guard let candidateSnapshot = candidate.quotaSnapshot,
               !candidateSnapshot.fiveHour.isExhausted,
@@ -111,6 +121,10 @@ enum SwapEngine {
         let activeExhausted = activeSnapshot.map { $0.fiveHour.isExhausted || $0.weekly.isExhausted } ?? false
         if activeExhausted || score(active) <= 0 {
             return true
+        }
+
+        if manualOverrideAccountId == active.id {
+            return false
         }
 
         let candidateScore = score(candidate)
@@ -137,6 +151,8 @@ enum SwapEngine {
         lines.append("5h: \(Int(fiveHr.remainingPercent))% | Weekly: \(Int(weekly.remainingPercent))%")
         if normalizedPlanType(for: candidate) == "pro" {
             lines.append("Pro plan preferred for higher capacity and faster inference")
+        } else if normalizedPlanType(for: candidate) == "free" {
+            lines.append("Free plan deprioritized because limits are much lower")
         }
 
         // Weekly status

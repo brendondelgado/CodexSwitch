@@ -44,6 +44,8 @@ private func installCrashHandlers() {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let manualOverrideAccountIdKey = "manualOverrideAccountId"
+
     // Set in applicationDidFinishLaunching before any other access
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
@@ -61,6 +63,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var iconUpdateTimer: Timer?
     private var lastAutoSwapAt: Date?
     private let autoSwapCooldown: TimeInterval = 30
+    private var manualOverrideAccountId: UUID? = {
+        guard let stored = UserDefaults.standard.string(forKey: AppDelegate.manualOverrideAccountIdKey) else {
+            return nil
+        }
+        return UUID(uuidString: stored)
+    }()
 
     private func persistAccounts() {
         do {
@@ -355,6 +363,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let activeNeedsRelief = activeSnapshot.fiveHour.isExhausted
             || activeSnapshot.weekly.isExhausted
+        if manualOverrideAccountId != nil, manualOverrideAccountId != active.id {
+            clearManualOverride()
+        }
+        if manualOverrideAccountId == active.id, activeNeedsRelief {
+            clearManualOverride()
+        }
 
         guard let best = SwapEngine.selectOptimalAccount(from: accountManager.accounts) else {
             if activeNeedsRelief {
@@ -362,7 +376,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        guard SwapEngine.shouldSwap(from: active, to: best) else { return }
+        guard SwapEngine.shouldSwap(
+            from: active,
+            to: best,
+            manualOverrideAccountId: manualOverrideAccountId
+        ) else { return }
 
         executeSwap(from: active, to: best, reason: .quotaExhausted)
     }
@@ -392,7 +410,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             accountManager.setActive(to.id)
-            if reason == .quotaExhausted {
+            switch reason {
+            case .manual:
+                setManualOverride(to.id)
+            case .quotaExhausted:
+                clearManualOverride()
                 lastAutoSwapAt = Date()
             }
             persistAccounts()
@@ -423,6 +445,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let active = accountManager.activeAccount,
               let target = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
         executeSwap(from: active, to: target, reason: .manual)
+    }
+
+    private func setManualOverride(_ accountId: UUID) {
+        manualOverrideAccountId = accountId
+        UserDefaults.standard.set(accountId.uuidString, forKey: Self.manualOverrideAccountIdKey)
+    }
+
+    private func clearManualOverride() {
+        manualOverrideAccountId = nil
+        UserDefaults.standard.removeObject(forKey: Self.manualOverrideAccountIdKey)
     }
 
     // MARK: - Popover

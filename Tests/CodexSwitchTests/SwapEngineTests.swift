@@ -158,6 +158,66 @@ struct SwapEngineTests {
         #expect(!SwapEngine.shouldSwap(from: activePlus, to: pro))
     }
 
+    @Test("Manual account selection is not preempted by a higher-value Pro account")
+    func manualSelectionPreventsProPreemption() {
+        let activePlus = makeAccount(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 50,
+            isActive: true,
+            planType: "plus"
+        )
+        let pro = makeAccount(
+            fiveHourRemaining: 20,
+            weeklyRemaining: 50,
+            planType: "pro"
+        )
+
+        #expect(!SwapEngine.shouldSwap(
+            from: activePlus,
+            to: pro,
+            manualOverrideAccountId: activePlus.id
+        ))
+    }
+
+    @Test("Manual account selection yields once exhausted")
+    func exhaustedManualSelectionCanSwap() {
+        let activePlus = makeAccount(
+            fiveHourRemaining: 0,
+            weeklyRemaining: 50,
+            isActive: true,
+            planType: "plus"
+        )
+        let pro = makeAccount(
+            fiveHourRemaining: 80,
+            weeklyRemaining: 50,
+            planType: "pro"
+        )
+
+        #expect(SwapEngine.shouldSwap(
+            from: activePlus,
+            to: pro,
+            manualOverrideAccountId: activePlus.id
+        ))
+    }
+
+    @Test("Free accounts are lower priority than low paid accounts")
+    func freeAccountsAreLowestPriority() {
+        let free = makeAccount(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 100,
+            planType: "free"
+        )
+        let plus = makeAccount(
+            fiveHourRemaining: 20,
+            weeklyRemaining: 50,
+            planType: "plus"
+        )
+
+        let best = SwapEngine.selectOptimalAccount(from: [free, plus])
+
+        #expect(best?.id == plus.id)
+    }
+
     @Test("Bonus for accounts about to reset")
     func resetBonus() {
         // Account A has less remaining but resets in 10 minutes
