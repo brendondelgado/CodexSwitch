@@ -58,7 +58,7 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 
 **🛠 Lightweight Fork Auto-Repair** — When a Codex CLI update replaces the live binary, CodexSwitch detects the new install surface on launch and reapplies the lightweight SIGHUP fork to the active `codex` install instead of waiting for a manual settings action.
 
-**🖥 Desktop App Auto-Patch** — When Codex.app updates, CodexSwitch detects the new bundle/version and applies the minimal desktop ASAR patch in the background once the desktop app is not running. The patch script removes legacy auth-sync loops, preserves stock behavior, updates ASAR integrity, ad-hoc signs the modified app bundle, verifies patch markers, and records the patched version so future launches know it is ready.
+**🖥 Desktop App Compatibility Check** — When Codex.app updates, CodexSwitch detects the new bundle/version and verifies desktop hot-swap compatibility once the desktop app is not running. Stock OpenAI bundles are recorded as ready without modifying model settings. If an older CodexSwitch renderer patch is present, the patch script removes that legacy auth-sync code, refreshes ASAR integrity/signing, and records the cleaned version.
 
 **🖥 Desktop App Token Injection** — Detects the Codex desktop app via WebSocket and injects new tokens directly, keeping desktop sessions in sync.
 
@@ -193,7 +193,7 @@ Sources/CodexSwitch/
 ├── Services/
 │   ├── AccountImporter.swift       # Import from ~/.codex/auth.json
 │   ├── CLIStatusChecker.swift      # Verify CLI can read current auth
-│   ├── CodexDesktopAppPatcher.swift # Safe offline Codex.app ASAR patching
+│   ├── CodexDesktopAppPatcher.swift # Safe offline Codex.app compatibility check
 │   ├── CodexInstallLocator.swift   # Resolve active codex install + patch target
 │   ├── CodexPatchState.swift       # Persist patched install state + marker checks
 │   ├── CodexVersionChecker.swift   # Detect SIGHUP-capable binary

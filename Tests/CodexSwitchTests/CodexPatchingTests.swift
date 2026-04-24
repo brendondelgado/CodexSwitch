@@ -52,7 +52,7 @@ struct CodexPatchingTests {
         let summary = CodexDesktopAppStatusSummary(
             installedVersionLabel: "26.417.41555 (1858)",
             runtimeLabel: "stale runtime",
-            patchLabel: "Desktop bundle is patched and ready",
+            patchLabel: "Desktop hot-swap ready",
             patchHealthy: true,
             canPatchNow: false
         )
@@ -87,7 +87,7 @@ struct CodexPatchingTests {
         let summary = CodexDesktopAppStatusSummary(
             installedVersionLabel: "26.417.41555 (1858)",
             runtimeLabel: "stale runtime",
-            patchLabel: "Desktop patch will be applied automatically",
+            patchLabel: "Desktop compatibility will be verified automatically",
             patchHealthy: false,
             canPatchNow: true
         )
@@ -130,8 +130,8 @@ struct CodexPatchingTests {
         #expect(decision == .repairNeeded)
     }
 
-    @Test("Desktop repair decider accepts a valid patched bundle with matching state")
-    func desktopRepairDeciderAcceptsPatchedBundle() {
+    @Test("Desktop repair decider accepts a valid stock bundle with matching state")
+    func desktopRepairDeciderAcceptsStockBundleWithMatchingState() {
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
             asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
@@ -146,11 +146,11 @@ struct CodexPatchingTests {
         let decision = CodexDesktopAppPatchRepairDecider.decision(
             currentInstall: install,
             savedState: savedState,
-            patchMarkerPresent: true,
+            patchMarkerPresent: false,
             legacyPatchMarkerPresent: false,
             usageState: .notRunning,
             bundleIsValid: true,
-            signatureStatus: .adHoc
+            signatureStatus: .officialOpenAI
         )
 
         #expect(decision == .noRepairNeeded)
@@ -375,8 +375,8 @@ struct CodexPatchingTests {
         #expect(decision == .repairNeeded)
     }
 
-    @Test("Desktop app repair treats patched ad-hoc bundles as restore-needed")
-    func desktopRepairRestoresPatchedAdHocBundle() {
+    @Test("Desktop app repair does not trust unrecorded ad-hoc bundles")
+    func desktopRepairDoesNotTrustUnrecordedAdHocBundle() {
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
             asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",

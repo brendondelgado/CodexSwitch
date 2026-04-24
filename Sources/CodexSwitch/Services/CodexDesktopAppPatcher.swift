@@ -104,12 +104,14 @@ enum CodexDesktopAppPatchRepairDecider {
     ) -> CodexDesktopAppPatchRepairDecision {
         let savedStateMatches = savedState?.bundleVersion == currentInstall.bundleVersion
             && savedState?.asarPath == currentInstall.asarPath
+        let signatureAllowsHotSwap = signatureStatus == .officialOpenAI
+            || signatureStatus == .adHoc
+        _ = patchMarkerPresent
 
         if bundleIsValid,
-           patchMarkerPresent,
            !legacyPatchMarkerPresent,
            savedStateMatches,
-           signatureStatus == .adHoc {
+           signatureAllowsHotSwap {
             return .noRepairNeeded
         }
 
@@ -202,11 +204,11 @@ enum CodexDesktopAppProcessClassifier {
 enum CodexDesktopAppLocator {
     static let appBundleIdentifier = "com.openai.codex"
     private static let defaultAppPath = "/Applications/Codex.app"
-    private static let requiredPatchMarkers = [
-        "_bundledFastModels",
-    ]
     private static let legacyPatchMarkers = [
         "_invalidateAccountQueries",
+        "_codexSwitchEnsureDesktopAuthSync",
+        "codexSwitchLoginWithChatGptAuthTokens",
+        "codexSwitchReadHostFile",
     ]
 
     static func locate(appPath: String = defaultAppPath) -> CodexDesktopAppInstall? {
@@ -239,13 +241,10 @@ enum CodexDesktopAppLocator {
             return false
         }
 
-        let hasAllRequiredMarkers = requiredPatchMarkers.allSatisfy { marker in
-            data.range(of: Data(marker.utf8)) != nil
-        }
         let hasLegacyMarkers = legacyPatchMarkers.contains { marker in
             data.range(of: Data(marker.utf8)) != nil
         }
-        return hasAllRequiredMarkers && !hasLegacyMarkers
+        return !hasLegacyMarkers
     }
 
     static func legacyPatchMarkerPresent(install: CodexDesktopAppInstall) -> Bool {
@@ -349,9 +348,17 @@ enum CodexDesktopAppPatcher {
         let inspection = inspect(install: install)
 
         switch inspection.decision {
-        case .noRepairNeeded, .deferWhileRunning:
+        case .noRepairNeeded:
             return nil
+        case .deferWhileRunning:
+            return CodexDesktopAppPatchResult(
+                success: true,
+                message: "Desktop compatibility check deferred: \(patchStatusLabel(for: inspection))"
+            )
         case .repairNeeded:
+            if let recordResult = recordCompatibleInstallIfPossible(inspection: inspection) {
+                return recordResult
+            }
             if let preparationFailure = prepareForRestore(
                 usageState: inspection.usageState,
                 appPath: install.appPath
@@ -491,7 +498,6 @@ enum CodexDesktopAppPatcher {
         }
 
         guard let patchedInstall = CodexDesktopAppLocator.locate(appPath: install.appPath),
-              CodexDesktopAppLocator.patchMarkerPresent(install: patchedInstall),
               !CodexDesktopAppLocator.legacyPatchMarkerPresent(install: patchedInstall),
               CodexDesktopAppLocator.bundleIsValid(appPath: patchedInstall.appPath) else {
             return CodexDesktopAppPatchResult(
@@ -500,23 +506,51 @@ enum CodexDesktopAppPatcher {
             )
         }
 
+        let signatureStatus = CodexDesktopAppLocator.signatureStatus(appPath: patchedInstall.appPath)
+        guard signatureStatus == .officialOpenAI || signatureStatus == .adHoc else {
+            return CodexDesktopAppPatchResult(
+                success: false,
+                message: "Desktop patch completed but bundle signature is not trusted"
+            )
+        }
+
+        return recordCompatibleInstall(install: patchedInstall)
+    }
+
+    private nonisolated static func recordCompatibleInstallIfPossible(
+        inspection: CodexDesktopAppInspection
+    ) -> CodexDesktopAppPatchResult? {
+        guard inspection.patchMarkerPresent,
+              !inspection.legacyPatchMarkerPresent,
+              inspection.bundleIsValid,
+              inspection.signatureStatus == .officialOpenAI
+                || inspection.signatureStatus == .adHoc else {
+            return nil
+        }
+
+        return recordCompatibleInstall(install: inspection.install)
+    }
+
+    private nonisolated static func recordCompatibleInstall(
+        install: CodexDesktopAppInstall
+    ) -> CodexDesktopAppPatchResult {
         do {
             try CodexDesktopAppPatchStateStore.save(
                 CodexDesktopPatchedAppState(
-                    bundleVersion: patchedInstall.bundleVersion,
-                    asarPath: patchedInstall.asarPath
+                    bundleVersion: install.bundleVersion,
+                    asarPath: install.asarPath
                 )
             )
         } catch {
             return CodexDesktopAppPatchResult(
                 success: false,
-                message: "Desktop patch applied but state save failed: \(error.localizedDescription)"
+                message: "Desktop compatibility verified but state save failed: \(error.localizedDescription)"
             )
         }
 
         return CodexDesktopAppPatchResult(
             success: true,
-            message: "Patched Codex.app \(patchedInstall.versionLabel) for CodexSwitch desktop compatibility"
+            message: "Verified Codex.app \(install.versionLabel) for CodexSwitch desktop hot-swap compatibility"
         )
     }
 
@@ -587,35 +621,18 @@ enum CodexDesktopAppPatcher {
     ) -> String {
         switch inspection.decision {
         case .noRepairNeeded:
-            return "Desktop bundle is patched and ready"
+            return "Desktop hot-swap ready"
         case .deferWhileRunning:
             if inspection.legacyPatchMarkerPresent {
                 return "Quit Codex.app to repair the legacy desktop patch"
             }
-            if !inspection.patchMarkerPresent {
-                return "Quit Codex.app to apply the desktop patch"
-            }
-            if inspection.signatureStatus == .adHoc {
-                return "Quit Codex.app to verify the desktop patch state"
-            }
             if inspection.signatureStatus == .nonOpenAISigned {
                 return "Quit Codex.app to repair the desktop bundle signature"
             }
-            return "Quit Codex.app before repairing the desktop bundle"
+            return "Quit Codex.app to verify the latest desktop build"
         case .repairNeeded:
             if inspection.legacyPatchMarkerPresent {
                 return "Legacy desktop patch found — auto-repair required"
-            }
-            if inspection.patchMarkerPresent,
-               inspection.signatureStatus == .adHoc,
-               !inspection.bundleIsValid {
-                return "Desktop patch signature is invalid — auto-repair required"
-            }
-            if inspection.patchMarkerPresent {
-                return "Desktop patch state is stale — auto-repair required"
-            }
-            if inspection.signatureStatus == .adHoc {
-                return "Desktop bundle is ad-hoc signed without a valid patch marker"
             }
             if inspection.signatureStatus == .nonOpenAISigned {
                 return "Desktop bundle signature is not from OpenAI — repair required"
@@ -626,7 +643,7 @@ enum CodexDesktopAppPatcher {
             if !inspection.bundleIsValid {
                 return "Desktop bundle signature is invalid — repair required"
             }
-            return "Desktop patch will be applied automatically"
+            return "Desktop compatibility will be verified automatically"
         }
     }
 }

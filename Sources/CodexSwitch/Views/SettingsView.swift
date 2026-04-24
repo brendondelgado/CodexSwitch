@@ -210,9 +210,9 @@ struct SettingsView: View {
                             if versionChecker.desktopPatchInFlight {
                                 ProgressView()
                                     .controlSize(.small)
-                                Text("Patching...")
+                                Text("Verifying...")
                             } else {
-                                Label("Apply Desktop Patch", systemImage: "wrench.and.screwdriver.fill")
+                                Label("Verify Desktop Compatibility", systemImage: "checkmark.shield.fill")
                             }
                         }
                         .disabled(versionChecker.desktopPatchInFlight)

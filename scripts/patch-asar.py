@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Apply the minimal safe Codex desktop patch used by CodexSwitch.
 
-This keeps the official OpenAI Codex macOS bundle as stock as possible while
-doing only two things:
-1. Remove any legacy or unstable desktop auth watcher patch that mutates the
-   renderer on a timer.
-2. Add the `/fast` fallback shim for bundled models whose refreshed metadata
-   omits `additionalSpeedTiers`.
+This keeps the official OpenAI Codex macOS bundle as stock as possible. It only
+removes legacy or unstable CodexSwitch desktop patches that mutated the renderer
+on a timer or added app-server request helpers.
 
 Desktop hot-swapping now happens through CodexSwitch's direct app-server login
 injection, not by polling `~/.codex/auth.json` from inside Codex.app.
@@ -42,7 +39,6 @@ AUTH_JSON_PATH = Path.home() / ".codex" / "auth.json"
 LEGACY_AUTH_PATCH_MARKER = "_invalidateAccountQueries"
 DESKTOP_AUTH_SYNC_MARKER = "_codexSwitchEnsureDesktopAuthSync"
 DESKTOP_AUTH_REQUEST_MARKER = "codexSwitchLoginWithChatGptAuthTokens"
-FAST_FALLBACK_MARKER = "_bundledFastModels"
 
 BUNDLE_CODE_SUFFIXES = {".app", ".framework", ".xpc"}
 FILE_CODE_SUFFIXES = {".dylib", ".so", ".node"}
@@ -54,6 +50,13 @@ RESOURCE_EXECUTABLE_NAMES = {
     "launch-services-helper",
     "spawn-helper",
 }
+
+LEGACY_PATCH_MARKERS = (
+    LEGACY_AUTH_PATCH_MARKER,
+    DESKTOP_AUTH_SYNC_MARKER,
+    DESKTOP_AUTH_REQUEST_MARKER,
+    "codexSwitchReadHostFile",
+)
 
 
 def resolve_asar_cmd() -> list[str]:
@@ -248,52 +251,6 @@ def find_request_file(assets_dir: Path) -> Path | None:
     return None
 
 
-def find_fast_mode_file(assets_dir: Path) -> Path | None:
-    if not assets_dir.exists():
-        return None
-    content_markers = ("additionalSpeedTiers", "modelsByType")
-
-    for pattern in ("font-settings-*.js", "font-settings*.js"):
-        for f in assets_dir.glob(pattern):
-            content = f.read_text()
-            if all(m in content for m in content_markers):
-                return f
-
-    for f in assets_dir.glob("*.js"):
-        content = f.read_text()
-        if all(m in content for m in content_markers) and "function Qe()" in content:
-            return f
-    return None
-
-
-def get_bundled_fast_model_slugs(
-    codex_path: Path = APP_RESOURCES / "codex",
-) -> set[str]:
-    result = subprocess.run(
-        [str(codex_path), "debug", "models", "--bundled"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        print(f"WARNING: bundled model dump failed: {result.stderr.strip()}")
-        return set()
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        print(f"WARNING: failed to parse bundled model dump: {exc}")
-        return set()
-
-    fast_models = set()
-    for model in payload.get("models", []):
-        speed_tiers = model.get("additional_speed_tiers") or []
-        if "fast" in speed_tiers:
-            slug = model.get("slug")
-            if slug:
-                fast_models.add(slug)
-    return fast_models
-
-
 # ---------------------------------------------------------------------------
 # Patch logic
 # ---------------------------------------------------------------------------
@@ -338,74 +295,6 @@ def migrate_legacy_auth_patch(file_path: Path) -> bool:
 
     file_path.write_text(patched)
     print(f"  Removed legacy auth patch: {file_path.name}")
-    return True
-
-
-def apply_desktop_request_patch(file_path: Path) -> bool:
-    content = file_path.read_text()
-
-    if DESKTOP_AUTH_REQUEST_MARKER in content and "codexSwitchReadHostFile" in content:
-        print(f"  Request helper patch already present: {file_path.name}")
-        return True
-
-    anchor = 'writeSkillConfig(e){return this.sendRequest(`skills/config/write`,e)}'
-    injected = (
-        anchor
-        + 'codexSwitchReadHostFile(e){return this.sendRequest(`fs/readFile`,{path:e})}'
-        + 'async codexSwitchLoginWithChatGptAuthTokens(e,t,n=null){return this.sendRequest(`account/login/start`,{type:`chatgptAuthTokens`,accessToken:e,chatgptAccountId:t,chatgptPlanType:n})}'
-    )
-    if anchor not in content:
-        print("ERROR: Cannot find request helper anchor in send-app-server-request bundle")
-        return False
-
-    patched = content.replace(anchor, injected, 1)
-    if DESKTOP_AUTH_REQUEST_MARKER not in patched or "codexSwitchReadHostFile" not in patched:
-        print("ERROR: Desktop request helper patch did not apply cleanly")
-        return False
-
-    file_path.write_text(patched)
-    print(f"  Added desktop request helpers: {file_path.name}")
-    return True
-
-
-def apply_desktop_auth_sync_patch(file_path: Path, auth_path: str) -> bool:
-    content = file_path.read_text()
-
-    if DESKTOP_AUTH_SYNC_MARKER in content:
-        print(f"  Desktop auth sync patch already present: {file_path.name}")
-        return True
-
-    module_anchor = "var d=n();"
-    if module_anchor not in content:
-        print("ERROR: Cannot find auth module anchor")
-        return False
-
-    auth_path_literal = json.dumps(auth_path)
-    module_patch = (
-        f"var _codexSwitchDesktopAuthPath={auth_path_literal},"
-        "_codexSwitchDesktopAuthSig=null,"
-        "_codexSwitchDesktopAuthInflight=null,"
-        "_codexSwitchDesktopAuthPrimed=!1,"
-        "_codexSwitchDesktopAuthTimerStarted=!1;"
-        "function _codexSwitchDecodeBase64(e){let t=atob(e),n=new Uint8Array(t.length);for(let e=0;e<t.length;e++)n[e]=t.charCodeAt(e);return new TextDecoder().decode(n)}"
-        "async function _codexSwitchSyncDesktopAuth(e){let t=await e.codexSwitchReadHostFile(_codexSwitchDesktopAuthPath),n=JSON.parse(_codexSwitchDecodeBase64(t.dataBase64)),r=n?.tokens?.account_id,i=n?.tokens?.access_token;if(!(typeof r==`string`&&r.length>0&&typeof i==`string`&&i.length>0))return;let a=`${r}:${i.slice(-32)}`;if(a===_codexSwitchDesktopAuthSig)return;if(!_codexSwitchDesktopAuthPrimed){_codexSwitchDesktopAuthPrimed=!0,_codexSwitchDesktopAuthSig=a;return}await e.codexSwitchLoginWithChatGptAuthTokens(i,r,null),_codexSwitchDesktopAuthSig=a}"
-        "function _codexSwitchEnsureDesktopAuthSync(e){if(_codexSwitchDesktopAuthTimerStarted||typeof e.codexSwitchReadHostFile!=`function`||typeof e.codexSwitchLoginWithChatGptAuthTokens!=`function`)return;_codexSwitchDesktopAuthTimerStarted=!0;let t=()=>{_codexSwitchDesktopAuthInflight??=Promise.resolve().then(()=>_codexSwitchSyncDesktopAuth(e)).catch(()=>{}).finally(()=>{_codexSwitchDesktopAuthInflight=null})};t(),setInterval(t,2e3)}"
-    )
-    patched = content.replace(module_anchor, module_anchor + module_patch, 1)
-
-    effect_anchor = ")),l();let d="
-    effect_replacement = ")),_codexSwitchEnsureDesktopAuthSync(e),l();let d="
-    if effect_anchor not in patched:
-        print("ERROR: Cannot find auth effect anchor for desktop sync patch")
-        return False
-    patched = patched.replace(effect_anchor, effect_replacement, 1)
-
-    if DESKTOP_AUTH_SYNC_MARKER not in patched or "_codexSwitchDesktopAuthPrimed" not in patched:
-        print("ERROR: Desktop auth sync patch marker missing after patch")
-        return False
-
-    file_path.write_text(patched)
-    print(f"  Added safe desktop auth sync: {file_path.name}")
     return True
 
 
@@ -478,59 +367,6 @@ def remove_desktop_auth_sync_patch(file_path: Path, auth_path: str) -> bool:
     return True
 
 
-def apply_fast_mode_fallback_patch(
-    file_path: Path,
-    bundled_fast_models: set[str],
-) -> bool:
-    content = file_path.read_text()
-
-    if FAST_FALLBACK_MARKER in content:
-        print(f"  Fast-mode fallback patch already present: {file_path.name}")
-        return True
-
-    if not bundled_fast_models:
-        print("WARNING: No bundled fast-tier models found; using conservative fallback for gpt-5.4")
-        bundled_fast_models = {"gpt-5.4"}
-
-    last_import_match = None
-    for match in re.finditer(r'from"\.\/[^"]+\.js";', content):
-        last_import_match = match
-    if not last_import_match:
-        print("ERROR: Cannot find end of import statements in fast-mode file")
-        return False
-
-    models_literal = ",".join(f"`{slug}`" for slug in sorted(bundled_fast_models))
-    insert_pos = last_import_match.end()
-    patched = (
-        content[:insert_pos]
-        + f"var {FAST_FALLBACK_MARKER}=new Set([{models_literal}]);"
-        + content[insert_pos:]
-    )
-
-    old_gate = "function G(e){return e.additionalSpeedTiers?.includes(qe)===!0}"
-    new_gate = (
-        "function G(e){return e.additionalSpeedTiers?.includes(qe)===!0||"
-        f"{FAST_FALLBACK_MARKER}.has(e.model)&&"
-        "(!(e.additionalSpeedTiers?.length>0))}"
-    )
-    if old_gate not in patched:
-        print("ERROR: Cannot find fast-tier gate to patch")
-        return False
-
-    patched = patched.replace(old_gate, new_gate, 1)
-
-    if FAST_FALLBACK_MARKER not in patched:
-        print("ERROR: Fast fallback marker missing after patch")
-        return False
-    if "function Qe()" not in patched:
-        print("ERROR: Fast availability function disappeared after patch")
-        return False
-
-    file_path.write_text(patched)
-    print(f"  Added fast-mode fallback: {file_path.name}")
-    return True
-
-
 def bundle_is_valid() -> bool:
     verify = subprocess.run(
         [
@@ -546,6 +382,11 @@ def bundle_is_valid() -> bool:
         timeout=120,
     )
     return verify.returncode == 0
+
+
+def asar_contains_legacy_patch() -> bool:
+    data = ASAR_PATH.read_bytes()
+    return any(marker.encode() in data for marker in LEGACY_PATCH_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +501,17 @@ def main():
         print(f"Codex.app not found at {APP_PATH}")
         sys.exit(2)
 
+    if not asar_contains_legacy_patch():
+        if bundle_is_valid():
+            print("Codex desktop bundle is already hot-swap compatible and signed.")
+            sys.exit(0)
+
+        print("Bundle has no legacy desktop patch, but the signature is invalid; refreshing signatures.")
+        if not refresh_signature_state():
+            sys.exit(1)
+        print("Done! Codex desktop app signatures were refreshed.")
+        sys.exit(0)
+
     if not ASAR_UNPACKED.exists():
         print(f"ERROR: Missing companion unpacked directory: {ASAR_UNPACKED}")
         sys.exit(2)
@@ -680,15 +532,6 @@ def main():
     assets_dir = extract_dir / "webview" / "assets"
     auth_file = find_auth_file(assets_dir)
     request_file = find_request_file(assets_dir)
-    fast_mode_file = find_fast_mode_file(assets_dir)
-
-    if not fast_mode_file:
-        print("WARNING: Could not find fast-mode bundle -- app structure may have changed")
-        sys.exit(2)
-
-    print(f"Found fast-mode file: {fast_mode_file.name}")
-
-    fast_content = fast_mode_file.read_text()
 
     needs_repack = False
 
@@ -716,20 +559,12 @@ def main():
             sys.exit(1)
         needs_repack = True
 
-    if FAST_FALLBACK_MARKER not in fast_content:
-        print("Applying fast-mode fallback patch...")
-        bundled_fast_models = get_bundled_fast_model_slugs()
-        if not apply_fast_mode_fallback_patch(fast_mode_file, bundled_fast_models):
-            print("ERROR: Fast-mode fallback patch failed")
-            sys.exit(1)
-        needs_repack = True
-
     if not needs_repack:
         if bundle_is_valid():
-            print("Codex desktop bundle is already patched and signed.")
+            print("Codex desktop bundle is already hot-swap compatible and signed.")
             sys.exit(0)
 
-        print("Bundle is already patched, but the signature is invalid; refreshing integrity and signatures.")
+        print("Bundle needs signature refresh; updating integrity and signatures.")
         if not refresh_signature_state():
             sys.exit(1)
         print("Done! Codex desktop app signatures were refreshed.")
@@ -752,7 +587,7 @@ def main():
     else:
         print("Backup already exists: app.asar.bak")
 
-    print("Installing patched asar...")
+    print("Installing cleaned asar...")
     shutil.copy2(repacked_asar, ASAR_PATH)
     print("Preserving existing app.asar.unpacked contents from installed Codex.app")
 
