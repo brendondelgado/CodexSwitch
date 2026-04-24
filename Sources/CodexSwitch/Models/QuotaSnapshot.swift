@@ -13,7 +13,7 @@ struct QuotaWindow: Codable, Sendable {
 
     var remainingPercent: Double { max(0, 100 - usedPercent) }
     var timeUntilReset: TimeInterval { resetsAt.timeIntervalSinceNow }
-    var isExhausted: Bool { remainingPercent < 1 }
+    var isExhausted: Bool { remainingPercent <= 1 }
 
     var urgency: QuotaUrgency { QuotaUrgency(remainingPercent: remainingPercent) }
 }

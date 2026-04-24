@@ -40,6 +40,10 @@ struct QuotaModelTests {
         #expect(exhausted.remainingPercent == 0)
         #expect(exhausted.isExhausted)
         #expect(exhausted.urgency == .critical)
+
+        let displayedAsOnePercent = QuotaWindow(usedPercent: 99, windowDurationMins: 300, resetsAt: future)
+        #expect(displayedAsOnePercent.remainingPercent == 1)
+        #expect(displayedAsOnePercent.isExhausted)
     }
 
     @Test("AccountManager active account")
