@@ -102,15 +102,14 @@ enum CodexDesktopAppPatchRepairDecider {
         bundleIsValid: Bool,
         signatureStatus: CodexDesktopAppSignatureStatus
     ) -> CodexDesktopAppPatchRepairDecision {
-        _ = currentInstall
-        _ = savedState
+        let savedStateMatches = savedState?.bundleVersion == currentInstall.bundleVersion
+            && savedState?.asarPath == currentInstall.asarPath
 
-        // Desktop auto-swap works through direct app-server token injection, so
-        // the only healthy state here is the official stock-signed bundle.
         if bundleIsValid,
-           signatureStatus == .officialOpenAI,
-           !patchMarkerPresent,
-           !legacyPatchMarkerPresent {
+           patchMarkerPresent,
+           !legacyPatchMarkerPresent,
+           savedStateMatches,
+           signatureStatus == .adHoc {
             return .noRepairNeeded
         }
 
@@ -318,6 +317,8 @@ struct CodexDesktopAppPatchResult: Sendable {
 }
 
 enum CodexDesktopAppPatcher {
+    private nonisolated static let patchScriptEnvironmentKey = "CODEXSWITCH_PATCH_ASAR_SCRIPT"
+
     nonisolated static func currentStatusSummary() -> CodexDesktopAppStatusSummary {
         guard let install = CodexDesktopAppLocator.locate() else {
             return CodexDesktopAppStatusSummary(
@@ -357,10 +358,7 @@ enum CodexDesktopAppPatcher {
             ) {
                 return preparationFailure
             }
-            return CodexDesktopAppPatchResult(
-                success: false,
-                message: "Codex.app needs an official stock restore before desktop stability can be trusted"
-            )
+            return patchInstalledApp(install: install)
         }
     }
 
@@ -403,19 +401,154 @@ enum CodexDesktopAppPatcher {
         case .appRunning:
             return CodexDesktopAppPatchResult(
                 success: false,
-                message: "Quit Codex.app before restoring the official desktop bundle"
+                message: "Quit Codex.app before applying the desktop patch"
             )
         case .backgroundServiceOnly:
             guard stopDetachedAppServer(appPath) else {
                 return CodexDesktopAppPatchResult(
                     success: false,
-                    message: "Failed to stop the detached Codex app-server before restoring the desktop bundle"
+                    message: "Failed to stop the detached Codex app-server before patching the desktop bundle"
                 )
             }
             return nil
         case .notRunning:
             return nil
         }
+    }
+
+    nonisolated static func patchInstalledAppNow() -> CodexDesktopAppPatchResult {
+        guard let install = CodexDesktopAppLocator.locate() else {
+            return CodexDesktopAppPatchResult(
+                success: false,
+                message: "Could not locate /Applications/Codex.app"
+            )
+        }
+
+        let usageState = CodexDesktopAppProcessClassifier.usageState(appPath: install.appPath)
+        if let preparationFailure = prepareForRestore(
+            usageState: usageState,
+            appPath: install.appPath
+        ) {
+            return preparationFailure
+        }
+
+        return patchInstalledApp(install: install)
+    }
+
+    private nonisolated static func patchInstalledApp(
+        install: CodexDesktopAppInstall,
+        processRunner: (
+            _ executablePath: String,
+            _ arguments: [String],
+            _ timeout: TimeInterval,
+            _ environment: [String: String]
+        ) -> ProcessRunnerOutput? = { executablePath, arguments, timeout, environment in
+            ProcessRunner.run(
+                executablePath: executablePath,
+                arguments: arguments,
+                timeout: timeout,
+                environment: environment
+            )
+        }
+    ) -> CodexDesktopAppPatchResult {
+        guard let scriptPath = patchScriptPath() else {
+            return CodexDesktopAppPatchResult(
+                success: false,
+                message: "Could not locate bundled patch-asar.py"
+            )
+        }
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["CODEX_APP"] = install.appPath
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+        guard let result = processRunner(
+            "/usr/bin/python3",
+            [scriptPath],
+            600,
+            environment
+        ) else {
+            return CodexDesktopAppPatchResult(
+                success: false,
+                message: "Failed to start desktop patcher"
+            )
+        }
+
+        guard !result.timedOut else {
+            return CodexDesktopAppPatchResult(
+                success: false,
+                message: "Desktop patcher timed out"
+            )
+        }
+
+        guard result.terminationStatus == 0 else {
+            let detail = (result.stderr.isEmpty ? result.stdout : result.stderr)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return CodexDesktopAppPatchResult(
+                success: false,
+                message: "Desktop patch failed: \(String(detail.suffix(300)))"
+            )
+        }
+
+        guard let patchedInstall = CodexDesktopAppLocator.locate(appPath: install.appPath),
+              CodexDesktopAppLocator.patchMarkerPresent(install: patchedInstall),
+              !CodexDesktopAppLocator.legacyPatchMarkerPresent(install: patchedInstall),
+              CodexDesktopAppLocator.bundleIsValid(appPath: patchedInstall.appPath) else {
+            return CodexDesktopAppPatchResult(
+                success: false,
+                message: "Desktop patch completed but verification failed"
+            )
+        }
+
+        do {
+            try CodexDesktopAppPatchStateStore.save(
+                CodexDesktopPatchedAppState(
+                    bundleVersion: patchedInstall.bundleVersion,
+                    asarPath: patchedInstall.asarPath
+                )
+            )
+        } catch {
+            return CodexDesktopAppPatchResult(
+                success: false,
+                message: "Desktop patch applied but state save failed: \(error.localizedDescription)"
+            )
+        }
+
+        return CodexDesktopAppPatchResult(
+            success: true,
+            message: "Patched Codex.app \(patchedInstall.versionLabel) for CodexSwitch desktop compatibility"
+        )
+    }
+
+    private nonisolated static func patchScriptPath() -> String? {
+        if let override = ProcessInfo.processInfo.environment[patchScriptEnvironmentKey],
+           FileManager.default.isReadableFile(atPath: override) {
+            return override
+        }
+
+        if let resourcePath = Bundle.main.resourcePath {
+            let bundled = URL(fileURLWithPath: resourcePath)
+                .appendingPathComponent("patch-asar.py")
+                .path
+            if FileManager.default.isReadableFile(atPath: bundled) {
+                return bundled
+            }
+        }
+
+        let developerCheckout = NSString("~/Developer/CodexSwitch/scripts/patch-asar.py")
+            .expandingTildeInPath
+        if FileManager.default.isReadableFile(atPath: developerCheckout) {
+            return developerCheckout
+        }
+
+        let currentDirectoryCheckout = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("scripts/patch-asar.py")
+            .path
+        if FileManager.default.isReadableFile(atPath: currentDirectoryCheckout) {
+            return currentDirectoryCheckout
+        }
+
+        return nil
     }
 
     private nonisolated static func inspect(
@@ -454,41 +587,46 @@ enum CodexDesktopAppPatcher {
     ) -> String {
         switch inspection.decision {
         case .noRepairNeeded:
-            return "Desktop bundle is stock and ready"
+            return "Desktop bundle is patched and ready"
         case .deferWhileRunning:
             if inspection.legacyPatchMarkerPresent {
-                return "Quit Codex.app to remove the legacy desktop patch"
+                return "Quit Codex.app to repair the legacy desktop patch"
             }
-            if inspection.patchMarkerPresent {
-                return "Quit Codex.app to restore the official stock desktop bundle"
+            if !inspection.patchMarkerPresent {
+                return "Quit Codex.app to apply the desktop patch"
             }
             if inspection.signatureStatus == .adHoc {
-                return "Quit Codex.app to restore the official signed bundle"
+                return "Quit Codex.app to verify the desktop patch state"
             }
             if inspection.signatureStatus == .nonOpenAISigned {
-                return "Quit Codex.app to restore the OpenAI-signed desktop bundle"
+                return "Quit Codex.app to repair the desktop bundle signature"
             }
             return "Quit Codex.app before repairing the desktop bundle"
         case .repairNeeded:
             if inspection.legacyPatchMarkerPresent {
-                return "Legacy desktop patch found — restore stock app required"
+                return "Legacy desktop patch found — auto-repair required"
+            }
+            if inspection.patchMarkerPresent,
+               inspection.signatureStatus == .adHoc,
+               !inspection.bundleIsValid {
+                return "Desktop patch signature is invalid — auto-repair required"
             }
             if inspection.patchMarkerPresent {
-                return "Desktop bundle is patched — restore stock app required"
+                return "Desktop patch state is stale — auto-repair required"
             }
             if inspection.signatureStatus == .adHoc {
-                return "Desktop bundle is ad-hoc signed — restore stock app required"
+                return "Desktop bundle is ad-hoc signed without a valid patch marker"
             }
             if inspection.signatureStatus == .nonOpenAISigned {
-                return "Desktop bundle signature is not from OpenAI — restore stock app required"
+                return "Desktop bundle signature is not from OpenAI — repair required"
             }
             if inspection.usageState == .backgroundServiceOnly {
-                return "Detached Codex app-server will be stopped before restoring the stock app"
+                return "Detached Codex app-server will be stopped before patching"
             }
             if !inspection.bundleIsValid {
-                return "Desktop bundle signature is invalid — restore stock app required"
+                return "Desktop bundle signature is invalid — repair required"
             }
-            return "Desktop bundle needs an official stock restore"
+            return "Desktop patch will be applied automatically"
         }
     }
 }
@@ -577,7 +715,7 @@ final class CodexAutoPatchMonitor {
                 )
             } else {
                 desktopPatchLogger.error(
-                    "Codex desktop requires stock restore (\(reason, privacy: .public)): \(desktopResult.message, privacy: .public)"
+                    "Codex desktop auto-patch failed (\(reason, privacy: .public)): \(desktopResult.message, privacy: .public)"
                 )
             }
             lastDesktopMessage = desktopResult.message

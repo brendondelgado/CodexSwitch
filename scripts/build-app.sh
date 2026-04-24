@@ -24,6 +24,11 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 # Copy binary
 cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
 
+# Bundle the desktop patcher used by CodexAutoPatchMonitor. Keeping this inside
+# the installed app avoids depending on whichever checkout happens to exist.
+cp "$PROJECT_DIR/scripts/patch-asar.py" "$APP_BUNDLE/Contents/Resources/patch-asar.py"
+chmod 755 "$APP_BUNDLE/Contents/Resources/patch-asar.py"
+
 # Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

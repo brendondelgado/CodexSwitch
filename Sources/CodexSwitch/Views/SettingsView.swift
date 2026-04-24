@@ -205,14 +205,14 @@ struct SettingsView: View {
                         .disabled(versionChecker.desktopUpdateInFlight || versionChecker.desktopPatchInFlight)
                     } else if versionChecker.desktopCanPatchNow || !versionChecker.desktopPatchHealthy {
                         Button {
-                            versionChecker.restoreDesktopAppNow()
+                            versionChecker.patchDesktopAppNow()
                         } label: {
                             if versionChecker.desktopPatchInFlight {
                                 ProgressView()
                                     .controlSize(.small)
-                                Text("Restoring...")
+                                Text("Patching...")
                             } else {
-                                Label("Restore Stock App", systemImage: "arrow.triangle.2.circlepath")
+                                Label("Apply Desktop Patch", systemImage: "wrench.and.screwdriver.fill")
                             }
                         }
                         .disabled(versionChecker.desktopPatchInFlight)

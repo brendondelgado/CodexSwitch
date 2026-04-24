@@ -1,3 +1,25 @@
+---
+toc:
+  - The Problem
+  - The Solution
+  - Features
+  - How It Works
+  - Swap Scoring Algorithm
+  - Getting Started
+  - Project Structure
+  - Testing
+cross_dependencies:
+  - Sources/CodexSwitch/Services/CodexDesktopAppPatcher.swift
+  - Sources/CodexSwitch/Services/CodexVersionChecker.swift
+  - Sources/CodexSwitch/Services/DesktopAppConnector.swift
+  - Sources/CodexSwitch/Services/SwapEngine.swift
+  - scripts/patch-asar.py
+version_control:
+  branch: main
+  last_updated: 2026-04-24
+  update_reason: Document desktop auto-patching contract for current Codex.app versions.
+---
+
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-15%2B-000?logo=apple&logoColor=white" alt="macOS 15+">
   <img src="https://img.shields.io/badge/Swift-6.3-F05138?logo=swift&logoColor=white" alt="Swift 6.3">
@@ -35,6 +57,8 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 **⚡ SIGHUP Hot-Swap** — Sends SIGHUP to running Codex CLI processes after every swap and on app launch, so the CLI reloads tokens instantly. Uses `pgrep` + `proc_pidinfo` to find processes and skip those younger than 10 seconds (still initializing).
 
 **🛠 Lightweight Fork Auto-Repair** — When a Codex CLI update replaces the live binary, CodexSwitch detects the new install surface on launch and reapplies the lightweight SIGHUP fork to the active `codex` install instead of waiting for a manual settings action.
+
+**🖥 Desktop App Auto-Patch** — When Codex.app updates, CodexSwitch detects the new bundle/version and applies the minimal desktop ASAR patch in the background once the desktop app is not running. The patch script removes legacy auth-sync loops, preserves stock behavior, updates ASAR integrity, ad-hoc signs the modified app bundle, verifies patch markers, and records the patched version so future launches know it is ready.
 
 **🖥 Desktop App Token Injection** — Detects the Codex desktop app via WebSocket and injects new tokens directly, keeping desktop sessions in sync.
 
@@ -169,6 +193,7 @@ Sources/CodexSwitch/
 ├── Services/
 │   ├── AccountImporter.swift       # Import from ~/.codex/auth.json
 │   ├── CLIStatusChecker.swift      # Verify CLI can read current auth
+│   ├── CodexDesktopAppPatcher.swift # Safe offline Codex.app ASAR patching
 │   ├── CodexInstallLocator.swift   # Resolve active codex install + patch target
 │   ├── CodexPatchState.swift       # Persist patched install state + marker checks
 │   ├── CodexVersionChecker.swift   # Detect SIGHUP-capable binary
@@ -198,7 +223,7 @@ Sources/CodexSwitch/
 swift test
 ```
 
-24 tests across 4 suites covering models, quota parsing, polling intervals, and swap scoring.
+Swift tests cover models, quota parsing, polling intervals, swap scoring, SIGHUP targeting, and desktop patch decision logic. `scripts/test_patch_asar.py` covers the ASAR patch script.
 
 ## License
 

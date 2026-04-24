@@ -52,7 +52,7 @@ struct CodexPatchingTests {
         let summary = CodexDesktopAppStatusSummary(
             installedVersionLabel: "26.417.41555 (1858)",
             runtimeLabel: "stale runtime",
-            patchLabel: "Desktop bundle is stock and ready",
+            patchLabel: "Desktop bundle is patched and ready",
             patchHealthy: true,
             canPatchNow: false
         )
@@ -87,9 +87,9 @@ struct CodexPatchingTests {
         let summary = CodexDesktopAppStatusSummary(
             installedVersionLabel: "26.417.41555 (1858)",
             runtimeLabel: "stale runtime",
-            patchLabel: "Desktop bundle is stock and ready",
-            patchHealthy: true,
-            canPatchNow: false
+            patchLabel: "Desktop patch will be applied automatically",
+            patchHealthy: false,
+            canPatchNow: true
         )
         let liveStatus = DesktopAppStatus(
             usageState: .appRunning,
@@ -105,10 +105,11 @@ struct CodexPatchingTests {
 
         #expect(display.autoSwapReady)
         #expect(display.autoSwapLabel == "Desktop auto-swap ready")
+        #expect(!display.patchHealthy)
     }
 
-    @Test("Desktop repair decider accepts a valid stock bundle without patch markers")
-    func desktopRepairDeciderAcceptsValidStockBundle() {
+    @Test("Desktop repair decider patches a stopped stock bundle without patch markers")
+    func desktopRepairDeciderPatchesStoppedStockBundle() {
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
             asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
@@ -124,6 +125,32 @@ struct CodexPatchingTests {
             usageState: .notRunning,
             bundleIsValid: true,
             signatureStatus: .officialOpenAI
+        )
+
+        #expect(decision == .repairNeeded)
+    }
+
+    @Test("Desktop repair decider accepts a valid patched bundle with matching state")
+    func desktopRepairDeciderAcceptsPatchedBundle() {
+        let install = CodexDesktopAppInstall(
+            appPath: "/Applications/Codex.app",
+            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
+            bundleVersion: "1858",
+            shortVersion: "26.417.41555"
+        )
+        let savedState = CodexDesktopPatchedAppState(
+            bundleVersion: "1858",
+            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
+        )
+
+        let decision = CodexDesktopAppPatchRepairDecider.decision(
+            currentInstall: install,
+            savedState: savedState,
+            patchMarkerPresent: true,
+            legacyPatchMarkerPresent: false,
+            usageState: .notRunning,
+            bundleIsValid: true,
+            signatureStatus: .adHoc
         )
 
         #expect(decision == .noRepairNeeded)
@@ -278,8 +305,8 @@ struct CodexPatchingTests {
         #expect(!recovered)
     }
 
-    @Test("Desktop app repair accepts a running stock unpatched bundle")
-    func desktopRepairAcceptsRunningStockBundle() {
+    @Test("Desktop app repair defers a running stock unpatched bundle")
+    func desktopRepairDefersRunningStockBundle() {
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
             asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
@@ -297,11 +324,11 @@ struct CodexPatchingTests {
             signatureStatus: .officialOpenAI
         )
 
-        #expect(decision == .noRepairNeeded)
+        #expect(decision == .deferWhileRunning)
     }
 
-    @Test("Desktop app repair accepts a valid stock bundle when Codex is stopped")
-    func desktopRepairAcceptsStoppedStockBundle() {
+    @Test("Desktop app repair patches a valid stock bundle when Codex is stopped")
+    func desktopRepairPatchesStoppedStockBundle() {
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
             asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
@@ -319,7 +346,7 @@ struct CodexPatchingTests {
             signatureStatus: .officialOpenAI
         )
 
-        #expect(decision == .noRepairNeeded)
+        #expect(decision == .repairNeeded)
     }
 
     @Test("Desktop app repair does not defer when only the detached app-server is running")

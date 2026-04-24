@@ -186,13 +186,13 @@ final class CodexVersionChecker {
         desktopAutoSwapReady = autoSwapState.ready
     }
 
-    func restoreDesktopAppNow() {
+    func patchDesktopAppNow() {
         desktopPatchInFlight = true
         desktopPatchResult = nil
         desktopPatchSucceeded = false
 
         Task.detached {
-            let result = await CodexDesktopAppPatcher.restoreInstalledAppNow()
+            let result = CodexDesktopAppPatcher.patchInstalledAppNow()
             let latestDesktopRelease = await CodexDesktopAppUpdater.latestRelease()
             let desktopStatus = Self._getDesktopStatus()
             let liveDesktopStatus = await MainActor.run { CLIStatusChecker.cachedDesktopStatus }
