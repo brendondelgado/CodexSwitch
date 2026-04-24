@@ -130,7 +130,10 @@ enum CodexDesktopAppProcessClassifier {
     ) -> CodexDesktopAppUsageState {
         let commands = processCommands ?? runningCommands(appPath: appPath)
         let appContentsPrefix = "\(appPath)/Contents/"
-        let relevantCommands = commands.filter { $0.contains(appContentsPrefix) }
+        let relevantCommands = commands.filter {
+            $0.contains(appContentsPrefix)
+                && !isIgnoredNonBlockingProcess(command: $0, appPath: appPath)
+        }
 
         guard !relevantCommands.isEmpty else {
             return .notRunning
@@ -174,6 +177,11 @@ enum CodexDesktopAppProcessClassifier {
             || command.contains("\(resourcesPath)/codex_chronicle")
             || command.contains("\(resourcesPath)/node_repl")
             || command.contains("\(resourcesPath)/plugins/")
+    }
+
+    private static func isIgnoredNonBlockingProcess(command: String, appPath: String) -> Bool {
+        let crashpadPath = "\(appPath)/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler"
+        return command.contains(crashpadPath)
     }
 
     static func stopDetachedAppServer(appPath: String) -> Bool {
@@ -672,7 +680,9 @@ enum CodexDesktopAppPatcher {
 final class CodexAutoPatchMonitor {
     private var workspaceObserver: NSObjectProtocol?
     private var periodicTimer: Timer?
+    private var desktopRetryTimer: Timer?
     private var repairTask: Task<Void, Never>?
+    private var desktopRepairTask: Task<Void, Never>?
     private var lastForkMessage: String?
     private var lastDesktopMessage: String?
 
@@ -709,8 +719,11 @@ final class CodexAutoPatchMonitor {
         workspaceObserver = nil
         periodicTimer?.invalidate()
         periodicTimer = nil
+        stopDesktopRetryTimer()
         repairTask?.cancel()
         repairTask = nil
+        desktopRepairTask?.cancel()
+        desktopRepairTask = nil
     }
 
     private func attemptRepair(reason: String) {
@@ -723,6 +736,19 @@ final class CodexAutoPatchMonitor {
             await MainActor.run {
                 self?.repairTask = nil
                 self?.log(forkResult: forkResult, desktopResult: desktopResult, reason: reason)
+            }
+        }
+    }
+
+    private func attemptDesktopRepair(reason: String) {
+        guard repairTask == nil, desktopRepairTask == nil else { return }
+
+        desktopRepairTask = Task.detached { [weak self] in
+            let desktopResult = CodexDesktopAppPatcher.repairInstalledAppIfNeeded()
+
+            await MainActor.run {
+                self?.desktopRepairTask = nil
+                self?.log(forkResult: nil, desktopResult: desktopResult, reason: reason)
             }
         }
     }
@@ -757,5 +783,29 @@ final class CodexAutoPatchMonitor {
             }
             lastDesktopMessage = desktopResult.message
         }
+
+        if let desktopResult {
+            if desktopResult.success,
+               desktopResult.message.contains("Desktop compatibility check deferred") {
+                startDesktopRetryTimer()
+            } else {
+                stopDesktopRetryTimer()
+            }
+        }
+    }
+
+    private func startDesktopRetryTimer() {
+        guard desktopRetryTimer == nil else { return }
+
+        desktopRetryTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.attemptDesktopRepair(reason: "desktop-retry")
+            }
+        }
+    }
+
+    private func stopDesktopRetryTimer() {
+        desktopRetryTimer?.invalidate()
+        desktopRetryTimer = nil
     }
 }

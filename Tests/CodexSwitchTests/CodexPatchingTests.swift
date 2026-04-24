@@ -530,6 +530,31 @@ struct CodexPatchingTests {
         #expect(usageState == .appRunning)
     }
 
+    @Test("Desktop app process classifier ignores orphaned crashpad handlers")
+    func desktopProcessClassifierIgnoresOrphanedCrashpadHandlers() {
+        let usageState = CodexDesktopAppProcessClassifier.usageState(
+            appPath: "/Applications/Codex.app",
+            processCommands: [
+                "/Applications/Codex.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler --database=/Users/example/Library/Application Support/Codex/Crashpad"
+            ]
+        )
+
+        #expect(usageState == .notRunning)
+    }
+
+    @Test("Desktop app process classifier allows detached app-server with orphaned crashpad")
+    func desktopProcessClassifierAllowsDetachedAppServerWithCrashpad() {
+        let usageState = CodexDesktopAppProcessClassifier.usageState(
+            appPath: "/Applications/Codex.app",
+            processCommands: [
+                "/Applications/Codex.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler --database=/Users/example/Library/Application Support/Codex/Crashpad",
+                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
+            ]
+        )
+
+        #expect(usageState == .backgroundServiceOnly)
+    }
+
     @Test("Desktop app repair runs when the tracked build changed and the new asar is unpatched")
     func desktopRepairRunsWhenBuildChanges() {
         let install = CodexDesktopAppInstall(
