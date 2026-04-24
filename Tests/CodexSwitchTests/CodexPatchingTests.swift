@@ -523,4 +523,30 @@ struct CodexPatchingTests {
 
         #expect(decision == .deferWhileRunning)
     }
+
+    @Test("Desktop app repair records a clean running stock bundle when the build changed")
+    func desktopRepairRecordsRunningCleanStockBundleWhenBuildChanged() {
+        let install = CodexDesktopAppInstall(
+            appPath: "/Applications/Codex.app",
+            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
+            bundleVersion: "2056",
+            shortVersion: "26.422.21637"
+        )
+        let staleState = CodexDesktopPatchedAppState(
+            bundleVersion: "1858",
+            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
+        )
+
+        let decision = CodexDesktopAppPatchRepairDecider.decision(
+            currentInstall: install,
+            savedState: staleState,
+            patchMarkerPresent: true,
+            legacyPatchMarkerPresent: false,
+            usageState: .appRunning,
+            bundleIsValid: true,
+            signatureStatus: .officialOpenAI
+        )
+
+        #expect(decision == .repairNeeded)
+    }
 }

@@ -115,6 +115,12 @@ enum CodexDesktopAppPatchRepairDecider {
             return .noRepairNeeded
         }
 
+        if bundleIsValid,
+           !legacyPatchMarkerPresent,
+           signatureAllowsHotSwap {
+            return .repairNeeded
+        }
+
         if usageState == .appRunning {
             return .deferWhileRunning
         }
