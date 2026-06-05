@@ -1,0 +1,40 @@
+Sources/CodexSwitch/Models/QuotaSnapshot.swift
+  s_17b60250b4a386::t_46ee38dee23f38 3,7-19,22-24,28-50,54-69
+Tests/CodexSwitchTests/AccountManagerTests.swift
+  s_17b60250b4a386::t_c2fc8132cdcb5d 148-152,160,163,167-169,173-174,185-189,192,200,202,205,207-209,214,223-227,229-231,243-247,267-269
+  s_17b60250b4a386::t_9e3a34dc86956e 78-79,92-99,102,104,111,123-125,128,130
+Tests/CodexSwitchTests/StatusRefreshTests.swift
+  s_17b60250b4a386::t_e6f0709679ec6f 23-24,27,31-32,34-35,38
+Sources/CodexSwitch/Models/AccountManager.swift
+  s_17b60250b4a386::t_32363e806cb568 4-7,9-19,21-24,26-34,38-58,64-67,70-74,79-81,87-97,100,102-165,176-181,183-185,187-188,191-196,199-204,206,209-210,213-295,297-304,307-317,319-365,367-370,374-382,392,399,405,407-414,416-417,419-420,422-433,438-441,444-451,455-464,466-467,470-471
+Sources/CodexSwitch/Views/AccountCardView.swift
+  s_17b60250b4a386::t_7901d8fa7c9b9b 1,8-9,12-16,18-23,26-34,44-52,67-86,88,95-102,104-114,118-119,128-144,153-155,158,168-182,184-190,192-203,205,218-227,258-263,266-270,275-276,279-280,292-348
+  s_17b60250b4a386::t_0e1adcf593519c 103
+  s_17b60250b4a386::t_d90320d7b7062d 87,89-92
+Sources/CodexSwitch/Services/CodexInstallLocator.swift
+  s_17b60250b4a386::t_701cd9c342c0dc 75-76,79,81,88-89,92,94
+Tests/CodexSwitchTests/AccountCardViewTests.swift
+  s_17b60250b4a386::t_d7221ae3c6df63 39,41,52,54,71-73
+Sources/CodexSwitch/Services/CodexDesktopAppPatcher.swift
+  s_17b60250b4a386::t_1c2064c3e76718 153-154,157,163,299-300,303-304,308,468,470,488,493,503-505,732,745
+Tests/CodexSwitchTests/DrainBarViewTests.swift
+  s_17b60250b4a386::t_4d5a6601b3e857 12,16
+.gitignore
+  s_17b60250b4a386::t_7bb00048149260 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "348a40e1a3dd91b6f37debed3504872ca674839e",
+  "prompts": {},
+  "sessions": {
+    "s_17b60250b4a386": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e498f-4e23-7d42-8cf6-6e470c609e67",
+        "model": "gpt-5.5"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
