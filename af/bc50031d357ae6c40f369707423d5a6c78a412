@@ -1,0 +1,25 @@
+Sources/CodexSwitch/Services/DesktopPatchManager.swift
+  s_17b60250b4a386::t_07b9c41b7a81d3 113-127,216-281
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_17b60250b4a386::t_47541a5f7084d7 94-95,286-287,289,293-295,297-299,301-318,320
+Tests/CodexSwitchTests/DesktopStatusTests.swift
+  s_17b60250b4a386::t_3ca74e21555173 300-346,394-406
+Tests/CodexSwitchTests/AppDelegateNotificationTests.swift
+  s_17b60250b4a386::t_2fd97801ef5214 19-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "afbc50031d357ae6c40f369707423d5a6c78a412",
+  "prompts": {},
+  "sessions": {
+    "s_17b60250b4a386": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e498f-4e23-7d42-8cf6-6e470c609e67",
+        "model": "gpt-5.5"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
