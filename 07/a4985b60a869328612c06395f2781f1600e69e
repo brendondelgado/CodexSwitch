@@ -1,0 +1,24 @@
+docs/linux-cli-only.md
+  s_17b60250b4a386::t_ad75dfa66a115e 99-100
+scripts/claude-vps
+  s_17b60250b4a386::t_59011a4eb207ff 12-13,65,71-73,109,111-112,116-120
+  s_17b60250b4a386::t_0adfb116f06b8a 110
+scripts/test_claude_vps.py
+  s_17b60250b4a386::t_3e2d9165423779 28-29,32-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "07a4985b60a869328612c06395f2781f1600e69e",
+  "prompts": {},
+  "sessions": {
+    "s_17b60250b4a386": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e498f-4e23-7d42-8cf6-6e470c609e67",
+        "model": "gpt-5.5"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
