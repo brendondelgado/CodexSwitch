@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "crates/codexswitch-cli",
+]
+resolver = "2"

@@ -75,8 +75,8 @@ struct AccountManagerTests {
         #expect(manager.sortedAccounts.first?.id == plus.id)
     }
 
-    @Test("Auth sync imports rotated tokens for the currently active account")
-    func syncImportsRotatedTokens() {
+    @Test("Refresh stored tokens imports rotated tokens for the currently active account")
+    func refreshStoredTokensImportsRotatedTokens() {
         let manager = AccountManager()
         var active = makeAccount(
             fiveHourRemaining: 80,
@@ -89,31 +89,26 @@ struct AccountManagerTests {
         active.idToken = "old-id"
         manager.accounts = [active]
 
-        let authFile = AuthFile(
-            authMode: "chatgpt",
-            openaiApiKey: nil,
-            tokens: AuthTokens(
-                idToken: "new-id",
-                accessToken: "new-access",
-                refreshToken: "new-refresh",
-                accountId: active.accountId
-            ),
-            lastRefresh: "2026-04-21T17:00:00.000Z"
+        let imported = CodexAccount(
+            id: UUID(),
+            email: active.email,
+            accessToken: "new-access",
+            refreshToken: "new-refresh",
+            idToken: "new-id",
+            accountId: active.accountId,
+            lastRefreshed: Date()
         )
 
-        let result = manager.sync(with: authFile)
+        let refreshedId = manager.refreshStoredTokens(from: imported)
 
-        #expect(result?.activeAccountId == active.id)
-        #expect(result?.activeAccountChanged == false)
-        #expect(result?.tokensUpdated == true)
+        #expect(refreshedId == active.id)
         #expect(manager.activeAccount?.accessToken == "new-access")
         #expect(manager.activeAccount?.refreshToken == "new-refresh")
         #expect(manager.activeAccount?.idToken == "new-id")
     }
 
     @Test("Auth sync activates the matching account when auth.json points elsewhere")
-    func syncActivatesMatchingAccount() {
-        let manager = AccountManager()
+    func syncActivatesMatchingAccount() async {
         let plus = makeAccount(
             fiveHourRemaining: 90,
             weeklyRemaining: 50,
@@ -125,24 +120,14 @@ struct AccountManagerTests {
             weeklyRemaining: 90,
             planType: "pro"
         )
+        let manager = AccountManager(authAccountIdProvider: {
+            pro.accountId
+        })
         manager.accounts = [plus, pro]
 
-        let authFile = AuthFile(
-            authMode: "chatgpt",
-            openaiApiKey: nil,
-            tokens: AuthTokens(
-                idToken: pro.idToken,
-                accessToken: pro.accessToken,
-                refreshToken: pro.refreshToken,
-                accountId: pro.accountId
-            ),
-            lastRefresh: "2026-04-21T17:00:00Z"
-        )
+        let changedId = await manager.syncWithAuthJson()
 
-        let result = manager.sync(with: authFile)
-
-        #expect(result?.activeAccountId == pro.id)
-        #expect(result?.activeAccountChanged == true)
+        #expect(changedId == pro.id)
         #expect(manager.activeAccount?.id == pro.id)
     }
 
@@ -160,7 +145,11 @@ struct AccountManagerTests {
         existing.accessToken = "old-access"
         existing.refreshToken = "old-refresh"
         manager.accounts = [existing]
-        manager.markReauthenticationRequired(for: existing.id, detail: "refresh token rejected")
+        manager.markRuntimeUnusable(
+            for: existing.id,
+            reason: "token_expired",
+            until: Date().addingTimeInterval(30 * 24 * 60 * 60)
+        )
 
         var replacement = existing
         replacement.accessToken = "new-access"
@@ -168,20 +157,21 @@ struct AccountManagerTests {
         replacement.idToken = "new-id"
         replacement.lastRefreshed = Date()
 
-        let result = manager.addAccount(replacement)
+        manager.addAccount(replacement)
 
-        #expect(result.localId == existing.id)
-        #expect(result.action == .updated)
         #expect(manager.accounts.count == 1)
+        #expect(manager.accounts[0].id == existing.id)
         #expect(manager.activeAccount?.id == existing.id)
         #expect(manager.activeAccount?.accessToken == "new-access")
         #expect(manager.activeAccount?.refreshToken == "new-refresh")
-        #expect(manager.accounts[0].reauthenticationError == nil)
+        #expect(manager.accounts[0].runtimeUnusableUntil == nil)
+        #expect(manager.accounts[0].runtimeUnusableReason == nil)
+        #expect(!manager.accounts[0].requiresReauthentication)
         #expect(manager.pollingErrors[existing.id] == nil)
     }
 
-    @Test("Preferred local id forces re-auth to update the selected stale account")
-    func addAccountUsesPreferredLocalId() {
+    @Test("Re-authenticated account refresh preserves the canonical local id")
+    func refreshStoredTokensPreservesCanonicalLocalId() {
         let manager = AccountManager()
         var existing = makeAccount(
             fiveHourRemaining: 30,
@@ -192,10 +182,14 @@ struct AccountManagerTests {
         existing.email = "stale@example.com"
         existing.accountId = "stale-account"
         manager.accounts = [existing]
-        manager.markReauthenticationRequired(for: existing.id)
+        manager.markRuntimeUnusable(
+            for: existing.id,
+            reason: "token_expired",
+            until: Date().addingTimeInterval(30 * 24 * 60 * 60)
+        )
 
         let replacement = CodexAccount(
-            email: "fresh@example.com",
+            email: "stale@example.com",
             accessToken: "fresh-access",
             refreshToken: "fresh-refresh",
             idToken: "fresh-id",
@@ -203,20 +197,21 @@ struct AccountManagerTests {
             lastRefreshed: Date()
         )
 
-        let result = manager.addAccount(replacement, preferredLocalId: existing.id)
+        let refreshedId = manager.refreshStoredTokens(from: replacement)
 
-        #expect(result.localId == existing.id)
-        #expect(result.action == .updated)
+        #expect(refreshedId == existing.id)
         #expect(manager.accounts.count == 1)
         #expect(manager.accounts[0].id == existing.id)
-        #expect(manager.accounts[0].email == "fresh@example.com")
+        #expect(manager.accounts[0].email == "stale@example.com")
         #expect(manager.accounts[0].accountId == "fresh-account")
-        #expect(manager.accounts[0].reauthenticationError == nil)
+        #expect(manager.accounts[0].runtimeUnusableUntil == nil)
+        #expect(manager.accounts[0].runtimeUnusableReason == nil)
+        #expect(!manager.accounts[0].requiresReauthentication)
         #expect(manager.pollingErrors[existing.id] == nil)
     }
 
     @Test("Marking re-authentication required persists on the account record")
-    func markReauthenticationRequiredPersists() {
+    func markRuntimeUnusablePersistsReauthenticationState() {
         let manager = AccountManager()
         let account = makeAccount(
             fiveHourRemaining: 75,
@@ -225,10 +220,15 @@ struct AccountManagerTests {
         )
         manager.accounts = [account]
 
-        manager.markReauthenticationRequired(for: account.id, detail: "refresh token rejected")
+        manager.markRuntimeUnusable(
+            for: account.id,
+            reason: "token_expired",
+            until: Date().addingTimeInterval(30 * 24 * 60 * 60)
+        )
 
-        #expect(manager.requiresReauthentication(for: account.id))
-        #expect(manager.accounts[0].reauthenticationError == "Re-authentication required — refresh token rejected")
+        #expect(manager.accounts[0].requiresReauthentication)
+        #expect(manager.accounts[0].runtimeStatusText == "Re-authentication required")
+        #expect(manager.pollingErrors[account.id] == "Re-authentication required")
     }
 
     @Test("Quota refresh does not clear a known stale refresh token")
@@ -240,7 +240,11 @@ struct AccountManagerTests {
             planType: "pro"
         )
         manager.accounts = [account]
-        manager.markReauthenticationRequired(for: account.id, detail: "refresh token rejected")
+        manager.markRuntimeUnusable(
+            for: account.id,
+            reason: "token_expired",
+            until: Date().addingTimeInterval(30 * 24 * 60 * 60)
+        )
 
         manager.updateQuota(
             for: account.id,
@@ -260,7 +264,8 @@ struct AccountManagerTests {
             planType: "pro"
         )
 
-        #expect(manager.requiresReauthentication(for: account.id))
-        #expect(manager.accounts[0].reauthenticationError == "Re-authentication required — refresh token rejected")
+        #expect(manager.accounts[0].requiresReauthentication)
+        #expect(manager.accounts[0].runtimeUnusableReason == "token_expired")
+        #expect(manager.pollingErrors[account.id] == "Re-authentication required")
     }
 }

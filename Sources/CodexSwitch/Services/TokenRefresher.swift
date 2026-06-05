@@ -60,6 +60,8 @@ enum TokenRefresher {
             updated.refreshToken = newRefreshToken
         }
         updated.lastRefreshed = Date()
+        updated.runtimeUnusableUntil = nil
+        updated.runtimeUnusableReason = nil
         return updated
     }
 }

@@ -72,30 +72,26 @@ enum CodexInstallLocator {
             return "?"
         }
 
-        guard let output = ProcessRunner.run(
-            executablePath: executablePath,
+        let output = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: executablePath),
             arguments: ["--version"],
             timeout: 2
-        ) else {
-            return "?"
-        }
+        )
         guard !output.timedOut else { return "?" }
-        let version = output.stdout
+        let version = output.stdoutString
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "codex-cli ", with: "")
         return version.isEmpty ? "?" : version
     }
 
     private static func locateExecutablePath() -> String? {
-        guard let output = ProcessRunner.run(
-            executablePath: "/usr/bin/which",
+        let output = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/which"),
             arguments: ["codex"],
             timeout: 1
-        ) else {
-            return nil
-        }
+        )
         guard !output.timedOut else { return nil }
-        let path = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = output.stdoutString.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? nil : path
     }
 }

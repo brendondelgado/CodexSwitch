@@ -4,61 +4,53 @@ import os
 
 private let logger = Logger(subsystem: "com.codexswitch", category: "SwapEngine")
 
+private final class ExecutableHotSwapSupportCache: @unchecked Sendable {
+    private struct Entry {
+        let modifiedAt: Date?
+        let supportsHotSwap: Bool
+    }
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+
+    func get(path: String, modifiedAt: Date?) -> Bool? {
+        lock.withLock {
+            guard let entry = entries[path],
+                  entry.modifiedAt == modifiedAt else {
+                return nil
+            }
+            return entry.supportsHotSwap
+        }
+    }
+
+    func set(path: String, modifiedAt: Date?, supportsHotSwap: Bool) {
+        lock.withLock {
+            entries[path] = Entry(modifiedAt: modifiedAt, supportsHotSwap: supportsHotSwap)
+        }
+    }
+}
+
 enum SwapEngine {
     private static let codexAuthPath = NSString("~/.codex/auth.json").expandingTildeInPath
-    private static let proCapacityMultiplier = 6.7
-    private static let proThroughputBonus = 15.0
-    private static let freeCapacityMultiplier = 0.1
-    private static let freeThroughputPenalty = -20.0
-
-    struct SighupProcessSnapshot: Equatable {
-        let pid: Int32
-        let commandLine: String
-        let executablePath: String
-        let controllingTTYDevice: UInt32
-        let terminalProcessGroup: UInt32
-        let startTime: Date
-    }
-
-    private static func normalizedPlanType(for account: CodexAccount) -> String? {
-        account.planType?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-    }
-
-    private static func planCapacityMultiplier(for account: CodexAccount) -> Double {
-        switch normalizedPlanType(for: account) {
-        case "pro":
-            return proCapacityMultiplier
-        case "free":
-            return freeCapacityMultiplier
-        default:
-            return 1.0
-        }
-    }
-
-    private static func planThroughputBonus(for account: CodexAccount) -> Double {
-        switch normalizedPlanType(for: account) {
-        case "pro":
-            return proThroughputBonus
-        case "free":
-            return freeThroughputPenalty
-        default:
-            return 0
-        }
-    }
+    private static let resetTieFiveHourTolerance = 2.0
+    private static let resetTieWeeklyTolerance = 5.0
+    private nonisolated static let hotSwapSupportCache = ExecutableHotSwapSupportCache()
 
     /// Score an account for swap eligibility. Higher = better candidate.
     /// Returns -1 for ineligible accounts (no data, both windows exhausted).
     static func score(_ account: CodexAccount) -> Double {
-        guard let snapshot = account.quotaSnapshot else { return -1 }
+        guard let snapshot = account.realQuotaSnapshot else { return -1 }
         let fiveHr = snapshot.fiveHour
         let weekly = snapshot.weekly
-        let capacityMultiplier = planCapacityMultiplier(for: account)
-        let throughputBonus = planThroughputBonus(for: account)
+
+        guard !snapshot.hasExpiredExhaustedWindow() else {
+            return -1
+        }
 
         // HARD EXCLUSION: Weekly exhausted = completely unusable until weekly resets
         if weekly.isExhausted { return -1 }
+
+        let planBase = planPriorityBase(for: account)
 
         // 5h exhausted but weekly has capacity — score by time until 5h resets.
         // Closer to reset = higher score. An account resetting in 10 min is much
@@ -68,76 +60,129 @@ enum SwapEngine {
             let maxHours: Double = 5  // 5h window duration
             // proximity: 1.0 when resetting now → 0.0 when resetting in 5h
             let proximity = max(0, 1 - (hoursUntilReset / maxHours))
-            // Score range: 0.1 (far reset) to ~19 (imminent reset + high weekly)
-            var score = proximity * 15 + weekly.remainingPercent * 0.1 + throughputBonus
-            if weekly.remainingPercent < 20 {
-                score *= 0.5
-            }
-            return score
+            return planBase + proximity * 100 + weekly.remainingPercent * 0.3
         }
 
-        // Primary: 5-hour remaining, normalized by effective plan capacity.
-        // Pro accounts are more valuable because they have materially more runway
-        // and faster inference, so modestly lower percentages should still win.
-        var s = fiveHr.remainingPercent * capacityMultiplier
+        // Primary: 5-hour remaining (0-100)
+        var s = planBase + fiveHr.remainingPercent
 
         // Weight weekly remaining — low weekly is a significant penalty
         s += weekly.remainingPercent * 0.3
-        s += throughputBonus
 
         // Penalize accounts with very low weekly (< 20%) even if 5h is high
         if weekly.remainingPercent < 20 {
-            s *= 0.5
+            s -= 50
         }
 
-        return max(0.1, s)
+        return s
+    }
+
+    static func isImmediatelyUsable(_ account: CodexAccount) -> Bool {
+        guard let snapshot = account.realQuotaSnapshot else { return false }
+        return score(account) > 0
+            && !snapshot.fiveHour.shouldAutoSwapAway
+            && !snapshot.weekly.shouldAutoSwapAway
+    }
+
+    private static func planPriorityBase(for account: CodexAccount) -> Double {
+        switch account.planPriority {
+        case 4:
+            return 15_000 // Pro: fastest inference and largest allowance
+        case 3:
+            return 10_000 // Pro Lite: above Plus, below full Pro
+        case 2:
+            return 5_000 // Plus/team/business: normal paid working pool
+        default:
+            return 100 // Free: usable only after paid accounts are spent/resetting
+        }
     }
 
     /// Select the best account to swap to from candidates (excluding currently active)
     static func selectOptimalAccount(from accounts: [CodexAccount]) -> CodexAccount? {
         accounts
             .filter { !$0.isActive }
-            .filter { score($0) > 0 }
-            .max { score($0) < score($1) }
+            .filter { isImmediatelyUsable($0) }
+            .reduce(nil) { best, account in
+                guard let best else { return account }
+                return isBetterCandidate(account, than: best) ? account : best
+            }
     }
 
-    /// Decide whether the current active account should yield to a candidate.
-    /// We still swap immediately for exhausted/invalid active accounts, but we
-    /// also allow a better Pro account to reclaim the active slot from a Plus
-    /// account because Pro offers materially better throughput and runway.
-    static func shouldSwap(
-        from active: CodexAccount,
-        to candidate: CodexAccount,
-        manualOverrideAccountId: UUID? = nil
+    /// Select a target for automatic failover. Unlike manual selection, this
+    /// excludes accounts that are themselves close enough to depletion that they
+    /// would immediately trigger another auto-swap.
+    static func selectAutoSwapCandidate(from accounts: [CodexAccount]) -> CodexAccount? {
+        accounts
+            .filter { !$0.isActive }
+            .filter { account in
+                isImmediatelyUsable(account)
+            }
+            .reduce(nil) { best, account in
+                guard let best else { return account }
+                return isBetterCandidate(account, than: best) ? account : best
+            }
+    }
+
+    /// Select a higher-tier account even when the active account still has
+    /// quota. Pro accounts get the fastest inference, so a usable higher plan
+    /// should not sit idle behind a healthy lower plan.
+    static func selectPlanUpgradeCandidate(active: CodexAccount, from accounts: [CodexAccount]) -> CodexAccount? {
+        accounts
+            .filter { !$0.isActive && $0.id != active.id }
+            .filter { $0.planPriority > active.planPriority }
+            .filter { isImmediatelyUsable($0) }
+            .reduce(nil) { best, account in
+                guard let best else { return account }
+                return isBetterCandidate(account, than: best) ? account : best
+            }
+    }
+
+    static func shouldHonorManualOverride(
+        activeAccountId: UUID,
+        manualOverrideAccountId: UUID?,
+        activeNeedsRelief: Bool
     ) -> Bool {
-        guard active.id != candidate.id else { return false }
-        guard let candidateSnapshot = candidate.quotaSnapshot,
-              !candidateSnapshot.fiveHour.isExhausted,
-              !candidateSnapshot.weekly.isExhausted else {
+        manualOverrideAccountId == activeAccountId && !activeNeedsRelief
+    }
+
+    static func earliestUsableReset(from accounts: [CodexAccount], now: Date = Date()) -> Date? {
+        accounts
+            .compactMap { account -> Date? in
+                guard let snapshot = account.realQuotaSnapshot else { return nil }
+                let resetCandidates = [
+                    snapshot.fiveHour.shouldAutoSwapAway ? snapshot.fiveHour.resetsAt : nil,
+                    snapshot.weekly.shouldAutoSwapAway ? snapshot.weekly.resetsAt : nil,
+                ].compactMap { $0 }
+                return resetCandidates.filter { $0 > now }.min()
+            }
+            .min()
+    }
+
+    private static func isBetterCandidate(_ left: CodexAccount, than right: CodexAccount) -> Bool {
+        if shouldUseFiveHourResetTieBreaker(left, right) {
+            let leftReset = left.realQuotaSnapshot!.fiveHour.resetsAt
+            let rightReset = right.realQuotaSnapshot!.fiveHour.resetsAt
+            if leftReset != rightReset {
+                return leftReset < rightReset
+            }
+        }
+        return score(left) > score(right)
+    }
+
+    private static func shouldUseFiveHourResetTieBreaker(_ left: CodexAccount, _ right: CodexAccount) -> Bool {
+        guard left.planPriority == right.planPriority,
+              let leftSnapshot = left.realQuotaSnapshot,
+              let rightSnapshot = right.realQuotaSnapshot else {
             return false
         }
 
-        let activeSnapshot = active.quotaSnapshot
-        let activeExhausted = activeSnapshot.map { $0.fiveHour.isExhausted || $0.weekly.isExhausted } ?? false
-        if activeExhausted || score(active) <= 0 {
-            return true
-        }
-
-        if manualOverrideAccountId == active.id {
-            return false
-        }
-
-        let candidateScore = score(candidate)
-        let activeScore = score(active)
-        guard candidateScore > activeScore else { return false }
-
-        return normalizedPlanType(for: candidate) == "pro"
-            && normalizedPlanType(for: active) != "pro"
+        return abs(leftSnapshot.fiveHour.remainingPercent - rightSnapshot.fiveHour.remainingPercent) <= resetTieFiveHourTolerance
+            && abs(leftSnapshot.weekly.remainingPercent - rightSnapshot.weekly.remainingPercent) <= resetTieWeeklyTolerance
     }
 
     /// Explain why a candidate was selected as next-up over alternatives
     static func explainSelection(candidate: CodexAccount, allAccounts: [CodexAccount]) -> String {
-        guard let snapshot = candidate.quotaSnapshot else {
+        guard let snapshot = candidate.realQuotaSnapshot else {
             return "Selected but no quota data available yet."
         }
 
@@ -148,12 +193,10 @@ enum SwapEngine {
         var lines: [String] = []
 
         // Primary factor
-        lines.append("5h: \(Int(fiveHr.remainingPercent))% | Weekly: \(Int(weekly.remainingPercent))%")
-        if normalizedPlanType(for: candidate) == "pro" {
-            lines.append("Pro plan preferred for higher capacity and faster inference")
-        } else if normalizedPlanType(for: candidate) == "free" {
-            lines.append("Free plan deprioritized because limits are much lower")
+        if !candidate.planLabel.isEmpty {
+            lines.append("\(candidate.planLabel) priority")
         }
+        lines.append("5h: \(Int(fiveHr.remainingPercent))% | Weekly: \(Int(weekly.remainingPercent))%")
 
         // Weekly status
         if weekly.remainingPercent < 20 {
@@ -163,7 +206,10 @@ enum SwapEngine {
         }
 
         // Reset proximity info
-        if fiveHr.isExhausted {
+        if !fiveHr.isExhausted {
+            let mins = Int(max(0, fiveHr.timeUntilReset) / 60)
+            lines.append("5h resets in \(mins / 60)h \(mins % 60)m")
+        } else {
             let mins = Int(fiveHr.timeUntilReset / 60)
             if mins < 60 {
                 lines.append("5h resets in \(mins)m")
@@ -176,9 +222,11 @@ enum SwapEngine {
         let eligible = allAccounts.filter { !$0.isActive && $0.id != candidate.id && score($0) > 0 }
         let others = eligible.sorted { score($0) > score($1) }
 
-        if let runnerUp = others.first, let ruSnap = runnerUp.quotaSnapshot {
+        if let runnerUp = others.first, let ruSnap = runnerUp.realQuotaSnapshot {
             let diff = Int(fiveHr.remainingPercent - ruSnap.fiveHour.remainingPercent)
-            if diff > 0 {
+            if shouldUseFiveHourResetTieBreaker(candidate, runnerUp), fiveHr.resetsAt < ruSnap.fiveHour.resetsAt {
+                lines.append("Comparable quota — earlier 5h reset broke the tie")
+            } else if diff > 0 {
                 lines.append("+\(diff)% over next best (\(runnerUp.email.components(separatedBy: "@").first ?? "")@...)")
             } else {
                 lines.append("Tied with others — weekly quota broke the tie")
@@ -214,52 +262,11 @@ enum SwapEngine {
     }
 
     /// Send SIGHUP to running Codex CLI processes so they reload auth.json.
-    /// Only sends if the current install is known to support SIGHUP — either
-    /// via runtime verification markers written by the fork or via a matching
-    /// recorded patched-install state.
-    static func shouldSignalCodexProcess(
-        _ process: SighupProcessSnapshot,
-        now: Date = Date(),
-        minAge: TimeInterval = 10
-    ) -> Bool {
-        guard process.controllingTTYDevice != 0, process.terminalProcessGroup != 0 else {
-            return false
-        }
-
-        guard now.timeIntervalSince(process.startTime) >= minAge else {
-            return false
-        }
-
-        let executablePath = process.executablePath.lowercased()
-        let executableName = URL(fileURLWithPath: process.executablePath)
-            .lastPathComponent
-            .lowercased()
-
-        guard executableName == "codex" || executableName.hasPrefix("codex-") else {
-            return false
-        }
-
-        guard !executablePath.contains(".app/contents/") else {
-            return false
-        }
-
-        return true
-    }
-
+    /// Only sends if a SIGHUP-capable binary wrote a verification marker.
     static func signalCodexReload() {
-        let install = CodexInstallLocator.locate()
-        let currentVersion = CodexInstallLocator.currentVersion()
-        let hasVerifiedMarker = CodexSighupMarkers.hasVerifiedMarker()
-        let hasMatchingPatchedState = install.map {
-            CodexPatchStateStore.matchesCurrentInstall(
-                currentVersion: currentVersion,
-                currentInstall: $0
-            )
-        } ?? false
-
-        guard hasVerifiedMarker || hasMatchingPatchedState else {
+        guard Self.hasVerifiedSighupMarker() else {
             logger.info("SIGHUP not verified by installed codex binary — skipping")
-            SwapLog.append(.sighupSkipped(reason: "sighup verification markers not found"))
+            SwapLog.append(.sighupSkipped(reason: "sighup-verified not found"))
             return
         }
 
@@ -286,86 +293,213 @@ enum SwapEngine {
         let output = String(data: data, encoding: .utf8) ?? ""
         var signaled = 0
         var skippedTooNew = 0
-        var skippedIneligible = 0
+        var skippedNoAck = 0
 
         for line in output.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty else { continue }
 
+            // pgrep -lf output: "PID command args..."
             guard let pid = Int32(trimmed.split(separator: " ").first ?? "") else { continue }
-            guard let snapshot = sighupProcessSnapshot(pid: pid, commandLine: trimmed) else {
-                skippedIneligible += 1
-                continue
+            guard Self.shouldSignalCodexProcess(pid: pid, commandLine: trimmed) else { continue }
+
+            // Check process age via /proc or kill(0) — use proc_pidinfo alternative on macOS
+            // Simple approach: check if process started recently via sysctl
+            var info = proc_bsdinfo()
+            let size = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
+            if size > 0 {
+                let startTime = Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec))
+                if now.timeIntervalSince(startTime) < minAge {
+                    skippedTooNew += 1
+                    logger.info("Skipping pid \(pid) — started <10s ago")
+                    SwapLog.append(.sighupSkipped(reason: "pid \(pid) started <10s ago"))
+                    continue
+                }
             }
 
-            if now.timeIntervalSince(snapshot.startTime) < minAge {
-                skippedTooNew += 1
-                logger.info("Skipping pid \(pid) — started <10s ago")
-                SwapLog.append(.sighupSkipped(reason: "pid \(pid) started <10s ago"))
-                continue
+            let sentAt = Date()
+            kill(pid, SIGHUP)
+            if waitForHotSwapAck(pid: pid, since: sentAt) {
+                signaled += 1
+                logger.info("SIGHUP → pid \(pid) acknowledged")
+                SwapLog.append(.sighupSent(pid: pid, startedAt: ""))
+            } else {
+                skippedNoAck += 1
+                logger.info("Skipping pid \(pid) — SIGHUP sent but no live ack observed")
+                SwapLog.append(.sighupSkipped(reason: "pid \(pid) did not acknowledge SIGHUP hot-swap"))
             }
-
-            guard shouldSignalCodexProcess(snapshot, now: now, minAge: minAge) else {
-                skippedIneligible += 1
-                continue
-            }
-
-            kill(snapshot.pid, SIGHUP)
-            signaled += 1
-            logger.info("SIGHUP → pid \(snapshot.pid)")
-            SwapLog.append(.sighupSent(pid: snapshot.pid, startedAt: ""))
         }
 
-        if signaled == 0 && skippedTooNew == 0 && skippedIneligible == 0 {
-            logger.info("No codex-related processes found to inspect")
+        if signaled == 0 && skippedTooNew == 0 && skippedNoAck == 0 {
+            logger.info("No codex CLI processes found to signal")
             SwapLog.append(.sighupSkipped(reason: "no codex processes found"))
-        } else if signaled == 0 {
-            logger.info("No eligible interactive codex CLI processes found to signal")
-            SwapLog.append(.sighupSkipped(reason: "no eligible codex cli processes found"))
         }
-        logger.info("SIGHUP summary: signaled=\(signaled) skippedTooNew=\(skippedTooNew) skippedIneligible=\(skippedIneligible)")
+        logger.info("SIGHUP summary: signaled=\(signaled) skippedTooNew=\(skippedTooNew) skippedNoAck=\(skippedNoAck)")
     }
 
-    private static func sighupProcessSnapshot(
+    @discardableResult
+    static func signalDesktopAppServerReload() -> Bool {
+        guard Self.hasVerifiedSighupMarker() else {
+            SwapLog.append(.desktopExternalReloadSkipped(reason: "sighup-verified not found"))
+            return false
+        }
+
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
+            arguments: ["-fl", "codex.*app-server"],
+            timeout: 3
+        )
+        guard !result.timedOut, result.terminationStatus == 0 else {
+            SwapLog.append(.desktopExternalReloadSkipped(reason: "desktop_app_server_not_found"))
+            return false
+        }
+
+        let pids = desktopAppServerPIDsToSignal(from: result.stdoutString) { pid in
+            codexProcessHasHotSwapSupport(pid: pid, logStaleProcess: true)
+        }
+        guard !pids.isEmpty else {
+            SwapLog.append(.desktopExternalReloadSkipped(reason: "desktop_app_server_not_sighup_capable"))
+            return false
+        }
+
+        var acknowledged = false
+        for pid in pids {
+            let sentAt = Date()
+            kill(pid, SIGHUP)
+            if waitForHotSwapAck(pid: pid, since: sentAt) {
+                acknowledged = true
+                logger.info("Desktop app-server SIGHUP → pid \(pid) acknowledged")
+                SwapLog.append(.sighupSent(pid: pid, startedAt: "desktop-app-server"))
+            } else {
+                logger.info("Desktop app-server SIGHUP → pid \(pid) was not acknowledged")
+                SwapLog.append(.desktopExternalReloadSkipped(reason: "pid \(pid) did not acknowledge SIGHUP hot-swap"))
+            }
+        }
+        return acknowledged
+    }
+
+    nonisolated static func desktopAppServerPIDsToSignal(
+        from pgrepOutput: String,
+        hotSwapSupport: (Int32) -> Bool
+    ) -> [Int32] {
+        DesktopRuntimeDiagnostics
+            .parseAppServerProcesses(fromPGrepOutput: pgrepOutput)
+            .filter { $0.classification == .desktopAppServer && hotSwapSupport($0.pid) }
+            .map(\.pid)
+    }
+
+    private static func hasVerifiedSighupMarker() -> Bool {
+        let markerDir = NSString("~/.codexswitch").expandingTildeInPath
+        let markerNames = [
+            "sighup-verified",
+            "sighup-verified-tui",
+            "sighup-verified-exec",
+        ]
+        return markerNames.contains { name in
+            FileManager.default.fileExists(
+                atPath: (markerDir as NSString).appendingPathComponent(name)
+            )
+        }
+    }
+
+    private static func shouldSignalCodexProcess(pid: Int32, commandLine: String) -> Bool {
+        guard !commandLine.contains("CodexSwitch"),
+              !commandLine.contains("pgrep"),
+              !commandLine.contains(" app-server"),
+              !commandLine.contains("codex_chronicle") else {
+            return false
+        }
+        guard !commandLineIsUnsafeCodexSighupTarget(commandLine) else {
+            SwapLog.append(.sighupSkipped(reason: "pid \(pid) is a terminal/SSH wrapper; restart instead of SIGHUP"))
+            return false
+        }
+
+        guard codexProcessHasHotSwapSupport(pid: pid, logStaleProcess: true) else { return false }
+
+        return true
+    }
+
+    nonisolated static func commandLineIsUnsafeCodexSighupTarget(_ commandLine: String) -> Bool {
+        let lower = commandLine.lowercased()
+        return lower.contains("codex-vps")
+            || lower.contains("signul_canary_actor=codex-vps")
+            || lower.contains(" --remote ")
+            || lower.contains("/bin/zsh")
+            || lower.contains(" zsh ")
+            || lower.contains("/bin/bash")
+            || lower.contains(" bash ")
+            || lower.contains("/usr/bin/ssh")
+            || lower.contains(" ssh ")
+    }
+
+    private static func waitForHotSwapAck(pid: Int32, since: Date) -> Bool {
+        let deadline = Date().addingTimeInterval(3)
+        repeat {
+            if DesktopPatchManager.desktopHotSwapAckExists(pid: pid, since: since) {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        } while Date() < deadline
+        return false
+    }
+
+    nonisolated static func codexProcessHotSwapAckExists(pid: Int32) -> Bool {
+        DesktopPatchManager.desktopHotSwapAckExists(pid: pid)
+    }
+
+    nonisolated static func codexProcessHasHotSwapSupport(
         pid: Int32,
-        commandLine: String
-    ) -> SighupProcessSnapshot? {
+        logStaleProcess: Bool = false
+    ) -> Bool {
+        guard let executable = executablePath(for: pid) else { return false }
+        guard (executable as NSString).lastPathComponent.lowercased().contains("codex") else {
+            return false
+        }
+        if let executableModifiedAt = executableModificationDate(executable),
+           let processStartedAt = processStartDate(pid: pid),
+           executableModifiedAt.timeIntervalSince(processStartedAt) > 1 {
+            if logStaleProcess {
+                SwapLog.append(.sighupSkipped(reason: "pid \(pid) started before hot-swap patch; restart CLI session"))
+            }
+            return false
+        }
+        return executableHasSighupSupport(executable)
+    }
+
+    private nonisolated static func executableHasSighupSupport(_ path: String) -> Bool {
+        let modifiedAt = executableModificationDate(path)
+        if let cached = hotSwapSupportCache.get(path: path, modifiedAt: modifiedAt) {
+            return cached
+        }
+
+        let supportsHotSwap = DesktopPatchManager.fileContainsMarker("sighup-verified", at: path)
+            && DesktopPatchManager.fileContainsMarker("SIGHUP: auth reloaded", at: path)
+            && DesktopPatchManager.fileContainsMarker("hotswap-ack", at: path)
+            && DesktopPatchManager.fileContainsMarker("CodexSwitch rotated accounts after a usage limit", at: path)
+        hotSwapSupportCache.set(path: path, modifiedAt: modifiedAt, supportsHotSwap: supportsHotSwap)
+        return supportsHotSwap
+    }
+
+    private nonisolated static func executableModificationDate(_ path: String) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return attributes?[.modificationDate] as? Date
+    }
+
+    private nonisolated static func processStartDate(pid: Int32) -> Date? {
         var info = proc_bsdinfo()
-        let infoSize = proc_pidinfo(
-            pid,
-            PROC_PIDTBSDINFO,
-            0,
-            &info,
-            Int32(MemoryLayout<proc_bsdinfo>.size)
-        )
-        guard infoSize == Int32(MemoryLayout<proc_bsdinfo>.size) else {
-            return nil
-        }
+        let size = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
+        guard size > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec))
+    }
 
-        var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        let pathSize = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
-        guard pathSize > 0 else {
-            return nil
-        }
-
-        let pathLength = pathBuffer.firstIndex(of: 0) ?? Int(pathSize)
-        let path = String(
-            decoding: pathBuffer.prefix(pathLength).map { UInt8(bitPattern: $0) },
-            as: UTF8.self
-        )
-        let startTime = Date(
-            timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec)
-                + (TimeInterval(info.pbi_start_tvusec) / 1_000_000)
-        )
-
-        return SighupProcessSnapshot(
-            pid: pid,
-            commandLine: commandLine,
-            executablePath: path,
-            controllingTTYDevice: info.e_tdev,
-            terminalProcessGroup: info.e_tpgid,
-            startTime: startTime
-        )
+    private nonisolated static func executablePath(for pid: Int32) -> String? {
+        // PROC_PIDPATHINFO_MAXSIZE is a C macro that Swift may not import on
+        // newer SDKs. 4096 is the documented 4 * MAXPATHLEN value.
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return nil }
+        let bytes = buffer.prefix(Int(length)).map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     /// Atomically write auth.json for the given account

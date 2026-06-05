@@ -1,6 +1,10 @@
 import Foundation
 
 enum UsageResponseParser {
+    enum ParserError: Error, Equatable {
+        case placeholderRateLimitWindow
+    }
+
     /// Top-level response from GET /wham/usage
     struct UsageResponse: Decodable {
         let planType: String
@@ -59,63 +63,89 @@ enum UsageResponseParser {
         let planType: String
     }
 
-    static func parse(_ data: Data, now: Date = Date()) throws -> ParseResult {
+    static func parse(_ data: Data) throws -> ParseResult {
         let response = try JSONDecoder().decode(UsageResponse.self, from: data)
+        guard let rateLimit = selectedRateLimit(from: response) else {
+            throw ParserError.placeholderRateLimitWindow
+        }
+
+        let hardLimitReached = rateLimit.limitReached == true
+            || rateLimit.allowed == false
+        let backendAllowsRequests = rateLimit.allowed == true
+            && rateLimit.limitReached != true
 
         // primary_window = 5-hour window, secondary_window = weekly window
         let fiveHour = mapWindow(
-            response.rateLimit?.primaryWindow,
+            rateLimit.primaryWindow,
             fallbackWindowMins: 300,
-            now: now
+            hardLimitReached: hardLimitReached,
+            backendAllowsRequests: backendAllowsRequests
         )
 
         let weekly = mapWindow(
-            response.rateLimit?.secondaryWindow,
+            rateLimit.secondaryWindow,
             fallbackWindowMins: 10080,
-            now: now
+            hardLimitReached: false,
+            backendAllowsRequests: backendAllowsRequests
         )
 
-        let snapshot = QuotaSnapshot(fiveHour: fiveHour, weekly: weekly, fetchedAt: now)
+        let snapshot = QuotaSnapshot(fiveHour: fiveHour, weekly: weekly, fetchedAt: Date())
         return ParseResult(snapshot: snapshot, planType: response.planType)
+    }
+
+    private static func selectedRateLimit(from response: UsageResponse) -> RateLimitDetails? {
+        if let rateLimit = response.rateLimit,
+           isUsablePrimaryWindow(rateLimit.primaryWindow) {
+            return rateLimit
+        }
+        if let additional = response.additionalRateLimits?
+            .compactMap(\.rateLimit)
+            .first(where: { isUsablePrimaryWindow($0.primaryWindow) }) {
+            return additional
+        }
+        if response.rateLimit?.allowed == false || response.rateLimit?.limitReached == true {
+            return response.rateLimit
+        }
+        return nil
+    }
+
+    private static func isUsablePrimaryWindow(_ window: WindowSnapshot?) -> Bool {
+        guard let window else { return false }
+        return window.limitWindowSeconds > 0
     }
 
     private static func mapWindow(
         _ window: WindowSnapshot?,
         fallbackWindowMins: Int,
-        now: Date
+        hardLimitReached: Bool,
+        backendAllowsRequests: Bool
     ) -> QuotaWindow {
         guard let window else {
             return QuotaWindow(
                 usedPercent: 0,
                 windowDurationMins: fallbackWindowMins,
-                resetsAt: now.addingTimeInterval(TimeInterval(fallbackWindowMins * 60))
+                resetsAt: Date().addingTimeInterval(TimeInterval(fallbackWindowMins * 60)),
+                hardLimitReached: hardLimitReached
             )
         }
 
-        let windowSeconds = window.limitWindowSeconds > 0
-            ? window.limitWindowSeconds
-            : fallbackWindowMins * 60
-
         let windowMins = window.limitWindowSeconds > 0
-            ? (windowSeconds + 59) / 60
+            ? (window.limitWindowSeconds + 59) / 60
             : fallbackWindowMins
 
-        let resetAt = Date(timeIntervalSince1970: TimeInterval(window.resetAt))
-        let resetsAt: Date
-        if let resetAfterSeconds = window.resetAfterSeconds, resetAfterSeconds > 0 {
-            resetsAt = now.addingTimeInterval(TimeInterval(resetAfterSeconds))
-        } else if resetAt > now {
-            resetsAt = resetAt
-        } else {
-            // OpenAI sometimes reports a stale reset_at for a freshly reset window.
-            // Keep the UI and poll scheduling moving by projecting a full window ahead.
-            resetsAt = now.addingTimeInterval(TimeInterval(windowSeconds))
+        // reset_at is a Unix timestamp
+        let resetsAt = Date(timeIntervalSince1970: TimeInterval(window.resetAt))
+
+        var usedPercent = max(0, min(100, Double(window.usedPercent)))
+        if backendAllowsRequests && !hardLimitReached && usedPercent >= 100 {
+            usedPercent = 100 - QuotaWindow.autoSwapThresholdPercent
         }
 
         return QuotaWindow(
-            usedPercent: max(0, min(100, Double(window.usedPercent))),
+            usedPercent: usedPercent,
             windowDurationMins: windowMins,
-            resetsAt: resetsAt
+            resetsAt: resetsAt,
+            hardLimitReached: hardLimitReached
         )
     }
 }

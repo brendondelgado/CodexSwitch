@@ -2,172 +2,287 @@ import Foundation
 import Testing
 @testable import CodexSwitch
 
-private final class WeeklyPrimerURLProtocol: URLProtocol, @unchecked Sendable {
-    static let lock = NSLock()
-    nonisolated(unsafe) static var requests: [URLRequest] = []
-    nonisolated(unsafe) static var statusCode: Int = 200
-    nonisolated(unsafe) static var responseBody: Data = Data("ok".utf8)
-    nonisolated(unsafe) static var responseDelaySeconds: TimeInterval = 0
-
-    static func reset() {
-        lock.lock()
-        requests = []
-        statusCode = 200
-        responseBody = Data("ok".utf8)
-        responseDelaySeconds = 0
-        lock.unlock()
-    }
-
-    static func snapshotRequests() -> [URLRequest] {
-        lock.lock()
-        defer { lock.unlock() }
-        return requests
-    }
-
-    static func snapshotRequestCount() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return requests.count
-    }
-
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        Self.lock.lock()
-        Self.requests.append(request)
-        let statusCode = Self.statusCode
-        let body = Self.responseBody
-        let responseDelaySeconds = Self.responseDelaySeconds
-        Self.lock.unlock()
-
-        if responseDelaySeconds > 0 {
-            Thread.sleep(forTimeInterval: responseDelaySeconds)
-        }
-
-        let response = HTTPURLResponse(
-            url: request.url!,
-            statusCode: statusCode,
-            httpVersion: nil,
-            headerFields: ["Content-Type": "text/event-stream"]
-        )!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: body)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
-}
-
-@Suite("WeeklyPrimer", .serialized)
+@Suite("WeeklyPrimer")
 struct WeeklyPrimerTests {
-    private func makeSession() -> URLSession {
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [WeeklyPrimerURLProtocol.self]
-        return URLSession(configuration: config)
+    @Test("Uses current Codex model for primer requests")
+    func usesCurrentCodexModelForPrimerRequests() {
+        #expect(WeeklyPrimer.defaultPrimerModel == "gpt-5.5")
     }
 
-    private func makeAccount(
-        id: UUID = UUID(),
-        fiveHourRemaining: Double = 100,
-        weeklyRemaining: Double = 100,
-        isActive: Bool = false
+    @Test("Retries 5h priming when local marker did not start backend window")
+    func retriesIneffectiveFiveHourPrimeMarker() async {
+        let defaults = isolatedDefaults()
+        let accountID = UUID()
+        defaults.set(
+            [accountID.uuidString: Date().addingTimeInterval(-11 * 60).timeIntervalSince1970],
+            forKey: "fiveHourPrimedAtByAccountId"
+        )
+
+        let recorder = PrimerRequestRecorder()
+        let primer = WeeklyPrimer(userDefaults: defaults) { account in
+            await recorder.record(account.id)
+        }
+        let account = testAccount(
+            id: accountID,
+            fiveHourResetAfter: 4.999 * 3600,
+            weeklyUsedPercent: 20
+        )
+
+        let primed = await primer.primeIfNeeded(accounts: [account]) { _ in account }
+
+        #expect(primed == [
+            WeeklyPrimer.PrimeResult(
+                accountId: accountID,
+                weeklyPrimed: false,
+                fiveHourPrimed: true,
+                fiveHourUnconfirmed: false
+            )
+        ])
+        #expect(await recorder.recordedIDs() == [accountID])
+    }
+
+    @Test("Keeps 5h priming cooldown when backend window has started")
+    func keepsCooldownWhenFiveHourWindowStarted() async {
+        let defaults = isolatedDefaults()
+        let accountID = UUID()
+        defaults.set(
+            [accountID.uuidString: Date().addingTimeInterval(-11 * 60).timeIntervalSince1970],
+            forKey: "fiveHourPrimedAtByAccountId"
+        )
+
+        let recorder = PrimerRequestRecorder()
+        let primer = WeeklyPrimer(userDefaults: defaults) { account in
+            await recorder.record(account.id)
+        }
+        let account = testAccount(
+            id: accountID,
+            fiveHourResetAfter: 3 * 3600,
+            weeklyUsedPercent: 20
+        )
+
+        let primed = await primer.primeIfNeeded(accounts: [account]) { _ in account }
+
+        #expect(primed.isEmpty)
+        #expect(await recorder.recordedIDs().isEmpty)
+    }
+
+    @Test("Primes weekly again when reset window changed")
+    func primesWeeklyAgainWhenResetWindowChanged() async {
+        let defaults = isolatedDefaults()
+        let accountID = UUID()
+        let oldResetAt = Date().addingTimeInterval(2 * 24 * 3600)
+        defaults.set(
+            [accountID.uuidString],
+            forKey: "primedAccountIds"
+        )
+        defaults.set(
+            [accountID.uuidString: oldResetAt.timeIntervalSince1970],
+            forKey: "weeklyPrimedResetAtByAccountId"
+        )
+
+        let recorder = PrimerRequestRecorder()
+        let primer = WeeklyPrimer(userDefaults: defaults) { account in
+            await recorder.record(account.id)
+        }
+        let account = testAccount(
+            id: accountID,
+            fiveHourResetAfter: 3 * 3600,
+            fiveHourUsedPercent: 10,
+            weeklyUsedPercent: 0,
+            weeklyResetAfter: 6 * 24 * 3600
+        )
+
+        let primed = await primer.primeIfNeeded(accounts: [account]) { _ in account }
+
+        #expect(primed == [
+            WeeklyPrimer.PrimeResult(
+                accountId: accountID,
+                weeklyPrimed: true,
+                fiveHourPrimed: false,
+                fiveHourUnconfirmed: false
+            )
+        ])
+        #expect(await recorder.recordedIDs() == [accountID])
+    }
+
+    @Test("Keeps weekly primed state for same reset window")
+    func keepsWeeklyPrimedStateForSameResetWindow() async {
+        let defaults = isolatedDefaults()
+        let accountID = UUID()
+        let resetAt = Date().addingTimeInterval(6 * 24 * 3600)
+        defaults.set(
+            [accountID.uuidString: resetAt.timeIntervalSince1970],
+            forKey: "weeklyPrimedResetAtByAccountId"
+        )
+
+        let recorder = PrimerRequestRecorder()
+        let primer = WeeklyPrimer(userDefaults: defaults) { account in
+            await recorder.record(account.id)
+        }
+        let account = testAccount(
+            id: accountID,
+            fiveHourResetAfter: 3 * 3600,
+            fiveHourUsedPercent: 10,
+            weeklyUsedPercent: 0,
+            weeklyResetAt: resetAt
+        )
+
+        let primed = await primer.primeIfNeeded(accounts: [account]) { _ in account }
+
+        #expect(primed.isEmpty)
+        #expect(await recorder.recordedIDs().isEmpty)
+    }
+
+    @Test("Keeps weekly primed state when unstarted reset slides forward")
+    func keepsWeeklyPrimedStateWhenUnstartedResetSlidesForward() async {
+        let defaults = isolatedDefaults()
+        let accountID = UUID()
+        let resetAt = Date().addingTimeInterval(6 * 24 * 3600)
+        defaults.set(
+            [accountID.uuidString: resetAt.timeIntervalSince1970],
+            forKey: "weeklyPrimedResetAtByAccountId"
+        )
+
+        let recorder = PrimerRequestRecorder()
+        let primer = WeeklyPrimer(userDefaults: defaults) { account in
+            await recorder.record(account.id)
+        }
+        let account = testAccount(
+            id: accountID,
+            fiveHourResetAfter: 3 * 3600,
+            fiveHourUsedPercent: 10,
+            weeklyUsedPercent: 0,
+            weeklyResetAt: resetAt.addingTimeInterval(90 * 60)
+        )
+
+        let primed = await primer.primeIfNeeded(accounts: [account]) { _ in account }
+
+        #expect(primed.isEmpty)
+        #expect(await recorder.recordedIDs().isEmpty)
+    }
+
+    @Test("Reports observed started 5h window so account store can persist marker")
+    func reportsObservedStartedFiveHourWindow() async {
+        let defaults = isolatedDefaults()
+        let accountID = UUID()
+
+        let recorder = PrimerRequestRecorder()
+        let primer = WeeklyPrimer(userDefaults: defaults) { account in
+            await recorder.record(account.id)
+        }
+        let account = testAccount(
+            id: accountID,
+            fiveHourResetAfter: 4.75 * 3600,
+            weeklyUsedPercent: 20
+        )
+
+        let primed = await primer.primeIfNeeded(accounts: [account]) { _ in account }
+
+        #expect(primed == [
+            WeeklyPrimer.PrimeResult(
+                accountId: accountID,
+                weeklyPrimed: false,
+                fiveHourPrimed: true,
+                fiveHourUnconfirmed: false
+            )
+        ])
+        #expect(await recorder.recordedIDs().isEmpty)
+        let confirmed = await primer.persistedFiveHourPrimedAt()
+        #expect(confirmed[accountID] != nil)
+    }
+
+    @Test("Does not mark 5h primed until backend quota confirms window started")
+    func doesNotMarkFiveHourPrimedUntilConfirmed() async {
+        let defaults = isolatedDefaults()
+        let accountID = UUID()
+
+        let recorder = PrimerRequestRecorder()
+        let account = testAccount(
+            id: accountID,
+            fiveHourResetAfter: 5 * 3600,
+            weeklyUsedPercent: 20
+        )
+        let primer = WeeklyPrimer(
+            userDefaults: defaults,
+            requestSender: { account in
+                await recorder.record(account.id)
+            },
+            quotaSnapshotFetcher: { _ in account.quotaSnapshot! },
+            confirmationDelay: 0
+        )
+
+        let first = await primer.primeIfNeeded(accounts: [account]) { _ in account }
+        let second = await primer.primeIfNeeded(accounts: [account]) { _ in account }
+
+        #expect(first == [
+            WeeklyPrimer.PrimeResult(
+                accountId: accountID,
+                weeklyPrimed: false,
+                fiveHourPrimed: false,
+                fiveHourUnconfirmed: true
+            )
+        ])
+        #expect(second.isEmpty)
+        #expect(await recorder.recordedIDs() == [accountID])
+        let confirmed = await primer.persistedFiveHourPrimedAt()
+        let attempted = await primer.persistedFiveHourPrimeAttemptedAt()
+        #expect(confirmed[accountID] == nil)
+        #expect(attempted[accountID] != nil)
+    }
+
+    private func testAccount(
+        id: UUID,
+        fiveHourResetAfter: TimeInterval,
+        fiveHourUsedPercent: Double = 0,
+        weeklyUsedPercent: Double,
+        weeklyResetAfter: TimeInterval = 6 * 24 * 3600,
+        weeklyResetAt explicitWeeklyResetAt: Date? = nil
     ) -> CodexAccount {
-        CodexAccount(
-            id: id,
-            email: "test-\(id.uuidString.prefix(4))@example.com",
-            accessToken: "access-token",
-            refreshToken: "refresh-token",
-            idToken: "id-token",
-            accountId: "acct-\(id.uuidString.prefix(8))",
-            quotaSnapshot: QuotaSnapshot(
-                fiveHour: QuotaWindow(
-                    usedPercent: 100 - fiveHourRemaining,
-                    windowDurationMins: 300,
-                    resetsAt: Date().addingTimeInterval(18_000)
-                ),
-                weekly: QuotaWindow(
-                    usedPercent: 100 - weeklyRemaining,
-                    windowDurationMins: 10_080,
-                    resetsAt: Date().addingTimeInterval(604_800)
-                ),
-                fetchedAt: Date()
+        let now = Date()
+        let weeklyResetAt = explicitWeeklyResetAt ?? now.addingTimeInterval(weeklyResetAfter)
+        let snapshot = QuotaSnapshot(
+            fiveHour: QuotaWindow(
+                usedPercent: fiveHourUsedPercent,
+                windowDurationMins: 300,
+                resetsAt: now.addingTimeInterval(fiveHourResetAfter),
+                hardLimitReached: false
             ),
-            planType: "pro",
-            lastRefreshed: Date(),
-            isActive: isActive
+            weekly: QuotaWindow(
+                usedPercent: weeklyUsedPercent,
+                windowDurationMins: 10_080,
+                resetsAt: weeklyResetAt,
+                hardLimitReached: false
+            ),
+            fetchedAt: now
+        )
+
+        return CodexAccount(
+            id: id,
+            email: "idle@test.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "acc-\(id.uuidString)",
+            quotaSnapshot: snapshot
         )
     }
 
-    @Test("Fresh inactive accounts are primed with a minimal Codex request")
-    func primesFreshInactiveAccount() async throws {
-        WeeklyPrimerURLProtocol.reset()
-        let account = makeAccount()
-        let primer = WeeklyPrimer(session: makeSession())
+    private func isolatedDefaults() -> UserDefaults {
+        let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        return defaults
+    }
+}
 
-        await primer.primeIfNeeded(accounts: [account], accountProvider: { _ in account })
+private actor PrimerRequestRecorder {
+    private var ids: [UUID] = []
 
-        let requests = WeeklyPrimerURLProtocol.snapshotRequests()
-
-        #expect(requests.count == 1)
-        #expect(requests.first?.url?.absoluteString == "https://chatgpt.com/backend-api/codex/responses")
-        #expect(requests.first?.value(forHTTPHeaderField: "Authorization") == "Bearer access-token")
-        #expect(requests.first?.value(forHTTPHeaderField: "ChatGPT-Account-Id") == account.accountId)
+    func record(_ id: UUID) {
+        ids.append(id)
     }
 
-    @Test("Active accounts are never primed")
-    func skipsActiveAccount() async throws {
-        WeeklyPrimerURLProtocol.reset()
-        let account = makeAccount(isActive: true)
-        let primer = WeeklyPrimer(session: makeSession())
-
-        await primer.primeIfNeeded(accounts: [account], accountProvider: { _ in account })
-
-        let requestCount = WeeklyPrimerURLProtocol.snapshotRequestCount()
-
-        #expect(requestCount == 0)
-    }
-
-    @Test("Already-used accounts are not re-primed")
-    func skipsAccountWithStartedWindows() async throws {
-        WeeklyPrimerURLProtocol.reset()
-        let account = makeAccount(fiveHourRemaining: 72, weeklyRemaining: 93)
-        let primer = WeeklyPrimer(session: makeSession())
-
-        await primer.primeIfNeeded(accounts: [account], accountProvider: { _ in account })
-
-        let requestCount = WeeklyPrimerURLProtocol.snapshotRequestCount()
-
-        #expect(requestCount == 0)
-    }
-
-    @Test("Fresh account is only primed once until its state changes")
-    func freshAccountOnlyPrimesOnce() async throws {
-        WeeklyPrimerURLProtocol.reset()
-        let account = makeAccount()
-        let primer = WeeklyPrimer(session: makeSession())
-
-        await primer.primeIfNeeded(accounts: [account], accountProvider: { _ in account })
-        await primer.primeIfNeeded(accounts: [account], accountProvider: { _ in account })
-
-        let requestCount = WeeklyPrimerURLProtocol.snapshotRequestCount()
-
-        #expect(requestCount == 1)
-    }
-
-    @Test("Concurrent prime checks only send one request per account")
-    func concurrentPrimeChecksDoNotDuplicateRequests() async throws {
-        WeeklyPrimerURLProtocol.reset()
-        WeeklyPrimerURLProtocol.responseDelaySeconds = 0.2
-        let account = makeAccount()
-        let primer = WeeklyPrimer(session: makeSession())
-
-        async let first: Void = primer.primeIfNeeded(accounts: [account], accountProvider: { _ in account })
-        async let second: Void = primer.primeIfNeeded(accounts: [account], accountProvider: { _ in account })
-        _ = await (first, second)
-
-        let requestCount = WeeklyPrimerURLProtocol.snapshotRequestCount()
-
-        #expect(requestCount == 1)
+    func recordedIDs() -> [UUID] {
+        ids
     }
 }

@@ -8,6 +8,9 @@ struct SwapEvent: Codable, Sendable {
 
     enum SwapReason: String, Codable, Sendable {
         case quotaExhausted
+        case higherPlanAvailable
+        case tokenInvalidated
+        case usageUnavailable
         case manual
     }
 }

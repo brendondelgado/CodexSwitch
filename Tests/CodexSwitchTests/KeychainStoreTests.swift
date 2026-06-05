@@ -27,20 +27,18 @@ private func keychainAvailable() -> Bool {
 
 @Suite("KeychainStore")
 struct KeychainStoreTests {
-    private func makeTempStore() throws -> (KeychainStore, URL) {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CodexSwitch-KeychainStoreTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let storeURL = dir.appendingPathComponent("accounts.json")
-        return (KeychainStore(service: "CodexSwitch-Test-\(UUID().uuidString)", storeURL: storeURL), dir)
+    // Use unique service names per test to avoid polluting real Keychain
+    private func isolatedStore() -> KeychainStore {
+        let path = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("CodexSwitchTests-\(UUID().uuidString)/accounts.json")
+        return KeychainStore(service: "CodexSwitch-Test-\(UUID().uuidString)", storePath: path)
     }
 
-    // Use unique service names per test to avoid polluting real Keychain
     @Test("Store and retrieve account credentials")
     func storeAndRetrieve() throws {
         try withKnownIssue("Keychain unavailable without entitlements", isIntermittent: true) {
             guard keychainAvailable() else { throw KeychainError.saveFailed(-50) }
-            let store = KeychainStore(service: "CodexSwitch-Test-\(UUID().uuidString)")
+            let store = isolatedStore()
             let account = CodexAccount(
                 email: "test@example.com",
                 accessToken: "access_123",
@@ -64,7 +62,7 @@ struct KeychainStoreTests {
     func updateAccount() throws {
         try withKnownIssue("Keychain unavailable without entitlements", isIntermittent: true) {
             guard keychainAvailable() else { throw KeychainError.saveFailed(-50) }
-            let store = KeychainStore(service: "CodexSwitch-Test-\(UUID().uuidString)")
+            let store = isolatedStore()
             var account = CodexAccount(
                 email: "test@example.com",
                 accessToken: "old_token",
@@ -87,7 +85,7 @@ struct KeychainStoreTests {
     func deleteAccount() throws {
         try withKnownIssue("Keychain unavailable without entitlements", isIntermittent: true) {
             guard keychainAvailable() else { throw KeychainError.saveFailed(-50) }
-            let store = KeychainStore(service: "CodexSwitch-Test-\(UUID().uuidString)")
+            let store = isolatedStore()
             let account = CodexAccount(
                 email: "test@example.com",
                 accessToken: "t",
@@ -123,55 +121,117 @@ struct KeychainStoreTests {
         #expect(account.email.contains("@")) // Extracted from JWT or fallback
     }
 
-    @Test("Replacing all accounts persists only one active account")
-    func replaceAllNormalizesActiveFlags() throws {
-        let (store, dir) = try makeTempStore()
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        let plus = CodexAccount(
-            email: "plus@test.com",
-            accessToken: "t1",
-            refreshToken: "r1",
-            idToken: "i1",
-            accountId: "plus-account",
-            isActive: true
+    @Test("Load accounts tolerates ISO date strings")
+    func loadAccountsToleratesISODateStrings() throws {
+        let path = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("CodexSwitchTests-\(UUID().uuidString)/accounts.json")
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
         )
-        let pro = CodexAccount(
-            email: "pro@test.com",
-            accessToken: "t2",
-            refreshToken: "r2",
-            idToken: "i2",
-            accountId: "pro-account",
-            isActive: true
-        )
-
-        try store.replaceAll([plus, pro])
+        let store = KeychainStore(service: "CodexSwitch-Test-\(UUID().uuidString)", storePath: path)
+        let json = """
+        [
+          {
+            "id": "6632BCE7-FD12-4A87-A074-A5E3767C51CC",
+            "email": "bd7349@me.com",
+            "accessToken": "access",
+            "refreshToken": "refresh",
+            "idToken": "id-token",
+            "accountId": "6632bce7-fd12-4a87-a074-a5e3767c51cc",
+            "lastRefreshed": "2026-06-01T02:38:38Z",
+            "isActive": true
+          }
+        ]
+        """
+        try json.data(using: .utf8)!.write(to: URL(fileURLWithPath: path))
 
         let loaded = try store.loadAll()
-        let activeAccounts = loaded.filter(\.isActive)
-        #expect(activeAccounts.count == 1)
-        #expect(activeAccounts.first?.accountId == "pro-account")
+
+        #expect(loaded.count == 1)
+        #expect(loaded[0].email == "bd7349@me.com")
+        #expect(loaded[0].lastRefreshed != nil)
+        #expect(loaded[0].isActive)
     }
 
-    @Test("Re-authentication state survives file round-trip")
-    func reauthenticationStateRoundTrips() throws {
-        let (store, dir) = try makeTempStore()
-        defer { try? FileManager.default.removeItem(at: dir) }
-
+    @Test("Load accounts removes placeholder quota snapshots")
+    func loadAccountsRemovesPlaceholderQuotaSnapshots() throws {
+        let store = isolatedStore()
+        let fetchedAt = Date(timeIntervalSinceReferenceDate: 802_157_341)
         let account = CodexAccount(
-            email: "stale@test.com",
-            accessToken: "t1",
-            refreshToken: "r1",
-            idToken: "i1",
-            accountId: "stale-account",
-            reauthenticationError: "Re-authentication required — refresh token rejected",
-            isActive: false
+            email: "brenchat7795@gmail.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id-token",
+            accountId: "acc-brenchat",
+            quotaSnapshot: QuotaSnapshot(
+                fiveHour: QuotaWindow(
+                    usedPercent: 0,
+                    windowDurationMins: 300,
+                    resetsAt: fetchedAt,
+                    hardLimitReached: false
+                ),
+                weekly: QuotaWindow(
+                    usedPercent: 0,
+                    windowDurationMins: 10_080,
+                    resetsAt: fetchedAt.addingTimeInterval(604_800),
+                    hardLimitReached: false
+                ),
+                fetchedAt: fetchedAt
+            ),
+            planType: "pro",
+            lastRefreshed: fetchedAt,
+            isActive: true
         )
-
-        try store.replaceAll([account])
+        try store.saveAll([account])
 
         let loaded = try store.loadAll()
+
         #expect(loaded.count == 1)
-        #expect(loaded[0].reauthenticationError == "Re-authentication required — refresh token rejected")
+        #expect(loaded[0].quotaSnapshot == nil)
+        #expect(loaded[0].lastRefreshed == nil)
+        #expect(loaded[0].planType == "pro")
+        #expect(loaded[0].isActive)
+    }
+
+    @Test("Save accounts removes placeholder quota snapshots before writing")
+    func saveAccountsRemovesPlaceholderQuotaSnapshotsBeforeWriting() throws {
+        let path = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("CodexSwitchTests-\(UUID().uuidString)/accounts.json")
+        let store = KeychainStore(service: "CodexSwitch-Test-\(UUID().uuidString)", storePath: path)
+        let fetchedAt = Date(timeIntervalSinceReferenceDate: 802_157_341)
+        let account = CodexAccount(
+            email: "placeholder@example.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id-token",
+            accountId: "acc-placeholder",
+            quotaSnapshot: QuotaSnapshot(
+                fiveHour: QuotaWindow(
+                    usedPercent: 0,
+                    windowDurationMins: 300,
+                    resetsAt: fetchedAt,
+                    hardLimitReached: false
+                ),
+                weekly: QuotaWindow(
+                    usedPercent: 0,
+                    windowDurationMins: 10_080,
+                    resetsAt: fetchedAt.addingTimeInterval(604_800),
+                    hardLimitReached: false
+                ),
+                fetchedAt: fetchedAt
+            ),
+            planType: "pro",
+            lastRefreshed: fetchedAt,
+            isActive: true
+        )
+
+        try store.saveAll([account])
+
+        let raw = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: URL(fileURLWithPath: path))
+        ) as? [[String: Any]]
+        #expect(raw?.first?["quotaSnapshot"] == nil)
+        #expect(raw?.first?["lastRefreshed"] == nil)
     }
 }

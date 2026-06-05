@@ -34,6 +34,10 @@ enum SwapLog {
 
         // Desktop app connector
         case desktopAppInjected(port: UInt16)
+        case desktopExternalReloadAttempt
+        case desktopExternalReloadSuccess(method: String)
+        case desktopExternalReloadSkipped(reason: String)
+        case desktopExternalReloadFailed(reason: String)
 
         // Polling
         case pollError(accountEmail: String, error: String)
@@ -68,6 +72,14 @@ enum SwapLog {
                 return "SIGHUP_SKIPPED reason=\(reason)"
             case .desktopAppInjected(let port):
                 return "DESKTOP_INJECTED port=\(port)"
+            case .desktopExternalReloadAttempt:
+                return "DESKTOP_EXTERNAL_RELOAD_ATTEMPT"
+            case .desktopExternalReloadSuccess(let method):
+                return "DESKTOP_EXTERNAL_RELOAD_SUCCESS method=\(method)"
+            case .desktopExternalReloadSkipped(let reason):
+                return "DESKTOP_EXTERNAL_RELOAD_SKIPPED reason=\(reason)"
+            case .desktopExternalReloadFailed(let reason):
+                return "DESKTOP_EXTERNAL_RELOAD_FAILED reason=\(reason)"
             case .pollError(let email, let error):
                 return "POLL_ERR email=\(email) error=\(error)"
             case .cliStatusChanged(let from, let to):

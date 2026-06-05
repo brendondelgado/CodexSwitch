@@ -49,7 +49,7 @@ final class StatusBarController {
         }
 
         guard let active = manager.activeAccount,
-              let snapshot = active.quotaSnapshot else {
+              let snapshot = active.realQuotaSnapshot else {
             applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "...")
             return
         }

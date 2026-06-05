@@ -43,15 +43,23 @@ enum NotificationManager {
         UNUserNotificationCenter.current().add(request)
     }
 
-    static func notifyAllExhausted() {
+    static func notifyAllExhausted(nextReset: Date? = nil) {
         guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: All Accounts Exhausted"
-        content.body = "No accounts have remaining quota. Waiting for earliest reset."
+        if let nextReset {
+            let minutes = max(0, Int(nextReset.timeIntervalSinceNow / 60))
+            let hours = minutes / 60
+            let remainingMinutes = minutes % 60
+            let resetText = hours > 0 ? "\(hours)h \(remainingMinutes)m" : "\(remainingMinutes)m"
+            content.body = "No accounts have remaining quota. Waiting for earliest reset in \(resetText)."
+        } else {
+            content.body = "No accounts have remaining quota. Waiting for earliest reset."
+        }
         content.sound = .defaultCritical
 
         let request = UNNotificationRequest(
-            identifier: "exhausted-\(UUID().uuidString)",
+            identifier: "codexswitch-pool-exhausted",
             content: content,
             trigger: nil
         )
@@ -67,6 +75,21 @@ enum NotificationManager {
 
         let request = UNNotificationRequest(
             identifier: "refresh-fail-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    static func notifyLinuxDevboxReadinessIssue(summary: String) {
+        guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "CodexSwitch: Linux Devbox Not Ready"
+        content.body = summary
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "linux-devbox-readiness-\(UUID().uuidString)",
             content: content,
             trigger: nil
         )

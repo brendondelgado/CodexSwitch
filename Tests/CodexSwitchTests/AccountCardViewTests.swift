@@ -36,9 +36,9 @@ struct AccountCardViewTests {
     func primaryClickTriggersSwap() {
         let account = makeAccount(isActive: false)
         var didSwap = false
-        let view = AccountCardView(account: account, pollingError: nil, onForceSwap: {
+        let view = AccountCardView(account: account, pollingError: nil, onReauthenticate: nil, onForceSwap: {
             didSwap = true
-        }, onReauthenticate: nil)
+        })
 
         #expect(view.handlePrimaryClick())
         #expect(didSwap)
@@ -49,9 +49,9 @@ struct AccountCardViewTests {
     func primaryClickIgnoresActiveAccount() {
         let account = makeAccount(isActive: true)
         var didSwap = false
-        let view = AccountCardView(account: account, pollingError: nil, onForceSwap: {
+        let view = AccountCardView(account: account, pollingError: nil, onReauthenticate: nil, onForceSwap: {
             didSwap = true
-        }, onReauthenticate: nil)
+        })
 
         #expect(!view.handlePrimaryClick())
         #expect(!didSwap)
@@ -66,11 +66,11 @@ struct AccountCardViewTests {
         let view = AccountCardView(
             account: account,
             pollingError: "Re-authentication required — click Re-authenticate",
-            onForceSwap: {
-                didSwap = true
-            },
             onReauthenticate: {
                 didReauthenticate = true
+            },
+            onForceSwap: {
+                didSwap = true
             }
         )
 

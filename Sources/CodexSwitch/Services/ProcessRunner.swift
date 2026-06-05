@@ -1,122 +1,127 @@
 import Darwin
 import Foundation
 
-struct ProcessRunnerOutput: Sendable {
-    let stdout: String
-    let stderr: String
+struct ProcessRunResult: Sendable {
     let terminationStatus: Int32
+    let stdout: Data
+    let stderr: Data
     let timedOut: Bool
+
+    var stdoutString: String {
+        String(data: stdout, encoding: .utf8) ?? ""
+    }
+
+    var stderrString: String {
+        String(data: stderr, encoding: .utf8) ?? ""
+    }
 }
 
 enum ProcessRunner {
     static func run(
-        executablePath: String,
+        executableURL: URL,
         arguments: [String] = [],
-        timeout: TimeInterval = 2,
-        currentDirectoryURL: URL? = nil,
+        timeout: TimeInterval,
         environment: [String: String]? = nil,
-        captureStdout: Bool = true,
-        captureStderr: Bool = true
-    ) -> ProcessRunnerOutput? {
+        currentDirectoryURL: URL? = nil
+    ) -> ProcessRunResult {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.executableURL = executableURL
         process.arguments = arguments
-        process.currentDirectoryURL = currentDirectoryURL
         process.environment = environment
+        process.currentDirectoryURL = currentDirectoryURL
 
-        let stdoutPipe = captureStdout ? Pipe() : nil
-        let stderrPipe = captureStderr ? Pipe() : nil
-        process.standardOutput = stdoutPipe ?? FileHandle.nullDevice
-        process.standardError = stderrPipe ?? FileHandle.nullDevice
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
-        let exitSignal = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            exitSignal.signal()
+        let stdout = LockedData()
+        let stderr = LockedData()
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if !chunk.isEmpty {
+                stdout.append(chunk)
+            }
         }
 
-        let readQueue = DispatchQueue(label: "com.codexswitch.process-runner", attributes: .concurrent)
-        let readGroup = DispatchGroup()
-        let stdoutBox = LockedData()
-        let stderrBox = LockedData()
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if !chunk.isEmpty {
+                stderr.append(chunk)
+            }
+        }
+
+        let terminated = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            terminated.signal()
+        }
 
         do {
             try process.run()
         } catch {
-            stdoutPipe?.fileHandleForReading.closeFile()
-            stdoutPipe?.fileHandleForWriting.closeFile()
-            stderrPipe?.fileHandleForReading.closeFile()
-            stderrPipe?.fileHandleForWriting.closeFile()
-            return nil
+            stopReading((stdoutPipe, stdout), (stderrPipe, stderr))
+            return ProcessRunResult(
+                terminationStatus: -1,
+                stdout: stdout.value,
+                stderr: Data(error.localizedDescription.utf8),
+                timedOut: false
+            )
         }
 
-        // Close the parent copy of the write ends immediately so EOF can reach our
-        // readers when the child exits or is killed. Leaving these open strands
-        // readDataToEndOfFile() threads and slowly wedges the app.
-        stdoutPipe?.fileHandleForWriting.closeFile()
-        stderrPipe?.fileHandleForWriting.closeFile()
-
-        if let stdoutPipe {
-            readGroup.enter()
-            readQueue.async {
-                stdoutBox.value = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                readGroup.leave()
-            }
-        }
-
-        if let stderrPipe {
-            readGroup.enter()
-            readQueue.async {
-                stderrBox.value = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                readGroup.leave()
-            }
-        }
-
-        let didExit = exitSignal.wait(timeout: .now() + timeout) == .success
+        let didExit = terminated.wait(timeout: .now() + timeout) == .success
         var timedOut = false
 
         if !didExit {
             timedOut = true
-            if process.isRunning {
-                process.terminate()
-                if exitSignal.wait(timeout: .now() + 0.5) == .timedOut, process.isRunning {
-                    Darwin.kill(process.processIdentifier, SIGKILL)
-                    _ = exitSignal.wait(timeout: .now() + 0.5)
-                }
+            process.terminate()
+            if terminated.wait(timeout: .now() + 0.5) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = terminated.wait(timeout: .now() + 1)
             }
         }
 
-        if readGroup.wait(timeout: .now() + 1) == .timedOut {
-            stdoutPipe?.fileHandleForReading.closeFile()
-            stderrPipe?.fileHandleForReading.closeFile()
-            _ = readGroup.wait(timeout: .now() + 1)
-        }
+        stopReading((stdoutPipe, stdout), (stderrPipe, stderr))
 
-        stdoutPipe?.fileHandleForReading.closeFile()
-        stderrPipe?.fileHandleForReading.closeFile()
+        let terminationStatus = process.isRunning ? Int32(-1) : process.terminationStatus
 
-        return ProcessRunnerOutput(
-            stdout: String(data: stdoutBox.value, encoding: .utf8) ?? "",
-            stderr: String(data: stderrBox.value, encoding: .utf8) ?? "",
-            terminationStatus: process.terminationStatus,
+        return ProcessRunResult(
+            terminationStatus: terminationStatus,
+            stdout: stdout.value,
+            stderr: stderr.value,
             timedOut: timedOut
         )
+    }
+
+    private static func stopReading(_ outputs: (Pipe, LockedData)...) {
+        for (pipe, buffer) in outputs {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            if let remaining = try? pipe.fileHandleForReading.readToEnd(), !remaining.isEmpty {
+                // Handlers are asynchronous; drain any bytes delivered between
+                // process exit and handler shutdown.
+                buffer.append(remaining)
+            }
+            try? pipe.fileHandleForReading.close()
+        }
     }
 }
 
 private final class LockedData: @unchecked Sendable {
     private let lock = NSLock()
-    private var storage = Data()
+    private var data = Data()
 
     var value: Data {
-        get {
-            lock.lock()
-            defer { lock.unlock() }
-            return storage
+        lock.withLock { data }
+    }
+
+    func set(_ newValue: Data) {
+        lock.withLock {
+            data = newValue
         }
-        set {
-            lock.lock()
-            storage = newValue
-            lock.unlock()
+    }
+
+    func append(_ chunk: Data) {
+        lock.withLock {
+            data.append(chunk)
         }
     }
 }

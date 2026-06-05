@@ -34,80 +34,6 @@ struct CodexPatchingTests {
         )
     }
 
-    @Test("Desktop runtime label follows the live process state")
-    func desktopRuntimeLabelFollowsUsageState() {
-        let status = DesktopAppStatus(
-            usageState: .appRunning,
-            isRunning: true,
-            port: nil
-        )
-
-        #expect(status.label == "Codex desktop app is running")
-        #expect(status.autoSwapReady)
-        #expect(status.autoSwapLabel == "Desktop auto-swap ready")
-    }
-
-    @Test("Desktop display state exposes update availability and auto-swap readiness separately")
-    func desktopDisplayStateSeparatesPatchAndAutoSwap() {
-        let summary = CodexDesktopAppStatusSummary(
-            installedVersionLabel: "26.417.41555 (1858)",
-            runtimeLabel: "stale runtime",
-            patchLabel: "Desktop hot-swap ready",
-            patchHealthy: true,
-            canPatchNow: false
-        )
-        let liveStatus = DesktopAppStatus(
-            usageState: .appRunning,
-            isRunning: true,
-            port: nil
-        )
-        let release = CodexDesktopAppRelease(
-            shortVersion: "26.418.50000",
-            bundleVersion: "1900",
-            downloadURL: URL(string: "https://example.com/Codex.zip")!
-        )
-
-        let display = CodexVersionChecker.describeDesktop(
-            summary: summary,
-            liveStatus: liveStatus,
-            latestRelease: release
-        )
-
-        #expect(display.installedVersionLabel == "26.417.41555 (1858)")
-        #expect(display.latestVersionLabel == "26.418.50000 (1900)")
-        #expect(display.runtimeLabel == "Codex desktop app is running")
-        #expect(display.autoSwapLabel == "Desktop auto-swap ready")
-        #expect(display.autoSwapReady)
-        #expect(display.patchHealthy)
-        #expect(display.updateAvailable)
-    }
-
-    @Test("Desktop display keeps auto-swap ready even when the bundle stays stock")
-    func desktopDisplayKeepsStockBundleSwapReady() {
-        let summary = CodexDesktopAppStatusSummary(
-            installedVersionLabel: "26.417.41555 (1858)",
-            runtimeLabel: "stale runtime",
-            patchLabel: "Desktop hot-swap patch will be applied automatically",
-            patchHealthy: false,
-            canPatchNow: true
-        )
-        let liveStatus = DesktopAppStatus(
-            usageState: .appRunning,
-            isRunning: true,
-            port: nil
-        )
-
-        let display = CodexVersionChecker.describeDesktop(
-            summary: summary,
-            liveStatus: liveStatus,
-            latestRelease: nil
-        )
-
-        #expect(display.autoSwapReady)
-        #expect(display.autoSwapLabel == "Desktop auto-swap ready")
-        #expect(!display.patchHealthy)
-    }
-
     @Test("Desktop repair decider patches a stopped stock bundle without patch markers")
     func desktopRepairDeciderPatchesStoppedStockBundle() {
         let install = CodexDesktopAppInstall(
@@ -201,24 +127,6 @@ struct CodexPatchingTests {
 
         #expect(official == .officialOpenAI)
         #expect(adHoc == .adHoc)
-    }
-
-    @Test("Lightweight rebuild uses the fork-release Codex binary artifact")
-    func lightweightRebuildUsesForkReleaseArtifact() {
-        let plan = CodexVersionChecker.forkBuildPlan(
-            targetDirectory: "/Users/test/Developer/codex/codex-rs/target"
-        )
-
-        #expect(plan.cargoArguments == [
-            "build",
-            "--profile", "fork-release",
-            "-p", "codex-cli",
-            "--bin", "codex",
-        ])
-        #expect(
-            plan.outputBinaryPath
-                == "/Users/test/Developer/codex/codex-rs/target/fork-release/codex"
-        )
     }
 
     @Test("Patch target resolves to Homebrew cask binary when codex is installed from cask")

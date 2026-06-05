@@ -150,20 +150,17 @@ enum CodexDesktopAppProcessClassifier {
     }
 
     static func runningCommands(appPath: String) -> [String] {
-        guard let output = ProcessRunner.run(
-            executablePath: "/bin/ps",
+        let output = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/bin/ps"),
             arguments: ["axww", "-o", "command="],
             timeout: 2.5
-        ) else {
-            desktopPatchLogger.warning("Unable to scan Codex.app processes; deferring desktop patch")
-            return ["\(appPath)/Contents/MacOS/Codex \(scanFailedSentinel)"]
-        }
+        )
         guard !output.timedOut, output.terminationStatus == 0 else {
             desktopPatchLogger.warning("Codex.app process scan failed or timed out; deferring desktop patch")
             return ["\(appPath)/Contents/MacOS/Codex \(scanFailedSentinel)"]
         }
 
-        return output.stdout
+        return output.stdoutString
             .split(separator: "\n")
             .map { line in
                 line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -299,15 +296,16 @@ enum CodexDesktopAppLocator {
     }
 
     static func signatureStatus(appPath: String = defaultAppPath) -> CodexDesktopAppSignatureStatus {
-        guard let output = ProcessRunner.run(
-            executablePath: "/usr/bin/codesign",
+        let output = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/codesign"),
             arguments: ["-dvvv", appPath],
             timeout: 5
-        ), !output.timedOut, output.terminationStatus == 0 else {
+        )
+        guard !output.timedOut, output.terminationStatus == 0 else {
             return .unreadable
         }
 
-        return signatureStatus(from: output.stdout + "\n" + output.stderr)
+        return signatureStatus(from: output.stdoutString + "\n" + output.stderrString)
     }
 
     static func signatureStatus(from output: String) -> CodexDesktopAppSignatureStatus {
@@ -467,9 +465,9 @@ enum CodexDesktopAppPatcher {
             _ arguments: [String],
             _ timeout: TimeInterval,
             _ environment: [String: String]
-        ) -> ProcessRunnerOutput? = { executablePath, arguments, timeout, environment in
+        ) -> ProcessRunResult = { executablePath, arguments, timeout, environment in
             ProcessRunner.run(
-                executablePath: executablePath,
+                executableURL: URL(fileURLWithPath: executablePath),
                 arguments: arguments,
                 timeout: timeout,
                 environment: environment
@@ -487,17 +485,12 @@ enum CodexDesktopAppPatcher {
         environment["CODEX_APP"] = install.appPath
         environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-        guard let result = processRunner(
+        let result = processRunner(
             "/usr/bin/python3",
             [scriptPath],
             600,
             environment
-        ) else {
-            return CodexDesktopAppPatchResult(
-                success: false,
-                message: "Failed to start desktop patcher"
-            )
-        }
+        )
 
         guard !result.timedOut else {
             return CodexDesktopAppPatchResult(
@@ -507,7 +500,9 @@ enum CodexDesktopAppPatcher {
         }
 
         guard result.terminationStatus == 0 else {
-            let detail = (result.stderr.isEmpty ? result.stdout : result.stderr)
+            let stderr = result.stderrString
+            let stdout = result.stdoutString
+            let detail = (stderr.isEmpty ? stdout : stderr)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return CodexDesktopAppPatchResult(
                 success: false,
@@ -731,11 +726,10 @@ final class CodexAutoPatchMonitor {
 
         repairTask = Task.detached { [weak self] in
             let desktopResult = CodexDesktopAppPatcher.repairInstalledAppIfNeeded()
-            let forkResult = CodexVersionChecker.repairInstalledForkIfNeeded()
 
             await MainActor.run {
                 self?.repairTask = nil
-                self?.log(forkResult: forkResult, desktopResult: desktopResult, reason: reason)
+                self?.log(desktopResult: desktopResult, reason: reason)
             }
         }
     }
@@ -748,29 +742,15 @@ final class CodexAutoPatchMonitor {
 
             await MainActor.run {
                 self?.desktopRepairTask = nil
-                self?.log(forkResult: nil, desktopResult: desktopResult, reason: reason)
+                self?.log(desktopResult: desktopResult, reason: reason)
             }
         }
     }
 
     private func log(
-        forkResult: CodexVersionChecker.ActionResult?,
         desktopResult: CodexDesktopAppPatchResult?,
         reason: String
     ) {
-        if let forkResult, forkResult.message != lastForkMessage {
-            if forkResult.success {
-                desktopPatchLogger.info(
-                    "Auto-repaired Codex CLI (\(reason, privacy: .public)): \(forkResult.message, privacy: .public)"
-                )
-            } else {
-                desktopPatchLogger.error(
-                    "Codex CLI auto-repair failed (\(reason, privacy: .public)): \(forkResult.message, privacy: .public)"
-                )
-            }
-            lastForkMessage = forkResult.message
-        }
-
         if let desktopResult, desktopResult.message != lastDesktopMessage {
             if desktopResult.success {
                 desktopPatchLogger.info(

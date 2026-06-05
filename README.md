@@ -1,23 +1,19 @@
 ---
 toc:
-  - The Problem
-  - The Solution
+  - CodexSwitch
   - Features
-  - How It Works
-  - Swap Scoring Algorithm
-  - Getting Started
+  - Settings
   - Project Structure
-  - Testing
+  - Security Notes
+  - Development
 cross_dependencies:
-  - Sources/CodexSwitch/Services/CodexDesktopAppPatcher.swift
-  - Sources/CodexSwitch/Services/CodexVersionChecker.swift
-  - Sources/CodexSwitch/Services/DesktopAppConnector.swift
-  - Sources/CodexSwitch/Services/SwapEngine.swift
-  - scripts/patch-asar.py
+  - Sources/CodexSwitch/Services/DesktopHeadroomCleanup.swift
+  - Sources/CodexSwitch/Views/SettingsView.swift
+  - docs/sighup-safety.md
 version_control:
-  branch: main
-  last_updated: 2026-04-24
-  update_reason: Document desktop auto-patching contract for current Codex.app versions.
+  updated_on: 2026-04-29
+  updated_by: Codex
+  status: working-tree
 ---
 
 <p align="center">
@@ -52,15 +48,13 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 
 **📊 Live Quota Monitoring** — Polls ChatGPT's usage API with adaptive intervals. Active account polls every 5 seconds for near-realtime UI. Inactive accounts poll based on urgency, sleeping until their reset time to minimize API calls.
 
-**🔄 Automatic Switching** — When the active account's 5-hour or weekly quota hits 0%, CodexSwitch scores all alternatives and atomically swaps `~/.codex/auth.json`. Anti-ping-pong logic ensures candidates must have usable capacity on both windows before swapping.
+**🔄 Automatic Switching** — When the active account's 5-hour or weekly quota reaches 1% or less, CodexSwitch scores all alternatives and atomically swaps `~/.codex/auth.json`. Anti-ping-pong logic ensures candidates are not already inside the auto-swap threshold before swapping.
 
-**⚡ SIGHUP Hot-Swap** — Sends SIGHUP to running Codex CLI processes after every swap and on app launch, so the CLI reloads tokens instantly. Uses `pgrep` + `proc_pidinfo` to find processes and skip those younger than 10 seconds (still initializing).
-
-**🛠 Lightweight Fork Auto-Repair** — When a Codex CLI update replaces the live binary, CodexSwitch detects the new install surface on launch and reapplies the lightweight SIGHUP fork to the active `codex` install instead of waiting for a manual settings action.
-
-**🖥 Desktop App Compatibility Check** — When Codex.app updates, CodexSwitch detects the new bundle/version and verifies desktop hot-swap compatibility once the desktop app is not running. Stock OpenAI bundles are recorded as ready without modifying model settings. If an older CodexSwitch renderer patch is present, the patch script removes that legacy auth-sync code, refreshes ASAR integrity/signing, and records the cleaned version.
+**⚡ SIGHUP Hot-Swap** — Sends SIGHUP to verified running Codex CLI processes only after real token/account changes, so the CLI reloads tokens instantly without routine status checks interrupting sessions. Uses `pgrep` + `proc_pidinfo` to find processes and skip those younger than 10 seconds (still initializing).
 
 **🖥 Desktop App Token Injection** — Detects the Codex desktop app via WebSocket and injects new tokens directly, keeping desktop sessions in sync.
+
+**🧭 Direct Desktop Routing** — Codex.app stays on stock OpenAI transport. CodexSwitch removes legacy desktop Headroom env bridges while preserving account hot-swap, bundled CLI repair, and plugin readiness patches.
 
 **📊 Pooled Usage Meter** — Aggregated view of all accounts' 5-hour and weekly capacity with Pro plan equivalence comparison. Shows estimated pool runway using `min(5h estimate, weekly ceiling)`. When all weekly is exhausted, shows countdown to nearest weekly reset.
 
@@ -111,7 +105,7 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 
 ### Swap Scoring Algorithm
 
-When the active account hits 0% on either window, CodexSwitch picks the best replacement:
+When the active account reaches 1% or less on either window, CodexSwitch picks the best replacement:
 
 ```
 if weekly exhausted → score = -1 (ineligible)
@@ -126,7 +120,7 @@ otherwise:
         × (0.5 penalty if weekly < 20%)
 ```
 
-Anti-ping-pong guard: a candidate must have **both** usable 5h and usable weekly (`!isExhausted` on both) before the swap executes.
+Anti-ping-pong guard: a candidate must have **both** 5h and weekly quota above the auto-swap threshold before the swap executes.
 
 ### Adaptive Polling
 
@@ -150,7 +144,7 @@ Inactive accounts with plenty of quota (> 50%) check every 10 minutes. Exhausted
 - macOS 15+
 - Swift 6.3+ (Xcode 26+)
 - One or more ChatGPT Plus accounts with Codex CLI access
-- A SIGHUP-capable Codex CLI binary (writes one of `~/.codexswitch/sighup-verified`, `~/.codexswitch/sighup-verified-tui`, or `~/.codexswitch/sighup-verified-exec` on startup)
+- A SIGHUP-capable Codex CLI binary (writes `~/.codexswitch/sighup-verified` on startup)
 
 ### Build & Run
 
@@ -175,6 +169,7 @@ open /Applications/CodexSwitch.app
 Click the ⚙ gear icon in the popover to configure:
 - **Launch at login** — start CodexSwitch automatically
 - **Poll frequency** — 0.5x (aggressive) to 2.0x (conservative) multiplier
+- **Desktop app repair** — optionally let CodexSwitch patch Codex.app after updates; desktop traffic remains direct OpenAI transport
 - **Remove all accounts** — clear Keychain and reset
 
 ## Project Structure
@@ -193,11 +188,9 @@ Sources/CodexSwitch/
 ├── Services/
 │   ├── AccountImporter.swift       # Import from ~/.codex/auth.json
 │   ├── CLIStatusChecker.swift      # Verify CLI can read current auth
-│   ├── CodexDesktopAppPatcher.swift # Safe offline Codex.app compatibility check
-│   ├── CodexInstallLocator.swift   # Resolve active codex install + patch target
-│   ├── CodexPatchState.swift       # Persist patched install state + marker checks
 │   ├── CodexVersionChecker.swift   # Detect SIGHUP-capable binary
 │   ├── DesktopAppConnector.swift   # WebSocket token injection for desktop app
+│   ├── DesktopHeadroomCleanup.swift # Remove legacy desktop Headroom routing env
 │   ├── KeychainStore.swift         # Keychain CRUD operations
 │   ├── NotificationManager.swift   # macOS notification delivery
 │   ├── OAuthLoginManager.swift     # Google OAuth login flow
@@ -223,7 +216,7 @@ Sources/CodexSwitch/
 swift test
 ```
 
-Swift tests cover models, quota parsing, polling intervals, swap scoring, SIGHUP targeting, and desktop patch decision logic. `scripts/test_patch_asar.py` covers the ASAR patch script.
+24 tests across 4 suites covering models, quota parsing, polling intervals, and swap scoring.
 
 ## License
 

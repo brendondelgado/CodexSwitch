@@ -10,11 +10,46 @@ BUILD_DIR="$PROJECT_DIR/.build/release"
 APP_NAME="CodexSwitch"
 APP_BUNDLE="$PROJECT_DIR/build/${APP_NAME}.app"
 IDENTIFIER="com.codexswitch"
+APP_VERSION="${CODEXSWITCH_VERSION:-1.0.0}"
+BUILD_NUMBER="${CODEXSWITCH_BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}"
+SOURCE_REVISION="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+select_codesign_identity() {
+    if [[ -n "${CODEXSWITCH_CODESIGN_IDENTITY:-}" ]]; then
+        printf '%s\n' "$CODEXSWITCH_CODESIGN_IDENTITY"
+        return
+    fi
+    if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+        printf '%s\n' "$CODESIGN_IDENTITY"
+        return
+    fi
+
+    local identities
+    identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+    local preferred
+    preferred="$(printf '%s\n' "$identities" | sed -nE 's/.*"((Developer ID Application|Apple Development|Mac Developer)[^"]+)".*/\1/p' | head -n 1)"
+    if [[ -n "$preferred" ]]; then
+        printf '%s\n' "$preferred"
+    else
+        printf '%s\n' "-"
+    fi
+}
 
 cd "$PROJECT_DIR"
 
 echo "Building ${APP_NAME} (release)..."
-swift build -c release --quiet
+swift_build_flags=()
+if [[ "${CODEXSWITCH_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
+    swift_build_flags+=(--disable-sandbox)
+fi
+if [[ -n "${CODEXSWITCH_SWIFTPM_CACHE_PATH:-}" ]]; then
+    swift_build_flags+=(--cache-path "$CODEXSWITCH_SWIFTPM_CACHE_PATH")
+fi
+if (( ${#swift_build_flags[@]} )); then
+    swift build -c release "${swift_build_flags[@]}" --quiet
+else
+    swift build -c release --quiet
+fi
 
 echo "Creating app bundle..."
 rm -rf "$APP_BUNDLE"
@@ -23,6 +58,7 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 # Copy binary
 cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
+cp "$PROJECT_DIR/scripts/patch-asar.py" "$APP_BUNDLE/Contents/Resources/"
 
 # Bundle the desktop patcher used by CodexAutoPatchMonitor. Keeping this inside
 # the installed app avoids depending on whichever checkout happens to exist.
@@ -30,7 +66,7 @@ cp "$PROJECT_DIR/scripts/patch-asar.py" "$APP_BUNDLE/Contents/Resources/patch-as
 chmod 755 "$APP_BUNDLE/Contents/Resources/patch-asar.py"
 
 # Info.plist
-cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
+cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -42,9 +78,11 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <key>CFBundleIdentifier</key>
     <string>com.codexswitch</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>${BUILD_NUMBER}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>${APP_VERSION}</string>
+    <key>CFBundleSourceRevision</key>
+    <string>${SOURCE_REVISION}</string>
     <key>CFBundleExecutable</key>
     <string>CodexSwitch</string>
     <key>CFBundlePackageType</key>
@@ -207,8 +245,15 @@ else:
     print(f"Warning: iconutil failed: {result.stderr}", file=sys.stderr)
 PYEOF
 
-# Sign the app (ad-hoc for local use)
-codesign --force --deep --sign - "$APP_BUNDLE" 2>/dev/null || true
+# Sign the app. Prefer a real Apple signing identity when Xcode has installed
+# a certificate plus private key in Keychain; otherwise fall back to ad-hoc.
+SIGN_IDENTITY="$(select_codesign_identity)"
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    echo "Signing app with ad-hoc fallback (no usable code-signing identity found)"
+else
+    echo "Signing app with identity: $SIGN_IDENTITY"
+fi
+codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE" 2>/dev/null || true
 
 echo ""
 echo "Built: $APP_BUNDLE"

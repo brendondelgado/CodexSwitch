@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${CODEXSWITCH_SECUREDROP_HOST:-signul-vps-files}"
+REMOTE_ROOT="${CODEXSWITCH_SECUREDROP_REMOTE_ROOT:-/home/signul/codexswitch-secure-files}"
+DEST="${CODEXSWITCH_SECUREDROP_DOWNLOADS_DIR:-$HOME/CodexSwitch SecureDrop/inbox}"
+STATE_DIR="$HOME/.codexswitch/securedrop"
+LOCK_DIR="$STATE_DIR/autopull.lock"
+LOG="$STATE_DIR/autopull.log"
+LIST="$STATE_DIR/outbox-files.txt"
+
+mkdir -p "$DEST" "$STATE_DIR"
+chmod 700 "$DEST" "$STATE_DIR"
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  exit 0
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"
+  chmod 600 "$LOG" 2>/dev/null || true
+}
+
+: > "$LIST"
+chmod 600 "$LIST"
+if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "cd '$REMOTE_ROOT/outbox' 2>/dev/null && find . -maxdepth 1 -type f -print" > "$LIST.tmp"; then
+  log "ssh-list-failed host=$HOST"
+  rm -f "$LIST.tmp"
+  exit 0
+fi
+mv "$LIST.tmp" "$LIST"
+
+if [ ! -s "$LIST" ]; then
+  exit 0
+fi
+
+if rsync -az --partial --timeout=30 -e ssh --files-from="$LIST" "$HOST:$REMOTE_ROOT/outbox/" "$DEST/"; then
+  DELETE_LIST="$STATE_DIR/delete-after-pull.txt"
+  : > "$DELETE_LIST"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    name="${rel#./}"
+    case "$name" in ""|.|..|*/*|*\\*) log "skip-unsafe-delete name=$name"; continue ;; esac
+    if [ -f "$DEST/$name" ]; then
+      printf '%s\n' "$name" >> "$DELETE_LIST"
+      remote_path="$REMOTE_ROOT/outbox/$name"
+      ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "rm -f -- $(printf '%q' "$remote_path")" || log "remote-delete-failed name=$name"
+    else
+      log "skip-delete-missing-local name=$name"
+    fi
+  done < "$LIST"
+  count=$(wc -l < "$DELETE_LIST" | tr -d ' ')
+  log "pulled count=$count dest=$DEST"
+else
+  log "rsync-failed host=$HOST dest=$DEST"
+  exit 1
+fi

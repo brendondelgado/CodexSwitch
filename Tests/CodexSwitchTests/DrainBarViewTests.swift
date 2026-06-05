@@ -9,10 +9,10 @@ struct DrainBarViewTests {
     func resetTextUsesCurrentTime() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let reset = now.addingTimeInterval(4 * 3600 + 55 * 60)
-        let text = DrainBarView.resetText(now: now, resetsAt: reset)
+        let text = DrainBarView.resetText(percent: 100, resetsAt: reset, now: now)
 
         #expect(text.contains("1/15"))
         #expect(text.hasSuffix("(4h 55m)"))
-        #expect(DrainBarView.resetText(now: reset.addingTimeInterval(1), resetsAt: reset) == "resetting...")
+        #expect(DrainBarView.resetText(percent: 0, resetsAt: reset, now: reset.addingTimeInterval(1)) == "confirming reset")
     }
 }

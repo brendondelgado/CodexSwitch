@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${CODEXSWITCH_SECUREDROP_HOST:-signul-vps-files}"
+REMOTE_ROOT="${CODEXSWITCH_SECUREDROP_REMOTE_ROOT:-/home/signul/codexswitch-secure-files}"
+LOCAL_ROOT="${CODEXSWITCH_SECUREDROP_LOCAL_ROOT:-$HOME/CodexSwitch SecureDrop}"
+SIDE="${CODEXSWITCH_SECUREDROP_SIDE:-mac}"
+LOCAL_KNOWLEDGE="${CODEXSWITCH_SECUREDROP_KNOWLEDGE:-$LOCAL_ROOT/knowledge}"
+STATE_DIR="${CODEXSWITCH_SECUREDROP_STATE_DIR:-$HOME/.codexswitch/securedrop}"
+LOCK_DIR="$STATE_DIR/knowledge-sync.lock"
+LOG="$LOCAL_KNOWLEDGE/.synclog.jsonl"
+CONFLICTS="$LOCAL_KNOWLEDGE/.conflicts"
+REMOTE_KNOWLEDGE="$REMOTE_ROOT/knowledge"
+LOCAL_TEST=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --side) SIDE="${2:?missing side}"; shift 2 ;;
+    --local-test) LOCAL_TEST=1; shift ;;
+    --local) LOCAL_KNOWLEDGE="${2:?missing local}"; shift 2 ;;
+    --remote) REMOTE_KNOWLEDGE="${2:?missing remote}"; shift 2 ;;
+    --state-dir) STATE_DIR="${2:?missing state dir}"; LOCK_DIR="$STATE_DIR/knowledge-sync.lock"; shift 2 ;;
+    --help|-h) echo "usage: knowledge-sync [--side mac|vps]"; exit 0 ;;
+    *) echo "knowledge-sync: unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$LOCAL_KNOWLEDGE" "$CONFLICTS" "$STATE_DIR"
+chmod 700 "$LOCAL_KNOWLEDGE" "$CONFLICTS" "$STATE_DIR" 2>/dev/null || true
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then exit 0; fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+json_log() { printf '{"timestamp":"%s","side":"%s","event":"%s","path":"%s"}\n' "$(ts)" "$SIDE" "$1" "$2" >> "$LOG"; chmod 600 "$LOG" 2>/dev/null || true; }
+rel_files() { (cd "$1" && find . -type f ! -path './.conflicts/*' ! -name '.synclog.jsonl' ! -name '.sync-index.tsv' -print | sed 's#^./##' | sort); }
+sha_file() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'; else sha256sum "$1" | awk '{print $1}'; fi; }
+mtime_file() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+safe_rel() { case "$1" in ""|.|..|../*|*/../*|*"/.."|/*|*\\*) return 1;; esac; return 0; }
+copy_file() { mkdir -p "$(dirname "$2")"; cp -p "$1" "$2"; chmod 600 "$2" 2>/dev/null || true; }
+conflict_copy() { mkdir -p "$CONFLICTS/$(dirname "$1")"; cp -p "$2" "$CONFLICTS/$1.$3.$(date -u +%Y%m%dT%H%M%SZ)"; json_log conflict "$1"; }
+
+if [[ "$LOCAL_TEST" == 0 && "$SIDE" == mac ]]; then
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "mkdir -p '$REMOTE_KNOWLEDGE' '$REMOTE_KNOWLEDGE/.conflicts'"
+  tmp_remote="$STATE_DIR/knowledge-remote"
+  rm -rf "$tmp_remote"; mkdir -p "$tmp_remote"
+  rsync -az --delete --timeout=30 --exclude='.conflicts/' --exclude='.synclog.jsonl' --exclude='.sync-index.tsv' -e ssh "$HOST:$REMOTE_KNOWLEDGE/" "$tmp_remote/"
+  REMOTE_KNOWLEDGE="$tmp_remote"
+elif [[ "$LOCAL_TEST" == 0 ]]; then
+  echo "knowledge-sync: non-test VPS side should run with --local pointing at VPS knowledge and --remote at mirror path" >&2
+  exit 2
+else
+  mkdir -p "$REMOTE_KNOWLEDGE" "$REMOTE_KNOWLEDGE/.conflicts"
+fi
+
+idx="$LOCAL_KNOWLEDGE/.sync-index.tsv"
+old="$STATE_DIR/knowledge-old.tsv"
+cp "$idx" "$old" 2>/dev/null || : > "$old"
+union="$STATE_DIR/knowledge-union.txt"
+{
+  rel_files "$LOCAL_KNOWLEDGE"
+  rel_files "$REMOTE_KNOWLEDGE"
+} | sort -u > "$union"
+
+old_lookup() {
+  awk -F '\t' -v key="$1" '$1 == key { print $2; found=1; exit } END { if (!found) exit 1 }' "$old" 2>/dev/null || true
+}
+
+while IFS= read -r rel; do
+  [[ -n "$rel" ]] || continue
+  safe_rel "$rel" || continue
+  l="$LOCAL_KNOWLEDGE/$rel"; r="$REMOTE_KNOWLEDGE/$rel"
+  lexists=0; rexists=0; [[ -f "$l" ]] && lexists=1; [[ -f "$r" ]] && rexists=1
+  if [[ "$lexists" == 1 ]]; then lsha=$(sha_file "$l"); lmt=$(mtime_file "$l"); else lsha=""; lmt=0; fi
+  if [[ "$rexists" == 1 ]]; then rsha=$(sha_file "$r"); rmt=$(mtime_file "$r"); else rsha=""; rmt=0; fi
+  [[ "$lsha" == "$rsha" && -n "$lsha" ]] && continue
+  oldv="$(old_lookup "$rel")"
+  if [[ "$lexists" == 1 && "$rexists" == 0 ]]; then copy_file "$l" "$r"; json_log push "$rel"; continue; fi
+  if [[ "$lexists" == 0 && "$rexists" == 1 ]]; then copy_file "$r" "$l"; json_log pull "$rel"; continue; fi
+  if [[ -n "$oldv" && "$lsha" != "$oldv" && "$rsha" != "$oldv" ]]; then
+    conflict_copy "$rel" "$l" local
+    conflict_copy "$rel" "$r" remote
+  fi
+  if (( rmt > lmt + 1 )); then copy_file "$r" "$l"; json_log pull "$rel"; else copy_file "$l" "$r"; json_log push "$rel"; fi
+done < "$union"
+
+: > "$idx.tmp"
+while IFS= read -r rel; do
+  safe_rel "$rel" || continue
+  printf '%s\t%s\n' "$rel" "$(sha_file "$LOCAL_KNOWLEDGE/$rel")" >> "$idx.tmp"
+done < <(rel_files "$LOCAL_KNOWLEDGE")
+mv "$idx.tmp" "$idx"; chmod 600 "$idx"
+
+if [[ "$LOCAL_TEST" == 0 && "$SIDE" == mac ]]; then
+  rsync -az --delete --timeout=30 --exclude='.conflicts/' --exclude='.synclog.jsonl' --exclude='.sync-index.tsv' -e ssh "$LOCAL_KNOWLEDGE/" "$HOST:$REMOTE_ROOT/knowledge/"
+  rsync -az --timeout=30 -e ssh "$LOCAL_KNOWLEDGE/.conflicts/" "$HOST:$REMOTE_ROOT/knowledge/.conflicts/" 2>/dev/null || true
+fi

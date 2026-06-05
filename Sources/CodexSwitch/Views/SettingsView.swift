@@ -8,11 +8,24 @@ struct SettingsView: View {
     @AppStorage("launchAtLogin") private var launchAtLogin = false
     @AppStorage("notificationsEnabled") private var notificationsEnabled = true
     @AppStorage("pollMultiplier") private var pollMultiplier = 1.0
+    @AppStorage(DesktopPatchManager.automaticPatchingDefaultsKey) private var desktopAutomaticPatchingEnabled = true
+    @AppStorage("linuxDevboxMonitorEnabled") private var linuxDevboxMonitorEnabled = false
+    @AppStorage("linuxDevboxHost") private var linuxDevboxHost = ""
+    @AppStorage("linuxDevboxUser") private var linuxDevboxUser = ""
+    @AppStorage("linuxDevboxSSHKeyPath") private var linuxDevboxSSHKeyPath = ""
+    @AppStorage("linuxDevboxSSHPort") private var linuxDevboxSSHPort = 22
 
+    var accounts: [CodexAccount] = []
     var onRemoveAllAccounts: (() -> Void)?
 
     @State private var showingRemoveConfirmation = false
     @State private var versionChecker = CodexVersionChecker()
+    @State private var linuxPassphrase = ""
+    @State private var linuxPassphraseConfirmation = ""
+    @State private var linuxExportResult: LinuxDevboxExportResult?
+    @State private var linuxExportError: String?
+    @State private var linuxMonitorResult: String?
+    @State private var linuxMonitorHealthy: Bool?
 
     private static let lastCheckedFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -71,7 +84,7 @@ struct SettingsView: View {
 
                 HStack {
                     Button {
-                        versionChecker.checkVersions(force: true)
+                        versionChecker.checkVersions()
                     } label: {
                         if versionChecker.isChecking {
                             ProgressView()
@@ -92,10 +105,7 @@ struct SettingsView: View {
                                     .controlSize(.small)
                                 Text("Updating...")
                             } else {
-                                Label(
-                                    versionChecker.forkInstalled ? "Update and Patch Now" : "Update Now",
-                                    systemImage: "arrow.down.circle.fill"
-                                )
+                                Label("Update Now", systemImage: "arrow.down.circle.fill")
                             }
                         }
                         .disabled(versionChecker.isUpdating)
@@ -138,100 +148,82 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Codex Desktop App") {
-                HStack {
-                    Text("Installed")
-                    Spacer()
-                    Text(versionChecker.desktopInstalledVersionLabel)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }
+            Section("Desktop App") {
+                Toggle("Automatically repair Codex.app patch", isOn: $desktopAutomaticPatchingEnabled)
+                Text("On by default because desktop hot-swap depends on it. CodexSwitch only patches after Codex.app is quit and verifies plugin signatures before reporting ready.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-                HStack {
-                    Text("Latest")
-                    Spacer()
-                    Text(versionChecker.desktopLatestVersionLabel)
-                        .font(.system(size: 11, weight: versionChecker.desktopUpdateAvailable ? .medium : .regular, design: .monospaced))
-                        .foregroundStyle(versionChecker.desktopUpdateAvailable ? .orange : .secondary)
-                }
+            Section("Linux Devbox") {
+                Text("Export encrypted account tokens for the Linux CLI so you do not need to log in again on the VPS.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
-                HStack(alignment: .top) {
-                    Text("Runtime")
-                    Spacer()
-                    Text(versionChecker.desktopRuntimeLabel)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.trailing)
-                }
+                SecureField("Export passphrase", text: $linuxPassphrase)
+                SecureField("Confirm passphrase", text: $linuxPassphraseConfirmation)
 
-                HStack(alignment: .top) {
-                    Text("Auto-Swap")
-                    Spacer()
-                    Text(versionChecker.desktopAutoSwapLabel)
-                        .font(.system(size: 11, weight: versionChecker.desktopAutoSwapReady ? .regular : .medium, design: .monospaced))
-                        .foregroundStyle(versionChecker.desktopAutoSwapReady ? .green : .orange)
-                        .multilineTextAlignment(.trailing)
+                Button {
+                    exportLinuxBundle()
+                } label: {
+                    Label("Export All Accounts For Linux", systemImage: "shippingbox.and.arrow.backward")
                 }
+                .disabled(accounts.isEmpty)
 
-                HStack(alignment: .top) {
-                    Text("Patch")
-                    Spacer()
-                    Text(versionChecker.desktopPatchLabel)
-                        .font(.system(size: 11, weight: versionChecker.desktopPatchHealthy ? .regular : .medium, design: .monospaced))
-                        .foregroundStyle(versionChecker.desktopPatchHealthy ? .green : .orange)
-                        .multilineTextAlignment(.trailing)
-                }
+                if let linuxExportResult {
+                    Text("Exported \(linuxExportResult.metadata.accountCount) account(s) to \(linuxExportResult.fileURL.lastPathComponent)")
+                        .font(.caption)
+                        .foregroundStyle(.green)
 
-                HStack {
-                    Button {
-                        versionChecker.checkVersions(force: true)
-                    } label: {
-                        Label("Refresh Desktop Status", systemImage: "arrow.clockwise")
+                    Button("Copy VPS Commands") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(
+                            [
+                                linuxExportResult.copyCommand,
+                                linuxExportResult.importCommand,
+                                "ssh user@devbox 'codexswitch-cli tui'",
+                            ].joined(separator: "\n"),
+                            forType: .string
+                        )
                     }
-                    .disabled(versionChecker.isChecking || versionChecker.desktopPatchInFlight || versionChecker.desktopUpdateInFlight)
 
-                    if versionChecker.desktopUpdateAvailable {
-                        Button {
-                            versionChecker.installLatestDesktopNow()
-                        } label: {
-                            if versionChecker.desktopUpdateInFlight {
-                                ProgressView()
-                                    .controlSize(.small)
-                                Text("Updating...")
-                            } else {
-                                Label("Install Latest Stock App", systemImage: "arrow.down.circle.fill")
-                            }
-                        }
-                        .disabled(versionChecker.desktopUpdateInFlight || versionChecker.desktopPatchInFlight)
-                    } else if versionChecker.desktopCanPatchNow || !versionChecker.desktopPatchHealthy {
-                        Button {
-                            versionChecker.patchDesktopAppNow()
-                        } label: {
-                            if versionChecker.desktopPatchInFlight {
-                                ProgressView()
-                                    .controlSize(.small)
-                                Text("Verifying...")
-                            } else {
-                                Label("Verify Desktop Compatibility", systemImage: "checkmark.shield.fill")
-                            }
-                        }
-                        .disabled(versionChecker.desktopPatchInFlight)
+                    Button("Reveal Export In Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([linuxExportResult.fileURL])
                     }
                 }
 
-                if let result = versionChecker.desktopPatchResult {
-                    Text(result)
+                if let linuxExportError {
+                    Text(linuxExportError)
                         .font(.caption)
-                        .foregroundStyle(versionChecker.desktopPatchSucceeded ? .green : .red)
-                        .lineLimit(4)
+                        .foregroundStyle(.red)
                 }
 
-                if let result = versionChecker.desktopUpdateResult {
-                    Text(result)
-                        .font(.caption)
-                        .foregroundStyle(versionChecker.desktopUpdateSucceeded ? .green : .red)
-                        .lineLimit(4)
+                Text("This bundle contains encrypted Codex login tokens. Anyone with the file and passphrase can use these accounts. Delete it after importing on the devbox.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            Section("Linux Devbox Monitor") {
+                Toggle("Notify when VPS auto-swap is not ready", isOn: $linuxDevboxMonitorEnabled)
+                TextField("Host", text: $linuxDevboxHost)
+                TextField("SSH user", text: $linuxDevboxUser)
+                TextField("SSH key path (optional)", text: $linuxDevboxSSHKeyPath)
+                Stepper("SSH port: \(linuxDevboxSSHPort)", value: $linuxDevboxSSHPort, in: 1...65535)
+
+                Button("Test VPS Readiness") {
+                    testLinuxDevboxMonitor()
                 }
+                .disabled(!linuxDevboxMonitorEnabled)
+
+                if let linuxMonitorResult {
+                    Text(linuxMonitorResult)
+                        .font(.caption)
+                        .foregroundStyle(linuxMonitorHealthy == true ? .green : .red)
+                }
+
+                Text("CodexSwitch checks `codexswitch-cli doctor --json` over SSH and sends a Mac notification if the VPS is not ready for automatic swaps.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Data") {
@@ -255,22 +247,18 @@ struct SettingsView: View {
             }
 
             Section("About") {
-                LabeledContent("CodexSwitch", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")
+                LabeledContent("CodexSwitch", value: AppBuildInfo.settingsVersionLabel)
+                if let sourceRevision = AppBuildInfo.sourceRevision {
+                    LabeledContent("Revision", value: sourceRevision)
+                }
                 LabeledContent("Auth file", value: "~/.codex/auth.json")
                 LabeledContent("Accounts", value: "~/.codexswitch/accounts.json")
             }
         }
         .formStyle(.grouped)
-        .frame(width: 400, height: 620)
+        .frame(width: 420, height: 640)
         .onAppear {
             versionChecker.checkVersions()
-        }
-        .task {
-            versionChecker.refreshDesktopRuntimeStatus()
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(5))
-                versionChecker.refreshDesktopRuntimeStatus()
-            }
         }
     }
 
@@ -284,6 +272,44 @@ struct SettingsView: View {
         } catch {
             launchAtLogin = !enabled
             logger.error("Launch at login toggle failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func exportLinuxBundle() {
+        do {
+            let result = try LinuxDevboxExportService().export(
+                accounts: accounts,
+                passphrase: linuxPassphrase,
+                confirmation: linuxPassphraseConfirmation
+            )
+            linuxExportResult = result
+            linuxExportError = nil
+        } catch {
+            linuxExportResult = nil
+            linuxExportError = error.localizedDescription
+        }
+    }
+
+    private func testLinuxDevboxMonitor() {
+        let settings = LinuxDevboxMonitorSettings(
+            enabled: linuxDevboxMonitorEnabled,
+            host: linuxDevboxHost,
+            user: linuxDevboxUser,
+            sshKeyPath: linuxDevboxSSHKeyPath,
+            port: linuxDevboxSSHPort
+        )
+        Task.detached {
+            let result = LinuxDevboxMonitor.check(settings: settings)
+            await MainActor.run {
+                switch result {
+                case .success(let readiness):
+                    linuxMonitorHealthy = readiness.ready
+                    linuxMonitorResult = readiness.summary
+                case .failure(let failure):
+                    linuxMonitorHealthy = false
+                    linuxMonitorResult = failure.message
+                }
+            }
         }
     }
 }

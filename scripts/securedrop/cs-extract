@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="."
+usage() { echo "usage: cs-extract <tarball> [--target <dir>]" >&2; exit 2; }
+[[ $# -ge 1 ]] || usage
+tarball="$1"; shift
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target) target="${2:?missing target}"; shift 2 ;;
+    --help|-h) usage ;;
+    *) echo "cs-extract: unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+[[ -f "$tarball" && ! -L "$tarball" ]] || { echo "cs-extract: tarball must be a real file: $tarball" >&2; exit 1; }
+if [[ -f "$tarball.sha256" ]]; then
+  expected=$(awk '{print $1}' "$tarball.sha256")
+  if command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 "$tarball" | awk '{print $1}'); else actual=$(sha256sum "$tarball" | awk '{print $1}'); fi
+  [[ "$expected" == "$actual" ]] || { echo "cs-extract: sha256 mismatch" >&2; exit 1; }
+fi
+mkdir -p "$target"
+tmp="$target/.incoming-extract-$(date +%s)-$$"
+mkdir -p "$tmp"
+tar -xf "$tarball" -C "$tmp"
+count=$(find "$tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+[[ "$count" == 1 ]] || { echo "cs-extract: archive must contain one top-level directory/file" >&2; rm -rf "$tmp"; exit 1; }
+item="$(find "$tmp" -mindepth 1 -maxdepth 1 -print -quit)"
+base="$(basename "$item")"; case "$base" in ""|.|..|*/*|*\\*) echo "cs-extract: invalid top-level name" >&2; rm -rf "$tmp"; exit 1;; esac
+dest="$target/$base"
+backup=""
+if [[ -e "$dest" ]]; then
+  backup="$target/.replaced-$base-$(date -u +%Y%m%dT%H%M%SZ)"
+  mv "$dest" "$backup"
+fi
+mv "$item" "$dest"
+rmdir "$tmp" 2>/dev/null || true
+echo "$dest"

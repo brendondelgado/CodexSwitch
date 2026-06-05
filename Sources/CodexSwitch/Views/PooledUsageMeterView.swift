@@ -1,21 +1,23 @@
 import SwiftUI
 
 /// Shows aggregate usage across all accounts compared to a single Pro plan.
-/// Uses TOTAL account count for cost/capacity calculations,
+/// Uses plan-weighted Plus-equivalent capacity for cost/capacity calculations,
 /// and reports how many are actually reporting data.
 struct PooledUsageMeterView: View {
     let accounts: [CodexAccount]
+    let tokenSavingsSummary: CodexTokenSavingsSummary?
 
-    // Pro plan has ~6.7x the usage of Plus per window
-    private static let proMultiplier = 6.7
+    private var capacitySummary: PooledCapacitySummary {
+        PooledCapacitySummary(accounts: accounts)
+    }
 
     private var accountsWithData: [CodexAccount] {
-        accounts.filter { $0.quotaSnapshot != nil }
+        accounts.filter { $0.realQuotaSnapshot != nil }
     }
 
     private var usableAccounts: [CodexAccount] {
         accountsWithData.filter { account in
-            guard let snap = account.quotaSnapshot else { return false }
+            guard let snap = account.realQuotaSnapshot else { return false }
             return !snap.fiveHour.isExhausted && !snap.weekly.isExhausted
         }
     }
@@ -23,7 +25,7 @@ struct PooledUsageMeterView: View {
     /// Count accounts where EITHER 5h or weekly is exhausted
     private var exhaustedCount: Int {
         accountsWithData.filter { account in
-            guard let snap = account.quotaSnapshot else { return false }
+            guard let snap = account.realQuotaSnapshot else { return false }
             return snap.fiveHour.isExhausted || snap.weekly.isExhausted
         }.count
     }
@@ -34,14 +36,19 @@ struct PooledUsageMeterView: View {
         let withData = accountsWithData
         guard !withData.isEmpty else { return .empty(totalAccounts: accounts.count) }
 
-        let totalRemaining = withData.reduce(0.0) { $0 + $1.quotaSnapshot!.fiveHour.remainingPercent }
-        let totalCapacity = Double(accounts.count) * 100.0
+        let totalRemaining = withData.reduce(0.0) { partial, account in
+            let multiplier = CodexPlanCapacity.forAccount(account).fiveHourPlusMultiplier
+            return partial + account.realQuotaSnapshot!.fiveHour.remainingPercent * multiplier
+        }
+        let totalCapacity = capacitySummary.fiveHourPlusCapacity * 100.0
+        guard totalCapacity > 0 else { return .empty(totalAccounts: accounts.count) }
         let pooledPercent = totalRemaining / totalCapacity * 100.0
 
-        let proEquivalentRemaining = totalRemaining / Self.proMultiplier
+        let pro20Capacity = CodexPlanCapacity.forPlanType("pro").fiveHourPlusMultiplier * 100.0
+        let proEquivalentRemaining = totalCapacity > 0 ? totalRemaining / pro20Capacity * 100.0 : 0
         let proPercent = min(100, proEquivalentRemaining)
 
-        let nextReset = withData.compactMap { $0.quotaSnapshot?.fiveHour.resetsAt }.min()
+        let nextReset = withData.compactMap { $0.realQuotaSnapshot?.fiveHour.resetsAt }.min()
 
         return PooledMetric(
             pooledPercent: pooledPercent,
@@ -59,14 +66,19 @@ struct PooledUsageMeterView: View {
         let withData = accountsWithData
         guard !withData.isEmpty else { return .empty(totalAccounts: accounts.count) }
 
-        let totalRemaining = withData.reduce(0.0) { $0 + $1.quotaSnapshot!.weekly.remainingPercent }
-        let totalCapacity = Double(accounts.count) * 100.0
+        let totalRemaining = withData.reduce(0.0) { partial, account in
+            let multiplier = CodexPlanCapacity.forAccount(account).weeklyPlusMultiplier
+            return partial + account.realQuotaSnapshot!.weekly.remainingPercent * multiplier
+        }
+        let totalCapacity = capacitySummary.weeklyPlusCapacity * 100.0
+        guard totalCapacity > 0 else { return .empty(totalAccounts: accounts.count) }
         let pooledPercent = totalRemaining / totalCapacity * 100.0
 
-        let proEquivalentRemaining = totalRemaining / Self.proMultiplier
+        let pro20Capacity = CodexPlanCapacity.forPlanType("pro").weeklyPlusMultiplier * 100.0
+        let proEquivalentRemaining = totalCapacity > 0 ? totalRemaining / pro20Capacity * 100.0 : 0
         let proPercent = min(100, proEquivalentRemaining)
 
-        let nextReset = withData.compactMap { $0.quotaSnapshot?.weekly.resetsAt }.min()
+        let nextReset = withData.compactMap { $0.realQuotaSnapshot?.weekly.resetsAt }.min()
 
         return PooledMetric(
             pooledPercent: pooledPercent,
@@ -81,7 +93,7 @@ struct PooledUsageMeterView: View {
 
     /// Time until nearest weekly reset (when capacity returns)
     private var nextWeeklyResetTime: String? {
-        let nextReset = accountsWithData.compactMap { $0.quotaSnapshot?.weekly.resetsAt }.min()
+        let nextReset = accountsWithData.compactMap { $0.realQuotaSnapshot?.weekly.resetsAt }.min()
         guard let reset = nextReset else { return nil }
         let seconds = reset.timeIntervalSinceNow
         guard seconds > 0 else { return nil }
@@ -92,7 +104,7 @@ struct PooledUsageMeterView: View {
     private var allWeeklyExhausted: Bool {
         let withData = accountsWithData
         guard !withData.isEmpty else { return false }
-        return withData.allSatisfy { $0.quotaSnapshot!.weekly.isExhausted }
+        return withData.allSatisfy { $0.realQuotaSnapshot!.weekly.isExhausted }
     }
 
     /// Estimated time until usable pooled capacity runs out.
@@ -100,16 +112,20 @@ struct PooledUsageMeterView: View {
     /// once weekly hits 0% on all accounts, 5h capacity is worthless.
     /// When all weekly is exhausted, returns nil (caller shows reset countdown instead).
     private var estimatedTimeRemaining: String? {
-        let usable = accountsWithData.filter { !$0.quotaSnapshot!.weekly.isExhausted }
+        let usable = accountsWithData.filter { !$0.realQuotaSnapshot!.weekly.isExhausted }
         guard !usable.isEmpty else { return nil }
 
         // --- Weekly ceiling ---
         let active = usable.first { $0.isActive } ?? usable.first!
-        let activeWk = active.quotaSnapshot!.weekly
+        let activeWk = active.realQuotaSnapshot!.weekly
+        let activeWeeklyMultiplier = CodexPlanCapacity.forAccount(active).weeklyPlusMultiplier
         let wkElapsed = max(60, Double(activeWk.windowDurationMins * 60) - max(0, activeWk.timeUntilReset))
-        let wkBurnPerSec = activeWk.usedPercent / wkElapsed
+        let wkBurnPerSec = activeWk.usedPercent * activeWeeklyMultiplier / wkElapsed
 
-        let totalWeeklyRemaining = usable.reduce(0.0) { $0 + $1.quotaSnapshot!.weekly.remainingPercent }
+        let totalWeeklyRemaining = usable.reduce(0.0) { partial, account in
+            let multiplier = CodexPlanCapacity.forAccount(account).weeklyPlusMultiplier
+            return partial + account.realQuotaSnapshot!.weekly.remainingPercent * multiplier
+        }
         let weeklyCeiling: TimeInterval = wkBurnPerSec > 0
             ? totalWeeklyRemaining / wkBurnPerSec
             : .greatestFiniteMagnitude
@@ -117,9 +133,10 @@ struct PooledUsageMeterView: View {
         // --- 5h estimate with reset simulation ---
         var fhBurnPerSec = 0.0
         for account in usable {
-            let fh = account.quotaSnapshot!.fiveHour
+            let fh = account.realQuotaSnapshot!.fiveHour
+            let multiplier = CodexPlanCapacity.forAccount(account).fiveHourPlusMultiplier
             let elapsed = max(60, Double(fh.windowDurationMins * 60) - max(0, fh.timeUntilReset))
-            let rate = fh.usedPercent / elapsed
+            let rate = fh.usedPercent * multiplier / elapsed
             if rate > 0 { fhBurnPerSec += rate }
         }
 
@@ -127,14 +144,18 @@ struct PooledUsageMeterView: View {
 
         var fhEstimate: TimeInterval = .greatestFiniteMagnitude
         if fhBurnPerSec > 0 {
-            var poolRemaining = usable.reduce(0.0) { $0 + $1.quotaSnapshot!.fiveHour.remainingPercent }
+            var poolRemaining = usable.reduce(0.0) { partial, account in
+                let multiplier = CodexPlanCapacity.forAccount(account).fiveHourPlusMultiplier
+                return partial + account.realQuotaSnapshot!.fiveHour.remainingPercent * multiplier
+            }
 
-            var resets: [(secondsFromNow: TimeInterval, email: String)] = []
+            var resets: [(secondsFromNow: TimeInterval, restoredCapacity: Double)] = []
             for account in usable {
-                let fh = account.quotaSnapshot!.fiveHour
+                let fh = account.realQuotaSnapshot!.fiveHour
                 let resetIn = fh.timeUntilReset
                 if resetIn > 0 && resetIn < 86400 {
-                    resets.append((resetIn, account.email))
+                    let multiplier = CodexPlanCapacity.forAccount(account).fiveHourPlusMultiplier
+                    resets.append((resetIn, multiplier * 100.0))
                 }
             }
             resets.sort { $0.secondsFromNow < $1.secondsFromNow }
@@ -150,7 +171,7 @@ struct PooledUsageMeterView: View {
                     break
                 }
                 poolRemaining -= burned
-                poolRemaining += 100.0
+                poolRemaining += reset.restoredCapacity
                 elapsedSec = reset.secondsFromNow
             }
             if !foundEmpty {
@@ -196,7 +217,7 @@ struct PooledUsageMeterView: View {
         }
 
         // All accounts have very low weekly (< 30%)
-        let lowWeeklyCount = accountsWithData.filter { ($0.quotaSnapshot?.weekly.remainingPercent ?? 100) < 30 }.count
+        let lowWeeklyCount = accountsWithData.filter { ($0.realQuotaSnapshot?.weekly.remainingPercent ?? 100) < 30 }.count
         if lowWeeklyCount == total && total > 0 {
             return ("exclamationmark.triangle",
                     "All \(total) accounts below 30% weekly — consider adding an account", .orange)
@@ -306,10 +327,11 @@ struct PooledUsageMeterView: View {
     }
 
     private var costComparison: some View {
-        let total = accounts.count
-        let monthlyCost = total * 20
-        let capacityPct = Double(total) / Self.proMultiplier * 100
-        let savings = 200 - monthlyCost
+        let summary = capacitySummary
+        let pro20FiveHourPercent = summary.fiveHourPlusCapacity
+            / CodexPlanCapacity.forPlanType("pro").fiveHourPlusMultiplier * 100
+        let pro20WeeklyPercent = summary.weeklyPlusCapacity
+            / CodexPlanCapacity.forPlanType("pro").weeklyPlusMultiplier * 100
 
         return VStack(alignment: .leading, spacing: 2) {
             // Line 1: Your plan
@@ -317,33 +339,139 @@ struct PooledUsageMeterView: View {
                 Image(systemName: "dollarsign.circle")
                     .font(.system(size: 9))
                     .foregroundStyle(.green)
-                Text("Your pool: \(total) Plus accounts at $20/mo = $\(monthlyCost)/mo")
+                Text("Your pool: \(summary.breakdownText) = $\(summary.totalMonthlyCostUSD)/mo")
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
             }
-            // Line 2: Pro comparison
+            // Line 2: Plus comparison
             HStack(spacing: 4) {
                 Image(systemName: "arrow.right")
                     .font(.system(size: 8))
                     .foregroundStyle(.tertiary)
-                Text("\(String(format: "%.0f", capacityPct))% the capacity of a single Pro plan ($200/mo)")
+                Text("Vs single Plus: \(formatMultiplier(summary.fiveHourPlusCapacity))x 5h / \(formatMultiplier(summary.weeklyPlusCapacity))x weekly")
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
             }
             .padding(.leading, 13)
-            // Line 3: Savings (if any)
-            if savings > 0 {
+            // Line 3: Pro comparison
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+                Text("Vs Pro 20x: \(String(format: "%.0f", pro20FiveHourPercent))% 5h / \(String(format: "%.0f", pro20WeeklyPercent))% weekly")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, 13)
+            if let promoText = summary.promoText {
                 HStack(spacing: 4) {
-                    Image(systemName: "leaf.fill")
+                    Image(systemName: "sparkles")
                         .font(.system(size: 8))
-                        .foregroundStyle(.green)
-                    Text("Saving $\(savings)/mo vs Pro")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(.blue)
+                    Text(promoText)
+                        .font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.leading, 13)
+            }
+            tokenSavingsComparison
+        }
+    }
+
+    @ViewBuilder
+    private var tokenSavingsComparison: some View {
+        if let tokenSavingsSummary, tokenSavingsSummary.total.completionCount > 0 {
+            let total = tokenSavingsSummary.total
+            HStack(spacing: 4) {
+                Image(systemName: "chart.line.uptrend.xyaxis")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.purple)
+                Text("API value: \(formatCurrency(tokenSavingsSummary.apiValueUSD)) observed in logs (\(tokenSavingsSummary.coverageText), \(tokenSavingsWindowText(tokenSavingsSummary)))")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, 13)
+
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+                Text("Tokens: \(formatCompactTokens(total.inputTokens)) in / \(formatCompactTokens(total.cachedInputTokens)) cached (\(tokenCacheHitText(total))) / \(formatCompactTokens(total.outputTokens)) out")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.leading, 13)
+
+            HStack(spacing: 4) {
+                Image(systemName: tokenSavingsSummary.savingsUSD >= 0 ? "checkmark.seal" : "info.circle")
+                    .font(.system(size: 8))
+                    .foregroundStyle(tokenSavingsSummary.savingsUSD >= 0 ? .green : .orange)
+                Text(tokenSavingsText(tokenSavingsSummary))
+                    .font(.system(size: 8))
+                    .foregroundStyle(tokenSavingsSummary.savingsUSD >= 0 ? Color.secondary : Color.orange)
+            }
+            .padding(.leading, 13)
+
+            if let reason = tokenSavingsSummary.remoteExcludedReason {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.orange)
+                    Text(reason)
+                        .font(.system(size: 8))
+                        .foregroundStyle(.orange)
                 }
                 .padding(.leading, 13)
             }
         }
+    }
+
+    private func formatMultiplier(_ value: Double) -> String {
+        if value.rounded() == value {
+            return String(format: "%.0f", value)
+        }
+        return String(format: "%.1f", value)
+    }
+
+    private func formatCurrency(_ value: Double) -> String {
+        if value >= 100 {
+            return "$\(Int(value.rounded()))"
+        }
+        return String(format: "$%.2f", value)
+    }
+
+    private func formatCompactTokens(_ value: Int) -> String {
+        if value >= 1_000_000 {
+            return String(format: "%.1fM", Double(value) / 1_000_000)
+        }
+        if value >= 1_000 {
+            return String(format: "%.0fK", Double(value) / 1_000)
+        }
+        return "\(value)"
+    }
+
+    private func tokenCacheHitText(_ usage: CodexModelTokenUsage) -> String {
+        guard usage.inputTokens > 0 else { return "0%" }
+        return "\(Int((Double(usage.cachedInputTokens) / Double(usage.inputTokens) * 100).rounded()))%"
+    }
+
+    private func tokenSavingsText(_ summary: CodexTokenSavingsSummary) -> String {
+        if summary.savingsUSD < 0 {
+            return "Vs API: \(formatCurrency(summary.apiValueUSD)) observed so far vs $\(summary.subscriptionMonthlyCostUSD)/mo subscriptions"
+        }
+        if let multiple = summary.apiMultiple, multiple > 0 {
+            return "Vs API: \(formatCurrency(summary.savingsUSD)) saved, \(String(format: "%.1f", multiple))x cheaper than GPT-5.5 API"
+        }
+        return "Vs API: \(formatCurrency(summary.savingsUSD)) net"
+    }
+
+    private func tokenSavingsWindowText(_ summary: CodexTokenSavingsSummary) -> String {
+        let requestedDays = summary.localReport?.windowDays ?? summary.remoteReport?.windowDays ?? 30
+        guard let firstEventAt = summary.firstEventAt else {
+            return "≤\(requestedDays)d"
+        }
+        let observedDays = max(1, Int(ceil(Date().timeIntervalSince(firstEventAt) / 86_400)))
+        return "\(min(observedDays, requestedDays))d observed"
     }
 
     @ViewBuilder

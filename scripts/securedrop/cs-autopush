@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${CODEXSWITCH_SECUREDROP_HOST:-signul-vps-files}"
+REMOTE_ROOT="${CODEXSWITCH_SECUREDROP_REMOTE_ROOT:-/home/signul/codexswitch-secure-files}"
+LOCAL_ROOT="${CODEXSWITCH_SECUREDROP_LOCAL_ROOT:-$HOME/CodexSwitch SecureDrop}"
+SRC="${CODEXSWITCH_SECUREDROP_OUTBOX_DIR:-$LOCAL_ROOT/outbox}"
+STATE_DIR="$HOME/.codexswitch/securedrop"
+LOCK_DIR="$STATE_DIR/autopush.lock"
+LOG="$STATE_DIR/autopush.log"
+MIN_AGE_SECONDS="${CODEXSWITCH_SECUREDROP_AUTOPUSH_MIN_AGE_SECONDS:-5}"
+
+mkdir -p "$SRC" "$STATE_DIR"
+chmod 700 "$LOCAL_ROOT" "$SRC" "$STATE_DIR" 2>/dev/null || true
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  exit 0
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"
+  chmod 600 "$LOG" 2>/dev/null || true
+}
+
+shell_quote() {
+  if [ "$#" -ne 1 ]; then
+    log "shell-quote-arity-error argc=$#"
+    return 2
+  fi
+  printf '%q' "$1"
+}
+
+remote_sha256() {
+  local remote_path="$1"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" \
+    "sha256sum -- $(shell_quote "$remote_path") | awk '{print \$1}'" 2>/dev/null || true
+}
+
+is_safe_name() {
+  local name="$1"
+  case "$name" in
+    ""|.|..|.*|*/*|*\\*|*.tmp|*.part|*.download|*.crdownload|*.incoming)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+now="$(date +%s)"
+sent_count=0
+
+while IFS= read -r -d '' file; do
+  name="$(basename "$file")"
+  if ! is_safe_name "$name"; then
+    log "skip-unsafe name=$name"
+    continue
+  fi
+
+  mtime="$(stat -f '%m' "$file" 2>/dev/null || echo "$now")"
+  age=$((now - mtime))
+  if [ "$age" -lt "$MIN_AGE_SECONDS" ]; then
+    log "skip-young name=$name age=${age}s"
+    continue
+  fi
+
+  local_hash="$(shasum -a 256 "$file" | awk '{print $1}')"
+  local_bytes="$(stat -f '%z' "$file")"
+  incoming_dir="$REMOTE_ROOT/.incoming/autopush-$(date +%s)-$$"
+  remote_incoming="$incoming_dir/$name"
+  remote_final="$REMOTE_ROOT/inbox/$name"
+  remote_hash_file="$REMOTE_ROOT/inbox/$name.sha256"
+  remote_final_hash="$(remote_sha256 "$remote_final")"
+
+  if [ "$remote_final_hash" = "$local_hash" ]; then
+    rm -f -- "$file"
+    sent_count=$((sent_count + 1))
+    log "already-pushed name=$name bytes=$local_bytes sha256=$local_hash dest=$HOST:$remote_final"
+    continue
+  fi
+
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" \
+    "mkdir -p $(shell_quote "$incoming_dir") $(shell_quote "$REMOTE_ROOT/inbox") && chmod 700 $(shell_quote "$REMOTE_ROOT") $(shell_quote "$REMOTE_ROOT/inbox") $(shell_quote "$REMOTE_ROOT/.incoming") 2>/dev/null || true" \
+    || { log "ssh-prepare-failed name=$name"; continue; }
+
+  if ! rsync -az --partial --timeout=30 -e ssh -- "$file" "$HOST:$(shell_quote "$remote_incoming")"; then
+    log "rsync-failed name=$name"
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "rm -rf -- $(shell_quote "$incoming_dir")" >/dev/null 2>&1 || true
+    continue
+  fi
+
+  remote_hash="$(remote_sha256 "$remote_incoming")"
+  if [ "$remote_hash" != "$local_hash" ]; then
+    log "hash-mismatch name=$name local=$local_hash remote=${remote_hash:-missing}"
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "rm -rf -- $(shell_quote "$incoming_dir")" >/dev/null 2>&1 || true
+    continue
+  fi
+
+  publish_cmd=$(
+    printf 'set -euo pipefail; chmod 600 -- %s; mv -f -- %s %s; printf "%%s  %%s\\n" %s %s > %s; chmod 600 -- %s; rmdir -- %s 2>/dev/null || true' \
+      "$(shell_quote "$remote_incoming")" \
+      "$(shell_quote "$remote_incoming")" \
+      "$(shell_quote "$remote_final")" \
+      "$(shell_quote "$local_hash")" \
+      "$(shell_quote "$name")" \
+      "$(shell_quote "$remote_hash_file")" \
+      "$(shell_quote "$remote_hash_file")" \
+      "$(shell_quote "$incoming_dir")"
+  )
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "$publish_cmd"; then
+    log "publish-failed name=$name"
+    continue
+  fi
+
+  remote_final_hash="$(remote_sha256 "$remote_final")"
+  if [ "$remote_final_hash" != "$local_hash" ]; then
+    log "final-hash-mismatch name=$name local=$local_hash remote=${remote_final_hash:-missing}"
+    continue
+  fi
+
+  rm -f -- "$file"
+  sent_count=$((sent_count + 1))
+  log "pushed name=$name bytes=$local_bytes sha256=$local_hash dest=$HOST:$remote_final"
+done < <(find "$SRC" -maxdepth 1 -type f -print0)
+
+if [ "$sent_count" -gt 0 ]; then
+  log "autopush-complete count=$sent_count"
+fi
