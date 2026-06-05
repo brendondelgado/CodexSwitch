@@ -110,6 +110,21 @@ private final class DesktopPatchStatusCache: @unchecked Sendable {
 }
 
 enum DesktopPatchManager {
+    struct InstallationFingerprint: Sendable, Equatable {
+        struct FileFingerprint: Sendable, Equatable {
+            let path: String
+            let exists: Bool
+            let fileType: String?
+            let size: UInt64?
+            let inode: UInt64?
+            let modifiedAt: TimeInterval?
+        }
+
+        let shortVersion: String?
+        let bundleVersion: String?
+        let files: [FileFingerprint]
+    }
+
     struct InstalledMarkers: Sendable, Equatable {
         let auth: Bool
         let fast: Bool
@@ -196,6 +211,74 @@ enum DesktopPatchManager {
         let status = computeCurrentStatus()
         statusCache.set(status)
         return status
+    }
+
+    nonisolated static func installationFingerprint(
+        codexAppPath: String = codexAppPath,
+        asarPath: String = asarPath,
+        bundledCLIPath: String = bundledCLIPath
+    ) -> InstallationFingerprint? {
+        guard FileManager.default.fileExists(atPath: codexAppPath) else {
+            return nil
+        }
+
+        let infoPlistPath = URL(fileURLWithPath: codexAppPath)
+            .appendingPathComponent("Contents")
+            .appendingPathComponent("Info.plist")
+            .path
+        let versions = infoPlistVersionValues(at: infoPlistPath)
+        let trackedPaths = [
+            codexAppPath,
+            infoPlistPath,
+            asarPath,
+            bundledCLIPath,
+        ]
+
+        return InstallationFingerprint(
+            shortVersion: versions.shortVersion,
+            bundleVersion: versions.bundleVersion,
+            files: trackedPaths.map { fileFingerprint(at: $0) }
+        )
+    }
+
+    private nonisolated static func infoPlistVersionValues(at path: String) -> (shortVersion: String?, bundleVersion: String?) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            return (nil, nil)
+        }
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        guard let plist = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: &format
+        ) as? [String: Any] else {
+            return (nil, nil)
+        }
+        return (
+            plist["CFBundleShortVersionString"] as? String,
+            plist["CFBundleVersion"] as? String
+        )
+    }
+
+    private nonisolated static func fileFingerprint(at path: String) -> InstallationFingerprint.FileFingerprint {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+            return InstallationFingerprint.FileFingerprint(
+                path: path,
+                exists: false,
+                fileType: nil,
+                size: nil,
+                inode: nil,
+                modifiedAt: nil
+            )
+        }
+
+        return InstallationFingerprint.FileFingerprint(
+            path: path,
+            exists: true,
+            fileType: (attributes[.type] as? FileAttributeType)?.rawValue,
+            size: (attributes[.size] as? NSNumber)?.uint64Value,
+            inode: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+            modifiedAt: (attributes[.modificationDate] as? Date)?.timeIntervalSince1970
+        )
     }
 
     private nonisolated static func computeCurrentStatus() -> DesktopPatchStatus {

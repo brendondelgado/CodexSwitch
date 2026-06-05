@@ -91,6 +91,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastCLIRepairCheck: Date?
     private var lastComputerUsePermissionRepair: Date?
     private var lastDesktopPatchCheck: Date?
+    private var lastDesktopPatchInstallationFingerprint: DesktopPatchManager.InstallationFingerprint?
+    private var hasObservedDesktopPatchInstallationFingerprint = false
     private var lastCodexBrowserSessionRepairCheck: Date?
     private var lastLinuxDevboxAccountPersistAt: Date?
     private var lastLinuxDevboxAccountRefreshByKey: [String: Date] = [:]
@@ -281,17 +283,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func scheduleDesktopPatchCheckIfNeeded(force: Bool = false) {
+        let installationChanged = recordDesktopPatchInstallationFingerprintChange()
+        let effectiveForce = force || installationChanged
         let now = Date()
-        if !force, let lastDesktopPatchCheck, now.timeIntervalSince(lastDesktopPatchCheck) < 15 * 60 {
+        if !effectiveForce, let lastDesktopPatchCheck, now.timeIntervalSince(lastDesktopPatchCheck) < 15 * 60 {
             return
         }
         lastDesktopPatchCheck = now
-        Task.detached {
-            DesktopPatchManager.checkAndPatchIfPossible(
-                ignoreCooldown: force,
-                ignorePermissionDeniedBackoff: force
-            )
+        if installationChanged {
+            SwapLog.append(.debug("DESKTOP_PATCH_INSTALLATION_CHANGED"))
         }
+        Task.detached {
+            let outcome = DesktopPatchManager.checkAndPatchIfPossible(
+                ignoreCooldown: effectiveForce,
+                ignorePermissionDeniedBackoff: effectiveForce
+            )
+            if installationChanged {
+                SwapLog.append(.debug("DESKTOP_PATCH_INSTALLATION_CHANGE_CHECK outcome=\(outcome.logValue)"))
+            }
+        }
+    }
+
+    private func recordDesktopPatchInstallationFingerprintChange() -> Bool {
+        let currentFingerprint = DesktopPatchManager.installationFingerprint()
+        defer {
+            lastDesktopPatchInstallationFingerprint = currentFingerprint
+            hasObservedDesktopPatchInstallationFingerprint = true
+        }
+
+        guard hasObservedDesktopPatchInstallationFingerprint else {
+            return false
+        }
+        guard currentFingerprint != nil else {
+            return false
+        }
+        return lastDesktopPatchInstallationFingerprint != currentFingerprint
     }
 
     private func scheduleDesktopPatchRetryBurst(reason: String) {

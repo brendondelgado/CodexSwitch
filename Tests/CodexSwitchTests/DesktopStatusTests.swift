@@ -297,6 +297,53 @@ struct DesktopStatusTests {
         #expect(DesktopPatchManager.stockVendorCLIRepairAllowed() == false)
     }
 
+    @Test("Installed app fingerprint changes when Codex app payload changes")
+    func installationFingerprintTracksInstalledPayloadChanges() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let app = directory.appendingPathComponent("Codex.app", isDirectory: true)
+        let contents = app.appendingPathComponent("Contents", isDirectory: true)
+        let resources = contents.appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+
+        let infoPlist = contents.appendingPathComponent("Info.plist")
+        let asar = resources.appendingPathComponent("app.asar")
+        let codex = resources.appendingPathComponent("codex")
+        try writeCodexInfoPlist(shortVersion: "26.1", bundleVersion: "100", to: infoPlist)
+        try Data("asar-v1".utf8).write(to: asar)
+        try Data("codex-v1".utf8).write(to: codex)
+
+        let first = try #require(
+            DesktopPatchManager.installationFingerprint(
+                codexAppPath: app.path,
+                asarPath: asar.path,
+                bundledCLIPath: codex.path
+            )
+        )
+
+        try Data("asar-v2-expanded".utf8).write(to: asar)
+        let second = try #require(
+            DesktopPatchManager.installationFingerprint(
+                codexAppPath: app.path,
+                asarPath: asar.path,
+                bundledCLIPath: codex.path
+            )
+        )
+        #expect(first != second)
+
+        try writeCodexInfoPlist(shortVersion: "26.1", bundleVersion: "101", to: infoPlist)
+        let third = try #require(
+            DesktopPatchManager.installationFingerprint(
+                codexAppPath: app.path,
+                asarPath: asar.path,
+                bundledCLIPath: codex.path
+            )
+        )
+        #expect(second != third)
+    }
+
     @Test("Post-quit desktop patch retry keeps trying through transient blockers")
     func postQuitPatchRetryKeepsTryingThroughTransientBlockers() {
         #expect(DesktopPatchManager.postQuitPatchRetryDelaysSeconds == [1, 3, 8, 20, 45])
@@ -344,4 +391,17 @@ struct DesktopStatusTests {
         )
     }
 
+    private func writeCodexInfoPlist(shortVersion: String, bundleVersion: String, to url: URL) throws {
+        let plist: [String: String] = [
+            "CFBundleIdentifier": "com.openai.codex",
+            "CFBundleShortVersionString": shortVersion,
+            "CFBundleVersion": bundleVersion,
+        ]
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: plist,
+            format: .xml,
+            options: 0
+        )
+        try data.write(to: url)
+    }
 }

@@ -16,4 +16,19 @@ struct AppDelegateNotificationTests {
         #expect(source.contains("queue: .main"))
         #expect(source.contains("scheduleDesktopPatchCheckIfNeeded(force: true)"))
     }
+
+    @Test("Desktop patch monitor forces patch checks when installed Codex app changes")
+    func desktopPatchMonitorForcesPatchChecksWhenInstalledCodexAppChanges() throws {
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/App/AppDelegate.swift",
+            encoding: .utf8
+        )
+
+        #expect(source.contains("lastDesktopPatchInstallationFingerprint"))
+        #expect(source.contains("recordDesktopPatchInstallationFingerprintChange()"))
+        #expect(source.contains("DesktopPatchManager.installationFingerprint()"))
+        #expect(source.contains("let effectiveForce = force || installationChanged"))
+        #expect(source.contains("ignoreCooldown: effectiveForce"))
+        #expect(source.contains("ignorePermissionDeniedBackoff: effectiveForce"))
+    }
 }
