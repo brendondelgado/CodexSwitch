@@ -9,8 +9,10 @@ REMOTE_REPO="${CLAUDE_VPS_REMOTE_REPO:-/home/signul/SIGNUL}"
 REMOTE_CLAUDE="${CLAUDE_VPS_REMOTE_CLAUDE:-/home/signul/.local/bin/claude}"
 REMOTE_TERM="${CLAUDE_VPS_REMOTE_TERM:-xterm-256color}"
 REMOTE_COLORTERM="${CLAUDE_VPS_REMOTE_COLORTERM:-truecolor}"
+REMOTE_FORCE_COLOR="${CLAUDE_VPS_FORCE_COLOR:-1}"
 REMOTE_TMUX_SESSION="${CLAUDE_VPS_TMUX_SESSION:-claude-vps}"
 REMOTE_TMUX_HISTORY_LIMIT="${CLAUDE_VPS_TMUX_HISTORY_LIMIT:-200000}"
+REMOTE_TMUX_TERM="${CLAUDE_VPS_TMUX_TERM:-tmux-256color}"
 
 SSH_OPTS=(
   -o BatchMode=yes
@@ -62,15 +64,19 @@ remote_env_prefix() {
   size="$(terminal_size)"
   rows="${size%% *}"
   cols="${size##* }"
-  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s TERM=%s COLORTERM=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s CLAUDE_VPS_TMUX_SESSION=%s CLAUDE_VPS_TMUX_HISTORY_LIMIT=%s' \
+  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s TERM=%s COLORTERM=%s REMOTE_COLORTERM=%s FORCE_COLOR=%s REMOTE_FORCE_COLOR=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s CLAUDE_VPS_TMUX_SESSION=%s CLAUDE_VPS_TMUX_HISTORY_LIMIT=%s CLAUDE_VPS_TMUX_TERM=%s' \
     "$(quote_zsh "$REMOTE_REPO")" \
     "$(quote_zsh "$REMOTE_CLAUDE")" \
     "$(quote_zsh "$REMOTE_TERM")" \
     "$(quote_zsh "$REMOTE_COLORTERM")" \
+    "$(quote_zsh "$REMOTE_COLORTERM")" \
+    "$(quote_zsh "$REMOTE_FORCE_COLOR")" \
+    "$(quote_zsh "$REMOTE_FORCE_COLOR")" \
     "$(quote_zsh "$rows")" \
     "$(quote_zsh "$cols")" \
     "$(quote_zsh "$REMOTE_TMUX_SESSION")" \
-    "$(quote_zsh "$REMOTE_TMUX_HISTORY_LIMIT")"
+    "$(quote_zsh "$REMOTE_TMUX_HISTORY_LIMIT")" \
+    "$(quote_zsh "$REMOTE_TMUX_TERM")"
 }
 
 select_ssh_transport() {
@@ -107,9 +113,9 @@ for arg in "$@"; do
 done
 
 if [ "$#" -eq 0 ] && [ "${CLAUDE_VPS_DISABLE_TMUX:-0}" != "1" ]; then
-  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; if command -v tmux >/dev/null 2>&1; then if ! tmux has-session -t \"\$CLAUDE_VPS_TMUX_SESSION\" 2>/dev/null; then tmux new-session -d -s \"\$CLAUDE_VPS_TMUX_SESSION\" -c \"\$REMOTE_REPO\"; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" history-limit \"\$CLAUDE_VPS_TMUX_HISTORY_LIMIT\" >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" mouse on >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" status off >/dev/null; tmux set-window-option -t \"\${CLAUDE_VPS_TMUX_SESSION}:0\" alternate-screen off >/dev/null; tmux send-keys -t \"\${CLAUDE_VPS_TMUX_SESSION}:0.0\" \"exec \\\"\$REMOTE_CLAUDE\\\"\" C-m; else tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" history-limit \"\$CLAUDE_VPS_TMUX_HISTORY_LIMIT\" >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" mouse on >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" status off >/dev/null; tmux set-window-option -t \"\${CLAUDE_VPS_TMUX_SESSION}:0\" alternate-screen off >/dev/null; fi; tmux attach-session -t \"\$CLAUDE_VPS_TMUX_SESSION\" || exec \"\$REMOTE_CLAUDE\"; exit 0; fi; exec \"\$REMOTE_CLAUDE\"' claude-vps"
+  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; if command -v tmux >/dev/null 2>&1; then tmux set-option -gq default-terminal \"\$CLAUDE_VPS_TMUX_TERM\" >/dev/null 2>&1 || true; tmux show-options -gqv terminal-features | grep -q \"tmux-256color:RGB\" || tmux set-option -gaq terminal-features \",tmux-256color:RGB\" >/dev/null 2>&1 || true; tmux show-options -gqv terminal-features | grep -q \"xterm-256color:RGB\" || tmux set-option -gaq terminal-features \",xterm-256color:RGB\" >/dev/null 2>&1 || true; tmux show-options -gqv terminal-overrides | grep -q \"tmux-256color:RGB\" || tmux set-option -gaq terminal-overrides \",tmux-256color:RGB\" >/dev/null 2>&1 || true; tmux show-options -gqv terminal-overrides | grep -q \"xterm-256color:RGB\" || tmux set-option -gaq terminal-overrides \",xterm-256color:RGB\" >/dev/null 2>&1 || true; if ! tmux has-session -t \"\$CLAUDE_VPS_TMUX_SESSION\" 2>/dev/null; then tmux new-session -d -s \"\$CLAUDE_VPS_TMUX_SESSION\" -c \"\$REMOTE_REPO\" \"unset NO_COLOR; exec env TERM=\\\"\$CLAUDE_VPS_TMUX_TERM\\\" COLORTERM=\\\"\$REMOTE_COLORTERM\\\" FORCE_COLOR=\\\"\$REMOTE_FORCE_COLOR\\\" \\\"\$REMOTE_CLAUDE\\\"\"; fi; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" history-limit \"\$CLAUDE_VPS_TMUX_HISTORY_LIMIT\" >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" mouse on >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" status off >/dev/null; tmux set-window-option -t \"\${CLAUDE_VPS_TMUX_SESSION}:0\" alternate-screen off >/dev/null; tmux set-environment -t \"\$CLAUDE_VPS_TMUX_SESSION\" TERM \"\$CLAUDE_VPS_TMUX_TERM\" >/dev/null; tmux set-environment -t \"\$CLAUDE_VPS_TMUX_SESSION\" COLORTERM \"\$REMOTE_COLORTERM\" >/dev/null; tmux set-environment -t \"\$CLAUDE_VPS_TMUX_SESSION\" FORCE_COLOR \"\$REMOTE_FORCE_COLOR\" >/dev/null; tmux attach-session -t \"\$CLAUDE_VPS_TMUX_SESSION\" || { unset NO_COLOR; exec env TERM=\"\$TERM\" COLORTERM=\"\$REMOTE_COLORTERM\" FORCE_COLOR=\"\$REMOTE_FORCE_COLOR\" \"\$REMOTE_CLAUDE\"; }; exit 0; fi; unset NO_COLOR; exec env TERM=\"\$TERM\" COLORTERM=\"\$REMOTE_COLORTERM\" FORCE_COLOR=\"\$REMOTE_FORCE_COLOR\" \"\$REMOTE_CLAUDE\"' claude-vps"
 else
-  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; exec \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
+  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; unset NO_COLOR; exec env TERM=\"\$TERM\" COLORTERM=\"\$REMOTE_COLORTERM\" FORCE_COLOR=\"\$REMOTE_FORCE_COLOR\" \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
   remote_command="${remote_command} ${remote_args[*]}"
 fi
 
