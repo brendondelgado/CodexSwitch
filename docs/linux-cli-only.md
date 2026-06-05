@@ -24,7 +24,7 @@ cross_dependencies:
   - docs/runbooks/codexswitch-hot-swap-verification.md
 version_control:
   branch: main
-  commit: 8ae2106
+  commit: pending
 ---
 
 # Linux CLI-Only CodexSwitch
@@ -96,7 +96,7 @@ Like `codex-vps`, `claude-vps` must pass `ControlMaster=no`, `ControlPath=none`,
 
 `claude-vps` must also normalize the remote terminal contract before launching Claude Code. It should set `TERM=xterm-256color`, preserve truecolor via `COLORTERM=truecolor`, and apply the local terminal size to the remote PTY with `stty rows <rows> cols <cols>` when available. Claude Code is a full-screen terminal app; if it inherits a zero-sized PTY or a terminal type the remote runtime handles poorly, redraws can repeat, wrap off-screen, and lose the anchored bottom statusline.
 
-For no-argument interactive launches, `claude-vps` should attach to a managed remote `tmux` session named `claude-vps` under `/home/signul/SIGNUL`. The session must keep a large scrollback history, enable mouse scrolling, hide tmux's own status bar, and disable the alternate screen so Claude redraws do not fight Ghostty/native terminal scrollback. Set `CLAUDE_VPS_DISABLE_TMUX=1` only for deliberate bare-terminal debugging.
+For no-argument interactive launches, `claude-vps` should attach to a managed remote `tmux` session named `claude-vps` under `/home/signul/SIGNUL`. The session must keep a large scrollback history, enable mouse scrolling, hide tmux's own status bar, and disable the alternate screen so Claude redraws do not fight Ghostty/native terminal scrollback. When the managed session does not already exist, the helper should launch Claude with `--continue` so it resumes the most recent conversation in `/home/signul/SIGNUL`; set `CLAUDE_VPS_AUTO_CONTINUE=0` to start a fresh no-argument Claude session intentionally. Set `CLAUDE_VPS_DISABLE_TMUX=1` only for deliberate bare-terminal debugging.
 
 ## signul ssh Terminal Stability
 
