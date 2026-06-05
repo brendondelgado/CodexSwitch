@@ -8,17 +8,27 @@ private let logger = Logger(subsystem: "com.codexswitch", category: "AccountStor
 /// Migrates from legacy Keychain on first load.
 struct KeychainStore: Sendable {
     let service: String
+    private let storePath: String
+    private let storeDir: String
     private static let allAccountsKey = "all-accounts"
-    private static let storePath: String = {
+    private static let defaultStorePath: String = {
         let dir = NSString("~/.codexswitch").expandingTildeInPath
         return (dir as NSString).appendingPathComponent("accounts.json")
     }()
-    private static let storeDir: String = {
+    private static let defaultStoreDir: String = {
         NSString("~/.codexswitch").expandingTildeInPath
     }()
 
-    init(service: String = "com.codexswitch.accounts") {
+    init(service: String = "com.codexswitch.accounts", storePath: String? = nil) {
         self.service = service
+        if let storePath {
+            let expanded = NSString(string: storePath).expandingTildeInPath
+            self.storePath = expanded
+            self.storeDir = (expanded as NSString).deletingLastPathComponent
+        } else {
+            self.storePath = Self.defaultStorePath
+            self.storeDir = Self.defaultStoreDir
+        }
     }
 
     func save(_ account: CodexAccount) throws {
@@ -35,8 +45,10 @@ struct KeychainStore: Sendable {
     func loadAll() throws -> [CodexAccount] {
         // Try file store first (no fileExists check — avoids TOCTOU race)
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: Self.storePath))
-            return try JSONDecoder().decode([CodexAccount].self, from: data)
+            let data = try Data(contentsOf: URL(fileURLWithPath: storePath))
+            return Self.removingPlaceholderQuotaSnapshots(
+                try Self.accountDecoder.decode([CodexAccount].self, from: data)
+            )
         } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
             // File doesn't exist — fall through to Keychain migration
         }
@@ -65,7 +77,9 @@ struct KeychainStore: Sendable {
             return []
         }
 
-        let accounts = try JSONDecoder().decode([CodexAccount].self, from: data)
+        let accounts = Self.removingPlaceholderQuotaSnapshots(
+            try Self.accountDecoder.decode([CodexAccount].self, from: data)
+        )
         logger.info("Migrating \(accounts.count) accounts from Keychain to file store")
 
         // Save to file, then clean up Keychain
@@ -86,8 +100,8 @@ struct KeychainStore: Sendable {
     }
 
     func deleteAll() throws {
-        if FileManager.default.fileExists(atPath: Self.storePath) {
-            try FileManager.default.removeItem(atPath: Self.storePath)
+        if FileManager.default.fileExists(atPath: storePath) {
+            try FileManager.default.removeItem(atPath: storePath)
         }
         // Also clean up legacy Keychain if present
         let legacyQuery: [String: Any] = [
@@ -98,13 +112,13 @@ struct KeychainStore: Sendable {
         SecItemDelete(legacyQuery as CFDictionary)
     }
 
-    // MARK: - Private
+    func saveAll(_ accounts: [CodexAccount]) throws {
+        let accounts = Self.removingPlaceholderQuotaSnapshots(accounts)
 
-    private func saveAll(_ accounts: [CodexAccount]) throws {
         // Ensure directory exists
-        if !FileManager.default.fileExists(atPath: Self.storeDir) {
+        if !FileManager.default.fileExists(atPath: storeDir) {
             try FileManager.default.createDirectory(
-                atPath: Self.storeDir,
+                atPath: storeDir,
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
@@ -115,11 +129,54 @@ struct KeychainStore: Sendable {
         let data = try encoder.encode(accounts)
 
         // .atomic already writes to tmp + renames internally
-        try data.write(to: URL(fileURLWithPath: Self.storePath), options: .atomic)
+        try data.write(to: URL(fileURLWithPath: storePath), options: .atomic)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
-            ofItemAtPath: Self.storePath
+            ofItemAtPath: storePath
         )
+    }
+
+    private static let accountDecoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            if let timestamp = try? container.decode(Double.self) {
+                return Date(timeIntervalSinceReferenceDate: timestamp)
+            }
+            let string = try container.decode(String.self)
+            if let date = Self.decodeISO8601Date(string) {
+                return date
+            }
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Expected Apple reference timestamp or ISO-8601 date string"
+            )
+        }
+        return decoder
+    }()
+
+    private static func decodeISO8601Date(_ string: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: string) {
+            return date
+        }
+
+        let internet = ISO8601DateFormatter()
+        internet.formatOptions = [.withInternetDateTime]
+        return internet.date(from: string)
+    }
+
+    private static func removingPlaceholderQuotaSnapshots(_ accounts: [CodexAccount]) -> [CodexAccount] {
+        accounts.map { account in
+            guard account.quotaSnapshot?.hasBackendUsagePlaceholder == true else {
+                return account
+            }
+            var cleaned = account
+            cleaned.quotaSnapshot = nil
+            cleaned.lastRefreshed = nil
+            return cleaned
+        }
     }
 }
 

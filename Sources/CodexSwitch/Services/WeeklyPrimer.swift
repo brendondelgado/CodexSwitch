@@ -15,61 +15,196 @@ private let logger = Logger(subsystem: "com.codexswitch", category: "WeeklyPrime
 /// - **Weekly**: prime when weekly remaining >= 99.5% (fresh/reset)
 /// - **5-hour**: prime when 5h remaining >= 99.5% (fresh/reset)
 actor WeeklyPrimer {
+    static let defaultPrimerModel = "gpt-5.5"
+
     private static let codexResponsesURL = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
 
     private static let weeklyPersistKey = "primedAccountIds"
+    private static let weeklyResetPersistKey = "weeklyPrimedResetAtByAccountId"
+    private static let fiveHourPersistKey = "fiveHourPrimedAtByAccountId"
+    private static let fiveHourAttemptPersistKey = "fiveHourPrimeAttemptedAtByAccountId"
 
     /// Accounts that have been primed since their last weekly reset.
     /// Persisted to UserDefaults — weekly windows last 7 days.
     private var weeklyPrimedAccounts: Set<UUID>
+    private var weeklyPrimedResetAt: [UUID: Date] = [:]
 
     /// Tracks 5h priming by remembering WHEN we primed. An account can only
-    /// be re-primed after 4+ hours (the timer needs to actually expire first).
-    /// NOT persisted — 5h windows are short-lived, so in-memory is fine.
+    /// be re-primed after 4+ hours, and the timestamps are persisted so app
+    /// restarts do not re-prime the same accounts immediately.
     private var fiveHourPrimedAt: [UUID: Date] = [:]
+    private var fiveHourPrimeAttemptedAt: [UUID: Date] = [:]
+    private var weeklyPrimingInFlight: Set<UUID> = []
+    private var fiveHourPrimingInFlight: Set<UUID> = []
 
     private var lastErrorBody: String?
 
     private let session: URLSession
+    private let userDefaults: UserDefaults
+    private let requestSender: (@Sendable (CodexAccount) async throws -> Void)?
+    private let quotaSnapshotFetcher: (@Sendable (CodexAccount) async throws -> QuotaSnapshot)?
+    private let confirmationDelay: TimeInterval
 
-    init(session: URLSession = .shared) {
+    struct PrimeResult: Equatable, Sendable {
+        let accountId: UUID
+        let weeklyPrimed: Bool
+        let fiveHourPrimed: Bool
+        let fiveHourUnconfirmed: Bool
+    }
+
+    init(
+        session: URLSession = .shared,
+        userDefaults: UserDefaults = .standard,
+        requestSender: (@Sendable (CodexAccount) async throws -> Void)? = nil,
+        quotaSnapshotFetcher: (@Sendable (CodexAccount) async throws -> QuotaSnapshot)? = nil,
+        confirmationDelay: TimeInterval = 2
+    ) {
         self.session = session
-        if let saved = UserDefaults.standard.stringArray(forKey: Self.weeklyPersistKey) {
+        self.userDefaults = userDefaults
+        self.requestSender = requestSender
+        self.quotaSnapshotFetcher = quotaSnapshotFetcher
+        self.confirmationDelay = confirmationDelay
+        if let saved = userDefaults.stringArray(forKey: Self.weeklyPersistKey) {
             self.weeklyPrimedAccounts = Set(saved.compactMap { UUID(uuidString: $0) })
         } else {
             self.weeklyPrimedAccounts = []
         }
-        // Clean up old persisted 5h state (no longer used)
-        UserDefaults.standard.removeObject(forKey: "fiveHourPrimedAccountIds")
+        if let saved = userDefaults.dictionary(forKey: Self.weeklyResetPersistKey) as? [String: TimeInterval] {
+            self.weeklyPrimedResetAt = saved.reduce(into: [:]) { result, item in
+                if let id = UUID(uuidString: item.key) {
+                    result[id] = Date(timeIntervalSince1970: item.value)
+                }
+            }
+        }
+        if let saved = userDefaults.dictionary(forKey: Self.fiveHourPersistKey) as? [String: TimeInterval] {
+            self.fiveHourPrimedAt = saved.reduce(into: [:]) { result, item in
+                if let id = UUID(uuidString: item.key) {
+                    result[id] = Date(timeIntervalSince1970: item.value)
+                }
+            }
+        }
+        if let saved = userDefaults.dictionary(forKey: Self.fiveHourAttemptPersistKey) as? [String: TimeInterval] {
+            self.fiveHourPrimeAttemptedAt = saved.reduce(into: [:]) { result, item in
+                if let id = UUID(uuidString: item.key) {
+                    result[id] = Date(timeIntervalSince1970: item.value)
+                }
+            }
+        }
+        // Clean up old persisted 5h string-array state.
+        userDefaults.removeObject(forKey: "fiveHourPrimedAccountIds")
     }
 
-    private func markWeeklyPrimed(_ id: UUID) {
+    private func markWeeklyPrimed(_ id: UUID, resetAt: Date) {
         weeklyPrimedAccounts.insert(id)
-        UserDefaults.standard.set(
+        weeklyPrimedResetAt[id] = resetAt
+        userDefaults.set(
             weeklyPrimedAccounts.map(\.uuidString),
             forKey: Self.weeklyPersistKey
         )
+        persistWeeklyPrimedResetAt()
     }
 
     private func unmarkWeeklyPrimed(_ id: UUID) {
         weeklyPrimedAccounts.remove(id)
-        UserDefaults.standard.set(
+        weeklyPrimedResetAt.removeValue(forKey: id)
+        userDefaults.set(
             weeklyPrimedAccounts.map(\.uuidString),
             forKey: Self.weeklyPersistKey
         )
+        persistWeeklyPrimedResetAt()
+    }
+
+    private func persistWeeklyPrimedResetAt() {
+        let encoded = weeklyPrimedResetAt.reduce(into: [String: TimeInterval]()) { result, item in
+            result[item.key.uuidString] = item.value.timeIntervalSince1970
+        }
+        userDefaults.set(encoded, forKey: Self.weeklyResetPersistKey)
+    }
+
+    private func isWeeklyPrimed(_ id: UUID, snapshot: QuotaSnapshot) -> Bool {
+        guard let primedResetAt = weeklyPrimedResetAt[id] else {
+            return false
+        }
+
+        let windowSeconds = TimeInterval(snapshot.weekly.windowDurationMins * 60)
+        let resetTolerance = max(15 * 60, windowSeconds * 0.10)
+        let sameResetWindow = abs(primedResetAt.timeIntervalSince(snapshot.weekly.resetsAt)) < resetTolerance
+        if !sameResetWindow {
+            SwapLog.append(.debug(
+                "WEEKLY_PRIME_RESET_CHANGED account=\(id.uuidString) old=\(Int(primedResetAt.timeIntervalSince1970)) new=\(Int(snapshot.weekly.resetsAt.timeIntervalSince1970))"
+            ))
+        }
+        return sameResetWindow
     }
 
     private static let fiveHourCooldown: TimeInterval = 4 * 3600 // 4 hours
+    private static let ineffectiveFiveHourRetryCooldown: TimeInterval = 10 * 60
+    private static let unstartedFiveHourWindowRatio = 0.995
 
-    private func isFiveHourPrimed(_ id: UUID) -> Bool {
+    private func isFiveHourPrimed(_ id: UUID, snapshot: QuotaSnapshot) -> Bool {
         guard let primedAt = fiveHourPrimedAt[id] else { return false }
-        // Only allow re-priming after the cooldown (the 5h window needs
-        // time to actually expire and reset before priming again)
-        return Date().timeIntervalSince(primedAt) < Self.fiveHourCooldown
+        let age = Date().timeIntervalSince(primedAt)
+        guard age < Self.fiveHourCooldown else { return false }
+        if age >= Self.ineffectiveFiveHourRetryCooldown,
+           fiveHourWindowStillLooksUnstarted(snapshot.fiveHour) {
+            let resetMinutes = max(0, Int(snapshot.fiveHour.timeUntilReset / 60))
+            logger.warning("5h prime marker still has full backend window after \(Int(age / 60))m; allowing retry")
+            SwapLog.append(.debug("PRIME_STALE_RETRY account=\(id.uuidString) reset_mins=\(resetMinutes) age_mins=\(Int(age / 60))"))
+            fiveHourPrimedAt.removeValue(forKey: id)
+            persistFiveHourPrimedAt()
+            return false
+        }
+        // Only allow re-priming after the cooldown unless the backend window
+        // still looks unstarted after the retry grace period.
+        return true
+    }
+
+    private func shouldThrottleFiveHourAttempt(_ id: UUID) -> Bool {
+        guard let attemptedAt = fiveHourPrimeAttemptedAt[id] else { return false }
+        return Date().timeIntervalSince(attemptedAt) < Self.ineffectiveFiveHourRetryCooldown
+    }
+
+    private func fiveHourWindowStillLooksUnstarted(_ window: QuotaWindow) -> Bool {
+        let windowSeconds = TimeInterval(window.windowDurationMins * 60)
+        guard windowSeconds > 0 else { return false }
+        return window.remainingPercent >= 99.5
+            && window.timeUntilReset >= windowSeconds * Self.unstartedFiveHourWindowRatio
+    }
+
+    func persistedFiveHourPrimedAt() -> [UUID: Date] {
+        fiveHourPrimedAt.filter { Date().timeIntervalSince($0.value) < Self.fiveHourCooldown }
+    }
+
+    func persistedFiveHourPrimeAttemptedAt() -> [UUID: Date] {
+        fiveHourPrimeAttemptedAt.filter {
+            Date().timeIntervalSince($0.value) < Self.ineffectiveFiveHourRetryCooldown
+        }
     }
 
     private func markFiveHourPrimed(_ id: UUID) {
         fiveHourPrimedAt[id] = Date()
+        fiveHourPrimeAttemptedAt.removeValue(forKey: id)
+        persistFiveHourPrimedAt()
+        persistFiveHourPrimeAttemptedAt()
+    }
+
+    private func persistFiveHourPrimedAt() {
+        let encoded = fiveHourPrimedAt.reduce(into: [String: TimeInterval]()) { result, item in
+            result[item.key.uuidString] = item.value.timeIntervalSince1970
+        }
+        userDefaults.set(encoded, forKey: Self.fiveHourPersistKey)
+    }
+
+    private func markFiveHourPrimeAttempted(_ id: UUID) {
+        fiveHourPrimeAttemptedAt[id] = Date()
+        persistFiveHourPrimeAttemptedAt()
+    }
+
+    private func persistFiveHourPrimeAttemptedAt() {
+        let encoded = fiveHourPrimeAttemptedAt.reduce(into: [String: TimeInterval]()) { result, item in
+            result[item.key.uuidString] = item.value.timeIntervalSince1970
+        }
+        userDefaults.set(encoded, forKey: Self.fiveHourAttemptPersistKey)
     }
 
     /// Check all accounts and prime any idle ones with full quota windows.
@@ -77,25 +212,57 @@ actor WeeklyPrimer {
     /// Safe to call frequently — skips already-primed and active accounts.
     func primeIfNeeded(
         accounts: [CodexAccount],
-        accountProvider: @escaping @Sendable (UUID) async -> CodexAccount?,
-        onPrimed: (@Sendable (UUID) -> Void)? = nil
-    ) async {
+        accountProvider: @escaping @Sendable (UUID) async -> CodexAccount?
+    ) async -> [PrimeResult] {
+        var primeResults: [PrimeResult] = []
+
         for account in accounts {
             guard !account.isActive else { continue }
             guard let snapshot = account.quotaSnapshot else { continue }
 
             let weeklyFull = snapshot.weekly.remainingPercent >= 99.5
             let fiveHourFull = snapshot.fiveHour.remainingPercent >= 99.5
+            let fiveHourAlreadyStarted = fiveHourFull
+                && !fiveHourWindowStillLooksUnstarted(snapshot.fiveHour)
+            var observedFiveHourPrimed = false
+
+            if fiveHourAlreadyStarted && !isFiveHourPrimed(account.id, snapshot: snapshot) {
+                markFiveHourPrimed(account.id)
+                observedFiveHourPrimed = true
+            }
 
             // Clear weekly primed state once usage drops below 99%
             if !weeklyFull { unmarkWeeklyPrimed(account.id) }
 
             // Determine if this account needs priming for either window
-            let needsWeeklyPrime = weeklyFull && !weeklyPrimedAccounts.contains(account.id)
+            let needsWeeklyPrime = weeklyFull
+                && !isWeeklyPrimed(account.id, snapshot: snapshot)
+                && !weeklyPrimingInFlight.contains(account.id)
             // 5h: only prime once per ~4 hour cooldown
-            let needsFiveHourPrime = fiveHourFull && !isFiveHourPrimed(account.id)
+            let needsFiveHourPrime = fiveHourFull
+                && !fiveHourAlreadyStarted
+                && !fiveHourPrimingInFlight.contains(account.id)
+                && !isFiveHourPrimed(account.id, snapshot: snapshot)
+                && !shouldThrottleFiveHourAttempt(account.id)
 
-            guard needsWeeklyPrime || needsFiveHourPrime else { continue }
+            guard needsWeeklyPrime || needsFiveHourPrime else {
+                if observedFiveHourPrimed {
+                    primeResults.append(PrimeResult(
+                        accountId: account.id,
+                        weeklyPrimed: false,
+                        fiveHourPrimed: true,
+                        fiveHourUnconfirmed: false
+                    ))
+                    SwapLog.append(.debug("PRIME_OBSERVED_STARTED email=\(account.email) windows=5h"))
+                }
+                continue
+            }
+            if needsWeeklyPrime { weeklyPrimingInFlight.insert(account.id) }
+            if needsFiveHourPrime { fiveHourPrimingInFlight.insert(account.id) }
+            defer {
+                weeklyPrimingInFlight.remove(account.id)
+                fiveHourPrimingInFlight.remove(account.id)
+            }
 
             // Get fresh account (tokens may have been refreshed since snapshot)
             guard let freshAccount = await accountProvider(account.id) else { continue }
@@ -106,11 +273,31 @@ actor WeeklyPrimer {
 
             do {
                 try await sendMinimalRequest(for: freshAccount)
-                if needsWeeklyPrime { markWeeklyPrimed(account.id) }
-                if needsFiveHourPrime { markFiveHourPrimed(account.id) }
-                onPrimed?(account.id)
-                SwapLog.append(.debug("PRIMED email=\(freshAccount.email) windows=\(windows)"))
-                logger.info("Successfully primed \(freshAccount.email, privacy: .private)")
+                var weeklyPrimed = false
+                var fiveHourPrimed = observedFiveHourPrimed
+                var fiveHourUnconfirmed = false
+                if needsWeeklyPrime { markWeeklyPrimed(account.id, resetAt: snapshot.weekly.resetsAt) }
+                weeklyPrimed = needsWeeklyPrime
+                if needsFiveHourPrime {
+                    markFiveHourPrimeAttempted(account.id)
+                    if await confirmFiveHourPrimeStarted(for: freshAccount, previousSnapshot: snapshot) {
+                        markFiveHourPrimed(account.id)
+                        fiveHourPrimed = true
+                    } else {
+                        fiveHourUnconfirmed = true
+                        SwapLog.append(.debug("PRIME_UNCONFIRMED email=\(freshAccount.email) windows=5h"))
+                    }
+                }
+                primeResults.append(PrimeResult(
+                    accountId: account.id,
+                    weeklyPrimed: weeklyPrimed,
+                    fiveHourPrimed: fiveHourPrimed,
+                    fiveHourUnconfirmed: fiveHourUnconfirmed
+                ))
+                SwapLog.append(.debug(
+                    "PRIME_REQUEST_ACCEPTED email=\(freshAccount.email) windows=\(windows) weekly_confirmed=\(weeklyPrimed) five_hour_confirmed=\(fiveHourPrimed)"
+                ))
+                logger.info("Primer request accepted for \(freshAccount.email, privacy: .private)")
             } catch PrimerError.tokenExpired {
                 logger.warning("Token expired during priming for \(freshAccount.email, privacy: .private) — will retry after refresh")
             } catch {
@@ -118,11 +305,46 @@ actor WeeklyPrimer {
                 SwapLog.append(.debug("PRIME_FAILED email=\(freshAccount.email) windows=\(windows) error=\(error.localizedDescription) detail=\(lastErrorBody ?? "none")"))
             }
         }
+
+        return primeResults
+    }
+
+    private func confirmFiveHourPrimeStarted(
+        for account: CodexAccount,
+        previousSnapshot: QuotaSnapshot
+    ) async -> Bool {
+        guard quotaSnapshotFetcher != nil || requestSender == nil else {
+            return true
+        }
+
+        if confirmationDelay > 0 {
+            try? await Task.sleep(for: .seconds(confirmationDelay))
+        }
+
+        do {
+            let snapshot: QuotaSnapshot
+            if let quotaSnapshotFetcher {
+                snapshot = try await quotaSnapshotFetcher(account)
+            } else {
+                snapshot = try await fetchQuotaSnapshot(for: account)
+            }
+            return !fiveHourWindowStillLooksUnstarted(snapshot.fiveHour)
+        } catch {
+            SwapLog.append(.debug("PRIME_CONFIRM_FAILED email=\(account.email) error=\(error.localizedDescription)"))
+            return !fiveHourWindowStillLooksUnstarted(previousSnapshot.fiveHour)
+        }
     }
 
     /// Send a single minimal Codex API request using the account's tokens.
     /// This registers as Codex usage, starting the weekly rolling window.
     private func sendMinimalRequest(for account: CodexAccount) async throws {
+        if let requestSender {
+            try await requestSender(account)
+            return
+        }
+
+        await NetworkBackoffGuard.shared.waitIfNeeded(operation: "primer:\(account.email)")
+
         var request = URLRequest(url: Self.codexResponsesURL)
         request.httpMethod = "POST"
         request.setValue("Bearer \(account.accessToken)", forHTTPHeaderField: "Authorization")
@@ -134,7 +356,7 @@ actor WeeklyPrimer {
 
         // Minimal Responses API body — just enough to get GPT to respond
         let body: [String: Any] = [
-            "model": "gpt-5.4",
+            "model": Self.defaultPrimerModel,
             "instructions": "",
             "input": [
                 ["role": "user", "content": [["type": "input_text", "text": "ok"]]]
@@ -149,7 +371,16 @@ actor WeeklyPrimer {
 
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+            await NetworkBackoffGuard.shared.recordSuccess(operation: "primer:\(account.email)")
+        } catch {
+            let message = error.localizedDescription
+            await NetworkBackoffGuard.shared.recordFailure(message, operation: "primer:\(account.email)")
+            throw error
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw PrimerError.invalidResponse
@@ -173,16 +404,43 @@ actor WeeklyPrimer {
         }
     }
 
+    private func fetchQuotaSnapshot(for account: CodexAccount) async throws -> QuotaSnapshot {
+        var request = URLRequest(url: URL(string: "https://chatgpt.com/backend-api/wham/usage")!)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(account.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(account.accountId, forHTTPHeaderField: "ChatGPT-Account-Id")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("codex-cli", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 15
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw PrimerError.invalidResponse
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw PrimerError.httpError(httpResponse.statusCode)
+        }
+        return try UsageResponseParser.parse(data).snapshot
+    }
+
     /// Clear priming state for an account (e.g., after resets and quota changes).
     func clearPrimedState(for accountId: UUID) {
         unmarkWeeklyPrimed(accountId)
         fiveHourPrimedAt.removeValue(forKey: accountId)
+        fiveHourPrimeAttemptedAt.removeValue(forKey: accountId)
+        persistFiveHourPrimedAt()
+        persistFiveHourPrimeAttemptedAt()
     }
 
     func clearAll() {
         weeklyPrimedAccounts.removeAll()
+        weeklyPrimedResetAt.removeAll()
         fiveHourPrimedAt.removeAll()
-        UserDefaults.standard.removeObject(forKey: Self.weeklyPersistKey)
+        fiveHourPrimeAttemptedAt.removeAll()
+        userDefaults.removeObject(forKey: Self.weeklyPersistKey)
+        userDefaults.removeObject(forKey: Self.weeklyResetPersistKey)
+        userDefaults.removeObject(forKey: Self.fiveHourPersistKey)
+        userDefaults.removeObject(forKey: Self.fiveHourAttemptPersistKey)
     }
 }
 

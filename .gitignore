@@ -4,5 +4,5 @@
 DerivedData/
 .DS_Store
 build/
-Sources/CodexNative/Resources/codex-web/*
-!Sources/CodexNative/Resources/codex-web/.gitkeep
+__pycache__/
+*.pyc

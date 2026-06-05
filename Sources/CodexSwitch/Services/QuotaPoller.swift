@@ -8,19 +8,55 @@ actor QuotaPoller {
     private var pollTasks: [UUID: Task<Void, Never>] = [:]
 
     private static let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+    private static let inactiveExhaustedPlanUpgradePollInterval: TimeInterval = 5
+    private static let inactivePlanUpgradePollInterval: TimeInterval = 15
 
     init(session: URLSession = .shared) {
         self.session = session
     }
 
     /// Calculate poll interval based on remaining percent, scaled by user's poll multiplier.
-    /// Active account polls every 5s for near-realtime UI (~500 byte response, negligible overhead).
+    /// Active account polls every 5s, then tightens to 2s/1s near exhaustion.
     static func pollInterval(forRemainingPercent remaining: Double, isActive: Bool = false) -> TimeInterval {
-        if isActive { return 5 }
+        if isActive {
+            if remaining <= 2 { return 1 }
+            if remaining <= 10 { return 2 }
+            return 5
+        }
         let base = QuotaUrgency(remainingPercent: remaining).pollInterval
         let raw = UserDefaults.standard.double(forKey: "pollMultiplier")
         let multiplier = raw > 0 ? max(0.5, min(2.0, raw)) : 1.0
         return base * multiplier
+    }
+
+    /// Inactive accounts normally sleep for minutes or until reset. Non-Pro accounts are
+    /// a special case because a user can buy/upgrade a plan while CodexSwitch is running;
+    /// poll them quickly enough that plan upgrades become visible without a restart.
+    static func inactivePollInterval(for account: CodexAccount, snapshot: QuotaSnapshot) -> TimeInterval {
+        let fhReset = snapshot.fiveHour.timeUntilReset
+        let wkReset = snapshot.weekly.timeUntilReset
+        var interval: TimeInterval
+
+        if snapshot.fiveHour.isExhausted && fhReset > 0 {
+            interval = fhReset + 2
+        } else if snapshot.fiveHour.remainingPercent > 50 {
+            interval = 600
+        } else {
+            interval = 300
+        }
+
+        let nearestReset = min(fhReset, wkReset)
+        if nearestReset > 0 && nearestReset + 2 < interval {
+            interval = nearestReset + 2
+        }
+
+        guard account.planPriority < 4 else {
+            return interval
+        }
+        if snapshot.fiveHour.isExhausted || snapshot.weekly.isExhausted {
+            return min(interval, inactiveExhaustedPlanUpgradePollInterval)
+        }
+        return min(interval, inactivePlanUpgradePollInterval)
     }
 
     struct FetchResult: Sendable {
@@ -30,6 +66,8 @@ actor QuotaPoller {
 
     /// Fetch quota snapshot for a single account
     func fetchQuota(for account: CodexAccount) async throws -> FetchResult {
+        await NetworkBackoffGuard.shared.waitIfNeeded(operation: "quota:\(account.email)")
+
         var request = URLRequest(url: Self.usageURL)
         request.httpMethod = "GET"
         request.setValue("Bearer \(account.accessToken)", forHTTPHeaderField: "Authorization")
@@ -40,31 +78,54 @@ actor QuotaPoller {
 
         logger.info("Fetching quota for accountId=\(account.accountId, privacy: .public) email=\(account.email, privacy: .private)")
 
-        let (data, response) = try await session.data(for: request)
+        let maxAttempts = 3
+        for attempt in 1...maxAttempts {
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await session.data(for: request)
+                await NetworkBackoffGuard.shared.recordSuccess(operation: "quota:\(account.email)")
+            } catch {
+                let message = error.localizedDescription
+                await NetworkBackoffGuard.shared.recordFailure(message, operation: "quota:\(account.email)")
+                throw PollerError.networkError(message)
+            }
 
-        guard let httpResponse = response as? HTTPURLResponse else {
-            logger.error("Invalid response (not HTTP) for \(account.email, privacy: .private)")
-            throw PollerError.invalidResponse
+            guard let httpResponse = response as? HTTPURLResponse else {
+                logger.error("Invalid response (not HTTP) for \(account.email, privacy: .private)")
+                throw PollerError.invalidResponse
+            }
+
+            logger.info("Quota API response: HTTP \(httpResponse.statusCode) for \(account.email, privacy: .private)")
+
+            switch httpResponse.statusCode {
+            case 200:
+                let result: UsageResponseParser.ParseResult
+                do {
+                    result = try UsageResponseParser.parse(data)
+                } catch UsageResponseParser.ParserError.placeholderRateLimitWindow {
+                    logger.warning("Quota API returned a placeholder usage window for \(account.email, privacy: .private) attempt=\(attempt, privacy: .public)")
+                    if attempt < maxAttempts {
+                        try? await Task.sleep(for: .seconds(1))
+                        continue
+                    }
+                    throw PollerError.usageUnavailable
+                }
+                logger.info("Quota parsed: 5h=\(String(format: "%.1f", result.snapshot.fiveHour.remainingPercent))% weekly=\(String(format: "%.1f", result.snapshot.weekly.remainingPercent))% plan=\(result.planType, privacy: .public)")
+                return FetchResult(snapshot: result.snapshot, planType: result.planType)
+            case 401:
+                logger.warning("Token expired (401) for \(account.email, privacy: .private)")
+                throw PollerError.tokenExpired
+            case 429:
+                logger.warning("Rate limited (429) for \(account.email, privacy: .private)")
+                throw PollerError.rateLimited
+            default:
+                let body = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+                logger.error("HTTP \(httpResponse.statusCode) for \(account.email, privacy: .private): \(body.prefix(500), privacy: .private)")
+                throw PollerError.httpError(httpResponse.statusCode)
+            }
         }
-
-        logger.info("Quota API response: HTTP \(httpResponse.statusCode) for \(account.email, privacy: .private)")
-
-        switch httpResponse.statusCode {
-        case 200:
-            let result = try UsageResponseParser.parse(data)
-            logger.info("Quota parsed: 5h=\(String(format: "%.1f", result.snapshot.fiveHour.remainingPercent))% weekly=\(String(format: "%.1f", result.snapshot.weekly.remainingPercent))% plan=\(result.planType, privacy: .public)")
-            return FetchResult(snapshot: result.snapshot, planType: result.planType)
-        case 401:
-            logger.warning("Token expired (401) for \(account.email, privacy: .private)")
-            throw PollerError.tokenExpired
-        case 429:
-            logger.warning("Rate limited (429) for \(account.email, privacy: .private)")
-            throw PollerError.rateLimited
-        default:
-            let body = String(data: data, encoding: .utf8) ?? "<non-utf8>"
-            logger.error("HTTP \(httpResponse.statusCode) for \(account.email, privacy: .private): \(body.prefix(500), privacy: .private)")
-            throw PollerError.httpError(httpResponse.statusCode)
-        }
+        throw PollerError.usageUnavailable
     }
 
     /// Start adaptive polling for an account, calling onUpdate with each new snapshot.
@@ -83,18 +144,21 @@ actor QuotaPoller {
         stopPolling(for: accountId)
 
         pollTasks[accountId] = Task {
-            // First poll: fetch immediately (small random delay to stagger multiple accounts)
+            // First poll: fetch immediately when we already have account state.
+            // Brand-new accounts use a small random delay to avoid burst traffic.
             let initialAccount = await accountProvider(accountId)
             let hasData = initialAccount?.quotaSnapshot != nil
             var interval: TimeInterval = hasData
-                ? Self.pollInterval(forRemainingPercent: initialAccount?.quotaSnapshot?.fiveHour.remainingPercent ?? 100)
+                ? 0
                 : TimeInterval.random(in: 5...15)
 
             logger.info("Starting poll for \(accountId) — initial interval: \(String(format: "%.0f", interval))s, hasData: \(hasData)")
 
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(interval))
-                guard !Task.isCancelled else { return }
+                if interval > 0 {
+                    try? await Task.sleep(for: .seconds(interval))
+                    guard !Task.isCancelled else { return }
+                }
 
                 guard let currentAccount = await accountProvider(accountId) else {
                     logger.error("Account \(accountId) not found in provider — stopping poll")
@@ -113,27 +177,7 @@ actor QuotaPoller {
                             isActive: true
                         )
                     } else {
-                        // Inactive account: sleep until next reset, then recheck
-                        let fhReset = result.snapshot.fiveHour.timeUntilReset
-                        let wkReset = result.snapshot.weekly.timeUntilReset
-
-                        if result.snapshot.fiveHour.isExhausted && fhReset > 0 {
-                            // Exhausted — wake up 2s after 5h reset
-                            interval = fhReset + 2
-                            logger.info("Inactive \(currentAccount.email, privacy: .private) exhausted — sleeping \(String(format: "%.0f", interval))s until 5h reset")
-                        } else if result.snapshot.fiveHour.remainingPercent > 50 {
-                            // Plenty of quota — check again in 10 minutes
-                            interval = 600
-                        } else {
-                            // Moderate quota — check every 5 minutes
-                            interval = 300
-                        }
-
-                        // But never sleep longer than the nearest reset window
-                        let nearestReset = min(fhReset, wkReset)
-                        if nearestReset > 0 && nearestReset + 2 < interval {
-                            interval = nearestReset + 2
-                        }
+                        interval = Self.inactivePollInterval(for: currentAccount, snapshot: result.snapshot)
                     }
 
                     logger.info("Poll success for \(currentAccount.email, privacy: .private) [active=\(currentAccount.isActive)] — next in \(String(format: "%.0f", interval))s")
@@ -166,6 +210,7 @@ enum PollerError: Error, Sendable {
     case invalidResponse
     case tokenExpired
     case rateLimited
+    case usageUnavailable
     case httpError(Int)
     case networkError(String)
 }

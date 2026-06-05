@@ -10,25 +10,10 @@ let package = Package(
             path: "Sources/CodexSwitch",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
-        .executableTarget(
-            name: "CodexNative",
-            path: "Sources/CodexNative",
-            resources: [
-                .copy("Resources/preload-shim.js"),
-                .copy("Resources/codex-web"),
-            ],
-            swiftSettings: [.swiftLanguageMode(.v6)]
-        ),
         .testTarget(
             name: "CodexSwitchTests",
             dependencies: ["CodexSwitch"],
             path: "Tests/CodexSwitchTests",
-            swiftSettings: [.swiftLanguageMode(.v6)]
-        ),
-        .testTarget(
-            name: "CodexNativeTests",
-            dependencies: ["CodexNative"],
-            path: "Tests/CodexNativeTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]

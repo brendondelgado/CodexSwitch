@@ -1,0 +1,77 @@
+#!/usr/bin/env zsh
+set -e
+
+REMOTE_HOST="${CLAUDE_VPS_REMOTE_HOST:-signul-vps}"
+TAILSCALE_HOST="${CLAUDE_VPS_TAILSCALE_HOST:-signul-hostinger-kvm4}"
+TAILSCALE_TARGET="${CLAUDE_VPS_TAILSCALE_TARGET:-signul@${TAILSCALE_HOST}}"
+TAILSCALE_BIN="${CLAUDE_VPS_TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+REMOTE_REPO="${CLAUDE_VPS_REMOTE_REPO:-/home/signul/SIGNUL}"
+REMOTE_CLAUDE="${CLAUDE_VPS_REMOTE_CLAUDE:-/home/signul/.local/bin/claude}"
+
+SSH_OPTS=(
+  -o BatchMode=yes
+  -o ConnectTimeout=8
+  -o ServerAliveInterval=5
+  -o ServerAliveCountMax=2
+  -o ControlMaster=no
+  -o ControlPath=none
+  -o ControlPersist=no
+)
+SSH_PROXY_OPTS=(
+  "${SSH_OPTS[@]}"
+  -o StrictHostKeyChecking=accept-new
+  -o "ProxyCommand=${TAILSCALE_BIN} nc %h %p"
+)
+
+log() {
+  echo "claude-vps: $*" >&2
+}
+
+quote_zsh() {
+  printf '%q' "$1"
+}
+
+remote_env_prefix() {
+  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s' "$(quote_zsh "$REMOTE_REPO")" "$(quote_zsh "$REMOTE_CLAUDE")"
+}
+
+select_ssh_transport() {
+  selected_host="$REMOTE_HOST"
+  selected_ssh_opts=("${SSH_OPTS[@]}")
+
+  if [ "${CLAUDE_VPS_DISABLE_TAILSCALE_PROXY:-0}" = "1" ]; then
+    return
+  fi
+  if [ "$REMOTE_HOST" != "signul-vps" ]; then
+    return
+  fi
+  if [ ! -x "$TAILSCALE_BIN" ]; then
+    return
+  fi
+
+  selected_host="$TAILSCALE_TARGET"
+  selected_ssh_opts=("${SSH_PROXY_OPTS[@]}")
+}
+
+selected_host="$REMOTE_HOST"
+selected_ssh_opts=("${SSH_OPTS[@]}")
+select_ssh_transport
+
+if [ "${1:-}" = "--check" ]; then
+  log "checking ${selected_host} Claude Code..."
+  ssh "${selected_ssh_opts[@]}" "$selected_host" "$(remote_env_prefix) bash -lc 'test -x \"\$REMOTE_CLAUDE\" && cd \"\$REMOTE_REPO\" && printf \"claude-vps ready: %s in %s\\n\" \"\$REMOTE_CLAUDE\" \"\$PWD\" && \"\$REMOTE_CLAUDE\" --version'"
+  exit 0
+fi
+
+remote_args=()
+for arg in "$@"; do
+  remote_args+=("$(quote_zsh "$arg")")
+done
+
+remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && exec \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
+if [ "${#remote_args[@]}" -gt 0 ]; then
+  remote_command="${remote_command} ${remote_args[*]}"
+fi
+
+log "connecting to Claude Code on ${selected_host}..."
+exec ssh -tt "${selected_ssh_opts[@]}" "$selected_host" "$remote_command"

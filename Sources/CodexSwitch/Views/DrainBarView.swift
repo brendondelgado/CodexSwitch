@@ -27,9 +27,15 @@ struct DrainBarView: View {
     }
 
     private var resetText: String {
+        Self.resetText(percent: percent, resetsAt: resetsAt)
+    }
+
+    static func resetText(percent: Double, resetsAt: Date?, now: Date = Date()) -> String {
         guard let resetsAt else { return "" }
-        let remaining = resetsAt.timeIntervalSinceNow
-        if remaining <= 0 { return "resetting..." }
+        let remaining = resetsAt.timeIntervalSince(now)
+        if remaining <= 0 {
+            return percent <= 1 ? "confirming reset" : ""
+        }
         let hours = Int(remaining) / 3600
         let mins = (Int(remaining) % 3600) / 60
         let countdown = hours > 0 ? "\(hours)h \(mins)m" : "\(mins)m"
@@ -58,7 +64,7 @@ struct DrainBarView: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .frame(width: 32, alignment: .trailing)
             }
-            if resetsAt != nil {
+            if !resetText.isEmpty {
                 Text(resetText)
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(boostedContrast ? .primary : .secondary)

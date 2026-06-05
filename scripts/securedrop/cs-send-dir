@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${CODEXSWITCH_SECUREDROP_HOST:-signul-vps-files}"
+REMOTE_ROOT="${CODEXSWITCH_SECUREDROP_REMOTE_ROOT:-/home/signul/codexswitch-secure-files}"
+LOCAL_ROOT="${CODEXSWITCH_SECUREDROP_LOCAL_ROOT:-$HOME/CodexSwitch SecureDrop}"
+COMPRESS=0
+LOCAL_TEST=0
+
+usage() { echo "usage: cs-send-dir [--compress] [--local-test] <local-dir> [optional-name]" >&2; exit 2; }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --compress) COMPRESS=1; shift ;;
+    --local-test) LOCAL_TEST=1; shift ;;
+    --help|-h) usage ;;
+    --*) echo "cs-send-dir: unknown option $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[[ $# -ge 1 && $# -le 2 ]] || usage
+src="${1%/}"
+[[ -d "$src" && ! -L "$src" ]] || { echo "cs-send-dir: source must be a real directory: $src" >&2; exit 1; }
+if find "$src" -type l -print -quit | grep -q .; then
+  echo "cs-send-dir: refusing directory containing symlinks: $src" >&2
+  exit 1
+fi
+name="${2:-$(basename "$src")}"; case "$name" in ""|.|..|*/*|*\\*) echo "cs-send-dir: invalid name: $name" >&2; exit 1;; esac
+ext="tar"; tar_flag="-cf"; [[ "$COMPRESS" == 1 ]] && { ext="tar.gz"; tar_flag="-czf"; }
+archive="$name.$ext"
+tmpdir="$(mktemp -d)"; trap 'rm -rf "$tmpdir"' EXIT
+archive_path="$tmpdir/$archive"
+tar $tar_flag "$archive_path" -C "$(dirname "$src")" "$(basename "$src")"
+if command -v shasum >/dev/null 2>&1; then sha=$(shasum -a 256 "$archive_path" | awk '{print $1}'); else sha=$(sha256sum "$archive_path" | awk '{print $1}'); fi
+printf '%s  %s\n' "$sha" "$archive" > "$archive_path.sha256"
+chmod 600 "$archive_path" "$archive_path.sha256"
+mkdir -p "$LOCAL_ROOT/manifests" "$LOCAL_ROOT/audit"
+cp "$archive_path.sha256" "$LOCAL_ROOT/manifests/$archive.sha256"
+chmod 600 "$LOCAL_ROOT/manifests/$archive.sha256"
+if [[ "$LOCAL_TEST" == 1 ]]; then
+  remote_root="${CS_SECUREDROP_TEST_REMOTE_ROOT:?CS_SECUREDROP_TEST_REMOTE_ROOT required in --local-test}"
+  mkdir -p "$remote_root/.incoming/dir-send" "$remote_root/inbox"
+  install -m 600 "$archive_path" "$remote_root/inbox/$archive"
+  install -m 600 "$archive_path.sha256" "$remote_root/inbox/$archive.sha256"
+  dest="$remote_root/inbox/$archive"
+else
+  uuid="$(uuidgen | tr 'A-Z' 'a-z')"
+  staging="$REMOTE_ROOT/.incoming/$uuid"
+  ssh "$HOST" "mkdir -p '$staging' '$REMOTE_ROOT/inbox'"
+  rsync -az --partial --timeout=30 -e ssh "$archive_path" "$archive_path.sha256" "$HOST:$staging/"
+  ssh "$HOST" "chmod 600 '$staging/$archive' '$staging/$archive.sha256' && mv -f '$staging/$archive' '$REMOTE_ROOT/inbox/$archive' && mv -f '$staging/$archive.sha256' '$REMOTE_ROOT/inbox/$archive.sha256' && rmdir '$staging' 2>/dev/null || true"
+  dest="$HOST:$REMOTE_ROOT/inbox/$archive"
+fi
+printf '{"timestamp":"%s","action":"dir_send","source":"%s","destination":"%s","sha256":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$src" "$dest" "$sha" >> "$LOCAL_ROOT/audit/transfers.jsonl"
+chmod 600 "$LOCAL_ROOT/audit/transfers.jsonl" 2>/dev/null || true
+echo "$dest"

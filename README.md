@@ -1,3 +1,21 @@
+---
+toc:
+  - CodexSwitch
+  - Features
+  - Settings
+  - Project Structure
+  - Security Notes
+  - Development
+cross_dependencies:
+  - Sources/CodexSwitch/Services/DesktopHeadroomCleanup.swift
+  - Sources/CodexSwitch/Views/SettingsView.swift
+  - docs/sighup-safety.md
+version_control:
+  updated_on: 2026-04-29
+  updated_by: Codex
+  status: working-tree
+---
+
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-15%2B-000?logo=apple&logoColor=white" alt="macOS 15+">
   <img src="https://img.shields.io/badge/Swift-6.3-F05138?logo=swift&logoColor=white" alt="Swift 6.3">
@@ -30,11 +48,13 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 
 **📊 Live Quota Monitoring** — Polls ChatGPT's usage API with adaptive intervals. Active account polls every 5 seconds for near-realtime UI. Inactive accounts poll based on urgency, sleeping until their reset time to minimize API calls.
 
-**🔄 Automatic Switching** — When the active account's 5-hour or weekly quota hits 0%, CodexSwitch scores all alternatives and atomically swaps `~/.codex/auth.json`. Anti-ping-pong logic ensures candidates must have usable capacity on both windows before swapping.
+**🔄 Automatic Switching** — When the active account's 5-hour or weekly quota reaches 1% or less, CodexSwitch scores all alternatives and atomically swaps `~/.codex/auth.json`. Anti-ping-pong logic ensures candidates are not already inside the auto-swap threshold before swapping.
 
-**⚡ SIGHUP Hot-Swap** — Sends SIGHUP to running Codex CLI processes after every swap and on app launch, so the CLI reloads tokens instantly. Uses `pgrep` + `proc_pidinfo` to find processes and skip those younger than 10 seconds (still initializing).
+**⚡ SIGHUP Hot-Swap** — Sends SIGHUP to verified running Codex CLI processes only after real token/account changes, so the CLI reloads tokens instantly without routine status checks interrupting sessions. Uses `pgrep` + `proc_pidinfo` to find processes and skip those younger than 10 seconds (still initializing).
 
 **🖥 Desktop App Token Injection** — Detects the Codex desktop app via WebSocket and injects new tokens directly, keeping desktop sessions in sync.
+
+**🧭 Direct Desktop Routing** — Codex.app stays on stock OpenAI transport. CodexSwitch removes legacy desktop Headroom env bridges while preserving account hot-swap, bundled CLI repair, and plugin readiness patches.
 
 **📊 Pooled Usage Meter** — Aggregated view of all accounts' 5-hour and weekly capacity with Pro plan equivalence comparison. Shows estimated pool runway using `min(5h estimate, weekly ceiling)`. When all weekly is exhausted, shows countdown to nearest weekly reset.
 
@@ -85,7 +105,7 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 
 ### Swap Scoring Algorithm
 
-When the active account hits 0% on either window, CodexSwitch picks the best replacement:
+When the active account reaches 1% or less on either window, CodexSwitch picks the best replacement:
 
 ```
 if weekly exhausted → score = -1 (ineligible)
@@ -100,7 +120,7 @@ otherwise:
         × (0.5 penalty if weekly < 20%)
 ```
 
-Anti-ping-pong guard: a candidate must have **both** usable 5h and usable weekly (`!isExhausted` on both) before the swap executes.
+Anti-ping-pong guard: a candidate must have **both** 5h and weekly quota above the auto-swap threshold before the swap executes.
 
 ### Adaptive Polling
 
@@ -149,6 +169,7 @@ open /Applications/CodexSwitch.app
 Click the ⚙ gear icon in the popover to configure:
 - **Launch at login** — start CodexSwitch automatically
 - **Poll frequency** — 0.5x (aggressive) to 2.0x (conservative) multiplier
+- **Desktop app repair** — optionally let CodexSwitch patch Codex.app after updates; desktop traffic remains direct OpenAI transport
 - **Remove all accounts** — clear Keychain and reset
 
 ## Project Structure
@@ -169,6 +190,7 @@ Sources/CodexSwitch/
 │   ├── CLIStatusChecker.swift      # Verify CLI can read current auth
 │   ├── CodexVersionChecker.swift   # Detect SIGHUP-capable binary
 │   ├── DesktopAppConnector.swift   # WebSocket token injection for desktop app
+│   ├── DesktopHeadroomCleanup.swift # Remove legacy desktop Headroom routing env
 │   ├── KeychainStore.swift         # Keychain CRUD operations
 │   ├── NotificationManager.swift   # macOS notification delivery
 │   ├── OAuthLoginManager.swift     # Google OAuth login flow

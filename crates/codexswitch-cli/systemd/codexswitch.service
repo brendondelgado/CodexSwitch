@@ -1,0 +1,10 @@
+[Unit]
+Description=CodexSwitch CLI daemon
+
+[Service]
+ExecStart=%h/.local/bin/codexswitch-cli daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,1026 @@
+mod account_store;
+mod auth;
+mod codex_health;
+mod codex_update;
+mod daemon;
+mod hermes;
+mod import;
+mod patched_codex;
+mod quota;
+mod readiness;
+mod reload;
+mod secure_drop;
+mod token_refresh;
+mod tui;
+
+use account_store::{
+    active_account, default_store_path, is_immediately_usable, load_accounts, lock_account_store,
+    mark_runtime_unusable, save_accounts, select_auto_swap_candidate, set_active,
+};
+use anyhow::{bail, Context, Result};
+use auth::{default_auth_path, write_auth_file};
+use chrono::{Duration as ChronoDuration, Utc};
+use clap::{Parser, Subcommand};
+use import::import_bundle;
+use quota::{apply_fetch_result, fetch_quota, FetchResult};
+use reload::{reload_codex_hot_swap_processes, restart_codex_processes, ReloadSummary};
+use ring::digest::{digest, SHA256};
+use serde::Serialize;
+use serde_json::Value;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(Debug, Parser)]
+#[command(name = "codexswitch-cli")]
+#[command(about = "Headless CodexSwitch for Linux CLI hot-swap")]
+struct Args {
+    #[arg(long, global = true)]
+    store: Option<PathBuf>,
+    #[arg(long, global = true)]
+    auth: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    Import {
+        bundle: PathBuf,
+        #[arg(long)]
+        ignore_expiry: bool,
+    },
+    UpdateBundle {
+        bundle: PathBuf,
+        #[arg(long)]
+        ignore_expiry: bool,
+    },
+    Status,
+    Files {
+        #[command(subcommand)]
+        command: secure_drop::FilesCommand,
+    },
+    Hermes {
+        #[command(subcommand)]
+        command: HermesCommand,
+    },
+    AuthDiagnostics {
+        #[arg(long)]
+        json: bool,
+    },
+    CodexUpdateStatus {
+        #[arg(long)]
+        json: bool,
+    },
+    CheckCodexUpdate {
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        prepare: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    PrepareCodexUpdate {
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        json: bool,
+    },
+    InstallPreparedCodex {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(hide = true)]
+    AutoInstallCodexUpdate {
+        #[arg(long)]
+        json: bool,
+    },
+    Swap {
+        account: String,
+    },
+    RotateNow {
+        #[arg(long, default_value = "external_runtime_failure")]
+        reason: String,
+        #[arg(long, default_value_t = 18_000)]
+        cooldown_seconds: i64,
+        #[arg(long)]
+        no_reload: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Daemon {
+        #[arg(long, default_value_t = 5)]
+        interval_seconds: u64,
+    },
+    Poll {
+        account: Option<String>,
+    },
+    Tui,
+    RestartCodex {
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        include_app_server: bool,
+    },
+    FixCodex {
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, default_value = "0.125.0")]
+        version: String,
+    },
+    InstallPatchedCodex {
+        #[arg(long, default_value = "~/.local/share/codexswitch/codex-source")]
+        source: PathBuf,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        replace_system_entry: bool,
+        #[arg(long)]
+        replace_npm_vendor: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HermesCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        gateway: bool,
+    },
+    Apply {
+        #[arg(long)]
+        restart_gateway: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let store_path = args.store.unwrap_or(default_store_path()?);
+    let auth_path = args.auth.unwrap_or(default_auth_path()?);
+
+    match args.command {
+        Command::Doctor { json } => doctor(&store_path, &auth_path, json),
+        Command::Import {
+            bundle,
+            ignore_expiry,
+        } => import_accounts(&bundle, &store_path, &auth_path, ignore_expiry, "Imported"),
+        Command::UpdateBundle {
+            bundle,
+            ignore_expiry,
+        } => import_accounts(&bundle, &store_path, &auth_path, ignore_expiry, "Updated"),
+        Command::Status => status(&store_path),
+        Command::Files { command } => secure_drop::run(command),
+        Command::Hermes { command } => hermes_command(&store_path, command),
+        Command::AuthDiagnostics { json } => auth_diagnostics(&store_path, &auth_path, json),
+        Command::CodexUpdateStatus { json } => codex_update_status(json),
+        Command::CheckCodexUpdate {
+            force,
+            prepare,
+            json,
+        } => check_codex_update(force, prepare, json),
+        Command::PrepareCodexUpdate { version, json } => prepare_codex_update(&version, json),
+        Command::InstallPreparedCodex { json } => install_prepared_codex(json),
+        Command::AutoInstallCodexUpdate { json } => auto_install_codex_update(json),
+        Command::Swap { account } => swap(&store_path, &auth_path, &account),
+        Command::RotateNow {
+            reason,
+            cooldown_seconds,
+            no_reload,
+            json,
+        } => rotate_now(
+            &store_path,
+            &auth_path,
+            &reason,
+            cooldown_seconds,
+            !no_reload,
+            json,
+        ),
+        Command::Daemon { interval_seconds } => daemon::run_loop(
+            &store_path,
+            &auth_path,
+            Duration::from_secs(interval_seconds),
+        ),
+        Command::Poll { account } => poll(&store_path, account.as_deref()),
+        Command::Tui => tui::run(&store_path, &auth_path),
+        Command::RestartCodex {
+            yes,
+            include_app_server,
+        } => restart_codex(yes, include_app_server),
+        Command::FixCodex { yes, version } => fix_codex(yes, &version),
+        Command::InstallPatchedCodex {
+            source,
+            yes,
+            replace_system_entry,
+            replace_npm_vendor,
+        } => install_patched_codex(source, yes, replace_system_entry, replace_npm_vendor),
+    }
+}
+
+fn import_accounts(
+    bundle: &PathBuf,
+    store_path: &PathBuf,
+    auth_path: &PathBuf,
+    ignore_expiry: bool,
+    verb: &str,
+) -> Result<()> {
+    let accounts = import_bundle(bundle, store_path, ignore_expiry)?;
+    let active = active_account(&accounts)
+        .or_else(|| accounts.first())
+        .context("bundle did not contain any accounts")?;
+    write_auth_file(auth_path, active)?;
+    if let Err(error) = hermes::apply_account_if_configured(active) {
+        eprintln!("warning: Hermes sync failed after import: {error:#}");
+    }
+    println!(
+        "{} {} account(s); active account written to {}",
+        verb,
+        accounts.len(),
+        auth_path.display()
+    );
+    Ok(())
+}
+
+fn hermes_command(store_path: &PathBuf, command: HermesCommand) -> Result<()> {
+    match command {
+        HermesCommand::Status { json, gateway } => hermes::status(json, gateway),
+        HermesCommand::Apply {
+            restart_gateway,
+            json,
+        } => {
+            let accounts = load_accounts(store_path)?;
+            hermes::apply_active(&accounts, restart_gateway, json)
+        }
+    }
+}
+
+pub(crate) fn doctor(store_path: &PathBuf, auth_path: &PathBuf, json: bool) -> Result<()> {
+    let report = readiness::check(store_path, auth_path)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("CodexSwitch Linux doctor");
+    println!("account store: {}", store_path.display());
+    println!("auth file: {}", auth_path.display());
+    println!(
+        "status: {}",
+        if report.ready { "ready" } else { "not ready" }
+    );
+    println!("summary: {}", report.summary);
+    println!("accounts: {}", report.account_count);
+    if let Some(active) = &report.active_email {
+        println!("active: {active}");
+    } else {
+        println!("active: none");
+    }
+    println!("auth writable: {}", report.auth_writable);
+    println!("daemon running: {}", report.daemon_running);
+    println!("live codex cli processes: {}", report.processes.len());
+    for process in report.processes {
+        println!(
+            "- pid={} verified={} exe={} reason={}",
+            process.pid, process.hot_swap_ready, process.executable, process.reason
+        );
+    }
+    println!("codex app-server processes: {}", report.app_servers.len());
+    for process in report.app_servers {
+        println!(
+            "- app-server pid={} verified={} exe={} reason={}",
+            process.pid, process.hot_swap_ready, process.executable, process.reason
+        );
+    }
+    if !report.issues.is_empty() {
+        println!("issues:");
+        for issue in report.issues {
+            println!("- {issue}");
+        }
+    }
+    print_codex_update_status_line()?;
+    Ok(())
+}
+
+pub(crate) fn status(store_path: &PathBuf) -> Result<()> {
+    let accounts = load_accounts(store_path)?;
+    for account in &accounts {
+        let marker = if account.is_active { "*" } else { " " };
+        let five = account
+            .quota_snapshot
+            .as_ref()
+            .map(|snapshot| format!("{:.0}%", snapshot.five_hour.remaining_percent()))
+            .unwrap_or_else(|| "?".to_string());
+        let weekly = account
+            .quota_snapshot
+            .as_ref()
+            .map(|snapshot| format!("{:.0}%", snapshot.weekly.remaining_percent()))
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "{} {} ({}) 5h={} weekly={}{}",
+            marker,
+            account.email,
+            account.plan_type.as_deref().unwrap_or("unknown"),
+            five,
+            weekly,
+            account
+                .runtime_unusable_until
+                .filter(|until| *until > Utc::now())
+                .map(|until| format!(
+                    " runtime-blocked={} until={}",
+                    account
+                        .runtime_unusable_reason
+                        .as_deref()
+                        .unwrap_or("runtime_failure"),
+                    until.to_rfc3339()
+                ))
+                .unwrap_or_default()
+        );
+    }
+    print_codex_update_status_line()?;
+    Ok(())
+}
+
+pub(crate) fn codex_update_status(json_output: bool) -> Result<()> {
+    let report = codex_update::status_report()?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.summary);
+        if let Some(command) = report.install_command.as_deref() {
+            println!("install command: {command}");
+        }
+        if let Some(version) = report.prepared_version.as_deref() {
+            println!("prepared version: {version}");
+        }
+        if let Some(version) = report.installed_version.as_deref() {
+            println!("installed version: {version}");
+        }
+        if let Some(error) = report.error.as_deref() {
+            println!("last error: {error}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_codex_update(force: bool, prepare: bool, json_output: bool) -> Result<()> {
+    let report = codex_update::check_for_update(force, prepare)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.summary);
+        if let Some(command) = report.install_command.as_deref() {
+            println!("install command: {command}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_codex_update(version: &str, json_output: bool) -> Result<()> {
+    let report = codex_update::prepare_version(version)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.summary);
+        if let Some(command) = report.install_command.as_deref() {
+            println!("install command: {command}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn install_prepared_codex(json_output: bool) -> Result<()> {
+    let report = codex_update::install_prepared()?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.summary);
+        if let Some(version) = report.installed_version.as_deref() {
+            println!("installed version: {version}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn auto_install_codex_update(json_output: bool) -> Result<()> {
+    let report = codex_update::auto_install_update()?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.summary);
+        if let Some(version) = report.installed_version.as_deref() {
+            println!("installed version: {version}");
+        }
+        if let Some(error) = report.error.as_deref() {
+            println!("last error: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn print_codex_update_status_line() -> Result<()> {
+    let report = codex_update::status_report()?;
+    println!("codex update: {}", report.summary);
+    if let Some(command) = report.install_command.as_deref() {
+        println!("codex update install: {command}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthDiagnostics {
+    store_path: String,
+    auth_path: String,
+    active_email: Option<String>,
+    active_account_id: Option<String>,
+    active_plan_type: Option<String>,
+    active_token_hash_prefix: Option<String>,
+    active_runtime_unusable: bool,
+    active_runtime_unusable_reason: Option<String>,
+    active_runtime_unusable_until: Option<String>,
+    auth_file_exists: bool,
+    auth_file_mtime: Option<String>,
+    auth_account_id: Option<String>,
+    auth_token_hash_prefix: Option<String>,
+    auth_matches_active_store_token: bool,
+    ready_candidate_count: usize,
+}
+
+pub(crate) fn auth_diagnostics(
+    store_path: &PathBuf,
+    auth_path: &PathBuf,
+    json_output: bool,
+) -> Result<()> {
+    let accounts = load_accounts(store_path)?;
+    let active = active_account(&accounts);
+    let auth_info = read_auth_info(auth_path)?;
+    let active_token_hash = active.map(|account| token_hash_prefix(&account.access_token));
+    let diagnostics = AuthDiagnostics {
+        store_path: store_path.display().to_string(),
+        auth_path: auth_path.display().to_string(),
+        active_email: active.map(|account| account.email.clone()),
+        active_account_id: active.map(|account| account.account_id.clone()),
+        active_plan_type: active.and_then(|account| account.plan_type.clone()),
+        active_token_hash_prefix: active_token_hash.clone(),
+        active_runtime_unusable: active
+            .map(|account| account.runtime_unusable())
+            .unwrap_or(false),
+        active_runtime_unusable_reason: active
+            .and_then(|account| account.runtime_unusable_reason.clone()),
+        active_runtime_unusable_until: active
+            .and_then(|account| account.runtime_unusable_until)
+            .map(|until| until.to_rfc3339()),
+        auth_file_exists: auth_info.exists,
+        auth_file_mtime: auth_info.mtime,
+        auth_account_id: auth_info.account_id,
+        auth_token_hash_prefix: auth_info.token_hash_prefix.clone(),
+        auth_matches_active_store_token: active_token_hash.is_some()
+            && active_token_hash == auth_info.token_hash_prefix,
+        ready_candidate_count: accounts
+            .iter()
+            .filter(|account| !account.is_active)
+            .filter(|account| is_immediately_usable(account))
+            .count(),
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+    } else {
+        println!("CodexSwitch auth diagnostics");
+        println!("store: {}", diagnostics.store_path);
+        println!("auth: {}", diagnostics.auth_path);
+        println!(
+            "active: {}",
+            diagnostics.active_email.as_deref().unwrap_or("none")
+        );
+        println!(
+            "active token hash: {}",
+            diagnostics
+                .active_token_hash_prefix
+                .as_deref()
+                .unwrap_or("none")
+        );
+        println!(
+            "auth token hash: {}",
+            diagnostics
+                .auth_token_hash_prefix
+                .as_deref()
+                .unwrap_or("none")
+        );
+        println!(
+            "auth matches active store token: {}",
+            diagnostics.auth_matches_active_store_token
+        );
+        println!("ready candidates: {}", diagnostics.ready_candidate_count);
+        if diagnostics.active_runtime_unusable {
+            println!(
+                "active runtime blocked: {} until {}",
+                diagnostics
+                    .active_runtime_unusable_reason
+                    .as_deref()
+                    .unwrap_or("runtime_failure"),
+                diagnostics
+                    .active_runtime_unusable_until
+                    .as_deref()
+                    .unwrap_or("unknown")
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn swap(store_path: &PathBuf, auth_path: &PathBuf, selector: &str) -> Result<()> {
+    let _store_lock = lock_account_store(store_path)?;
+    let mut accounts = load_accounts(store_path)?;
+    if !set_active(&mut accounts, selector) {
+        bail!("no account matched {selector}");
+    }
+    let active = active_account(&accounts).context("failed to set active account")?;
+    write_auth_file(auth_path, active)?;
+    if let Err(error) = hermes::apply_account_if_configured(active) {
+        eprintln!("warning: Hermes sync failed after swap: {error:#}");
+    }
+    save_accounts(store_path, &accounts)?;
+    let summary = reload_codex_hot_swap_processes()?;
+    println!(
+        "Swapped to {}; signaled {} Codex hot-swap process(es), restarted {}",
+        active.email,
+        summary.signaled.len(),
+        summary.restarted.len()
+    );
+    for (pid, reason) in summary.skipped {
+        println!("Skipped pid={pid}: {reason}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateNowReport {
+    reason: String,
+    previous_email: String,
+    previous_token_hash_prefix: String,
+    next_email: String,
+    next_token_hash_prefix: String,
+    auth_path: String,
+    reload_attempted: bool,
+    signaled_processes: usize,
+    restarted_processes: usize,
+    skipped_processes: usize,
+    #[serde(skip)]
+    skipped: Vec<(i32, String)>,
+}
+
+pub(crate) fn rotate_now(
+    store_path: &PathBuf,
+    auth_path: &PathBuf,
+    reason: &str,
+    cooldown_seconds: i64,
+    reload_processes: bool,
+    json_output: bool,
+) -> Result<()> {
+    let report = rotate_now_with(
+        store_path,
+        auth_path,
+        reason,
+        cooldown_seconds,
+        reload_processes,
+        fetch_quota,
+        reload_codex_hot_swap_processes,
+    )?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.previous_email == report.next_email {
+        println!(
+            "Kept {} active for {}; fresh quota says it is still usable; signaled {} process(es), restarted {}",
+            report.next_email, report.reason, report.signaled_processes, report.restarted_processes
+        );
+        if !reload_processes {
+            println!("Reload skipped because --no-reload was passed.");
+        }
+    } else {
+        println!(
+            "Rotated from {} to {} for {}; signaled {} process(es), restarted {}",
+            report.previous_email,
+            report.next_email,
+            report.reason,
+            report.signaled_processes,
+            report.restarted_processes
+        );
+        if !reload_processes {
+            println!("Reload skipped because --no-reload was passed.");
+        } else {
+            for (pid, reason) in report.skipped {
+                println!("Skipped pid={pid}: {reason}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rotate_now_with<F, R>(
+    store_path: &PathBuf,
+    auth_path: &PathBuf,
+    reason: &str,
+    cooldown_seconds: i64,
+    reload_processes: bool,
+    fetch_quota_fn: F,
+    reload_fn: R,
+) -> Result<RotateNowReport>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    R: Fn() -> Result<ReloadSummary>,
+{
+    let _store_lock = lock_account_store(store_path)?;
+    let mut accounts = load_accounts(store_path)?;
+    let active_index = accounts
+        .iter()
+        .position(|account| account.is_active)
+        .context("no active account in store")?;
+    let previous_email = accounts[active_index].email.clone();
+    let previous_token_hash_prefix = token_hash_prefix(&accounts[active_index].access_token);
+
+    if reason == "usage_limit" {
+        if let Ok(result) = fetch_quota_fn(&accounts[active_index]) {
+            apply_fetch_result(&mut accounts[active_index], result);
+            if is_immediately_usable(&accounts[active_index]) {
+                write_auth_file(auth_path, &accounts[active_index])?;
+                if let Err(error) = hermes::apply_account_if_configured(&accounts[active_index]) {
+                    eprintln!(
+                        "warning: Hermes sync failed after usage-limit verification: {error:#}"
+                    );
+                }
+                save_accounts(store_path, &accounts)?;
+                let summary = if reload_processes {
+                    reload_fn()?
+                } else {
+                    Default::default()
+                };
+                return Ok(RotateNowReport {
+                    reason: reason.to_string(),
+                    previous_email: previous_email.clone(),
+                    previous_token_hash_prefix,
+                    next_email: previous_email,
+                    next_token_hash_prefix: token_hash_prefix(&accounts[active_index].access_token),
+                    auth_path: auth_path.display().to_string(),
+                    reload_attempted: reload_processes,
+                    signaled_processes: summary.signaled.len(),
+                    restarted_processes: summary.restarted.len(),
+                    skipped_processes: summary.skipped.len(),
+                    skipped: summary.skipped,
+                });
+            }
+        }
+    }
+
+    let cooldown_until = Utc::now() + ChronoDuration::seconds(cooldown_seconds.max(60));
+    mark_runtime_unusable(&mut accounts[active_index], reason, cooldown_until);
+
+    for account in accounts.iter_mut().filter(|account| !account.is_active) {
+        if account.runtime_unusable() {
+            continue;
+        }
+        if let Ok(result) = fetch_quota_fn(account) {
+            apply_fetch_result(account, result);
+        }
+    }
+
+    let Some(target) = select_auto_swap_candidate(&accounts).cloned() else {
+        save_accounts(store_path, &accounts)?;
+        bail!("marked {previous_email} unusable but no ready replacement account exists");
+    };
+
+    set_active(&mut accounts, &target.account_id);
+    write_auth_file(auth_path, &target)?;
+    if let Err(error) = hermes::apply_account_if_configured(&target) {
+        eprintln!("warning: Hermes sync failed after rotate: {error:#}");
+    }
+    save_accounts(store_path, &accounts)?;
+    let summary = if reload_processes {
+        reload_fn()?
+    } else {
+        Default::default()
+    };
+    Ok(RotateNowReport {
+        reason: reason.to_string(),
+        previous_email,
+        previous_token_hash_prefix,
+        next_email: target.email.clone(),
+        next_token_hash_prefix: token_hash_prefix(&target.access_token),
+        auth_path: auth_path.display().to_string(),
+        reload_attempted: reload_processes,
+        signaled_processes: summary.signaled.len(),
+        restarted_processes: summary.restarted.len(),
+        skipped_processes: summary.skipped.len(),
+        skipped: summary.skipped,
+    })
+}
+
+pub(crate) fn poll(store_path: &PathBuf, selector: Option<&str>) -> Result<()> {
+    let _store_lock = lock_account_store(store_path)?;
+    let mut accounts = load_accounts(store_path)?;
+    let selectors: Vec<String> = match selector {
+        Some(selector) => vec![selector.to_string()],
+        None => accounts
+            .iter()
+            .map(|account| account.account_id.clone())
+            .collect(),
+    };
+
+    for selector in selectors {
+        let Some(index) = accounts.iter().position(|account| {
+            account.account_id == selector
+                || account.email.eq_ignore_ascii_case(&selector)
+                || account.id.to_string() == selector
+        }) else {
+            eprintln!("warning: no account matched {selector}");
+            continue;
+        };
+
+        let result = fetch_quota(&accounts[index])
+            .with_context(|| format!("failed to poll {}", accounts[index].email))?;
+        apply_fetch_result(&mut accounts[index], result);
+        println!("polled {}", accounts[index].email);
+    }
+
+    save_accounts(store_path, &accounts)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct AuthInfo {
+    exists: bool,
+    mtime: Option<String>,
+    account_id: Option<String>,
+    token_hash_prefix: Option<String>,
+}
+
+fn read_auth_info(auth_path: &PathBuf) -> Result<AuthInfo> {
+    if !auth_path.exists() {
+        return Ok(AuthInfo {
+            exists: false,
+            mtime: None,
+            account_id: None,
+            token_hash_prefix: None,
+        });
+    }
+
+    let metadata = fs::metadata(auth_path)
+        .with_context(|| format!("failed to stat {}", auth_path.display()))?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .map(chrono::DateTime::<Utc>::from)
+        .map(|time| time.to_rfc3339());
+    let value: Value = serde_json::from_slice(
+        &fs::read(auth_path).with_context(|| format!("failed to read {}", auth_path.display()))?,
+    )
+    .with_context(|| format!("failed to decode {}", auth_path.display()))?;
+    let tokens = value.get("tokens").and_then(|tokens| tokens.as_object());
+    let account_id = tokens
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let token_hash_prefix = tokens
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(|value| value.as_str())
+        .map(token_hash_prefix);
+
+    Ok(AuthInfo {
+        exists: true,
+        mtime,
+        account_id,
+        token_hash_prefix,
+    })
+}
+
+fn token_hash_prefix(token: &str) -> String {
+    hex_prefix(digest(&SHA256, token.as_bytes()).as_ref(), 12)
+}
+
+fn hex_prefix(bytes: &[u8], chars: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(chars);
+    for byte in bytes {
+        if output.len() >= chars {
+            break;
+        }
+        output.push(HEX[(byte >> 4) as usize] as char);
+        if output.len() >= chars {
+            break;
+        }
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+pub(crate) fn restart_codex(yes: bool, include_app_server: bool) -> Result<()> {
+    let summary = restart_codex_processes(include_app_server, yes)?;
+    if yes {
+        println!(
+            "Restarted Codex by terminating {} process(es). Relaunch Codex CLI normally.",
+            summary.terminated.len()
+        );
+    } else {
+        println!("Dry run only. Pass --yes to terminate Codex CLI process(es).");
+    }
+    for pid in summary.terminated {
+        println!("Terminated pid={pid}");
+    }
+    for (pid, reason) in summary.skipped {
+        println!("Skipped pid={pid}: {reason}");
+    }
+    if !include_app_server {
+        println!("Tip: pass --include-app-server if the Codex app-server also needs a restart.");
+    }
+    Ok(())
+}
+
+pub(crate) fn fix_codex(yes: bool, version: &str) -> Result<()> {
+    let health = codex_health::fix(yes, version)?;
+    println!(
+        "codex path: {}",
+        health.path.as_deref().unwrap_or("not found")
+    );
+    if health.healthy {
+        println!(
+            "codex healthy: {}",
+            health.version.as_deref().unwrap_or("version unavailable")
+        );
+    } else {
+        println!(
+            "codex unhealthy: {}",
+            health.problem.as_deref().unwrap_or("unknown problem")
+        );
+        println!("Dry run only. Pass --yes to reinstall @openai/codex@{version}.");
+    }
+    Ok(())
+}
+
+pub(crate) fn install_patched_codex(
+    source: PathBuf,
+    yes: bool,
+    replace_system_entry: bool,
+    replace_npm_vendor: bool,
+) -> Result<()> {
+    let report = patched_codex::install(patched_codex::InstallPatchedCodexOptions {
+        source,
+        yes,
+        replace_system_entry,
+        replace_npm_vendor,
+    })?;
+    if report.dry_run {
+        println!("Dry run only. Pass --yes to build and install patched Codex.");
+    } else {
+        println!(
+            "installed patched Codex: {}",
+            report.installed_binary.display()
+        );
+        println!("user launcher: {}", report.user_launcher.display());
+        if report.system_launcher_replaced {
+            println!("system launcher replaced: /usr/bin/codex");
+        }
+        if report.npm_vendor_replaced {
+            println!("npm vendor binary replaced");
+        }
+    }
+    println!("built binary: {}", report.built_binary.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use account_store::{CodexAccount, QuotaSnapshot, QuotaWindow};
+    use serde_json::json;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn account(email: &str, active: bool, five_used: f64, weekly_used: f64) -> CodexAccount {
+        CodexAccount {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            access_token: format!("access-{email}"),
+            refresh_token: format!("refresh-{email}"),
+            id_token: format!("id-{email}"),
+            account_id: email.to_string(),
+            quota_snapshot: Some(QuotaSnapshot {
+                five_hour: QuotaWindow {
+                    used_percent: five_used,
+                    window_duration_mins: 300,
+                    resets_at: json!(0),
+                    hard_limit_reached: false,
+                },
+                weekly: QuotaWindow {
+                    used_percent: weekly_used,
+                    window_duration_mins: 10_080,
+                    resets_at: json!(0),
+                    hard_limit_reached: false,
+                },
+                fetched_at: None,
+            }),
+            plan_type: Some("pro".to_string()),
+            last_refreshed: None,
+            subscription_renews_at: None,
+            subscription_expires_at: None,
+            subscription_will_renew: None,
+            has_active_subscription: Some(true),
+            five_hour_primed_at: None,
+            runtime_unusable_until: None,
+            runtime_unusable_reason: None,
+            is_active: active,
+        }
+    }
+
+    fn fetch_from_account(account: &CodexAccount) -> Result<FetchResult> {
+        Ok(FetchResult {
+            snapshot: account.quota_snapshot.clone().unwrap(),
+            plan_type: account.plan_type.clone().unwrap(),
+        })
+    }
+
+    #[test]
+    fn usage_limit_rotate_verifies_fresh_active_quota_before_blocking() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let mut active = account("active@example.com", true, 100.0, 10.0);
+        active.runtime_unusable_reason = Some("usage_limit".to_string());
+        let replacement = account("replacement@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, replacement])?;
+
+        let report = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "usage_limit",
+            21_600,
+            false,
+            |account| {
+                let mut result = fetch_from_account(account)?;
+                if account.email == "active@example.com" {
+                    result.snapshot.five_hour.used_percent = 1.0;
+                    result.snapshot.weekly.used_percent = 20.0;
+                }
+                Ok(result)
+            },
+            || Ok(ReloadSummary::default()),
+        )?;
+
+        assert_eq!(report.previous_email, "active@example.com");
+        assert_eq!(report.next_email, "active@example.com");
+        let stored = load_accounts(&store_path)?;
+        let active = active_account(&stored).unwrap();
+        assert_eq!(active.email, "active@example.com");
+        assert_eq!(active.runtime_unusable_reason, None);
+        assert_eq!(
+            active
+                .quota_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.five_hour.remaining_percent()),
+            Some(99.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_rotate_refreshes_candidates_before_selecting() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 10.0);
+        let stale_replacement = account("replacement@example.com", false, 100.0, 10.0);
+        save_accounts(&store_path, &[active, stale_replacement])?;
+
+        let report = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "usage_limit",
+            21_600,
+            false,
+            |account| {
+                let mut result = fetch_from_account(account)?;
+                if account.email == "replacement@example.com" {
+                    result.snapshot.five_hour.used_percent = 1.0;
+                }
+                Ok(result)
+            },
+            || Ok(ReloadSummary::default()),
+        )?;
+
+        assert_eq!(report.previous_email, "active@example.com");
+        assert_eq!(report.next_email, "replacement@example.com");
+        let stored = load_accounts(&store_path)?;
+        assert_eq!(
+            active_account(&stored).map(|account| account.email.as_str()),
+            Some("replacement@example.com")
+        );
+        Ok(())
+    }
+}
