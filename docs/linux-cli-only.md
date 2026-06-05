@@ -96,6 +96,8 @@ Like `codex-vps`, `claude-vps` must pass `ControlMaster=no`, `ControlPath=none`,
 
 `claude-vps` must also normalize the remote terminal contract before launching Claude Code. It should set `TERM=xterm-256color`, preserve truecolor via `COLORTERM=truecolor`, and apply the local terminal size to the remote PTY with `stty rows <rows> cols <cols>` when available. Claude Code is a full-screen terminal app; if it inherits a zero-sized PTY or a terminal type the remote runtime handles poorly, redraws can repeat, wrap off-screen, and lose the anchored bottom statusline.
 
+For no-argument interactive launches, `claude-vps` should attach to a managed remote `tmux` session named `claude-vps` under `/home/signul/SIGNUL`. The session must keep a large scrollback history, enable mouse scrolling, hide tmux's own status bar, and disable the alternate screen so Claude redraws do not fight Ghostty/native terminal scrollback. Set `CLAUDE_VPS_DISABLE_TMUX=1` only for deliberate bare-terminal debugging.
+
 ## signul ssh Terminal Stability
 
 Use `signul ssh` for ad hoc interactive SIGNUL VPS shells that may run full-screen CLIs such as `claude`. It opens the same protected SSH lane as `claude-vps`: no OpenSSH multiplexing, forced interactive TTY, safe `xterm-256color` terminal type, truecolor enabled, and explicit initial PTY rows/columns.

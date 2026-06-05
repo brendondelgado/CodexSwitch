@@ -9,6 +9,8 @@ REMOTE_REPO="${CLAUDE_VPS_REMOTE_REPO:-/home/signul/SIGNUL}"
 REMOTE_CLAUDE="${CLAUDE_VPS_REMOTE_CLAUDE:-/home/signul/.local/bin/claude}"
 REMOTE_TERM="${CLAUDE_VPS_REMOTE_TERM:-xterm-256color}"
 REMOTE_COLORTERM="${CLAUDE_VPS_REMOTE_COLORTERM:-truecolor}"
+REMOTE_TMUX_SESSION="${CLAUDE_VPS_TMUX_SESSION:-claude-vps}"
+REMOTE_TMUX_HISTORY_LIMIT="${CLAUDE_VPS_TMUX_HISTORY_LIMIT:-200000}"
 
 SSH_OPTS=(
   -o BatchMode=yes
@@ -60,13 +62,15 @@ remote_env_prefix() {
   size="$(terminal_size)"
   rows="${size%% *}"
   cols="${size##* }"
-  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s TERM=%s COLORTERM=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s' \
+  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s TERM=%s COLORTERM=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s CLAUDE_VPS_TMUX_SESSION=%s CLAUDE_VPS_TMUX_HISTORY_LIMIT=%s' \
     "$(quote_zsh "$REMOTE_REPO")" \
     "$(quote_zsh "$REMOTE_CLAUDE")" \
     "$(quote_zsh "$REMOTE_TERM")" \
     "$(quote_zsh "$REMOTE_COLORTERM")" \
     "$(quote_zsh "$rows")" \
-    "$(quote_zsh "$cols")"
+    "$(quote_zsh "$cols")" \
+    "$(quote_zsh "$REMOTE_TMUX_SESSION")" \
+    "$(quote_zsh "$REMOTE_TMUX_HISTORY_LIMIT")"
 }
 
 select_ssh_transport() {
@@ -102,10 +106,16 @@ for arg in "$@"; do
   remote_args+=("$(quote_zsh "$arg")")
 done
 
-remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; exec \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
-if [ "${#remote_args[@]}" -gt 0 ]; then
+if [ "$#" -eq 0 ] && [ "${CLAUDE_VPS_DISABLE_TMUX:-0}" != "1" ]; then
+  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; if command -v tmux >/dev/null 2>&1; then if ! tmux has-session -t \"\$CLAUDE_VPS_TMUX_SESSION\" 2>/dev/null; then tmux new-session -d -s \"\$CLAUDE_VPS_TMUX_SESSION\" -c \"\$REMOTE_REPO\"; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" history-limit \"\$CLAUDE_VPS_TMUX_HISTORY_LIMIT\" >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" mouse on >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" status off >/dev/null; tmux set-window-option -t \"\${CLAUDE_VPS_TMUX_SESSION}:0\" alternate-screen off >/dev/null; tmux send-keys -t \"\${CLAUDE_VPS_TMUX_SESSION}:0.0\" \"exec \\\"\$REMOTE_CLAUDE\\\"\" C-m; else tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" history-limit \"\$CLAUDE_VPS_TMUX_HISTORY_LIMIT\" >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" mouse on >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" status off >/dev/null; tmux set-window-option -t \"\${CLAUDE_VPS_TMUX_SESSION}:0\" alternate-screen off >/dev/null; fi; tmux attach-session -t \"\$CLAUDE_VPS_TMUX_SESSION\" || exec \"\$REMOTE_CLAUDE\"; exit 0; fi; exec \"\$REMOTE_CLAUDE\"' claude-vps"
+else
+  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; exec \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
   remote_command="${remote_command} ${remote_args[*]}"
 fi
 
-log "connecting to Claude Code on ${selected_host}..."
+if [ "$#" -eq 0 ] && [ "${CLAUDE_VPS_DISABLE_TMUX:-0}" != "1" ]; then
+  log "connecting to Claude Code on ${selected_host} in tmux session ${REMOTE_TMUX_SESSION}..."
+else
+  log "connecting to Claude Code on ${selected_host}..."
+fi
 exec ssh -tt "${selected_ssh_opts[@]}" "$selected_host" "$remote_command"
