@@ -7,6 +7,8 @@ TAILSCALE_TARGET="${CLAUDE_VPS_TAILSCALE_TARGET:-signul@${TAILSCALE_HOST}}"
 TAILSCALE_BIN="${CLAUDE_VPS_TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
 REMOTE_REPO="${CLAUDE_VPS_REMOTE_REPO:-/home/signul/SIGNUL}"
 REMOTE_CLAUDE="${CLAUDE_VPS_REMOTE_CLAUDE:-/home/signul/.local/bin/claude}"
+REMOTE_TERM="${CLAUDE_VPS_REMOTE_TERM:-xterm-256color}"
+REMOTE_COLORTERM="${CLAUDE_VPS_REMOTE_COLORTERM:-truecolor}"
 
 SSH_OPTS=(
   -o BatchMode=yes
@@ -31,8 +33,40 @@ quote_zsh() {
   printf '%q' "$1"
 }
 
+terminal_size() {
+  local size rows cols
+  size="$(stty size 2>/dev/null || true)"
+  rows="${size%% *}"
+  cols="${size##* }"
+
+  if [[ ! "$rows" =~ '^[1-9][0-9]*$' ]]; then
+    rows="${LINES:-24}"
+  fi
+  if [[ ! "$cols" =~ '^[1-9][0-9]*$' ]]; then
+    cols="${COLUMNS:-80}"
+  fi
+  if [[ ! "$rows" =~ '^[1-9][0-9]*$' ]]; then
+    rows=24
+  fi
+  if [[ ! "$cols" =~ '^[1-9][0-9]*$' ]]; then
+    cols=80
+  fi
+
+  printf '%s %s\n' "$rows" "$cols"
+}
+
 remote_env_prefix() {
-  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s' "$(quote_zsh "$REMOTE_REPO")" "$(quote_zsh "$REMOTE_CLAUDE")"
+  local size rows cols
+  size="$(terminal_size)"
+  rows="${size%% *}"
+  cols="${size##* }"
+  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s TERM=%s COLORTERM=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s' \
+    "$(quote_zsh "$REMOTE_REPO")" \
+    "$(quote_zsh "$REMOTE_CLAUDE")" \
+    "$(quote_zsh "$REMOTE_TERM")" \
+    "$(quote_zsh "$REMOTE_COLORTERM")" \
+    "$(quote_zsh "$rows")" \
+    "$(quote_zsh "$cols")"
 }
 
 select_ssh_transport() {
@@ -68,7 +102,7 @@ for arg in "$@"; do
   remote_args+=("$(quote_zsh "$arg")")
 done
 
-remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && exec \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
+remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; exec \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
 if [ "${#remote_args[@]}" -gt 0 ]; then
   remote_command="${remote_command} ${remote_args[*]}"
 fi

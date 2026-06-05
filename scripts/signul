@@ -1,0 +1,120 @@
+#!/usr/bin/env zsh
+set -e
+
+REMOTE_HOST="${SIGNUL_SSH_REMOTE_HOST:-signul-vps}"
+TAILSCALE_HOST="${SIGNUL_SSH_TAILSCALE_HOST:-signul-hostinger-kvm4}"
+TAILSCALE_TARGET="${SIGNUL_SSH_TAILSCALE_TARGET:-signul@${TAILSCALE_HOST}}"
+TAILSCALE_BIN="${SIGNUL_SSH_TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+REMOTE_REPO="${SIGNUL_SSH_REMOTE_REPO:-/home/signul/SIGNUL}"
+REMOTE_TERM="${SIGNUL_SSH_REMOTE_TERM:-xterm-256color}"
+REMOTE_COLORTERM="${SIGNUL_SSH_REMOTE_COLORTERM:-truecolor}"
+
+SSH_OPTS=(
+  -o BatchMode=yes
+  -o ConnectTimeout=8
+  -o ServerAliveInterval=5
+  -o ServerAliveCountMax=2
+  -o ControlMaster=no
+  -o ControlPath=none
+  -o ControlPersist=no
+)
+SSH_PROXY_OPTS=(
+  "${SSH_OPTS[@]}"
+  -o StrictHostKeyChecking=accept-new
+  -o "ProxyCommand=${TAILSCALE_BIN} nc %h %p"
+)
+
+log() {
+  echo "signul: $*" >&2
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: signul ssh [command...]
+
+Open a protected SIGNUL VPS SSH TTY with terminal settings suitable for
+full-screen CLIs such as Claude Code.
+EOF
+}
+
+quote_zsh() {
+  printf '%q' "$1"
+}
+
+terminal_size() {
+  local size rows cols
+  size="$(stty size 2>/dev/null || true)"
+  rows="${size%% *}"
+  cols="${size##* }"
+
+  if [[ ! "$rows" =~ '^[1-9][0-9]*$' ]]; then
+    rows="${LINES:-24}"
+  fi
+  if [[ ! "$cols" =~ '^[1-9][0-9]*$' ]]; then
+    cols="${COLUMNS:-80}"
+  fi
+  if [[ ! "$rows" =~ '^[1-9][0-9]*$' ]]; then
+    rows=24
+  fi
+  if [[ ! "$cols" =~ '^[1-9][0-9]*$' ]]; then
+    cols=80
+  fi
+
+  printf '%s %s\n' "$rows" "$cols"
+}
+
+remote_env_prefix() {
+  local size rows cols
+  size="$(terminal_size)"
+  rows="${size%% *}"
+  cols="${size##* }"
+  printf 'REMOTE_REPO=%s TERM=%s COLORTERM=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s' \
+    "$(quote_zsh "$REMOTE_REPO")" \
+    "$(quote_zsh "$REMOTE_TERM")" \
+    "$(quote_zsh "$REMOTE_COLORTERM")" \
+    "$(quote_zsh "$rows")" \
+    "$(quote_zsh "$cols")"
+}
+
+select_ssh_transport() {
+  selected_host="$REMOTE_HOST"
+  selected_ssh_opts=("${SSH_OPTS[@]}")
+
+  if [ "${SIGNUL_SSH_DISABLE_TAILSCALE_PROXY:-0}" = "1" ]; then
+    return
+  fi
+  if [ "$REMOTE_HOST" != "signul-vps" ]; then
+    return
+  fi
+  if [ ! -x "$TAILSCALE_BIN" ]; then
+    return
+  fi
+
+  selected_host="$TAILSCALE_TARGET"
+  selected_ssh_opts=("${SSH_PROXY_OPTS[@]}")
+}
+
+if [ "${1:-}" != "ssh" ]; then
+  usage
+  exit 2
+fi
+shift
+
+selected_host="$REMOTE_HOST"
+selected_ssh_opts=("${SSH_OPTS[@]}")
+select_ssh_transport
+
+remote_tty_setup='if [ -n "$CODEXSWITCH_REMOTE_TTY_ROWS" ] && [ -n "$CODEXSWITCH_REMOTE_TTY_COLS" ]; then stty rows "$CODEXSWITCH_REMOTE_TTY_ROWS" cols "$CODEXSWITCH_REMOTE_TTY_COLS" 2>/dev/null || true; fi'
+
+if [ "$#" -eq 0 ]; then
+  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" 2>/dev/null || cd \"\$HOME\"; ${remote_tty_setup}; exec \"\${SHELL:-/bin/bash}\" -l'"
+else
+  remote_args=()
+  for arg in "$@"; do
+    remote_args+=("$(quote_zsh "$arg")")
+  done
+  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" 2>/dev/null || cd \"\$HOME\"; ${remote_tty_setup}; exec \"\$@\"' signul-ssh ${remote_args[*]}"
+fi
+
+log "connecting to ${selected_host}..."
+exec ssh -tt "${selected_ssh_opts[@]}" "$selected_host" "$remote_command"

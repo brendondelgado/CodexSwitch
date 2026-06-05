@@ -9,11 +9,13 @@ toc:
   - SecureDrop File Transfer
   - codex-vps Tunnel Stability
   - claude-vps Remote CLI Entry
+  - signul ssh Terminal Stability
   - Implementation Plan
 cross_dependencies:
   - scripts/securedrop/cs-autopush
   - scripts/codex-vps
   - scripts/claude-vps
+  - scripts/signul
   - Sources/CodexSwitch/Services/SwapEngine.swift
   - Sources/CodexSwitch/Services/CodexVersionChecker.swift
   - Sources/CodexSwitch/Services/CLIStatusChecker.swift
@@ -21,8 +23,8 @@ cross_dependencies:
   - docs/superpowers/plans/2026-04-30-desktop-linux-token-transfer.md
   - docs/runbooks/codexswitch-hot-swap-verification.md
 version_control:
-  branch: feat/codex-native
-  commit: 58da612
+  branch: main
+  commit: 8ae2106
 ---
 
 # Linux CLI-Only CodexSwitch
@@ -91,6 +93,14 @@ For this helper, avoid implicit Tailscale SSH browser-check fallback. Tailscale 
 The Mac-side `claude-vps` helper provides the same one-word VPS entrypoint for Claude Code that `codex-vps` provides for Codex. Claude Code is a terminal CLI rather than a WebSocket app-server, so `claude-vps` opens an interactive SSH TTY, changes to `/home/signul/SIGNUL`, and execs `/home/signul/.local/bin/claude` through the VPS default `bash`.
 
 Like `codex-vps`, `claude-vps` must pass `ControlMaster=no`, `ControlPath=none`, and `ControlPersist=no` so interactive keystrokes do not share an old OpenSSH master connection. For the default `signul-vps` target, it should prefer Tailscale's userspace SSH transport with `ProxyCommand=/Applications/Tailscale.app/Contents/MacOS/Tailscale nc %h %p`, targeting `signul@signul-hostinger-kvm4`, because the normal OpenSSH host can still be affected by stale mux masters and other SSH traffic. The default remote host, repo, Claude binary, and Tailscale target can be overridden with `CLAUDE_VPS_REMOTE_HOST`, `CLAUDE_VPS_REMOTE_REPO`, `CLAUDE_VPS_REMOTE_CLAUDE`, `CLAUDE_VPS_TAILSCALE_HOST`, and `CLAUDE_VPS_TAILSCALE_TARGET`; set `CLAUDE_VPS_DISABLE_TAILSCALE_PROXY=1` to force the plain SSH host.
+
+`claude-vps` must also normalize the remote terminal contract before launching Claude Code. It should set `TERM=xterm-256color`, preserve truecolor via `COLORTERM=truecolor`, and apply the local terminal size to the remote PTY with `stty rows <rows> cols <cols>` when available. Claude Code is a full-screen terminal app; if it inherits a zero-sized PTY or a terminal type the remote runtime handles poorly, redraws can repeat, wrap off-screen, and lose the anchored bottom statusline.
+
+## signul ssh Terminal Stability
+
+Use `signul ssh` for ad hoc interactive SIGNUL VPS shells that may run full-screen CLIs such as `claude`. It opens the same protected SSH lane as `claude-vps`: no OpenSSH multiplexing, forced interactive TTY, safe `xterm-256color` terminal type, truecolor enabled, and explicit initial PTY rows/columns.
+
+Avoid launching full-screen TUIs from a plain shared `ssh signul-vps` session. That host is still useful for simple commands, but shared SSH masters and missing/zero PTY geometry can make terminal UIs redraw over themselves.
 
 The implemented Linux CLI supports:
 
