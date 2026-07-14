@@ -183,7 +183,7 @@ fn stage_macos_runtime_artifact_with_lock_held(directory: &Path) -> Result<Codex
             })
     {
         state.status = UpdateStatus::ReadyToInstall;
-        state.installed_version = installed_codex_version();
+        observe_installed_version(&mut state, installed_codex_version());
         state.error = None;
         state.updated_at = Utc::now();
         save_state(&state)?;
@@ -238,7 +238,7 @@ fn stage_macos_runtime_artifact_with_lock_held(directory: &Path) -> Result<Codex
 
     state.status = UpdateStatus::ReadyToInstall;
     state.latest_stable_version = Some(manifest.upstream_codex_version.clone());
-    state.installed_version = installed_codex_version();
+    observe_installed_version(&mut state, installed_codex_version());
     state.prepared_version = Some(manifest.upstream_codex_version.clone());
     state.prepared_source_path = None;
     state.prepared_binary_path = Some(prepared_binary.display().to_string());

@@ -108,7 +108,7 @@ where
     let mut state = load_state_at(state_path)?;
     let observed_installed_version = installed_version();
     let mut changed = state.installed_version != observed_installed_version;
-    state.installed_version = observed_installed_version;
+    observe_installed_version(&mut state, observed_installed_version);
     if state.unresolved_failure.is_some() {
         changed |= restore_unresolved_failure(&mut state);
     } else {
@@ -273,7 +273,7 @@ fn apply_successful_metadata_check(
 ) -> bool {
     state.last_checked_at = Some(now);
     state.latest_stable_version = Some(latest.to_string());
-    state.installed_version = installed_version;
+    observe_installed_version(state, installed_version);
     if version_is_stable(latest)
         && state
             .unresolved_failure
@@ -427,7 +427,7 @@ fn prepare_version_with_lock_held(version: &str) -> Result<CodexUpdateReport> {
             cleanup_warning,
         }) => {
             state.status = UpdateStatus::ReadyToInstall;
-            state.installed_version = installed_codex_version();
+            observe_installed_version(&mut state, installed_codex_version());
             resolve_prepare_failure_for_version(&mut state, version);
             match cleanup_warning {
                 Some(error) => {
@@ -779,7 +779,7 @@ where
 {
     let mut state = load_state_at(state_path)?;
     if context.policy.permits_preparation(context.platform) && state.installed_version.is_none() {
-        state.installed_version = installed();
+        observe_installed_version(&mut state, installed());
     }
     match automatic_update_decision(&state, now, context) {
         AutomaticUpdateDecision::None => Ok(report_from_state(state)),
@@ -1050,8 +1050,14 @@ fn clear_obsolete_install_failure(state: &mut CodexUpdateState, latest: &str) {
     }
 }
 
+fn observe_installed_version(state: &mut CodexUpdateState, installed_version: Option<String>) {
+    if state.installed_version != installed_version {
+        state.installed_artifact_manifest_sha256 = None;
+    }
+    state.installed_version = installed_version;
+}
+
 fn mark_version_installed(state: &mut CodexUpdateState, version: &str, now: DateTime<Utc>) {
-    state.installed_artifact_manifest_sha256 = None;
     if state.unresolved_failure.is_some() {
         restore_unresolved_failure(state);
         state.installed_version = Some(version.to_string());
@@ -1130,7 +1136,7 @@ fn reconcile_requested_version_as_installed(
     installed_version: Option<String>,
     now: DateTime<Utc>,
 ) -> bool {
-    state.installed_version = installed_version;
+    observe_installed_version(state, installed_version);
     if state.installed_version.as_deref() != Some(requested_version) {
         return false;
     }
@@ -1478,6 +1484,7 @@ fn reconcile_installed_state_at(state: &mut CodexUpdateState, installed_binary: 
     }
 
     let installed_version = prepared_version.to_string();
+    state.installed_artifact_manifest_sha256 = None;
     mark_version_installed(state, &installed_version, Utc::now());
     true
 }

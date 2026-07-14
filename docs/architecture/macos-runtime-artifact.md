@@ -245,6 +245,10 @@ state. The committed state records `installedArtifactManifestSha256`; prepared
 artifact identity is cleared independently so an installed report cannot
 confuse completed provenance with pending work. `manifest.json` is frozen
 read-only with its generation; executable members are frozen read/execute-only.
+Later metadata and status observations preserve that committed identity when
+the installed version is unchanged. A changed installed-version observation or
+reconciliation of a source-built prepared runtime clears it, so neither routine
+polling nor stale provenance can rewrite the truth.
 The repository installer preserves its original `PATH` through final route
 validation; in zsh, the special `path` array must never be reused as a scalar
 loop variable before the launcher smoke test.

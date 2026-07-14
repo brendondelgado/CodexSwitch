@@ -2599,6 +2599,44 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
     }
 
     #[test]
+    fn same_version_metadata_check_preserves_installed_artifact_identity() {
+        let now = automatic_update_test_time();
+        let mut state = automatic_update_test_state(UpdateStatus::Installed, now);
+        state.latest_stable_version = Some("0.144.1".to_string());
+        state.installed_artifact_manifest_sha256 = Some("manifest-sha256".to_string());
+
+        let should_prepare = apply_successful_metadata_check(
+            &mut state,
+            "0.144.1",
+            Some("0.144.1".to_string()),
+            false,
+            false,
+            false,
+            UpdateStatus::Installed,
+            now + ChronoDuration::minutes(15),
+        );
+
+        assert!(!should_prepare);
+        assert_eq!(state.status, UpdateStatus::Installed);
+        assert_eq!(
+            state.installed_artifact_manifest_sha256.as_deref(),
+            Some("manifest-sha256")
+        );
+    }
+
+    #[test]
+    fn changed_installed_version_observation_clears_artifact_identity() {
+        let now = automatic_update_test_time();
+        let mut state = automatic_update_test_state(UpdateStatus::Installed, now);
+        state.installed_artifact_manifest_sha256 = Some("stale-manifest-sha256".to_string());
+
+        observe_installed_version(&mut state, Some("0.145.0".to_string()));
+
+        assert_eq!(state.installed_version.as_deref(), Some("0.145.0"));
+        assert!(state.installed_artifact_manifest_sha256.is_none());
+    }
+
+    #[test]
     fn same_version_reconciliation_preserves_failed_activation_truth() {
         let now = automatic_update_test_time();
         let mut state = automatic_update_test_state(UpdateStatus::Failed, now);
