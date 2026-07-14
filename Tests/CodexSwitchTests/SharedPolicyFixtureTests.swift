@@ -70,7 +70,7 @@ struct SharedPolicyFixtureTests {
                 transport: { _ in
                     RateLimitResetHTTPResponse(
                         statusCode: 200,
-                        data: Data("{\"code\":\"(code)\"}".utf8)
+                        data: Data("{\"code\":\"\(code)\"}".utf8)
                     )
                 },
                 journalURL: journalURL
@@ -125,10 +125,10 @@ struct SharedPolicyFixtureTests {
             bank: fixture.beforeBank,
             now: fixture.now
         )
-        let attemptId = try #require({
-            guard case .reconciliationRequired(let id) = consume else { return nil }
-            return id
-        }())
+        guard case .reconciliationRequired(let attemptId) = consume else {
+            Issue.record("Expected reset submission to require reconciliation")
+            return
+        }
         let snapshot = usableWeeklySnapshot(fetchedAt: fixture.quotaFetchedAt)
         let reconciliation = try await service.reconcile(
             for: account,
@@ -137,10 +137,10 @@ struct SharedPolicyFixtureTests {
             now: fixture.quotaFetchedAt
         )
 
-        let pending = try #require({
-            guard case .pendingPersistence(let attempt) = reconciliation else { return nil }
-            return attempt
-        }())
+        guard case .pendingPersistence(let pending) = reconciliation else {
+            Issue.record("Expected reconciliation to require durable persistence")
+            return
+        }
         #expect(pending.id == attemptId)
         let finalized = try await service.finalizeReconciliationAfterPersistence(
             attemptId: attemptId,

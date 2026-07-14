@@ -91,7 +91,7 @@ struct AccountActivationTransactionTests {
             let result = try await transaction.withActivationLease(
                 targetAccountId: target.id,
                 activationGeneration: activationGeneration
-            ) { lease in
+            ) { lease -> AccountActivationCommitResult in
                 let decision = try await coordinator.beginAuthorizedCredentialMutation(
                     targetAccountId: target.id,
                     kind: .automatic,
