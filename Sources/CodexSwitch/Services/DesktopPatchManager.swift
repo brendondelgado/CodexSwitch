@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 import os
@@ -10,6 +11,11 @@ enum DesktopRuntimeHotSwapState: Sendable, Equatable {
     case unknown
 }
 
+enum HotSwapRuntimeKind: String, Decodable, Sendable, Equatable {
+    case externalAppServer = "external-app-server"
+    case localInteractiveCLI = "local-interactive-cli"
+}
+
 enum DesktopPatchAttemptOutcome: Sendable, Equatable {
     case notNeeded
     case disabled
@@ -19,6 +25,8 @@ enum DesktopPatchAttemptOutcome: Sendable, Equatable {
     case permissionDenied
     case cooldownActive
     case scriptMissing
+    case alreadyInProgress
+    case leaseUnavailable
     case completed
     case timedOut
     case structureChanged
@@ -34,6 +42,8 @@ enum DesktopPatchAttemptOutcome: Sendable, Equatable {
         case .permissionDenied: "permission_denied"
         case .cooldownActive: "cooldown_active"
         case .scriptMissing: "script_missing"
+        case .alreadyInProgress: "already_in_progress"
+        case .leaseUnavailable: "lease_unavailable"
         case .completed: "completed"
         case .timedOut: "timed_out"
         case .structureChanged: "structure_changed"
@@ -49,6 +59,8 @@ enum DesktopPatchAttemptOutcome: Sendable, Equatable {
              .permissionDeniedBackoff,
              .permissionDenied,
              .cooldownActive,
+             .alreadyInProgress,
+             .leaseUnavailable,
              .timedOut,
              .structureChanged,
              .failed:
@@ -62,6 +74,7 @@ struct DesktopPatchStatus: Sendable, Equatable {
     let codexAppSignatureCompatible: Bool
     let codesignIdentityAvailable: Bool
     let authPatchInstalled: Bool
+    let remoteRecentsPatchInstalled: Bool
     let fastPatchInstalled: Bool
     let bundledCLIHotSwapInstalled: Bool
     let bundledCLIVersionCompatible: Bool
@@ -70,6 +83,8 @@ struct DesktopPatchStatus: Sendable, Equatable {
 
     var allPatchesInstalled: Bool {
         authPatchInstalled
+            && remoteRecentsPatchInstalled
+            && fastPatchInstalled
             && bundledCLIHotSwapInstalled
             && bundledCLIVersionCompatible
             && computerUsePluginSignatureCompatible
@@ -77,6 +92,8 @@ struct DesktopPatchStatus: Sendable, Equatable {
 
     var computerUsePreservedModeInstalled: Bool {
         authPatchInstalled
+            && remoteRecentsPatchInstalled
+            && fastPatchInstalled
             && !bundledCLIHotSwapInstalled
             && bundledCLIVersionCompatible
             && computerUsePluginSignatureCompatible
@@ -109,6 +126,92 @@ private final class DesktopPatchStatusCache: @unchecked Sendable {
     }
 }
 
+private enum DesktopPatchLeaseAcquisition {
+    case acquired(DesktopPatchMutationLease)
+    case alreadyInProgress
+    case unavailable
+}
+
+private final class DesktopPatchMutationLease {
+    private static let processLock = NSLock()
+
+    private var fileDescriptor: Int32
+
+    private init(fileDescriptor: Int32) {
+        self.fileDescriptor = fileDescriptor
+    }
+
+    deinit {
+        release()
+    }
+
+    static func acquire(at path: String) -> DesktopPatchLeaseAcquisition {
+        guard processLock.try() else {
+            return .alreadyInProgress
+        }
+
+        let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        do {
+            try FileManager.default.createDirectory(
+                atPath: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directory
+            )
+        } catch {
+            processLock.unlock()
+            return .unavailable
+        }
+
+        let opened = Darwin.open(
+            path,
+            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(0o600)
+        )
+        guard opened >= 0 else {
+            processLock.unlock()
+            return .unavailable
+        }
+
+        guard Darwin.fchmod(opened, mode_t(0o600)) == 0 else {
+            Darwin.close(opened)
+            processLock.unlock()
+            return .unavailable
+        }
+
+        guard flock(opened, LOCK_EX | LOCK_NB) == 0 else {
+            let lockError = errno
+            Darwin.close(opened)
+            processLock.unlock()
+            if lockError == EWOULDBLOCK || lockError == EAGAIN {
+                return .alreadyInProgress
+            }
+            return .unavailable
+        }
+
+        _ = ftruncate(opened, 0)
+        let pidLine = Data("\(getpid())\n".utf8)
+        pidLine.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return }
+            _ = Darwin.write(opened, baseAddress, buffer.count)
+        }
+
+        return .acquired(DesktopPatchMutationLease(fileDescriptor: opened))
+    }
+
+    func release() {
+        guard fileDescriptor >= 0 else { return }
+        let descriptor = fileDescriptor
+        fileDescriptor = -1
+        _ = flock(descriptor, LOCK_UN)
+        Darwin.close(descriptor)
+        Self.processLock.unlock()
+    }
+}
+
 enum DesktopPatchManager {
     struct InstallationFingerprint: Sendable, Equatable {
         struct FileFingerprint: Sendable, Equatable {
@@ -127,14 +230,35 @@ enum DesktopPatchManager {
 
     struct InstalledMarkers: Sendable, Equatable {
         let auth: Bool
+        let remoteRecents: Bool
         let fast: Bool
         let bundledPluginListRoot: Bool
         let bundledCLI: Bool
         let versionCompatible: Bool
         let computerUsePluginSignatureCompatible: Bool
 
+        init(
+            auth: Bool,
+            remoteRecents: Bool = true,
+            fast: Bool,
+            bundledPluginListRoot: Bool,
+            bundledCLI: Bool,
+            versionCompatible: Bool,
+            computerUsePluginSignatureCompatible: Bool
+        ) {
+            self.auth = auth
+            self.remoteRecents = remoteRecents
+            self.fast = fast
+            self.bundledPluginListRoot = bundledPluginListRoot
+            self.bundledCLI = bundledCLI
+            self.versionCompatible = versionCompatible
+            self.computerUsePluginSignatureCompatible = computerUsePluginSignatureCompatible
+        }
+
         var required: Bool {
             auth
+                && remoteRecents
+                && fast
                 && bundledCLI
                 && versionCompatible
                 && computerUsePluginSignatureCompatible
@@ -142,6 +266,8 @@ enum DesktopPatchManager {
 
         var computerUsePreservedModeInstalled: Bool {
             auth
+                && remoteRecents
+                && fast
                 && !bundledCLI
                 && versionCompatible
                 && computerUsePluginSignatureCompatible
@@ -155,13 +281,22 @@ enum DesktopPatchManager {
     nonisolated static let automaticPatchingDefaultsKey = "desktopAutomaticPatchingEnabled"
     private nonisolated static let automaticPatchingMigrationKey = "desktopAutomaticPatchingEnabled.v2Migrated"
 
-    private nonisolated static let codexAppPath = "/Applications/Codex.app"
-    private nonisolated static let asarPath = "/Applications/Codex.app/Contents/Resources/app.asar"
-    private nonisolated static let bundledCLIPath = "/Applications/Codex.app/Contents/Resources/codex"
-    private nonisolated static let computerUsePluginAppPath =
-        "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"
-    private nonisolated static let skyComputerUseClientAppPath =
-        "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app"
+    private nonisolated static var codexAppPath: String {
+        CodexDesktopAppLocator.locate()?.appPath
+            ?? CodexDesktopAppLocator.defaultAppPaths[0]
+    }
+    private nonisolated static var asarPath: String {
+        "\(codexAppPath)/Contents/Resources/app.asar"
+    }
+    private nonisolated static var bundledCLIPath: String {
+        "\(codexAppPath)/Contents/Resources/codex"
+    }
+    private nonisolated static var computerUsePluginAppPath: String {
+        "\(codexAppPath)/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"
+    }
+    private nonisolated static var skyComputerUseClientAppPath: String {
+        "\(computerUsePluginAppPath)/Contents/SharedSupport/SkyComputerUseClient.app"
+    }
     private nonisolated static let stockVendorCLIPath =
         "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex"
     private nonisolated static let lastPatchAttemptPath =
@@ -170,13 +305,25 @@ enum DesktopPatchManager {
         NSString("~/.codexswitch/logs/desktop-patch.log").expandingTildeInPath
     private nonisolated static let permissionDeniedPath =
         NSString("~/.codexswitch/desktop-patch-permission-denied").expandingTildeInPath
+    private nonisolated static let patchLeasePath =
+        NSString("~/.codexswitch/desktop-patch.lock").expandingTildeInPath
 
     private nonisolated static let authPatchMarker = "_invalidateAccountQueries"
+    private nonisolated static let remoteRecentsPatchMarker = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH"
+    private nonisolated static let modelLabelFallbackMarker = "CODEXSWITCH_MODEL_LABEL_FALLBACK"
+    private nonisolated static let modelAvailabilityFallbackMarker = "CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK"
+    private nonisolated static let selectedModelLabelFallbackMarker = "CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK"
+    private nonisolated static let gpt56MaxEffortFallbackMarker = "CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK"
+    private nonisolated static let remoteModelRefreshMarker = "CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH"
     private nonisolated static let fastPatchMarker = "_bundledFastModels"
     private nonisolated static let bundledPluginListRootPatchMarker = "CODEXSWITCH_BUNDLED_PLUGIN_LIST_ROOT_PATCH"
-    private nonisolated static let sighupReloadMarker = "SIGHUP: auth reloaded"
-    private nonisolated static let sighupVerifiedMarker = "sighup-verified"
-    private nonisolated static let hotSwapAckMarker = "hotswap-ack"
+    private nonisolated static let goalUsageMarker = "Usage: /goal <objective>"
+    private nonisolated static let goalStatusMarker = "Pursuing goal"
+    private nonisolated static let goalRPCMarker = "thread/goal/set"
+    nonisolated static let desktopHostBundleIdentifiers = [
+        "com.openai.codex",
+        "com.openai.chat",
+    ]
     private nonisolated static let patchCooldownSeconds: TimeInterval = 60
     private nonisolated static let permissionDeniedBackoffSeconds: TimeInterval = 60 * 60
     private nonisolated static let openAITeamIdentifier = "2DC432GLL2"
@@ -288,6 +435,7 @@ enum DesktopPatchManager {
                 codexAppSignatureCompatible: false,
                 codesignIdentityAvailable: false,
                 authPatchInstalled: false,
+                remoteRecentsPatchInstalled: false,
                 fastPatchInstalled: false,
                 bundledCLIHotSwapInstalled: false,
                 bundledCLIVersionCompatible: false,
@@ -316,6 +464,7 @@ enum DesktopPatchManager {
             codexAppSignatureCompatible: codexAppSignatureCompatible,
             codesignIdentityAvailable: codesignIdentityAvailable,
             authPatchInstalled: markers.auth,
+            remoteRecentsPatchInstalled: markers.remoteRecents,
             fastPatchInstalled: markers.fast,
             bundledCLIHotSwapInstalled: markers.bundledCLI,
             bundledCLIVersionCompatible: markers.versionCompatible,
@@ -330,7 +479,6 @@ enum DesktopPatchManager {
         ignorePermissionDeniedBackoff: Bool = false
     ) -> DesktopPatchAttemptOutcome {
         let status = currentStatus(maxAge: 0)
-        repairStockVendorCLIIfNeeded()
         guard !status.desktopIntegrationInstalled else { return .notNeeded }
         appendPatchLog("desktop patch needed: running=\(status.isCodexAppRunning) automatic=\(automaticPatchingEnabled)")
         SwapLog.append(.debug("DESKTOP_PATCH_NEEDED running=\(status.isCodexAppRunning) automatic=\(automaticPatchingEnabled)"))
@@ -355,137 +503,139 @@ enum DesktopPatchManager {
             SwapLog.append(.debug("DESKTOP_PATCH_PERMISSION_DENIED_BACKOFF"))
             return .permissionDeniedBackoff
         }
-        if !patchCooldownExpired(), !ignoreCooldown {
-            appendPatchLog("desktop ASAR patch skipped: patch attempt cooldown active")
-            SwapLog.append(.debug("DESKTOP_PATCH_COOLDOWN_ACTIVE"))
-            return .cooldownActive
-        }
         guard let script = patchScriptPath() else {
             appendPatchLog("patch script not found")
             return .scriptMissing
         }
 
-        markPatchAttempt()
-        appendPatchLog("starting desktop patch with \(script)")
+        let outcome = withDesktopPatchMutationLease(
+            lockPath: patchLeasePath,
+            appendLog: { appendPatchLog($0) }
+        ) {
+            if !patchCooldownExpired(), !ignoreCooldown {
+                appendPatchLog("desktop ASAR patch skipped: patch attempt cooldown active")
+                SwapLog.append(.debug("DESKTOP_PATCH_COOLDOWN_ACTIVE"))
+                return .cooldownActive
+            }
 
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            markPatchAttempt()
+            appendPatchLog("starting desktop patch with \(script)")
 
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
-            arguments: [script],
-            timeout: 600,
-            environment: environment
-        )
+            var environment = ProcessInfo.processInfo.environment
+            environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            environment["CODEXSWITCH_CODEX_APP_PATH"] = codexAppPath
 
-        let output = [result.stdoutString, result.stderrString]
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
-        appendPatchLog(output.isEmpty ? "patch exited status=\(result.terminationStatus)" : output)
+            let result = ProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                arguments: [script],
+                timeout: 600,
+                environment: environment
+            )
 
-        if result.timedOut {
-            desktopPatchLogger.error("Desktop patch timed out")
-            SwapLog.append(.debug("DESKTOP_PATCH_TIMEOUT"))
-            return .timedOut
-        } else if result.terminationStatus == 0 {
-            clearPermissionDenied()
-            statusCache.set(computeCurrentStatus())
-            desktopPatchLogger.info("Desktop patch completed")
-            SwapLog.append(.debug("DESKTOP_PATCH_COMPLETED"))
-            return .completed
-        } else if result.terminationStatus == 3 || isLiveAppRefusal(output) {
-            clearPatchAttempt()
-            desktopPatchLogger.warning("Desktop patch waiting for Codex.app to quit")
-            SwapLog.append(.debug("DESKTOP_PATCH_WAITING_FOR_CODEX_APP_QUIT"))
-            return .waitingForCodexAppQuit
-        } else if result.terminationStatus == 2 {
-            desktopPatchLogger.warning("Desktop patch skipped; app structure changed")
-            SwapLog.append(.debug("DESKTOP_PATCH_SKIPPED_STRUCTURE_CHANGED"))
-            return .structureChanged
-        } else if isSigningIdentityMissing(output) {
-            desktopPatchLogger.error("Desktop patch needs a non-ad-hoc code signing identity")
-            SwapLog.append(.debug("DESKTOP_PATCH_SIGNING_IDENTITY_MISSING"))
-            return .missingSigningIdentity
-        } else if isPermissionDenied(output) {
-            markPermissionDenied()
-            desktopPatchLogger.error("Desktop patch needs App Management permission")
-            SwapLog.append(.debug("DESKTOP_PATCH_PERMISSION_DENIED"))
-            return .permissionDenied
-        } else {
-            desktopPatchLogger.error("Desktop patch failed status=\(result.terminationStatus)")
-            SwapLog.append(.debug("DESKTOP_PATCH_FAILED status=\(result.terminationStatus)"))
-            return .failed(result.terminationStatus)
+            let output = [result.stdoutString, result.stderrString]
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            appendPatchLog(output.isEmpty ? "patch exited status=\(result.terminationStatus)" : output)
+
+            if result.timedOut {
+                desktopPatchLogger.error("Desktop patch timed out")
+                SwapLog.append(.debug("DESKTOP_PATCH_TIMEOUT"))
+                return .timedOut
+            } else if result.terminationStatus == 0 {
+                clearPermissionDenied()
+                desktopPatchLogger.info("Desktop patch completed")
+                SwapLog.append(.debug("DESKTOP_PATCH_COMPLETED"))
+                return .completed
+            } else if result.terminationStatus == 3 || isLiveAppRefusal(output) {
+                clearPatchAttempt()
+                desktopPatchLogger.warning("Desktop patch waiting for Codex.app to quit")
+                SwapLog.append(.debug("DESKTOP_PATCH_WAITING_FOR_CODEX_APP_QUIT"))
+                return .waitingForCodexAppQuit
+            } else if result.terminationStatus == 2 {
+                desktopPatchLogger.warning("Desktop patch skipped; app structure changed")
+                SwapLog.append(.debug("DESKTOP_PATCH_SKIPPED_STRUCTURE_CHANGED"))
+                return .structureChanged
+            } else if isSigningIdentityMissing(output) {
+                desktopPatchLogger.error("Desktop patch needs a non-ad-hoc code signing identity")
+                SwapLog.append(.debug("DESKTOP_PATCH_SIGNING_IDENTITY_MISSING"))
+                return .missingSigningIdentity
+            } else if isPermissionDenied(output) {
+                markPermissionDenied()
+                desktopPatchLogger.error("Desktop patch needs App Management permission")
+                SwapLog.append(.debug("DESKTOP_PATCH_PERMISSION_DENIED"))
+                return .permissionDenied
+            } else {
+                desktopPatchLogger.error("Desktop patch failed status=\(result.terminationStatus)")
+                SwapLog.append(.debug("DESKTOP_PATCH_FAILED status=\(result.terminationStatus)"))
+                return .failed(result.terminationStatus)
+            }
         }
+
+        switch outcome {
+        case .alreadyInProgress:
+            SwapLog.append(.debug("DESKTOP_PATCH_ALREADY_IN_PROGRESS"))
+        case .leaseUnavailable:
+            SwapLog.append(.debug("DESKTOP_PATCH_LEASE_UNAVAILABLE"))
+        case .completed:
+            statusCache.set(computeCurrentStatus())
+        default:
+            break
+        }
+        return outcome
     }
 
-    nonisolated static func runtimeHotSwapState() -> DesktopRuntimeHotSwapState {
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-fl", "codex"],
-            timeout: 2
-        )
-        guard !result.timedOut, result.terminationStatus == 0 else {
-            return .unknown
+    nonisolated static func withDesktopPatchMutationLease(
+        lockPath: String,
+        appendLog: (String) -> Void,
+        operation: () throws -> DesktopPatchAttemptOutcome
+    ) rethrows -> DesktopPatchAttemptOutcome {
+        switch DesktopPatchMutationLease.acquire(at: lockPath) {
+        case .acquired(let lease):
+            defer { lease.release() }
+            return try operation()
+        case .alreadyInProgress:
+            let outcome = DesktopPatchAttemptOutcome.alreadyInProgress
+            appendLog(
+                "desktop patch lease contention: another patch attempt is already in progress outcome=\(outcome.logValue)"
+            )
+            return outcome
+        case .unavailable:
+            let outcome = DesktopPatchAttemptOutcome.leaseUnavailable
+            appendLog("desktop patch lease unavailable at \(lockPath): outcome=\(outcome.logValue)")
+            return outcome
         }
-
-        return runtimeHotSwapState(
-            from: result.stdoutString,
-            hotSwapSupport: { pid in
-                SwapEngine.codexProcessHasHotSwapSupport(pid: pid)
-            }
-        )
     }
 
     nonisolated static func runtimeHotSwapState(
-        from processListOutput: String,
-        hotSwapSupport: (Int32) -> Bool,
-        hotSwapAck: (Int32) -> Bool = { pid in desktopHotSwapAckExists(pid: pid) }
-    ) -> DesktopRuntimeHotSwapState {
-        var sawDesktopRuntime = false
-
-        for line in processListOutput.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-
-            let lower = trimmed.lowercased()
-            if lower.contains("codexswitch"),
-               !isCodexSwitchManagedDesktopRuntimeLine(lower) {
-                continue
-            }
-            if lower.contains("pgrep") || lower.contains("codex_chronicle") {
-                continue
-            }
-            guard isDesktopHotSwapRuntimeLine(lower) else {
-                continue
-            }
-            guard let pid = Int32(trimmed.split(separator: " ", maxSplits: 1).first ?? "") else {
-                continue
-            }
-
-            sawDesktopRuntime = true
-            if !hotSwapSupport(pid) || !hotSwapAck(pid) {
-                return .restartRequired
-            }
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        runtimeEvidenceProvider: @Sendable (
+            HotSwapRuntimeKind,
+            URL
+        ) -> CodexLocalRuntimeEvidenceSnapshot = { runtimeKind, homeDirectory in
+            SwapEngine.localRuntimeEvidenceSnapshot(
+                runtimeKind: runtimeKind,
+                homeDirectory: homeDirectory
+            )
         }
-
-        return sawDesktopRuntime ? .ready : .unknown
+    ) -> DesktopRuntimeHotSwapState {
+        let evidence = runtimeEvidenceProvider(
+            .externalAppServer,
+            homeDirectory
+        )
+        return runtimeHotSwapState(from: evidence)
     }
 
-    nonisolated static func desktopHotSwapAckExists(pid: Int32, since: Date? = nil) -> Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let ackURL = home
-            .appendingPathComponent(".codexswitch")
-            .appendingPathComponent("hotswap-ack")
-            .appendingPathComponent("\(pid).json")
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: ackURL.path),
-              let modified = attributes[.modificationDate] as? Date
-        else {
-            return false
-        }
-        if let since, modified < since.addingTimeInterval(-1) {
-            return false
-        }
-        return true
+    nonisolated static func runtimeHotSwapState(
+        from evidence: CodexLocalRuntimeEvidenceSnapshot
+    ) -> DesktopRuntimeHotSwapState {
+        guard evidence.isComplete, !evidence.runtimes.isEmpty else { return .unknown }
+        return evidence.runtimes.allSatisfy { runtime in
+            runtime.observation.target.runtimeKind == .externalAppServer
+                && SwapEngine.bindingMatchesObservation(
+                    runtime.startupAcknowledgement.binding,
+                    runtime.observation
+                )
+        } ? .ready : .unknown
     }
 
     nonisolated static func isDesktopHotSwapRuntimeLine(_ lowercasedProcessLine: String) -> Bool {
@@ -561,7 +711,7 @@ enum DesktopPatchManager {
         if !codesignIdentityAvailable {
             return running
                 ? "Desktop app patch blocked: Apple signing identity/private key is missing; quitting Codex.app alone will not patch it."
-                : "Desktop app patch blocked: Apple signing identity/private key is missing. Revoke and recreate Apple Development in Xcode."
+                : "Desktop app patch blocked: Apple signing identity/private key is missing. Open Xcode account signing or restore the cached Apple-issued iPhone Developer keypair."
         }
         if running {
             return "Desktop app patch pending: Codex.app/app-server is still running; use ⌘Q to quit."
@@ -579,6 +729,7 @@ enum DesktopPatchManager {
         guard FileManager.default.fileExists(atPath: asarPath) else {
             return InstalledMarkers(
                 auth: false,
+                remoteRecents: false,
                 fast: false,
                 bundledPluginListRoot: false,
                 bundledCLI: false,
@@ -587,6 +738,12 @@ enum DesktopPatchManager {
             )
         }
         let auth = fileContainsMarker(authPatchMarker, at: asarPath)
+            && fileContainsMarker(modelLabelFallbackMarker, at: asarPath)
+            && fileContainsMarker(modelAvailabilityFallbackMarker, at: asarPath)
+            && fileContainsMarker(selectedModelLabelFallbackMarker, at: asarPath)
+            && fileContainsMarker(gpt56MaxEffortFallbackMarker, at: asarPath)
+            && fileContainsMarker(remoteModelRefreshMarker, at: asarPath)
+        let remoteRecents = fileContainsMarker(remoteRecentsPatchMarker, at: asarPath)
         let fast = fileContainsMarker(fastPatchMarker, at: asarPath)
         let bundledPluginListRoot = fileContainsMarker(bundledPluginListRootPatchMarker, at: asarPath)
         let bundledCLI = bundledCLIHasHotSwapPatch()
@@ -594,6 +751,7 @@ enum DesktopPatchManager {
         let versionCompatible = bundledCLI ? bundledCLIVersionCompatible() : pluginSignatureCompatible
         return InstalledMarkers(
             auth: auth,
+            remoteRecents: remoteRecents,
             fast: fast,
             bundledPluginListRoot: bundledPluginListRoot,
             bundledCLI: bundledCLI,
@@ -636,9 +794,9 @@ enum DesktopPatchManager {
     }
 
     nonisolated static func bundledCLIHasHotSwapPatch() -> Bool {
-        fileContainsMarker(sighupVerifiedMarker, at: bundledCLIPath)
-            && fileContainsMarker(sighupReloadMarker, at: bundledCLIPath)
-            && fileContainsMarker(hotSwapAckMarker, at: bundledCLIPath)
+        (RuntimeHotSwapContract.commonMarkers + RuntimeHotSwapContract.externalAppServerMarkers)
+            .allSatisfy { fileContainsMarker($0, at: bundledCLIPath) }
+            && fileHasGoalSupport(at: bundledCLIPath)
     }
 
     nonisolated static func fileContainsMarker(
@@ -705,25 +863,20 @@ enum DesktopPatchManager {
         return !bundledVersion.lexicographicallyPrecedes(stockVersion)
     }
 
-    nonisolated static func stockVendorCLIRepairAllowed() -> Bool {
-        false
+    nonisolated static func fileHasGoalSupport(at path: String) -> Bool {
+        fileContainsMarker(goalUsageMarker, at: path)
+            || (
+                fileContainsMarker(goalStatusMarker, at: path)
+                    && fileContainsMarker(goalRPCMarker, at: path)
+            )
     }
 
-    private nonisolated static func repairStockVendorCLIIfNeeded() {
-        guard FileManager.default.fileExists(atPath: stockVendorCLIPath) else { return }
-        guard !cliHasHotSwapPatch(at: stockVendorCLIPath) else { return }
-        guard stockVendorCLIRepairAllowed() else {
-            return
-        }
-    }
-
-    private nonisolated static func cliHasHotSwapPatch(at path: String) -> Bool {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
-            return false
-        }
-        return data.range(of: Data(sighupVerifiedMarker.utf8)) != nil
-            && data.range(of: Data(sighupReloadMarker.utf8)) != nil
-            && data.range(of: Data(hotSwapAckMarker.utf8)) != nil
+    nonisolated static func binaryDataHasGoalSupport(_ data: Data) -> Bool {
+        data.range(of: Data(goalUsageMarker.utf8)) != nil
+            || (
+                data.range(of: Data(goalStatusMarker.utf8)) != nil
+                    && data.range(of: Data(goalRPCMarker.utf8)) != nil
+            )
     }
 
     private nonisolated static func cliVersion(at path: String) -> [Int]? {
@@ -773,6 +926,36 @@ enum DesktopPatchManager {
     }
 
     nonisolated static func codesignIdentityAvailable() -> Bool {
+        selectedCodesignIdentityFromPatcher() != nil
+    }
+
+    nonisolated static func selectedCodesignIdentityFromPatcher() -> String? {
+        guard let script = patchScriptPath() else {
+            return nil
+        }
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            arguments: [script, "--print-codesign-identity"],
+            timeout: 30,
+            environment: environment
+        )
+        guard !result.timedOut, result.terminationStatus == 0 else {
+            return nil
+        }
+        let output = result.stdoutString + "\n" + result.stderrString
+        guard let identity = output.components(separatedBy: "\n")
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .last(where: { !$0.isEmpty }),
+            identity != "-"
+        else {
+            return nil
+        }
+        return identity
+    }
+
+    nonisolated static func legacyCodesignIdentityLineAvailable() -> Bool {
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/security"),
             arguments: ["find-identity", "-v", "-p", "codesigning"],
@@ -801,8 +984,10 @@ enum DesktopPatchManager {
         }
         let identity = String(trimmed[trimmed.index(after: firstQuote)..<lastQuote])
         return identity.hasPrefix("Developer ID Application")
+            || identity.hasPrefix("Apple Distribution")
             || identity.hasPrefix("Apple Development")
             || identity.hasPrefix("Mac Developer")
+            || identity.hasPrefix("iPhone Developer")
     }
 
     private nonisolated static func spctlAccepts(path: String) -> Bool {
@@ -830,36 +1015,54 @@ enum DesktopPatchManager {
             "/Applications/CodexSwitch.app/Contents/Resources/patch-asar.py",
             NSString("~/Developer/CodexSwitch/scripts/patch-asar.py").expandingTildeInPath,
             NSString("~/Developer/codexswitch/scripts/patch-asar.py").expandingTildeInPath,
-            "/Users/brendondelgado/Developer/CodexSwitch/scripts/patch-asar.py",
         ].compactMap { $0 }
 
         return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }
 
     nonisolated static func isCodexDesktopRuntimeRunning() -> Bool {
+        let runningHostBundleIdentifiers = desktopHostBundleIdentifiers.filter { bundleIdentifier in
+            NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+                .contains { !$0.isTerminated }
+        }
+        if desktopSafeQuitIsBlocked(
+            runningHostBundleIdentifiers: runningHostBundleIdentifiers,
+            appServerProcessListOutput: ""
+        ) {
+            return true
+        }
+
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-fl", "/Applications/Codex.app/Contents"],
+            arguments: ["-fl", "codex.*app-server"],
             timeout: 2
         )
-        guard !result.timedOut, result.terminationStatus == 0 else {
+        if result.timedOut || (result.terminationStatus != 0 && result.terminationStatus != 1) {
+            return true
+        }
+        guard result.terminationStatus == 0 else {
             return false
         }
 
-        return result.stdoutString.components(separatedBy: "\n").contains { line in
-            let lower = line.lowercased()
-            if lower.contains("codexswitch") { return false }
-            if lower.contains("pgrep") { return false }
-            if lower.contains("codex resume") { return false }
-            if lower.contains("codex exec") { return false }
-            if lower.contains("/applications/codex.app/contents/resources/codex")
-                && !lower.contains(" app-server") {
-                return false
-            }
-            if lower.contains(" app-server") { return true }
-            return lower.contains("/applications/codex.app/contents/macos/codex")
-                || lower.contains("codex helper")
+        return desktopSafeQuitIsBlocked(
+            runningHostBundleIdentifiers: [],
+            appServerProcessListOutput: result.stdoutString
+        )
+    }
+
+    nonisolated static func desktopSafeQuitIsBlocked(
+        runningHostBundleIdentifiers: [String],
+        appServerProcessListOutput: String
+    ) -> Bool {
+        let knownBundleIdentifiers = Set(desktopHostBundleIdentifiers.map { $0.lowercased() })
+        if runningHostBundleIdentifiers.contains(where: {
+            knownBundleIdentifiers.contains($0.lowercased())
+        }) {
+            return true
         }
+        return !DesktopRuntimeDiagnostics.parseAppServerProcesses(
+            fromPGrepOutput: appServerProcessListOutput
+        ).isEmpty
     }
 
     private nonisolated static func appServerPIDs() -> [Int32] {
@@ -884,9 +1087,11 @@ enum DesktopPatchManager {
     }
 
     private nonisolated static func codexDesktopHostPIDs() -> [Int32] {
+        let appContentsPath = "\(codexAppPath)/Contents"
+        let lowerAppContentsPath = appContentsPath.lowercased()
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-fl", "/Applications/Codex.app/Contents"],
+            arguments: ["-fl", appContentsPath],
             timeout: 2
         )
         guard !result.timedOut, result.terminationStatus == 0 else {
@@ -900,8 +1105,9 @@ enum DesktopPatchManager {
             if lower.contains("codex resume") { return nil }
             if lower.contains("codex exec") { return nil }
             if lower.contains("computer use") { return nil }
-            guard lower.contains("/applications/codex.app/contents/macos/codex")
-                || lower.contains("codex helper") else {
+            guard lower.contains("\(lowerAppContentsPath)/macos/")
+                || lower.contains("codex helper")
+                || lower.contains("codex (renderer)") else {
                 return nil
             }
             let parts = line.split(separator: " ", maxSplits: 1)

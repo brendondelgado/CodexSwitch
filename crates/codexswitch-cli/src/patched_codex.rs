@@ -1,7 +1,16 @@
+use crate::bounded_command;
 use anyhow::{bail, Context, Result};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{BufReader, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const INSTALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const LAUNCHER_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct InstallPatchedCodexOptions {
@@ -22,191 +31,83 @@ pub struct InstallPatchedCodexReport {
 }
 
 pub fn install(options: InstallPatchedCodexOptions) -> Result<InstallPatchedCodexReport> {
-    let source = options.source.expand_home();
-    let workspace = if source.file_name().is_some_and(|name| name == "codex-rs") {
-        source
-    } else {
-        source.join("codex-rs")
-    };
-    let built_binary = workspace.join("target/release/codex");
-    let install_dir = home_dir()?.join(".local/share/codexswitch/patched-codex");
-    let installed_binary = install_dir.join("codex");
-    let user_launcher = home_dir()?.join(".local/bin/codex");
+    let InstallPatchedCodexOptions {
+        source,
+        yes,
+        replace_system_entry,
+        replace_npm_vendor,
+    } = options;
+    bail!(
+        "direct install-patched-codex is disabled for source {} (yes={yes}, replace-system-entry={replace_system_entry}, replace-npm-vendor={replace_npm_vendor}); prepare a reviewed generation and install it only through the guarded journaled updater transaction",
+        source.display()
+    )
+}
 
-    let report = InstallPatchedCodexReport {
-        built_binary: built_binary.clone(),
-        installed_binary: installed_binary.clone(),
-        user_launcher: user_launcher.clone(),
-        system_launcher_replaced: options.replace_system_entry,
-        npm_vendor_replaced: options.replace_npm_vendor,
-        dry_run: !options.yes,
-    };
-
-    if !options.yes {
-        return Ok(report);
-    }
-
-    if !workspace.join("Cargo.toml").exists() {
-        bail!("Codex Rust workspace not found at {}", workspace.display());
-    }
-
-    ensure_linux_build_prerequisites()?;
-
-    let build_status = Command::new("bash")
-        .arg("-lc")
-        .arg(
-            ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             CARGO_PROFILE_RELEASE_LTO=false \
-             CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
-             cargo build --release -p codex-cli",
+pub fn validate_code_mode_host_for_runtime(codex_binary: &Path) -> Result<()> {
+    let helper = codex_binary.with_file_name("codex-code-mode-host");
+    let metadata = fs::metadata(&helper).with_context(|| {
+        format!(
+            "prepared Codex runtime is missing codex-code-mode-host: {}",
+            helper.display()
         )
-        .current_dir(&workspace)
-        .status()
-        .with_context(|| format!("failed to build Codex at {}", workspace.display()))?;
-    if !build_status.success() {
-        bail!("Codex build failed with {build_status}");
-    }
-    if !binary_has_hot_swap_markers(&built_binary) {
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 {
         bail!(
-            "built Codex binary is missing SIGHUP hot-swap markers: {}",
-            built_binary.display()
+            "prepared codex-code-mode-host is empty or not a file: {}",
+            helper.display()
         );
     }
-
-    install_prepared_binary(&built_binary, &installed_binary, &user_launcher)?;
-
-    if options.replace_system_entry {
-        let system_launcher = "/usr/bin/codex";
-        let backup = "/usr/bin/codex.codexswitch-backup";
-        let script_path = install_dir.join("codex-launcher");
-        fs::write(
-            &script_path,
-            launcher_script(&installed_binary.display().to_string()),
-        )?;
-        set_executable(&script_path)?;
-        let command = format!(
-            "if [ ! -e {backup} ]; then cp -P {system} {backup}; fi; install -m 755 {script} {system}",
-            backup = shell_quote(backup),
-            system = shell_quote(system_launcher),
-            script = shell_quote(&script_path.display().to_string())
-        );
-        let status = Command::new("bash")
-            .arg("-lc")
-            .arg(format!("sudo -n bash -lc {}", shell_quote(&command)))
-            .status()
-            .context("failed to replace /usr/bin/codex with patched launcher")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!(
+                "prepared codex-code-mode-host is not executable: {}",
+                helper.display()
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if path_is_macho(&helper)? {
+        let status = bounded_command::status(
+            Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict"])
+                .arg(&helper),
+            PROBE_COMMAND_TIMEOUT,
+        )
+        .with_context(|| format!("failed to verify staged helper {}", helper.display()))?;
         if !status.success() {
-            bail!("failed to replace /usr/bin/codex with patched launcher: {status}");
+            bail!(
+                "staged codex-code-mode-host signature is invalid: {}",
+                helper.display()
+            );
         }
-    }
-
-    if options.replace_npm_vendor {
-        replace_npm_vendor_binary(&installed_binary)?;
-    }
-
-    Ok(report)
-}
-
-fn replace_npm_vendor_binary(installed_binary: &Path) -> Result<()> {
-    let vendor_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex";
-    let backup = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex.codexswitch-backup";
-    if !Path::new(vendor_binary).exists() {
-        return Ok(());
-    }
-    let command = format!(
-        "if [ ! -e {backup} ]; then cp -P {vendor} {backup}; fi; install -m 755 {source} {vendor}",
-        backup = shell_quote(backup),
-        vendor = shell_quote(vendor_binary),
-        source = shell_quote(&installed_binary.display().to_string())
-    );
-    let status = Command::new("bash")
-        .arg("-lc")
-        .arg(format!("sudo -n bash -lc {}", shell_quote(&command)))
-        .status()
-        .context("failed to replace npm Codex vendor binary")?;
-    if !status.success() {
-        bail!("failed to replace npm Codex vendor binary: {status}");
     }
     Ok(())
 }
 
-pub fn install_prepared_binary(
-    prepared_binary: &Path,
-    installed_binary: &Path,
-    user_launcher: &Path,
-) -> Result<()> {
-    if !binary_has_hot_swap_markers(prepared_binary) {
-        bail!(
-            "prepared Codex binary is missing SIGHUP hot-swap markers: {}",
-            prepared_binary.display()
-        );
-    }
-    let launcher_target = if cfg!(target_os = "macos") {
-        if let Some(parent) = installed_binary.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(
-            installed_binary,
-            launcher_script(&prepared_binary.display().to_string()),
-        )?;
-        set_executable(installed_binary)?;
-        prepared_binary
-    } else {
-        if let Some(parent) = installed_binary.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        atomic_install_binary(prepared_binary, installed_binary)?;
-        installed_binary
-    };
-
-    if let Some(parent) = user_launcher.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        user_launcher,
-        launcher_script(&launcher_target.display().to_string()),
-    )?;
-    set_executable(user_launcher)?;
-    Ok(())
+pub fn runtime_has_valid_code_mode_host(codex_binary: &Path) -> bool {
+    validate_code_mode_host_for_runtime(codex_binary).is_ok()
 }
 
-fn atomic_install_binary(source: &Path, destination: &Path) -> Result<()> {
-    let parent = destination
-        .parent()
-        .with_context(|| format!("{} has no parent directory", destination.display()))?;
-    fs::create_dir_all(parent)?;
-    let pid = std::process::id();
-    let temp_destination = parent.join(format!(
-        ".{}.tmp-{pid}",
-        destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("codex")
-    ));
-    if temp_destination.exists() {
-        fs::remove_file(&temp_destination).with_context(|| {
-            format!(
-                "failed to remove stale temporary install file {}",
-                temp_destination.display()
-            )
-        })?;
+#[cfg(target_os = "macos")]
+fn path_is_macho(path: &Path) -> Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut magic = [0_u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return Ok(false);
     }
-    fs::copy(source, &temp_destination).with_context(|| {
-        format!(
-            "failed to copy {} to temporary install file {}",
-            source.display(),
-            temp_destination.display()
-        )
-    })?;
-    set_executable(&temp_destination)?;
-    fs::rename(&temp_destination, destination).with_context(|| {
-        format!(
-            "failed to atomically replace {} with {}",
-            destination.display(),
-            source.display()
-        )
-    })?;
-    Ok(())
+    Ok(matches!(
+        magic,
+        [0xcf, 0xfa, 0xed, 0xfe]
+            | [0xfe, 0xed, 0xfa, 0xcf]
+            | [0xce, 0xfa, 0xed, 0xfe]
+            | [0xfe, 0xed, 0xfa, 0xce]
+            | [0xca, 0xfe, 0xba, 0xbe]
+            | [0xbe, 0xba, 0xfe, 0xca]
+            | [0xca, 0xfe, 0xba, 0xbf]
+            | [0xbf, 0xba, 0xfe, 0xca]
+    ))
 }
 
 pub fn default_installed_binary() -> Result<PathBuf> {
@@ -217,28 +118,166 @@ pub fn default_user_launcher() -> Result<PathBuf> {
     Ok(home_dir()?.join(".local/bin/codex"))
 }
 
-pub fn binary_has_hot_swap_markers(path: &Path) -> bool {
-    let Ok(data) = fs::read(path) else {
-        return false;
-    };
-    contains_bytes(&data, b"sighup-verified")
-        && contains_bytes(&data, b"SIGHUP: auth reloaded")
-        && contains_bytes(&data, b"hotswap-ack")
-        && contains_bytes(&data, b"CodexSwitch rotated accounts after a usage limit")
-        && contains_bytes(
-            &data,
-            b"Auth changed, opening new WebSocket with fresh credentials",
-        )
-        && binary_data_has_goal_support(&data)
+pub fn default_homebrew_launcher() -> PathBuf {
+    PathBuf::from("/opt/homebrew/bin/codex")
 }
 
-pub fn binary_data_has_goal_support(data: &[u8]) -> bool {
-    contains_bytes(data, b"Usage: /goal <objective>")
-        || (contains_bytes(data, b"Pursuing goal") && contains_bytes(data, b"thread/goal/set"))
+pub fn binary_has_hot_swap_markers(path: &Path) -> bool {
+    binary_has_marker_contract(path, RequiredMarkerContract::Full)
+}
+
+#[cfg(test)]
+pub fn binary_has_external_app_server_hot_swap_markers(path: &Path) -> bool {
+    binary_has_marker_contract(path, RequiredMarkerContract::ExternalAppServer)
+}
+
+#[cfg(test)]
+pub fn binary_has_local_cli_hot_swap_markers(path: &Path) -> bool {
+    binary_has_marker_contract(path, RequiredMarkerContract::LocalCli)
+}
+
+const BINARY_MARKER_SCAN_CHUNK_BYTES: usize = 128 * 1024;
+const COMMON_HOT_SWAP_MARKERS: [&[u8]; 8] = [
+    b"sighup-verified",
+    b"SIGHUP: auth reloaded",
+    b"hotswap-ack",
+    b"CodexSwitch rotated accounts after a usage limit",
+    b"CodexSwitch rotated accounts after an auth failure",
+    b"Auth changed, opening new WebSocket with fresh credentials",
+    b"codexswitch-runtime-convergence-v3",
+    b"codexswitch-runtime-rotation-handoff-v1",
+];
+const EXTERNAL_APP_SERVER_HOT_SWAP_MARKERS: [&[u8]; 2] = [
+    b"CodexSwitch account/updated frontend write acknowledged after auth reload",
+    b"codexswitch-hotswap-contract-v3",
+];
+const LOCAL_CLI_HOT_SWAP_MARKERS: [&[u8]; 1] = [b"codexswitch-hotswap-cli-contract-v3"];
+const GOAL_USAGE_MARKER: &[u8] = b"Usage: /goal <objective>";
+const GOAL_PURSUING_MARKER: &[u8] = b"Pursuing goal";
+const GOAL_SET_MARKER: &[u8] = b"thread/goal/set";
+
+#[derive(Default)]
+struct BinaryMarkerState {
+    common: [bool; COMMON_HOT_SWAP_MARKERS.len()],
+    external: [bool; EXTERNAL_APP_SERVER_HOT_SWAP_MARKERS.len()],
+    local: [bool; LOCAL_CLI_HOT_SWAP_MARKERS.len()],
+    goal_usage: bool,
+    goal_pursuing: bool,
+    goal_set: bool,
+}
+
+#[derive(Clone, Copy)]
+enum RequiredMarkerContract {
+    Full,
+    #[cfg(test)]
+    ExternalAppServer,
+    #[cfg(test)]
+    LocalCli,
+}
+
+impl BinaryMarkerState {
+    fn update(&mut self, data: &[u8]) {
+        update_marker_flags(&mut self.common, &COMMON_HOT_SWAP_MARKERS, data);
+        update_marker_flags(
+            &mut self.external,
+            &EXTERNAL_APP_SERVER_HOT_SWAP_MARKERS,
+            data,
+        );
+        update_marker_flags(&mut self.local, &LOCAL_CLI_HOT_SWAP_MARKERS, data);
+        self.goal_usage |= contains_bytes(data, GOAL_USAGE_MARKER);
+        self.goal_pursuing |= contains_bytes(data, GOAL_PURSUING_MARKER);
+        self.goal_set |= contains_bytes(data, GOAL_SET_MARKER);
+    }
+
+    fn has_common_contract(&self) -> bool {
+        self.common.iter().all(|present| *present)
+            && (self.goal_usage || (self.goal_pursuing && self.goal_set))
+    }
+
+    fn has_external_app_server_contract(&self) -> bool {
+        self.external.iter().all(|present| *present)
+    }
+
+    fn has_local_cli_contract(&self) -> bool {
+        self.local.iter().all(|present| *present)
+    }
+
+    fn satisfies(&self, required: RequiredMarkerContract) -> bool {
+        self.has_common_contract()
+            && match required {
+                RequiredMarkerContract::Full => {
+                    self.has_external_app_server_contract() && self.has_local_cli_contract()
+                }
+                #[cfg(test)]
+                RequiredMarkerContract::ExternalAppServer => {
+                    self.has_external_app_server_contract()
+                }
+                #[cfg(test)]
+                RequiredMarkerContract::LocalCli => self.has_local_cli_contract(),
+            }
+    }
+}
+
+fn update_marker_flags<const N: usize>(flags: &mut [bool; N], markers: &[&[u8]; N], data: &[u8]) {
+    for (index, marker) in markers.iter().enumerate() {
+        if !flags[index] {
+            flags[index] = contains_bytes(data, marker);
+        }
+    }
+}
+
+fn binary_has_marker_contract(path: &Path, required: RequiredMarkerContract) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::with_capacity(BINARY_MARKER_SCAN_CHUNK_BYTES, file);
+    let overlap_bytes = maximum_marker_length().saturating_sub(1);
+    let mut chunk = vec![0_u8; BINARY_MARKER_SCAN_CHUNK_BYTES];
+    let mut overlap = Vec::with_capacity(overlap_bytes);
+    let mut scan = Vec::with_capacity(BINARY_MARKER_SCAN_CHUNK_BYTES + overlap_bytes);
+    let mut state = BinaryMarkerState::default();
+
+    loop {
+        let Ok(count) = reader.read(&mut chunk) else {
+            return false;
+        };
+        if count == 0 {
+            break;
+        }
+        scan.clear();
+        scan.extend_from_slice(&overlap);
+        scan.extend_from_slice(&chunk[..count]);
+        state.update(&scan);
+        if state.satisfies(required) {
+            return true;
+        }
+
+        let keep = overlap_bytes.min(scan.len());
+        overlap.clear();
+        overlap.extend_from_slice(&scan[scan.len() - keep..]);
+    }
+    state.satisfies(required)
+}
+
+fn maximum_marker_length() -> usize {
+    COMMON_HOT_SWAP_MARKERS
+        .iter()
+        .chain(EXTERNAL_APP_SERVER_HOT_SWAP_MARKERS.iter())
+        .chain(LOCAL_CLI_HOT_SWAP_MARKERS.iter())
+        .copied()
+        .chain([GOAL_USAGE_MARKER, GOAL_PURSUING_MARKER, GOAL_SET_MARKER])
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or(1)
 }
 
 pub fn codex_version(binary: &Path) -> Option<String> {
-    let output = Command::new(binary).arg("--version").output().ok()?;
+    let output = bounded_command::output(
+        Command::new(binary).arg("--version"),
+        PROBE_COMMAND_TIMEOUT,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -257,21 +296,25 @@ pub fn build_codex(workspace: &Path) -> Result<PathBuf> {
         bail!("Codex Rust workspace not found at {}", workspace.display());
     }
     ensure_linux_build_prerequisites()?;
-    let build_status = Command::new("bash")
-        .arg("-lc")
-        .arg(
-            ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
-             CARGO_PROFILE_RELEASE_LTO=false \
-             CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
-             cargo build --release -p codex-cli",
-        )
-        .current_dir(workspace)
-        .status()
-        .with_context(|| format!("failed to build Codex at {}", workspace.display()))?;
+    let build_status = bounded_command::status_inherited(
+        Command::new("bash")
+            .arg("-lc")
+            .arg(codex_build_command())
+            .current_dir(workspace),
+        BUILD_COMMAND_TIMEOUT,
+    )
+    .with_context(|| format!("failed to build Codex at {}", workspace.display()))?;
     if !build_status.success() {
         bail!("Codex build failed with {build_status}");
     }
     let built_binary = workspace.join("target/release/codex");
+    let built_code_mode_host = workspace.join("target/release/codex-code-mode-host");
+    if !built_code_mode_host.is_file() {
+        bail!(
+            "Codex build did not produce codex-code-mode-host: {}",
+            built_code_mode_host.display()
+        );
+    }
     if !binary_has_hot_swap_markers(&built_binary) {
         bail!(
             "built Codex binary is missing SIGHUP hot-swap markers: {}",
@@ -281,91 +324,263 @@ pub fn build_codex(workspace: &Path) -> Result<PathBuf> {
     Ok(built_binary)
 }
 
-fn launcher_script(patched_binary: &str) -> String {
-    let quoted = shell_quote(patched_binary);
-    r#"#!/usr/bin/env bash
-set -euo pipefail
-PATCHED_CODEX=__PATCHED_CODEX__
-
-has_patch() {
-  local candidate="$1"
-  [[ -r "$candidate" ]] || return 1
-  strings "$candidate" 2>/dev/null | awk '
-            /sighup-verified/ { has_marker = 1 }
-            /SIGHUP: auth reloaded/ { has_reload = 1 }
-            /hotswap-ack/ { has_ack = 1 }
-            /CodexSwitch rotated accounts after a usage limit/ { has_usage_retry = 1 }
-            /Auth changed, opening new WebSocket with fresh credentials/ { has_auth_ws = 1 }
-            END { exit !(has_marker && has_reload && has_ack && has_usage_retry && has_auth_ws) }
-          '
+fn codex_build_command() -> &'static str {
+    ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
+     CARGO_BUILD_JOBS=1; \
+     CODEXSWITCH_BUILD_NICE=\"${CODEXSWITCH_BUILD_NICE:-10}\"; \
+     export CARGO_BUILD_JOBS; \
+     build_codex_with_limits() { \
+       if command -v ionice >/dev/null 2>&1; then \
+         exec ionice -c 3 nice -n \"$CODEXSWITCH_BUILD_NICE\" cargo build --release --jobs \"$CARGO_BUILD_JOBS\" -p codex-cli -p codex-code-mode-host; \
+       else \
+         exec nice -n \"$CODEXSWITCH_BUILD_NICE\" cargo build --release --jobs \"$CARGO_BUILD_JOBS\" -p codex-cli -p codex-code-mode-host; \
+       fi; \
+     }; \
+     CARGO_TARGET_DIR=\"$PWD/target\" \
+     CARGO_PROFILE_RELEASE_LTO=false \
+     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+     build_codex_with_limits"
 }
 
-codex_version_base() {
-  local candidate="$1"
-  "$candidate" --version 2>/dev/null | awk '
-    {
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+/) {
-          sub(/-.*/, "", $i)
-          print $i
-          exit
+pub(crate) fn launcher_script_for_runtime(patched_binary: &Path) -> Result<String> {
+    let helper = patched_binary.with_file_name("codex-code-mode-host");
+    for path in [patched_binary, helper.as_path()] {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect launcher provenance {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "launcher provenance must be a regular non-symlink file: {}",
+                path.display()
+            );
         }
-      }
     }
-  '
+    if !binary_has_hot_swap_markers(patched_binary) {
+        bail!(
+            "launcher target is missing the complete CodexSwitch hot-swap contract: {}",
+            patched_binary.display()
+        );
+    }
+    validate_code_mode_host_for_runtime(patched_binary)?;
+    let canonical = fs::canonicalize(patched_binary).with_context(|| {
+        format!(
+            "failed to resolve launcher runtime provenance {}",
+            patched_binary.display()
+        )
+    })?;
+    Ok(launcher_script(
+        &canonical.display().to_string(),
+        &sha256_file(patched_binary)?,
+        &sha256_file(&helper)?,
+    ))
 }
 
-version_at_least_0128() {
-  local version major minor patch
-  version="$(codex_version_base "$1")"
-  IFS=. read -r major minor patch <<< "$version"
-  [[ "${major:-0}" =~ ^[0-9]+$ && "${minor:-0}" =~ ^[0-9]+$ && "${patch:-0}" =~ ^[0-9]+$ ]] || return 1
-  (( major > 0 || minor > 128 || (minor == 128 && patch >= 0) ))
+pub(crate) fn bridge_script_for_managed_launcher(managed_launcher: &Path) -> Result<String> {
+    if !managed_launcher.is_absolute() {
+        bail!("managed Codex launcher path must be absolute");
+    }
+    Ok(format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nMANAGED_CODEX={}\nif [[ ! -x \"$MANAGED_CODEX\" || -L \"$MANAGED_CODEX\" ]]; then\n  echo \"codex: managed CodexSwitch launcher is unavailable at $MANAGED_CODEX; run 'codexswitch-cli codex-update-status'\" >&2\n  exit 1\nfi\nexec \"$MANAGED_CODEX\" \"$@\"\n",
+        shell_quote(&managed_launcher.display().to_string())
+    ))
 }
 
-has_goal_support() {
-  local candidate="$1"
-  [[ -r "$candidate" ]] || return 1
-  strings "$candidate" 2>/dev/null | awk '
-            /Usage: \/goal <objective>/ { has_goal_usage = 1 }
-            /Pursuing goal/ { has_goal_status = 1 }
-            /thread\/goal\/set/ { has_goal_rpc = 1 }
-            END { exit !(has_goal_usage || (has_goal_status && has_goal_rpc)) }
-          '
+pub fn resolve_installed_runtime(installed_binary: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(installed_binary).with_context(|| {
+        format!(
+            "failed to inspect installed Codex entry {}",
+            installed_binary.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "installed Codex entry must be a regular non-symlink file: {}",
+            installed_binary.display()
+        );
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(installed_binary)
+        .with_context(|| format!("failed to open {}", installed_binary.display()))?;
+    let opened = file.metadata()?;
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.mode() != metadata.mode()
+    {
+        bail!("installed Codex entry changed identity while it was opened");
+    }
+    let mut prefix = [0_u8; 2];
+    let prefix_len = file
+        .read(&mut prefix)
+        .with_context(|| format!("failed to read {}", installed_binary.display()))?;
+    if prefix_len != prefix.len() || prefix != *b"#!" {
+        return Ok(installed_binary.to_path_buf());
+    }
+
+    let mut bytes = prefix.to_vec();
+    file.take(LAUNCHER_MAX_BYTES - prefix.len() as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", installed_binary.display()))?;
+    if bytes.len() as u64 > LAUNCHER_MAX_BYTES {
+        bail!("installed Codex launcher exceeded its bounded read limit");
+    }
+    if !bytes
+        .windows(b"PATCHED_CODEX=".len())
+        .any(|value| value == b"PATCHED_CODEX=")
+    {
+        return Ok(installed_binary.to_path_buf());
+    }
+
+    let launcher = std::str::from_utf8(&bytes).context("installed Codex launcher is not UTF-8")?;
+    let runtime = launcher_assignment(launcher, "PATCHED_CODEX")?;
+    let helper = launcher_assignment(launcher, "PATCHED_HELPER")?;
+    let expected_runtime_hash = launcher_assignment(launcher, "EXPECTED_CODEX_SHA256")?;
+    let expected_helper_hash = launcher_assignment(launcher, "EXPECTED_HELPER_SHA256")?;
+    for (label, hash) in [
+        ("runtime", expected_runtime_hash.as_str()),
+        ("helper", expected_helper_hash.as_str()),
+    ] {
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("installed Codex launcher has an invalid pinned {label} SHA-256");
+        }
+    }
+
+    let runtime = PathBuf::from(runtime);
+    let expected_helper = runtime.with_file_name("codex-code-mode-host");
+    if Path::new(&helper) != expected_helper {
+        bail!("installed Codex launcher helper provenance does not match its runtime");
+    }
+    let canonical_runtime = fs::canonicalize(&runtime)
+        .with_context(|| format!("failed to resolve pinned runtime {}", runtime.display()))?;
+    if canonical_runtime != runtime {
+        bail!("installed Codex launcher runtime path is not canonical");
+    }
+    for path in [&runtime, &expected_helper] {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect pinned runtime file {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "pinned runtime provenance must be a regular non-symlink file: {}",
+                path.display()
+            );
+        }
+    }
+    if sha256_file(&runtime)? != expected_runtime_hash
+        || sha256_file(&expected_helper)? != expected_helper_hash
+    {
+        bail!("installed Codex launcher pinned runtime hash verification failed");
+    }
+    if !binary_has_hot_swap_markers(&runtime) {
+        bail!("installed Codex launcher target lacks the complete hot-swap contract");
+    }
+    validate_code_mode_host_for_runtime(&runtime)?;
+    Ok(runtime)
 }
 
-if [[ -x "$PATCHED_CODEX" ]] \
-  && "$PATCHED_CODEX" --version >/dev/null 2>&1 \
-  && version_at_least_0128 "$PATCHED_CODEX" \
-  && has_patch "$PATCHED_CODEX" \
-  && has_goal_support "$PATCHED_CODEX"; then
-  exec "$PATCHED_CODEX" "$@"
-fi
+fn launcher_assignment(launcher: &str, key: &str) -> Result<String> {
+    let prefix = format!("{key}='");
+    let mut matches = launcher.lines().filter_map(|line| {
+        line.trim()
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix('\''))
+    });
+    let value = matches
+        .next()
+        .with_context(|| format!("installed Codex launcher omitted {key}"))?;
+    if matches.next().is_some() || value.contains('\'') || value.contains('\n') {
+        bail!("installed Codex launcher has ambiguous {key} provenance");
+    }
+    Ok(value.to_string())
+}
 
-echo "codex: patched goal-capable Codex binary unavailable; run codexswitch-cli install-prepared-codex" >&2
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open launcher provenance file {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    loop {
+        let count = reader.read(&mut buffer).with_context(|| {
+            format!("failed to hash launcher provenance file {}", path.display())
+        })?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn launcher_script(patched_binary: &str, runtime_sha256: &str, helper_sha256: &str) -> String {
+    let quoted = shell_quote(patched_binary);
+    let helper = shell_quote(
+        &Path::new(patched_binary)
+            .with_file_name("codex-code-mode-host")
+            .display()
+            .to_string(),
+    );
+    r#"#!/usr/bin/env bash
+	set -euo pipefail
+	PATCHED_CODEX=__PATCHED_CODEX__
+	PATCHED_HELPER=__PATCHED_HELPER__
+	EXPECTED_CODEX_SHA256=__EXPECTED_CODEX_SHA256__
+	EXPECTED_HELPER_SHA256=__EXPECTED_HELPER_SHA256__
+	CODEX_VPS="${CODEXSWITCH_CODEX_VPS:-$HOME/.local/bin/codex-vps}"
+
+	if [[ "${1:-}" == "--remote" ]]; then
+	  shift
+	  if [[ ! -x "$CODEX_VPS" ]]; then
+	    echo "codex: --remote requires the provenance-checked codex-vps synced client: $CODEX_VPS" >&2
+	    exit 1
+	  fi
+	  exec "$CODEX_VPS" --remote-client "$@"
+	fi
+
+	if [[ -x "$PATCHED_CODEX" && -x "$PATCHED_HELPER" ]] \
+	  && [[ ! -L "$PATCHED_CODEX" && ! -L "$PATCHED_HELPER" ]]; then
+	  exec "$PATCHED_CODEX" "$@"
+	fi
+
+echo "codex: local runtime failed complete provenance/hot-swap validation at $PATCHED_CODEX; run 'codexswitch-cli codex-update-status' and explicitly prepare/install a verified runtime" >&2
 exit 1
 "#
     .replace("__PATCHED_CODEX__", &quoted)
+    .replace("__PATCHED_HELPER__", &helper)
+    .replace("__EXPECTED_CODEX_SHA256__", &shell_quote(runtime_sha256))
+    .replace("__EXPECTED_HELPER_SHA256__", &shell_quote(helper_sha256))
 }
 
 fn ensure_linux_build_prerequisites() -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Ok(());
     }
-    let has_libcap = Command::new("bash")
-        .arg("-lc")
-        .arg("pkg-config --exists libcap")
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+    let has_libcap = bounded_command::status(
+        Command::new("bash")
+            .arg("-lc")
+            .arg("pkg-config --exists libcap"),
+        PROBE_COMMAND_TIMEOUT,
+    )
+    .map(|status| status.success())
+    .unwrap_or(false);
     if has_libcap {
         return Ok(());
     }
 
-    let status = Command::new("bash")
-        .arg("-lc")
-        .arg("sudo -n apt-get update && sudo -n apt-get install -y pkg-config libcap-dev build-essential")
-        .status()
+    let status = bounded_command::status_inherited(
+        Command::new("bash")
+            .arg("-lc")
+            .arg("sudo -n apt-get update && sudo -n apt-get install -y pkg-config libcap-dev build-essential"),
+        INSTALL_COMMAND_TIMEOUT,
+    )
         .context("failed to install Linux Codex build prerequisites")?;
     if !status.success() {
         bail!("failed to install Linux Codex build prerequisites: {status}");
@@ -379,6 +594,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+#[cfg(test)]
 fn set_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -396,27 +612,6 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-trait ExpandHome {
-    fn expand_home(&self) -> PathBuf;
-}
-
-impl ExpandHome for PathBuf {
-    fn expand_home(&self) -> PathBuf {
-        let Some(path) = self.to_str() else {
-            return self.clone();
-        };
-        if path == "~" {
-            return home_dir().unwrap_or_else(|_| self.clone());
-        }
-        if let Some(rest) = path.strip_prefix("~/") {
-            return home_dir()
-                .map(|home| home.join(rest))
-                .unwrap_or_else(|_| self.clone());
-        }
-        self.clone()
-    }
-}
-
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -424,82 +619,256 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
 
     #[test]
-    fn launcher_routes_app_server_to_patched_binary() {
-        let script = launcher_script("/home/signul/.local/share/codexswitch/patched-codex/codex");
+    fn marker_scans_distinguish_cli_and_strict_external_app_server_contracts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let strict = temp.path().join("strict-codex");
+        let cli = temp.path().join("cli-codex");
+        let full = temp.path().join("full-codex");
+        let common = "sighup-verified\nSIGHUP: auth reloaded\nhotswap-ack\nCodexSwitch rotated accounts after a usage limit\nCodexSwitch rotated accounts after an auth failure\nAuth changed, opening new WebSocket with fresh credentials\ncodexswitch-runtime-convergence-v3\ncodexswitch-runtime-rotation-handoff-v1\nUsage: /goal <objective>\n";
+        let strict_markers = "CodexSwitch account/updated frontend write acknowledged after auth reload\ncodexswitch-hotswap-contract-v3\n";
+        let cli_markers = "codexswitch-hotswap-cli-contract-v3\n";
+        fs::write(&strict, format!("{common}{strict_markers}"))?;
+        fs::write(&cli, format!("{common}{cli_markers}"))?;
+        fs::write(&full, format!("{common}{strict_markers}{cli_markers}"))?;
+
+        assert!(binary_has_external_app_server_hot_swap_markers(&strict));
+        assert!(!binary_has_local_cli_hot_swap_markers(&strict));
+        assert!(!binary_has_hot_swap_markers(&strict));
+        assert!(binary_has_local_cli_hot_swap_markers(&cli));
+        assert!(!binary_has_external_app_server_hot_swap_markers(&cli));
+        assert!(!binary_has_hot_swap_markers(&cli));
+        assert!(binary_has_hot_swap_markers(&full));
+        Ok(())
+    }
+
+    #[test]
+    fn marker_scan_handles_large_sparse_binaries_without_whole_file_reads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binary = temp.path().join("large-codex");
+        let markers = b"sighup-verified\nSIGHUP: auth reloaded\nhotswap-ack\nCodexSwitch rotated accounts after a usage limit\nCodexSwitch rotated accounts after an auth failure\nAuth changed, opening new WebSocket with fresh credentials\ncodexswitch-runtime-convergence-v3\ncodexswitch-runtime-rotation-handoff-v1\nUsage: /goal <objective>\nCodexSwitch account/updated frontend write acknowledged after auth reload\ncodexswitch-hotswap-contract-v3\ncodexswitch-hotswap-cli-contract-v3\n";
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&binary)?;
+        file.set_len(64 * 1024 * 1024)?;
+        file.seek(SeekFrom::End(-(markers.len() as i64)))?;
+        file.write_all(markers)?;
+        drop(file);
+
+        assert!(binary_has_hot_swap_markers(&binary));
+        Ok(())
+    }
+
+    #[test]
+    fn marker_scan_detects_markers_split_across_chunk_boundaries() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binary = temp.path().join("boundary-codex");
+        let markers = b"sighup-verified\nSIGHUP: auth reloaded\nhotswap-ack\nCodexSwitch rotated accounts after a usage limit\nCodexSwitch rotated accounts after an auth failure\nAuth changed, opening new WebSocket with fresh credentials\ncodexswitch-runtime-convergence-v3\ncodexswitch-runtime-rotation-handoff-v1\nUsage: /goal <objective>\ncodexswitch-hotswap-cli-contract-v3\n";
+        let mut contents = vec![0_u8; BINARY_MARKER_SCAN_CHUNK_BYTES - 5];
+        contents.extend_from_slice(markers);
+        fs::write(&binary, contents)?;
+
+        assert!(binary_has_local_cli_hot_swap_markers(&binary));
+        Ok(())
+    }
+
+    #[test]
+    fn launcher_routes_local_sessions_only_to_the_pinned_runtime() {
+        let script = launcher_script(
+            "/home/signul/.local/share/codexswitch/patched-codex/codex",
+            "runtime-sha256",
+            "helper-sha256",
+        );
 
         assert!(script
             .contains("PATCHED_CODEX='/home/signul/.local/share/codexswitch/patched-codex/codex'"));
         assert!(script.contains("exec \"$PATCHED_CODEX\" \"$@\""));
-        assert!(script.contains("sighup-verified"));
-        assert!(script.contains("SIGHUP: auth reloaded"));
-        assert!(script.contains("hotswap-ack"));
-        assert!(script.contains("CodexSwitch rotated accounts after a usage limit"));
-        assert!(script.contains("Auth changed, opening new WebSocket with fresh credentials"));
-        assert!(script.contains("Usage: \\/goal <objective>"));
+        assert!(script.contains("EXPECTED_CODEX_SHA256='runtime-sha256'"));
+        assert!(script.contains("EXPECTED_HELPER_SHA256='helper-sha256'"));
+        assert!(script.contains("codex-update-status"));
+        assert!(!script.contains("sha256_file()"));
+        assert!(!script.contains("codex_version_base()"));
+        assert!(!script.contains("version_at_least_0128"));
+        assert!(!script.contains("--version"));
+        assert!(!script.contains("strings \"$candidate\""));
+        assert!(!script.contains("has_patch()"));
+        assert!(!script.contains("has_goal_support()"));
         assert!(!script.contains("/usr/lib/node_modules/@openai/codex/bin/codex.js"));
+        assert!(!script.contains("remote-client/.../codex"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_executes_one_prevalidated_runtime_and_status_detects_drift() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = temp.path().join("runtime/codex");
+        let helper = temp.path().join("runtime/codex-code-mode-host");
+        let launcher = temp.path().join("bin/codex");
+        let trace = temp.path().join("trace");
+        fs::create_dir_all(runtime.parent().unwrap())?;
+        fs::create_dir_all(launcher.parent().unwrap())?;
+        fs::write(
+            &runtime,
+            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\nif [ \"${1:-}\" = --version ]; then echo 'codex-cli 0.144.1'; exit 0; fi\nprintf 'local:%s\\n' \"$*\" >> \"$TRACE\"\n",
+        )?;
+        fs::write(&helper, "#!/bin/sh\nexit 0\n")?;
+        set_executable(&runtime)?;
+        set_executable(&helper)?;
+        fs::write(&launcher, launcher_script_for_runtime(&runtime)?)?;
+        set_executable(&launcher)?;
+        assert_eq!(
+            resolve_installed_runtime(&launcher)?,
+            fs::canonicalize(&runtime)?
+        );
+
+        let first = Command::new(&launcher)
+            .arg("local-session")
+            .env("TRACE", &trace)
+            .output()?;
+        assert!(first.status.success());
+        assert_eq!(fs::read_to_string(&trace)?, "local:local-session\n");
+
+        fs::write(
+            &runtime,
+            "#!/bin/sh\nif [ \"${1:-}\" = --version ]; then echo 'codex-cli 0.144.1'; exit 0; fi\nprintf 'unverified:%s\\n' \"$*\" >> \"$TRACE\"\n",
+        )?;
+        set_executable(&runtime)?;
+        assert!(resolve_installed_runtime(&launcher).is_err());
+        assert_eq!(fs::read_to_string(&trace)?, "local:local-session\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_executes_only_the_managed_launcher() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let managed = temp.path().join("managed/codex");
+        let bridge = temp.path().join("bin/codex");
+        let trace = temp.path().join("trace");
+        fs::create_dir_all(managed.parent().unwrap())?;
+        fs::create_dir_all(bridge.parent().unwrap())?;
+        fs::write(&managed, "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$TRACE\"\n")?;
+        set_executable(&managed)?;
+        fs::write(&bridge, bridge_script_for_managed_launcher(&managed)?)?;
+        set_executable(&bridge)?;
+
+        let result = Command::new(&bridge)
+            .args(["resume", "thread-1"])
+            .env("TRACE", &trace)
+            .output()?;
+
+        assert!(result.status.success());
+        assert_eq!(fs::read_to_string(trace)?, "resume thread-1\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_remote_mode_uses_only_the_synced_remote_client_entrypoint() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let launcher = temp.path().join("codex");
+        let remote = temp.path().join("codex-vps");
+        let trace = temp.path().join("trace");
+        fs::write(
+            &launcher,
+            launcher_script("/missing/local/codex", "missing", "missing"),
+        )?;
+        fs::write(&remote, "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$TRACE\"\n")?;
+        set_executable(&launcher)?;
+        set_executable(&remote)?;
+
+        let result = Command::new(&launcher)
+            .args(["--remote", "resume", "thread-1"])
+            .env("CODEXSWITCH_CODEX_VPS", &remote)
+            .env("TRACE", &trace)
+            .output()?;
+
+        assert!(result.status.success());
+        assert_eq!(
+            fs::read_to_string(trace)?,
+            "--remote-client resume thread-1\n"
+        );
+        Ok(())
     }
 
     #[test]
-    fn install_prepared_binary_uses_versioned_prepared_path_on_macos() -> Result<()> {
+    fn legacy_fallback_launcher_is_rejected_without_executing_it() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let prepared_binary = temp.path().join("prepared-codex/0.128.0/codex");
+        let launcher = temp.path().join("codex");
+        let trace = temp.path().join("must-not-exist");
+        fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nPATCHED_CODEX='/missing/incomplete-runtime'\nprintf executed > '{}'\nexec /missing/synced-remote-client\n",
+                trace.display()
+            ),
+        )?;
+        set_executable(&launcher)?;
+
+        let error = resolve_installed_runtime(&launcher)
+            .expect_err("legacy fallback launchers must not be accepted as local provenance");
+
+        assert!(error.to_string().contains("omitted PATCHED_HELPER"));
+        assert!(!trace.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn native_binary_resolution_does_not_apply_the_launcher_size_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binary = temp.path().join("codex");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&binary)?;
+        file.write_all(b"\x7fELF")?;
+        file.set_len(LAUNCHER_MAX_BYTES + 1)?;
+        drop(file);
+
+        assert_eq!(resolve_installed_runtime(&binary)?, binary);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_install_command_is_hard_disabled_without_writing_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
         let installed_binary = temp.path().join("patched-codex/codex");
         let user_launcher = temp.path().join("bin/codex");
-        fs::create_dir_all(prepared_binary.parent().unwrap())?;
-        fs::write(
-            &prepared_binary,
-            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit Auth changed, opening new WebSocket with fresh credentials Usage: /goal <objective>\necho codex-cli 0.128.0\n",
-        )?;
-        set_executable(&prepared_binary)?;
-
-        install_prepared_binary(&prepared_binary, &installed_binary, &user_launcher)?;
-
-        let script = fs::read_to_string(&user_launcher)?;
-        if cfg!(target_os = "macos") {
-            assert!(script.contains(&format!(
-                "PATCHED_CODEX={}",
-                shell_quote(&prepared_binary.display().to_string())
-            )));
-            assert!(installed_binary.exists());
-            let installed_script = fs::read_to_string(&installed_binary)?;
-            assert!(installed_script.contains(&format!(
-                "PATCHED_CODEX={}",
-                shell_quote(&prepared_binary.display().to_string())
-            )));
-        } else {
-            assert!(script.contains(&format!(
-                "PATCHED_CODEX={}",
-                shell_quote(&installed_binary.display().to_string())
-            )));
-            assert!(installed_binary.exists());
-        }
+        let command_error = install(InstallPatchedCodexOptions {
+            source: temp.path().join("source"),
+            yes: true,
+            replace_system_entry: true,
+            replace_npm_vendor: true,
+        })
+        .expect_err("legacy public install command must stay disabled");
+        assert!(command_error.to_string().contains("guarded journaled"));
+        assert!(!installed_binary.exists());
+        assert!(!user_launcher.exists());
         Ok(())
     }
 
     #[test]
-    fn atomic_install_binary_replaces_destination_without_copying_over_it() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let source = temp.path().join("source-codex");
-        let destination = temp.path().join("bin/codex");
-        fs::create_dir_all(destination.parent().unwrap())?;
-        fs::write(&source, "#!/bin/sh\necho new\n")?;
-        fs::write(&destination, "#!/bin/sh\necho old\n")?;
+    fn codex_build_command_is_single_job_bounded_and_timeout_owns_the_writer() {
+        let command = codex_build_command();
 
-        atomic_install_binary(&source, &destination)?;
-
-        assert_eq!(fs::read_to_string(&destination)?, "#!/bin/sh\necho new\n");
-        let temp_files = fs::read_dir(destination.parent().unwrap())?
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".codex.tmp-")
-            })
-            .count();
-        assert_eq!(temp_files, 0);
-        Ok(())
+        assert_eq!(BUILD_COMMAND_TIMEOUT, Duration::from_secs(10 * 60));
+        assert!(BUILD_COMMAND_TIMEOUT < Duration::from_secs(30 * 60));
+        assert!(command.contains("CARGO_BUILD_JOBS=1"));
+        assert!(!command.contains("CARGO_BUILD_JOBS:-"));
+        assert!(command.contains("CODEXSWITCH_BUILD_NICE=\"${CODEXSWITCH_BUILD_NICE:-10}\""));
+        assert!(command.contains("export CARGO_BUILD_JOBS"));
+        assert!(command.contains("CARGO_TARGET_DIR=\"$PWD/target\""));
+        assert!(command.contains("cargo build --release --jobs \"$CARGO_BUILD_JOBS\""));
+        assert!(command.contains("-p codex-cli"));
+        assert!(command.contains("-p codex-code-mode-host"));
+        assert!(command.contains("exec ionice -c 3 nice -n \"$CODEXSWITCH_BUILD_NICE\""));
+        assert!(command.contains("exec nice -n \"$CODEXSWITCH_BUILD_NICE\""));
     }
 }

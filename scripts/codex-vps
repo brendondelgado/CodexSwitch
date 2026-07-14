@@ -1,38 +1,57 @@
 #!/usr/bin/env zsh
 set -e
+setopt NO_BG_NICE
 
 DEFAULT_THREAD_ID="019ddf25-8e5d-7d93-9006-54488876f0fa"
 THREAD_ID_FILE="${HOME}/.codexswitch/codex-vps-thread-id"
 THREAD_ID="${CODEX_VPS_THREAD_ID:-$(cat "$THREAD_ID_FILE" 2>/dev/null || printf "%s" "$DEFAULT_THREAD_ID")}"
-LOCAL_PORT="18390"
+LOCAL_PORT="${CODEX_VPS_LOCAL_PORT:-18390}"
 REMOTE_PORT="8390"
-REMOTE_HOST="signul-vps"
-TAILSCALE_HOST="signul-hostinger-kvm4"
+REMOTE_HOST="${CODEX_VPS_REMOTE_HOST:-signul@100.95.84.123}"
+TAILSCALE_HOST="${CODEX_VPS_TAILSCALE_HOST:-signul-hostinger-kvm4}"
 TAILSCALE_TARGET="signul@${TAILSCALE_HOST}"
 TAILSCALE_BIN="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-LOCAL_REPO="/Users/brendondelgado/SIGNUL"
+LOCAL_REPO="${CODEX_VPS_LOCAL_REPO:-${HOME}/SIGNUL}"
+REMOTE_REPO="${CODEX_VPS_REMOTE_REPO:-/home/signul/SIGNUL}"
 SERVICE_NAME="signul-codex-app-server.service"
 LOCAL_CLIENT_ROOT="${HOME}/.local/share/codexswitch/remote-client"
 PATCHED_REMOTE_CLIENT="${HOME}/.local/share/codexswitch/patched-mac-remote-client/codex"
-APP_BUNDLED_CLIENT="/Applications/Codex.app/Contents/Resources/codex"
+if [[ -x "/Applications/ChatGPT.app/Contents/Resources/codex" ]]; then
+  APP_BUNDLED_CLIENT="/Applications/ChatGPT.app/Contents/Resources/codex"
+else
+  APP_BUNDLED_CLIENT="/Applications/Codex.app/Contents/Resources/codex"
+fi
 NPM_REMOTE_CLIENT="${LOCAL_CLIENT_ROOT}/node_modules/.bin/codex"
 LOCAL_CLIENT="${PATCHED_REMOTE_CLIENT}"
 PTY_BRIDGE="${HOME}/.local/bin/codex-vps-pty-bridge"
 DESKTOP_REMOTE_PROXY_PATTERN='codex app-server proxy --sock .*desktop-ssh-websocket-v0\.sock'
+SSH_BIN="${CODEX_VPS_SSH_BIN:-ssh}"
+LSOF_BIN="${CODEX_VPS_LSOF_BIN:-lsof}"
+CURL_BIN="${CODEX_VPS_CURL_BIN:-/usr/bin/curl}"
+PS_BIN="${CODEX_VPS_PS_BIN:-ps}"
+KILL_BIN="${CODEX_VPS_KILL_BIN:-kill}"
+SLEEP_BIN="${CODEX_VPS_SLEEP_BIN:-sleep}"
+SSH_CONNECT_TIMEOUT="${CODEX_VPS_SSH_CONNECT_TIMEOUT:-30}"
+SSH_SERVER_ALIVE_INTERVAL="${CODEX_VPS_SSH_SERVER_ALIVE_INTERVAL:-15}"
+SSH_SERVER_ALIVE_COUNT_MAX="${CODEX_VPS_SSH_SERVER_ALIVE_COUNT_MAX:-6}"
+SSH_PROBE_TIMEOUT="${CODEX_VPS_SSH_PROBE_TIMEOUT:-40}"
 SSH_OPTS=(
+  -F /dev/null
   -o BatchMode=yes
-  -o ConnectTimeout=8
-  -o ServerAliveInterval=5
-  -o ServerAliveCountMax=2
+  -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}"
+  -o "ServerAliveInterval=${SSH_SERVER_ALIVE_INTERVAL}"
+  -o "ServerAliveCountMax=${SSH_SERVER_ALIVE_COUNT_MAX}"
   -o ControlMaster=no
   -o ControlPath=none
   -o ControlPersist=no
+  -o IdentityFile="${HOME}/.ssh/id_ed25519"
+  -o IdentitiesOnly=yes
 )
 SSH_PROXY_OPTS=(
   -o BatchMode=yes
-  -o ConnectTimeout=8
-  -o ServerAliveInterval=5
-  -o ServerAliveCountMax=2
+  -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}"
+  -o "ServerAliveInterval=${SSH_SERVER_ALIVE_INTERVAL}"
+  -o "ServerAliveCountMax=${SSH_SERVER_ALIVE_COUNT_MAX}"
   -o ControlMaster=no
   -o ControlPath=none
   -o ControlPersist=no
@@ -53,11 +72,265 @@ DIRECT_HEALTH_URL="http://${DIRECT_TAILSCALE_HOST}:${REMOTE_PORT}/healthz"
 REMOTE_URL="ws://127.0.0.1:${LOCAL_PORT}"
 USE_DIRECT_TAILSCALE_APP_SERVER=0
 TUNNEL_SUPERVISOR_PID=""
+TUNNEL_SSH_PID=""
+TUNNEL_OWNER_PID=""
+TUNNEL_OWNER_TOKEN=""
+TUNNEL_LOCK_HELD=0
+TUNNEL_LOCK_DIR="${CODEX_VPS_TUNNEL_LOCK_DIR:-${HOME}/.codexswitch/codex-vps-tunnel-${LOCAL_PORT}.lock}"
+TUNNEL_METADATA_FILE="${TUNNEL_LOCK_DIR}/owner"
+TUNNEL_HEALTH_TIMEOUT_SECONDS="${CODEX_VPS_TUNNEL_HEALTH_TIMEOUT_SECONDS:-8}"
 TUNNEL_HEALTH_FAILURE_LIMIT="${CODEX_VPS_TUNNEL_HEALTH_FAILURE_LIMIT:-4}"
 TUNNEL_HEALTH_INTERVAL_SECONDS="${CODEX_VPS_TUNNEL_HEALTH_INTERVAL_SECONDS:-2}"
+TUNNEL_STARTUP_TIMEOUT_SECONDS="${CODEX_VPS_TUNNEL_STARTUP_TIMEOUT_SECONDS:-90}"
+TUNNEL_RECONNECT_DELAY="${CODEX_VPS_TUNNEL_RECONNECT_DELAY:-2}"
+TUNNEL_RECONNECT_DELAY_MAX="${CODEX_VPS_TUNNEL_RECONNECT_DELAY_MAX:-30}"
+TUNNEL_SUPERVISOR_MAX_ITERATIONS="${CODEX_VPS_TEST_TUNNEL_SUPERVISOR_MAX_ITERATIONS:-0}"
+TUNNEL_CLEANUP_ACTIVE=0
+REMOTE_DISK_WARN_USED_PERCENT="${CODEX_VPS_REMOTE_DISK_WARN_USED_PERCENT:-90}"
+REMOTE_DISK_FAIL_USED_PERCENT="${CODEX_VPS_REMOTE_DISK_FAIL_USED_PERCENT:-97}"
+REMOTE_DISK_MIN_FREE_MB="${CODEX_VPS_REMOTE_DISK_MIN_FREE_MB:-20480}"
+REMOTE_CLIENT_AUTO_RECONNECT="${CODEX_VPS_AUTO_RECONNECT:-1}"
+REMOTE_CLIENT_RECONNECT_DELAY="${CODEX_VPS_RECONNECT_DELAY:-2}"
+REMOTE_CLIENT_RECONNECT_DELAY_MAX="${CODEX_VPS_RECONNECT_DELAY_MAX:-30}"
+REMOTE_CLIENT_RECONNECT_MAX="${CODEX_VPS_RECONNECT_MAX:-0}"
 
 log() {
   echo "codex-vps: $*" >&2
+}
+
+is_nonnegative_integer() {
+  case "$1" in
+    ""|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+is_positive_integer() {
+  is_nonnegative_integer "$1" && [ "$1" -gt 0 ]
+}
+
+is_valid_thread_id() {
+  local pattern='^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+  [[ "${1:-}" =~ $pattern ]]
+}
+
+require_valid_thread_id() {
+  local value="${1:-}"
+  local source="${2:-thread id}"
+  if ! is_valid_thread_id "$value"; then
+    echo "codex-vps: invalid ${source}; expected a canonical UUID" >&2
+    return 2
+  fi
+}
+
+validate_thread_command_args() {
+  case "${1:-}" in
+    help|-h|--help|--check|start|sync-client|create|new|reset|old|legacy|restart|--restart|restart-connect|--restart-connect)
+      return 0
+      ;;
+    resume|use|archive)
+      require_valid_thread_id "${2:-}" "thread id"
+      ;;
+    *)
+      require_valid_thread_id "$THREAD_ID" "configured thread id"
+      ;;
+  esac
+}
+
+print_usage() {
+  cat <<'EOF'
+usage: codex-vps [command]
+
+commands:
+  codex-vps              connect to the default VPS thread
+  codex-vps create       create a fresh VPS thread and make it default without connecting
+  codex-vps new          create a fresh VPS thread, make it default, and connect
+  codex-vps reset        alias for new
+  codex-vps list         list visible VPS app-server threads
+  codex-vps resume <id>  set <id> as default and connect to it
+  codex-vps use <id>     set <id> as default without connecting
+  codex-vps old          restore the original giant thread as default
+  codex-vps archive <id> archive a visible thread in the app-server
+  codex-vps --check      inspect transport, service, and client readiness without repair
+  codex-vps start        explicitly start the port-8390 VPS app-server
+  codex-vps restart      explicitly restart the VPS app-server and desktop bridge
+  codex-vps sync-client  explicitly install the matching Mac remote client
+EOF
+}
+
+persist_default_thread_id() {
+  local thread_id="$1"
+  local directory tmp
+  require_valid_thread_id "$thread_id" "thread id" || return $?
+  directory="${THREAD_ID_FILE:h}"
+  tmp="${THREAD_ID_FILE}.tmp.$$"
+  mkdir -p "$directory"
+  chmod 700 "$directory" 2>/dev/null || true
+  printf '%s\n' "$thread_id" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$THREAD_ID_FILE"
+}
+
+validate_runtime_config() {
+  local name value
+  for name value in \
+    CODEX_VPS_SSH_CONNECT_TIMEOUT "$SSH_CONNECT_TIMEOUT" \
+    CODEX_VPS_SSH_SERVER_ALIVE_INTERVAL "$SSH_SERVER_ALIVE_INTERVAL" \
+    CODEX_VPS_SSH_SERVER_ALIVE_COUNT_MAX "$SSH_SERVER_ALIVE_COUNT_MAX" \
+    CODEX_VPS_SSH_PROBE_TIMEOUT "$SSH_PROBE_TIMEOUT" \
+    CODEX_VPS_TUNNEL_HEALTH_TIMEOUT_SECONDS "$TUNNEL_HEALTH_TIMEOUT_SECONDS" \
+    CODEX_VPS_TUNNEL_HEALTH_FAILURE_LIMIT "$TUNNEL_HEALTH_FAILURE_LIMIT" \
+    CODEX_VPS_TUNNEL_HEALTH_INTERVAL_SECONDS "$TUNNEL_HEALTH_INTERVAL_SECONDS" \
+    CODEX_VPS_TUNNEL_STARTUP_TIMEOUT_SECONDS "$TUNNEL_STARTUP_TIMEOUT_SECONDS" \
+    CODEX_VPS_TUNNEL_RECONNECT_DELAY "$TUNNEL_RECONNECT_DELAY" \
+    CODEX_VPS_TUNNEL_RECONNECT_DELAY_MAX "$TUNNEL_RECONNECT_DELAY_MAX" \
+    CODEX_VPS_RECONNECT_DELAY "$REMOTE_CLIENT_RECONNECT_DELAY" \
+    CODEX_VPS_RECONNECT_DELAY_MAX "$REMOTE_CLIENT_RECONNECT_DELAY_MAX"; do
+    if ! is_positive_integer "$value"; then
+      echo "codex-vps: ${name} must be a positive integer (got '${value}')" >&2
+      return 2
+    fi
+  done
+
+  if ! is_nonnegative_integer "$REMOTE_CLIENT_RECONNECT_MAX"; then
+    echo "codex-vps: CODEX_VPS_RECONNECT_MAX must be a nonnegative integer (got '${REMOTE_CLIENT_RECONNECT_MAX}')" >&2
+    return 2
+  fi
+}
+
+current_process_pid() {
+  zmodload zsh/system 2>/dev/null || true
+  # Every caller captures this function with $(...), so the command-substitution
+  # process reports its parent: the shell that actually owns the child/lock.
+  printf '%s' "${sysparams[ppid]:-$$}"
+}
+
+process_is_alive() {
+  local pid="$1"
+  local state
+  [ -n "$pid" ] && "$KILL_BIN" -0 "$pid" >/dev/null 2>&1 || return 1
+  state="$("$PS_BIN" -p "$pid" -o stat= 2>/dev/null | tr -d '[:space:]')"
+  [[ -z "$state" || "$state" != Z* ]]
+}
+
+sleep_for() {
+  "$SLEEP_BIN" "$1"
+}
+
+reconnect_delay_for_attempt() {
+  local attempt="$1"
+  local delay="$2"
+  local maximum="$3"
+  local index=1
+
+  while [ "$index" -lt "$attempt" ] && [ "$delay" -lt "$maximum" ]; do
+    delay=$((delay * 2))
+    if [ "$delay" -gt "$maximum" ]; then
+      delay="$maximum"
+    fi
+    index=$((index + 1))
+  done
+  printf '%s' "$delay"
+}
+
+tunnel_listener_pids() {
+  "$LSOF_BIN" -tiTCP:${LOCAL_PORT} -sTCP:LISTEN 2>/dev/null | awk 'NF && !seen[$0]++'
+}
+
+tunnel_metadata_value() {
+  local key="$1"
+  [ -f "$TUNNEL_METADATA_FILE" ] || return 1
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$TUNNEL_METADATA_FILE"
+}
+
+tunnel_metadata_matches_current_owner() {
+  [ "$TUNNEL_LOCK_HELD" = "1" ] &&
+    [ "$(tunnel_metadata_value owner_pid 2>/dev/null || true)" = "$TUNNEL_OWNER_PID" ] &&
+    [ "$(tunnel_metadata_value owner_token 2>/dev/null || true)" = "$TUNNEL_OWNER_TOKEN" ]
+}
+
+write_tunnel_metadata() {
+  local supervisor_pid="${1:-}"
+  local ssh_pid="${2:-}"
+  local writer_pid temp_file
+
+  [ "$TUNNEL_LOCK_HELD" = "1" ] || return 1
+  writer_pid="$(current_process_pid)"
+  temp_file="${TUNNEL_METADATA_FILE}.tmp.${writer_pid}.${RANDOM}"
+  umask 077
+  {
+    printf 'version=1\n'
+    printf 'owner_pid=%s\n' "$TUNNEL_OWNER_PID"
+    printf 'owner_token=%s\n' "$TUNNEL_OWNER_TOKEN"
+    printf 'supervisor_pid=%s\n' "$supervisor_pid"
+    printf 'ssh_pid=%s\n' "$ssh_pid"
+    printf 'local_port=%s\n' "$LOCAL_PORT"
+    printf 'remote_port=%s\n' "$REMOTE_PORT"
+    printf 'remote_host=%s\n' "$REMOTE_HOST"
+  } > "$temp_file"
+  mv -f "$temp_file" "$TUNNEL_METADATA_FILE"
+}
+
+refuse_unknown_tunnel_listener() {
+  local pids
+  pids="$(tunnel_listener_pids || true)"
+  [ -n "$pids" ] || return 0
+  log "refusing listener on 127.0.0.1:${LOCAL_PORT}; it is not this helper's verified SSH child (PID(s): ${(j:,:)${(f)pids}})"
+  return 1
+}
+
+acquire_tunnel_lock() {
+  local lock_parent existing_owner stale_lock
+
+  TUNNEL_OWNER_PID="$(current_process_pid)"
+  TUNNEL_OWNER_TOKEN="${TUNNEL_OWNER_PID}-${EPOCHSECONDS:-0}-${RANDOM}-${RANDOM}"
+  lock_parent="${TUNNEL_LOCK_DIR:h}"
+  mkdir -p "$lock_parent"
+
+  if mkdir "$TUNNEL_LOCK_DIR" 2>/dev/null; then
+    TUNNEL_LOCK_HELD=1
+    write_tunnel_metadata "" ""
+    return 0
+  fi
+
+  existing_owner="$(tunnel_metadata_value owner_pid 2>/dev/null || true)"
+  if [ -n "$existing_owner" ] && process_is_alive "$existing_owner"; then
+    log "refusing tunnel startup; another codex-vps helper owns ${TUNNEL_LOCK_DIR} (PID ${existing_owner})"
+    return 1
+  fi
+  refuse_unknown_tunnel_listener || return 1
+
+  stale_lock="${TUNNEL_LOCK_DIR}.stale.${TUNNEL_OWNER_PID}.${RANDOM}"
+  if ! mv "$TUNNEL_LOCK_DIR" "$stale_lock" 2>/dev/null; then
+    log "refusing tunnel startup; ownership lock changed while checking it"
+    return 1
+  fi
+  rm -f "${stale_lock}/owner"
+  if ! rmdir "$stale_lock" 2>/dev/null; then
+    log "warning: stale ownership lock retained at ${stale_lock} for inspection"
+  fi
+
+  if ! mkdir "$TUNNEL_LOCK_DIR" 2>/dev/null; then
+    log "refusing tunnel startup; another helper acquired the ownership lock"
+    return 1
+  fi
+  TUNNEL_LOCK_HELD=1
+  write_tunnel_metadata "" ""
+}
+
+release_tunnel_lock() {
+  [ "$TUNNEL_LOCK_HELD" = "1" ] || return 0
+  if tunnel_metadata_matches_current_owner; then
+    if [ -n "$(tunnel_listener_pids || true)" ]; then
+      log "warning: listener still present on ${LOCAL_PORT}; retaining ownership lock"
+      return 1
+    fi
+    rm -f "$TUNNEL_METADATA_FILE"
+    rmdir "$TUNNEL_LOCK_DIR" 2>/dev/null || log "warning: could not remove tunnel ownership lock ${TUNNEL_LOCK_DIR}"
+  else
+    log "warning: tunnel ownership token changed; leaving lock untouched"
+  fi
+  TUNNEL_LOCK_HELD=0
 }
 
 codex_version() {
@@ -88,7 +361,7 @@ safe_model_value() {
 
 safe_reasoning_effort_value() {
   case "$1" in
-    none|minimal|low|medium|high|xhigh) return 0 ;;
+    none|minimal|low|medium|high|xhigh|max|ultra) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -234,171 +507,48 @@ codex_launch_permission_summary() {
 
 ssh_remote() {
   if [ "$USE_TAILSCALE_PROXY" = "1" ]; then
-    ssh "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" "$@"
+    "$SSH_BIN" "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" "$@"
   else
-    ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "$@"
+    "$SSH_BIN" "${SSH_OPTS[@]}" "$REMOTE_HOST" "$@"
   fi
 }
 
-heal_remote_thread_state() {
-  local thread_id="$1"
-  [ -n "$thread_id" ] || return 0
+remote_disk_status() {
+  local command='df -Pk / | awk '\''NR==2 {gsub(/%/, "", $5); print $4, $5}'\'''
+  local output
+  output="$("$SSH_BIN" "${SSH_OPTS[@]}" "$REMOTE_HOST" "$command" 2>/dev/null || true)"
+  if [ -z "$output" ] && [ -x "$TAILSCALE_BIN" ]; then
+    output="$("$SSH_BIN" "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" "$command" 2>/dev/null || true)"
+  fi
+  printf '%s' "$output"
+}
 
-  ssh_remote "python3 - '${thread_id}'" <<'PY'
-import datetime as dt
-import gzip
-import json
-import os
-import shutil
-import sqlite3
-import sys
-import time
+check_remote_disk_headroom() {
+  if [ "${CODEX_VPS_SKIP_REMOTE_DISK_PREFLIGHT:-0}" = "1" ]; then
+    return 0
+  fi
 
-thread_id = sys.argv[1]
-home = os.path.expanduser("~")
-codex_dir = os.path.join(home, ".codex")
-state_path = os.path.join(codex_dir, "state_5.sqlite")
-index_path = os.path.join(codex_dir, "session_index.jsonl")
-now_ms = int(time.time() * 1000)
-now_s = int(time.time())
+  local disk_status free_kb used_percent free_mb
+  disk_status="$(remote_disk_status)"
+  if [ -z "$disk_status" ]; then
+    log "warning: could not check ${REMOTE_HOST} disk headroom before attach"
+    return 0
+  fi
 
-def backup_db(path):
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup_path = f"{path}.bak-codex-vps-heal-{ts}"
-    src = sqlite3.connect(path, timeout=30)
-    try:
-        dst = sqlite3.connect(backup_path)
-        try:
-            src.backup(dst)
-        finally:
-            dst.close()
-    finally:
-        src.close()
-    return backup_path
+  free_kb="${disk_status%% *}"
+  used_percent="${disk_status##* }"
+  free_mb=$((free_kb / 1024))
 
-def session_meta_from(path, gz_path):
-    candidates = []
-    if path and os.path.exists(path):
-        candidates.append((open, path))
-    if gz_path and os.path.exists(gz_path):
-        candidates.append((gzip.open, gz_path))
-    for opener, candidate in candidates:
-        try:
-            with opener(candidate, "rt", encoding="utf-8", errors="replace") as fh:
-                for _ in range(40):
-                    line = fh.readline()
-                    if not line:
-                        break
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if event.get("type") == "session_meta":
-                        payload = event.get("payload")
-                        return payload if isinstance(payload, dict) else {}
-        except Exception:
-            continue
-    return {}
+  if [ "$free_mb" -lt "$REMOTE_DISK_MIN_FREE_MB" ] || [ "$used_percent" -ge "$REMOTE_DISK_FAIL_USED_PERCENT" ]; then
+    echo "codex-vps: refusing to attach because ${REMOTE_HOST} disk headroom is unsafe (${used_percent}% used, ${free_mb}MB free)." >&2
+    echo "codex-vps: low disk has previously broken Codex rollout writes and can disconnect active sessions." >&2
+    echo "codex-vps: inspect with: ssh ${REMOTE_HOST} 'df -h /; du -xhd1 ~ 2>/dev/null | sort -h | tail -n 40'" >&2
+    exit 1
+  fi
 
-def latest_index_title():
-    title = None
-    if not os.path.exists(index_path):
-        return None
-    with open(index_path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if item.get("id") == thread_id and item.get("thread_name"):
-                title = item["thread_name"]
-    return title
-
-if not os.path.exists(state_path):
-    raise SystemExit(0)
-
-con = sqlite3.connect(state_path, timeout=30)
-con.row_factory = sqlite3.Row
-row = con.execute("select * from threads where id=?", (thread_id,)).fetchone()
-if not row:
-    con.close()
-    raise SystemExit(0)
-
-rollout_path = row["rollout_path"]
-gz_path = f"{rollout_path}.gz" if rollout_path else None
-changed = False
-materialized = False
-
-if rollout_path and not os.path.exists(rollout_path) and gz_path and os.path.exists(gz_path):
-    tmp_path = f"{rollout_path}.tmp-{os.getpid()}"
-    os.makedirs(os.path.dirname(rollout_path), exist_ok=True)
-    with gzip.open(gz_path, "rb") as src, open(tmp_path, "wb") as dst:
-        shutil.copyfileobj(src, dst, length=1024 * 1024)
-    os.replace(tmp_path, rollout_path)
-    try:
-        shutil.copymode(gz_path, rollout_path)
-    except OSError:
-        os.chmod(rollout_path, 0o600)
-    materialized = True
-    changed = True
-
-meta = session_meta_from(rollout_path, gz_path)
-title = row["title"] or latest_index_title() or meta.get("thread_name")
-cwd = row["cwd"] or meta.get("cwd")
-source = row["source"] or meta.get("source")
-if source == "unknown" and meta.get("source"):
-    source = meta["source"]
-thread_source = row["thread_source"] or meta.get("thread_source")
-model_provider = row["model_provider"] or meta.get("model_provider")
-cli_version = row["cli_version"] or meta.get("cli_version")
-preview = row["preview"] or row["first_user_message"] or title
-first_user_message = row["first_user_message"] or preview
-
-updates = {}
-for key, value in (
-    ("title", title),
-    ("cwd", cwd),
-    ("source", source),
-    ("thread_source", thread_source),
-    ("model_provider", model_provider),
-    ("cli_version", cli_version),
-    ("preview", preview),
-    ("first_user_message", first_user_message),
-):
-    if value and row[key] != value:
-        updates[key] = value
-
-if updates:
-    changed = True
-
-if changed:
-    backup_path = backup_db(state_path)
-    if updates:
-        updates["has_user_event"] = 1
-        updates["updated_at"] = max(int(row["updated_at"] or 0), now_s)
-        updates["updated_at_ms"] = max(int(row["updated_at_ms"] or 0), now_ms)
-        assignments = ", ".join(f"{key}=?" for key in updates)
-        con.execute(
-            f"update threads set {assignments} where id=?",
-            tuple(updates.values()) + (thread_id,),
-        )
-    con.commit()
-    if title:
-        with open(index_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({
-                "id": thread_id,
-                "thread_name": title,
-                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
-            }, separators=(",", ":")) + "\n")
-    print(
-        f"codex-vps: healed thread {thread_id}"
-        f" materialized_rollout={str(materialized).lower()}"
-        f" metadata_fields={','.join(sorted(updates)) or '-'}"
-        f" backup={backup_path}",
-        file=sys.stderr,
-    )
-con.close()
-PY
+  if [ "$used_percent" -ge "$REMOTE_DISK_WARN_USED_PERCENT" ]; then
+    log "warning: ${REMOTE_HOST} disk is ${used_percent}% used (${free_mb}MB free); low headroom can destabilize Codex sessions"
+  fi
 }
 
 tailscale_check_url_from_output() {
@@ -413,7 +563,7 @@ maybe_run_tailscale_ssh_check() {
     return 1
   fi
 
-  output="$(timeout 6s ssh -vv -o BatchMode=yes -o ConnectTimeout=4 -o ConnectionAttempts=1 -o ControlMaster=no -o ControlPath=none -o ControlPersist=no -o StrictHostKeyChecking=accept-new "$TAILSCALE_TARGET" true 2>&1 || true)"
+  output="$(timeout "${SSH_PROBE_TIMEOUT}s" "$SSH_BIN" -vv -o BatchMode=yes -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}" -o ConnectionAttempts=1 -o ControlMaster=no -o ControlPath=none -o ControlPersist=no -o StrictHostKeyChecking=accept-new "$TAILSCALE_TARGET" true 2>&1 || true)"
   url="$(printf '%s\n' "$output" | tailscale_check_url_from_output)"
   if [ -z "$url" ] && ! printf '%s\n' "$output" | grep -qi 'Tailscale SSH requires an additional check'; then
     return 1
@@ -432,7 +582,7 @@ maybe_run_tailscale_ssh_check() {
 
 select_ssh_transport() {
   if [ "${CODEX_VPS_USE_TAILSCALE_PROXY:-0}" != "1" ] \
-    && timeout 10s ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" true >/dev/null 2>&1; then
+    && timeout "${SSH_PROBE_TIMEOUT}s" "$SSH_BIN" "${SSH_OPTS[@]}" "$REMOTE_HOST" true >/dev/null 2>&1; then
     USE_TAILSCALE_PROXY=0
     log "using normal SSH transport"
     return 0
@@ -444,13 +594,13 @@ select_ssh_transport() {
   esac
 
   if [ -x "$TAILSCALE_BIN" ] \
-    && timeout 10s ssh "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" true >/dev/null 2>&1; then
+    && timeout "${SSH_PROBE_TIMEOUT}s" "$SSH_BIN" "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" true >/dev/null 2>&1; then
     USE_TAILSCALE_PROXY=1
     log "using Tailscale userspace SSH transport"
     return 0
   fi
 
-  if timeout 10s ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" true >/dev/null 2>&1; then
+  if timeout "${SSH_PROBE_TIMEOUT}s" "$SSH_BIN" "${SSH_OPTS[@]}" "$REMOTE_HOST" true >/dev/null 2>&1; then
     USE_TAILSCALE_PROXY=0
     log "Tailscale userspace SSH unavailable; using normal SSH transport"
     return 0
@@ -503,7 +653,19 @@ asyncio.run(main())
 PY
 }
 
-ensure_local_remote_client() {
+select_matching_local_remote_client() {
+  local remote_version="$1"
+  local candidate
+  for candidate in "$NPM_REMOTE_CLIENT" "$APP_BUNDLED_CLIENT" "$PATCHED_REMOTE_CLIENT" "$LOCAL_CLIENT"; do
+    if [ -x "$candidate" ] && [ "$(codex_version "$candidate")" = "$remote_version" ]; then
+      LOCAL_CLIENT="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+require_matching_local_remote_client() {
   local remote_version local_version
   remote_version="$(remote_codex_version)"
   if [ -z "$remote_version" ]; then
@@ -511,70 +673,129 @@ ensure_local_remote_client() {
     exit 1
   fi
 
-  local_version=""
-  if [ -x "$NPM_REMOTE_CLIENT" ] && [ "$(codex_version "$NPM_REMOTE_CLIENT")" = "$remote_version" ]; then
-    LOCAL_CLIENT="$NPM_REMOTE_CLIENT"
-    local_version="$remote_version"
-  elif [ -x "$APP_BUNDLED_CLIENT" ] && [ "$(codex_version "$APP_BUNDLED_CLIENT")" = "$remote_version" ]; then
-    LOCAL_CLIENT="$APP_BUNDLED_CLIENT"
-    local_version="$remote_version"
-  elif [ -x "$PATCHED_REMOTE_CLIENT" ]; then
-    LOCAL_CLIENT="$PATCHED_REMOTE_CLIENT"
+  if ! select_matching_local_remote_client "$remote_version"; then
     local_version="$(codex_version "$LOCAL_CLIENT")"
-  elif [ -x "$LOCAL_CLIENT" ]; then
-    local_version="$(codex_version "$LOCAL_CLIENT")"
-  fi
-
-  if [ "$local_version" != "$remote_version" ]; then
-    log "syncing Mac Codex remote client to ${remote_version} to match ${REMOTE_HOST}..."
-    mkdir -p "$LOCAL_CLIENT_ROOT"
-    (
-      cd "$LOCAL_CLIENT_ROOT"
-      if [ ! -f package.json ]; then
-        npm init -y >/dev/null
-      fi
-      npm install "@openai/codex@${remote_version}" --omit=dev --no-audit --no-fund >/dev/null
-    )
-    if [ -x "$NPM_REMOTE_CLIENT" ]; then
-      LOCAL_CLIENT="$NPM_REMOTE_CLIENT"
-      local_version="$(codex_version "$LOCAL_CLIENT")"
-    fi
-  fi
-
-  if [ "$local_version" != "$remote_version" ]; then
     echo "codex-vps: local remote client ${local_version:-missing} does not match remote ${remote_version}" >&2
-    exit 1
+    echo "codex-vps: run 'codex-vps sync-client' to install the matching client explicitly" >&2
+    return 1
   fi
 }
 
-kill_tunnel() {
-  local pids
-  pids="$(lsof -tiTCP:${LOCAL_PORT} -sTCP:LISTEN 2>/dev/null || true)"
-  [ -n "$pids" ] || return 0
-  printf '%s\n' "$pids" | while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    kill "$pid" 2>/dev/null || true
+sync_local_remote_client() {
+  local command_name="${1:-}"
+  local remote_version
+  if [ "$command_name" != "sync-client" ]; then
+    echo "codex-vps: client synchronization is only available through 'codex-vps sync-client'" >&2
+    return 2
+  fi
+
+  remote_version="$(remote_codex_version)"
+  if [ -z "$remote_version" ]; then
+    echo "codex-vps: could not determine remote Codex version on ${REMOTE_HOST}" >&2
+    return 1
+  fi
+  if select_matching_local_remote_client "$remote_version"; then
+    echo "codex-vps client already matches remote ${remote_version}: ${LOCAL_CLIENT}"
+    return 0
+  fi
+
+  log "installing Mac Codex remote client ${remote_version} to match ${REMOTE_HOST}..."
+  mkdir -p "$LOCAL_CLIENT_ROOT"
+  (
+    cd "$LOCAL_CLIENT_ROOT"
+    if [ ! -f package.json ]; then
+      npm init -y >/dev/null
+    fi
+    npm install "@openai/codex@${remote_version}" --omit=dev --no-audit --no-fund >/dev/null
+  )
+  if ! select_matching_local_remote_client "$remote_version"; then
+    echo "codex-vps: installed client still does not match remote ${remote_version}" >&2
+    return 1
+  fi
+  echo "codex-vps client synchronized: ${LOCAL_CLIENT} (${remote_version})"
+}
+
+verified_owned_ssh_child() {
+  local pid="${1:-$(tunnel_metadata_value ssh_pid 2>/dev/null || true)}"
+  local supervisor_pid="${2:-$(tunnel_metadata_value supervisor_pid 2>/dev/null || true)}"
+  local metadata_pid metadata_supervisor metadata_port metadata_remote_port
+  local actual_parent args forward ssh_name
+
+  tunnel_metadata_matches_current_owner || return 1
+  metadata_pid="$(tunnel_metadata_value ssh_pid 2>/dev/null || true)"
+  metadata_supervisor="$(tunnel_metadata_value supervisor_pid 2>/dev/null || true)"
+  metadata_port="$(tunnel_metadata_value local_port 2>/dev/null || true)"
+  metadata_remote_port="$(tunnel_metadata_value remote_port 2>/dev/null || true)"
+  [ -n "$pid" ] && [ "$pid" = "$metadata_pid" ] || return 1
+  [ -n "$supervisor_pid" ] && [ "$supervisor_pid" = "$metadata_supervisor" ] || return 1
+  [ "$metadata_port" = "$LOCAL_PORT" ] && [ "$metadata_remote_port" = "$REMOTE_PORT" ] || return 1
+  process_is_alive "$pid" || return 1
+
+  actual_parent="$("$PS_BIN" -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]')"
+  [ "$actual_parent" = "$supervisor_pid" ] || return 1
+  args="$("$PS_BIN" -p "$pid" -o args= 2>/dev/null || true)"
+  forward="${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}"
+  ssh_name="${SSH_BIN:t}"
+  [[ "$args" == *"${ssh_name}"* && "$args" == *" -N "* && "$args" == *" -L ${forward} "* ]] || return 1
+  [[ "$args" == *"${REMOTE_HOST}"* || "$args" == *"${TAILSCALE_TARGET}"* ]]
+}
+
+owned_tunnel_listener_ok() {
+  local expected_pid pids pid
+  expected_pid="$(tunnel_metadata_value ssh_pid 2>/dev/null || true)"
+  verified_owned_ssh_child "$expected_pid" || return 1
+  pids="$(tunnel_listener_pids || true)"
+  [ -n "$pids" ] || return 1
+  while IFS= read -r pid; do
+    [ "$pid" = "$expected_pid" ] || return 1
+  done <<< "$pids"
+}
+
+stop_owned_ssh_child() {
+  local pid supervisor_pid attempt
+  pid="$(tunnel_metadata_value ssh_pid 2>/dev/null || true)"
+  supervisor_pid="$(tunnel_metadata_value supervisor_pid 2>/dev/null || true)"
+  [ -n "$pid" ] || return 0
+  if ! verified_owned_ssh_child "$pid" "$supervisor_pid"; then
+    log "refusing to signal unverified tunnel PID ${pid}"
+    return 1
+  fi
+
+  "$KILL_BIN" -TERM "$pid" 2>/dev/null || true
+  for attempt in {1..10}; do
+    process_is_alive "$pid" || break
+    sleep_for 0.1
   done
+  if process_is_alive "$pid"; then
+    "$KILL_BIN" -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+  TUNNEL_SSH_PID=""
+  write_tunnel_metadata "$supervisor_pid" ""
+}
+
+desktop_codex_host_is_running() {
+  pgrep -x ChatGPT >/dev/null 2>&1 || pgrep -x Codex >/dev/null 2>&1
 }
 
 restart_codex_desktop_remote_bridge() {
-  if ! pgrep -x Codex >/dev/null 2>&1; then
+  if ! desktop_codex_host_is_running; then
     return 0
   fi
 
   local pids
   pids="$(pgrep -f "$DESKTOP_REMOTE_PROXY_PATTERN" 2>/dev/null || true)"
   if [ -z "$pids" ]; then
-    log "Codex.app desktop remote bridge proxy is not running"
+    log "ChatGPT/Codex desktop remote bridge proxy is not running"
     return 0
   fi
 
-  log "restarting Codex.app desktop remote bridge..."
+  log "restarting ChatGPT/Codex desktop remote bridge..."
   printf '%s\n' "$pids" | while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     kill -TERM "$pid" 2>/dev/null || true
   done
-  sleep 1
+  sleep_for 1
 
   pids="$(pgrep -f "$DESKTOP_REMOTE_PROXY_PATTERN" 2>/dev/null || true)"
   if [ -n "$pids" ]; then
@@ -586,93 +807,150 @@ restart_codex_desktop_remote_bridge() {
 }
 
 tunnel_health_ok() {
-  /usr/bin/curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1
+  "$CURL_BIN" -fsS --max-time "$TUNNEL_HEALTH_TIMEOUT_SECONDS" "$HEALTH_URL" >/dev/null 2>&1
 }
 
-ensure_tunnel() {
-  if lsof -nP -iTCP:${LOCAL_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
-    if tunnel_health_ok; then
+spawn_tunnel_ssh_child() {
+  local supervisor_pid target
+  supervisor_pid="$(current_process_pid)"
+  refuse_unknown_tunnel_listener || return 1
+
+  if [ "$USE_TAILSCALE_PROXY" = "1" ]; then
+    target="$TAILSCALE_TARGET"
+    log "opening Tailscale userspace SSH tunnel 127.0.0.1:${LOCAL_PORT} -> ${TAILSCALE_HOST}:127.0.0.1:${REMOTE_PORT}"
+    "$SSH_BIN" "${TUNNEL_SSH_PROXY_OPTS[@]}" -N -o ExitOnForwardFailure=yes -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} "$target" &
+  else
+    target="$REMOTE_HOST"
+    log "opening SSH tunnel 127.0.0.1:${LOCAL_PORT} -> ${REMOTE_HOST}:127.0.0.1:${REMOTE_PORT}"
+    "$SSH_BIN" "${TUNNEL_SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} "$target" &
+  fi
+  TUNNEL_SSH_PID="$!"
+  write_tunnel_metadata "$supervisor_pid" "$TUNNEL_SSH_PID"
+}
+
+tunnel_supervisor_cleanup() {
+  local exit_code="$?"
+  trap - EXIT INT TERM HUP
+  stop_owned_ssh_child || true
+  return "$exit_code"
+}
+
+run_tunnel_supervisor() {
+  local health_failures=0
+  local retry_attempt=0
+  local first_spawn=1
+  local iterations=0
+  local delay child_status
+
+  TUNNEL_SUPERVISOR_PID="$(current_process_pid)"
+  write_tunnel_metadata "$TUNNEL_SUPERVISOR_PID" ""
+  trap tunnel_supervisor_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  while true; do
+    iterations=$((iterations + 1))
+    if [ "$TUNNEL_SUPERVISOR_MAX_ITERATIONS" -gt 0 ] && [ "$iterations" -gt "$TUNNEL_SUPERVISOR_MAX_ITERATIONS" ]; then
       return 0
     fi
-    log "existing SSH tunnel is not forwarding; reopening..."
-    kill_tunnel
-  fi
 
-  if ! lsof -nP -iTCP:${LOCAL_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
-    if [ "$USE_TAILSCALE_PROXY" = "1" ]; then
-      log "opening Tailscale userspace SSH tunnel 127.0.0.1:${LOCAL_PORT} -> ${TAILSCALE_HOST}:127.0.0.1:${REMOTE_PORT}"
-      if ! ssh "${TUNNEL_SSH_PROXY_OPTS[@]}" -fN -o ExitOnForwardFailure=yes -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} "$TAILSCALE_TARGET"; then
-        log "Tailscale userspace SSH tunnel failed; falling back to normal SSH tunnel"
-        USE_TAILSCALE_PROXY=0
-        ssh "${TUNNEL_SSH_OPTS[@]}" -fN -o ExitOnForwardFailure=yes -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} "$REMOTE_HOST"
+    if [ -z "$TUNNEL_SSH_PID" ] || ! process_is_alive "$TUNNEL_SSH_PID"; then
+      if [ -n "$TUNNEL_SSH_PID" ]; then
+        set +e
+        wait "$TUNNEL_SSH_PID" 2>/dev/null
+        child_status="$?"
+        set -e
+        log "SSH tunnel child ${TUNNEL_SSH_PID} exited with status ${child_status}"
+        TUNNEL_SSH_PID=""
+        write_tunnel_metadata "$TUNNEL_SUPERVISOR_PID" ""
+        if [ "$USE_TAILSCALE_PROXY" = "1" ]; then
+          log "Tailscale userspace SSH tunnel failed; falling back to normal SSH tunnel"
+          USE_TAILSCALE_PROXY=0
+        fi
       fi
-    else
-      log "opening SSH tunnel 127.0.0.1:${LOCAL_PORT} -> ${REMOTE_HOST}:127.0.0.1:${REMOTE_PORT}"
-      ssh "${TUNNEL_SSH_OPTS[@]}" -fN -o ExitOnForwardFailure=yes -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} "$REMOTE_HOST"
+
+      refuse_unknown_tunnel_listener || return 1
+      if [ "$first_spawn" = "0" ]; then
+        retry_attempt=$((retry_attempt + 1))
+        delay="$(reconnect_delay_for_attempt "$retry_attempt" "$TUNNEL_RECONNECT_DELAY" "$TUNNEL_RECONNECT_DELAY_MAX")"
+        log "retrying SSH tunnel in ${delay}s (attempt ${retry_attempt})"
+        sleep_for "$delay"
+      fi
+      first_spawn=0
+      spawn_tunnel_ssh_child || return 1
+      health_failures=0
     fi
-  fi
+
+    if owned_tunnel_listener_ok && tunnel_health_ok; then
+      health_failures=0
+      retry_attempt=0
+    else
+      if [ -n "$(tunnel_listener_pids || true)" ] && ! owned_tunnel_listener_ok; then
+        log "an unknown listener appeared on 127.0.0.1:${LOCAL_PORT}; refusing to replace it"
+        return 1
+      fi
+      health_failures=$((health_failures + 1))
+      if [ "$health_failures" -lt "$TUNNEL_HEALTH_FAILURE_LIMIT" ]; then
+        log "SSH tunnel health probe failed (${health_failures}/${TUNNEL_HEALTH_FAILURE_LIMIT}); keeping owned child open"
+      else
+        log "owned SSH tunnel is unhealthy after ${health_failures} failed probes; reconnecting"
+        stop_owned_ssh_child || return 1
+        health_failures=0
+      fi
+    fi
+    sleep_for "$TUNNEL_HEALTH_INTERVAL_SECONDS"
+  done
 }
 
-refresh_tunnel_for_interactive_attach() {
-  log "refreshing SSH tunnel for interactive attach..."
-  kill_tunnel
-  ensure_tunnel
-  wait_for_health
+install_tunnel_cleanup_traps() {
+  trap cleanup_tunnel_supervisor EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
 }
 
 start_tunnel_supervisor_for_interactive_attach() {
-  log "refreshing SSH tunnel for interactive attach..."
-  kill_tunnel
-  (
-    trap 'exit 0' INT TERM
-    local tunnel_health_failures=0
-    while true; do
-      if lsof -nP -iTCP:${LOCAL_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
-        if tunnel_health_ok; then
-          tunnel_health_failures=0
-          sleep "$TUNNEL_HEALTH_INTERVAL_SECONDS"
-          continue
-        fi
-        tunnel_health_failures=$((tunnel_health_failures + 1))
-        if [ "$tunnel_health_failures" -lt "$TUNNEL_HEALTH_FAILURE_LIMIT" ]; then
-          log "SSH tunnel health probe failed (${tunnel_health_failures}/${TUNNEL_HEALTH_FAILURE_LIMIT}); keeping tunnel open..."
-          sleep "$TUNNEL_HEALTH_INTERVAL_SECONDS"
-          continue
-        fi
-        log "existing SSH tunnel listener is unhealthy after ${tunnel_health_failures} failed probes; reopening..."
-        kill_tunnel
-        tunnel_health_failures=0
-        sleep 1
-      fi
-
-      if [ "$USE_TAILSCALE_PROXY" = "1" ]; then
-        log "opening Tailscale userspace SSH tunnel 127.0.0.1:${LOCAL_PORT} -> ${TAILSCALE_HOST}:127.0.0.1:${REMOTE_PORT}"
-        ssh "${TUNNEL_SSH_PROXY_OPTS[@]}" -N -o ExitOnForwardFailure=yes -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} "$TAILSCALE_TARGET" || {
-          log "Tailscale userspace SSH tunnel failed; falling back to normal SSH tunnel"
-          USE_TAILSCALE_PROXY=0
-          ssh "${TUNNEL_SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} "$REMOTE_HOST" || true
-        }
-      else
-        log "opening SSH tunnel 127.0.0.1:${LOCAL_PORT} -> ${REMOTE_HOST}:127.0.0.1:${REMOTE_PORT}"
-        ssh "${TUNNEL_SSH_OPTS[@]}" -N -o ExitOnForwardFailure=yes -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} "$REMOTE_HOST" || true
-      fi
-      sleep 1
-    done
-  ) &
+  if [ -n "$TUNNEL_SUPERVISOR_PID" ] && process_is_alive "$TUNNEL_SUPERVISOR_PID"; then
+    wait_for_health
+    return $?
+  fi
+  refuse_unknown_tunnel_listener || return 1
+  if [ "$TUNNEL_LOCK_HELD" != "1" ] || ! tunnel_metadata_matches_current_owner; then
+    acquire_tunnel_lock || return 1
+  fi
+  install_tunnel_cleanup_traps
+  run_tunnel_supervisor &
   TUNNEL_SUPERVISOR_PID="$!"
-  wait_for_health
+  if ! wait_for_health; then
+    log "SSH tunnel did not become ready within ${TUNNEL_STARTUP_TIMEOUT_SECONDS}s"
+    return 1
+  fi
 }
 
 cleanup_tunnel_supervisor() {
-  if [ -n "$TUNNEL_SUPERVISOR_PID" ]; then
-    kill "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
+  local exit_code="$?"
+  local child_cleanup_ok=1
+  [ "$TUNNEL_CLEANUP_ACTIVE" = "0" ] || return "$exit_code"
+  TUNNEL_CLEANUP_ACTIVE=1
+  trap - EXIT INT TERM HUP
+  if [ -n "$TUNNEL_SUPERVISOR_PID" ] && process_is_alive "$TUNNEL_SUPERVISOR_PID"; then
+    "$KILL_BIN" -TERM "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
     wait "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
   fi
-  kill_tunnel
+  stop_owned_ssh_child || child_cleanup_ok=0
+  if [ "$child_cleanup_ok" = "1" ]; then
+    release_tunnel_lock || true
+  else
+    log "warning: retaining tunnel ownership lock because the recorded SSH child could not be verified"
+  fi
+  TUNNEL_SUPERVISOR_PID=""
+  TUNNEL_CLEANUP_ACTIVE=0
+  return "$exit_code"
 }
 
 direct_tailscale_app_server_available() {
-  [ "${CODEX_VPS_FORCE_TUNNEL:-0}" != "1" ] && /usr/bin/curl -fsS --max-time 8 "$DIRECT_HEALTH_URL" >/dev/null 2>&1
+  [ "${CODEX_VPS_FORCE_TUNNEL:-0}" != "1" ] && "$CURL_BIN" -fsS --max-time 8 "$DIRECT_HEALTH_URL" >/dev/null 2>&1
 }
 
 ensure_local_remote_client_for_direct() {
@@ -691,32 +969,42 @@ ensure_local_remote_client_for_direct() {
 }
 
 wait_for_health() {
-  for _ in {1..30}; do
-    if tunnel_health_ok; then
+  local waited=0
+  while [ "$waited" -lt "$TUNNEL_STARTUP_TIMEOUT_SECONDS" ]; do
+    if owned_tunnel_listener_ok && tunnel_health_ok; then
       return 0
     fi
-    sleep 1
+    if [ -n "$TUNNEL_SUPERVISOR_PID" ] && ! process_is_alive "$TUNNEL_SUPERVISOR_PID"; then
+      return 1
+    fi
+    sleep_for 1
+    waited=$((waited + 1))
   done
   return 1
+}
+
+ensure_tunnel() {
+  start_tunnel_supervisor_for_interactive_attach
 }
 
 ensure_rpc_transport() {
   if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" != "1" ]; then
     ensure_tunnel
-    wait_for_health
   fi
 }
 
 codex_vps_thread_rpc() {
-  python3 - "$REMOTE_URL" "$@" <<'PY'
+  CODEX_VPS_REMOTE_REPO="$REMOTE_REPO" python3 - "$REMOTE_URL" "$@" <<'PY'
 import asyncio
 import datetime as dt
 import json
+import os
 import sys
 import textwrap
 import websockets
 
 uri = sys.argv[1]
+remote_repo = os.environ["CODEX_VPS_REMOTE_REPO"]
 command = sys.argv[2] if len(sys.argv) > 2 else "list"
 args = sys.argv[3:]
 
@@ -777,7 +1065,7 @@ async def main():
                 print(f"{marker:1} {format_time(row.get('updatedAt')):11} {source_label(row.get('source'))[:9]:9} {cwd:28} {thread_id:36}  {short(label, 90)}")
             return
         if command == "new":
-            params = {"cwd": "/home/signul/SIGNUL"}
+            params = {"cwd": remote_repo}
             if len(args) > 0 and args[0]:
                 params["model"] = args[0]
             result = await request(ws, 2, "thread/start", params)
@@ -800,38 +1088,73 @@ PY
 }
 
 restart_remote_codex() {
-  log "restarting remote Codex app-server on ${REMOTE_HOST}..."
+  if [ -n "$(tunnel_listener_pids || true)" ] && ! owned_tunnel_listener_ok; then
+    refuse_unknown_tunnel_listener
+    return 1
+  fi
+  log "restarting port-${REMOTE_PORT} Codex app-server on ${REMOTE_HOST}..."
   ssh_remote "systemctl --user restart ${SERVICE_NAME}"
-  kill_tunnel
   ensure_tunnel
-  wait_for_health
   restart_codex_desktop_remote_bridge
   echo "codex-vps restarted: local 127.0.0.1:${LOCAL_PORT} -> ${REMOTE_HOST}:127.0.0.1:${REMOTE_PORT}"
+  echo "codex-vps note: ChatGPT's built-in SSH Unix-socket worker is separate and was not verified by this restart."
 }
+
+codex_vps_main() {
+validate_runtime_config || return $?
+validate_thread_command_args "$@" || return $?
+
+case "${1:-}" in
+  help|-h|--help)
+    print_usage
+    return 0
+    ;;
+  use)
+    persist_default_thread_id "$2"
+    echo "codex-vps default thread set to $2"
+    return 0
+    ;;
+  old|legacy)
+    persist_default_thread_id "$DEFAULT_THREAD_ID"
+    echo "codex-vps default thread set to $DEFAULT_THREAD_ID"
+    return 0
+    ;;
+esac
 
 log "checking ${REMOTE_HOST} app-server..."
 if [ "${CODEX_VPS_FORCE_TUNNEL:-0}" != "1" ] && direct_tailscale_app_server_available; then
   USE_DIRECT_TAILSCALE_APP_SERVER=1
   REMOTE_URL="$DIRECT_REMOTE_URL"
   log "using direct Tailscale app-server ${DIRECT_REMOTE_URL}"
-elif /usr/bin/curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then
-  USE_DIRECT_TAILSCALE_APP_SERVER=0
-  REMOTE_URL="ws://127.0.0.1:${LOCAL_PORT}"
-  log "using existing local app-server tunnel ${REMOTE_URL}"
 else
+  refuse_unknown_tunnel_listener
   select_ssh_transport
-  ssh_remote "systemctl --user start ${SERVICE_NAME} >/dev/null 2>&1 || true"
+fi
+
+if [ "${1:-}" = "start" ]; then
+  log "starting port-${REMOTE_PORT} Codex app-server on ${REMOTE_HOST}..."
+  ssh_remote "systemctl --user start ${SERVICE_NAME}"
+  echo "codex-vps started ${SERVICE_NAME}"
+  return 0
 fi
 
 if [ "${1:-}" = "--restart" ] || [ "${1:-}" = "restart" ]; then
   restart_remote_codex
-  ensure_local_remote_client
-  exit 0
+  return 0
+fi
+
+if [ "${1:-}" = "sync-client" ]; then
+  sync_local_remote_client "$1"
+  return $?
 fi
 
 case "${1:-}" in
+  --check|list|threads) ;;
+  *) check_remote_disk_headroom ;;
+esac
+
+case "${1:-}" in
   list|threads)
-    heal_remote_thread_state "$THREAD_ID" || log "thread state heal warning: failed for ${THREAD_ID}"
     ensure_rpc_transport
     codex_vps_thread_rpc list "$THREAD_ID"
     exit 0
@@ -839,8 +1162,8 @@ case "${1:-}" in
   create)
     ensure_rpc_transport
     NEW_THREAD_ID="$(codex_vps_thread_rpc new "$(codex_launch_model)")"
-    mkdir -p "$(dirname "$THREAD_ID_FILE")"
-    printf '%s\n' "$NEW_THREAD_ID" > "$THREAD_ID_FILE"
+    require_valid_thread_id "$NEW_THREAD_ID" "new thread id returned by app-server"
+    persist_default_thread_id "$NEW_THREAD_ID"
     echo "codex-vps new default thread: ${NEW_THREAD_ID}"
     exit 0
     ;;
@@ -848,8 +1171,8 @@ case "${1:-}" in
     ensure_rpc_transport
     log "starting a fresh remote Codex thread..."
     NEW_THREAD_ID="$(codex_vps_thread_rpc new "$(codex_launch_model)")"
-    mkdir -p "$(dirname "$THREAD_ID_FILE")"
-    printf '%s\n' "$NEW_THREAD_ID" > "$THREAD_ID_FILE"
+    require_valid_thread_id "$NEW_THREAD_ID" "new thread id returned by app-server"
+    persist_default_thread_id "$NEW_THREAD_ID"
     THREAD_ID="$NEW_THREAD_ID"
     log "new default thread ${THREAD_ID}"
     shift
@@ -860,51 +1183,12 @@ case "${1:-}" in
       exit 2
     fi
     THREAD_ID="$2"
-    mkdir -p "$(dirname "$THREAD_ID_FILE")"
-    printf '%s\n' "$THREAD_ID" > "$THREAD_ID_FILE"
-    heal_remote_thread_state "$THREAD_ID" || log "thread state heal warning: failed for ${THREAD_ID}"
+    persist_default_thread_id "$THREAD_ID"
     shift 2
-    ;;
-  use)
-    if [ -z "${2:-}" ]; then
-      echo "usage: codex-vps use <thread-id>" >&2
-      exit 2
-    fi
-    mkdir -p "$(dirname "$THREAD_ID_FILE")"
-    printf '%s\n' "$2" > "$THREAD_ID_FILE"
-    heal_remote_thread_state "$2" || log "thread state heal warning: failed for ${2}"
-    echo "codex-vps default thread set to $2"
-    exit 0
-    ;;
-  old|legacy)
-    THREAD_ID="$DEFAULT_THREAD_ID"
-    mkdir -p "$(dirname "$THREAD_ID_FILE")"
-    printf '%s\n' "$THREAD_ID" > "$THREAD_ID_FILE"
-    heal_remote_thread_state "$THREAD_ID" || log "thread state heal warning: failed for ${THREAD_ID}"
-    shift
     ;;
   archive)
     ensure_rpc_transport
     codex_vps_thread_rpc archive "${2:-}"
-    exit 0
-    ;;
-  help|-h|--help)
-    cat <<'EOF'
-usage: codex-vps [command]
-
-commands:
-  codex-vps              connect to the default VPS thread
-  codex-vps create       create a fresh VPS thread and make it default without connecting
-  codex-vps new          create a fresh VPS thread, make it default, and connect
-  codex-vps reset        alias for new
-  codex-vps list         list visible VPS app-server threads
-  codex-vps resume <id>  set <id> as default and connect to it
-  codex-vps use <id>     set <id> as default without connecting
-  codex-vps old          restore the original giant thread as default
-  codex-vps archive <id> archive a visible thread in the app-server
-  codex-vps restart      restart the VPS app-server and Codex.app desktop bridge
-  codex-vps --restart    alias for restart
-EOF
     exit 0
     ;;
 esac
@@ -927,17 +1211,23 @@ fi
 
 if [ "${1:-}" = "--check" ] || [ "$USE_REMOTE_CLIENT" = "1" ]; then
   log "checking Codex client version..."
-  ensure_local_remote_client
+  require_matching_local_remote_client || return $?
 fi
 
 if [ "${1:-}" = "--check" ]; then
-  heal_remote_thread_state "$THREAD_ID" || log "thread state heal warning: failed for ${THREAD_ID}"
   if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" = "1" ]; then
     echo "codex-vps ready: direct ${DIRECT_REMOTE_URL}"
   else
-    ensure_tunnel
-    wait_for_health
-    echo "codex-vps ready: local 127.0.0.1:${LOCAL_PORT} -> ${REMOTE_HOST}:127.0.0.1:${REMOTE_PORT}"
+    service_status="$(ssh_remote "systemctl --user is-active ${SERVICE_NAME}" 2>/dev/null || true)"
+    if [ "$service_status" != "active" ]; then
+      echo "codex-vps: ${SERVICE_NAME} is ${service_status:-unavailable}; run 'codex-vps start' explicitly" >&2
+      return 1
+    fi
+    if owned_tunnel_listener_ok && tunnel_health_ok; then
+      echo "codex-vps ready: existing local 127.0.0.1:${LOCAL_PORT} -> ${REMOTE_HOST}:127.0.0.1:${REMOTE_PORT}"
+    else
+      echo "codex-vps ready: remote service active; no existing owned local tunnel"
+    fi
   fi
   if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" = "1" ]; then
     echo "codex-vps versions: Mac remote client $(codex_version "$LOCAL_CLIENT") (remote version probe skipped on direct path)"
@@ -958,15 +1248,15 @@ fi
 if [ "$USE_REMOTE_CLIENT" != "1" ]; then
   log "connecting over direct SSH TTY fallback..."
   REMOTE_CODEX_ARGS="$(codex_remote_shell_config_args)"
+  REMOTE_REPO_QUOTED="$(printf '%q' "$REMOTE_REPO")"
   if [ "$USE_TAILSCALE_PROXY" = "1" ]; then
-    exec ssh -tt "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" "cd /home/signul/SIGNUL && exec ~/.local/share/codexswitch/patched-codex/codex ${REMOTE_CODEX_ARGS} resume ${THREAD_ID}"
+    exec "$SSH_BIN" -tt "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" "cd ${REMOTE_REPO_QUOTED} && exec ~/.local/share/codexswitch/patched-codex/codex ${REMOTE_CODEX_ARGS} resume ${THREAD_ID}"
   fi
-  exec ssh -tt "${SSH_OPTS[@]}" "$REMOTE_HOST" "cd /home/signul/SIGNUL && exec ~/.local/share/codexswitch/patched-codex/codex ${REMOTE_CODEX_ARGS} resume ${THREAD_ID}"
+  exec "$SSH_BIN" -tt "${SSH_OPTS[@]}" "$REMOTE_HOST" "cd ${REMOTE_REPO_QUOTED} && exec ~/.local/share/codexswitch/patched-codex/codex ${REMOTE_CODEX_ARGS} resume ${THREAD_ID}"
 fi
 
 if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" != "1" ]; then
   start_tunnel_supervisor_for_interactive_attach
-  trap cleanup_tunnel_supervisor EXIT INT TERM
 fi
 
 cd "$LOCAL_REPO"
@@ -974,11 +1264,52 @@ if [ "$RESTART_AND_CONNECT" = "1" ]; then
   shift
 fi
 
-heal_remote_thread_state "$THREAD_ID" || log "thread state heal warning: failed for ${THREAD_ID}"
-
 log "connecting to remote Codex session via ${REMOTE_URL}..."
 CODEX_ARGS=("${(@f)$(codex_launch_config_args)}")
-if [ -n "${CODEX_VPS_USE_PTY_BRIDGE:-}" ]; then
-  exec env TERM=xterm-256color "$PTY_BRIDGE" -- "$LOCAL_CLIENT" "${CODEX_ARGS[@]}" --remote "$REMOTE_URL" resume "$THREAD_ID"
+
+run_remote_client_once() {
+  if [ -n "${CODEX_VPS_USE_PTY_BRIDGE:-}" ]; then
+    env TERM=xterm-256color "$PTY_BRIDGE" -- "$LOCAL_CLIENT" "${CODEX_ARGS[@]}" --remote "$REMOTE_URL" resume "$THREAD_ID"
+  else
+    "$LOCAL_CLIENT" "${CODEX_ARGS[@]}" --remote "$REMOTE_URL" resume "$THREAD_ID"
+  fi
+}
+
+if [ "$REMOTE_CLIENT_AUTO_RECONNECT" != "1" ]; then
+  if [ -n "${CODEX_VPS_USE_PTY_BRIDGE:-}" ]; then
+    exec env TERM=xterm-256color "$PTY_BRIDGE" -- "$LOCAL_CLIENT" "${CODEX_ARGS[@]}" --remote "$REMOTE_URL" resume "$THREAD_ID"
+  fi
+  exec "$LOCAL_CLIENT" "${CODEX_ARGS[@]}" --remote "$REMOTE_URL" resume "$THREAD_ID"
 fi
-exec "$LOCAL_CLIENT" "${CODEX_ARGS[@]}" --remote "$REMOTE_URL" resume "$THREAD_ID"
+
+remote_client_attempt=0
+while true; do
+  set +e
+  run_remote_client_once
+  remote_client_status="$?"
+  set -e
+
+  case "$remote_client_status" in
+    0|130|143)
+      exit "$remote_client_status"
+      ;;
+  esac
+
+  remote_client_attempt=$((remote_client_attempt + 1))
+  if [ "$REMOTE_CLIENT_RECONNECT_MAX" -gt 0 ] && [ "$remote_client_attempt" -gt "$REMOTE_CLIENT_RECONNECT_MAX" ]; then
+    log "remote Codex client exited with status ${remote_client_status}; reconnect limit reached"
+    exit "$remote_client_status"
+  fi
+
+  remote_client_delay="$(reconnect_delay_for_attempt "$remote_client_attempt" "$REMOTE_CLIENT_RECONNECT_DELAY" "$REMOTE_CLIENT_RECONNECT_DELAY_MAX")"
+  log "remote Codex client exited with status ${remote_client_status}; reconnecting in ${remote_client_delay}s..."
+  if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" != "1" ]; then
+    ensure_rpc_transport || true
+  fi
+  sleep_for "$remote_client_delay"
+done
+}
+
+if [ "${CODEX_VPS_SOURCE_ONLY:-0}" != "1" ]; then
+  codex_vps_main "$@"
+fi

@@ -8,8 +8,6 @@ SIDE="${CODEXSWITCH_SECUREDROP_SIDE:-mac}"
 LOCAL_KNOWLEDGE="${CODEXSWITCH_SECUREDROP_KNOWLEDGE:-$LOCAL_ROOT/knowledge}"
 STATE_DIR="${CODEXSWITCH_SECUREDROP_STATE_DIR:-$HOME/.codexswitch/securedrop}"
 LOCK_DIR="$STATE_DIR/knowledge-sync.lock"
-LOG="$LOCAL_KNOWLEDGE/.synclog.jsonl"
-CONFLICTS="$LOCAL_KNOWLEDGE/.conflicts"
 REMOTE_KNOWLEDGE="$REMOTE_ROOT/knowledge"
 LOCAL_TEST=0
 
@@ -25,8 +23,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$SIDE" in
+  mac|vps) ;;
+  *) echo "knowledge-sync: --side must be mac or vps" >&2; exit 2 ;;
+esac
+
+LOG="$LOCAL_KNOWLEDGE/.synclog.jsonl"
+CONFLICTS="$LOCAL_KNOWLEDGE/.conflicts"
 mkdir -p "$LOCAL_KNOWLEDGE" "$CONFLICTS" "$STATE_DIR"
 chmod 700 "$LOCAL_KNOWLEDGE" "$CONFLICTS" "$STATE_DIR" 2>/dev/null || true
+
+canonical_directory() {
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+
+if [[ "$(canonical_directory "$LOCAL_KNOWLEDGE")" == "$(canonical_directory "$REMOTE_KNOWLEDGE")" ]]; then
+  echo "knowledge-sync: local and remote endpoints resolve to the same directory; refusing no-op sync" >&2
+  exit 2
+fi
+
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then exit 0; fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 

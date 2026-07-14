@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "case": "five-hour-only",
+  "now": 805550400,
+  "snapshot": {
+    "version": 2,
+    "allowed": true,
+    "limitReached": false,
+    "fetchedAt": 805550400,
+    "windows": [
+      {
+        "kind": "fiveHour",
+        "durationSeconds": 18000,
+        "usedPercent": 25,
+        "resetsAt": 805568400,
+        "source": {
+          "rateLimit": "main",
+          "slot": "primary",
+          "limitName": "codex",
+          "meteredFeature": "codex"
+        },
+        "hardLimitReached": false
+      }
+    ]
+  },
+  "expected": {
+    "availability": "usable",
+    "windowKinds": ["fiveHour"],
+    "minimumRemainingPercent": 75
+  }
+}

@@ -1,17 +1,26 @@
 ---
 toc:
   - CodexSwitch
+  - The Problem
+  - The Solution
   - Features
-  - Settings
+  - How It Works
+  - Getting Started
   - Project Structure
-  - Security Notes
-  - Development
+  - Documentation
+  - Testing
+  - License
 cross_dependencies:
-  - Sources/CodexSwitch/Services/DesktopHeadroomCleanup.swift
+  - Sources/CodexSwitch/App/AppDelegate.swift
+  - Sources/CodexSwitch/Services/DesktopPatchManager.swift
+  - Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - Sources/CodexSwitch/Views/SettingsView.swift
   - docs/sighup-safety.md
+  - docs/README.md
+  - docs/architecture/system-overview.md
+  - docs/audits/2026-07-12-codebase-audit.md
 version_control:
-  updated_on: 2026-04-29
+  updated_on: 2026-07-12
   updated_by: Codex
   status: working-tree
 ---
@@ -27,11 +36,11 @@ version_control:
 
 <p align="center">
   <strong>Multi-account quota manager for Codex CLI</strong><br>
-  <em>Never hit a rate limit again — CodexSwitch monitors your ChatGPT accounts and auto-switches to the one with the most remaining quota.</em>
+  <em>Reduce quota interruptions with observable account selection and verified runtime reloads.</em>
 </p>
 
 <p align="center">
-  <strong>macOS only</strong> · Native Swift + SwiftUI · No Electron, no web views
+  <strong>Mac menu app and Linux/VPS coordinator</strong> · Native Swift + Rust CLI/daemon
 </p>
 
 ---
@@ -42,21 +51,21 @@ Codex CLI uses a single `~/.codex/auth.json` file for authentication. If you hav
 
 ## The Solution
 
-CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accounts simultaneously. It polls each account's quota, visualizes remaining capacity with drain bars, and **automatically swaps to the best account** when the active one runs dry — with SIGHUP hot-swap so the CLI picks up new tokens instantly without restarting.
+CodexSwitch manages multiple paid ChatGPT accounts through a native Mac menu app and a headless Linux/VPS coordinator. Each host observes quota, selects an eligible local account, commits the complete token bundle, and reloads verified Codex runtimes without requiring the user to exit and resume a session.
 
 ## Features
 
-**📊 Live Quota Monitoring** — Polls ChatGPT's usage API with adaptive intervals. Active account polls every 5 seconds for near-realtime UI. Inactive accounts poll based on urgency, sleeping until their reset time to minimize API calls.
+**📊 Live Quota Monitoring** — Polls ChatGPT usage with adaptive intervals and renders only the quota windows the service actually supplies. Five-hour and weekly windows are optional; weekly-only paid accounts remain fully supported.
 
-**🔄 Automatic Switching** — When the active account's 5-hour or weekly quota reaches 1% or less, CodexSwitch scores all alternatives and atomically swaps `~/.codex/auth.json`. Anti-ping-pong logic ensures candidates are not already inside the auto-swap threshold before swapping.
+**🔄 Automatic Switching** — Ranks confirmed usable accounts by plan, capacity, and stability, then atomically commits the selected account. Pro capacity is preferred for faster inference; scarce banked resets are protected near natural weekly recovery.
 
-**⚡ SIGHUP Hot-Swap** — Sends SIGHUP to verified running Codex CLI processes only after real token/account changes, so the CLI reloads tokens instantly without routine status checks interrupting sessions. Uses `pgrep` + `proc_pidinfo` to find processes and skip those younger than 10 seconds (still initializing).
+**⚡ Verified Hot-Swap** — Reloads only verified Codex CLI or app-server targets after the auth commit passes readback. Runtime identity and acknowledgement are part of the operation; status checks never signal processes.
 
-**🖥 Desktop App Token Injection** — Detects the Codex desktop app via WebSocket and injects new tokens directly, keeping desktop sessions in sync.
+**🖥 Desktop Runtime Reload** — Sends the complete access, refresh, and identity token set through the supported desktop app-server RPC path and records acknowledgement.
 
 **🧭 Direct Desktop Routing** — Codex.app stays on stock OpenAI transport. CodexSwitch removes legacy desktop Headroom env bridges while preserving account hot-swap, bundled CLI repair, and plugin readiness patches.
 
-**📊 Pooled Usage Meter** — Aggregated view of all accounts' 5-hour and weekly capacity with Pro plan equivalence comparison. Shows estimated pool runway using `min(5h estimate, weekly ceiling)`. When all weekly is exhausted, shows countdown to nearest weekly reset.
+**📊 Pooled Usage Meter** — Aggregates only observed windows and keeps Mac and VPS state distinct. Missing data is displayed as unknown or absent, never as zero or full.
 
 **⚡ Menu Bar Icon** — SF Symbol bolt with color states:
 | Color | Meaning |
@@ -68,74 +77,24 @@ CodexSwitch lives in your macOS menu bar and manages multiple ChatGPT Plus accou
 
 **🔔 macOS Notifications** — Notified on account swap, token refresh failure, and all-accounts-exhausted.
 
-**🔐 Keychain Storage** — All OAuth tokens stored in macOS Keychain. Never written to disk in plaintext.
+**🔐 Private Account Store** — Account records use a locked, validated, atomically replaced private store. Runtime token material is written only to the host's required Codex auth location with restrictive permissions.
 
 **📋 Diagnostic Logging** — Daily log files at `~/.codexswitch/logs/` with swap events, SIGHUP delivery, polling errors, and token refreshes. Old logs auto-pruned after 7 days.
 
 ## How It Works
 
-```
-                    ┌─────────────────┐
-                    │   Menu Bar ⚡    │
-                    │ StatusBarController│
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │   AppDelegate    │  orchestrates everything
-                    └──┬──┬──┬──┬──┬──┘
-                       │  │  │  │  │
-          ┌────────────┘  │  │  │  └────────────┐
-          │               │  │  │               │
-   ┌──────▼──────┐ ┌─────▼──▼──▼─────┐  ┌──────▼──────┐
-   │ QuotaPoller  │ │ AccountManager  │  │  SwapEngine  │
-   │  (actor)     │ │ (@Observable)   │  │  (scoring)   │
-   │              │ │                 │  │              │
-   │ adaptive     │ │ accounts[]      │  │ score()      │
-   │ polling      │ │ swapHistory[]   │  │ writeAuth()  │
-   │              │ │ syncWithAuth()  │  │ signalCLI()  │
-   └──────┬───────┘ └────────┬────────┘  └──────┬───────┘
-          │                  │                   │
-   ┌──────▼───────┐   ┌─────▼──────┐    ┌───────▼──────┐
-   │TokenRefresher │   │KeychainStore│    │~/.codex/     │
-   │              │   │            │    │  auth.json   │
-   │ OAuth refresh│   │ macOS      │    │  (atomic     │
-   │ via OpenAI   │   │ Keychain   │    │   rename)    │
-   └──────────────┘   └────────────┘    └──────────────┘
+```text
+observe quota/reset state -> rank eligible local accounts
+                          -> lock and revalidate the account store
+                          -> commit complete auth state atomically
+                          -> read back the committed identity
+                          -> reload verified local runtimes
+                          -> publish acknowledgement and status
 ```
 
-### Swap Scoring Algorithm
+The Mac and VPS run this lifecycle independently. The Mac can display read-only VPS observations, but a remote session never becomes authority over Mac auth state. Diagnostics are observational, and updates or repairs require explicit commands.
 
-When the active account reaches 1% or less on either window, CodexSwitch picks the best replacement:
-
-```
-if weekly exhausted → score = -1 (ineligible)
-
-if 5h exhausted (but weekly available):
-  score = resetProximity × 15 + weekly.remaining × 0.1
-  (closer to 5h reset = higher score, scaled 0→1 over 5h window)
-
-otherwise:
-  score = fiveHour.remainingPercent
-        + weekly.remainingPercent × 0.3
-        × (0.5 penalty if weekly < 20%)
-```
-
-Anti-ping-pong guard: a candidate must have **both** 5h and weekly quota above the auto-swap threshold before the swap executes.
-
-### Adaptive Polling
-
-Active account polls every 5 seconds. Inactive accounts use urgency-based intervals that sleep until their next reset:
-
-| Remaining | Active | Inactive |
-|-----------|--------|----------|
-| > 50% | 5s | 10 min |
-| 20–50% | 5s | 5 min |
-| 10–20% | 5s | 2 min |
-| 5–10% | 5s | 1 min |
-| < 5% | 5s | 10 sec |
-| Exhausted | 5s | Sleep until reset + 2s |
-
-Inactive accounts with plenty of quota (> 50%) check every 10 minutes. Exhausted inactive accounts sleep until their 5h window resets, then poll once to confirm.
+The detailed component map and rationale live in the [system overview](docs/architecture/system-overview.md). The exact candidate and reset hierarchy lives in the [quota and reset policy](docs/architecture/quota-and-reset-policy.md).
 
 ## Getting Started
 
@@ -143,7 +102,7 @@ Inactive accounts with plenty of quota (> 50%) check every 10 minutes. Exhausted
 
 - macOS 15+
 - Swift 6.3+ (Xcode 26+)
-- One or more ChatGPT Plus accounts with Codex CLI access
+- One or more paid ChatGPT accounts with Codex access
 - A SIGHUP-capable Codex CLI binary (writes `~/.codexswitch/sighup-verified` on startup)
 
 ### Build & Run
@@ -151,17 +110,18 @@ Inactive accounts with plenty of quota (> 50%) check every 10 minutes. Exhausted
 ```bash
 git clone https://github.com/brendondelgado/CodexSwitch.git
 cd CodexSwitch
-swift build
-# Copy to Applications
-cp .build/debug/CodexSwitch /Applications/CodexSwitch.app/Contents/MacOS/CodexSwitch
-open /Applications/CodexSwitch.app
+scripts/build-app.sh --install
 ```
+
+The installer stages and verifies the complete signed app before replacing the
+installed bundle, and restores the previous bundle if activation fails. Use
+`CODEXSWITCH_SWIFTPM_JOBS=1` to keep compilation memory bounded on smaller Macs.
 
 ### Adding Accounts
 
 1. Click the ⚡ menu bar icon → **Add Account**
 2. Sign in with Google OAuth in the browser window that opens
-3. Tokens are extracted and stored securely in Keychain
+3. Tokens are stored in the private CodexSwitch account store and written to Codex auth only during a verified activation
 4. Repeat for each account
 
 ### Settings
@@ -170,11 +130,11 @@ Click the ⚙ gear icon in the popover to configure:
 - **Launch at login** — start CodexSwitch automatically
 - **Poll frequency** — 0.5x (aggressive) to 2.0x (conservative) multiplier
 - **Desktop app repair** — optionally let CodexSwitch patch Codex.app after updates; desktop traffic remains direct OpenAI transport
-- **Remove all accounts** — clear Keychain and reset
+- **Remove all accounts** — clear the CodexSwitch account store and reset local state
 
 ## Project Structure
 
-```
+```text
 Sources/CodexSwitch/
 ├── App/
 │   ├── CodexSwitchApp.swift        # @main entry point
@@ -183,15 +143,15 @@ Sources/CodexSwitch/
 │   ├── AccountManager.swift        # @Observable account state + sync
 │   ├── AuthFile.swift              # Codex auth.json schema
 │   ├── CodexAccount.swift          # Account model with quota data
-│   ├── QuotaSnapshot.swift         # 5h/weekly windows + urgency tiers
+│   ├── QuotaSnapshot.swift         # Optional semantic quota windows
 │   └── SwapEvent.swift             # Swap history records
 ├── Services/
 │   ├── AccountImporter.swift       # Import from ~/.codex/auth.json
 │   ├── CLIStatusChecker.swift      # Verify CLI can read current auth
-│   ├── CodexVersionChecker.swift   # Detect SIGHUP-capable binary
-│   ├── DesktopAppConnector.swift   # WebSocket token injection for desktop app
-│   ├── DesktopHeadroomCleanup.swift # Remove legacy desktop Headroom routing env
-│   ├── KeychainStore.swift         # Keychain CRUD operations
+│   ├── CodexVersionChecker.swift   # Detect and prepare compatible Codex runtimes
+│   ├── DesktopPatchManager.swift   # Desktop compatibility status and patching
+│   ├── DesktopRuntimeReloadClient.swift # Complete-token desktop reload RPC
+│   ├── KeychainStore.swift         # File account repository + legacy migration
 │   ├── NotificationManager.swift   # macOS notification delivery
 │   ├── OAuthLoginManager.swift     # Google OAuth login flow
 │   ├── QuotaPoller.swift           # Adaptive HTTP polling (actor)
@@ -208,15 +168,36 @@ Sources/CodexSwitch/
     ├── SettingsView.swift          # Preferences window
     ├── StatusBarController.swift   # Menu bar icon + color state management
     └── SwapStatsView.swift         # Swap history statistics display
+
+crates/codexswitch-cli/
+├── src/                            # Linux/VPS coordinator, policy, reload, updater
+└── systemd/                        # Repository-owned user service definitions
+
+scripts/                            # Transport, deployment, patching, and focused tests
+docs/                               # Canonical architecture wiki, runbooks, plans, and audits
 ```
+
+## Documentation
+
+The canonical maintainer and agent wiki starts at [`docs/README.md`](docs/README.md). Architecture contracts define product policy and ownership; runbooks define operational procedures; audits and plans track migration state without redefining behavior.
+
+Claude and other repository agents should begin with [`CLAUDE.md`](CLAUDE.md), which routes questions to the smallest authoritative document and records live-session and deployment safety boundaries.
 
 ## Testing
 
 ```bash
+# Requires full Xcode, including SwiftUI and Testing macro plugins.
 swift test
+
+# Linux/VPS core without writing build artifacts into the repository.
+CARGO_TARGET_DIR=/tmp/codexswitch-target CARGO_BUILD_JOBS=1 \
+  cargo test --locked --offline -p codexswitch-cli
+
+# Transport, deployment, SecureDrop, and patcher fixtures.
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-24 tests across 4 suites covering models, quota parsing, polling intervals, and swap scoring.
+The audit also uses a standalone Swift banked-reset harness when the selected Command Line Tools installation lacks `SwiftUIMacros` or `TestingMacros`. See the [codebase audit](docs/audits/2026-07-12-codebase-audit.md) for the current verified counts and environment limitations.
 
 ## License
 

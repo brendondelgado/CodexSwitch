@@ -1,3 +1,25 @@
+---
+title: CodexSwitch agent instructions
+description: Repository constraints, operational safety rules, and canonical documentation routing for coding agents.
+toc:
+  - Memory Context
+  - Canonical Documentation Routing
+  - Codex.app Desktop Patch Runbook
+  - Codex.app Auth Reload Contract
+  - Codex.app Embedded Browser Session Repair
+  - CodexSwitch SecureDrop Agent Protocol
+cross_dependencies:
+  - CLAUDE.md
+  - docs/README.md
+  - docs/architecture/system-overview.md
+  - docs/architecture/quota-and-reset-policy.md
+  - docs/architecture/runtime-and-host-ownership.md
+version_control:
+  branch: main
+  status: canonical
+  last_updated: 2026-07-12
+---
+
 <claude-mem-context>
 # Memory Context
 
@@ -64,6 +86,23 @@ Stats: 50 obs (22,623t read) | 1,521,956t work | 99% savings
 Access 1522k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>
 
+## Canonical Documentation Routing
+
+- Start repository work at `CLAUDE.md`, then use `docs/README.md` to route to
+  the smallest authoritative document.
+- Architecture contracts define product invariants. Runbooks define operator
+  procedures. Plans and audits describe migration state; they do not redefine
+  product policy.
+- When documents disagree, prefer `docs/architecture/`, deterministic tests,
+  current source, active audit/plan status, then runbooks and historical notes.
+- Distinguish target architecture, repository implementation, staged artifact,
+  and live deployed behavior. Never claim a repository fix is active on the VPS
+  without matching provenance and post-activation verification.
+- Hermes is outside the CodexSwitch boundary. Its former integration was
+  removed and must not be reintroduced.
+- Update the canonical docs, implementation, and tests together whenever
+  behavior changes.
+
 ## Codex.app Desktop Patch Runbook
 
 Use this when the user explicitly asks to patch `/Applications/Codex.app` after
@@ -87,10 +126,20 @@ instructions that protected the stock app during wrapper-only debugging.
   `Apple Development: ...` can make `codesign --verify` pass while launchd still
   refuses to spawn Codex.app with `RBSRequestErrorDomain Code=5` /
   `NSPOSIXErrorDomain Code=163`.
+- On Brendon's Mac, the recurring working fallback is the Apple-issued
+  `iPhone Developer: bd7349@gmail.com (856E75LLMU)` identity, not the
+  self-signed `Apple Development: Brendon Delgado (856E75LLMU)` certificate.
+  `scripts/patch-asar.py --print-codesign-identity` is the source of truth and
+  should select/import that fallback automatically when no better macOS signing
+  identity is present.
 - If an Apple-issued cert/key pair is already on disk, import it with
   `openssl pkcs12 -legacy -export ...` and `security import ... -A`, then approve
   the Keychain prompt with `Always Allow`. Without `-legacy`, Keychain import may
   fail with PKCS#12 MAC verification errors.
+- The cached iPhone Developer cert/key pair has historically lived under
+  `~/Library/Application Support/me.nabdev.iloader/keys/*/{cert.pem,key.pem}`.
+  The patcher may export/import that pair into the login Keychain automatically;
+  do not copy the private key to SecureDrop or commit it.
 - When signing Codex.app with a non-OpenAI Team ID, do not preserve OpenAI-only
   entitlements such as `2DC432GLL2.*` keychain groups or application groups.
   Re-sign the app root with minimal Electron-safe local entitlements instead.

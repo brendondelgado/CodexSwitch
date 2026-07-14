@@ -4,6 +4,51 @@ import Testing
 
 @Suite("Codex patching")
 struct CodexPatchingTests {
+    @Test("Desktop app locator prefers the unified ChatGPT bundle")
+    func desktopAppLocatorPrefersUnifiedChatGPTBundle() throws {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let unified = temp.appendingPathComponent("ChatGPT.app", isDirectory: true)
+        let legacy = temp.appendingPathComponent("Codex.app", isDirectory: true)
+        for app in [legacy, unified] {
+            let contents = app.appendingPathComponent("Contents", isDirectory: true)
+            let resources = contents.appendingPathComponent("Resources", isDirectory: true)
+            try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+            try Data().write(to: resources.appendingPathComponent("app.asar"))
+            try PropertyListSerialization.data(
+                fromPropertyList: [
+                    "CFBundleIdentifier": "com.openai.codex",
+                    "CFBundleVersion": "5042",
+                    "CFBundleShortVersionString": "26.707.31123",
+                ],
+                format: .xml,
+                options: 0
+            ).write(to: contents.appendingPathComponent("Info.plist"))
+        }
+
+        let install = CodexDesktopAppLocator.locate(
+            candidateAppPaths: [unified.path, legacy.path]
+        )
+
+        #expect(install?.appPath == unified.path)
+    }
+
+    @Test("Desktop updater accepts the unified ChatGPT archive layout")
+    func desktopUpdaterAcceptsUnifiedArchiveLayout() throws {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let unified = temp.appendingPathComponent("ChatGPT.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: unified, withIntermediateDirectories: true)
+
+        let extracted = CodexDesktopAppUpdater.findDesktopApp(in: temp)
+
+        #expect(extracted == unified)
+        #expect(CodexDesktopAppUpdater.installationPath(for: extracted!) == "/Applications/ChatGPT.app")
+    }
+
     @Test("Desktop appcast parser extracts the latest release")
     func parsesLatestDesktopRelease() throws {
         let xml = """
@@ -34,78 +79,43 @@ struct CodexPatchingTests {
         )
     }
 
-    @Test("Desktop repair decider patches a stopped stock bundle without patch markers")
-    func desktopRepairDeciderPatchesStoppedStockBundle() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1858",
-            shortVersion: "26.417.41555"
-        )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: nil,
-            patchMarkerPresent: false,
-            legacyPatchMarkerPresent: false,
-            usageState: .notRunning,
-            bundleIsValid: true,
-            signatureStatus: .officialOpenAI
-        )
-
-        #expect(decision == .repairNeeded)
+    @Test("Desktop update comparison uses monotonically increasing bundle builds")
+    func desktopUpdateComparisonUsesBundleBuilds() {
+        #expect(CodexDesktopAppUpdater.isReleaseNewer(bundleVersion: "5103", than: "5059"))
+        #expect(!CodexDesktopAppUpdater.isReleaseNewer(bundleVersion: "5059", than: "5059"))
+        #expect(!CodexDesktopAppUpdater.isReleaseNewer(bundleVersion: "5042", than: "5059"))
     }
 
-    @Test("Desktop repair decider does not accept stock bundles as patched")
-    func desktopRepairDeciderDoesNotAcceptStockBundleWithMatchingState() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1858",
-            shortVersion: "26.417.41555"
+    @Test("Staged desktop update waits for a safe quit boundary")
+    func stagedDesktopUpdateWaitsForSafeQuit() {
+        #expect(
+            CodexDesktopAppUpdater.installDecision(
+                stagedBundleVersion: "5103",
+                installedBundleVersion: "5059",
+                desktopRuntimeRunning: true
+            ) == .waitForDesktopQuit
         )
-        let savedState = CodexDesktopPatchedAppState(
-            bundleVersion: "1858",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
+        #expect(
+            CodexDesktopAppUpdater.installDecision(
+                stagedBundleVersion: "5103",
+                installedBundleVersion: "5059",
+                desktopRuntimeRunning: false
+            ) == .install
         )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: savedState,
-            patchMarkerPresent: false,
-            legacyPatchMarkerPresent: false,
-            usageState: .notRunning,
-            bundleIsValid: true,
-            signatureStatus: .officialOpenAI
+        #expect(
+            CodexDesktopAppUpdater.installDecision(
+                stagedBundleVersion: "5059",
+                installedBundleVersion: "5059",
+                desktopRuntimeRunning: false
+            ) == .discard
         )
-
-        #expect(decision == .repairNeeded)
     }
 
-    @Test("Desktop repair decider accepts a patched ad-hoc bundle with matching state")
-    func desktopRepairDeciderAcceptsPatchedAdHocBundleWithMatchingState() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1858",
-            shortVersion: "26.417.41555"
-        )
-        let savedState = CodexDesktopPatchedAppState(
-            bundleVersion: "1858",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
-        )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: savedState,
-            patchMarkerPresent: true,
-            legacyPatchMarkerPresent: false,
-            usageState: .notRunning,
-            bundleIsValid: true,
-            signatureStatus: .adHoc
-        )
-
-        #expect(decision == .noRepairNeeded)
+    @Test("Desktop update coordinator checks the official feed every minute")
+    func desktopUpdateCoordinatorChecksEveryMinute() {
+        #expect(CodexDesktopUpdateCoordinator.checkInterval == 60)
+        #expect(CodexDesktopAppUpdater.hasEnoughDiskSpace(availableBytes: 6 * 1024 * 1024 * 1024))
+        #expect(!CodexDesktopAppUpdater.hasEnoughDiskSpace(availableBytes: 512 * 1024 * 1024))
     }
 
     @Test("Desktop signature parser distinguishes official and ad-hoc bundles")
@@ -129,411 +139,100 @@ struct CodexPatchingTests {
         #expect(adHoc == .adHoc)
     }
 
-    @Test("Patch target resolves to Homebrew cask binary when codex is installed from cask")
-    func resolvesHomebrewCaskPatchTarget() {
-        let install = CodexInstallLocator.install(
-            whichCodexPath: "/opt/homebrew/bin/codex",
-            resolvedExecutablePath: "/opt/homebrew/Caskroom/codex/0.120.0/codex-aarch64-apple-darwin",
-            npmVendorBinaryPath: "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex"
-        )
+    @Test("Desktop app locator requires auth, recents, model, Fast, and reconnect markers")
+    func desktopAppLocatorRequiresCurrentDesktopPatchMarkers() throws {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
 
-        #expect(install.channel == .homebrewCask)
-        #expect(install.patchTargetPath == "/opt/homebrew/Caskroom/codex/0.120.0/codex-aarch64-apple-darwin")
-    }
-
-    @Test("Current upstream SIGHUP verification markers are accepted")
-    func acceptsCurrentVerifiedMarkers() {
-        let markerDirectory = "/Users/test/.codexswitch"
-
-        let hasTuiMarker = CodexSighupMarkers.hasVerifiedMarker(
-            markerDirectory: markerDirectory,
-            fileExists: { $0 == "\(markerDirectory)/sighup-verified-tui" }
-        )
-        let hasExecMarker = CodexSighupMarkers.hasVerifiedMarker(
-            markerDirectory: markerDirectory,
-            fileExists: { $0 == "\(markerDirectory)/sighup-verified-exec" }
-        )
-
-        #expect(hasTuiMarker)
-        #expect(hasExecMarker)
-    }
-
-    @Test("Auto repair is required when the patched state drifts from the active install")
-    func needsRepairWhenPatchedStateDrifts() {
-        let install = CodexInstall(
-            executablePath: "/opt/homebrew/bin/codex",
-            resolvedExecutablePath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin",
-            patchTargetPath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin",
-            channel: .homebrewCask
-        )
-        let staleState = CodexPatchedInstallState(
-            version: "0.120.0",
-            patchTargetPath: "/opt/homebrew/Caskroom/codex/0.120.0/codex-aarch64-apple-darwin"
-        )
-
-        #expect(CodexPatchRepairDecider.needsRepair(
-            forkEnabled: true,
-            currentInstall: install,
-            currentVersion: "0.121.0",
-            savedState: staleState
-        ))
-    }
-
-    @Test("Auto repair is skipped when patched state still matches the active install")
-    func skipsRepairWhenPatchedStateMatches() {
-        let install = CodexInstall(
-            executablePath: "/opt/homebrew/bin/codex",
-            resolvedExecutablePath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin",
-            patchTargetPath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin",
-            channel: .homebrewCask
-        )
-        let currentState = CodexPatchedInstallState(
-            version: "0.121.0",
-            patchTargetPath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin"
-        )
-
-        #expect(!CodexPatchRepairDecider.needsRepair(
-            forkEnabled: true,
-            currentInstall: install,
-            currentVersion: "0.121.0",
-            savedState: currentState
-        ))
-    }
-
-    @Test("Bootstrap only trusts existing patch state when the current-version backup exists")
-    func recoversPatchedStateOnlyWithCurrentVersionBackup() {
-        let install = CodexInstall(
-            executablePath: "/opt/homebrew/bin/codex",
-            resolvedExecutablePath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin",
-            patchTargetPath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin",
-            channel: .homebrewCask
-        )
-        let expectedBackup = "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin.stock-v0.121.0"
-
-        let recovered = CodexPatchRepairDecider.canRecoverPatchedState(
-            verifiedMarkerPresent: true,
-            currentInstall: install,
-            currentVersion: "0.121.0",
-            fileExists: { $0 == expectedBackup }
-        )
-
-        #expect(recovered)
-    }
-
-    @Test("Bootstrap rejects stale markers when there is no current-version backup")
-    func rejectsStaleMarkersWithoutCurrentVersionBackup() {
-        let install = CodexInstall(
-            executablePath: "/opt/homebrew/bin/codex",
-            resolvedExecutablePath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin",
-            patchTargetPath: "/opt/homebrew/Caskroom/codex/0.121.0/codex-aarch64-apple-darwin",
-            channel: .homebrewCask
-        )
-
-        let recovered = CodexPatchRepairDecider.canRecoverPatchedState(
-            verifiedMarkerPresent: true,
-            currentInstall: install,
-            currentVersion: "0.121.0",
-            fileExists: { _ in false }
-        )
-
-        #expect(!recovered)
-    }
-
-    @Test("Desktop app repair defers a running stock unpatched bundle")
-    func desktopRepairDefersRunningStockBundle() {
+        let asar = temp.appendingPathComponent("app.asar")
         let install = CodexDesktopAppInstall(
             appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1799",
-            shortVersion: "26.415.40636"
-        )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: nil,
-            patchMarkerPresent: false,
-            legacyPatchMarkerPresent: false,
-            usageState: .appRunning,
-            bundleIsValid: true,
-            signatureStatus: .officialOpenAI
-        )
-
-        #expect(decision == .deferWhileRunning)
-    }
-
-    @Test("Desktop app repair patches a valid stock bundle when Codex is stopped")
-    func desktopRepairPatchesStoppedStockBundle() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1799",
-            shortVersion: "26.415.40636"
-        )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: nil,
-            patchMarkerPresent: false,
-            legacyPatchMarkerPresent: false,
-            usageState: .notRunning,
-            bundleIsValid: true,
-            signatureStatus: .officialOpenAI
-        )
-
-        #expect(decision == .repairNeeded)
-    }
-
-    @Test("Desktop app repair does not defer when only the detached app-server is running")
-    func desktopRepairDoesNotDeferForBackgroundService() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1858",
-            shortVersion: "26.417.41555"
-        )
-        let staleState = CodexDesktopPatchedAppState(
-            bundleVersion: "1799",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
-        )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: staleState,
-            patchMarkerPresent: false,
-            legacyPatchMarkerPresent: false,
-            usageState: .backgroundServiceOnly,
-            bundleIsValid: false,
-            signatureStatus: .unreadable
-        )
-
-        #expect(decision == .repairNeeded)
-    }
-
-    @Test("Desktop app repair does not trust unrecorded ad-hoc bundles")
-    func desktopRepairDoesNotTrustUnrecordedAdHocBundle() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
+            asarPath: asar.path,
             bundleVersion: "1858",
             shortVersion: "26.417.41555"
         )
 
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: nil,
-            patchMarkerPresent: true,
-            legacyPatchMarkerPresent: false,
-            usageState: .notRunning,
-            bundleIsValid: true,
-            signatureStatus: .adHoc
-        )
+        try Data("_invalidateAccountQueries".utf8).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
 
-        #expect(decision == .repairNeeded)
+        try Data(
+            "_invalidateAccountQueries CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH "
+                .appending("CODEXSWITCH_MODEL_LABEL_FALLBACK")
+                .utf8
+        ).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
+
+        try Data(
+            "_invalidateAccountQueries CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH "
+                .appending("CODEXSWITCH_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK")
+                .utf8
+        ).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
+
+        try Data(
+            "_invalidateAccountQueries CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH "
+                .appending("CODEXSWITCH_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK ")
+                .appending("CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH")
+                .utf8
+        ).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
+
+        try Data(
+            "_invalidateAccountQueries CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH "
+                .appending("CODEXSWITCH_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK ")
+                .appending("CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK ")
+                .appending("CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH")
+                .utf8
+        ).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
+
+        try Data(
+            "_invalidateAccountQueries CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH "
+                .appending("CODEXSWITCH_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK ")
+                .appending("CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK ")
+                .appending("CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH ")
+                .appending("_bundledFastModels")
+                .utf8
+        ).write(to: asar)
+        #expect(CodexDesktopAppLocator.patchMarkerPresent(install: install))
+
+        try Data(
+            "_invalidateAccountQueries CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH "
+                .appending("_codexSwitchEnsureDesktopAuthSync")
+                .utf8
+        ).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
+        #expect(CodexDesktopAppLocator.legacyPatchMarkerPresent(install: install))
     }
 
-    @Test("Desktop app repair does not trust matching patch state when bundle signature is invalid")
-    func desktopRepairRebuildsWhenBundleSignatureIsInvalid() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1858",
-            shortVersion: "26.417.41555"
+    @Test("App packager refuses replacement when CodexSwitch does not quit")
+    func appPackagerGuardsLiveBundleReplacement() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let script = try String(
+            contentsOf: projectRoot.appendingPathComponent("scripts/build-app.sh"),
+            encoding: .utf8
         )
-        let currentState = CodexDesktopPatchedAppState(
-            bundleVersion: "1858",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
-        )
+        let guardText = "if /usr/bin/pgrep -x \"$APP_NAME\" >/dev/null 2>&1; then"
+        let refusalText = "refusing to replace its installed bundle"
+        let activationText = "atomic_swap_paths \"$STAGED_PATH\" \"$INSTALL_PATH\""
+        let guardRange = try #require(script.range(of: guardText))
+        let refusalRange = try #require(script.range(of: refusalText))
+        let activationRange = try #require(script.range(of: activationText))
 
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: currentState,
-            patchMarkerPresent: true,
-            legacyPatchMarkerPresent: false,
-            usageState: .notRunning,
-            bundleIsValid: false,
-            signatureStatus: .adHoc
-        )
-
-        #expect(decision == .repairNeeded)
-    }
-
-    @Test("Desktop restore preparation stops detached app-server before reinstall")
-    func desktopRestorePreparationStopsDetachedAppServer() {
-        var terminatedPath: String?
-
-        let result = CodexDesktopAppPatcher.prepareForRestore(
-            usageState: .backgroundServiceOnly,
-            appPath: "/Applications/Codex.app",
-            stopDetachedAppServer: { appPath in
-                terminatedPath = appPath
-                return true
-            }
-        )
-
-        #expect(result == nil)
-        #expect(terminatedPath == "/Applications/Codex.app")
-    }
-
-    @Test("Desktop restore preparation surfaces detached app-server shutdown failures")
-    func desktopRestorePreparationFailsWhenDetachedAppServerWontStop() {
-        let result = CodexDesktopAppPatcher.prepareForRestore(
-            usageState: .backgroundServiceOnly,
-            appPath: "/Applications/Codex.app",
-            stopDetachedAppServer: { _ in false }
-        )
-
-        #expect(result?.success == false)
-        #expect(result?.message == "Failed to stop the detached Codex app-server before patching the desktop bundle")
-    }
-
-    @Test("Desktop app process classifier ignores detached app-server as a patch blocker")
-    func desktopProcessClassifierIgnoresDetachedAppServer() {
-        let usageState = CodexDesktopAppProcessClassifier.usageState(
-            appPath: "/Applications/Codex.app",
-            processCommands: [
-                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
-            ]
-        )
-
-        #expect(usageState == .backgroundServiceOnly)
-    }
-
-    @Test("Desktop app process classifier blocks patching when the GUI app binary is running")
-    func desktopProcessClassifierBlocksForegroundApp() {
-        let usageState = CodexDesktopAppProcessClassifier.usageState(
-            appPath: "/Applications/Codex.app",
-            processCommands: [
-                "/Applications/Codex.app/Contents/MacOS/Codex"
-            ]
-        )
-
-        #expect(usageState == .appRunning)
-    }
-
-    @Test("Desktop app process classifier treats detached app-server children as stoppable")
-    func desktopProcessClassifierTreatsDetachedAppServerChildrenAsStoppable() {
-        let usageState = CodexDesktopAppProcessClassifier.usageState(
-            appPath: "/Applications/Codex.app",
-            processCommands: [
-                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
-                "/Applications/Codex.app/Contents/Resources/codex_chronicle",
-                "/Applications/Codex.app/Contents/Resources/node_repl",
-                "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient mcp"
-            ]
-        )
-
-        #expect(usageState == .backgroundServiceOnly)
-    }
-
-    @Test("Desktop app process classifier blocks Electron helpers")
-    func desktopProcessClassifierBlocksElectronHelpers() {
-        let usageState = CodexDesktopAppProcessClassifier.usageState(
-            appPath: "/Applications/Codex.app",
-            processCommands: [
-                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
-                "/Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=gpu-process"
-            ]
-        )
-
-        #expect(usageState == .appRunning)
-    }
-
-    @Test("Desktop app process classifier ignores orphaned crashpad handlers")
-    func desktopProcessClassifierIgnoresOrphanedCrashpadHandlers() {
-        let usageState = CodexDesktopAppProcessClassifier.usageState(
-            appPath: "/Applications/Codex.app",
-            processCommands: [
-                "/Applications/Codex.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler --database=/Users/example/Library/Application Support/Codex/Crashpad"
-            ]
-        )
-
-        #expect(usageState == .notRunning)
-    }
-
-    @Test("Desktop app process classifier allows detached app-server with orphaned crashpad")
-    func desktopProcessClassifierAllowsDetachedAppServerWithCrashpad() {
-        let usageState = CodexDesktopAppProcessClassifier.usageState(
-            appPath: "/Applications/Codex.app",
-            processCommands: [
-                "/Applications/Codex.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler --database=/Users/example/Library/Application Support/Codex/Crashpad",
-                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
-            ]
-        )
-
-        #expect(usageState == .backgroundServiceOnly)
-    }
-
-    @Test("Desktop app repair runs when the tracked build changed and the new asar is unpatched")
-    func desktopRepairRunsWhenBuildChanges() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1799",
-            shortVersion: "26.415.40636"
-        )
-        let staleState = CodexDesktopPatchedAppState(
-            bundleVersion: "1763",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
-        )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: staleState,
-            patchMarkerPresent: false,
-            legacyPatchMarkerPresent: false,
-            usageState: .notRunning,
-            bundleIsValid: false,
-            signatureStatus: .unreadable
-        )
-
-        #expect(decision == .repairNeeded)
-    }
-
-    @Test("Desktop app repair defers while Codex.app is still running")
-    func desktopRepairDefersForRunningBundle() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "1858",
-            shortVersion: "26.417.41555"
-        )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: nil,
-            patchMarkerPresent: false,
-            legacyPatchMarkerPresent: false,
-            usageState: .appRunning,
-            bundleIsValid: true,
-            signatureStatus: .adHoc
-        )
-
-        #expect(decision == .deferWhileRunning)
-    }
-
-    @Test("Desktop app repair defers a running clean stock bundle when the build changed")
-    func desktopRepairDefersRunningCleanStockBundleWhenBuildChanged() {
-        let install = CodexDesktopAppInstall(
-            appPath: "/Applications/Codex.app",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar",
-            bundleVersion: "2056",
-            shortVersion: "26.422.21637"
-        )
-        let staleState = CodexDesktopPatchedAppState(
-            bundleVersion: "1858",
-            asarPath: "/Applications/Codex.app/Contents/Resources/app.asar"
-        )
-
-        let decision = CodexDesktopAppPatchRepairDecider.decision(
-            currentInstall: install,
-            savedState: staleState,
-            patchMarkerPresent: true,
-            legacyPatchMarkerPresent: false,
-            usageState: .appRunning,
-            bundleIsValid: true,
-            signatureStatus: .officialOpenAI
-        )
-
-        #expect(decision == .deferWhileRunning)
+        #expect(guardRange.lowerBound < refusalRange.lowerBound)
+        #expect(refusalRange.lowerBound < activationRange.lowerBound)
+        #expect(!script.contains("rm -rf \"$INSTALL_PATH\""))
     }
 }

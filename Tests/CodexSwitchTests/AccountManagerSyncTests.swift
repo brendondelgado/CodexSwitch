@@ -4,74 +4,28 @@ import Testing
 
 @Suite("AccountManager Sync")
 struct AccountManagerSyncTests {
-    @Test("syncWithAuthJson promotes auth target immediately")
-    @MainActor func syncPromotesAuthTarget() async {
+    @Test("Email lookup resolves a local account without changing configuration")
+    @MainActor func emailLookupDoesNotSelectAccount() {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authAccountIdProvider: { "acc-target" },
-            authFileWriter: { _ in }
-        )
-
-        let current = CodexAccount(email: "current@test.com", accessToken: "t1", refreshToken: "r1", idToken: "i1", accountId: "acc-current", isActive: true)
-        let target = CodexAccount(email: "target@test.com", accessToken: "t2", refreshToken: "r2", idToken: "i2", accountId: "acc-target")
-        manager.addAccount(current)
-        manager.addAccount(target)
-        manager.setActive(current.id)
-
-        let changed = await manager.syncWithAuthJson()
-
-        #expect(changed == target.id)
-        #expect(manager.activeAccount?.id == target.id)
-    }
-
-    @Test("syncWithAuthJson returns nil when already in sync")
-    @MainActor func syncReturnsNilWhenAlreadyInSync() async {
-        let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authAccountIdProvider: { "acc-current" },
-            authFileWriter: { _ in }
-        )
-
-        let current = CodexAccount(email: "current@test.com", accessToken: "t1", refreshToken: "r1", idToken: "i1", accountId: "acc-current", isActive: true)
-        manager.addAccount(current)
-        manager.setActive(current.id)
-
-        let changed = await manager.syncWithAuthJson()
-
-        #expect(changed == nil)
-        #expect(manager.activeAccount?.id == current.id)
-    }
-
-    @Test("setActiveByEmail mirrors Linux devbox active account")
-    @MainActor func setActiveByEmailMirrorsLinuxDevboxActive() {
-        let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
 
         let current = CodexAccount(email: "current@test.com", accessToken: "t1", refreshToken: "r1", idToken: "i1", accountId: "acc-current", isActive: true)
         let remoteActive = CodexAccount(email: "REMOTE@test.com", accessToken: "t2", refreshToken: "r2", idToken: "i2", accountId: "acc-remote")
         manager.addAccount(current)
         manager.addAccount(remoteActive)
-        manager.setActive(current.id)
+        manager.setConfiguredAccount(current.id)
 
-        let changed = manager.setActiveByEmail("remote@test.com")
+        let resolved = manager.accountId(matchingEmail: "remote@test.com")
 
-        #expect(changed == remoteActive.id)
-        #expect(manager.activeAccount?.id == remoteActive.id)
-        #expect(defaults.string(forKey: "activeAccountId") == remoteActive.id.uuidString)
+        #expect(resolved == remoteActive.id)
+        #expect(manager.configuredAccount?.id == current.id)
+        #expect(defaults.string(forKey: "activeAccountId") == current.id.uuidString)
     }
 
-    @Test("Linux devbox account state mirrors active account and quota without replacing tokens")
-    @MainActor func linuxDevboxAccountStateMirrorsActiveAndQuotaWithoutReplacingTokens() {
+    @Test("Linux devbox observations remain separate from Mac policy and active ownership")
+    @MainActor func linuxDevboxObservationsRemainPresentationOnly() {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
 
         let current = CodexAccount(
             email: "current@test.com",
@@ -91,10 +45,9 @@ struct AccountManagerSyncTests {
         let remoteSnapshot = quotaSnapshot(fiveHourRemaining: 92, weeklyRemaining: 10)
         manager.addAccount(current)
         manager.addAccount(remoteActive)
-        manager.setActive(current.id)
+        manager.setConfiguredAccount(current.id)
 
-        let changed = manager.applyLinuxDevboxAccountStates([
-            LinuxDevboxAccountState(
+        let observation = LinuxDevboxAccountState(
                 email: "REMOTE@test.com",
                 isActive: true,
                 quotaSnapshot: remoteSnapshot,
@@ -104,27 +57,25 @@ struct AccountManagerSyncTests {
                 subscriptionExpiresAt: nil,
                 subscriptionWillRenew: nil,
                 hasActiveSubscription: true
-            ),
-        ])
+            )
+        let result = manager.applyLinuxDevboxAccountStates([observation])
 
-        #expect(changed == remoteActive.id)
-        #expect(manager.activeAccount?.id == remoteActive.id)
-        #expect(manager.activeAccount?.accessToken == "local-remote-access")
-        #expect(manager.activeAccount?.refreshToken == "local-remote-refresh")
-        #expect(manager.activeAccount?.quotaSnapshot?.fiveHour.remainingPercent == 92)
-        #expect(manager.activeAccount?.quotaSnapshot?.weekly.remainingPercent == 10)
-        #expect(manager.activeAccount?.planType == "plus")
-        #expect(manager.activeAccount?.hasActiveSubscription == true)
-        #expect(defaults.string(forKey: "activeAccountId") == remoteActive.id.uuidString)
+        #expect(result.stateChanged)
+        #expect(manager.configuredAccount?.id == current.id)
+        let mirrored = manager.accounts.first(where: { $0.id == remoteActive.id })
+        #expect(mirrored?.accessToken == "local-remote-access")
+        #expect(mirrored?.refreshToken == "local-remote-refresh")
+        #expect(mirrored?.quotaSnapshot == nil)
+        #expect(mirrored?.planType == nil)
+        #expect(mirrored?.hasActiveSubscription == nil)
+        #expect(manager.linuxDevboxAccountStates == [observation])
+        #expect(defaults.string(forKey: "activeAccountId") == current.id.uuidString)
     }
 
-    @Test("Linux devbox account state can skip active takeover while updating quota")
-    @MainActor func linuxDevboxAccountStateCanSkipActiveTakeoverWhileUpdatingQuota() {
+    @Test("Linux devbox remote active status never mutates the Mac active account")
+    @MainActor func linuxDevboxRemoteActiveDoesNotMutateMacActiveAccount() {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
 
         let localActive = CodexAccount(
             email: "bd7349@me.com",
@@ -144,9 +95,9 @@ struct AccountManagerSyncTests {
         let remoteSnapshot = quotaSnapshot(fiveHourRemaining: 89, weeklyRemaining: 79)
         manager.addAccount(localActive)
         manager.addAccount(remoteActive)
-        manager.setActive(localActive.id)
+        manager.setConfiguredAccount(localActive.id)
 
-        let result = manager.applyLinuxDevboxAccountStatesWithResult([
+        let result = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
                 email: "apps7349@gmail.com",
                 isActive: true,
@@ -158,22 +109,19 @@ struct AccountManagerSyncTests {
                 subscriptionWillRenew: nil,
                 hasActiveSubscription: true
             ),
-        ], mirrorRemoteActive: false)
+        ])
 
-        #expect(result.activeChangedId == nil)
         #expect(result.stateChanged)
-        #expect(manager.activeAccount?.id == localActive.id)
-        #expect(manager.accounts.first(where: { $0.id == remoteActive.id })?.quotaSnapshot?.fiveHour.remainingPercent == 89)
+        #expect(manager.configuredAccount?.id == localActive.id)
+        #expect(manager.accounts.first(where: { $0.id == remoteActive.id })?.quotaSnapshot == nil)
+        #expect(manager.linuxDevboxAccountStates.first?.quotaSnapshot?.fiveHour?.remainingPercent == 89)
         #expect(defaults.string(forKey: "activeAccountId") == localActive.id.uuidString)
     }
 
     @Test("Linux devbox stale account state cannot overwrite fresher local quota")
     @MainActor func linuxDevboxStaleAccountStateCannotOverwriteFresherLocalQuota() {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
 
         let freshSnapshot = quotaSnapshot(
             fiveHourRemaining: 95,
@@ -197,7 +145,7 @@ struct AccountManagerSyncTests {
         )
         manager.addAccount(account)
 
-        let changed = manager.applyLinuxDevboxAccountStates([
+        _ = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
                 email: "brenchat7795@gmail.com",
                 isActive: true,
@@ -211,21 +159,18 @@ struct AccountManagerSyncTests {
             ),
         ])
 
-        #expect(changed == account.id)
-        #expect(manager.activeAccount?.id == account.id)
-        #expect(manager.activeAccount?.quotaSnapshot?.fetchedAt == freshSnapshot.fetchedAt)
-        #expect(manager.activeAccount?.quotaSnapshot?.fiveHour.remainingPercent == 95)
-        #expect(manager.activeAccount?.quotaSnapshot?.weekly.remainingPercent == 99)
-        #expect(manager.activeAccount?.lastRefreshed == freshSnapshot.fetchedAt)
+        #expect(manager.configuredAccount == nil)
+        #expect(manager.accounts.first?.quotaSnapshot?.fetchedAt == freshSnapshot.fetchedAt)
+        #expect(manager.accounts.first?.quotaSnapshot?.fiveHour?.remainingPercent == 95)
+        #expect(manager.accounts.first?.quotaSnapshot?.weekly?.remainingPercent == 99)
+        #expect(manager.accounts.first?.lastRefreshed == freshSnapshot.fetchedAt)
+        #expect(manager.linuxDevboxAccountStates.first?.quotaSnapshot == staleSnapshot)
     }
 
     @Test("Linux devbox placeholder quota cannot overwrite real local quota")
     @MainActor func linuxDevboxPlaceholderQuotaCannotOverwriteRealLocalQuota() {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
         let localFetchedAt = Date(timeIntervalSince1970: 1_777_000_000)
         let placeholderFetchedAt = localFetchedAt.addingTimeInterval(600)
         let realSnapshot = quotaSnapshot(
@@ -261,7 +206,7 @@ struct AccountManagerSyncTests {
         )
         manager.addAccount(account)
 
-        let result = manager.applyLinuxDevboxAccountStatesWithResult([
+        let result = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
                 email: "brenchat7795@gmail.com",
                 isActive: true,
@@ -275,20 +220,18 @@ struct AccountManagerSyncTests {
             ),
         ])
 
-        #expect(result.activeChangedId == nil)
-        #expect(manager.activeAccount?.quotaSnapshot?.fetchedAt == realSnapshot.fetchedAt)
-        #expect(manager.activeAccount?.quotaSnapshot?.fiveHour.remainingPercent == 77)
-        #expect(manager.activeAccount?.quotaSnapshot?.weekly.remainingPercent == 88)
-        #expect(manager.activeAccount?.lastRefreshed == realSnapshot.fetchedAt)
+        #expect(manager.configuredAccount?.quotaSnapshot?.fetchedAt == realSnapshot.fetchedAt)
+        #expect(manager.configuredAccount?.quotaSnapshot?.fiveHour?.remainingPercent == 77)
+        #expect(manager.configuredAccount?.quotaSnapshot?.weekly?.remainingPercent == 88)
+        #expect(manager.configuredAccount?.lastRefreshed == realSnapshot.fetchedAt)
+        #expect(result.stateChanged)
+        #expect(manager.linuxDevboxAccountStates.first?.quotaSnapshot == placeholderSnapshot)
     }
 
-    @Test("Linux devbox placeholder quota clears existing placeholder quota")
-    @MainActor func linuxDevboxPlaceholderQuotaClearsExistingPlaceholderQuota() {
+    @Test("Linux devbox placeholder quota does not clear local placeholder diagnostics")
+    @MainActor func linuxDevboxPlaceholderQuotaDoesNotMutateLocalPlaceholder() {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
         let fetchedAt = Date(timeIntervalSince1970: 1_777_000_000)
         let placeholderSnapshot = QuotaSnapshot(
             fiveHour: QuotaWindow(
@@ -318,7 +261,7 @@ struct AccountManagerSyncTests {
         )
         manager.addAccount(account)
 
-        _ = manager.applyLinuxDevboxAccountStatesWithResult([
+        _ = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
                 email: "brenchat7795@gmail.com",
                 isActive: true,
@@ -332,18 +275,16 @@ struct AccountManagerSyncTests {
             ),
         ])
 
-        #expect(manager.activeAccount?.quotaSnapshot == nil)
-        #expect(manager.activeAccount?.lastRefreshed == nil)
-        #expect(manager.activeAccount?.planType == "pro")
+        #expect(manager.configuredAccount?.quotaSnapshot == placeholderSnapshot)
+        #expect(manager.configuredAccount?.lastRefreshed == fetchedAt)
+        #expect(manager.configuredAccount?.planType == "pro")
+        #expect(manager.linuxDevboxAccountStates.first?.quotaSnapshot == placeholderSnapshot)
     }
 
     @Test("Linux devbox no-op state does not report changes")
     @MainActor func linuxDevboxNoOpStateDoesNotReportChanges() {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
         let snapshot = quotaSnapshot(
             fiveHourRemaining: 97,
             weeklyRemaining: 88,
@@ -363,8 +304,7 @@ struct AccountManagerSyncTests {
         )
         manager.addAccount(account)
 
-        let result = manager.applyLinuxDevboxAccountStatesWithResult([
-            LinuxDevboxAccountState(
+        let state = LinuxDevboxAccountState(
                 email: "apps7349@gmail.com",
                 isActive: true,
                 quotaSnapshot: snapshot,
@@ -374,19 +314,17 @@ struct AccountManagerSyncTests {
                 subscriptionExpiresAt: nil,
                 subscriptionWillRenew: nil,
                 hasActiveSubscription: true
-            ),
-        ])
+            )
+        _ = manager.applyLinuxDevboxAccountStates([state])
+        let result = manager.applyLinuxDevboxAccountStates([state])
 
-        #expect(result == LinuxDevboxAccountApplyResult(activeChangedId: nil, stateChanged: false))
+        #expect(result == LinuxDevboxAccountApplyResult(stateChanged: false))
     }
 
-    @Test("Linux devbox runtime auth block overrides stale quota")
-    @MainActor func linuxDevboxRuntimeAuthBlockOverridesStaleQuota() {
+    @Test("Linux devbox runtime auth block remains presentation-only")
+    @MainActor func linuxDevboxRuntimeAuthBlockDoesNotBlockMacAccount() {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
         let staleSnapshot = QuotaSnapshot(
             fiveHour: QuotaWindow(
                 usedPercent: 100,
@@ -415,7 +353,7 @@ struct AccountManagerSyncTests {
         manager.addAccount(account)
 
         let blockedUntil = Date().addingTimeInterval(30 * 24 * 60 * 60)
-        let result = manager.applyLinuxDevboxAccountStatesWithResult([
+        let result = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
                 email: "bren78349@gmail.com",
                 isActive: false,
@@ -433,19 +371,17 @@ struct AccountManagerSyncTests {
 
         let updated = manager.accounts.first { $0.id == account.id }
         #expect(result.stateChanged)
-        #expect(updated?.requiresReauthentication == true)
-        #expect(updated?.realQuotaSnapshot == nil)
-        #expect(manager.pollingErrors[account.id] == "Re-authentication required")
+        #expect(updated?.requiresReauthentication == false)
+        #expect(updated?.realQuotaSnapshot == staleSnapshot)
+        #expect(manager.pollingErrors[account.id] == nil)
+        #expect(manager.linuxDevboxAccountStates.first?.runtimeUnusableUntil == blockedUntil)
+        #expect(manager.linuxDevboxAccountStates.first?.runtimeUnusableReason == "token_expired")
     }
 
-    @Test("Restore prefers stored preference over auth.json — CodexSwitch state is authoritative")
-    @MainActor func restorePrefersStored() async {
+    @Test("Restore prefers auth.json over stale stored preference")
+    @MainActor func restorePrefersAuthJsonOverStaleStoredPreference() async {
         let defaults = isolatedDefaults()
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authAccountIdProvider: { "acc-target" },
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
 
         let current = CodexAccount(email: "current@test.com", accessToken: "t1", refreshToken: "r1", idToken: "i1", accountId: "acc-current")
         let target = CodexAccount(email: "target@test.com", accessToken: "t2", refreshToken: "r2", idToken: "i2", accountId: "acc-target")
@@ -453,29 +389,84 @@ struct AccountManagerSyncTests {
         manager.addAccount(target)
         defaults.set(current.id.uuidString, forKey: "activeAccountId")
 
-        await manager.restoreActiveAccount()
+        manager.restoreConfiguredAccount(observedProviderAccountId: target.accountId)
 
-        // Stored preference wins — auth.json may be stale from a swap chain
-        // before the app was killed. CodexSwitch re-writes auth.json to match.
-        #expect(manager.activeAccount?.id == current.id)
+        #expect(manager.configuredAccount?.id == target.id)
+        #expect(defaults.string(forKey: "activeAccountId") == target.id.uuidString)
     }
 
-    @Test("Restore falls back to stored preference when no auth.json")
-    @MainActor func restoreFallsBackToStored() async {
+    @Test("Restore ignores stale defaults when no durable configured record exists")
+    @MainActor func restoreRejectsStaleStoredPreference() async {
         let defaults = isolatedDefaults()
         let current = CodexAccount(email: "current@test.com", accessToken: "t1", refreshToken: "r1", idToken: "i1", accountId: "acc-current")
-        let manager = AccountManager(
-            userDefaults: defaults,
-            authAccountIdProvider: { nil },
-            authFileWriter: { _ in }
-        )
+        let manager = AccountManager(userDefaults: defaults)
 
         manager.addAccount(current)
         defaults.set(current.id.uuidString, forKey: "activeAccountId")
 
-        await manager.restoreActiveAccount()
+        let recovery = manager.restoreConfiguredAccount(observedProviderAccountId: nil)
 
-        #expect(manager.activeAccount?.id == current.id)
+        #expect(recovery == .ambiguous)
+        #expect(manager.configuredAccount == nil)
+        #expect(defaults.string(forKey: "activeAccountId") == nil)
+    }
+
+    @Test("Restore preserves the durable selected account without writing auth")
+    @MainActor func restorePreservesDurableSelection() async {
+        let defaults = isolatedDefaults()
+        let original = CodexAccount(
+            email: "original@test.com",
+            accessToken: "t1",
+            refreshToken: "r1",
+            idToken: "i1",
+            accountId: "acc-original",
+            isActive: true
+        )
+        let fallback = CodexAccount(
+            email: "fallback@test.com",
+            accessToken: "t2",
+            refreshToken: "r2",
+            idToken: "i2",
+            accountId: "acc-fallback"
+        )
+        let manager = AccountManager(userDefaults: defaults)
+        #expect(manager.restorePersistedAccounts([original, fallback]))
+        defaults.set(fallback.id.uuidString, forKey: "activeAccountId")
+
+        let recovery = manager.restoreConfiguredAccount(observedProviderAccountId: nil)
+
+        #expect(recovery == .recovered(original.id))
+        #expect(manager.configuredAccount?.id == original.id)
+        #expect(defaults.string(forKey: "activeAccountId") == original.id.uuidString)
+        #expect(manager.pollingErrors[fallback.id] == nil)
+    }
+
+    @Test("Restart recovery fails closed when durable selection is ambiguous")
+    @MainActor func restoreRejectsMultipleDurableSelections() {
+        let defaults = isolatedDefaults()
+        let first = CodexAccount(
+            email: "first@test.com",
+            accessToken: "t1",
+            refreshToken: "r1",
+            idToken: "i1",
+            accountId: "acc-first",
+            isActive: true
+        )
+        let second = CodexAccount(
+            email: "second@test.com",
+            accessToken: "t2",
+            refreshToken: "r2",
+            idToken: "i2",
+            accountId: "acc-second",
+            isActive: true
+        )
+        let manager = AccountManager(userDefaults: defaults)
+        #expect(manager.restorePersistedAccounts([first, second]))
+
+        let recovery = manager.restoreConfiguredAccount(observedProviderAccountId: nil)
+
+        #expect(recovery == .ambiguous)
+        #expect(manager.configuredAccount == nil)
     }
 
     @Test("Quota updates record fetch time as last refreshed")
@@ -539,7 +530,7 @@ struct AccountManagerSyncTests {
         )
         let snapshot = QuotaSnapshot(
             fiveHour: QuotaWindow(
-                usedPercent: 0,
+                usedPercent: 1,
                 windowDurationMins: 300,
                 resetsAt: fetchedAt.addingTimeInterval(299.5 * 60),
                 hardLimitReached: false
@@ -574,7 +565,7 @@ struct AccountManagerSyncTests {
         )
         let snapshot = QuotaSnapshot(
             fiveHour: QuotaWindow(
-                usedPercent: 0,
+                usedPercent: 1,
                 windowDurationMins: 300,
                 resetsAt: fetchedAt.addingTimeInterval(299.5 * 60),
                 hardLimitReached: false
@@ -592,6 +583,41 @@ struct AccountManagerSyncTests {
         manager.updateQuota(for: account.id, snapshot: snapshot, planType: "pro")
 
         #expect(manager.accounts.first?.fiveHourPrimedAt == nil)
+    }
+
+    @Test("Weekly-only quota clears legacy five-hour presentation state")
+    @MainActor func weeklyOnlyQuotaClearsLegacyFiveHourMarker() {
+        let defaults = isolatedDefaults()
+        let manager = AccountManager(userDefaults: defaults)
+        let fetchedAt = Date(timeIntervalSince1970: 1_777_000_000)
+        let account = CodexAccount(
+            email: "weekly-only@test.com",
+            accessToken: "t1",
+            refreshToken: "r1",
+            idToken: "i1",
+            accountId: "acc-weekly-only",
+            fiveHourPrimedAt: fetchedAt.addingTimeInterval(-60)
+        )
+        let snapshot = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: fetchedAt,
+            windows: [
+                QuotaWindow(
+                    kind: .weekly,
+                    durationSeconds: 604_800,
+                    usedPercent: 20,
+                    resetsAt: fetchedAt.addingTimeInterval(604_800),
+                    source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+                ),
+            ]
+        )
+
+        manager.addAccount(account)
+        manager.updateQuota(for: account.id, snapshot: snapshot, planType: "plus")
+
+        #expect(manager.accounts.first?.fiveHourPrimedAt == nil)
+        #expect(manager.accounts.first?.quotaSnapshot?.fiveHour == nil)
     }
 
     @Test("Sorted accounts put immediately usable accounts before exhausted active/pro accounts")
@@ -624,8 +650,8 @@ struct AccountManagerSyncTests {
         #expect(manager.sortedAccounts.first?.id == usablePlus.id)
     }
 
-    @Test("Imported auth refreshes stored tokens for existing account")
-    @MainActor func importedAuthRefreshesStoredTokens() {
+    @Test("Inactive imported credentials refresh an existing account")
+    @MainActor func inactiveImportedCredentialsRefreshStoredTokens() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
         let existing = CodexAccount(
@@ -647,16 +673,16 @@ struct AccountManagerSyncTests {
         manager.addAccount(existing)
         manager.updatePollingError(for: existing.id, error: "Re-authentication required")
 
-        let refreshedId = manager.refreshStoredTokens(from: imported)
+        let result = manager.upsertInactiveAccount(imported)
 
-        #expect(refreshedId == existing.id)
+        #expect(result == .updated(existing.id))
         #expect(manager.accounts.first?.accessToken == "new-access")
         #expect(manager.accounts.first?.refreshToken == "new-refresh")
         #expect(manager.pollingErrors[existing.id] == nil)
     }
 
-    @Test("Imported auth clears stored reauthentication block even when tokens match")
-    @MainActor func importedAuthClearsStoredReauthenticationBlockEvenWhenTokensMatch() {
+    @Test("Inactive imported credentials clear a stored reauthentication block")
+    @MainActor func inactiveImportedCredentialsClearStoredReauthenticationBlock() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
         let blockedUntil = Date().addingTimeInterval(30 * 24 * 60 * 60)
@@ -682,10 +708,10 @@ struct AccountManagerSyncTests {
         manager.addAccount(existing)
         manager.updatePollingError(for: existing.id, error: "Re-authentication required")
 
-        let refreshedId = manager.refreshStoredTokens(from: imported)
+        let result = manager.upsertInactiveAccount(imported)
 
         let updated = manager.accounts.first
-        #expect(refreshedId == existing.id)
+        #expect(result == .updated(existing.id))
         #expect(updated?.runtimeUnusableUntil == nil)
         #expect(updated?.runtimeUnusableReason == nil)
         #expect(updated?.requiresReauthentication == false)
@@ -693,8 +719,8 @@ struct AccountManagerSyncTests {
         #expect(manager.pollingErrors[existing.id] == nil)
     }
 
-    @Test("Stale VPS auth block cannot overwrite newer local reauthentication")
-    @MainActor func staleVPSAuthBlockCannotOverwriteNewerLocalReauthentication() {
+    @Test("VPS auth observations never overwrite local runtime state")
+    @MainActor func vpsAuthObservationDoesNotOverwriteLocalRuntimeState() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
         let localRefreshedAt = Date(timeIntervalSince1970: 1_778_000_000)
@@ -712,7 +738,7 @@ struct AccountManagerSyncTests {
 
         manager.addAccount(account)
 
-        let result = manager.applyLinuxDevboxAccountStatesWithResult([
+        let result = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
                 email: "brendon.delgado3@gmail.com",
                 isActive: false,
@@ -729,15 +755,16 @@ struct AccountManagerSyncTests {
         ])
 
         let updated = manager.accounts.first
-        #expect(result.stateChanged == false)
+        #expect(result.stateChanged)
         #expect(updated?.runtimeUnusableUntil == nil)
         #expect(updated?.runtimeUnusableReason == nil)
         #expect(updated?.requiresReauthentication == false)
         #expect(manager.pollingErrors[account.id] == nil)
+        #expect(manager.linuxDevboxAccountStates.first?.runtimeUnusableReason == "token_expired")
     }
 
-    @Test("Imported auth clears expired exhausted quota snapshot")
-    @MainActor func importedAuthClearsExpiredExhaustedQuotaSnapshot() {
+    @Test("Inactive imported credentials clear expired exhausted quota snapshot")
+    @MainActor func inactiveImportedCredentialsClearExpiredExhaustedQuotaSnapshot() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
         let expired = Date(timeIntervalSinceNow: -60)
@@ -773,14 +800,14 @@ struct AccountManagerSyncTests {
 
         manager.addAccount(existing)
 
-        let refreshedId = manager.refreshStoredTokens(from: imported)
+        let result = manager.upsertInactiveAccount(imported)
 
-        #expect(refreshedId == existing.id)
+        #expect(result == .updated(existing.id))
         #expect(manager.accounts.first?.quotaSnapshot == nil)
     }
 
-    @Test("Imported auth can match existing account by email")
-    @MainActor func importedAuthCanMatchByEmail() {
+    @Test("Same email with a different provider identity inserts a separate inactive account")
+    @MainActor func inactiveImportedCredentialsDoNotMatchByEmailAlone() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
         let existing = CodexAccount(
@@ -800,11 +827,14 @@ struct AccountManagerSyncTests {
 
         manager.addAccount(existing)
 
-        let refreshedId = manager.refreshStoredTokens(from: imported)
+        let result = manager.upsertInactiveAccount(imported)
 
-        #expect(refreshedId == existing.id)
-        #expect(manager.accounts.first?.accountId == "new-account-id")
-        #expect(manager.accounts.first?.accessToken == "new-access")
+        #expect(result == .inserted(imported.id))
+        #expect(manager.accounts.count == 2)
+        #expect(manager.accounts.first?.accountId == "old-account-id")
+        #expect(manager.accounts.first?.accessToken == "old-access")
+        #expect(manager.accounts.last?.accountId == "new-account-id")
+        #expect(manager.accounts.last?.isActive == false)
     }
 
     private func isolatedDefaults() -> UserDefaults {

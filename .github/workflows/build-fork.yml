@@ -1,379 +1,592 @@
-# -----------------------------------------------------------------------
-# build-fork.yml -- Automated Codex CLI fork builder
-#
-# Checks daily whether a new @openai/codex version has been published to
-# npm.  When a new version is detected (or a manual build is triggered),
-# it rebases the fork branch onto upstream/main, builds the patched
-# arm64-darwin binary, and publishes a GitHub Release.
-#
-# Fork patches (feat/sighup-v2):
-#   - SIGHUP signal handler for CLI sessions (reloads auth.json)
-#   - File watcher in app-server (polls auth.json every 2s)
-#   - Auth generation counter for WebSocket session invalidation
-#   - React Query cache invalidation notifications to Electron
-#
-# Required secrets:
-#   FORK_PUSH_TOKEN - PAT with push access to brendondelgado/codex
-# -----------------------------------------------------------------------
-
-name: Build Codex Fork
+name: Build macOS Runtime Artifact
 
 on:
-  schedule:
-    # Daily at 06:00 UTC
-    - cron: "0 6 * * *"
-
   workflow_dispatch:
     inputs:
-      version_override:
-        description: "Force build for a specific version (e.g. 0.117.0). Leave empty to auto-detect from npm."
-        required: false
+      codexswitch_git_sha:
+        description: Exact 40-character CodexSwitch commit selected by the dispatch ref
+        required: true
         type: string
-      skip_version_check:
-        description: "Skip the version check and always build"
-        required: false
-        type: boolean
-        default: false
+      upstream_codex_version:
+        description: Stable upstream Codex version, for example 0.144.4
+        required: true
+        type: string
+      upstream_codex_git_sha:
+        description: Exact 40-character commit behind the upstream rust-v version tag
+        required: true
+        type: string
 
 permissions:
-  contents: write
-  issues: write
+  attestations: write
+  contents: read
+  id-token: write
 
-env:
-  FORK_REPO: brendondelgado/codex
-  FORK_BRANCH: feat/sighup-v2
-  UPSTREAM_REPO: https://github.com/openai/codex.git
-  CARGO_TERM_COLOR: always
+concurrency:
+  group: macos-runtime-${{ github.sha }}-${{ inputs.upstream_codex_version }}
+  cancel-in-progress: false
 
 jobs:
-  # -------------------------------------------------------------------
-  # 1. Detect whether a new upstream version exists
-  # -------------------------------------------------------------------
-  check-version:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.resolve.outputs.version }}
-      should_build: ${{ steps.resolve.outputs.should_build }}
-    steps:
-      - name: Query npm for latest @openai/codex version
-        id: npm
-        run: |
-          NPM_VERSION=$(npm view @openai/codex version 2>/dev/null || echo "")
-          if [ -z "$NPM_VERSION" ]; then
-            echo "::error::Failed to query npm registry for @openai/codex"
-            exit 1
-          fi
-          echo "npm_version=$NPM_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Latest npm version: $NPM_VERSION"
-
-      - name: Check existing releases
-        id: releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          EXISTING=$(gh release list \
-            --repo "${{ github.repository }}" \
-            --limit 100 \
-            --json tagName \
-            --jq '.[].tagName' 2>/dev/null || echo "")
-          echo "Existing release tags:"
-          echo "$EXISTING"
-          echo "existing_tags<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$EXISTING" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve version and decide whether to build
-        id: resolve
-        run: |
-          OVERRIDE="${{ inputs.version_override }}"
-          SKIP_CHECK="${{ inputs.skip_version_check }}"
-          NPM_VERSION="${{ steps.npm.outputs.npm_version }}"
-          EXISTING_TAGS="${{ steps.releases.outputs.existing_tags }}"
-
-          if [ -n "$OVERRIDE" ]; then
-            VERSION="$OVERRIDE"
-            echo "Using manual version override: $VERSION"
-          else
-            VERSION="$NPM_VERSION"
-            echo "Using npm version: $VERSION"
-          fi
-
-          TAG="fork-v${VERSION}"
-
-          if echo "$EXISTING_TAGS" | grep -qx "$TAG"; then
-            if [ "$SKIP_CHECK" = "true" ]; then
-              echo "Version $VERSION already released, but skip_version_check=true -- rebuilding"
-              SHOULD_BUILD="true"
-            elif [ -n "$OVERRIDE" ]; then
-              echo "Version $VERSION already released, but override provided -- rebuilding"
-              SHOULD_BUILD="true"
-            else
-              echo "Version $VERSION already released as $TAG -- skipping"
-              SHOULD_BUILD="false"
-            fi
-          else
-            echo "New version $VERSION detected (no existing $TAG release)"
-            SHOULD_BUILD="true"
-          fi
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
-          echo "--- Decision ---"
-          echo "Version:      $VERSION"
-          echo "Tag:          $TAG"
-          echo "Should build: $SHOULD_BUILD"
-
-  # -------------------------------------------------------------------
-  # 2. Rebase fork, build binary, publish release
-  # -------------------------------------------------------------------
   build:
-    needs: check-version
-    if: needs.check-version.outputs.should_build == 'true'
-    runs-on: macos-14
+    name: Build native arm64 runtime set
+    runs-on: macos-15
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
     env:
-      VERSION: ${{ needs.check-version.outputs.version }}
+      UPSTREAM_REPO_URL: https://github.com/openai/codex.git
+      TARGET_TRIPLE: aarch64-apple-darwin
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_INCREMENTAL: "0"
+
     steps:
-      - name: Log build parameters
+      - name: Require a native Apple Silicon runner
         run: |
-          echo "========================================="
-          echo "  Building Codex fork v${VERSION}"
-          echo "  Runner: $(uname -m) / $(sw_vers -productVersion)"
-          echo "========================================="
+          set -euo pipefail
+          runner_arch="$(uname -m)"
+          if [[ "$runner_arch" != "arm64" ]]; then
+            echo "::error::macos-15 did not provide a native arm64 runner: $runner_arch"
+            exit 1
+          fi
+          echo "Runner: $(sw_vers -productVersion) / $runner_arch"
 
-      - name: Checkout fork
-        uses: actions/checkout@v4
+      - name: Check out the dispatched CodexSwitch commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: ${{ env.FORK_REPO }}
-          ref: ${{ env.FORK_BRANCH }}
-          fetch-depth: 0
-          token: ${{ secrets.FORK_PUSH_TOKEN }}
-          path: codex-fork
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Rebase fork onto upstream
-        id: rebase
-        working-directory: codex-fork
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          echo "Adding upstream remote..."
-          git remote add upstream "${{ env.UPSTREAM_REPO }}"
-          git fetch upstream main --no-tags
-
-          echo "Current HEAD: $(git log --oneline -1)"
-          echo "Upstream HEAD: $(git log --oneline -1 upstream/main)"
-
-          # Stash any uncommitted changes (defensive -- fresh checkout should be clean)
-          STASH_RESULT=$(git stash 2>&1) || true
-          HAS_STASH="false"
-          if [[ "$STASH_RESULT" != *"No local changes"* ]]; then
-            HAS_STASH="true"
-            echo "Stashed local changes"
-          fi
-
-          if git rebase upstream/main; then
-            echo "Rebase succeeded"
-            echo "rebase_ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Rebase failed -- manual intervention required"
-            git rebase --abort || true
-            echo "rebase_ok=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          if [ "$HAS_STASH" = "true" ]; then
-            git stash pop || echo "::warning::Stash pop failed"
-          fi
-
-      - name: Create issue on rebase failure
-        if: steps.rebase.outputs.rebase_ok == 'false'
+      - name: Lock CodexSwitch provenance
+        id: provenance
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_CODEXSWITCH_SHA: ${{ inputs.codexswitch_git_sha }}
+          UPSTREAM_CODEX_VERSION: ${{ inputs.upstream_codex_version }}
+          EXPECTED_UPSTREAM_CODEX_SHA: ${{ inputs.upstream_codex_git_sha }}
         run: |
-          TITLE="Codex fork rebase failed for upstream v${VERSION}"
-          BODY="## Rebase Failure
+          set -euo pipefail
+          sha_pattern='^[0-9a-f]{40}$'
+          version_pattern='^[0-9]+\.[0-9]+\.[0-9]+$'
 
-          The automated rebase of \`${{ env.FORK_BRANCH }}\` onto \`upstream/main\` failed for upstream version **v${VERSION}**.
-
-          ### Action Required
-          1. Checkout \`${{ env.FORK_BRANCH }}\` from \`${{ env.FORK_REPO }}\`
-          2. \`git fetch upstream && git rebase upstream/main\`
-          3. Resolve conflicts and force-push
-          4. Re-run this workflow manually with **skip_version_check** enabled
-
-          ### Workflow Run
-          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          # Check for duplicate open issues before creating
-          EXISTING_ISSUE=$(gh issue list \
-            --repo "${{ github.repository }}" \
-            --search "Codex fork rebase failed" \
-            --state open \
-            --json number \
-            --jq '.[0].number // empty' 2>/dev/null || echo "")
-
-          if [ -n "$EXISTING_ISSUE" ]; then
-            echo "Existing open rebase issue #${EXISTING_ISSUE} -- adding comment instead"
-            gh issue comment "$EXISTING_ISSUE" \
-              --repo "${{ github.repository }}" \
-              --body "New rebase failure for v${VERSION}: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          else
-            gh issue create \
-              --repo "${{ github.repository }}" \
-              --title "$TITLE" \
-              --body "$BODY" \
-              --label "rebase-conflict"
+          if [[ ! "$EXPECTED_CODEXSWITCH_SHA" =~ $sha_pattern ]]; then
+            echo "::error::codexswitch_git_sha must be 40 lowercase hexadecimal characters"
+            exit 1
           fi
-          exit 1
-
-      - name: Update version in Cargo.toml
-        if: steps.rebase.outputs.rebase_ok == 'true'
-        working-directory: codex-fork
-        run: |
-          CARGO_FILE="codex-rs/cli/Cargo.toml"
-          if [ ! -f "$CARGO_FILE" ]; then
-            CARGO_FILE="Cargo.toml"
+          if [[ ! "$EXPECTED_UPSTREAM_CODEX_SHA" =~ $sha_pattern ]]; then
+            echo "::error::upstream_codex_git_sha must be 40 lowercase hexadecimal characters"
+            exit 1
           fi
-
-          echo "Patching version in $CARGO_FILE to ${VERSION}"
-          sed -i '' -E "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+[^\"]*\"/version = \"${VERSION}\"/" "$CARGO_FILE"
-
-          grep '^version' "$CARGO_FILE" | head -3
-          echo "Version patched successfully"
-
-      - name: Install Rust toolchain
-        if: steps.rebase.outputs.rebase_ok == 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
-
-      - name: Cache Cargo registry and build artifacts
-        if: steps.rebase.outputs.rebase_ok == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            codex-fork/target/
-          key: macos-arm64-cargo-${{ hashFiles('codex-fork/**/Cargo.lock') }}
-          restore-keys: |
-            macos-arm64-cargo-
-
-      - name: Build codex-cli (fork-release profile)
-        if: steps.rebase.outputs.rebase_ok == 'true'
-        working-directory: codex-fork
-        run: |
-          echo "Building codex-cli with fork-release profile..."
-          echo "Target: aarch64-apple-darwin (native on this runner)"
-
-          if [ -f "codex-rs/Cargo.toml" ]; then
-            cd codex-rs
-          fi
-
-          cargo build --profile fork-release -p codex-cli 2>&1
-
-          echo ""
-          echo "Build complete. Locating binary..."
-
-          # Search both possible target locations (depends on where cargo was invoked)
-          BINARY_PATH=$(find ../target/fork-release -name "codex" -type f -not -path "*/deps/*" -not -path "*/build/*" 2>/dev/null | head -1)
-          if [ -z "$BINARY_PATH" ]; then
-            BINARY_PATH=$(find ./target/fork-release -name "codex" -type f -not -path "*/deps/*" -not -path "*/build/*" 2>/dev/null | head -1)
-          fi
-
-          if [ -z "$BINARY_PATH" ]; then
-            echo "::error::Binary not found in target/fork-release/"
-            echo "Contents of target/fork-release/:"
-            find . -path "*/fork-release/*" -type f -name "codex*" 2>/dev/null || echo "(empty)"
+          if [[ ! "$UPSTREAM_CODEX_VERSION" =~ $version_pattern ]]; then
+            echo "::error::upstream_codex_version must be a stable three-component version"
             exit 1
           fi
 
-          echo "Binary: $BINARY_PATH"
-          file "$BINARY_PATH"
-          ls -lh "$BINARY_PATH"
-
-          if ! file "$BINARY_PATH" | grep -q "arm64"; then
-            echo "::error::Binary is not arm64 -- architecture mismatch"
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" == "$GITHUB_SHA" && "$actual_sha" == "$EXPECTED_CODEXSWITCH_SHA" ]]; then
+            :
+          else
+            echo "::error::dispatch, checkout, and requested CodexSwitch SHAs do not match"
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+            echo "::error::CodexSwitch checkout is not clean before the build"
             exit 1
           fi
 
-          # Stage binary outside the working-directory for the release step
-          cp "$BINARY_PATH" "$GITHUB_WORKSPACE/codex-fork-binary"
+          build_epoch="$(git show -s --format=%ct HEAD)"
+          if [[ ! "$build_epoch" =~ ^[0-9]+$ ]] || [[ "$build_epoch" == "0" ]]; then
+            echo "::error::CodexSwitch commit has an invalid build epoch"
+            exit 1
+          fi
+          short_sha="${actual_sha:0:12}"
+          artifact_name="codexswitch-macos-runtime-${short_sha}-codex-${UPSTREAM_CODEX_VERSION}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-      - name: Create GitHub Release
-        if: steps.rebase.outputs.rebase_ok == 'true'
+          {
+            printf 'source_sha=%s\n' "$actual_sha"
+            printf 'build_epoch=%s\n' "$build_epoch"
+            printf 'upstream_version=%s\n' "$UPSTREAM_CODEX_VERSION"
+            printf 'expected_upstream_sha=%s\n' "$EXPECTED_UPSTREAM_CODEX_SHA"
+            printf 'artifact_name=%s\n' "$artifact_name"
+          } >> "$GITHUB_OUTPUT"
+          {
+            printf 'SOURCE_DATE_EPOCH=%s\n' "$build_epoch"
+            printf 'CODEXSWITCH_SOURCE_SHA=%s\n' "$actual_sha"
+            printf 'UPSTREAM_CODEX_VERSION=%s\n' "$UPSTREAM_CODEX_VERSION"
+            printf 'CONTROL_TARGET_DIR=%s/codexswitch-target\n' "$RUNNER_TEMP"
+            printf 'UPSTREAM_SOURCE_DIR=%s/codex-upstream\n' "$RUNNER_TEMP"
+            printf 'UPSTREAM_TARGET_DIR=%s/codex-target\n' "$RUNNER_TEMP"
+            printf 'PATCH_DRIVER=%s/patch-codex-source\n' "$RUNNER_TEMP"
+            printf 'ARTIFACT_DIR=%s/codexswitch-macos-runtime-artifact\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare the Rust toolchain
+        run: |
+          set -euo pipefail
+          rustc -Vv
+          cargo -V
+          rustup target add "$TARGET_TRIPLE"
+          command -v jq >/dev/null
+          command -v shasum >/dev/null
+          command -v lipo >/dev/null
+
+      - name: Verify the Swift app and test suite
+        run: |
+          set -euo pipefail
+          trap 'rm -rf -- .build' EXIT
+          swift --version
+          swift test --jobs 1
+
+      - name: Build the CodexSwitch control plane
+        id: control_plane
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$CONTROL_TARGET_DIR" cargo build \
+            --locked \
+            --release \
+            --target "$TARGET_TRIPLE" \
+            --jobs "$CARGO_BUILD_JOBS" \
+            -p codexswitch-cli
+
+          control_binary="$CONTROL_TARGET_DIR/$TARGET_TRIPLE/release/codexswitch-cli"
+          if [[ ! -f "$control_binary" || -L "$control_binary" || ! -x "$control_binary" || ! -s "$control_binary" ]]; then
+            echo "::error::Cargo did not produce a regular executable codexswitch-cli"
+            exit 1
+          fi
+
+          mkdir -p "$ARTIFACT_DIR"
+          install -m 0755 "$control_binary" "$ARTIFACT_DIR/codexswitch-cli"
+          version_output="$("$ARTIFACT_DIR/codexswitch-cli" --version)"
+          if [[ "$version_output" != codexswitch-cli\ * || "$version_output" == *$'\n'* ]]; then
+            echo "::error::codexswitch-cli returned a malformed build version"
+            exit 1
+          fi
+          build_version="$version_output"
+          if (( ${#build_version} > 512 )); then
+            echo "::error::codexswitch-cli build version exceeds the manifest limit"
+            exit 1
+          fi
+          expected_provenance="git ${CODEXSWITCH_SOURCE_SHA}, built ${SOURCE_DATE_EPOCH}"
+          if [[ "$build_version" != *"$expected_provenance"* || "$build_version" == *-dirty* ]]; then
+            echo "::error::codexswitch-cli does not embed the dispatched clean-tree provenance"
+            exit 1
+          fi
+          "$ARTIFACT_DIR/codexswitch-cli" activate-macos-runtime-artifact --help >/dev/null
+          "$ARTIFACT_DIR/codexswitch-cli" install-prepared-codex --help >/dev/null
+          printf 'build_version=%s\n' "$build_version" >> "$GITHUB_OUTPUT"
+
+          rm -rf -- "$CONTROL_TARGET_DIR"
+
+      - name: Compile the exact-commit source patch driver
+        run: |
+          set -euo pipefail
+          CODEXSWITCH_REPOSITORY_ROOT="$GITHUB_WORKSPACE" \
+            rustc \
+              --edition=2021 \
+              -D warnings \
+              -C opt-level=1 \
+              Tests/Fixtures/BuildFork/patch_codex_source.rs \
+              -o "$PATCH_DRIVER"
+          test -x "$PATCH_DRIVER"
+
+      - name: Check out the exact upstream Codex tag
+        id: upstream
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        working-directory: codex-fork
+          EXPECTED_UPSTREAM_CODEX_SHA: ${{ steps.provenance.outputs.expected_upstream_sha }}
         run: |
-          TAG="fork-v${VERSION}"
-          BINARY_NAME="codex-fork-${VERSION}-arm64-darwin"
-          UPSTREAM_SHA=$(git log --oneline -1 upstream/main | cut -d' ' -f1)
-          FORK_SHA=$(git log --oneline -1 HEAD)
+          set -euo pipefail
+          upstream_tag="rust-v${UPSTREAM_CODEX_VERSION}"
+          if [[ -e "$UPSTREAM_SOURCE_DIR" ]]; then
+            echo "::error::upstream source destination already exists"
+            exit 1
+          fi
 
-          cp "$GITHUB_WORKSPACE/codex-fork-binary" "$BINARY_NAME"
-          chmod +x "$BINARY_NAME"
+          git clone \
+            --depth 1 \
+            --branch "$upstream_tag" \
+            --single-branch \
+            "$UPSTREAM_REPO_URL" \
+            "$UPSTREAM_SOURCE_DIR"
 
-          # Write release notes to a temp file
-          cat > /tmp/release-notes.md <<EOF
-          ## Codex CLI Fork v${VERSION}
+          actual_upstream_sha="$(git -C "$UPSTREAM_SOURCE_DIR" rev-parse HEAD)"
+          actual_tag="$(git -C "$UPSTREAM_SOURCE_DIR" describe --tags --exact-match HEAD)"
+          origin_url="$(git -C "$UPSTREAM_SOURCE_DIR" remote get-url origin)"
+          if [[ "$actual_upstream_sha" != "$EXPECTED_UPSTREAM_CODEX_SHA" ]]; then
+            echo "::error::upstream tag resolved to $actual_upstream_sha instead of $EXPECTED_UPSTREAM_CODEX_SHA"
+            exit 1
+          fi
+          if [[ "$actual_tag" != "$upstream_tag" ]]; then
+            echo "::error::upstream checkout is not exactly $upstream_tag"
+            exit 1
+          fi
+          if [[ "$origin_url" != "$UPSTREAM_REPO_URL" ]]; then
+            echo "::error::unexpected upstream remote: $origin_url"
+            exit 1
+          fi
+          if [[ -n "$(git -C "$UPSTREAM_SOURCE_DIR" status --porcelain --untracked-files=normal)" ]]; then
+            echo "::error::upstream checkout is dirty before patching"
+            exit 1
+          fi
 
-          Patched build of \`@openai/codex\` v${VERSION} with CodexSwitch extensions.
+          printf 'tag=%s\n' "$upstream_tag" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$actual_upstream_sha" >> "$GITHUB_OUTPUT"
 
-          ### Upstream
-          - **npm version**: ${VERSION}
-          - **upstream commit**: \`${UPSTREAM_SHA}\`
-          - **fork commit**: \`${FORK_SHA}\`
-
-          ### Fork Patches (feat/sighup-v2)
-          - SIGHUP signal handler for CLI sessions (reloads auth.json on signal)
-          - File watcher in app-server (polls auth.json every 2s for desktop app)
-          - Auth generation counter for WebSocket session invalidation
-          - React Query cache invalidation notifications to Electron
-
-          ### Binary Details
-          - **Architecture**: arm64 (Apple Silicon)
-          - **Platform**: macOS (darwin)
-          - **Build profile**: fork-release (thin LTO, codegen-units=8)
-          - **Runner**: macos-14
-
-          ### Installation
-          \`\`\`bash
-          cp ${BINARY_NAME} /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex
-          chmod +x /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex
-          \`\`\`
-          EOF
-
-          # Delete existing release if rebuilding the same version
-          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
-          git tag -d "$TAG" 2>/dev/null || true
-          git push origin --delete "$TAG" 2>/dev/null || true
-
-          gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
-            --title "Codex Fork v${VERSION}" \
-            --notes-file /tmp/release-notes.md \
-            "$BINARY_NAME"
-
-          echo "Release published: $TAG"
-          echo "release_tag=$TAG" >> "$GITHUB_ENV"
-
-      - name: Push rebased fork branch
-        if: steps.rebase.outputs.rebase_ok == 'true'
-        working-directory: codex-fork
+      - name: Apply the dispatched v3 source patches
+        id: patches
         run: |
-          echo "Pushing rebased ${{ env.FORK_BRANCH }} to origin..."
-          git push origin "${{ env.FORK_BRANCH }}" --force-with-lease
-          echo "Fork branch updated successfully"
+          set -euo pipefail
+          "$PATCH_DRIVER" "$UPSTREAM_SOURCE_DIR"
+          git -C "$UPSTREAM_SOURCE_DIR" diff --check
 
-      - name: Build summary
-        if: always()
+          if git -C "$UPSTREAM_SOURCE_DIR" diff --quiet; then
+            echo "::error::the v3 source patch driver made no changes"
+            exit 1
+          fi
+          if ! git -C "$UPSTREAM_SOURCE_DIR" diff --cached --quiet --exit-code; then
+            echo "::error::the source patch driver unexpectedly staged changes"
+            exit 1
+          fi
+          if [[ -n "$(git -C "$UPSTREAM_SOURCE_DIR" ls-files --others --exclude-standard)" ]]; then
+            echo "::error::the source patch created unexpected untracked files"
+            exit 1
+          fi
+
+          patch_sha256="$(git -C "$UPSTREAM_SOURCE_DIR" diff --binary HEAD | shasum -a 256 | awk '{print $1}')"
+          if [[ ! "$patch_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::failed to derive the patched-source diff hash"
+            exit 1
+          fi
+          printf 'sha256=%s\n' "$patch_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Build the patched Codex runtime pair
+        working-directory: ${{ runner.temp }}/codex-upstream/codex-rs
         run: |
-          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Version | \`${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Tag | \`${release_tag:-n/a}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Rebase | \`${{ steps.rebase.outputs.rebase_ok }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Runner | \`$(uname -m)\` |" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          df -h .
+          CARGO_TARGET_DIR="$UPSTREAM_TARGET_DIR" cargo build \
+            --locked \
+            --release \
+            --target "$TARGET_TRIPLE" \
+            --jobs "$CARGO_BUILD_JOBS" \
+            -p codex-cli \
+            -p codex-code-mode-host
+
+      - name: Revalidate both source trees after compilation
+        env:
+          EXPECTED_PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+          EXPECTED_UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          EXPECTED_UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          observed_codexswitch_sha="$(git rev-parse HEAD)"
+          if [[ "$observed_codexswitch_sha" != "$CODEXSWITCH_SOURCE_SHA" ]]; then
+            echo "::error::CodexSwitch source commit changed during compilation"
+            exit 1
+          fi
+          if [[ "$observed_codexswitch_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::CodexSwitch source no longer matches the dispatch commit"
+            exit 1
+          fi
+          if ! git diff --quiet --exit-code; then
+            echo "::error::CodexSwitch tracked source changed during compilation"
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+            echo "::error::CodexSwitch source tree is not clean after compilation"
+            exit 1
+          fi
+
+          if [[ "$(git -C "$UPSTREAM_SOURCE_DIR" rev-parse HEAD)" != "$EXPECTED_UPSTREAM_SHA" \
+            || "$(git -C "$UPSTREAM_SOURCE_DIR" describe --tags --exact-match HEAD)" != "$EXPECTED_UPSTREAM_TAG" ]]; then
+            echo "::error::upstream source commit or tag changed during compilation"
+            exit 1
+          fi
+          if [[ -n "$(git -C "$UPSTREAM_SOURCE_DIR" ls-files --others --exclude-standard)" ]]; then
+            echo "::error::upstream build created untracked source-tree files"
+            exit 1
+          fi
+          if ! git -C "$UPSTREAM_SOURCE_DIR" diff --cached --quiet --exit-code; then
+            echo "::error::upstream build staged source-tree changes"
+            exit 1
+          fi
+          observed_patch_sha256="$(
+            git -C "$UPSTREAM_SOURCE_DIR" diff --binary HEAD \
+              | shasum -a 256 \
+              | awk '{print $1}'
+          )"
+          if [[ "$observed_patch_sha256" != "$EXPECTED_PATCH_SHA256" ]]; then
+            echo "::error::patched upstream source changed during compilation"
+            exit 1
+          fi
+
+      - name: Stage the exact four-file artifact directory
+        run: |
+          set -euo pipefail
+          runtime_build_dir="$UPSTREAM_TARGET_DIR/$TARGET_TRIPLE/release"
+          for name in codex codex-code-mode-host; do
+            source_path="$runtime_build_dir/$name"
+            if [[ ! -f "$source_path" || -L "$source_path" || ! -x "$source_path" || ! -s "$source_path" ]]; then
+              echo "::error::Cargo did not produce a regular executable $name"
+              exit 1
+            fi
+            install -m 0755 "$source_path" "$ARTIFACT_DIR/$name"
+          done
+          rm -rf -- "$UPSTREAM_TARGET_DIR"
+
+      - name: Validate architecture and runtime contracts
+        run: |
+          set -euo pipefail
+
+          validate_macho_arm64() {
+            local path="$1"
+            local description architectures bytes
+            if [[ ! -f "$path" || -L "$path" || ! -x "$path" || ! -s "$path" ]]; then
+              echo "::error::$path is not a nonempty regular executable"
+              return 1
+            fi
+            bytes="$(stat -f '%z' "$path")"
+            if (( bytes > 2147483648 )); then
+              echo "::error::$path exceeds the 2 GiB artifact member limit"
+              return 1
+            fi
+            description="$(file -b "$path")"
+            architectures="$(lipo -archs "$path")"
+            if [[ "$description" != *"Mach-O 64-bit executable arm64"* || "$architectures" != "arm64" ]]; then
+              echo "::error::$path is not a thin arm64 Mach-O executable: $description / $architectures"
+              return 1
+            fi
+            if ! codesign --verify --strict "$path"; then
+              echo "::error::$path does not have a valid Mach-O signature"
+              return 1
+            fi
+          }
+
+          validate_macho_arm64 "$ARTIFACT_DIR/codex"
+          validate_macho_arm64 "$ARTIFACT_DIR/codex-code-mode-host"
+          validate_macho_arm64 "$ARTIFACT_DIR/codexswitch-cli"
+
+          codex_version_output="$("$ARTIFACT_DIR/codex" --version)"
+          if [[ "$codex_version_output" != "codex-cli $UPSTREAM_CODEX_VERSION" ]]; then
+            echo "::error::codex version mismatch: $codex_version_output"
+            exit 1
+          fi
+          "$ARTIFACT_DIR/codexswitch-cli" activate-macos-runtime-artifact --help >/dev/null
+          "$ARTIFACT_DIR/codexswitch-cli" install-prepared-codex --help >/dev/null
+
+          control_marker_dump="$RUNNER_TEMP/codexswitch-cli.strings"
+          strings -a "$ARTIFACT_DIR/codexswitch-cli" > "$control_marker_dump"
+          control_markers=(
+            "codexswitch-macos-runtime-artifact-v1"
+            "codexswitch-macos-runtime-activation-v1"
+            "activate-macos-runtime-artifact"
+            "install-prepared-codex"
+          )
+          for marker in "${control_markers[@]}"; do
+            if ! grep -Fq -- "$marker" "$control_marker_dump"; then
+              echo "::error::codexswitch-cli is missing required control-plane marker: $marker"
+              exit 1
+            fi
+          done
+
+          marker_dump="$RUNNER_TEMP/codex-runtime.strings"
+          strings -a "$ARTIFACT_DIR/codex" > "$marker_dump"
+          required_markers=(
+            "sighup-verified"
+            "SIGHUP: auth reloaded"
+            "hotswap-ack"
+            "CodexSwitch rotated accounts after a usage limit"
+            "CodexSwitch rotated accounts after an auth failure"
+            "Auth changed, opening new WebSocket with fresh credentials"
+            "codexswitch-runtime-convergence-v3"
+            "codexswitch-runtime-rotation-handoff-v1"
+            "CodexSwitch account/updated frontend write acknowledged after auth reload"
+            "codexswitch-hotswap-contract-v3"
+            "codexswitch-hotswap-cli-contract-v3"
+          )
+          for marker in "${required_markers[@]}"; do
+            if ! grep -Fq -- "$marker" "$marker_dump"; then
+              echo "::error::codex is missing required runtime marker: $marker"
+              exit 1
+            fi
+          done
+
+          if grep -Fq -- "Usage: /goal <objective>" "$marker_dump"; then
+            :
+          elif grep -Fq -- "Pursuing goal" "$marker_dump" \
+            && grep -Fq -- "thread/goal/set" "$marker_dump"; then
+            :
+          else
+            echo "::error::codex is missing the /goal capability markers"
+            exit 1
+          fi
+
+      - name: Generate and verify the canonical manifest
+        env:
+          CONTROL_BUILD_VERSION: ${{ steps.control_plane.outputs.build_version }}
+        run: |
+          set -euo pipefail
+
+          file_sha256() {
+            shasum -a 256 "$1" | awk '{print $1}'
+          }
+          file_bytes() {
+            stat -f '%z' "$1"
+          }
+
+          codex_bytes="$(file_bytes "$ARTIFACT_DIR/codex")"
+          helper_bytes="$(file_bytes "$ARTIFACT_DIR/codex-code-mode-host")"
+          control_bytes="$(file_bytes "$ARTIFACT_DIR/codexswitch-cli")"
+          codex_sha256="$(file_sha256 "$ARTIFACT_DIR/codex")"
+          helper_sha256="$(file_sha256 "$ARTIFACT_DIR/codex-code-mode-host")"
+          control_sha256="$(file_sha256 "$ARTIFACT_DIR/codexswitch-cli")"
+
+          jq -n \
+            --arg format "codexswitch-macos-runtime-artifact-v1" \
+            --arg sourceSha "$CODEXSWITCH_SOURCE_SHA" \
+            --arg buildVersion "$CONTROL_BUILD_VERSION" \
+            --arg upstreamVersion "$UPSTREAM_CODEX_VERSION" \
+            --arg upstreamSha "${{ steps.upstream.outputs.sha }}" \
+            --arg patchSha256 "${{ steps.patches.outputs.sha256 }}" \
+            --arg targetTriple "$TARGET_TRIPLE" \
+            --arg architecture "arm64" \
+            --argjson buildEpoch "$SOURCE_DATE_EPOCH" \
+            --argjson codexBytes "$codex_bytes" \
+            --arg codexSha256 "$codex_sha256" \
+            --argjson helperBytes "$helper_bytes" \
+            --arg helperSha256 "$helper_sha256" \
+            --argjson controlBytes "$control_bytes" \
+            --arg controlSha256 "$control_sha256" \
+            '{
+              format: $format,
+              codexSwitchGitSha: $sourceSha,
+              codexSwitchBuildVersion: $buildVersion,
+              upstreamCodexVersion: $upstreamVersion,
+              upstreamCodexGitSha: $upstreamSha,
+              sourcePatchSha256: $patchSha256,
+              targetTriple: $targetTriple,
+              architecture: $architecture,
+              buildEpoch: $buildEpoch,
+              files: [
+                {name: "codex", bytes: $codexBytes, sha256: $codexSha256},
+                {name: "codex-code-mode-host", bytes: $helperBytes, sha256: $helperSha256},
+                {name: "codexswitch-cli", bytes: $controlBytes, sha256: $controlSha256}
+              ]
+            }' > "$ARTIFACT_DIR/manifest.json"
+          chmod 0644 "$ARTIFACT_DIR/manifest.json"
+
+          jq -e \
+            --arg sourceSha "$CODEXSWITCH_SOURCE_SHA" \
+            --arg buildVersion "$CONTROL_BUILD_VERSION" \
+            --arg upstreamVersion "$UPSTREAM_CODEX_VERSION" \
+            --arg upstreamSha "${{ steps.upstream.outputs.sha }}" \
+            --arg patchSha256 "${{ steps.patches.outputs.sha256 }}" \
+            --argjson buildEpoch "$SOURCE_DATE_EPOCH" \
+            '
+              type == "object" and
+              (keys == ["architecture", "buildEpoch", "codexSwitchBuildVersion", "codexSwitchGitSha", "files", "format", "sourcePatchSha256", "targetTriple", "upstreamCodexGitSha", "upstreamCodexVersion"]) and
+              .format == "codexswitch-macos-runtime-artifact-v1" and
+              .codexSwitchGitSha == $sourceSha and
+              (.codexSwitchGitSha | test("^[0-9a-f]{40}$")) and
+              .codexSwitchBuildVersion == $buildVersion and
+              (.codexSwitchBuildVersion | (length > 0 and length <= 512)) and
+              .upstreamCodexVersion == $upstreamVersion and
+              (.upstreamCodexVersion | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+              .upstreamCodexGitSha == $upstreamSha and
+              (.upstreamCodexGitSha | test("^[0-9a-f]{40}$")) and
+              .sourcePatchSha256 == $patchSha256 and
+              (.sourcePatchSha256 | test("^[0-9a-f]{64}$")) and
+              .targetTriple == "aarch64-apple-darwin" and
+              .architecture == "arm64" and
+              .buildEpoch == $buildEpoch and
+              (.buildEpoch | (type == "number" and . > 0)) and
+              ([.files[].name] == ["codex", "codex-code-mode-host", "codexswitch-cli"]) and
+              (all(.files[];
+                (keys == ["bytes", "name", "sha256"]) and
+                (.bytes | (type == "number" and . > 0 and . <= 2147483648)) and
+                (.sha256 | test("^[0-9a-f]{64}$"))
+              ))
+            ' "$ARTIFACT_DIR/manifest.json" >/dev/null
+
+          expected_names="$RUNNER_TEMP/expected-artifact-files.txt"
+          actual_names="$RUNNER_TEMP/actual-artifact-files.txt"
+          printf '%s\n' codex codex-code-mode-host codexswitch-cli manifest.json \
+            | LC_ALL=C sort > "$expected_names"
+          find "$ARTIFACT_DIR" -mindepth 1 -maxdepth 1 -exec basename {} \; \
+            | LC_ALL=C sort > "$actual_names"
+          diff -u "$expected_names" "$actual_names"
+
+          while IFS= read -r member; do
+            if [[ ! -f "$ARTIFACT_DIR/$member" || -L "$ARTIFACT_DIR/$member" ]]; then
+              echo "::error::artifact member is not a regular non-symlink file: $member"
+              exit 1
+            fi
+          done < "$expected_names"
+
+          for name in codex codex-code-mode-host codexswitch-cli; do
+            manifest_bytes="$(jq -r --arg name "$name" '.files[] | select(.name == $name) | .bytes' "$ARTIFACT_DIR/manifest.json")"
+            manifest_sha256="$(jq -r --arg name "$name" '.files[] | select(.name == $name) | .sha256' "$ARTIFACT_DIR/manifest.json")"
+            if [[ "$manifest_bytes" != "$(file_bytes "$ARTIFACT_DIR/$name")" \
+              || "$manifest_sha256" != "$(file_sha256 "$ARTIFACT_DIR/$name")" ]]; then
+              echo "::error::manifest identity mismatch for $name"
+              exit 1
+            fi
+          done
+
+      - name: Attest all exact runtime artifact members
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/codexswitch-macos-runtime-artifact/codex
+            ${{ runner.temp }}/codexswitch-macos-runtime-artifact/codex-code-mode-host
+            ${{ runner.temp }}/codexswitch-macos-runtime-artifact/codexswitch-cli
+            ${{ runner.temp }}/codexswitch-macos-runtime-artifact/manifest.json
+
+      - name: Upload the verified runtime artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.provenance.outputs.artifact_name }}
+          path: ${{ runner.temp }}/codexswitch-macos-runtime-artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: false
+
+      - name: Record build evidence
+        env:
+          ARTIFACT_NAME: ${{ steps.provenance.outputs.artifact_name }}
+          CONTROL_BUILD_VERSION: ${{ steps.control_plane.outputs.build_version }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## macOS Runtime Artifact"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Dispatch ref | \`$GITHUB_REF\` |"
+            echo "| CodexSwitch SHA | \`$CODEXSWITCH_SOURCE_SHA\` |"
+            echo "| CodexSwitch build version | \`$CONTROL_BUILD_VERSION\` |"
+            echo "| Upstream tag | \`$UPSTREAM_TAG\` |"
+            echo "| Upstream SHA | \`$UPSTREAM_SHA\` |"
+            echo "| Patched diff SHA-256 | \`$PATCH_SHA256\` |"
+            echo "| Target | \`$TARGET_TRIPLE\` |"
+            echo "| Runner architecture | \`$(uname -m)\` |"
+            echo "| Build epoch | \`$SOURCE_DATE_EPOCH\` |"
+            echo "| Artifact | \`$ARTIFACT_NAME\` |"
+            echo "| Upload digest | \`$ARTIFACT_DIGEST\` |"
+            echo "| Retention | 7 days |"
+            echo "| Download modes | Restore the three binaries to \`0755\`; GitHub artifacts normalize files to \`0644\` |"
+            echo "| Activation | Not performed |"
+            echo
+            echo "### Files"
+            echo
+            echo "| Name | Bytes | SHA-256 |"
+            echo "| --- | ---: | --- |"
+            jq -r '.files[] | "| `\(.name)` | \(.bytes) | `\(.sha256)` |"' "$ARTIFACT_DIR/manifest.json"
+          } >> "$GITHUB_STEP_SUMMARY"

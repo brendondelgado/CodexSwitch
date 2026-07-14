@@ -6,6 +6,17 @@ import SwiftUI
 struct PooledUsageMeterView: View {
     let accounts: [CodexAccount]
     let tokenSavingsSummary: CodexTokenSavingsSummary?
+    let rateLimitResetPresentations: [UUID: RateLimitResetInventoryPresentation]
+
+    init(
+        accounts: [CodexAccount],
+        tokenSavingsSummary: CodexTokenSavingsSummary? = nil,
+        rateLimitResetPresentations: [UUID: RateLimitResetInventoryPresentation] = [:]
+    ) {
+        self.accounts = accounts
+        self.tokenSavingsSummary = tokenSavingsSummary
+        self.rateLimitResetPresentations = rateLimitResetPresentations
+    }
 
     private var capacitySummary: PooledCapacitySummary {
         PooledCapacitySummary(accounts: accounts)
@@ -15,174 +26,184 @@ struct PooledUsageMeterView: View {
         accounts.filter { $0.realQuotaSnapshot != nil }
     }
 
-    private var usableAccounts: [CodexAccount] {
-        accountsWithData.filter { account in
-            guard let snap = account.realQuotaSnapshot else { return false }
-            return !snap.fiveHour.isExhausted && !snap.weekly.isExhausted
-        }
+    private var quotaStateSummary: PooledQuotaStateSummary {
+        Self.stateSummary(for: accounts)
     }
 
-    /// Count accounts where EITHER 5h or weekly is exhausted
-    private var exhaustedCount: Int {
-        accountsWithData.filter { account in
-            guard let snap = account.realQuotaSnapshot else { return false }
-            return snap.fiveHour.isExhausted || snap.weekly.isExhausted
-        }.count
+    static func quotaState(for snapshot: QuotaSnapshot) -> PooledAccountQuotaState {
+        if snapshot.isDenied { return .denied }
+        if snapshot.windows.isEmpty { return .unknown }
+        if snapshot.isImmediatelyUsable { return .usable }
+        if !snapshot.blockingWindows.isEmpty { return .exhausted }
+        return .unknown
     }
+
+    static func stateSummary(for accounts: [CodexAccount]) -> PooledQuotaStateSummary {
+        var deniedCount = 0
+        var exhaustedCount = 0
+        var unknownCount = 0
+        var usableCount = 0
+        var missingCount = 0
+
+        for account in accounts {
+            guard let snapshot = account.realQuotaSnapshot else {
+                missingCount += 1
+                continue
+            }
+            switch quotaState(for: snapshot) {
+            case .denied: deniedCount += 1
+            case .exhausted: exhaustedCount += 1
+            case .unknown: unknownCount += 1
+            case .usable: usableCount += 1
+            }
+        }
+
+        return PooledQuotaStateSummary(
+            deniedCount: deniedCount,
+            exhaustedCount: exhaustedCount,
+            unknownCount: unknownCount,
+            usableCount: usableCount,
+            missingCount: missingCount
+        )
+    }
+
+    private var rateLimitResetSummary: PooledRateLimitResetPresentation {
+        PooledRateLimitResetPresentation.summarize(
+            accounts.compactMap { rateLimitResetPresentations[$0.id] }
+        )
+    }
+
+    private static let bankedResetExpiryFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("MMM d")
+        return formatter
+    }()
 
     /// Pooled 5h remaining across ALL accounts. Shows real 5h capacity even when
     /// weekly is exhausted — the weekly bar separately shows that constraint.
     private var pooled5h: PooledMetric {
-        let withData = accountsWithData
-        guard !withData.isEmpty else { return .empty(totalAccounts: accounts.count) }
-
-        let totalRemaining = withData.reduce(0.0) { partial, account in
-            let multiplier = CodexPlanCapacity.forAccount(account).fiveHourPlusMultiplier
-            return partial + account.realQuotaSnapshot!.fiveHour.remainingPercent * multiplier
-        }
-        let totalCapacity = capacitySummary.fiveHourPlusCapacity * 100.0
-        guard totalCapacity > 0 else { return .empty(totalAccounts: accounts.count) }
-        let pooledPercent = totalRemaining / totalCapacity * 100.0
-
-        let pro20Capacity = CodexPlanCapacity.forPlanType("pro").fiveHourPlusMultiplier * 100.0
-        let proEquivalentRemaining = totalCapacity > 0 ? totalRemaining / pro20Capacity * 100.0 : 0
-        let proPercent = min(100, proEquivalentRemaining)
-
-        let nextReset = withData.compactMap { $0.realQuotaSnapshot?.fiveHour.resetsAt }.min()
-
-        return PooledMetric(
-            pooledPercent: pooledPercent,
-            totalRemaining: totalRemaining,
-            totalCapacity: totalCapacity,
-            proEquivalentPercent: proPercent,
-            reportingCount: withData.count,
-            totalCount: accounts.count,
-            nextReset: nextReset
-        )
+        Self.metric(for: .fiveHour, accounts: accounts)
     }
 
     /// Pooled weekly remaining
     private var pooledWeekly: PooledMetric {
-        let withData = accountsWithData
-        guard !withData.isEmpty else { return .empty(totalAccounts: accounts.count) }
+        Self.metric(for: .weekly, accounts: accounts)
+    }
 
-        let totalRemaining = withData.reduce(0.0) { partial, account in
-            let multiplier = CodexPlanCapacity.forAccount(account).weeklyPlusMultiplier
-            return partial + account.realQuotaSnapshot!.weekly.remainingPercent * multiplier
+    static func metric(for kind: QuotaWindowKind, accounts: [CodexAccount]) -> PooledMetric {
+        guard kind == .fiveHour || kind == .weekly else {
+            return .empty(totalAccounts: accounts.count)
         }
-        let totalCapacity = capacitySummary.weeklyPlusCapacity * 100.0
-        guard totalCapacity > 0 else { return .empty(totalAccounts: accounts.count) }
-        let pooledPercent = totalRemaining / totalCapacity * 100.0
 
-        let pro20Capacity = CodexPlanCapacity.forPlanType("pro").weeklyPlusMultiplier * 100.0
-        let proEquivalentRemaining = totalCapacity > 0 ? totalRemaining / pro20Capacity * 100.0 : 0
-        let proPercent = min(100, proEquivalentRemaining)
+        let reports = reportedWindows(for: kind, accounts: accounts)
+        guard !reports.isEmpty else { return .empty(totalAccounts: accounts.count) }
 
-        let nextReset = withData.compactMap { $0.realQuotaSnapshot?.weekly.resetsAt }.min()
+        let totalRemaining = reports.reduce(0.0) { partial, report in
+            return partial + report.window.effectiveRemainingPercent * multiplier(for: kind, account: report.account)
+        }
+        let totalCapacity = reports.reduce(0.0) { partial, report in
+            partial + multiplier(for: kind, account: report.account) * 100.0
+        }
+        let pooledPercent = totalCapacity > 0 ? totalRemaining / totalCapacity * 100.0 : 0
+        let proCapacity = multiplier(for: kind, planType: "pro") * 100.0
+        let proPercent = proCapacity > 0 ? min(100, totalRemaining / proCapacity * 100.0) : 0
 
         return PooledMetric(
             pooledPercent: pooledPercent,
             totalRemaining: totalRemaining,
             totalCapacity: totalCapacity,
             proEquivalentPercent: proPercent,
-            reportingCount: withData.count,
+            reportingCount: reports.count,
             totalCount: accounts.count,
-            nextReset: nextReset
+            nextReset: reports.map(\.window.resetsAt).min()
         )
     }
 
-    /// Time until nearest weekly reset (when capacity returns)
-    private var nextWeeklyResetTime: String? {
-        let nextReset = accountsWithData.compactMap { $0.realQuotaSnapshot?.weekly.resetsAt }.min()
-        guard let reset = nextReset else { return nil }
-        let seconds = reset.timeIntervalSinceNow
-        guard seconds > 0 else { return nil }
-        return formatTime(seconds)
+    private static func reportedWindows(
+        for kind: QuotaWindowKind,
+        accounts: [CodexAccount]
+    ) -> [ReportedQuotaWindow] {
+        accounts.compactMap { account in
+            guard let snapshot = account.realQuotaSnapshot,
+                  !snapshot.isDenied,
+                  let window = snapshot.windows.first(where: { $0.kind == kind }) else {
+                return nil
+            }
+            return ReportedQuotaWindow(account: account, snapshot: snapshot, window: window)
+        }
     }
 
-    /// Whether ALL accounts have weekly exhausted (pool is fully locked)
-    private var allWeeklyExhausted: Bool {
-        let withData = accountsWithData
-        guard !withData.isEmpty else { return false }
-        return withData.allSatisfy { $0.realQuotaSnapshot!.weekly.isExhausted }
+    private static func multiplier(for kind: QuotaWindowKind, account: CodexAccount) -> Double {
+        let capacity = CodexPlanCapacity.forAccount(account)
+        return kind == .fiveHour ? capacity.fiveHourPlusMultiplier : capacity.weeklyPlusMultiplier
     }
 
-    /// Estimated time until usable pooled capacity runs out.
-    /// Uses min(5h estimate, weekly estimate) — weekly is the hard ceiling since
-    /// once weekly hits 0% on all accounts, 5h capacity is worthless.
-    /// When all weekly is exhausted, returns nil (caller shows reset countdown instead).
-    private var estimatedTimeRemaining: String? {
-        let usable = accountsWithData.filter { !$0.realQuotaSnapshot!.weekly.isExhausted }
-        guard !usable.isEmpty else { return nil }
+    private static func multiplier(for kind: QuotaWindowKind, planType: String) -> Double {
+        let capacity = CodexPlanCapacity.forPlanType(planType)
+        return kind == .fiveHour ? capacity.fiveHourPlusMultiplier : capacity.weeklyPlusMultiplier
+    }
 
-        // --- Weekly ceiling ---
-        let active = usable.first { $0.isActive } ?? usable.first!
-        let activeWk = active.realQuotaSnapshot!.weekly
-        let activeWeeklyMultiplier = CodexPlanCapacity.forAccount(active).weeklyPlusMultiplier
-        let wkElapsed = max(60, Double(activeWk.windowDurationMins * 60) - max(0, activeWk.timeUntilReset))
-        let wkBurnPerSec = activeWk.usedPercent * activeWeeklyMultiplier / wkElapsed
-
-        let totalWeeklyRemaining = usable.reduce(0.0) { partial, account in
-            let multiplier = CodexPlanCapacity.forAccount(account).weeklyPlusMultiplier
-            return partial + account.realQuotaSnapshot!.weekly.remainingPercent * multiplier
+    static func naturalWeeklyResetDate(accounts: [CodexAccount]) -> Date? {
+        let recoveryDates = accounts.compactMap { account -> Date? in
+            guard let snapshot = account.realQuotaSnapshot,
+                  let weekly = snapshot.weekly,
+                  snapshot.isDenied || weekly.shouldAutoSwapAway else {
+                return nil
+            }
+            return weekly.resetsAt
         }
-        let weeklyCeiling: TimeInterval = wkBurnPerSec > 0
-            ? totalWeeklyRemaining / wkBurnPerSec
-            : .greatestFiniteMagnitude
+        guard !recoveryDates.isEmpty else { return nil }
+        return recoveryDates.min()
+    }
 
-        // --- 5h estimate with reset simulation ---
-        var fhBurnPerSec = 0.0
-        for account in usable {
-            let fh = account.realQuotaSnapshot!.fiveHour
-            let multiplier = CodexPlanCapacity.forAccount(account).fiveHourPlusMultiplier
-            let elapsed = max(60, Double(fh.windowDurationMins * 60) - max(0, fh.timeUntilReset))
-            let rate = fh.usedPercent * multiplier / elapsed
-            if rate > 0 { fhBurnPerSec += rate }
+    static func runwayPresentation(
+        accounts: [CodexAccount],
+        now: Date = Date()
+    ) -> PooledRunwayPresentation {
+        let summary = stateSummary(for: accounts)
+        if summary.usableCount == 0,
+           let weeklyReset = naturalWeeklyResetDate(accounts: accounts),
+           weeklyReset > now {
+            return .weeklyRecovery(weeklyReset)
         }
 
-        guard fhBurnPerSec > 0 || wkBurnPerSec > 0 else { return nil }
-
-        var fhEstimate: TimeInterval = .greatestFiniteMagnitude
-        if fhBurnPerSec > 0 {
-            var poolRemaining = usable.reduce(0.0) { partial, account in
-                let multiplier = CodexPlanCapacity.forAccount(account).fiveHourPlusMultiplier
-                return partial + account.realQuotaSnapshot!.fiveHour.remainingPercent * multiplier
-            }
-
-            var resets: [(secondsFromNow: TimeInterval, restoredCapacity: Double)] = []
-            for account in usable {
-                let fh = account.realQuotaSnapshot!.fiveHour
-                let resetIn = fh.timeUntilReset
-                if resetIn > 0 && resetIn < 86400 {
-                    let multiplier = CodexPlanCapacity.forAccount(account).fiveHourPlusMultiplier
-                    resets.append((resetIn, multiplier * 100.0))
-                }
-            }
-            resets.sort { $0.secondsFromNow < $1.secondsFromNow }
-
-            var elapsedSec: TimeInterval = 0
-            var foundEmpty = false
-            for reset in resets {
-                let timeToReset = reset.secondsFromNow - elapsedSec
-                let burned = fhBurnPerSec * timeToReset
-                if burned >= poolRemaining {
-                    fhEstimate = elapsedSec + poolRemaining / fhBurnPerSec
-                    foundEmpty = true
-                    break
-                }
-                poolRemaining -= burned
-                poolRemaining += reset.restoredCapacity
-                elapsedSec = reset.secondsFromNow
-            }
-            if !foundEmpty {
-                fhEstimate = elapsedSec + poolRemaining / fhBurnPerSec
-            }
+        if summary.exhaustedCount > 0, summary.usableCount == 0 {
+            return .unavailable
         }
 
-        let estimate = min(fhEstimate, weeklyCeiling)
-        guard estimate < .greatestFiniteMagnitude else { return nil }
+        let estimates = [
+            estimatedRunway(for: .fiveHour, accounts: accounts, now: now),
+            estimatedRunway(for: .weekly, accounts: accounts, now: now),
+        ].compactMap { $0 }
+        guard let estimate = estimates.min() else { return .unavailable }
+        return .estimate(estimate)
+    }
 
-        return formatTime(estimate)
+    static func estimatedRunway(
+        for kind: QuotaWindowKind,
+        accounts: [CodexAccount],
+        now: Date = Date()
+    ) -> TimeInterval? {
+        let reports = Self.reportedWindows(for: kind, accounts: accounts).filter {
+            $0.snapshot.isImmediatelyUsable
+        }
+        guard !reports.isEmpty else { return nil }
+
+        let burnPerSecond = reports.reduce(0.0) { partial, report in
+            let multiplier = Self.multiplier(for: kind, account: report.account)
+            let elapsed = max(
+                60,
+                Double(report.window.durationSeconds) - max(0, report.window.resetsAt.timeIntervalSince(now))
+            )
+            return partial + report.window.usedPercent * multiplier / elapsed
+        }
+        guard burnPerSecond > 0 else { return nil }
+
+        let totalRemaining = reports.reduce(0.0) { partial, report in
+            partial + report.window.effectiveRemainingPercent
+                * Self.multiplier(for: kind, account: report.account)
+        }
+        return totalRemaining / burnPerSecond
     }
 
     private func formatTime(_ seconds: TimeInterval) -> String {
@@ -193,39 +214,57 @@ struct PooledUsageMeterView: View {
         return "~\(mins)m"
     }
 
-    /// Smart status line based on current pool state
-    private var poolStatus: (icon: String, text: String, color: Color)? {
+    /// Compact status rows keep denial, natural exhaustion, and unknown data distinct.
+    private var poolStatuses: [(icon: String, text: String, color: Color)] {
         let total = accounts.count
-        let reporting = accountsWithData.count
-        let usable = usableAccounts.count
-        let exhausted = exhaustedCount
+        let summary = quotaStateSummary
+        var statuses: [(icon: String, text: String, color: Color)] = []
 
-        // Not all accounts reporting yet
-        if reporting < total {
-            let pending = total - reporting
-            return ("clock.fill", "\(pending) account\(pending == 1 ? "" : "s") still connecting — pool stats are partial", .orange)
+        if summary.deniedCount > 0 {
+            let color: Color = summary.usableCount > 0 ? .orange : .red
+            statuses.append((
+                "hand.raised.fill",
+                "\(summary.deniedCount) of \(total) account\(total == 1 ? "" : "s") denied by provider",
+                color
+            ))
         }
 
-        // Accounts exhausted
-        if exhausted > 0 {
-            if usable <= 1 {
-                return ("exclamationmark.triangle.fill",
-                        "\(exhausted) of \(total) accounts exhausted — add more or wait for resets", .red)
+        if summary.exhaustedCount > 0 {
+            if summary.usableCount <= 1 {
+                statuses.append(("exclamationmark.triangle.fill",
+                                 "\(summary.exhaustedCount) of \(total) accounts exhausted", .red))
+            } else {
+                statuses.append(("exclamationmark.triangle",
+                                 "\(summary.exhaustedCount) of \(total) exhausted, \(summary.usableCount) still usable", .orange))
             }
-            return ("exclamationmark.triangle",
-                    "\(exhausted) of \(total) accounts exhausted, \(usable) still usable", .orange)
         }
 
-        // All accounts have very low weekly (< 30%)
-        let lowWeeklyCount = accountsWithData.filter { ($0.realQuotaSnapshot?.weekly.remainingPercent ?? 100) < 30 }.count
-        if lowWeeklyCount == total && total > 0 {
-            return ("exclamationmark.triangle",
-                    "All \(total) accounts below 30% weekly — consider adding an account", .orange)
+        if summary.unknownCount > 0 {
+            statuses.append((
+                "questionmark.circle",
+                "\(summary.unknownCount) of \(total) quota state\(summary.unknownCount == 1 ? " is" : "s are") unknown",
+                .secondary
+            ))
+        }
+
+        if summary.missingCount > 0 {
+            let pending = summary.missingCount
+            statuses.append(("clock.fill", "\(pending) account\(pending == 1 ? "" : "s") still connecting - pool stats are partial", .orange))
+        }
+
+        if !statuses.isEmpty { return statuses }
+
+        // All accounts reporting weekly capacity have very low weekly quota.
+        let weeklyReports = Self.reportedWindows(for: .weekly, accounts: accounts)
+        let lowWeeklyCount = weeklyReports.filter { $0.window.effectiveRemainingPercent < 30 }.count
+        if !weeklyReports.isEmpty, lowWeeklyCount == weeklyReports.count {
+            return [("exclamationmark.triangle",
+                     "All \(weeklyReports.count) weekly reporters below 30%", .orange)]
         }
 
         // Everything healthy
-        return ("checkmark.seal.fill",
-                "All \(total) accounts healthy", .green)
+        return [("checkmark.seal.fill",
+                 "All \(total) accounts healthy", .green)]
     }
 
     private static func barColor(for percent: Double) -> Color {
@@ -246,9 +285,9 @@ struct PooledUsageMeterView: View {
     private var meterContent: some View {
         let fh = pooled5h
         let wk = pooledWeekly
-        let estTime = estimatedTimeRemaining
-        let weeklyLocked = allWeeklyExhausted
-        let resetTime = nextWeeklyResetTime
+        let now = Date()
+        let runway = Self.runwayPresentation(accounts: accounts, now: now)
+        let reporting = accountsWithData.count
 
         return VStack(alignment: .leading, spacing: 6) {
             // Header
@@ -256,58 +295,68 @@ struct PooledUsageMeterView: View {
                 Image(systemName: "chart.bar.fill")
                     .font(.system(size: 10))
                     .foregroundStyle(.blue)
-                if fh.reportingCount < fh.totalCount {
-                    Text("Pooled Usage (\(fh.reportingCount)/\(fh.totalCount) reporting)")
+                if reporting < accounts.count {
+                    Text("Pooled Usage (\(reporting)/\(accounts.count) reporting)")
                         .font(.system(size: 10, weight: .semibold))
                 } else {
-                    Text("Pooled Usage — All \(fh.totalCount) Accounts")
+                    Text("Pooled Usage - All \(accounts.count) Accounts")
                         .font(.system(size: 10, weight: .semibold))
                 }
                 Spacer()
-                if let est = estTime {
-                    HStack(spacing: 2) {
-                        Image(systemName: "timer")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.secondary)
-                        Text(est)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    .help("Estimated time until combined pool runs out at current usage rate")
-                } else if weeklyLocked, let reset = resetTime {
+                switch runway {
+                case .weeklyRecovery(let resetAt):
                     HStack(spacing: 2) {
                         Image(systemName: "clock.arrow.circlepath")
                             .font(.system(size: 8))
                             .foregroundStyle(.orange)
-                        Text(reset)
+                        Text(formatTime(resetAt.timeIntervalSince(now)))
                             .font(.system(size: 10, weight: .medium, design: .monospaced))
                             .foregroundStyle(.orange)
                     }
                     .help("Time until earliest weekly reset restores capacity")
+                case .estimate(let estimate):
+                    HStack(spacing: 2) {
+                        Image(systemName: "timer")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.secondary)
+                        Text(formatTime(estimate))
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    .help("Estimated time until combined pool runs out at current usage rate")
+                case .unavailable:
+                    EmptyView()
                 }
             }
 
             // Context line
-            if estTime != nil {
-                Text("Est. pool runway at current pace (includes upcoming resets)")
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, 16)
-            } else if weeklyLocked {
-                Text("Weekly exhausted on all accounts — 5h capacity locked until weekly resets")
+            switch runway {
+            case .weeklyRecovery:
+                Text("Reported weekly capacity is exhausted")
                     .font(.system(size: 8))
                     .foregroundStyle(.orange)
                     .padding(.leading, 16)
+            case .estimate:
+                Text("Est. pool runway at current pace")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 16)
+            case .unavailable:
+                EmptyView()
             }
 
-            // 5h pooled bar
-            pooledBar(label: "5h pool", percent: fh.pooledPercent, proPercent: fh.proEquivalentPercent)
+            if fh.reportingCount > 0 {
+                pooledBar(label: "5h pool", percent: fh.pooledPercent, proPercent: fh.proEquivalentPercent)
+                    .help("\(fh.reportingCount) of \(fh.totalCount) accounts report a 5h window")
+            }
 
-            // Weekly pooled bar
-            pooledBar(label: "Weekly", percent: wk.pooledPercent, proPercent: wk.proEquivalentPercent)
+            if wk.reportingCount > 0 {
+                pooledBar(label: "Weekly", percent: wk.pooledPercent, proPercent: wk.proEquivalentPercent)
+                    .help("\(wk.reportingCount) of \(wk.totalCount) accounts report a weekly window")
+            }
 
-            // Pool health status
-            if let status = poolStatus {
+            // Pool health statuses
+            ForEach(Array(poolStatuses.enumerated()), id: \.offset) { _, status in
                 HStack(spacing: 4) {
                     Image(systemName: status.icon)
                         .font(.system(size: 9))
@@ -318,20 +367,62 @@ struct PooledUsageMeterView: View {
                 }
             }
 
-            // Cost comparison — broken into readable lines
-            costComparison
+            if rateLimitResetSummary.currentAvailableCount > 0
+                || rateLimitResetSummary.hasIncompleteInventory {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.counterclockwise.circle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.teal)
+                    Text(rateLimitResetStatusText)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .help("Reset inventory across the account pool")
+            }
+
+            costComparison(fiveHour: fh, weekly: wk)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color.blue.opacity(0.04))
     }
 
-    private var costComparison: some View {
+    private var rateLimitResetStatusText: String {
+        Self.rateLimitResetStatusText(
+            for: rateLimitResetSummary,
+            nextExpirationText: rateLimitResetSummary.nextCurrentExpiration.map {
+                Self.bankedResetExpiryFormatter.string(from: $0)
+            }
+        )
+    }
+
+    static func rateLimitResetStatusText(
+        for summary: PooledRateLimitResetPresentation,
+        nextExpirationText: String? = nil
+    ) -> String {
+        let count = summary.currentAvailableCount
+        let noun = count == 1 ? "reset" : "resets"
+        var parts = [summary.hasIncompleteInventory
+            ? "\(count) current \(noun)"
+            : "\(count) banked \(noun)"]
+
+        if count > 0, let nextExpirationText {
+            parts.append("next expires \(nextExpirationText)")
+        }
+        if summary.pendingAccountCount > 0 {
+            parts.append("\(summary.pendingAccountCount) pending")
+        }
+        if summary.staleAccountCount > 0 {
+            parts.append("\(summary.staleAccountCount) stale")
+        }
+        return parts.joined(separator: " • ")
+    }
+
+    private func costComparison(fiveHour: PooledMetric, weekly: PooledMetric) -> some View {
         let summary = capacitySummary
-        let pro20FiveHourPercent = summary.fiveHourPlusCapacity
-            / CodexPlanCapacity.forPlanType("pro").fiveHourPlusMultiplier * 100
-        let pro20WeeklyPercent = summary.weeklyPlusCapacity
-            / CodexPlanCapacity.forPlanType("pro").weeklyPlusMultiplier * 100
+        let plusParts = reportedCapacityParts(fiveHour: fiveHour, weekly: weekly, relativeToPro: false)
+        let proParts = reportedCapacityParts(fiveHour: fiveHour, weekly: weekly, relativeToPro: true)
 
         return VStack(alignment: .leading, spacing: 2) {
             // Line 1: Your plan
@@ -343,27 +434,29 @@ struct PooledUsageMeterView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
             }
-            // Line 2: Plus comparison
-            HStack(spacing: 4) {
-                Image(systemName: "arrow.right")
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
-                Text("Vs single Plus: \(formatMultiplier(summary.fiveHourPlusCapacity))x 5h / \(formatMultiplier(summary.weeklyPlusCapacity))x weekly")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
+            if !plusParts.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                    Text("Vs single Plus: \(plusParts.joined(separator: " / "))")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.leading, 13)
             }
-            .padding(.leading, 13)
-            // Line 3: Pro comparison
-            HStack(spacing: 4) {
-                Image(systemName: "arrow.right")
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
-                Text("Vs Pro 20x: \(String(format: "%.0f", pro20FiveHourPercent))% 5h / \(String(format: "%.0f", pro20WeeklyPercent))% weekly")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
+            if !proParts.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.tertiary)
+                    Text("Vs Pro 20x: \(proParts.joined(separator: " / "))")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.leading, 13)
             }
-            .padding(.leading, 13)
-            if let promoText = summary.promoText {
+            if fiveHour.reportingCount > 0, let promoText = summary.promoText {
                 HStack(spacing: 4) {
                     Image(systemName: "sparkles")
                         .font(.system(size: 8))
@@ -376,6 +469,33 @@ struct PooledUsageMeterView: View {
             }
             tokenSavingsComparison
         }
+    }
+
+    private func reportedCapacityParts(
+        fiveHour: PooledMetric,
+        weekly: PooledMetric,
+        relativeToPro: Bool
+    ) -> [String] {
+        var parts: [String] = []
+        if fiveHour.reportingCount > 0 {
+            if relativeToPro {
+                let proCapacity = CodexPlanCapacity.forPlanType("pro").fiveHourPlusMultiplier * 100
+                let percent = proCapacity > 0 ? fiveHour.totalCapacity / proCapacity * 100 : 0
+                parts.append("\(String(format: "%.0f", percent))% 5h")
+            } else {
+                parts.append("\(formatMultiplier(fiveHour.totalCapacity / 100))x 5h")
+            }
+        }
+        if weekly.reportingCount > 0 {
+            if relativeToPro {
+                let proCapacity = CodexPlanCapacity.forPlanType("pro").weeklyPlusMultiplier * 100
+                let percent = proCapacity > 0 ? weekly.totalCapacity / proCapacity * 100 : 0
+                parts.append("\(String(format: "%.0f", percent))% weekly")
+            } else {
+                parts.append("\(formatMultiplier(weekly.totalCapacity / 100))x weekly")
+            }
+        }
+        return parts
     }
 
     @ViewBuilder
@@ -510,7 +630,34 @@ struct PooledUsageMeterView: View {
     }
 }
 
-private struct PooledMetric {
+private struct ReportedQuotaWindow {
+    let account: CodexAccount
+    let snapshot: QuotaSnapshot
+    let window: QuotaWindow
+}
+
+enum PooledRunwayPresentation: Equatable {
+    case weeklyRecovery(Date)
+    case estimate(TimeInterval)
+    case unavailable
+}
+
+enum PooledAccountQuotaState: Equatable {
+    case usable
+    case denied
+    case exhausted
+    case unknown
+}
+
+struct PooledQuotaStateSummary: Equatable {
+    let deniedCount: Int
+    let exhaustedCount: Int
+    let unknownCount: Int
+    let usableCount: Int
+    let missingCount: Int
+}
+
+struct PooledMetric: Equatable {
     let pooledPercent: Double
     let totalRemaining: Double
     let totalCapacity: Double

@@ -8,6 +8,7 @@ struct SettingsView: View {
     @AppStorage("launchAtLogin") private var launchAtLogin = false
     @AppStorage("notificationsEnabled") private var notificationsEnabled = true
     @AppStorage("pollMultiplier") private var pollMultiplier = 1.0
+    @AppStorage(RateLimitResetSettings.automaticRedemptionDefaultsKey) private var automaticRateLimitResetRedemption = true
     @AppStorage(DesktopPatchManager.automaticPatchingDefaultsKey) private var desktopAutomaticPatchingEnabled = true
     @AppStorage("linuxDevboxMonitorEnabled") private var linuxDevboxMonitorEnabled = false
     @AppStorage("linuxDevboxHost") private var linuxDevboxHost = ""
@@ -57,6 +58,10 @@ struct SettingsView: View {
                 Text("Adjusts base polling intervals. 1.0x = default, 0.5x = faster, 2.0x = slower.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            Section("Banked Resets") {
+                Toggle("Automatically use banked resets", isOn: $automaticRateLimitResetRedemption)
             }
 
             Section("Codex CLI") {
@@ -181,7 +186,7 @@ struct SettingsView: View {
                             [
                                 linuxExportResult.copyCommand,
                                 linuxExportResult.importCommand,
-                                "ssh user@devbox 'codexswitch-cli tui'",
+                                "ssh user@devbox 'codexswitch-cli doctor'",
                             ].joined(separator: "\n"),
                             forType: .string
                         )

@@ -21,9 +21,17 @@ version_control:
   branch: feat/codex-native
   base_commit: 58da612
   created: 2026-04-29
+  status: superseded
+  superseded_by:
+    - ../../architecture/macos-runtime-discovery.md
+    - ../../architecture/runtime-and-host-ownership.md
 ---
 
 # Desktop External Hot-Swap Implementation Plan
+
+> Historical plan. It is not an implementation contract. Use
+> `docs/architecture/macos-runtime-discovery.md` and
+> `docs/architecture/runtime-and-host-ownership.md` for current behavior.
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 

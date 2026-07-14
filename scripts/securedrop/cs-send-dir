@@ -24,7 +24,7 @@ if find "$src" -type l -print -quit | grep -q .; then
   echo "cs-send-dir: refusing directory containing symlinks: $src" >&2
   exit 1
 fi
-name="${2:-$(basename "$src")}"; case "$name" in ""|.|..|*/*|*\\*) echo "cs-send-dir: invalid name: $name" >&2; exit 1;; esac
+name="${2:-$(basename "$src")}"; case "$name" in ""|.|..|*[!A-Za-z0-9._-]*) echo "cs-send-dir: invalid name: $name" >&2; exit 1;; esac
 ext="tar"; tar_flag="-cf"; [[ "$COMPRESS" == 1 ]] && { ext="tar.gz"; tar_flag="-czf"; }
 archive="$name.$ext"
 tmpdir="$(mktemp -d)"; trap 'rm -rf "$tmpdir"' EXIT
@@ -43,10 +43,14 @@ if [[ "$LOCAL_TEST" == 1 ]]; then
   install -m 600 "$archive_path.sha256" "$remote_root/inbox/$archive.sha256"
   dest="$remote_root/inbox/$archive"
 else
-  uuid="$(uuidgen | tr 'A-Z' 'a-z')"
+  uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
   staging="$REMOTE_ROOT/.incoming/$uuid"
+  # All expanded remote paths are validated above.
+  # shellcheck disable=SC2029
   ssh "$HOST" "mkdir -p '$staging' '$REMOTE_ROOT/inbox'"
   rsync -az --partial --timeout=30 -e ssh "$archive_path" "$archive_path.sha256" "$HOST:$staging/"
+  # All expanded remote paths are validated above.
+  # shellcheck disable=SC2029
   ssh "$HOST" "chmod 600 '$staging/$archive' '$staging/$archive.sha256' && mv -f '$staging/$archive' '$REMOTE_ROOT/inbox/$archive' && mv -f '$staging/$archive.sha256' '$REMOTE_ROOT/inbox/$archive.sha256' && rmdir '$staging' 2>/dev/null || true"
   dest="$HOST:$REMOTE_ROOT/inbox/$archive"
 fi

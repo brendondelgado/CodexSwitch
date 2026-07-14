@@ -4,6 +4,11 @@ import Testing
 
 @Suite("Desktop runtime reload client")
 struct DesktopRuntimeReloadClientTests {
+    private static let successfulStrictSummary = CodexReloadSummary(
+        discoveredRuntimeCount: 1,
+        acknowledgedRuntimeCount: 1
+    )
+
     @Test("safe probe methods use read-only order from protocol exploration")
     func safeProbeMethodsUseExpectedOrder() {
         #expect(DesktopRuntimeReloadClient.safeProbeMethods == [
@@ -89,14 +94,351 @@ struct DesktopRuntimeReloadClientTests {
         #expect(mismatchedID == .failed("json-rpc response id mismatch"))
     }
 
-    @Test("success JSON-RPC reload response classifies as reloaded")
-    func successJSONRPCClassifiesAsReloaded() {
+    @Test("generic login success does not classify as reloaded without identity verification")
+    func genericLoginSuccessDoesNotClassifyAsReloaded() {
         let result = DesktopRuntimeReloadClient.classifyReloadResponse(
             .string(#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#),
             method: "account/login/start"
         )
 
+        #expect(result == .failed("desktop account identity not verified"))
+    }
+
+    @Test("reload succeeds only after exact account identity and strict ACK convergence")
+    func reloadRequiresMatchingChatGPTAccount() async throws {
+        let (client, sender) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":" USER@EXAMPLE.COM ","planType":" PRO ","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
         #expect(result == .reloaded(method: "account/login/start"))
+        let requests = await sender.recordedRequests()
+        try #require(requests.count == 2)
+        #expect(requestMethod(in: requests[0].payload) == "account/login/start")
+        #expect(requestMethod(in: requests[1].payload) == "account/read")
+        #expect(requests.allSatisfy { $0.port == 9223 })
+
+        let verificationParams = requestParams(in: requests[1].payload) as? [String: Bool]
+        #expect(verificationParams?["refreshToken"] == false)
+    }
+
+    @Test("matching account ID verifies when target email is unavailable")
+    func reloadUsesMatchingAccountIDWhenTargetEmailIsUnavailable() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount(email: ""))
+
+        #expect(result == .reloaded(method: "account/login/start"))
+    }
+
+    @Test(
+        "account IDs with surrounding or embedded whitespace fail before convergence",
+        arguments: [" acct_123", "acct_123 ", "acct 123"]
+    )
+    func reloadRejectsWhitespaceBearingAccountIDs(responseAccountID: String) async {
+        let escapedID = responseAccountID
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(
+                #"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro","chatgptAccountId":""#
+                    + escapedID
+                    + #""},"requiresOpenaiAuth":true}}"#
+            )
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount(email: ""))
+
+        #expect(result == .failed("desktop account ID is invalid"))
+    }
+
+    @Test("account ID comparison is case sensitive")
+    func reloadRejectsCaseChangedAccountID() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro","chatgptAccountId":"Acct_123"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount(email: ""))
+
+        #expect(result == .failed("desktop account ID mismatch"))
+    }
+
+    @Test("conflicting account ID aliases are ambiguous")
+    func reloadRejectsConflictingAccountIDAliases() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro","chatgptAccountId":"acct_123","accountId":"acct_other"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount(email: ""))
+
+        #expect(result == .failed("desktop account identity is ambiguous"))
+    }
+
+    @Test(
+        "invalid target account IDs fail before socket mutation",
+        arguments: ["", " acct_123", "acct_123 ", "acct 123"]
+    )
+    func reloadRejectsInvalidTargetAccountID(accountID: String) async {
+        let strictCalls = LockedTestState(0)
+        let (client, sender) = makeClient(
+            responses: [],
+            strictReload: { _, _, _ in
+                strictCalls.update { $0 += 1 }
+                return Self.successfulStrictSummary
+            }
+        )
+
+        let result = await client.reloadAuth(
+            account: makeAccount(accountID: accountID)
+        )
+
+        #expect(result == .failed("target account ID is invalid"))
+        #expect(await sender.recordedRequests().isEmpty)
+        #expect(strictCalls.read() == 0)
+    }
+
+    @Test("matching plan without email or account ID cannot prove convergence")
+    func reloadRejectsPlanOnlyVerification() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("desktop account identity missing"))
+    }
+
+    @Test("mismatched account ID fails even when email and plan match")
+    func reloadRejectsMismatchedAccountID() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","accountId":"acct_other"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("desktop account ID mismatch"))
+    }
+
+    @Test("reload rejects a different normalized email")
+    func reloadRejectsMismatchedEmail() async {
+        let (client, sender) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"other@example.com","planType":"pro"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("desktop account email mismatch"))
+        let requests = await sender.recordedRequests()
+        #expect(requests.count == 2)
+    }
+
+    @Test("reload rejects inconsistent meaningful plans")
+    func reloadRejectsMismatchedPlan() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"plus"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("desktop account plan mismatch"))
+    }
+
+    @Test("equivalent ChatGPT plan aliases verify as the same tier")
+    func reloadAllowsEquivalentPlanAliases() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(
+            account: makeAccount(planType: "ChatGPT Pro Monthly")
+        )
+
+        #expect(result == .reloaded(method: "account/login/start"))
+    }
+
+    @Test("unknown target plan does not conflict with a meaningful server plan")
+    func reloadAllowsUnknownTargetPlan() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(
+            account: makeAccount(planType: "unknown")
+        )
+
+        #expect(result == .reloaded(method: "account/login/start"))
+    }
+
+    @Test("null account verification fails closed")
+    func reloadRejectsNullAccount() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":null,"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("desktop account missing"))
+    }
+
+    @Test("non-ChatGPT account verification fails closed")
+    func reloadRejectsWrongAccountType() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("desktop account is not ChatGPT"))
+    }
+
+    @Test("account verification method not found is unsupported")
+    func reloadRejectsVerificationMethodNotFound() async {
+        let (client, sender) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .unsupported)
+        let requests = await sender.recordedRequests()
+        #expect(requests.count == 2)
+    }
+
+    @Test("malformed account verification response is not reloaded")
+    func reloadRejectsMalformedVerificationResponse() async {
+        let (client, sender) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("invalid account verification response"))
+        let requests = await sender.recordedRequests()
+        #expect(requests.count == 2)
+    }
+
+    @Test("account verification timeout is not reloaded")
+    func reloadRejectsVerificationTimeout() async {
+        let (client, sender) = makeClient(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .timeout
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("timeout"))
+        let requests = await sender.recordedRequests()
+        #expect(requests.count == 2)
+    }
+
+    @Test("port ownership drift suppresses every WebSocket send and strict signal phase")
+    func portReuseFailsClosedBeforeSend() async {
+        let currentnessChecks = LockedTestState(0)
+        let socketOwners = LockedTestState<[Int32]>([42, 42, 99])
+        let strictCalls = LockedTestState(0)
+        let (client, sender) = makeClient(
+            responses: [],
+            socketBindingIsCurrent: { binding, requiredOwnerUID in
+                currentnessChecks.update { checks in
+                    checks += 1
+                }
+                return DesktopRuntimeReloadClient.socketBindingIsCurrent(
+                    binding,
+                    requiredOwnerUID: requiredOwnerUID,
+                    socketOwnerPID: { _ in
+                        var owner: Int32?
+                        socketOwners.update { remainingOwners in
+                            if !remainingOwners.isEmpty {
+                                owner = remainingOwners.removeFirst()
+                            }
+                        }
+                        return owner
+                    },
+                    runtimeTargetIsCurrent: { _, _ in true }
+                )
+            },
+            strictReload: { _, _, _ in
+                strictCalls.update { $0 += 1 }
+                return Self.successfulStrictSummary
+            }
+        )
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed("desktop runtime binding drift"))
+        #expect(currentnessChecks.read() == 2)
+        #expect(socketOwners.read().isEmpty)
+        #expect(await sender.recordedRequests().isEmpty)
+        #expect(strictCalls.read() == 0)
+    }
+
+    @Test("PID admission covers typed desktop discovery through strict ACK completion")
+    func overlappingDesktopReloadsSerializeBeforeTypedDiscovery() async {
+        let firstEnteredACKWait = TestSemaphore()
+        let releaseFirstACKWait = TestSemaphore()
+        let secondContended = TestSemaphore()
+        let secondDiscoveryRuns = LockedTestState(0)
+        let gate = CodexReloadAttemptGate { _ in secondContended.signal() }
+        let responses: [DesktopRuntimeWebSocketEvent] = [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
+        ]
+        let (firstClient, _) = makeClient(
+            responses: responses,
+            gate: gate,
+            strictReload: { _, _, _ in
+                firstEnteredACKWait.signal()
+                releaseFirstACKWait.wait()
+                return Self.successfulStrictSummary
+            }
+        )
+        let (secondClient, secondSender) = makeClient(
+            responses: responses,
+            gate: gate,
+            runtimeDiscoveryDidRun: {
+                secondDiscoveryRuns.update { $0 += 1 }
+            }
+        )
+        let account = makeAccount()
+
+        let firstTask = Task {
+            await firstClient.reloadAuth(account: account)
+        }
+        #expect(firstEnteredACKWait.wait(timeout: .now() + 2) == .success)
+
+        let secondTask = Task {
+            await secondClient.reloadAuth(account: account)
+        }
+        #expect(secondContended.wait(timeout: .now() + 2) == .success)
+        #expect(secondDiscoveryRuns.read() == 0)
+        #expect(await secondSender.recordedRequests().isEmpty)
+
+        releaseFirstACKWait.signal()
+        let firstResult = await firstTask.value
+        let secondResult = await secondTask.value
+
+        #expect(firstResult == .reloaded(method: "account/login/start"))
+        #expect(secondResult == .reloaded(method: "account/login/start"))
+        #expect(secondDiscoveryRuns.read() == 1)
+        #expect(await secondSender.recordedRequests().count == 2)
     }
 
     @Test("method-not-found JSON-RPC error classifies as unsupported")
@@ -152,7 +494,8 @@ struct DesktopRuntimeReloadClientTests {
 
     @Test("receive timeout returns promptly even when operation ignores cancellation")
     func receiveTimeoutReturnsPromptlyForNonCooperativeOperation() async {
-        let started = Date()
+        let clock = ContinuousClock()
+        let started = clock.now
         let cancellationFlag = LockedFlag()
 
         do {
@@ -160,15 +503,17 @@ struct DesktopRuntimeReloadClientTests {
                 seconds: 0.05,
                 cancel: { cancellationFlag.setTrue() },
                 operation: {
-                    while true {
-                        try? await Task.sleep(for: .milliseconds(100))
+                    await withCheckedContinuation { continuation in
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                            continuation.resume(returning: ())
+                        }
                     }
                 }
             )
             Issue.record("Expected receive timeout to throw")
         } catch is CancellationError {
             #expect(cancellationFlag.value)
-            #expect(Date().timeIntervalSince(started) < 1)
+            #expect(started.duration(to: clock.now) < .seconds(1))
         } catch {
             Issue.record("Expected CancellationError, got \(error)")
         }
@@ -182,6 +527,163 @@ struct DesktopRuntimeReloadClientTests {
         )
 
         #expect(result == .failed("reload refused"))
+    }
+
+    private func makeAccount(
+        email: String = "user@example.com",
+        accountID: String = "acct_123",
+        planType: String? = "pro"
+    ) -> CodexAccount {
+        CodexAccount(
+            email: email,
+            accessToken: "secret-access-token",
+            refreshToken: "secret-refresh-token",
+            idToken: "secret-id-token",
+            accountId: accountID,
+            planType: planType
+        )
+    }
+
+    private func makeClient(
+        responses: [DesktopRuntimeWebSocketEvent],
+        gate: CodexReloadAttemptGate = CodexReloadAttemptGate(),
+        runtimeDiscoveryDidRun: (@Sendable () -> Void)? = nil,
+        socketBindingIsCurrent: @escaping @Sendable (
+            CodexDesktopRuntimeSocketBinding,
+            UInt32
+        ) -> Bool = { _, _ in true },
+        strictReload: @escaping @Sendable (
+            CodexRuntimeDiscoverySnapshot,
+            CodexReloadAdmission,
+            UInt32
+        ) -> CodexReloadSummary = { _, _, _ in
+            DesktopRuntimeReloadClientTests.successfulStrictSummary
+        }
+    ) -> (DesktopRuntimeReloadClient, StubDesktopRuntimeRequestSender) {
+        let target = runtimeTarget()
+        let sender = StubDesktopRuntimeRequestSender(responses: responses)
+        let client = DesktopRuntimeReloadClient(
+            requestSender: { payload, port in
+                await sender.send(payload: payload, port: port)
+            },
+            dependencies: DesktopRuntimeReloadDependencies(
+                requiredOwnerUID: 501,
+                gate: gate,
+                preliminaryDiscovery: {
+                    .snapshot(CodexPGrepProcessSnapshot(
+                        pids: [target.process.identity.pid],
+                        isComplete: true
+                    ))
+                },
+                runtimeDiscovery: { _, _ in
+                    runtimeDiscoveryDidRun?()
+                    return CodexRuntimeDiscoverySnapshot(
+                        targets: [target],
+                        isComplete: true
+                    )
+                },
+                socketBinding: {
+                    CodexDesktopRuntimeSocketBinding(target: $0, port: 9223)
+                },
+                socketBindingIsCurrent: socketBindingIsCurrent,
+                strictReload: strictReload
+            )
+        )
+        return (client, sender)
+    }
+
+    private func runtimeTarget(pid: Int32 = 42) -> CodexRuntimeTarget {
+        let path = "/Users/me/.local/share/codexswitch/prepared-codex/0.144.1/codex"
+        let identity = CodexSignalProcessIdentity(
+            pid: pid,
+            ownerUID: 501,
+            executablePath: path,
+            startSeconds: 1_000,
+            startMicroseconds: 12
+        )
+        return CodexRuntimeTarget(
+            process: CodexIdentityBoundProcess(
+                identity: identity,
+                kernelExecutableIdentity: CodexKernelExecutableIdentity(
+                    canonicalPath: path,
+                    device: 7,
+                    inode: 10_000 + UInt64(pid)
+                ),
+                arguments: [path, "app-server", "--analytics-default-enabled"]
+            ),
+            runtimeKind: .externalAppServer
+        )
+    }
+
+    private func requestMethod(in payload: String) -> String? {
+        requestObject(in: payload)?["method"] as? String
+    }
+
+    private func requestParams(in payload: String) -> Any? {
+        requestObject(in: payload)?["params"]
+    }
+
+    private func requestObject(in payload: String) -> [String: Any]? {
+        try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any]
+    }
+}
+
+private struct CapturedDesktopRuntimeRequest: Sendable {
+    let payload: String
+    let port: UInt16
+}
+
+private actor StubDesktopRuntimeRequestSender {
+    private var responses: [DesktopRuntimeWebSocketEvent]
+    private var requests: [CapturedDesktopRuntimeRequest] = []
+
+    init(responses: [DesktopRuntimeWebSocketEvent]) {
+        self.responses = responses
+    }
+
+    func send(payload: String, port: UInt16) -> DesktopRuntimeWebSocketEvent {
+        requests.append(CapturedDesktopRuntimeRequest(payload: payload, port: port))
+        guard !responses.isEmpty else {
+            return .failure("unexpected request")
+        }
+        return responses.removeFirst()
+    }
+
+    func recordedRequests() -> [CapturedDesktopRuntimeRequest] {
+        requests
+    }
+}
+
+private final class LockedTestState<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+
+    init(_ value: Value) {
+        stored = value
+    }
+
+    func read() -> Value {
+        lock.withLock { stored }
+    }
+
+    func update(_ operation: (inout Value) -> Void) {
+        lock.withLock { operation(&stored) }
+    }
+}
+
+private final class TestSemaphore: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func signal() {
+        semaphore.signal()
+    }
+
+    func wait() {
+        semaphore.wait()
+    }
+
+    func wait(timeout: DispatchTime) -> DispatchTimeoutResult {
+        semaphore.wait(timeout: timeout)
     }
 }
 

@@ -1,7 +1,7 @@
+use crate::bounded_command;
 use anyhow::{anyhow, bail, Context, Result};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexHealth {
@@ -125,38 +125,27 @@ struct CommandOutput {
 }
 
 fn command_output(program: &str, args: &[&str], timeout: Duration) -> Result<CommandOutput> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn {program}"))?;
-
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let output = child.wait_with_output()?;
-            return Ok(CommandOutput {
-                status: status
-                    .code()
-                    .unwrap_or_else(|| 128 + status_signal(&status)),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                timed_out: false,
-            });
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            return Ok(CommandOutput {
-                status: 124,
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                timed_out: true,
-            });
-        }
-        thread::sleep(Duration::from_millis(50));
+    match bounded_command::output(
+        Command::new(program).args(args),
+        timeout,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    ) {
+        Ok(output) => Ok(CommandOutput {
+            status: output
+                .status
+                .code()
+                .unwrap_or_else(|| 128 + status_signal(&output.status)),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            timed_out: false,
+        }),
+        Err(error) if format!("{error:#}").contains("deadline") => Ok(CommandOutput {
+            status: 124,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+        }),
+        Err(error) => Err(error).with_context(|| format!("failed to run {program}")),
     }
 }
 

@@ -4,22 +4,60 @@ set -e
 REMOTE_HOST="${CLAUDE_VPS_REMOTE_HOST:-signul-vps}"
 TAILSCALE_HOST="${CLAUDE_VPS_TAILSCALE_HOST:-signul-hostinger-kvm4}"
 TAILSCALE_TARGET="${CLAUDE_VPS_TAILSCALE_TARGET:-signul@${TAILSCALE_HOST}}"
+TAILSCALE_TARGET_IP="${CLAUDE_VPS_TAILSCALE_TARGET_IP:-100.95.84.123}"
 TAILSCALE_BIN="${CLAUDE_VPS_TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+MOSH_BIN="${CLAUDE_VPS_MOSH_BIN:-mosh}"
+MOSH_PREDICT="${CLAUDE_VPS_MOSH_PREDICT:-never}"
+SESSION_TRANSPORT_REQUESTED="${CLAUDE_VPS_TRANSPORT:-auto}"
 REMOTE_REPO="${CLAUDE_VPS_REMOTE_REPO:-/home/signul/SIGNUL}"
-REMOTE_CLAUDE="${CLAUDE_VPS_REMOTE_CLAUDE:-/home/signul/.local/bin/claude}"
+if [ -n "${CLAUDE_VPS_REMOTE_CLAUDE:-}" ]; then
+  REMOTE_CLAUDE="$CLAUDE_VPS_REMOTE_CLAUDE"
+  REMOTE_CLAUDE_SUBCOMMAND="${CLAUDE_VPS_REMOTE_CLAUDE_SUBCOMMAND:-}"
+else
+  REMOTE_CLAUDE="/usr/bin/ccs"
+  REMOTE_CLAUDE_SUBCOMMAND="${CLAUDE_VPS_REMOTE_CLAUDE_SUBCOMMAND:-claude}"
+fi
 REMOTE_TERM="${CLAUDE_VPS_REMOTE_TERM:-xterm-256color}"
 REMOTE_COLORTERM="${CLAUDE_VPS_REMOTE_COLORTERM:-truecolor}"
 REMOTE_FORCE_COLOR="${CLAUDE_VPS_FORCE_COLOR:-3}"
 REMOTE_AUTO_CONTINUE="${CLAUDE_VPS_AUTO_CONTINUE:-1}"
+REMOTE_CONTROL_DEFAULT="${CLAUDE_VPS_REMOTE_CONTROL_DEFAULT:-0}"
+REMOTE_CONTROL_NAME="${CLAUDE_VPS_REMOTE_CONTROL_NAME:-signul-vps}"
+REMOTE_CONTROL_SPAWN="${CLAUDE_VPS_REMOTE_CONTROL_SPAWN:-same-dir}"
+REMOTE_DISABLE_TMUX="${CLAUDE_VPS_DISABLE_TMUX:-0}"
+REMOTE_DANGEROUSLY_SKIP_PERMISSIONS="${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}"
 REMOTE_TMUX_SESSION="${CLAUDE_VPS_TMUX_SESSION:-claude-vps}"
 REMOTE_TMUX_HISTORY_LIMIT="${CLAUDE_VPS_TMUX_HISTORY_LIMIT:-200000}"
 REMOTE_TMUX_TERM="${CLAUDE_VPS_TMUX_TERM:-tmux-256color}"
+REMOTE_TMUX_DETACH_OTHER_CLIENTS="${CLAUDE_VPS_TMUX_DETACH_OTHER_CLIENTS:-1}"
+REMOTE_TMUX_LOG="${CLAUDE_VPS_TMUX_LOG:-0}"
+REMOTE_TMUX_LOG_DIR="${CLAUDE_VPS_TMUX_LOG_DIR:-}"
+REMOTE_TMUX_STATUS="${CLAUDE_VPS_TMUX_STATUS:-0}"
+REMOTE_TMUX_STATUS_POSITION="${CLAUDE_VPS_TMUX_STATUS_POSITION:-top}"
+REMOTE_TMUX_STATUS_INTERVAL="${CLAUDE_VPS_TMUX_STATUS_INTERVAL:-5}"
+REMOTE_TMUX_FORCE_COPY_SCROLL="${CLAUDE_VPS_TMUX_FORCE_COPY_SCROLL:-0}"
+REMOTE_TRANSPORT_LABEL="${CLAUDE_VPS_TRANSPORT_LABEL:-ssh}"
+REMOTE_CLAUDE_NO_FLICKER="${CLAUDE_VPS_CLAUDE_CODE_NO_FLICKER:-0}"
+REMOTE_CLAUDE_DISABLE_ALTERNATE_SCREEN="${CLAUDE_VPS_CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}"
+REMOTE_CLAUDE_SCROLL_SPEED="${CLAUDE_VPS_CLAUDE_CODE_SCROLL_SPEED:-3}"
+REMOTE_CLAUDE_DISABLE_MOUSE="${CLAUDE_VPS_CLAUDE_CODE_DISABLE_MOUSE:-0}"
+REMOTE_CLAUDE_DISABLE_VIRTUAL_SCROLL="${CLAUDE_VPS_CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL:-0}"
+REMOTE_CLAUDE_STATUSLINE="${CLAUDE_VPS_CLAUDE_STATUSLINE:-1}"
+SSH_CONNECT_TIMEOUT="${CLAUDE_VPS_CONNECT_TIMEOUT:-8}"
+SSH_SERVER_ALIVE_INTERVAL="${CLAUDE_VPS_SERVER_ALIVE_INTERVAL:-30}"
+SSH_SERVER_ALIVE_COUNT_MAX="${CLAUDE_VPS_SERVER_ALIVE_COUNT_MAX:-6}"
+SSH_AUTO_RECONNECT="${CLAUDE_VPS_AUTO_RECONNECT:-1}"
+SSH_RECONNECT_DELAY="${CLAUDE_VPS_RECONNECT_DELAY:-2}"
+SSH_RECONNECT_MAX="${CLAUDE_VPS_RECONNECT_MAX:-0}"
+SYNC_DESKTOP_SESSION_INDEX="${CLAUDE_VPS_SYNC_DESKTOP_SESSION_INDEX:-1}"
+DESKTOP_SESSION_ROOT="${CLAUDE_VPS_DESKTOP_SESSION_ROOT:-$HOME/Library/Application Support/Claude/claude-code-sessions}"
+REMOTE_RESPAWN_PANE="${CLAUDE_VPS_RESPAWN_PANE:-0}"
 
 SSH_OPTS=(
   -o BatchMode=yes
-  -o ConnectTimeout=8
-  -o ServerAliveInterval=5
-  -o ServerAliveCountMax=2
+  -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}"
+  -o "ServerAliveInterval=${SSH_SERVER_ALIVE_INTERVAL}"
+  -o "ServerAliveCountMax=${SSH_SERVER_ALIVE_COUNT_MAX}"
   -o ControlMaster=no
   -o ControlPath=none
   -o ControlPersist=no
@@ -69,22 +107,43 @@ remote_env_prefix() {
   if [ "$REMOTE_AUTO_CONTINUE" = "1" ]; then
     continue_arg="--continue"
   fi
-  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s TERM=%s COLORTERM=%s REMOTE_COLORTERM=%s FORCE_COLOR=%s REMOTE_FORCE_COLOR=%s CLAUDE_VPS_AUTO_CONTINUE=%s REMOTE_AUTO_CONTINUE=%s CLAUDE_VPS_CONTINUE_ARG=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s CLAUDE_VPS_TMUX_SESSION=%s CLAUDE_VPS_TMUX_HISTORY_LIMIT=%s CLAUDE_VPS_TMUX_TERM=%s' \
+  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s REMOTE_CLAUDE_SUBCOMMAND=%s TERM=%s COLORTERM=%s REMOTE_COLORTERM=%s FORCE_COLOR=%s REMOTE_FORCE_COLOR=%s CLAUDE_CODE_NO_FLICKER=%s CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=%s CLAUDE_CODE_SCROLL_SPEED=%s CLAUDE_CODE_DISABLE_MOUSE=%s CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=%s CLAUDE_VPS_CLAUDE_STATUSLINE=%s CLAUDE_VPS_AUTO_CONTINUE=%s REMOTE_AUTO_CONTINUE=%s CLAUDE_VPS_CONTINUE_ARG=%s CLAUDE_VPS_REMOTE_CONTROL_DEFAULT=%s CLAUDE_VPS_REMOTE_CONTROL_NAME=%s CLAUDE_VPS_REMOTE_CONTROL_SPAWN=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s CLAUDE_VPS_DISABLE_TMUX=%s CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS=%s CLAUDE_VPS_TMUX_SESSION=%s CLAUDE_VPS_TMUX_HISTORY_LIMIT=%s CLAUDE_VPS_TMUX_TERM=%s CLAUDE_VPS_TMUX_DETACH_OTHER_CLIENTS=%s CLAUDE_VPS_TMUX_LOG=%s CLAUDE_VPS_TMUX_LOG_DIR=%s CLAUDE_VPS_TMUX_STATUS=%s CLAUDE_VPS_TMUX_STATUS_POSITION=%s CLAUDE_VPS_TMUX_STATUS_INTERVAL=%s CLAUDE_VPS_TMUX_FORCE_COPY_SCROLL=%s CLAUDE_VPS_RESPAWN_PANE=%s CLAUDE_VPS_TRANSPORT_LABEL=%s' \
     "$(quote_zsh "$REMOTE_REPO")" \
     "$(quote_zsh "$REMOTE_CLAUDE")" \
+    "$(quote_zsh "$REMOTE_CLAUDE_SUBCOMMAND")" \
     "$(quote_zsh "$REMOTE_TERM")" \
     "$(quote_zsh "$REMOTE_COLORTERM")" \
     "$(quote_zsh "$REMOTE_COLORTERM")" \
     "$(quote_zsh "$REMOTE_FORCE_COLOR")" \
     "$(quote_zsh "$REMOTE_FORCE_COLOR")" \
+    "$(quote_zsh "$REMOTE_CLAUDE_NO_FLICKER")" \
+    "$(quote_zsh "$REMOTE_CLAUDE_DISABLE_ALTERNATE_SCREEN")" \
+    "$(quote_zsh "$REMOTE_CLAUDE_SCROLL_SPEED")" \
+    "$(quote_zsh "$REMOTE_CLAUDE_DISABLE_MOUSE")" \
+    "$(quote_zsh "$REMOTE_CLAUDE_DISABLE_VIRTUAL_SCROLL")" \
+    "$(quote_zsh "$REMOTE_CLAUDE_STATUSLINE")" \
     "$(quote_zsh "$REMOTE_AUTO_CONTINUE")" \
     "$(quote_zsh "$REMOTE_AUTO_CONTINUE")" \
     "$(quote_zsh "$continue_arg")" \
+    "$(quote_zsh "$REMOTE_CONTROL_DEFAULT")" \
+    "$(quote_zsh "$REMOTE_CONTROL_NAME")" \
+    "$(quote_zsh "$REMOTE_CONTROL_SPAWN")" \
     "$(quote_zsh "$rows")" \
     "$(quote_zsh "$cols")" \
+    "$(quote_zsh "$REMOTE_DISABLE_TMUX")" \
+    "$(quote_zsh "$REMOTE_DANGEROUSLY_SKIP_PERMISSIONS")" \
     "$(quote_zsh "$REMOTE_TMUX_SESSION")" \
     "$(quote_zsh "$REMOTE_TMUX_HISTORY_LIMIT")" \
-    "$(quote_zsh "$REMOTE_TMUX_TERM")"
+    "$(quote_zsh "$REMOTE_TMUX_TERM")" \
+    "$(quote_zsh "$REMOTE_TMUX_DETACH_OTHER_CLIENTS")" \
+    "$(quote_zsh "$REMOTE_TMUX_LOG")" \
+    "$(quote_zsh "$REMOTE_TMUX_LOG_DIR")" \
+    "$(quote_zsh "$REMOTE_TMUX_STATUS")" \
+    "$(quote_zsh "$REMOTE_TMUX_STATUS_POSITION")" \
+    "$(quote_zsh "$REMOTE_TMUX_STATUS_INTERVAL")" \
+    "$(quote_zsh "$REMOTE_TMUX_FORCE_COPY_SCROLL")" \
+    "$(quote_zsh "$REMOTE_RESPAWN_PANE")" \
+    "$(quote_zsh "$REMOTE_TRANSPORT_LABEL")"
 }
 
 select_ssh_transport() {
@@ -105,13 +164,222 @@ select_ssh_transport() {
   selected_ssh_opts=("${SSH_PROXY_OPTS[@]}")
 }
 
+mosh_ssh_command() {
+  local parts quoted part
+  parts=("ssh" "${selected_ssh_opts[@]}")
+  quoted=()
+  for part in "${parts[@]}"; do
+    quoted+=("$(quote_zsh "$part")")
+  done
+  printf '%s ' "${quoted[@]}"
+}
+
+tailscale_packet_filter_allows_mosh() {
+  if [ ! -x "$TAILSCALE_BIN" ] || ! command -v jq >/dev/null 2>&1; then
+    return 1
+  fi
+
+  "$TAILSCALE_BIN" debug netmap 2>/dev/null | jq -e --arg ip "$TAILSCALE_TARGET_IP" '
+    any(.PacketFilterRules[]?.DstPorts[]?;
+      .IP == $ip and
+      (.Ports.First <= 60000) and
+      (.Ports.Last >= 61000)
+    )
+  ' >/dev/null 2>&1
+}
+
+select_session_transport() {
+  selected_session_transport="ssh"
+
+  if [ "$#" -ne 0 ] || [ "$REMOTE_DISABLE_TMUX" = "1" ]; then
+    return
+  fi
+
+  case "$SESSION_TRANSPORT_REQUESTED" in
+    ssh)
+      return
+      ;;
+    mosh)
+      if ! command -v "$MOSH_BIN" >/dev/null 2>&1; then
+        log "mosh requested but '${MOSH_BIN}' is not installed or not on PATH; using ssh."
+        return
+      fi
+      selected_session_transport="mosh"
+      return
+      ;;
+    auto)
+      if command -v "$MOSH_BIN" >/dev/null 2>&1 && tailscale_packet_filter_allows_mosh; then
+        selected_session_transport="mosh"
+      fi
+      return
+      ;;
+    *)
+      log "unknown CLAUDE_VPS_TRANSPORT='${SESSION_TRANSPORT_REQUESTED}'; using ssh."
+      return
+      ;;
+  esac
+}
+
+remote_session_snapshot_script() {
+  cat <<'REMOTE_SCRIPT'
+python3 - <<'PY'
+import glob
+import json
+import os
+import sys
+
+repo = os.environ.get("REMOTE_REPO", "")
+if not repo:
+    sys.exit(0)
+project_key = repo.replace("/", "-")
+project_dir = os.path.expanduser(os.path.join("~", ".claude", "projects", project_key))
+paths = glob.glob(os.path.join(project_dir, "*.jsonl"))
+if not paths:
+    sys.exit(0)
+path = max(paths, key=os.path.getmtime)
+session_id = os.path.basename(path)[:-len(".jsonl")]
+stat = os.stat(path)
+title = ""
+model = ""
+effort = ""
+window = 16 * 1024 * 1024
+
+with open(path, "rb") as handle:
+    if stat.st_size > window:
+        handle.seek(stat.st_size - window)
+        handle.readline()
+    for raw_line in handle:
+        try:
+            event = json.loads(raw_line)
+        except Exception:
+            continue
+        if event.get("type") == "custom-title" and event.get("customTitle"):
+            title = event["customTitle"]
+        if event.get("model"):
+            model = event["model"]
+        effort_value = event.get("effort")
+        if isinstance(effort_value, dict) and effort_value.get("level"):
+            effort = effort_value["level"]
+        elif isinstance(effort_value, str):
+            effort = effort_value
+
+print(json.dumps({
+    "sessionId": session_id,
+    "cwd": repo,
+    "mtimeMs": int(stat.st_mtime * 1000),
+    "title": title,
+    "model": model,
+    "effort": effort,
+}, separators=(",", ":")))
+PY
+REMOTE_SCRIPT
+}
+
+refresh_claude_desktop_session_index() {
+  if [ "$SYNC_DESKTOP_SESSION_INDEX" != "1" ]; then
+    return
+  fi
+  if [ "$#" -ne 0 ] || [ "$REMOTE_DISABLE_TMUX" = "1" ]; then
+    return
+  fi
+  if [ ! -d "$DESKTOP_SESSION_ROOT" ] || ! command -v jq >/dev/null 2>&1; then
+    return
+  fi
+
+  local snapshot session_id mtime_ms title model effort session_file tmp
+  snapshot="$(ssh "${selected_ssh_opts[@]}" "$selected_host" "$(remote_env_prefix) bash -lc $(quote_zsh "$(remote_session_snapshot_script)")" 2>/dev/null || true)"
+  if [ -z "$snapshot" ]; then
+    return
+  fi
+  session_id="$(printf '%s' "$snapshot" | jq -er '.sessionId // empty' 2>/dev/null || true)"
+  mtime_ms="$(printf '%s' "$snapshot" | jq -er '.mtimeMs // empty' 2>/dev/null || true)"
+  title="$(printf '%s' "$snapshot" | jq -er '.title // empty' 2>/dev/null || true)"
+  model="$(printf '%s' "$snapshot" | jq -er '.model // empty' 2>/dev/null || true)"
+  effort="$(printf '%s' "$snapshot" | jq -er '.effort // empty' 2>/dev/null || true)"
+  if [ -z "$session_id" ] || [ -z "$mtime_ms" ]; then
+    return
+  fi
+
+  session_file="$(find "$DESKTOP_SESSION_ROOT" -type f -name 'local_*.json' -print0 2>/dev/null | while IFS= read -r -d '' candidate; do
+    if jq -e --arg session_id "$session_id" '(.cliSessionId == $session_id) or (.sessionId == ("local_" + $session_id))' "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      break
+    fi
+  done)"
+  if [ -z "$session_file" ]; then
+    return
+  fi
+
+  tmp="$(mktemp)"
+  if jq --argjson mtime "$mtime_ms" --arg title "$title" --arg model "$model" --arg effort "$effort" '
+    .lastActivityAt = $mtime |
+    .lastFocusedAt = $mtime |
+    .isArchived = false |
+    if $title != "" then .title = $title | .titleSource = "user" else . end |
+    if $model != "" then .model = $model else . end |
+    if $effort != "" then .effort = $effort else . end
+  ' "$session_file" > "$tmp"; then
+    mv "$tmp" "$session_file"
+    chmod 600 "$session_file" 2>/dev/null || true
+  else
+    rm -f "$tmp"
+  fi
+}
+
 selected_host="$REMOTE_HOST"
 selected_ssh_opts=("${SSH_OPTS[@]}")
 select_ssh_transport
 
+while [ "$#" -gt 0 ]; do
+  case "${1:-}" in
+    -yolo|--yolo|--dangerously-skip-permissions)
+      REMOTE_DANGEROUSLY_SKIP_PERMISSIONS=1
+      shift
+      ;;
+    --remote-control|--rc|--web)
+      REMOTE_CONTROL_DEFAULT=1
+      REMOTE_DISABLE_TMUX=1
+      shift
+      ;;
+    --tmux|--persistent)
+      REMOTE_CONTROL_DEFAULT=0
+      REMOTE_DISABLE_TMUX=0
+      shift
+      ;;
+    --raw|--no-tmux|--terminal|--tui)
+      REMOTE_CONTROL_DEFAULT=0
+      REMOTE_DISABLE_TMUX=1
+      shift
+      ;;
+    --fullscreen)
+      REMOTE_CONTROL_DEFAULT=0
+      REMOTE_DISABLE_TMUX=1
+      REMOTE_CLAUDE_NO_FLICKER=1
+      REMOTE_CLAUDE_DISABLE_ALTERNATE_SCREEN=0
+      shift
+      ;;
+    --classic|--native-scrollback)
+      REMOTE_CONTROL_DEFAULT=0
+      REMOTE_DISABLE_TMUX=1
+      REMOTE_CLAUDE_NO_FLICKER=0
+      REMOTE_CLAUDE_DISABLE_ALTERNATE_SCREEN=1
+      shift
+      ;;
+    --repair-scrollback|--respawn-pane)
+      REMOTE_CONTROL_DEFAULT=0
+      REMOTE_DISABLE_TMUX=0
+      REMOTE_RESPAWN_PANE=1
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 if [ "${1:-}" = "--check" ]; then
   log "checking ${selected_host} Claude Code..."
-  ssh "${selected_ssh_opts[@]}" "$selected_host" "$(remote_env_prefix) bash -lc 'test -x \"\$REMOTE_CLAUDE\" && cd \"\$REMOTE_REPO\" && printf \"claude-vps ready: %s in %s\\n\" \"\$REMOTE_CLAUDE\" \"\$PWD\" && \"\$REMOTE_CLAUDE\" --version'"
+  ssh "${selected_ssh_opts[@]}" "$selected_host" "$(remote_env_prefix) bash -lc 'test -x \"\$REMOTE_CLAUDE\" && cd \"\$REMOTE_REPO\" && if [ -n \"\$REMOTE_CLAUDE_SUBCOMMAND\" ]; then printf \"claude-vps ready: %s %s in %s\\n\" \"\$REMOTE_CLAUDE\" \"\$REMOTE_CLAUDE_SUBCOMMAND\" \"\$PWD\" && \"\$REMOTE_CLAUDE\" \"\$REMOTE_CLAUDE_SUBCOMMAND\" --version; else printf \"claude-vps ready: %s in %s\\n\" \"\$REMOTE_CLAUDE\" \"\$PWD\" && \"\$REMOTE_CLAUDE\" --version; fi'"
   exit 0
 fi
 
@@ -120,16 +388,351 @@ for arg in "$@"; do
   remote_args+=("$(quote_zsh "$arg")")
 done
 
-if [ "$#" -eq 0 ] && [ "${CLAUDE_VPS_DISABLE_TMUX:-0}" != "1" ]; then
-  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; if command -v tmux >/dev/null 2>&1; then tmux set-option -gq default-terminal \"\$CLAUDE_VPS_TMUX_TERM\" >/dev/null 2>&1 || true; tmux show-options -gqv terminal-features | grep -q \"tmux-256color:RGB\" || tmux set-option -gaq terminal-features \",tmux-256color:RGB\" >/dev/null 2>&1 || true; tmux show-options -gqv terminal-features | grep -q \"xterm-256color:RGB\" || tmux set-option -gaq terminal-features \",xterm-256color:RGB\" >/dev/null 2>&1 || true; tmux show-options -gqv terminal-overrides | grep -q \"tmux-256color:RGB\" || tmux set-option -gaq terminal-overrides \",tmux-256color:RGB\" >/dev/null 2>&1 || true; tmux show-options -gqv terminal-overrides | grep -q \"xterm-256color:RGB\" || tmux set-option -gaq terminal-overrides \",xterm-256color:RGB\" >/dev/null 2>&1 || true; tmux set-environment -g REMOTE_CLAUDE \"\$REMOTE_CLAUDE\" >/dev/null; tmux set-environment -g CLAUDE_VPS_TMUX_TERM \"\$CLAUDE_VPS_TMUX_TERM\" >/dev/null; tmux set-environment -g REMOTE_COLORTERM \"\$REMOTE_COLORTERM\" >/dev/null; tmux set-environment -g REMOTE_FORCE_COLOR \"\$REMOTE_FORCE_COLOR\" >/dev/null; tmux set-environment -g CLAUDE_VPS_AUTO_CONTINUE \"\$CLAUDE_VPS_AUTO_CONTINUE\" >/dev/null; tmux set-environment -g CLAUDE_VPS_CONTINUE_ARG \"\$CLAUDE_VPS_CONTINUE_ARG\" >/dev/null; if ! tmux has-session -t \"\$CLAUDE_VPS_TMUX_SESSION\" 2>/dev/null; then tmux new-session -d -s \"\$CLAUDE_VPS_TMUX_SESSION\" -c \"\$REMOTE_REPO\" \"unset NO_COLOR; exec env TERM=\\\"\$CLAUDE_VPS_TMUX_TERM\\\" COLORTERM=\\\"\$REMOTE_COLORTERM\\\" FORCE_COLOR=\\\"\$REMOTE_FORCE_COLOR\\\" \\\"\$REMOTE_CLAUDE\\\" \$CLAUDE_VPS_CONTINUE_ARG\"; fi; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" history-limit \"\$CLAUDE_VPS_TMUX_HISTORY_LIMIT\" >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" mouse on >/dev/null; tmux set-option -t \"\$CLAUDE_VPS_TMUX_SESSION\" status off >/dev/null; tmux set-window-option -t \"\${CLAUDE_VPS_TMUX_SESSION}:0\" alternate-screen on >/dev/null; tmux set-environment -t \"\$CLAUDE_VPS_TMUX_SESSION\" TERM \"\$CLAUDE_VPS_TMUX_TERM\" >/dev/null; tmux set-environment -t \"\$CLAUDE_VPS_TMUX_SESSION\" COLORTERM \"\$REMOTE_COLORTERM\" >/dev/null; tmux set-environment -t \"\$CLAUDE_VPS_TMUX_SESSION\" FORCE_COLOR \"\$REMOTE_FORCE_COLOR\" >/dev/null; tmux set-environment -t \"\$CLAUDE_VPS_TMUX_SESSION\" CLAUDE_VPS_AUTO_CONTINUE \"\$CLAUDE_VPS_AUTO_CONTINUE\" >/dev/null; tmux set-environment -t \"\$CLAUDE_VPS_TMUX_SESSION\" CLAUDE_VPS_CONTINUE_ARG \"\$CLAUDE_VPS_CONTINUE_ARG\" >/dev/null; tmux attach-session -t \"\$CLAUDE_VPS_TMUX_SESSION\" || { if [ -n \"\$CLAUDE_VPS_CONTINUE_ARG\" ]; then set -- \"\$CLAUDE_VPS_CONTINUE_ARG\"; fi; unset NO_COLOR; exec env TERM=\"\$TERM\" COLORTERM=\"\$REMOTE_COLORTERM\" FORCE_COLOR=\"\$REMOTE_FORCE_COLOR\" \"\$REMOTE_CLAUDE\" \"\$@\"; }; exit 0; fi; if [ -n \"\$CLAUDE_VPS_CONTINUE_ARG\" ]; then set -- \"\$CLAUDE_VPS_CONTINUE_ARG\"; fi; unset NO_COLOR; exec env TERM=\"\$TERM\" COLORTERM=\"\$REMOTE_COLORTERM\" FORCE_COLOR=\"\$REMOTE_FORCE_COLOR\" \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
+selected_session_transport="ssh"
+select_session_transport "$@"
+REMOTE_TRANSPORT_LABEL="$selected_session_transport"
+
+remote_tmux_script() {
+  cat <<'REMOTE_SCRIPT'
+ensure_claude_vps_statusline() {
+  case "${CLAUDE_VPS_CLAUDE_STATUSLINE:-1}" in
+    0|off|false|no) return ;;
+  esac
+  if ! command -v jq >/dev/null 2>&1; then
+    return
+  fi
+
+  statusline_path="$HOME/.claude/bin/claude-vps-statusline.sh"
+  settings_path="$HOME/.claude/settings.json"
+  mkdir -p "$HOME/.claude/bin" "$HOME/.claude" 2>/dev/null || return
+  cat > "$statusline_path" <<'STATUSLINE_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+input="$(cat)"
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf 'Claude Code'
+  exit 0
+fi
+
+model="$(jq -r '.model.display_name // .model.name // .model // "Claude"' <<<"$input" 2>/dev/null || printf 'Claude')"
+cwd="$(jq -r '.workspace.current_dir // .cwd // ""' <<<"$input" 2>/dev/null || true)"
+branch="$(jq -r '.workspace.git_branch // .git.branch // empty' <<<"$input" 2>/dev/null || true)"
+context_pct="$(jq -r '.context_window.used_percentage // .context_window.current_usage // empty' <<<"$input" 2>/dev/null || true)"
+cost="$(jq -r '.cost.total_cost_usd // .total_cost_usd // .session_cost_usd // empty' <<<"$input" 2>/dev/null || true)"
+rate_5h="$(jq -r '.rate_limits.five_hour.used_percentage // empty' <<<"$input" 2>/dev/null || true)"
+
+if [ -n "$cwd" ]; then
+  cwd="${cwd/#$HOME/~}"
 else
-  remote_command="$(remote_env_prefix) bash -lc 'cd \"\$REMOTE_REPO\" && if [ -n \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" ] && [ -n \"\$CODEXSWITCH_REMOTE_TTY_COLS\" ]; then stty rows \"\$CODEXSWITCH_REMOTE_TTY_ROWS\" cols \"\$CODEXSWITCH_REMOTE_TTY_COLS\" 2>/dev/null || true; fi; if [ \"\$#\" -eq 0 ] && [ -n \"\$CLAUDE_VPS_CONTINUE_ARG\" ]; then set -- \"\$CLAUDE_VPS_CONTINUE_ARG\"; fi; unset NO_COLOR; exec env TERM=\"\$TERM\" COLORTERM=\"\$REMOTE_COLORTERM\" FORCE_COLOR=\"\$REMOTE_FORCE_COLOR\" \"\$REMOTE_CLAUDE\" \"\$@\"' claude-vps"
+  cwd="$(pwd 2>/dev/null || true)"
+fi
+
+parts=()
+parts+=("$model")
+[ -n "$cwd" ] && parts+=("$cwd")
+[ -n "$branch" ] && parts+=("git:$branch")
+
+if [[ "$context_pct" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  parts+=("ctx:${context_pct%.*}%")
+fi
+
+if [[ "$rate_5h" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  parts+=("5h:${rate_5h%.*}%")
+fi
+
+if [[ "$cost" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  parts+=("cost:\$$(printf '%.2f' "$cost")")
+fi
+
+printf '%s' "${parts[0]}"
+for part in "${parts[@]:1}"; do
+  printf ' | %s' "$part"
+done
+STATUSLINE_SCRIPT
+  chmod 755 "$statusline_path" 2>/dev/null || true
+
+  if [ ! -s "$settings_path" ]; then
+    printf '{}\n' > "$settings_path" || return
+  fi
+  tmp="$(mktemp)"
+  if jq --arg command "$statusline_path" \
+    '.statusLine = {"type":"command","command":$command,"padding":0,"refreshInterval":5}' \
+    "$settings_path" > "$tmp"; then
+    mv "$tmp" "$settings_path"
+    chmod 600 "$settings_path" 2>/dev/null || true
+  else
+    rm -f "$tmp"
+  fi
+}
+
+apply_claude_renderer_env() {
+  case "${CLAUDE_CODE_NO_FLICKER:-0}" in
+    1|true|yes|on) export CLAUDE_CODE_NO_FLICKER=1 ;;
+    *) unset CLAUDE_CODE_NO_FLICKER ;;
+  esac
+  case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" in
+    1|true|yes|on) export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 ;;
+    *) unset CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN ;;
+  esac
+  case "${CLAUDE_CODE_DISABLE_MOUSE:-0}" in
+    1|true|yes|on) export CLAUDE_CODE_DISABLE_MOUSE=1 ;;
+    *) unset CLAUDE_CODE_DISABLE_MOUSE ;;
+  esac
+  case "${CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL:-0}" in
+    1|true|yes|on) export CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 ;;
+    *) unset CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL ;;
+  esac
+}
+
+ensure_claude_vps_statusline
+cd "$REMOTE_REPO" || exit
+if [ -n "$CODEXSWITCH_REMOTE_TTY_ROWS" ] && [ -n "$CODEXSWITCH_REMOTE_TTY_COLS" ]; then
+  stty rows "$CODEXSWITCH_REMOTE_TTY_ROWS" cols "$CODEXSWITCH_REMOTE_TTY_COLS" 2>/dev/null || true
+fi
+stty -ixon -ixoff 2>/dev/null || true
+if command -v tmux >/dev/null 2>&1; then
+  tmux set-option -gq default-terminal "$CLAUDE_VPS_TMUX_TERM" >/dev/null 2>&1 || true
+  tmux set-option -gq history-limit "$CLAUDE_VPS_TMUX_HISTORY_LIMIT" >/dev/null 2>&1 || true
+  tmux set-window-option -gq history-limit "$CLAUDE_VPS_TMUX_HISTORY_LIMIT" >/dev/null 2>&1 || true
+  tmux set-option -gq focus-events on >/dev/null 2>&1 || true
+  tmux set-option -gq escape-time 10 >/dev/null 2>&1 || true
+  tmux set-option -gq extended-keys on >/dev/null 2>&1 || true
+  tmux set-option -gq allow-passthrough on >/dev/null 2>&1 || true
+  if [ "${CLAUDE_VPS_TMUX_FORCE_COPY_SCROLL:-0}" = "1" ]; then
+    tmux bind-key -T root WheelUpPane copy-mode -e >/dev/null 2>&1 || true
+    tmux bind-key -T copy-mode WheelUpPane send-keys -X -N 5 scroll-up >/dev/null 2>&1 || true
+    tmux bind-key -T copy-mode WheelDownPane send-keys -X -N 5 scroll-down >/dev/null 2>&1 || true
+    tmux bind-key -T copy-mode-vi WheelUpPane send-keys -X -N 5 scroll-up >/dev/null 2>&1 || true
+    tmux bind-key -T copy-mode-vi WheelDownPane send-keys -X -N 5 scroll-down >/dev/null 2>&1 || true
+  else
+    tmux bind-key -T root WheelUpPane if-shell -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' 'send-keys -M' 'copy-mode -e' >/dev/null 2>&1 || true
+    tmux bind-key -T copy-mode WheelUpPane send-keys -X -N 5 scroll-up >/dev/null 2>&1 || true
+    tmux bind-key -T copy-mode WheelDownPane send-keys -X -N 5 scroll-down >/dev/null 2>&1 || true
+    tmux bind-key -T copy-mode-vi WheelUpPane send-keys -X -N 5 scroll-up >/dev/null 2>&1 || true
+    tmux bind-key -T copy-mode-vi WheelDownPane send-keys -X -N 5 scroll-down >/dev/null 2>&1 || true
+  fi
+  tmux show-options -gqv terminal-features | grep -q "tmux-256color:RGB" || tmux set-option -gaq terminal-features ",tmux-256color:RGB" >/dev/null 2>&1 || true
+  tmux show-options -gqv terminal-features | grep -q "xterm-256color:RGB" || tmux set-option -gaq terminal-features ",xterm-256color:RGB" >/dev/null 2>&1 || true
+  tmux show-options -gqv terminal-overrides | grep -q "tmux-256color:RGB" || tmux set-option -gaq terminal-overrides ",tmux-256color:RGB" >/dev/null 2>&1 || true
+  tmux show-options -gqv terminal-overrides | grep -q "xterm-256color:RGB" || tmux set-option -gaq terminal-overrides ",xterm-256color:RGB" >/dev/null 2>&1 || true
+  tmux set-environment -g REMOTE_CLAUDE "$REMOTE_CLAUDE" >/dev/null
+  tmux set-environment -g REMOTE_CLAUDE_SUBCOMMAND "$REMOTE_CLAUDE_SUBCOMMAND" >/dev/null
+  tmux set-environment -g CLAUDE_VPS_TMUX_TERM "$CLAUDE_VPS_TMUX_TERM" >/dev/null
+  tmux set-environment -g REMOTE_COLORTERM "$REMOTE_COLORTERM" >/dev/null
+  tmux set-environment -g REMOTE_FORCE_COLOR "$REMOTE_FORCE_COLOR" >/dev/null
+  tmux set-environment -g CLAUDE_CODE_NO_FLICKER "$CLAUDE_CODE_NO_FLICKER" >/dev/null
+  tmux set-environment -g CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN "$CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" >/dev/null
+  tmux set-environment -g CLAUDE_CODE_SCROLL_SPEED "$CLAUDE_CODE_SCROLL_SPEED" >/dev/null
+  tmux set-environment -g CLAUDE_CODE_DISABLE_MOUSE "$CLAUDE_CODE_DISABLE_MOUSE" >/dev/null
+  tmux set-environment -g CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL "$CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL" >/dev/null
+  tmux set-environment -g CLAUDE_VPS_AUTO_CONTINUE "$CLAUDE_VPS_AUTO_CONTINUE" >/dev/null
+  tmux set-environment -g CLAUDE_VPS_CONTINUE_ARG "$CLAUDE_VPS_CONTINUE_ARG" >/dev/null
+  tmux set-environment -g CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS "$CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS" >/dev/null
+  tmux set-environment -g CLAUDE_VPS_TRANSPORT_LABEL "$CLAUDE_VPS_TRANSPORT_LABEL" >/dev/null
+
+  claude_vps_launch='stty -ixon -ixoff 2>/dev/null || true; unset NO_COLOR; case "${CLAUDE_CODE_NO_FLICKER:-0}" in 1|true|yes|on) export CLAUDE_CODE_NO_FLICKER=1 ;; *) unset CLAUDE_CODE_NO_FLICKER ;; esac; case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 ;; *) unset CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN ;; esac; case "${CLAUDE_CODE_DISABLE_MOUSE:-0}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_MOUSE=1 ;; *) unset CLAUDE_CODE_DISABLE_MOUSE ;; esac; case "${CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL:-0}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 ;; *) unset CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL ;; esac; claude_vps_permission_arg=""; case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}" in 1|true|yes|on) claude_vps_permission_arg="--dangerously-skip-permissions" ;; esac; if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then exec env TERM="$CLAUDE_VPS_TMUX_TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" $claude_vps_permission_arg $CLAUDE_VPS_CONTINUE_ARG; else exec env TERM="$CLAUDE_VPS_TMUX_TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" $claude_vps_permission_arg $CLAUDE_VPS_CONTINUE_ARG; fi'
+  if ! tmux has-session -t "$CLAUDE_VPS_TMUX_SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$CLAUDE_VPS_TMUX_SESSION" -c "$REMOTE_REPO" "$claude_vps_launch"
+  elif [ "${CLAUDE_VPS_RESPAWN_PANE:-0}" = "1" ]; then
+    printf "claude-vps: recreating tmux session with history-limit %s\n" "$CLAUDE_VPS_TMUX_HISTORY_LIMIT" >&2
+    tmux kill-session -t "$CLAUDE_VPS_TMUX_SESSION" 2>/dev/null || true
+    tmux set-window-option -gq history-limit "$CLAUDE_VPS_TMUX_HISTORY_LIMIT" >/dev/null 2>&1 || true
+    tmux new-session -d -s "$CLAUDE_VPS_TMUX_SESSION" -c "$REMOTE_REPO" "$claude_vps_launch"
+  elif ! tmux list-panes -t "$CLAUDE_VPS_TMUX_SESSION" -F "#{pane_dead}" 2>/dev/null | grep -q "^0$"; then
+    printf "claude-vps: respawning dead tmux pane\n" >&2
+    dead_target="$(tmux list-panes -t "$CLAUDE_VPS_TMUX_SESSION" -F "#{pane_id}" 2>/dev/null | head -n 1)"
+    if [ -n "$dead_target" ] && tmux respawn-pane -k -t "$dead_target" -c "$REMOTE_REPO" "$claude_vps_launch"; then
+      :
+    else
+      tmux kill-session -t "$CLAUDE_VPS_TMUX_SESSION" 2>/dev/null || true
+      tmux new-session -d -s "$CLAUDE_VPS_TMUX_SESSION" -c "$REMOTE_REPO" "$claude_vps_launch"
+    fi
+  fi
+
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" history-limit "$CLAUDE_VPS_TMUX_HISTORY_LIMIT" >/dev/null
+  tmux set-window-option -t "${CLAUDE_VPS_TMUX_SESSION}:0" history-limit "$CLAUDE_VPS_TMUX_HISTORY_LIMIT" >/dev/null
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" mouse on >/dev/null
+  case "${CLAUDE_VPS_TMUX_STATUS:-1}" in
+    0|off|false|no) claude_vps_status_mode=off ;;
+    *) claude_vps_status_mode=on ;;
+  esac
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status "$claude_vps_status_mode" >/dev/null
+  case "${CLAUDE_VPS_TMUX_STATUS_POSITION:-top}" in
+    bottom) claude_vps_status_position=bottom ;;
+    *) claude_vps_status_position=top ;;
+  esac
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-position "$claude_vps_status_position" >/dev/null
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-interval "${CLAUDE_VPS_TMUX_STATUS_INTERVAL:-5}" >/dev/null
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-style 'fg=colour250,bg=colour235' >/dev/null
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-left-length 90 >/dev/null
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-right-length 110 >/dev/null
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-left '#[fg=colour82,bold] claude-vps #[fg=colour244]#{@claude-vps-backend}/#{@claude-vps-transport} #[fg=colour250]#S ' >/dev/null
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-right '#[fg=colour244]#{pane_current_command} #[fg=colour250]%H:%M #[fg=colour244]#{client_width}x#{client_height} ' >/dev/null
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" @claude-vps-backend "tmux" >/dev/null 2>&1 || true
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" @claude-vps-transport "${CLAUDE_VPS_TRANSPORT_LABEL:-ssh}" >/dev/null 2>&1 || true
+  tmux set-window-option -t "${CLAUDE_VPS_TMUX_SESSION}:0" alternate-screen on >/dev/null
+  tmux set-window-option -t "${CLAUDE_VPS_TMUX_SESSION}:0" aggressive-resize on >/dev/null 2>&1 || true
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" TERM "$CLAUDE_VPS_TMUX_TERM" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" COLORTERM "$REMOTE_COLORTERM" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" FORCE_COLOR "$REMOTE_FORCE_COLOR" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_CODE_NO_FLICKER "$CLAUDE_CODE_NO_FLICKER" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN "$CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_CODE_SCROLL_SPEED "$CLAUDE_CODE_SCROLL_SPEED" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_CODE_DISABLE_MOUSE "$CLAUDE_CODE_DISABLE_MOUSE" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL "$CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_AUTO_CONTINUE "$CLAUDE_VPS_AUTO_CONTINUE" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_CONTINUE_ARG "$CLAUDE_VPS_CONTINUE_ARG" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS "$CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" REMOTE_CLAUDE "$REMOTE_CLAUDE" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" REMOTE_CLAUDE_SUBCOMMAND "$REMOTE_CLAUDE_SUBCOMMAND" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_TRANSPORT_LABEL "$CLAUDE_VPS_TRANSPORT_LABEL" >/dev/null
+  if [ "$CLAUDE_VPS_TMUX_LOG" = "1" ]; then
+    log_dir="${CLAUDE_VPS_TMUX_LOG_DIR:-$HOME/.claude-vps/logs}"
+    mkdir -p "$log_dir" 2>/dev/null || true
+    log_file="$log_dir/claude-vps-$(date +%Y-%m-%d).ansi"
+    quoted_log_file="$(printf '%q' "$log_file")"
+    tmux pipe-pane -o -t "${CLAUDE_VPS_TMUX_SESSION}:0" "cat >> $quoted_log_file" >/dev/null 2>&1 || true
+    tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" @claude-vps-log "$log_file" >/dev/null 2>&1 || true
+  else
+    tmux pipe-pane -t "${CLAUDE_VPS_TMUX_SESSION}:0" >/dev/null 2>&1 || true
+    tmux set-option -u -t "$CLAUDE_VPS_TMUX_SESSION" @claude-vps-log >/dev/null 2>&1 || true
+  fi
+  attach_flags=()
+  if [ "${CLAUDE_VPS_TMUX_DETACH_OTHER_CLIENTS:-1}" = "1" ]; then
+    attach_flags=(-d)
+  fi
+  tmux attach-session "${attach_flags[@]}" -t "$CLAUDE_VPS_TMUX_SESSION" || {
+    if [ -n "$CLAUDE_VPS_CONTINUE_ARG" ]; then
+      set -- "$CLAUDE_VPS_CONTINUE_ARG"
+    fi
+    case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}" in
+      1|true|yes|on) set -- --dangerously-skip-permissions "$@" ;;
+    esac
+    unset NO_COLOR
+    apply_claude_renderer_env
+    if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then
+      exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" "$@"
+    fi
+    exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$@"
+  }
+  exit 0
+fi
+if [ -n "$CLAUDE_VPS_CONTINUE_ARG" ]; then
+  set -- "$CLAUDE_VPS_CONTINUE_ARG"
+fi
+case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}" in
+  1|true|yes|on) set -- --dangerously-skip-permissions "$@" ;;
+esac
+unset NO_COLOR
+apply_claude_renderer_env
+if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then
+  exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" "$@"
+fi
+exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$@"
+REMOTE_SCRIPT
+}
+
+remote_bare_script() {
+  cat <<'REMOTE_SCRIPT'
+apply_claude_renderer_env() {
+  case "${CLAUDE_CODE_NO_FLICKER:-0}" in
+    1|true|yes|on) export CLAUDE_CODE_NO_FLICKER=1 ;;
+    *) unset CLAUDE_CODE_NO_FLICKER ;;
+  esac
+  case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" in
+    1|true|yes|on) export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 ;;
+    *) unset CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN ;;
+  esac
+  case "${CLAUDE_CODE_DISABLE_MOUSE:-0}" in
+    1|true|yes|on) export CLAUDE_CODE_DISABLE_MOUSE=1 ;;
+    *) unset CLAUDE_CODE_DISABLE_MOUSE ;;
+  esac
+  case "${CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL:-0}" in
+    1|true|yes|on) export CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 ;;
+    *) unset CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL ;;
+  esac
+}
+
+cd "$REMOTE_REPO" || exit
+if [ -n "$CODEXSWITCH_REMOTE_TTY_ROWS" ] && [ -n "$CODEXSWITCH_REMOTE_TTY_COLS" ]; then
+  stty rows "$CODEXSWITCH_REMOTE_TTY_ROWS" cols "$CODEXSWITCH_REMOTE_TTY_COLS" 2>/dev/null || true
+fi
+stty -ixon -ixoff 2>/dev/null || true
+if [ "$#" -eq 0 ]; then
+  case "${CLAUDE_VPS_REMOTE_CONTROL_DEFAULT:-0}" in
+    1|true|yes|on)
+      if [ -n "${CLAUDE_VPS_REMOTE_CONTROL_NAME:-}" ]; then
+        set -- remote-control --name "$CLAUDE_VPS_REMOTE_CONTROL_NAME" --spawn="${CLAUDE_VPS_REMOTE_CONTROL_SPAWN:-same-dir}"
+      else
+        set -- remote-control --spawn="${CLAUDE_VPS_REMOTE_CONTROL_SPAWN:-same-dir}"
+      fi
+      ;;
+    *)
+      if [ -n "$CLAUDE_VPS_CONTINUE_ARG" ]; then
+        set -- "$CLAUDE_VPS_CONTINUE_ARG"
+      fi
+      ;;
+  esac
+fi
+case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}" in
+  1|true|yes|on) set -- --dangerously-skip-permissions "$@" ;;
+esac
+unset NO_COLOR
+apply_claude_renderer_env
+if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then
+  exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" "$@"
+fi
+exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$@"
+REMOTE_SCRIPT
+}
+
+remote_command_for_script() {
+  local script="$1"
+  printf '%s bash -lc %s claude-vps' "$(remote_env_prefix)" "$(quote_zsh "$script")"
+}
+
+if [ "$#" -eq 0 ] && [ "$REMOTE_DISABLE_TMUX" != "1" ]; then
+  remote_command="$(remote_command_for_script "$(remote_tmux_script)")"
+else
+  remote_command="$(remote_command_for_script "$(remote_bare_script)")"
   remote_command="${remote_command} ${remote_args[*]}"
 fi
 
-if [ "$#" -eq 0 ] && [ "${CLAUDE_VPS_DISABLE_TMUX:-0}" != "1" ]; then
-  log "connecting to Claude Code on ${selected_host} in tmux session ${REMOTE_TMUX_SESSION}..."
+if [ "$#" -eq 0 ] && [ "$REMOTE_DISABLE_TMUX" != "1" ]; then
+  log "connecting to Claude Code on ${selected_host} in tmux session ${REMOTE_TMUX_SESSION} via ${selected_session_transport}..."
+elif [ "$#" -eq 0 ] && [[ "$REMOTE_CONTROL_DEFAULT" =~ ^(1|true|yes|on)$ ]]; then
+  log "connecting to Claude Code Remote Control on ${selected_host} through CCS..."
+elif [ "$#" -eq 0 ]; then
+  log "connecting to Claude Code on ${selected_host} with terminal renderer (no tmux)..."
 else
   log "connecting to Claude Code on ${selected_host}..."
 fi
+
+refresh_claude_desktop_session_index "$@" >/dev/null 2>&1 &
+
+if [ "$selected_session_transport" = "mosh" ]; then
+  exec "$MOSH_BIN" --experimental-remote-ip=remote --predict="$MOSH_PREDICT" --ssh="$(mosh_ssh_command)" "$selected_host" -- /bin/bash -lc "$remote_command"
+fi
+
+if [ "$#" -eq 0 ] && [ "$REMOTE_DISABLE_TMUX" != "1" ] && [ "$SSH_AUTO_RECONNECT" = "1" ]; then
+  reconnect_attempt=0
+  while true; do
+    set +e
+    ssh -tt "${selected_ssh_opts[@]}" "$selected_host" "$remote_command"
+    ssh_status="$?"
+    set -e
+    if [ "$ssh_status" -ne 255 ]; then
+      exit "$ssh_status"
+    fi
+    reconnect_attempt=$((reconnect_attempt + 1))
+    if [ "$SSH_RECONNECT_MAX" -gt 0 ] && [ "$reconnect_attempt" -gt "$SSH_RECONNECT_MAX" ]; then
+      exit "$ssh_status"
+    fi
+    log "SSH transport dropped; reconnecting to ${REMOTE_TMUX_SESSION} in ${SSH_RECONNECT_DELAY}s (attempt ${reconnect_attempt})..."
+    sleep "$SSH_RECONNECT_DELAY"
+  done
+fi
+
 exec ssh -tt "${selected_ssh_opts[@]}" "$selected_host" "$remote_command"

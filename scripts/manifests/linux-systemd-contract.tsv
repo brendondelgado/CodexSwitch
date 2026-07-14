@@ -1,0 +1,73 @@
+unit:signul-codex-app-server.service:Description	SIGNUL Codex app-server remote-control endpoint
+unit:signul-codex-app-server.service:Wants	network-online.target
+unit:signul-codex-app-server.service:After	network-online.target
+unit:signul-codex-app-server.service:StartLimitIntervalSec	0
+unit:signul-codex-app-server.service:Type	simple
+unit:signul-codex-app-server.service:WorkingDirectory	/home/signul/SIGNUL
+unit:signul-codex-app-server.service:Environment	CODEX_HOME=/home/signul/.codex
+unit:signul-codex-app-server.service:EnvironmentFile	-/home/signul/SIGNUL/.env.vps.pipeline
+unit:signul-codex-app-server.service:UMask	0077
+unit:signul-codex-app-server.service:ExecStart	/usr/bin/flock --shared --no-fork %h/.local/share/codexswitch/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork %h/.codex/app-server-daemon/app-server.pid.lock %h/.local/share/codexswitch/current/patched-codex/codex -c features.local_thread_store_compression=true app-server --remote-control --listen ws://127.0.0.1:8390
+unit:signul-codex-app-server.service:KillSignal	SIGINT
+unit:signul-codex-app-server.service:KillMode	mixed
+unit:signul-codex-app-server.service:TimeoutStopSec	120
+unit:signul-codex-app-server.service:SendSIGKILL	no
+unit:signul-codex-app-server.service:Restart	always
+unit:signul-codex-app-server.service:RestartSec	2
+unit:signul-codex-app-server.service:Nice	0
+unit:signul-codex-app-server.service:CPUWeight	10000
+unit:signul-codex-app-server.service:IOWeight	10000
+unit:signul-codex-app-server.service:IOSchedulingClass	best-effort
+unit:signul-codex-app-server.service:IOSchedulingPriority	0
+unit:signul-codex-app-server.service:MemoryLow	512M
+unit:signul-codex-app-server.service:MemoryHigh	12G
+unit:signul-codex-app-server.service:MemoryMax	14G
+unit:signul-codex-app-server.service:MemorySwapMax	2G
+unit:signul-codex-app-server.service:TasksMax	2048
+unit:signul-codex-app-server.service:LimitNOFILE	1048576
+unit:signul-codex-app-server.service:WantedBy	default.target
+unit:codexswitch.service:Description	CodexSwitch CLI daemon
+unit:codexswitch.service:ExecStart	%h/.local/bin/codexswitch-cli daemon
+unit:codexswitch.service:Restart	on-failure
+unit:codexswitch.service:RestartSec	5
+unit:codexswitch.service:Nice	10
+unit:codexswitch.service:CPUWeight	25
+unit:codexswitch.service:IOWeight	25
+unit:codexswitch.service:IOSchedulingClass	idle
+unit:codexswitch.service:MemoryHigh	4G
+unit:codexswitch.service:MemoryMax	6G
+unit:codexswitch.service:MemorySwapMax	2G
+unit:codexswitch.service:TasksMax	512
+unit:codexswitch.service:LimitNOFILE	65536
+unit:codexswitch.service:WantedBy	default.target
+resource:codexswitch.service:MemoryMax	6442450944
+resource:codexswitch.service:MemorySwapMax	2147483648
+resource:signul-codex-app-server.service:MemoryMax	15032385536
+resource:signul-codex-app-server.service:MemorySwapMax	2147483648
+dependency:codexswitch.service:Requires	sysinit.target
+dependency:signul-codex-app-server.service:Requires	sysinit.target
+dependency:codexswitch.service:Conflicts	shutdown.target
+dependency:signul-codex-app-server.service:Conflicts	shutdown.target
+dependency:codexswitch.service:Before	shutdown.target
+dependency:signul-codex-app-server.service:Before	shutdown.target
+dependency:codexswitch.service:After	basic.target sysinit.target
+dependency:signul-codex-app-server.service:Wants	network-online.target
+dependency:signul-codex-app-server.service:After	basic.target network-online.target sysinit.target
+start-barrier:codexswitch.service:Required	1
+start-barrier:signul-codex-app-server.service:Required	1
+start-barrier:codexswitch-knowledge-sync.service:Required	1
+start-barrier:codexswitch-knowledge-sync.timer:Required	1
+start-barrier:codexswitch-daemon.service:Required	1
+start-barrier:codexswitch-app-server.service:Required	1
+start-barrier:codexswitch-app-server-proxy.service:Required	1
+start-barrier:codex-app-server.service:Required	1
+start-barrier:codex-app-server-daemon.service:Required	1
+start-barrier:codex-app-server-control.service:Required	1
+start-barrier:codexswitch.socket:Required	1
+start-barrier:codexswitch.path:Required	1
+start-barrier:signul-codex-app-server.socket:Required	1
+start-barrier:signul-codex-app-server.path:Required	1
+start-barrier:codexswitch-app-server.socket:Required	1
+start-barrier:codexswitch-app-server.path:Required	1
+start-barrier:codex-app-server.socket:Required	1
+start-barrier:codex-app-server.path:Required	1

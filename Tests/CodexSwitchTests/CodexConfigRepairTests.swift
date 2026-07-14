@@ -4,6 +4,9 @@ import Testing
 
 @Suite("Codex config repair")
 struct CodexConfigRepairTests {
+    private let unifiedMarketplacePath =
+        "/Applications/ChatGPT.app/Contents/Resources/plugins/openai-bundled"
+
     @Test("Bundled plugins enable both app and plugin feature gates")
     func bundledPluginsEnableRequiredFeatureGates() {
         let input = """
@@ -22,7 +25,10 @@ struct CodexConfigRepairTests {
         enabled = true
         """
 
-        let result = CodexConfigRepair.repairedConfigText(input)
+        let result = CodexConfigRepair.repairedConfigText(
+            input,
+            appMarketplacePath: unifiedMarketplacePath
+        )
 
         #expect(result.changed)
         #expect(result.text.contains("[features]\napps = true\nplugins = true\nchronicle = false\nshell_snapshot = true"))
@@ -70,7 +76,7 @@ struct CodexConfigRepairTests {
         #expect(!result.text.contains("[mcp_servers.computer-use]"))
         #expect(!result.text.contains("SkyComputerUseClient"))
         #expect(result.text.contains("chronicle = false"))
-        #expect(result.text.contains("source = \"/Applications/Codex.app/Contents/Resources/plugins/openai-bundled\""))
+        #expect(result.text.contains("source = \"\(unifiedMarketplacePath)\""))
     }
 
     @Test("Unrelated notify commands and MCP servers are preserved")
@@ -91,14 +97,17 @@ struct CodexConfigRepairTests {
         source = "/Users/brendondelgado/.codex/.tmp/bundled-marketplaces/openai-bundled"
         """
 
-        let result = CodexConfigRepair.repairedConfigText(input)
+        let result = CodexConfigRepair.repairedConfigText(
+            input,
+            appMarketplacePath: unifiedMarketplacePath
+        )
 
         #expect(result.changed)
         #expect(result.text.contains("notify = [ \"/usr/bin/osascript\", \"turn-ended\" ]"))
         #expect(result.text.contains("[mcp_servers.docs]"))
         #expect(result.text.contains("command = \"docs-mcp\""))
         #expect(result.text.contains("chronicle = false"))
-        #expect(result.text.contains("source = \"/Applications/Codex.app/Contents/Resources/plugins/openai-bundled\""))
+        #expect(result.text.contains("source = \"\(unifiedMarketplacePath)\""))
     }
 
     @Test("Config without bundled plugins is left untouched")
@@ -133,11 +142,12 @@ struct CodexConfigRepairTests {
 
         CodexConfigRepair.repairDefaultConfigIfNeeded(
             configPath: config.path,
-            removeStaleCopies: false
+            removeStaleCopies: false,
+            appMarketplacePath: unifiedMarketplacePath
         )
 
         let repaired = try String(contentsOf: config, encoding: .utf8)
-        #expect(repaired.contains("source = \"/Applications/Codex.app/Contents/Resources/plugins/openai-bundled\""))
+        #expect(repaired.contains("source = \"\(unifiedMarketplacePath)\""))
     }
 
     @Test("Bundled plugin discovery repair creates marketplace and cache")

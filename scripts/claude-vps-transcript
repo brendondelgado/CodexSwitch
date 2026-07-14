@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import pathlib
+import subprocess
+import sys
+
+
+REMOTE_PY = r'''
+import argparse
+import collections
+import datetime as dt
+import glob
+import json
+import os
+import pathlib
+import sys
+
+
+def short(value, limit):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False, indent=2)
+    if limit <= 0 or len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "\n... [truncated; rerun with --full-tools]"
+
+
+def render_tool_input(name, payload, limit):
+    if not isinstance(payload, dict):
+        return short(payload, limit)
+    if name == "Bash":
+        parts = []
+        if payload.get("description"):
+            parts.append(payload["description"])
+        if payload.get("command"):
+            parts.append("$ " + payload["command"])
+        return "\n".join(parts)
+    for key in ("file_path", "path", "command", "query", "pattern"):
+        if payload.get(key):
+            return f"{key}: {payload[key]}"
+    return short(payload, limit)
+
+
+def content_to_text(content, include_tools, full_tools, tool_chars):
+    chunks = []
+    tool_limit = 0 if full_tools else tool_chars
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return short(content, tool_limit)
+    for item in content:
+        if isinstance(item, str):
+            chunks.append(item)
+            continue
+        if not isinstance(item, dict):
+            chunks.append(short(item, tool_limit))
+            continue
+        kind = item.get("type")
+        if kind == "text":
+            text = item.get("text", "")
+            if text:
+                chunks.append(text)
+        elif kind == "tool_use" and include_tools:
+            name = item.get("name", "tool")
+            body = render_tool_input(name, item.get("input"), tool_limit)
+            chunks.append(f"[tool use: {name}]\n{body}".rstrip())
+        elif kind == "tool_result" and include_tools:
+            body = short(item.get("content", ""), tool_limit)
+            if body:
+                chunks.append(f"[tool result]\n{body}")
+        elif kind in ("thinking", "redacted_thinking"):
+            continue
+        elif include_tools:
+            chunks.append(f"[{kind or 'content'}]\n{short(item, tool_limit)}")
+    return "\n\n".join(chunk for chunk in chunks if chunk)
+
+
+def event_to_entry(event, include_tools, full_tools, tool_chars):
+    kind = event.get("type")
+    timestamp = event.get("timestamp", "")
+    if kind in ("user", "assistant"):
+        message = event.get("message") or {}
+        role = (message.get("role") or kind or "").upper()
+        text = content_to_text(message.get("content"), include_tools, full_tools, tool_chars)
+        if not text:
+            return None
+        if text.startswith("[tool result]"):
+            role = "TOOL RESULT"
+        elif text.startswith("[tool use:"):
+            role = "TOOL USE"
+        return timestamp, role, text
+    if kind == "queue-operation" and event.get("content"):
+        operation = event.get("operation") or "queued"
+        return timestamp, f"QUEUE {operation}".upper(), str(event.get("content"))
+    return None
+
+
+def resolve_session(project_dir, session):
+    paths = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    if not paths:
+        raise SystemExit(f"No Claude session JSONL files found in {project_dir}")
+    if not session:
+        return paths[-1]
+    candidate = pathlib.Path(os.path.expanduser(session))
+    if candidate.exists():
+        return candidate
+    session = session.removesuffix(".jsonl")
+    matches = [path for path in paths if path.stem == session or path.stem.startswith(session)]
+    if not matches:
+        raise SystemExit(f"No session matching {session!r} in {project_dir}")
+    return matches[-1]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--session", default="")
+    parser.add_argument("--messages", type=int, default=80)
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--no-tools", action="store_true")
+    parser.add_argument("--full-tools", action="store_true")
+    parser.add_argument("--tool-chars", type=int, default=2000)
+    args = parser.parse_args()
+
+    project_key = args.repo.replace("/", "-")
+    project_dir = pathlib.Path.home() / ".claude" / "projects" / project_key
+    path = resolve_session(project_dir, args.session)
+
+    include_tools = not args.no_tools
+    entries = [] if args.all else collections.deque(maxlen=max(args.messages, 1))
+    total = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            entry = event_to_entry(event, include_tools, args.full_tools, args.tool_chars)
+            if not entry:
+                continue
+            total += 1
+            entries.append(entry)
+
+    selected = list(entries)
+    stat = path.stat()
+    modified = dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+    print(f"# Claude VPS Transcript")
+    print(f"# repo: {args.repo}")
+    print(f"# session: {path.stem}")
+    print(f"# source: {path}")
+    print(f"# modified: {modified}")
+    print(f"# entries: {'all' if args.all else f'last {len(selected)} of {total}'}")
+    print()
+
+    for timestamp, role, text in selected:
+        print(f"## {timestamp} {role}".rstrip())
+        print(text.rstrip())
+        print()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Render the latest SIGNUL VPS Claude Code JSONL session as stable plain text."
+    )
+    parser.add_argument("-n", "--messages", type=int, default=80, help="number of rendered entries to show")
+    parser.add_argument("--all", action="store_true", help="render the entire session")
+    parser.add_argument("--session", default="", help="session UUID/prefix or remote JSONL path")
+    parser.add_argument("--repo", default=os.environ.get("CLAUDE_VPS_REMOTE_REPO", "/home/signul/SIGNUL"))
+    parser.add_argument("--host", default=os.environ.get("CLAUDE_VPS_REMOTE_HOST", "signul-vps"))
+    parser.add_argument("--no-tools", action="store_true", help="hide tool calls and tool results")
+    parser.add_argument("--full-tools", action="store_true", help="do not truncate tool results")
+    parser.add_argument("--tool-chars", type=int, default=2000, help="max chars per tool result unless --full-tools")
+    parser.add_argument("--copy", action="store_true", help="copy output to the macOS clipboard")
+    parser.add_argument("--output", help="write output to a local file")
+    return parser.parse_args()
+
+
+def ssh_target(host):
+    opts = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=6",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+    ]
+    tailscale_bin = os.environ.get(
+        "CLAUDE_VPS_TAILSCALE_BIN",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    )
+    if (
+        host == "signul-vps"
+        and os.environ.get("CLAUDE_VPS_DISABLE_TAILSCALE_PROXY") != "1"
+        and pathlib.Path(tailscale_bin).exists()
+    ):
+        target = os.environ.get("CLAUDE_VPS_TAILSCALE_TARGET", "signul@signul-hostinger-kvm4")
+        opts.extend(["-o", "StrictHostKeyChecking=accept-new", "-o", f"ProxyCommand={tailscale_bin} nc %h %p"])
+        return target, opts
+    return host, opts
+
+
+def main():
+    args = parse_args()
+    target, opts = ssh_target(args.host)
+    remote_args = [
+        "python3",
+        "-",
+        "--repo",
+        args.repo,
+        "--messages",
+        str(args.messages),
+        "--tool-chars",
+        str(args.tool_chars),
+    ]
+    if args.session:
+        remote_args.extend(["--session", args.session])
+    if args.all:
+        remote_args.append("--all")
+    if args.no_tools:
+        remote_args.append("--no-tools")
+    if args.full_tools:
+        remote_args.append("--full-tools")
+
+    command = ["ssh", *opts, target, *remote_args]
+    if args.copy or args.output:
+        result = subprocess.run(command, input=REMOTE_PY, text=True, capture_output=True)
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            return result.returncode
+        if args.output:
+            pathlib.Path(args.output).expanduser().write_text(result.stdout, encoding="utf-8")
+            print(args.output)
+        if args.copy:
+            subprocess.run(["pbcopy"], input=result.stdout, text=True, check=True)
+            print("copied transcript to clipboard")
+        if not args.output and not args.copy:
+            print(result.stdout, end="")
+        return 0
+
+    return subprocess.run(command, input=REMOTE_PY, text=True).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

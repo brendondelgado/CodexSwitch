@@ -1,0 +1,29 @@
+{
+  "plan_type": "pro",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+      "used_percent": 33,
+      "limit_window_seconds": 86400,
+      "reset_after_seconds": 72000,
+      "reset_at": 1780536593
+    }
+  },
+  "additional_rate_limits": [
+    {
+      "limit_name": "Codex",
+      "metered_feature": "codex",
+      "rate_limit": {
+        "allowed": true,
+        "limit_reached": false,
+        "primary_window": {
+          "used_percent": 19,
+          "limit_window_seconds": 604800,
+          "reset_after_seconds": 500000,
+          "reset_at": 1781036593
+        }
+      }
+    }
+  ]
+}

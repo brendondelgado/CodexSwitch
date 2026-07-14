@@ -15,8 +15,11 @@ enum CodexConfigRepair {
 
     private static let defaultConfigPath =
         NSString("~/.codex/config.toml").expandingTildeInPath
-    private static let bundledMarketplaceAppPath =
-        "/Applications/Codex.app/Contents/Resources/plugins/openai-bundled"
+    private static var bundledMarketplaceAppPath: String {
+        let appPath = CodexDesktopAppLocator.locate()?.appPath
+            ?? CodexDesktopAppLocator.defaultAppPaths[0]
+        return "\(appPath)/Contents/Resources/plugins/openai-bundled"
+    }
     private static let defaultCodexHome =
         NSString("~/.codex").expandingTildeInPath
     private static let bundledMarketplaceCachePathPattern =
@@ -24,11 +27,14 @@ enum CodexConfigRepair {
 
     static func repairDefaultConfigIfNeeded(
         configPath: String = defaultConfigPath,
-        removeStaleCopies: Bool = true
+        removeStaleCopies: Bool = true,
+        appMarketplacePath: String = bundledMarketplaceAppPath
     ) {
         if removeStaleCopies {
             removeStaleBundledMarketplaceCopies()
-            let discoveryResult = ensureBundledPluginDiscoveryIfNeeded()
+            let discoveryResult = ensureBundledPluginDiscoveryIfNeeded(
+                appMarketplacePath: appMarketplacePath
+            )
             if discoveryResult.attempted, !discoveryResult.success {
                 SwapLog.append(.debug("CODEX_BUNDLED_PLUGIN_DISCOVERY_REPAIR_FAILED message=\(discoveryResult.message)"))
             }
@@ -39,7 +45,10 @@ enum CodexConfigRepair {
 
         do {
             let text = try String(contentsOf: url, encoding: .utf8)
-            let repaired = repairedConfigText(text)
+            let repaired = repairedConfigText(
+                text,
+                appMarketplacePath: appMarketplacePath
+            )
             guard repaired.changed else { return }
             try repaired.text.write(to: url, atomically: true, encoding: .utf8)
             SwapLog.append(.debug("CODEX_CONFIG_REPAIRED path=\(url.path) features=apps,plugins chronicle=false"))
@@ -48,12 +57,18 @@ enum CodexConfigRepair {
         }
     }
 
-    static func repairedConfigText(_ text: String) -> RepairResult {
+    static func repairedConfigText(
+        _ text: String,
+        appMarketplacePath: String = bundledMarketplaceAppPath
+    ) -> RepairResult {
         guard referencesBundledPlugins(text) else {
             return RepairResult(text: text, changed: false)
         }
 
-        var result = ensureBundledMarketplaceAppPath(in: text)
+        var result = ensureBundledMarketplaceAppPath(
+            in: text,
+            appMarketplacePath: appMarketplacePath
+        )
         let notifyResult = removeStaleBundledComputerUseNotify(from: result.text)
         result.text = notifyResult.text
         result.changed = result.changed || notifyResult.changed
@@ -285,10 +300,13 @@ enum CodexConfigRepair {
         return version
     }
 
-    private static func ensureBundledMarketplaceAppPath(in text: String) -> RepairResult {
+    private static func ensureBundledMarketplaceAppPath(
+        in text: String,
+        appMarketplacePath: String
+    ) -> RepairResult {
         let repaired = text.replacingOccurrences(
             of: bundledMarketplaceCachePathPattern,
-            with: bundledMarketplaceAppPath,
+            with: appMarketplacePath,
             options: .regularExpression
         )
         return RepairResult(text: repaired, changed: repaired != text)

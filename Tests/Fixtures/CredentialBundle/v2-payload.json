@@ -1,0 +1,26 @@
+{
+  "accounts" : [
+    {
+      "accessToken" : "fixture-access-token",
+      "accountId" : "fixture-account-id",
+      "email" : "fixture@example.com",
+      "id" : "11111111-2222-3333-4444-555555555555",
+      "idToken" : "fixture-id-token",
+      "isActive" : true,
+      "planType" : "plus",
+      "refreshToken" : "fixture-refresh-token"
+    }
+  ],
+  "metadata" : {
+    "accountCount" : 1,
+    "activeAccountId" : "fixture-account-id",
+    "activeEmail" : "fixture@example.com",
+    "createdAt" : "2099-01-01T00:00:00Z",
+    "emails" : [
+      "fixture@example.com"
+    ],
+    "expiresAt" : "2099-01-01T00:30:00Z",
+    "exportedByHost" : "fixture-mac",
+    "schemaVersion" : 2
+  }
+}

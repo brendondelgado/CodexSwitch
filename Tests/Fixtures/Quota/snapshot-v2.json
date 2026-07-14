@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "allowed": true,
+  "limitReached": false,
+  "fetchedAt": 799048365.342368,
+  "windows": [
+    {
+      "kind": "weekly",
+      "durationSeconds": 604800,
+      "usedPercent": 19,
+      "resetsAt": 799653165.342368,
+      "source": {
+        "rateLimit": "additional",
+        "slot": "primary",
+        "limitName": "GPT-5.5",
+        "meteredFeature": "codex"
+      },
+      "hardLimitReached": false
+    }
+  ]
+}

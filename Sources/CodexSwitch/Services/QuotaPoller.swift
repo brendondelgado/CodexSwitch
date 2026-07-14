@@ -10,6 +10,7 @@ actor QuotaPoller {
     private static let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
     private static let inactiveExhaustedPlanUpgradePollInterval: TimeInterval = 5
     private static let inactivePlanUpgradePollInterval: TimeInterval = 15
+    private static let inactiveProManualResetPollInterval: TimeInterval = 60
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -29,31 +30,51 @@ actor QuotaPoller {
         return base * multiplier
     }
 
+    static func pollInterval(for snapshot: QuotaSnapshot, isActive: Bool) -> TimeInterval {
+        guard let remaining = snapshot.minimumRemainingPercent else { return 60 }
+        return pollInterval(forRemainingPercent: remaining, isActive: isActive)
+    }
+
+    static func accepts(_ snapshot: QuotaSnapshot) -> Bool {
+        snapshot.isDenied || !snapshot.policyWindows.isEmpty
+    }
+
     /// Inactive accounts normally sleep for minutes or until reset. Non-Pro accounts are
     /// a special case because a user can buy/upgrade a plan while CodexSwitch is running;
-    /// poll them quickly enough that plan upgrades become visible without a restart.
+    /// poll them quickly enough that plan upgrades become visible without a restart. Pro
+    /// accounts are capped at one minute so manual usage resets are detected live too.
     static func inactivePollInterval(for account: CodexAccount, snapshot: QuotaSnapshot) -> TimeInterval {
-        let fhReset = snapshot.fiveHour.timeUntilReset
-        let wkReset = snapshot.weekly.timeUntilReset
+        guard let mostConstrained = snapshot.mostUrgentWindow else { return 60 }
         var interval: TimeInterval
 
-        if snapshot.fiveHour.isExhausted && fhReset > 0 {
-            interval = fhReset + 2
-        } else if snapshot.fiveHour.remainingPercent > 50 {
-            interval = 600
+        if snapshot.isDenied {
+            interval = inactiveExhaustedPlanUpgradePollInterval
+        } else if mostConstrained.isExhausted, mostConstrained.timeUntilReset > 0 {
+            interval = mostConstrained.timeUntilReset + 2
         } else {
-            interval = 300
+            interval = pollInterval(
+                forRemainingPercent: mostConstrained.effectiveRemainingPercent,
+                isActive: false
+            )
         }
 
-        let nearestReset = min(fhReset, wkReset)
-        if nearestReset > 0 && nearestReset + 2 < interval {
+        let nearestReset = snapshot.policyWindows
+            .map(\.timeUntilReset)
+            .filter { $0 > 0 }
+            .min()
+        if let nearestReset, nearestReset + 2 < interval {
             interval = nearestReset + 2
         }
 
         guard account.planPriority < 4 else {
-            return interval
+            if snapshot.isDenied || mostConstrained.isExhausted {
+                let naturalResetWake = nearestReset.map { $0 + 2 }
+                    ?? inactiveProManualResetPollInterval
+                return min(naturalResetWake, inactiveProManualResetPollInterval)
+            }
+            return min(interval, inactiveProManualResetPollInterval)
         }
-        if snapshot.fiveHour.isExhausted || snapshot.weekly.isExhausted {
+        if snapshot.needsSwap || snapshot.policyWindows.contains(where: \.isExhausted) {
             return min(interval, inactiveExhaustedPlanUpgradePollInterval)
         }
         return min(interval, inactivePlanUpgradePollInterval)
@@ -111,7 +132,14 @@ actor QuotaPoller {
                     }
                     throw PollerError.usageUnavailable
                 }
-                logger.info("Quota parsed: 5h=\(String(format: "%.1f", result.snapshot.fiveHour.remainingPercent))% weekly=\(String(format: "%.1f", result.snapshot.weekly.remainingPercent))% plan=\(result.planType, privacy: .public)")
+                guard Self.accepts(result.snapshot) else {
+                    logger.warning("Quota API returned no usable windows for \(account.email, privacy: .private)")
+                    throw PollerError.usageUnavailable
+                }
+                let windowSummary = result.snapshot.orderedPolicyWindows.map {
+                    "\($0.kind.rawValue)=\(String(format: "%.1f", $0.effectiveRemainingPercent))%"
+                }.joined(separator: " ")
+                logger.info("Quota parsed: \(windowSummary, privacy: .public) denied=\(result.snapshot.isDenied) plan=\(result.planType, privacy: .public)")
                 return FetchResult(snapshot: result.snapshot, planType: result.planType)
             case 401:
                 logger.warning("Token expired (401) for \(account.email, privacy: .private)")
@@ -165,17 +193,17 @@ actor QuotaPoller {
                     onError(accountId, .invalidResponse)
                     return
                 }
+                guard !currentAccount.hasHardRuntimeBlock else {
+                    logger.info("Account \(currentAccount.email, privacy: .private) has a hard runtime block — stopping poll until account state changes")
+                    return
+                }
 
                 do {
                     let result = try await self.fetchQuota(for: currentAccount)
                     onUpdate(accountId, result.snapshot, result.planType)
 
                     if currentAccount.isActive {
-                        // Active account: poll at urgency-based intervals (capped at 30s)
-                        interval = Self.pollInterval(
-                            forRemainingPercent: result.snapshot.fiveHour.remainingPercent,
-                            isActive: true
-                        )
+                        interval = Self.pollInterval(for: result.snapshot, isActive: true)
                     } else {
                         interval = Self.inactivePollInterval(for: currentAccount, snapshot: result.snapshot)
                     }

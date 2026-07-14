@@ -1,39 +1,56 @@
 mod account_store;
+mod activation;
 mod auth;
+mod bounded_command;
 mod codex_health;
 mod codex_update;
 mod daemon;
-mod hermes;
 mod import;
 mod patched_codex;
 mod quota;
+mod rate_limit_resets;
 mod readiness;
 mod reload;
 mod secure_drop;
+mod secure_file;
 mod token_refresh;
-mod tui;
 
+#[cfg(test)]
+use account_store::save_accounts;
 use account_store::{
-    active_account, default_store_path, is_immediately_usable, load_accounts, lock_account_store,
-    mark_runtime_unusable, save_accounts, select_auto_swap_candidate, set_active,
+    active_account, commit_accounts, default_store_path, load_accounts, lock_account_store,
+    mark_runtime_unusable, quota_availability_at, resolve_account_selector,
+    select_auto_swap_candidate_from_observations, usage_limit_runtime_block_until,
+    CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
+};
+use activation::{
+    activate_with, reconcile_activation_barrier, replace_accounts_with, ActivationBarrierContext,
+    ActivationContext, ActivationOutcome, ActivationState,
 };
 use anyhow::{bail, Context, Result};
-use auth::{default_auth_path, write_auth_file};
+use auth::default_auth_path;
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
-use import::import_bundle;
+use import::prepare_import_bundle;
 use quota::{apply_fetch_result, fetch_quota, FetchResult};
+use rate_limit_resets::{
+    consume_rate_limit_reset, fetch_rate_limit_reset_bank, orchestrate_reset, ConsumeResult,
+    RateLimitResetBank, ResetOrchestrationContext, ResetOrchestrationDependencies,
+    ResetQuotaRefreshStrategy, SmartResetReason,
+};
 use reload::{reload_codex_hot_swap_processes, restart_codex_processes, ReloadSummary};
 use ring::digest::{digest, SHA256};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "codexswitch-cli")]
 #[command(about = "Headless CodexSwitch for Linux CLI hot-swap")]
+#[command(version = env!("CODEXSWITCH_BUILD_VERSION"))]
 struct Args {
     #[arg(long, global = true)]
     store: Option<PathBuf>,
@@ -53,20 +70,22 @@ enum Command {
         bundle: PathBuf,
         #[arg(long)]
         ignore_expiry: bool,
+        /// Commit and verify store/auth while an operator-proven runtime is idle.
+        #[arg(long)]
+        offline_file_only: bool,
     },
     UpdateBundle {
         bundle: PathBuf,
         #[arg(long)]
         ignore_expiry: bool,
+        /// Commit and verify store/auth while an operator-proven runtime is idle.
+        #[arg(long)]
+        offline_file_only: bool,
     },
     Status,
     Files {
         #[command(subcommand)]
         command: secure_drop::FilesCommand,
-    },
-    Hermes {
-        #[command(subcommand)]
-        command: HermesCommand,
     },
     AuthDiagnostics {
         #[arg(long)]
@@ -90,6 +109,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(name = "stage-macos-runtime-artifact")]
+    StageMacOsRuntimeArtifact {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(name = "activate-macos-runtime-artifact")]
+    ActivateMacOsRuntimeArtifact {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     InstallPreparedCodex {
         #[arg(long)]
         json: bool,
@@ -107,8 +140,12 @@ enum Command {
         reason: String,
         #[arg(long, default_value_t = 18_000)]
         cooldown_seconds: i64,
+        /// Allow this command to consume a banked reset before rotating.
         #[arg(long)]
-        no_reload: bool,
+        allow_banked_reset: bool,
+        /// Commit store/auth without claiming a hot swap. Intended only when no runtime is live.
+        #[arg(long)]
+        offline_file_only: bool,
         #[arg(long)]
         json: bool,
     },
@@ -119,7 +156,6 @@ enum Command {
     Poll {
         account: Option<String>,
     },
-    Tui,
     RestartCodex {
         #[arg(long)]
         yes: bool,
@@ -144,23 +180,8 @@ enum Command {
     },
 }
 
-#[derive(Debug, Subcommand)]
-enum HermesCommand {
-    Status {
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        gateway: bool,
-    },
-    Apply {
-        #[arg(long)]
-        restart_gateway: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 fn main() -> Result<()> {
+    codex_update::arm_background_update_deadline();
     let args = Args::parse();
     let store_path = args.store.unwrap_or(default_store_path()?);
     let auth_path = args.auth.unwrap_or(default_auth_path()?);
@@ -170,14 +191,29 @@ fn main() -> Result<()> {
         Command::Import {
             bundle,
             ignore_expiry,
-        } => import_accounts(&bundle, &store_path, &auth_path, ignore_expiry, "Imported"),
+            offline_file_only,
+        } => import_accounts(
+            &bundle,
+            &store_path,
+            &auth_path,
+            ignore_expiry,
+            offline_file_only,
+            "Imported",
+        ),
         Command::UpdateBundle {
             bundle,
             ignore_expiry,
-        } => import_accounts(&bundle, &store_path, &auth_path, ignore_expiry, "Updated"),
+            offline_file_only,
+        } => import_accounts(
+            &bundle,
+            &store_path,
+            &auth_path,
+            ignore_expiry,
+            offline_file_only,
+            "Updated",
+        ),
         Command::Status => status(&store_path),
         Command::Files { command } => secure_drop::run(command),
-        Command::Hermes { command } => hermes_command(&store_path, command),
         Command::AuthDiagnostics { json } => auth_diagnostics(&store_path, &auth_path, json),
         Command::CodexUpdateStatus { json } => codex_update_status(json),
         Command::CheckCodexUpdate {
@@ -186,20 +222,28 @@ fn main() -> Result<()> {
             json,
         } => check_codex_update(force, prepare, json),
         Command::PrepareCodexUpdate { version, json } => prepare_codex_update(&version, json),
+        Command::StageMacOsRuntimeArtifact { directory, json } => {
+            stage_macos_runtime_artifact(&directory, json)
+        }
+        Command::ActivateMacOsRuntimeArtifact { directory, json } => {
+            activate_macos_runtime_artifact(&directory, json)
+        }
         Command::InstallPreparedCodex { json } => install_prepared_codex(json),
         Command::AutoInstallCodexUpdate { json } => auto_install_codex_update(json),
         Command::Swap { account } => swap(&store_path, &auth_path, &account),
         Command::RotateNow {
             reason,
             cooldown_seconds,
-            no_reload,
+            allow_banked_reset,
+            offline_file_only,
             json,
         } => rotate_now(
             &store_path,
             &auth_path,
             &reason,
             cooldown_seconds,
-            !no_reload,
+            allow_banked_reset,
+            !offline_file_only,
             json,
         ),
         Command::Daemon { interval_seconds } => daemon::run_loop(
@@ -208,7 +252,6 @@ fn main() -> Result<()> {
             Duration::from_secs(interval_seconds),
         ),
         Command::Poll { account } => poll(&store_path, account.as_deref()),
-        Command::Tui => tui::run(&store_path, &auth_path),
         Command::RestartCodex {
             yes,
             include_app_server,
@@ -224,43 +267,47 @@ fn main() -> Result<()> {
 }
 
 fn import_accounts(
-    bundle: &PathBuf,
-    store_path: &PathBuf,
-    auth_path: &PathBuf,
+    bundle: &Path,
+    store_path: &Path,
+    auth_path: &Path,
     ignore_expiry: bool,
+    offline_file_only: bool,
     verb: &str,
 ) -> Result<()> {
-    let accounts = import_bundle(bundle, store_path, ignore_expiry)?;
-    let active = active_account(&accounts)
-        .or_else(|| accounts.first())
-        .context("bundle did not contain any accounts")?;
-    write_auth_file(auth_path, active)?;
-    if let Err(error) = hermes::apply_account_if_configured(active) {
-        eprintln!("warning: Hermes sync failed after import: {error:#}");
+    let accounts = prepare_import_bundle(bundle, ignore_expiry)?;
+    let account_count = accounts.len();
+    let store_lock = lock_account_store(store_path)?;
+    let snapshot = store_lock.load()?;
+    let mut generation = snapshot.generation;
+    let mut stored_accounts = snapshot.accounts;
+    let outcome = replace_accounts_with(
+        &store_lock,
+        &mut generation,
+        &mut stored_accounts,
+        accounts,
+        auth_path,
+        !offline_file_only,
+        reload_codex_hot_swap_processes,
+    )?;
+    require_rotation_activation(outcome, !offline_file_only)?;
+    if offline_file_only {
+        println!(
+            "Prepared {} account(s) in file-only mode; runtime convergence is pending for {}",
+            account_count,
+            auth_path.display()
+        );
+    } else {
+        println!(
+            "{} {} account(s); active account written to {}",
+            verb,
+            account_count,
+            auth_path.display()
+        );
     }
-    println!(
-        "{} {} account(s); active account written to {}",
-        verb,
-        accounts.len(),
-        auth_path.display()
-    );
     Ok(())
 }
 
-fn hermes_command(store_path: &PathBuf, command: HermesCommand) -> Result<()> {
-    match command {
-        HermesCommand::Status { json, gateway } => hermes::status(json, gateway),
-        HermesCommand::Apply {
-            restart_gateway,
-            json,
-        } => {
-            let accounts = load_accounts(store_path)?;
-            hermes::apply_active(&accounts, restart_gateway, json)
-        }
-    }
-}
-
-pub(crate) fn doctor(store_path: &PathBuf, auth_path: &PathBuf, json: bool) -> Result<()> {
+pub(crate) fn doctor(store_path: &Path, auth_path: &Path, json: bool) -> Result<()> {
     let report = readiness::check(store_path, auth_path)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -307,27 +354,30 @@ pub(crate) fn doctor(store_path: &PathBuf, auth_path: &PathBuf, json: bool) -> R
     Ok(())
 }
 
-pub(crate) fn status(store_path: &PathBuf) -> Result<()> {
+pub(crate) fn status(store_path: &Path) -> Result<()> {
     let accounts = load_accounts(store_path)?;
     for account in &accounts {
         let marker = if account.is_active { "*" } else { " " };
-        let five = account
-            .quota_snapshot
+        let quota_status = quota_status_fields(account.quota_snapshot.as_ref());
+        let reset_status = account
+            .rate_limit_reset_bank
             .as_ref()
-            .map(|snapshot| format!("{:.0}%", snapshot.five_hour.remaining_percent()))
-            .unwrap_or_else(|| "?".to_string());
-        let weekly = account
-            .quota_snapshot
-            .as_ref()
-            .map(|snapshot| format!("{:.0}%", snapshot.weekly.remaining_percent()))
-            .unwrap_or_else(|| "?".to_string());
+            .map(|bank| {
+                let next_expiration = bank
+                    .oldest_expiring_available_credit(Utc::now())
+                    .and_then(|credit| credit.expires_at)
+                    .map(|expires_at| format!(" next-reset-expiry={}", expires_at.to_rfc3339()))
+                    .unwrap_or_default();
+                format!(" resets={}{}", bank.available_count, next_expiration)
+            })
+            .unwrap_or_else(|| " resets=?".to_string());
         println!(
-            "{} {} ({}) 5h={} weekly={}{}",
+            "{} {} ({}) {}{}{}",
             marker,
             account.email,
             account.plan_type.as_deref().unwrap_or("unknown"),
-            five,
-            weekly,
+            quota_status,
+            reset_status,
             account
                 .runtime_unusable_until
                 .filter(|until| *until > Utc::now())
@@ -344,6 +394,30 @@ pub(crate) fn status(store_path: &PathBuf) -> Result<()> {
     }
     print_codex_update_status_line()?;
     Ok(())
+}
+
+fn quota_status_fields(snapshot: Option<&QuotaSnapshot>) -> String {
+    let Some(snapshot) = snapshot else {
+        return "quota=?".to_string();
+    };
+    let mut fields = snapshot
+        .ordered_windows()
+        .into_iter()
+        .map(|window| {
+            let label = match window.kind {
+                QuotaWindowKind::FiveHour => "5h".to_string(),
+                QuotaWindowKind::Weekly => "weekly".to_string(),
+                QuotaWindowKind::Unknown => format!("window-{}s", window.duration_seconds),
+            };
+            format!("{}={:.0}%", label, window.effective_remaining_percent())
+        })
+        .collect::<Vec<_>>();
+    if snapshot.is_denied() {
+        fields.push("quota=denied".to_string());
+    } else if fields.is_empty() {
+        fields.push("quota=unavailable".to_string());
+    }
+    fields.join(" ")
 }
 
 pub(crate) fn codex_update_status(json_output: bool) -> Result<()> {
@@ -389,6 +463,32 @@ pub(crate) fn prepare_codex_update(version: &str, json_output: bool) -> Result<(
         println!("{}", report.summary);
         if let Some(command) = report.install_command.as_deref() {
             println!("install command: {command}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn stage_macos_runtime_artifact(directory: &Path, json_output: bool) -> Result<()> {
+    let report = codex_update::stage_macos_runtime_artifact(directory)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.summary);
+        if let Some(command) = report.install_command.as_deref() {
+            println!("install command: {command}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn activate_macos_runtime_artifact(directory: &Path, json_output: bool) -> Result<()> {
+    let report = codex_update::activate_macos_runtime_artifact(directory)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.summary);
+        if let Some(version) = report.installed_version.as_deref() {
+            println!("installed version: {version}");
         }
     }
     Ok(())
@@ -453,41 +553,11 @@ struct AuthDiagnostics {
 }
 
 pub(crate) fn auth_diagnostics(
-    store_path: &PathBuf,
-    auth_path: &PathBuf,
+    store_path: &Path,
+    auth_path: &Path,
     json_output: bool,
 ) -> Result<()> {
-    let accounts = load_accounts(store_path)?;
-    let active = active_account(&accounts);
-    let auth_info = read_auth_info(auth_path)?;
-    let active_token_hash = active.map(|account| token_hash_prefix(&account.access_token));
-    let diagnostics = AuthDiagnostics {
-        store_path: store_path.display().to_string(),
-        auth_path: auth_path.display().to_string(),
-        active_email: active.map(|account| account.email.clone()),
-        active_account_id: active.map(|account| account.account_id.clone()),
-        active_plan_type: active.and_then(|account| account.plan_type.clone()),
-        active_token_hash_prefix: active_token_hash.clone(),
-        active_runtime_unusable: active
-            .map(|account| account.runtime_unusable())
-            .unwrap_or(false),
-        active_runtime_unusable_reason: active
-            .and_then(|account| account.runtime_unusable_reason.clone()),
-        active_runtime_unusable_until: active
-            .and_then(|account| account.runtime_unusable_until)
-            .map(|until| until.to_rfc3339()),
-        auth_file_exists: auth_info.exists,
-        auth_file_mtime: auth_info.mtime,
-        auth_account_id: auth_info.account_id,
-        auth_token_hash_prefix: auth_info.token_hash_prefix.clone(),
-        auth_matches_active_store_token: active_token_hash.is_some()
-            && active_token_hash == auth_info.token_hash_prefix,
-        ready_candidate_count: accounts
-            .iter()
-            .filter(|account| !account.is_active)
-            .filter(|account| is_immediately_usable(account))
-            .count(),
-    };
+    let diagnostics = collect_auth_diagnostics(store_path, auth_path)?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&diagnostics)?);
@@ -535,29 +605,134 @@ pub(crate) fn auth_diagnostics(
     Ok(())
 }
 
-pub(crate) fn swap(store_path: &PathBuf, auth_path: &PathBuf, selector: &str) -> Result<()> {
-    let _store_lock = lock_account_store(store_path)?;
-    let mut accounts = load_accounts(store_path)?;
-    if !set_active(&mut accounts, selector) {
-        bail!("no account matched {selector}");
-    }
-    let active = active_account(&accounts).context("failed to set active account")?;
-    write_auth_file(auth_path, active)?;
-    if let Err(error) = hermes::apply_account_if_configured(active) {
-        eprintln!("warning: Hermes sync failed after swap: {error:#}");
-    }
-    save_accounts(store_path, &accounts)?;
-    let summary = reload_codex_hot_swap_processes()?;
+fn collect_auth_diagnostics(store_path: &Path, auth_path: &Path) -> Result<AuthDiagnostics> {
+    let accounts = load_accounts(store_path)?;
+    let active = active_account(&accounts);
+    let auth_info = read_auth_info(auth_path)?;
+    let active_token_fingerprint = active.and_then(auth::account_token_fingerprint);
+    let diagnostics = AuthDiagnostics {
+        store_path: store_path.display().to_string(),
+        auth_path: auth_path.display().to_string(),
+        active_email: active.map(|account| account.email.clone()),
+        active_account_id: active.map(|account| account.account_id.clone()),
+        active_plan_type: active.and_then(|account| account.plan_type.clone()),
+        active_token_hash_prefix: active_token_fingerprint
+            .as_deref()
+            .map(fingerprint_hash_prefix),
+        active_runtime_unusable: active
+            .map(|account| account.runtime_unusable())
+            .unwrap_or(false),
+        active_runtime_unusable_reason: active
+            .and_then(|account| account.runtime_unusable_reason.clone()),
+        active_runtime_unusable_until: active
+            .and_then(|account| account.runtime_unusable_until)
+            .map(|until| until.to_rfc3339()),
+        auth_file_exists: auth_info.exists,
+        auth_file_mtime: auth_info.mtime,
+        auth_account_id: auth_info.account_id,
+        auth_token_hash_prefix: auth_info.token_hash_prefix.clone(),
+        auth_matches_active_store_token: active_token_fingerprint.is_some()
+            && active_token_fingerprint == auth_info.token_fingerprint,
+        ready_candidate_count: accounts
+            .iter()
+            .filter(|account| !account.is_active)
+            .filter(|account| {
+                quota_availability_at(account, Utc::now()) == QuotaAvailability::Usable
+            })
+            .count(),
+    };
+    Ok(diagnostics)
+}
+
+pub(crate) fn swap(store_path: &Path, auth_path: &Path, selector: &str) -> Result<()> {
+    let (target_email, summary) = swap_with_reload(
+        store_path,
+        auth_path,
+        selector,
+        reload_codex_hot_swap_processes,
+    )?;
     println!(
         "Swapped to {}; signaled {} Codex hot-swap process(es), restarted {}",
-        active.email,
+        target_email,
         summary.signaled.len(),
         summary.restarted.len()
     );
-    for (pid, reason) in summary.skipped {
+    for (pid, reason) in &summary.skipped {
         println!("Skipped pid={pid}: {reason}");
     }
     Ok(())
+}
+
+fn swap_with_reload<R>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    reload: R,
+) -> Result<(String, ReloadSummary)>
+where
+    R: FnMut(&Path) -> Result<ReloadSummary>,
+{
+    let store_lock = lock_account_store(store_path)?;
+    let snapshot = store_lock.load()?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let target_id = resolve_account_selector(&accounts, selector)?;
+    let target_email = accounts
+        .iter()
+        .find(|account| account.id == target_id)
+        .map(|account| account.email.clone())
+        .context("activation target disappeared")?;
+    let outcome = activate_with(
+        ActivationContext {
+            store_lock: &store_lock,
+            generation: &mut generation,
+            accounts: &mut accounts,
+            auth_path,
+            target_id,
+            reload_enabled: true,
+        },
+        reload,
+    )?;
+    let summary = require_confirmed_activation(outcome)?;
+    Ok((target_email, summary))
+}
+
+fn require_confirmed_activation(outcome: ActivationOutcome) -> Result<ReloadSummary> {
+    if outcome.is_confirmed() {
+        return Ok(outcome.reload);
+    }
+    bail!(
+        "activation did not publish as swapped ({:?}): {}",
+        outcome.state,
+        outcome.detail.as_deref().unwrap_or("no detail")
+    )
+}
+
+fn require_rotation_activation(
+    outcome: ActivationOutcome,
+    reload_processes: bool,
+) -> Result<ReloadSummary> {
+    if reload_processes {
+        return require_confirmed_activation(outcome);
+    }
+    if outcome.is_file_only() {
+        return Ok(outcome.reload);
+    }
+    bail!(
+        "offline file-only activation did not converge ({:?}): {}",
+        outcome.state,
+        outcome.detail.as_deref().unwrap_or("no detail")
+    )
+}
+
+fn ensure_reload_converged(skipped: &[(i32, String)]) -> Result<()> {
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "auth was written, but {} discovered Codex runtime(s) did not acknowledge the reload; restart is required",
+        skipped.len()
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -568,42 +743,71 @@ struct RotateNowReport {
     previous_token_hash_prefix: String,
     next_email: String,
     next_token_hash_prefix: String,
+    next_token_fingerprint: String,
     auth_path: String,
+    activation_state: ActivationState,
+    runtime_converged: bool,
     reload_attempted: bool,
     signaled_processes: usize,
     restarted_processes: usize,
     skipped_processes: usize,
+    used_banked_reset: bool,
+    banked_resets_remaining: Option<u32>,
+    reset_reason: Option<SmartResetReason>,
     #[serde(skip)]
     skipped: Vec<(i32, String)>,
 }
 
 pub(crate) fn rotate_now(
-    store_path: &PathBuf,
-    auth_path: &PathBuf,
+    store_path: &Path,
+    auth_path: &Path,
     reason: &str,
     cooldown_seconds: i64,
+    allow_banked_reset: bool,
     reload_processes: bool,
     json_output: bool,
 ) -> Result<()> {
-    let report = rotate_now_with(
-        store_path,
-        auth_path,
-        reason,
-        cooldown_seconds,
-        reload_processes,
-        fetch_quota,
-        reload_codex_hot_swap_processes,
+    let report = rotate_now_with_resets(
+        RotateNowContext {
+            store_path,
+            auth_path,
+            reason,
+            cooldown_seconds,
+            reload_processes,
+            allow_banked_reset,
+        },
+        RotateNowDependencies::new(
+            fetch_quota,
+            fetch_rate_limit_reset_bank,
+            consume_rate_limit_reset,
+            reload_codex_hot_swap_processes,
+        ),
     )?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.used_banked_reset {
+        println!(
+            "Applied a banked reset to {} for {}; {} reset(s) remain; signaled {} process(es), restarted {}",
+            report.next_email,
+            report
+                .reset_reason
+                .map(SmartResetReason::as_str)
+                .unwrap_or("usage_limit"),
+            report.banked_resets_remaining.unwrap_or(0),
+            report.signaled_processes,
+            report.restarted_processes
+        );
+        if !reload_processes {
+            println!("File-only activation was requested with --offline-file-only.");
+        }
     } else if report.previous_email == report.next_email {
         println!(
             "Kept {} active for {}; fresh quota says it is still usable; signaled {} process(es), restarted {}",
             report.next_email, report.reason, report.signaled_processes, report.restarted_processes
         );
         if !reload_processes {
-            println!("Reload skipped because --no-reload was passed.");
+            println!("File-only activation was requested with --offline-file-only.");
         }
     } else {
         println!(
@@ -615,19 +819,22 @@ pub(crate) fn rotate_now(
             report.restarted_processes
         );
         if !reload_processes {
-            println!("Reload skipped because --no-reload was passed.");
-        } else {
-            for (pid, reason) in report.skipped {
-                println!("Skipped pid={pid}: {reason}");
-            }
+            println!("File-only activation was requested with --offline-file-only.");
         }
+    }
+    if reload_processes {
+        for (pid, reason) in &report.skipped {
+            println!("Skipped pid={pid}: {reason}");
+        }
+        ensure_reload_converged(&report.skipped)?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn rotate_now_with<F, R>(
-    store_path: &PathBuf,
-    auth_path: &PathBuf,
+    store_path: &Path,
+    auth_path: &Path,
     reason: &str,
     cooldown_seconds: i64,
     reload_processes: bool,
@@ -636,10 +843,122 @@ fn rotate_now_with<F, R>(
 ) -> Result<RotateNowReport>
 where
     F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
-    R: Fn() -> Result<ReloadSummary>,
+    R: Fn(&Path) -> Result<ReloadSummary>,
 {
-    let _store_lock = lock_account_store(store_path)?;
-    let mut accounts = load_accounts(store_path)?;
+    rotate_now_with_resets(
+        RotateNowContext {
+            store_path,
+            auth_path,
+            reason,
+            cooldown_seconds,
+            reload_processes,
+            allow_banked_reset: false,
+        },
+        RotateNowDependencies::new(
+            fetch_quota_fn,
+            |_account| bail!("reset inventory unavailable in legacy test harness"),
+            |_account, _bank, _request_id| {
+                bail!("reset consume unavailable in legacy test harness")
+            },
+            reload_fn,
+        ),
+    )
+}
+
+struct RotateNowContext<'a> {
+    store_path: &'a Path,
+    auth_path: &'a Path,
+    reason: &'a str,
+    cooldown_seconds: i64,
+    reload_processes: bool,
+    allow_banked_reset: bool,
+}
+
+struct RotateNowDependencies<F, B, C, R> {
+    fetch_quota: F,
+    fetch_reset_bank: B,
+    consume_reset: C,
+    reload: R,
+}
+
+impl<F, B, C, R> RotateNowDependencies<F, B, C, R>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    fn new(fetch_quota: F, fetch_reset_bank: B, consume_reset: C, reload: R) -> Self {
+        Self {
+            fetch_quota,
+            fetch_reset_bank,
+            consume_reset,
+            reload,
+        }
+    }
+}
+
+fn rotate_now_with_resets<F, B, C, R>(
+    context: RotateNowContext<'_>,
+    dependencies: RotateNowDependencies<F, B, C, R>,
+) -> Result<RotateNowReport>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    rotate_now_with_resets_and_barrier_loader(context, dependencies, |store_lock| store_lock.load())
+}
+
+fn rotate_now_with_resets_and_barrier_loader<F, B, C, R, L>(
+    context: RotateNowContext<'_>,
+    dependencies: RotateNowDependencies<F, B, C, R>,
+    load_after_barrier: L,
+) -> Result<RotateNowReport>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    R: Fn(&Path) -> Result<ReloadSummary>,
+    L: Fn(&account_store::AccountStoreLock) -> Result<account_store::AccountStoreSnapshot>,
+{
+    let RotateNowContext {
+        store_path,
+        auth_path,
+        reason,
+        cooldown_seconds,
+        reload_processes,
+        allow_banked_reset,
+    } = context;
+    let RotateNowDependencies {
+        fetch_quota: fetch_quota_fn,
+        fetch_reset_bank: fetch_reset_bank_fn,
+        consume_reset: consume_reset_fn,
+        reload: reload_fn,
+    } = dependencies;
+    let store_lock = lock_account_store(store_path)?;
+    let snapshot = store_lock.load()?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    if let Some(outcome) = reconcile_activation_barrier(
+        ActivationBarrierContext {
+            store_lock: &store_lock,
+            generation: &mut generation,
+            accounts: &mut accounts,
+            auth_path,
+            reload_enabled: reload_processes,
+        },
+        &reload_fn,
+    )? {
+        // This outcome belongs to an activation that predated the current
+        // command. Offline mode may create FileOnly for the new request, but it
+        // must never waive runtime convergence of an older barrier.
+        require_confirmed_activation(outcome)?;
+        let refreshed = load_after_barrier(&store_lock)?;
+        generation = refreshed.generation;
+        accounts = refreshed.accounts;
+    }
     let active_index = accounts
         .iter()
         .position(|account| account.is_active)
@@ -647,85 +966,192 @@ where
     let previous_email = accounts[active_index].email.clone();
     let previous_token_hash_prefix = token_hash_prefix(&accounts[active_index].access_token);
 
+    let fallback_until = Utc::now() + ChronoDuration::seconds(cooldown_seconds.max(60));
     if reason == "usage_limit" {
+        // A typed runtime usage-limit response is newer and more authoritative
+        // than the separately cached quota endpoint. Refresh the active account
+        // for reset timing and bank policy, but never let a healthy-looking poll
+        // keep the rejected account active.
         if let Ok(result) = fetch_quota_fn(&accounts[active_index]) {
             apply_fetch_result(&mut accounts[active_index], result);
-            if is_immediately_usable(&accounts[active_index]) {
-                write_auth_file(auth_path, &accounts[active_index])?;
-                if let Err(error) = hermes::apply_account_if_configured(&accounts[active_index]) {
+        }
+    }
+
+    let candidate_observations = refresh_direct_rotation_candidates(&mut accounts, &fetch_quota_fn);
+
+    if reason == "usage_limit" {
+        match orchestrate_reset(
+            ResetOrchestrationContext {
+                store_lock: &store_lock,
+                accounts: &mut accounts,
+                active_index,
+                candidate_observations: Some(&candidate_observations),
+                allow_reset: allow_banked_reset,
+                direct_runtime_usage_limit: true,
+                refresh_strategy: ResetQuotaRefreshStrategy::Direct,
+                now: Utc::now(),
+            },
+            ResetOrchestrationDependencies::new(
+                |account: &account_store::CodexAccount| fetch_reset_bank_fn(account),
+                |account: &mut account_store::CodexAccount, strategy| {
+                    debug_assert_eq!(strategy, ResetQuotaRefreshStrategy::Direct);
+                    let result = fetch_quota_fn(&*account)?;
+                    apply_fetch_result(account, result);
+                    Ok(())
+                },
+                |account: &account_store::CodexAccount,
+                 bank: &RateLimitResetBank,
+                 request_id| { consume_reset_fn(account, bank, request_id) },
+                |accounts: &mut [account_store::CodexAccount], active_index: usize| {
+                    let target_id = accounts[active_index].id;
+                    activate_with(
+                        ActivationContext {
+                            store_lock: &store_lock,
+                            generation: &mut generation,
+                            accounts,
+                            auth_path,
+                            target_id,
+                            reload_enabled: reload_processes,
+                        },
+                        &reload_fn,
+                    )
+                },
+            ),
+        ) {
+            Ok(outcome) => {
+                if let Some(activation) = outcome.completion {
+                    let activation_state = activation.state;
+                    let summary = require_rotation_activation(activation, reload_processes)?;
+                    let next_token_fingerprint = auth::account_token_fingerprint(
+                        &accounts[active_index],
+                    )
+                    .context("reset activation has incomplete token material")?;
+                    return Ok(RotateNowReport {
+                        reason: reason.to_string(),
+                        previous_email: previous_email.clone(),
+                        previous_token_hash_prefix,
+                        next_email: previous_email,
+                        next_token_hash_prefix: token_hash_prefix(
+                            &accounts[active_index].access_token,
+                        ),
+                        next_token_fingerprint,
+                        auth_path: auth_path.display().to_string(),
+                        activation_state,
+                        runtime_converged: summary.verified_hot_swap(),
+                        reload_attempted: reload_processes,
+                        signaled_processes: summary.signaled.len(),
+                        restarted_processes: summary.restarted.len(),
+                        skipped_processes: summary.skipped.len(),
+                        used_banked_reset: true,
+                        banked_resets_remaining: accounts[active_index]
+                            .rate_limit_reset_bank
+                            .as_ref()
+                            .map(|bank| bank.available_count),
+                        reset_reason: outcome.reason,
+                        skipped: summary.skipped,
+                    });
+                }
+                if outcome.flow.suppresses_redemption() {
                     eprintln!(
-                        "warning: Hermes sync failed after usage-limit verification: {error:#}"
+                        "banked reset remains unreconciled for {}; new redemption is suppressed{}",
+                        accounts[active_index].email,
+                        outcome
+                            .flow
+                            .detail
+                            .as_deref()
+                            .map(|detail| format!(": {detail}"))
+                            .unwrap_or_default()
                     );
                 }
-                save_accounts(store_path, &accounts)?;
-                let summary = if reload_processes {
-                    reload_fn()?
-                } else {
-                    Default::default()
-                };
-                return Ok(RotateNowReport {
-                    reason: reason.to_string(),
-                    previous_email: previous_email.clone(),
-                    previous_token_hash_prefix,
-                    next_email: previous_email,
-                    next_token_hash_prefix: token_hash_prefix(&accounts[active_index].access_token),
-                    auth_path: auth_path.display().to_string(),
-                    reload_attempted: reload_processes,
-                    signaled_processes: summary.signaled.len(),
-                    restarted_processes: summary.restarted.len(),
-                    skipped_processes: summary.skipped.len(),
-                    skipped: summary.skipped,
-                });
             }
+            Err(error) => eprintln!(
+                "warning: reset reconciliation failed for {}; continuing with normal rotation: {error:#}",
+                accounts[active_index].email
+            ),
         }
-    }
 
-    let cooldown_until = Utc::now() + ChronoDuration::seconds(cooldown_seconds.max(60));
-    mark_runtime_unusable(&mut accounts[active_index], reason, cooldown_until);
-
-    for account in accounts.iter_mut().filter(|account| !account.is_active) {
-        if account.runtime_unusable() {
-            continue;
-        }
-        if let Ok(result) = fetch_quota_fn(account) {
-            apply_fetch_result(account, result);
-        }
-    }
-
-    let Some(target) = select_auto_swap_candidate(&accounts).cloned() else {
-        save_accounts(store_path, &accounts)?;
-        bail!("marked {previous_email} unusable but no ready replacement account exists");
-    };
-
-    set_active(&mut accounts, &target.account_id);
-    write_auth_file(auth_path, &target)?;
-    if let Err(error) = hermes::apply_account_if_configured(&target) {
-        eprintln!("warning: Hermes sync failed after rotate: {error:#}");
-    }
-    save_accounts(store_path, &accounts)?;
-    let summary = if reload_processes {
-        reload_fn()?
+        let block_until = usage_limit_runtime_block_until(&accounts[active_index], fallback_until);
+        mark_runtime_unusable(&mut accounts[active_index], reason, block_until);
     } else {
-        Default::default()
+        mark_runtime_unusable(&mut accounts[active_index], reason, fallback_until);
+    }
+
+    let Some(target) = select_auto_swap_candidate_from_observations(
+        &accounts,
+        &candidate_observations,
+        Utc::now(),
+    )
+    .cloned() else {
+        commit_accounts(&store_lock, &mut generation, &accounts)?;
+        bail!(
+            "marked {previous_email} unusable but no freshly confirmed usable replacement exists"
+        );
     };
+
+    let activation = activate_with(
+        ActivationContext {
+            store_lock: &store_lock,
+            generation: &mut generation,
+            accounts: &mut accounts,
+            auth_path,
+            target_id: target.id,
+            reload_enabled: reload_processes,
+        },
+        &reload_fn,
+    )?;
+    let activation_state = activation.state;
+    let summary = require_rotation_activation(activation, reload_processes)?;
+    let next_token_fingerprint = auth::account_token_fingerprint(&target)
+        .context("rotation target has incomplete token material")?;
     Ok(RotateNowReport {
         reason: reason.to_string(),
         previous_email,
         previous_token_hash_prefix,
         next_email: target.email.clone(),
         next_token_hash_prefix: token_hash_prefix(&target.access_token),
+        next_token_fingerprint,
         auth_path: auth_path.display().to_string(),
+        activation_state,
+        runtime_converged: summary.verified_hot_swap(),
         reload_attempted: reload_processes,
         signaled_processes: summary.signaled.len(),
         restarted_processes: summary.restarted.len(),
         skipped_processes: summary.skipped.len(),
+        used_banked_reset: false,
+        banked_resets_remaining: accounts[active_index]
+            .rate_limit_reset_bank
+            .as_ref()
+            .map(|bank| bank.available_count),
+        reset_reason: None,
         skipped: summary.skipped,
     })
 }
 
-pub(crate) fn poll(store_path: &PathBuf, selector: Option<&str>) -> Result<()> {
-    let _store_lock = lock_account_store(store_path)?;
-    let mut accounts = load_accounts(store_path)?;
+fn refresh_direct_rotation_candidates<F>(
+    accounts: &mut [account_store::CodexAccount],
+    fetch_quota_fn: &F,
+) -> CurrentQuotaObservations
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+{
+    let mut observations = CurrentQuotaObservations::new(Utc::now());
+    for account in accounts.iter_mut().filter(|account| !account.is_active) {
+        if account.runtime_unusable() {
+            continue;
+        }
+        if let Ok(result) = fetch_quota_fn(account) {
+            apply_fetch_result(account, result);
+            observations.record_success(account);
+        }
+    }
+    observations
+}
+
+pub(crate) fn poll(store_path: &Path, selector: Option<&str>) -> Result<()> {
+    let store_lock = lock_account_store(store_path)?;
+    let snapshot = store_lock.load()?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
     let selectors: Vec<String> = match selector {
         Some(selector) => vec![selector.to_string()],
         None => accounts
@@ -747,10 +1173,26 @@ pub(crate) fn poll(store_path: &PathBuf, selector: Option<&str>) -> Result<()> {
         let result = fetch_quota(&accounts[index])
             .with_context(|| format!("failed to poll {}", accounts[index].email))?;
         apply_fetch_result(&mut accounts[index], result);
-        println!("polled {}", accounts[index].email);
+        match fetch_rate_limit_reset_bank(&accounts[index]) {
+            Ok(bank) => {
+                let available_count = bank.available_count;
+                accounts[index].rate_limit_reset_bank = Some(bank);
+                println!(
+                    "polled {} ({} banked reset(s))",
+                    accounts[index].email, available_count
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to poll reset bank for {}: {error:#}",
+                    accounts[index].email
+                );
+                println!("polled {}", accounts[index].email);
+            }
+        }
     }
 
-    save_accounts(store_path, &accounts)?;
+    commit_accounts(&store_lock, &mut generation, &accounts)?;
     Ok(())
 }
 
@@ -759,15 +1201,17 @@ struct AuthInfo {
     exists: bool,
     mtime: Option<String>,
     account_id: Option<String>,
+    token_fingerprint: Option<String>,
     token_hash_prefix: Option<String>,
 }
 
-fn read_auth_info(auth_path: &PathBuf) -> Result<AuthInfo> {
+fn read_auth_info(auth_path: &Path) -> Result<AuthInfo> {
     if !auth_path.exists() {
         return Ok(AuthInfo {
             exists: false,
             mtime: None,
             account_id: None,
+            token_fingerprint: None,
             token_hash_prefix: None,
         });
     }
@@ -788,17 +1232,20 @@ fn read_auth_info(auth_path: &PathBuf) -> Result<AuthInfo> {
         .and_then(|tokens| tokens.get("account_id"))
         .and_then(|value| value.as_str())
         .map(str::to_string);
-    let token_hash_prefix = tokens
-        .and_then(|tokens| tokens.get("access_token"))
-        .and_then(|value| value.as_str())
-        .map(token_hash_prefix);
+    let token_fingerprint = auth::auth_file_fingerprint(auth_path);
+    let token_hash_prefix = token_fingerprint.as_deref().map(fingerprint_hash_prefix);
 
     Ok(AuthInfo {
         exists: true,
         mtime,
         account_id,
+        token_fingerprint,
         token_hash_prefix,
     })
+}
+
+fn fingerprint_hash_prefix(fingerprint: &str) -> String {
+    fingerprint.chars().take(12).collect()
 }
 
 fn token_hash_prefix(token: &str) -> String {
@@ -898,8 +1345,11 @@ pub(crate) fn install_patched_codex(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use account_store::{CodexAccount, QuotaSnapshot, QuotaWindow};
-    use serde_json::json;
+    use account_store::{
+        CodexAccount, QuotaWindow, QuotaWindowRateLimitSource, QuotaWindowSlot,
+        QuotaWindowSourceMetadata,
+    };
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -912,19 +1362,13 @@ mod tests {
             id_token: format!("id-{email}"),
             account_id: email.to_string(),
             quota_snapshot: Some(QuotaSnapshot {
-                five_hour: QuotaWindow {
-                    used_percent: five_used,
-                    window_duration_mins: 300,
-                    resets_at: json!(0),
-                    hard_limit_reached: false,
-                },
-                weekly: QuotaWindow {
-                    used_percent: weekly_used,
-                    window_duration_mins: 10_080,
-                    resets_at: json!(0),
-                    hard_limit_reached: false,
-                },
-                fetched_at: None,
+                allowed: Some(true),
+                limit_reached: Some(false),
+                fetched_at: Utc::now(),
+                windows: vec![
+                    window(QuotaWindowKind::FiveHour, five_used),
+                    window(QuotaWindowKind::Weekly, weekly_used),
+                ],
             }),
             plan_type: Some("pro".to_string()),
             last_refreshed: None,
@@ -935,24 +1379,256 @@ mod tests {
             five_hour_primed_at: None,
             runtime_unusable_until: None,
             runtime_unusable_reason: None,
+            rate_limit_reset_bank: None,
             is_active: active,
         }
     }
 
+    fn window(kind: QuotaWindowKind, used_percent: f64) -> QuotaWindow {
+        let duration_seconds = match kind {
+            QuotaWindowKind::FiveHour => 18_000,
+            QuotaWindowKind::Weekly => 604_800,
+            QuotaWindowKind::Unknown => 86_400,
+        };
+        QuotaWindow {
+            kind,
+            duration_seconds,
+            used_percent,
+            resets_at: Utc::now() + chrono::Duration::seconds(duration_seconds as i64),
+            source: QuotaWindowSourceMetadata::new(
+                QuotaWindowRateLimitSource::Main,
+                QuotaWindowSlot::Primary,
+            ),
+            hard_limit_reached: false,
+        }
+    }
+
     fn fetch_from_account(account: &CodexAccount) -> Result<FetchResult> {
+        let mut snapshot = account.quota_snapshot.clone().unwrap();
+        snapshot.fetched_at = Utc::now();
         Ok(FetchResult {
-            snapshot: account.quota_snapshot.clone().unwrap(),
+            snapshot,
             plan_type: account.plan_type.clone().unwrap(),
         })
     }
 
+    fn verified_reload_summary() -> ReloadSummary {
+        ReloadSummary {
+            signaled: vec![42],
+            ..ReloadSummary::default()
+        }
+    }
+
     #[test]
-    fn usage_limit_rotate_verifies_fresh_active_quota_before_blocking() -> Result<()> {
+    fn status_fields_do_not_print_absent_five_hour_window() {
+        let mut weekly_only = account("weekly@example.com", true, 10.0, 37.0);
+        weekly_only
+            .quota_snapshot
+            .as_mut()
+            .unwrap()
+            .windows
+            .retain(|window| window.kind == QuotaWindowKind::Weekly);
+
+        let fields = quota_status_fields(weekly_only.quota_snapshot.as_ref());
+        assert_eq!(fields, "weekly=63%");
+        assert!(!fields.contains("5h="));
+
+        assert_eq!(quota_status_fields(None), "quota=?");
+    }
+
+    #[test]
+    fn reload_convergence_rejects_unacknowledged_runtime() {
+        assert!(ensure_reload_converged(&[]).is_ok());
+
+        let error = ensure_reload_converged(&[(
+            42,
+            "SIGHUP sent but live reload acknowledgement was not observed".to_string(),
+        )])
+        .expect_err("an unacknowledged runtime must fail the command");
+        assert!(error.to_string().contains("restart is required"));
+    }
+
+    #[test]
+    fn cli_version_uses_build_provenance() {
+        let error = Args::try_parse_from(["codexswitch-cli", "--version"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(error
+            .to_string()
+            .contains(env!("CODEXSWITCH_BUILD_VERSION")));
+    }
+
+    #[test]
+    fn auth_diagnostics_complete_fingerprint_detects_non_access_token_drift() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        auth::write_auth_file(&auth_path, &active)?;
+
+        let matching = collect_auth_diagnostics(&store_path, &auth_path)?;
+        assert!(matching.auth_matches_active_store_token);
+        assert_eq!(
+            matching.active_token_hash_prefix,
+            auth::account_token_fingerprint(&active)
+                .as_deref()
+                .map(fingerprint_hash_prefix)
+        );
+
+        let mut id_drift = active.clone();
+        id_drift.id_token = "different-id".to_string();
+        let mut refresh_drift = active.clone();
+        refresh_drift.refresh_token = "different-refresh".to_string();
+        let mut account_drift = active.clone();
+        account_drift.account_id = "different-account".to_string();
+        for drifted in [id_drift, refresh_drift, account_drift] {
+            assert_eq!(drifted.access_token, active.access_token);
+            auth::write_auth_file(&auth_path, &drifted)?;
+            assert!(
+                !collect_auth_diagnostics(&store_path, &auth_path)?.auth_matches_active_store_token
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn swap_production_path_passes_custom_auth_path_to_reload() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("custom/auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let candidate = account("candidate@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active.clone(), candidate.clone()])?;
+        auth::write_auth_file(&auth_path, &active)?;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_reload = Arc::clone(&observed);
+
+        let (email, _) = swap_with_reload(
+            &store_path,
+            &auth_path,
+            &candidate.email,
+            move |observed_path| {
+                observed_for_reload
+                    .lock()
+                    .unwrap()
+                    .push(observed_path.to_path_buf());
+                Ok(verified_reload_summary())
+            },
+        )?;
+
+        assert_eq!(email, candidate.email);
+        assert_eq!(*observed.lock().unwrap(), vec![auth_path.clone()]);
+        assert!(auth::auth_file_matches_account(&auth_path, &candidate));
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_production_path_passes_custom_auth_path_to_reload() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("custom/auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let candidate = account("candidate@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active.clone(), candidate.clone()])?;
+        auth::write_auth_file(&auth_path, &active)?;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_reload = Arc::clone(&observed);
+
+        let report = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "usage_limit",
+            18_000,
+            true,
+            fetch_from_account,
+            move |observed_path| {
+                observed_for_reload
+                    .lock()
+                    .unwrap()
+                    .push(observed_path.to_path_buf());
+                Ok(verified_reload_summary())
+            },
+        )?;
+
+        assert_eq!(report.next_email, candidate.email);
+        assert_eq!(report.auth_path, auth_path.display().to_string());
+        assert_eq!(*observed.lock().unwrap(), vec![auth_path.clone()]);
+        assert!(auth::auth_file_matches_account(&auth_path, &candidate));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_has_no_automatic_reset_option_and_manual_rotation_is_explicit() -> Result<()> {
+        let default = Args::try_parse_from(["codexswitch-cli", "daemon"])?;
+        assert!(matches!(default.command, Command::Daemon { .. }));
+
+        assert!(
+            Args::try_parse_from(["codexswitch-cli", "daemon", "--consume-banked-resets"]).is_err()
+        );
+
+        let default =
+            Args::try_parse_from(["codexswitch-cli", "rotate-now", "--reason", "usage_limit"])?;
+        assert!(matches!(
+            default.command,
+            Command::RotateNow {
+                allow_banked_reset: false,
+                ..
+            }
+        ));
+
+        let opt_in = Args::try_parse_from([
+            "codexswitch-cli",
+            "rotate-now",
+            "--reason",
+            "usage_limit",
+            "--allow-banked-reset",
+        ])?;
+        assert!(matches!(
+            opt_in.command,
+            Command::RotateNow {
+                allow_banked_reset: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn import_file_only_handoff_requires_explicit_flag() -> Result<()> {
+        let live = Args::try_parse_from(["codexswitch-cli", "import", "bundle.json"])?;
+        assert!(matches!(
+            live.command,
+            Command::Import {
+                offline_file_only: false,
+                ..
+            }
+        ));
+
+        let offline = Args::try_parse_from([
+            "codexswitch-cli",
+            "update-bundle",
+            "bundle.json",
+            "--offline-file-only",
+        ])?;
+        assert!(matches!(
+            offline.command,
+            Command::UpdateBundle {
+                offline_file_only: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_usage_limit_rotates_even_when_quota_poll_looks_usable() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let mut active = account("active@example.com", true, 100.0, 10.0);
         active.runtime_unusable_reason = Some("usage_limit".to_string());
+        active.runtime_unusable_until = Some(Utc::now() + ChronoDuration::hours(6));
         let replacement = account("replacement@example.com", false, 10.0, 10.0);
         save_accounts(&store_path, &[active, replacement])?;
 
@@ -961,30 +1637,103 @@ mod tests {
             &auth_path,
             "usage_limit",
             21_600,
-            false,
+            true,
             |account| {
                 let mut result = fetch_from_account(account)?;
                 if account.email == "active@example.com" {
-                    result.snapshot.five_hour.used_percent = 1.0;
-                    result.snapshot.weekly.used_percent = 20.0;
+                    result.snapshot.five_hour_mut().unwrap().used_percent = 1.0;
+                    result.snapshot.weekly_mut().unwrap().used_percent = 20.0;
+                    result.snapshot.allowed = Some(true);
+                    result.snapshot.limit_reached = Some(false);
                 }
                 Ok(result)
             },
-            || Ok(ReloadSummary::default()),
+            |_| Ok(verified_reload_summary()),
         )?;
 
         assert_eq!(report.previous_email, "active@example.com");
-        assert_eq!(report.next_email, "active@example.com");
+        assert_eq!(report.next_email, "replacement@example.com");
         let stored = load_accounts(&store_path)?;
         let active = active_account(&stored).unwrap();
-        assert_eq!(active.email, "active@example.com");
-        assert_eq!(active.runtime_unusable_reason, None);
+        assert_eq!(active.email, "replacement@example.com");
+        let rejected = stored
+            .iter()
+            .find(|account| account.email == "active@example.com")
+            .unwrap();
         assert_eq!(
-            active
+            rejected.runtime_unusable_reason.as_deref(),
+            Some("usage_limit")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_rotate_blocks_only_until_exhausted_five_hour_reset() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 32.0);
+        let replacement = account("replacement@example.com", false, 10.0, 10.0);
+        let five_hour_reset = Utc::now() + ChronoDuration::minutes(45);
+        save_accounts(&store_path, &[active, replacement])?;
+
+        let report = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "usage_limit",
+            21_600,
+            true,
+            |account| {
+                let mut result = fetch_from_account(account)?;
+                if account.email == "active@example.com" {
+                    let five_hour = result.snapshot.five_hour_mut().unwrap();
+                    five_hour.used_percent = 100.0;
+                    five_hour.hard_limit_reached = true;
+                    five_hour.resets_at = five_hour_reset;
+                    let weekly = result.snapshot.weekly_mut().unwrap();
+                    weekly.used_percent = 32.0;
+                    weekly.hard_limit_reached = false;
+                }
+                Ok(result)
+            },
+            |_| Ok(verified_reload_summary()),
+        )?;
+
+        assert_eq!(report.previous_email, "active@example.com");
+        assert_eq!(report.next_email, "replacement@example.com");
+        let stored = load_accounts(&store_path)?;
+        assert_eq!(
+            active_account(&stored).map(|account| account.email.as_str()),
+            Some("replacement@example.com")
+        );
+        let previous = stored
+            .iter()
+            .find(|account| account.email == "active@example.com")
+            .unwrap();
+        assert_eq!(
+            previous.runtime_unusable_reason.as_deref(),
+            Some("usage_limit")
+        );
+        let runtime_until = previous.runtime_unusable_until.unwrap();
+        assert!((runtime_until - five_hour_reset).num_seconds().abs() <= 1);
+        assert!(
+            previous
                 .quota_snapshot
                 .as_ref()
-                .map(|snapshot| snapshot.five_hour.remaining_percent()),
-            Some(99.0)
+                .unwrap()
+                .five_hour()
+                .unwrap()
+                .hard_limit_reached
+        );
+        assert_eq!(
+            previous
+                .quota_snapshot
+                .as_ref()
+                .unwrap()
+                .weekly()
+                .unwrap()
+                .used_percent,
+            32.0
         );
         Ok(())
     }
@@ -1003,19 +1752,520 @@ mod tests {
             &auth_path,
             "usage_limit",
             21_600,
-            false,
+            true,
             |account| {
                 let mut result = fetch_from_account(account)?;
                 if account.email == "replacement@example.com" {
-                    result.snapshot.five_hour.used_percent = 1.0;
+                    result.snapshot.five_hour_mut().unwrap().used_percent = 1.0;
                 }
                 Ok(result)
             },
-            || Ok(ReloadSummary::default()),
+            |_| Ok(verified_reload_summary()),
         )?;
 
         assert_eq!(report.previous_email, "active@example.com");
         assert_eq!(report.next_email, "replacement@example.com");
+        let stored = load_accounts(&store_path)?;
+        assert_eq!(
+            active_account(&stored).map(|account| account.email.as_str()),
+            Some("replacement@example.com")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_defaults_to_rotation_without_consuming_banked_reset() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 20.0, 100.0);
+        let mut replacement = account("replacement@example.com", false, 10.0, 10.0);
+        replacement.plan_type = Some("free".to_string());
+        save_accounts(&store_path, &[active, replacement])?;
+
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_closure = Arc::clone(&consume_calls);
+        let report = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 21_600,
+                reload_processes: true,
+                allow_banked_reset: false,
+            },
+            RotateNowDependencies::new(
+                fetch_from_account,
+                |_account| {
+                    Ok(RateLimitResetBank {
+                        available_count: 1,
+                        total_earned_count: 1,
+                        credits: Vec::new(),
+                        fetched_at: Utc::now(),
+                    })
+                },
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_closure.lock().unwrap() += 1;
+                    Ok(ConsumeResult {
+                        code: rate_limit_resets::ConsumeCode::Reset,
+                        credit_id: None,
+                    })
+                },
+                |_| Ok(verified_reload_summary()),
+            ),
+        )?;
+
+        assert!(!report.used_banked_reset);
+        assert_eq!(report.next_email, "replacement@example.com");
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        let stored = load_accounts(&store_path)?;
+        assert_eq!(
+            active_account(&stored).map(|account| account.email.as_str()),
+            Some("replacement@example.com")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_reconciles_activation_barrier_before_reset_policy() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let first = account("first@example.com", true, 10.0, 10.0);
+        let second = account("second@example.com", false, 100.0, 100.0);
+        let replacement = account("replacement@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[first.clone(), second, replacement])?;
+        auth::write_auth_file(&auth_path, &first)?;
+
+        {
+            let store_lock = lock_account_store(&store_path)?;
+            let snapshot = store_lock.load()?;
+            let mut generation = snapshot.generation;
+            let mut accounts = snapshot.accounts;
+            let second_id = accounts[1].id;
+            let degraded = activate_with(
+                ActivationContext {
+                    store_lock: &store_lock,
+                    generation: &mut generation,
+                    accounts: &mut accounts,
+                    auth_path: &auth_path,
+                    target_id: second_id,
+                    reload_enabled: true,
+                },
+                |_| Ok(ReloadSummary::default()),
+            )?;
+            assert_eq!(degraded.state, ActivationState::CommittedDegraded);
+        }
+
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_closure = Arc::clone(&consume_calls);
+        let error = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 21_600,
+                reload_processes: true,
+                allow_banked_reset: true,
+            },
+            RotateNowDependencies::new(
+                fetch_from_account,
+                |_account| {
+                    Ok(RateLimitResetBank {
+                        available_count: 1,
+                        total_earned_count: 1,
+                        credits: Vec::new(),
+                        fetched_at: Utc::now(),
+                    })
+                },
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_closure.lock().unwrap() += 1;
+                    Ok(ConsumeResult {
+                        code: rate_limit_resets::ConsumeCode::Reset,
+                        credit_id: None,
+                    })
+                },
+                |_| Ok(ReloadSummary::default()),
+            ),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("activation did not publish as swapped"));
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        assert_eq!(
+            active_account(&load_accounts(&store_path)?)
+                .map(|account| account.email.as_str().to_string()),
+            Some("second@example.com".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_offline_rejects_prior_file_only_barrier_before_policy() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let prior_target = account("prior@example.com", false, 100.0, 100.0);
+        let replacement = account("replacement@example.com", false, 10.0, 10.0);
+        save_accounts(
+            &store_path,
+            &[active.clone(), prior_target.clone(), replacement],
+        )?;
+        auth::write_auth_file(&auth_path, &active)?;
+
+        {
+            let store_lock = lock_account_store(&store_path)?;
+            let snapshot = store_lock.load()?;
+            let mut generation = snapshot.generation;
+            let mut accounts = snapshot.accounts;
+            let outcome = activate_with(
+                ActivationContext {
+                    store_lock: &store_lock,
+                    generation: &mut generation,
+                    accounts: &mut accounts,
+                    auth_path: &auth_path,
+                    target_id: prior_target.id,
+                    reload_enabled: false,
+                },
+                |_| bail!("offline activation must not reload"),
+            )?;
+            assert_eq!(outcome.state, ActivationState::FileOnly);
+        }
+
+        let fetch_calls = Arc::new(Mutex::new(0usize));
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let reload_calls = Arc::new(Mutex::new(0usize));
+        let error = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 21_600,
+                reload_processes: false,
+                allow_banked_reset: true,
+            },
+            RotateNowDependencies::new(
+                {
+                    let calls = Arc::clone(&fetch_calls);
+                    move |account| {
+                        *calls.lock().unwrap() += 1;
+                        fetch_from_account(account)
+                    }
+                },
+                {
+                    let calls = Arc::clone(&bank_calls);
+                    move |_account| {
+                        *calls.lock().unwrap() += 1;
+                        bail!("reset-bank policy must remain blocked")
+                    }
+                },
+                {
+                    let calls = Arc::clone(&consume_calls);
+                    move |_account, _bank, _request_id| {
+                        *calls.lock().unwrap() += 1;
+                        bail!("reset consumption must remain blocked")
+                    }
+                },
+                {
+                    let calls = Arc::clone(&reload_calls);
+                    move |_| {
+                        *calls.lock().unwrap() += 1;
+                        Ok(verified_reload_summary())
+                    }
+                },
+            ),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("activation did not publish as swapped"));
+        assert_eq!(*fetch_calls.lock().unwrap(), 0);
+        assert_eq!(*bank_calls.lock().unwrap(), 0);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        assert_eq!(*reload_calls.lock().unwrap(), 0);
+        assert_eq!(
+            active_account(&load_accounts(&store_path)?)
+                .map(|account| account.email.as_str().to_string()),
+            Some("prior@example.com".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_repairs_legacy_barrier_then_selects_fresh_target() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let mut replacement = account("replacement@example.com", false, 10.0, 10.0);
+        replacement.plan_type = Some("free".to_string());
+        let fresh_target = account("fresh@example.com", false, 5.0, 5.0);
+        save_accounts(&store_path, &[active.clone(), replacement.clone()])?;
+        auth::write_auth_file(&auth_path, &active)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let generation = store_lock.load()?.generation;
+        let record = activation::ActivationRecord {
+            version: 3,
+            state: ActivationState::ManualReview,
+            kind: activation::ActivationKind::Rotation,
+            previous_account_id: replacement.account_id.clone(),
+            target_account_id: active.account_id.clone(),
+            store_generation: generation.as_str().to_string(),
+            auth_fingerprint: Some("superseded-token-generation".to_string()),
+            base_store_generation: None,
+            owned_store_generation: None,
+            base_auth_generation: None,
+            owned_auth_generation: None,
+            rollback: None,
+            detail: Some(activation::LEGACY_DEGRADED_TOKEN_MISMATCH.to_string()),
+            updated_at: Utc::now(),
+        };
+        fs::write(
+            activation::activation_record_path(&store_path),
+            serde_json::to_vec_pretty(&record)?,
+        )?;
+        drop(store_lock);
+
+        let observed_fingerprints = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_reload = Arc::clone(&observed_fingerprints);
+        let barrier_loads = Arc::new(Mutex::new(0usize));
+        let barrier_loads_for_loader = Arc::clone(&barrier_loads);
+        let fresh_for_loader = fresh_target.clone();
+        let report = rotate_now_with_resets_and_barrier_loader(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 21_600,
+                reload_processes: true,
+                allow_banked_reset: false,
+            },
+            RotateNowDependencies::new(
+                fetch_from_account,
+                |_account| {
+                    Ok(RateLimitResetBank {
+                        available_count: 1,
+                        total_earned_count: 1,
+                        credits: Vec::new(),
+                        fetched_at: Utc::now(),
+                    })
+                },
+                |_account, _bank, _request_id| bail!("reset consumption must remain disabled"),
+                move |path| {
+                    observed_for_reload
+                        .lock()
+                        .unwrap()
+                        .push(auth::auth_file_fingerprint(path).unwrap());
+                    Ok(verified_reload_summary())
+                },
+            ),
+            move |store_lock| {
+                *barrier_loads_for_loader.lock().unwrap() += 1;
+                let snapshot = store_lock.load()?;
+                let mut fresh_accounts = snapshot.accounts;
+                fresh_accounts.push(fresh_for_loader.clone());
+                let mut fresh_generation = snapshot.generation;
+                commit_accounts(store_lock, &mut fresh_generation, &fresh_accounts)?;
+                store_lock.load()
+            },
+        )?;
+
+        assert_eq!(report.next_email, fresh_target.email);
+        assert!(report.runtime_converged);
+        assert_eq!(observed_fingerprints.lock().unwrap().len(), 2);
+        assert_eq!(*barrier_loads.lock().unwrap(), 1);
+        assert_eq!(
+            active_account(&load_accounts(&store_path)?)
+                .map(|account| account.email.as_str().to_string()),
+            Some("fresh@example.com".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_offline_file_only_is_explicit_and_never_runtime_confirmed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let replacement = account("replacement@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, replacement])?;
+
+        let report = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "usage_limit",
+            21_600,
+            false,
+            fetch_from_account,
+            |_| Ok(ReloadSummary::default()),
+        )?;
+
+        assert_eq!(report.activation_state, ActivationState::FileOnly);
+        assert!(!report.runtime_converged);
+        assert!(!report.reload_attempted);
+        let stored = load_accounts(&store_path)?;
+        let selected = active_account(&stored).unwrap();
+        assert_eq!(selected.email, "replacement@example.com");
+        assert!(auth::auth_file_matches_account(&auth_path, selected));
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .unwrap()
+                .state,
+            activation::ActivationState::FileOnly
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_banked_reset_opt_in_consumes_and_keeps_active() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 20.0, 100.0);
+        let mut replacement = account("replacement@example.com", false, 10.0, 10.0);
+        replacement.plan_type = Some("free".to_string());
+        save_accounts(&store_path, &[active, replacement])?;
+
+        let active_fetches = Arc::new(Mutex::new(0usize));
+        let active_fetches_for_closure = Arc::clone(&active_fetches);
+        let bank_fetches = Arc::new(Mutex::new(0usize));
+        let bank_fetches_for_closure = Arc::clone(&bank_fetches);
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_closure = Arc::clone(&consume_calls);
+        let report = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 21_600,
+                reload_processes: true,
+                allow_banked_reset: true,
+            },
+            RotateNowDependencies::new(
+                move |account| {
+                    let mut result = fetch_from_account(account)?;
+                    if account.email == "active@example.com" {
+                        let mut calls = active_fetches_for_closure.lock().unwrap();
+                        *calls += 1;
+                        if *calls > 1 {
+                            let five_hour = result.snapshot.five_hour_mut().unwrap();
+                            five_hour.used_percent = 0.0;
+                            five_hour.hard_limit_reached = false;
+                            let weekly = result.snapshot.weekly_mut().unwrap();
+                            weekly.used_percent = 0.0;
+                            weekly.hard_limit_reached = false;
+                            result.snapshot.allowed = Some(true);
+                            result.snapshot.limit_reached = Some(false);
+                        }
+                    }
+                    Ok(result)
+                },
+                move |_account| {
+                    let mut calls = bank_fetches_for_closure.lock().unwrap();
+                    *calls += 1;
+                    let available_count = u32::from(*calls == 1);
+                    Ok(RateLimitResetBank {
+                        available_count,
+                        total_earned_count: 1,
+                        credits: (0..available_count)
+                            .map(|index| rate_limit_resets::RateLimitResetCredit {
+                                id: format!("credit-{index}"),
+                                reset_type: Some("full".to_string()),
+                                status: "available".to_string(),
+                                granted_at: Some(Utc::now() - chrono::Duration::days(1)),
+                                expires_at: Some(Utc::now() + chrono::Duration::days(10)),
+                                redeem_started_at: None,
+                                redeemed_at: None,
+                                title: Some("Full reset".to_string()),
+                                description: None,
+                            })
+                            .collect(),
+                        fetched_at: Utc::now(),
+                    })
+                },
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_closure.lock().unwrap() += 1;
+                    Ok(ConsumeResult {
+                        code: rate_limit_resets::ConsumeCode::Reset,
+                        credit_id: None,
+                    })
+                },
+                |_| Ok(verified_reload_summary()),
+            ),
+        )?;
+
+        assert!(report.used_banked_reset);
+        assert_eq!(report.previous_email, "active@example.com");
+        assert_eq!(report.next_email, "active@example.com");
+        assert_eq!(report.banked_resets_remaining, Some(0));
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+        assert_eq!(*bank_fetches.lock().unwrap(), 2);
+        assert_eq!(*active_fetches.lock().unwrap(), 2);
+        let stored = load_accounts(&store_path)?;
+        let active = active_account(&stored).unwrap();
+        assert_eq!(active.email, "active@example.com");
+        assert_eq!(active.runtime_unusable_reason, None);
+        assert_eq!(
+            active
+                .rate_limit_reset_bank
+                .as_ref()
+                .map(|bank| bank.available_count),
+            Some(0)
+        );
+        assert_eq!(
+            quota_availability_at(active, Utc::now()),
+            QuotaAvailability::Usable
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_rotate_does_not_spend_five_hour_reset_with_ready_replacement() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 20.0);
+        let replacement = account("replacement@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, replacement])?;
+
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_closure = Arc::clone(&consume_calls);
+        let report = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 21_600,
+                reload_processes: true,
+                allow_banked_reset: true,
+            },
+            RotateNowDependencies::new(
+                fetch_from_account,
+                |_account| {
+                    Ok(RateLimitResetBank {
+                        available_count: 1,
+                        total_earned_count: 1,
+                        credits: Vec::new(),
+                        fetched_at: Utc::now(),
+                    })
+                },
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_closure.lock().unwrap() += 1;
+                    Ok(ConsumeResult {
+                        code: rate_limit_resets::ConsumeCode::Reset,
+                        credit_id: None,
+                    })
+                },
+                |_| Ok(verified_reload_summary()),
+            ),
+        )?;
+
+        assert!(!report.used_banked_reset);
+        assert_eq!(report.next_email, "replacement@example.com");
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
         let stored = load_accounts(&store_path)?;
         assert_eq!(
             active_account(&stored).map(|account| account.email.as_str()),

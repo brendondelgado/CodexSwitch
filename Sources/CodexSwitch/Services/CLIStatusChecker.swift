@@ -46,10 +46,10 @@ struct DesktopAppStatus: Sendable {
                 return "Codex desktop app connected (port \(port)): \(patchMessage)"
             }
             if patchMessage.contains("Computer Use") && patchMessage.contains("hot-swap is unavailable") {
-                return "Codex desktop app connected (port \(port)): Computer Use ready; hot-swap unavailable"
+                return "Codex desktop app connected (port \(port)): Computer Use plugin preserved; hot-swap unavailable"
             }
             if patchMessage.contains("external/upstream reload path") {
-                return "Codex desktop app connected (port \(port)): Computer Use ready; desktop hot-swap needs upstream reload"
+                return "Codex desktop app connected (port \(port)): Computer Use plugin preserved; desktop hot-swap needs upstream reload"
             }
             if patchInstalled {
                 return "Codex desktop app connected (port \(port)): restart Codex.app to activate hot-swap"
@@ -63,10 +63,10 @@ struct DesktopAppStatus: Sendable {
             return "Codex desktop app running: \(patchMessage)"
         }
         if isRunning, patchMessage.contains("Computer Use") && patchMessage.contains("hot-swap is unavailable") {
-            return "Codex desktop app running: Computer Use ready; hot-swap unavailable"
+            return "Codex desktop app running: Computer Use plugin preserved; hot-swap unavailable"
         }
         if isRunning, patchMessage.contains("external/upstream reload path") {
-            return "Codex desktop app running: Computer Use ready; desktop hot-swap needs upstream reload"
+            return "Codex desktop app running: Computer Use plugin preserved; desktop hot-swap needs upstream reload"
         }
         if isRunning, patchInstalled {
             return "Codex desktop app running: restart Codex.app to activate hot-swap"
@@ -91,12 +91,7 @@ struct DesktopAppStatus: Sendable {
 
 }
 
-struct CodexCLIProcessInfo: Equatable, Sendable {
-    let pid: Int32
-    let commandLine: String
-}
-
-private struct CLICheckResult: Sendable {
+struct CLICheckResult: Equatable, Sendable {
     let status: CLIStatus
     let detail: String?
 }
@@ -106,12 +101,36 @@ struct CLIHotSwapReadiness: Equatable, Sendable {
     let detail: String?
 }
 
+struct CLIStatusRefreshGeneration: Equatable, Sendable {
+    private(set) var generation: UInt64 = 0
+    private(set) var inFlightGeneration: UInt64?
+
+    mutating func begin() -> UInt64? {
+        guard inFlightGeneration == nil else { return nil }
+        generation += 1
+        inFlightGeneration = generation
+        return generation
+    }
+
+    mutating func invalidate() {
+        generation += 1
+        inFlightGeneration = nil
+    }
+
+    mutating func complete(_ capturedGeneration: UInt64) -> Bool {
+        guard capturedGeneration == generation,
+              inFlightGeneration == capturedGeneration else {
+            return false
+        }
+        inFlightGeneration = nil
+        return true
+    }
+}
+
 /// Cached status checker — runs checks on a background queue and caches results.
 /// Call `refresh()` periodically; read `cachedCLIStatus` / `cachedDesktopStatus` from views.
 @MainActor
 enum CLIStatusChecker {
-    private nonisolated static let authPath = NSString("~/.codex/auth.json").expandingTildeInPath
-
     // Cached values — safe to read from view body without blocking
     private(set) static var cachedCLIStatus: CLIStatus = .noActiveAccount
     private(set) static var cachedCLIStatusDetail: String?
@@ -122,7 +141,7 @@ enum CLIStatusChecker {
         patchInstalled: false,
         patchMessage: "Not checked yet"
     )
-    private static var refreshInFlight = false
+    private static var refreshGeneration = CLIStatusRefreshGeneration()
     private static var lastDesktopRefreshAt: Date?
     private static let desktopRefreshInterval: TimeInterval = 5 * 60
 
@@ -131,8 +150,7 @@ enum CLIStatusChecker {
         activeAccountId: String?,
         onUpdated: (@MainActor @Sendable () -> Void)? = nil
     ) {
-        guard !refreshInFlight else { return }
-        refreshInFlight = true
+        guard let generation = refreshGeneration.begin() else { return }
 
         let accountId = activeAccountId
         let now = Date()
@@ -146,39 +164,62 @@ enum CLIStatusChecker {
                 ? _checkDesktopApp()
                 : previousDesktopStatus
             await MainActor.run {
+                guard refreshGeneration.complete(generation) else { return }
                 cachedCLIStatus = cliCheck.status
                 cachedCLIStatusDetail = cliCheck.detail
                 cachedDesktopStatus = desktopStatus
                 if shouldRefreshDesktop {
                     lastDesktopRefreshAt = Date()
                 }
-                refreshInFlight = false
                 onUpdated?()
             }
         }
     }
 
+    /// Invalidates any result captured before the active account changed.
+    @MainActor
+    static func invalidateForAccountSwap() {
+        refreshGeneration.invalidate()
+    }
+
     // MARK: - Background checks (never call from main thread directly)
 
     private nonisolated static func _checkCLI(activeAccountId: String?) -> CLICheckResult {
+        cliCheckResult(activeAccountId: activeAccountId) {
+            SwapEngine.localRuntimeEvidenceSnapshot(runtimeKind: .localInteractiveCLI)
+        }
+    }
+
+    nonisolated static func cliCheckResult(
+        activeAccountId: String?,
+        runtimeEvidenceProvider: () -> CodexLocalRuntimeEvidenceSnapshot
+    ) -> CLICheckResult {
         guard let activeAccountId else {
             return CLICheckResult(status: .noActiveAccount, detail: nil)
         }
 
-        let processes = _runningCodexCLIProcesses()
-        let authAccountId = _readAuthAccountId()
-
-        if processes.isEmpty {
+        let runtimeEvidence = runtimeEvidenceProvider()
+        if runtimeEvidence.isComplete, runtimeEvidence.runtimes.isEmpty {
             return CLICheckResult(status: .cliNotRunning, detail: nil)
         }
-        let readiness = codexCLIProcessesAreHotSwapReady(
-            processes,
-            hotSwapAck: { SwapEngine.codexProcessHotSwapAckExists(pid: $0) }
-        )
+        let readiness = codexCLIRuntimeEvidenceIsHotSwapReady(runtimeEvidence)
         if !readiness.ready {
             return CLICheckResult(status: .hotSwapMissing, detail: readiness.detail)
         }
-        if authAccountId == activeAccountId {
+
+        guard let authIdentity = runtimeEvidence.runtimes.first?.observation.authFileIdentity,
+              !authIdentity.accountID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              runtimeEvidence.runtimes.allSatisfy({ evidence in
+                  evidence.observation.authFileIdentity == authIdentity
+                      && evidence.startupAcknowledgement.binding.authFileIdentity == authIdentity
+              }) else {
+            return CLICheckResult(
+                status: .hotSwapMissing,
+                detail: "Local runtime auth identity evidence is inconsistent."
+            )
+        }
+
+        if authIdentity.accountID == activeAccountId {
             return CLICheckResult(status: .ready, detail: nil)
         }
         return CLICheckResult(status: .authMismatch, detail: nil)
@@ -186,12 +227,21 @@ enum CLIStatusChecker {
 
     private nonisolated static func _checkDesktopApp() -> DesktopAppStatus {
         let patchStatus = DesktopPatchManager.currentStatus()
-        let runtimeState = DesktopPatchManager.runtimeHotSwapState()
-        let authWatcherReady = DesktopAppConnector.authWatcherReady()
+        let runtimeEvidence = SwapEngine.localRuntimeEvidenceSnapshot(
+            runtimeKind: .externalAppServer
+        )
+        let runtimeState: DesktopRuntimeHotSwapState
+        if !runtimeEvidence.isComplete {
+            runtimeState = .restartRequired
+        } else if runtimeEvidence.runtimes.isEmpty {
+            runtimeState = .unknown
+        } else {
+            runtimeState = .ready
+        }
 
         // Check WebSocket port first
         if let port = DesktopAppConnector.discoverPort() {
-            let hotSwapReady = runtimeState == .ready && authWatcherReady
+            let hotSwapReady = runtimeState == .ready
             let patchMessage = hotSwapReady
                 ? "Desktop app-server hot-swap ready."
                 : patchStatus.lastMessage
@@ -203,7 +253,7 @@ enum CLIStatusChecker {
                 patchMessage: patchMessage
             )
         }
-        let hotSwapReady = runtimeState == .ready && authWatcherReady
+        let hotSwapReady = runtimeState == .ready
         guard patchStatus.isCodexAppRunning else {
             return DesktopAppStatus(
                 isRunning: false,
@@ -222,9 +272,7 @@ enum CLIStatusChecker {
             case .restartRequired:
                 patchMessage = "Desktop app is patched on disk; restart Codex.app to activate hot-swap."
             case .ready:
-                patchMessage = authWatcherReady
-                    ? "Desktop app-server hot-swap ready."
-                    : "Desktop app patch is installed, but the live session has not armed auth watching yet."
+                patchMessage = "Desktop app-server hot-swap ready."
             case .unknown:
                 patchMessage = patchStatus.lastMessage
             }
@@ -239,83 +287,40 @@ enum CLIStatusChecker {
         )
     }
 
-    private nonisolated static func _runningCodexCLIProcesses() -> [CodexCLIProcessInfo] {
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-lf", "codex"],
-            timeout: 2
-        )
-        guard !result.timedOut, result.terminationStatus == 0 else { return [] }
-        return codexCLIProcesses(fromPGrepOutput: result.stdoutString)
-    }
-
-    private nonisolated static func _allRunningCLIsAreHotSwapCapable() -> Bool {
-        let processes = _runningCodexCLIProcesses()
-        guard !processes.isEmpty else { return false }
-        return codexCLIProcessesAreHotSwapReady(
-            processes,
-            hotSwapAck: { SwapEngine.codexProcessHotSwapAckExists(pid: $0) }
-        ).ready
-    }
-
-    nonisolated static func codexCLIProcessPIDsAreHotSwapReady(
-        _ pids: [Int32],
-        hotSwapSupport: (Int32) -> Bool = { SwapEngine.codexProcessHasHotSwapSupport(pid: $0) },
-        hotSwapAck: (Int32) -> Bool = { DesktopPatchManager.desktopHotSwapAckExists(pid: $0) }
-    ) -> Bool {
-        codexCLIProcessesAreHotSwapReady(
-            pids.map { CodexCLIProcessInfo(pid: $0, commandLine: "") },
-            hotSwapSupport: hotSwapSupport,
-            hotSwapAck: hotSwapAck,
-            detailProvider: { _, _, _ in nil }
-        ).ready
-    }
-
-    nonisolated static func codexCLIProcessesAreHotSwapReady(
-        _ processes: [CodexCLIProcessInfo],
-        hotSwapSupport: (Int32) -> Bool = { SwapEngine.codexProcessHasHotSwapSupport(pid: $0) },
-        hotSwapAck: (Int32) -> Bool = { DesktopPatchManager.desktopHotSwapAckExists(pid: $0) },
-        detailProvider: (Int32, String, Bool) -> String? = { pid, commandLine, missingPatch in
-            cliHotSwapBlockerDetail(pid: pid, commandLine: commandLine, missingPatch: missingPatch)
+    nonisolated static func codexCLIRuntimeEvidenceIsHotSwapReady(
+        _ snapshot: CodexLocalRuntimeEvidenceSnapshot,
+        detailProvider: (Int32, String) -> String? = { pid, commandLine in
+            cliHotSwapBlockerDetail(pid: pid, commandLine: commandLine, missingPatch: true)
         }
     ) -> CLIHotSwapReadiness {
-        guard !processes.isEmpty else {
+        guard snapshot.isComplete else {
+            return CLIHotSwapReadiness(
+                ready: false,
+                detail: "Local runtime discovery or identity evidence is incomplete."
+            )
+        }
+        guard !snapshot.runtimes.isEmpty else {
             return CLIHotSwapReadiness(ready: false, detail: nil)
         }
 
-        for process in processes {
-            let hasSupport = hotSwapSupport(process.pid)
-            guard hasSupport else {
+        for evidence in snapshot.runtimes {
+            let observation = evidence.observation
+            guard observation.target.runtimeKind == .localInteractiveCLI,
+                  SwapEngine.bindingMatchesObservation(
+                    evidence.startupAcknowledgement.binding,
+                    observation
+                  ) else {
+                let process = observation.target.process
                 return CLIHotSwapReadiness(
                     ready: false,
-                    detail: detailProvider(process.pid, process.commandLine, true)
-                )
-            }
-            guard hotSwapAck(process.pid) else {
-                return CLIHotSwapReadiness(
-                    ready: false,
-                    detail: detailProvider(process.pid, process.commandLine, false)
+                    detail: detailProvider(
+                        process.identity.pid,
+                        process.arguments.joined(separator: " ")
+                    )
                 )
             }
         }
         return CLIHotSwapReadiness(ready: true, detail: nil)
-    }
-
-    nonisolated static func codexCLIProcessPIDs(fromPGrepOutput output: String) -> [Int32] {
-        codexCLIProcesses(fromPGrepOutput: output).map(\.pid)
-    }
-
-    nonisolated static func codexCLIProcesses(fromPGrepOutput output: String) -> [CodexCLIProcessInfo] {
-        output.components(separatedBy: "\n").compactMap { line in
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return nil }
-            let parts = trimmed.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-            guard parts.count == 2, let pid = Int32(parts[0]) else { return nil }
-            let commandLine = String(parts[1])
-            return isCodexCLICommandLine(commandLine)
-                ? CodexCLIProcessInfo(pid: pid, commandLine: commandLine)
-                : nil
-        }
     }
 
     private nonisolated static func cliHotSwapBlockerDetail(
@@ -368,10 +373,22 @@ enum CLIStatusChecker {
     nonisolated static func isCodexCLICommandLine(_ commandLine: String) -> Bool {
         let lower = commandLine.lowercased()
         guard lower.contains("codex") else { return false }
+        let executableToken = lower
+            .split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            .first
+            .map(String.init) ?? ""
+        let executableName = (executableToken as NSString).lastPathComponent
+        if executableName == "node"
+            || executableName == "bash"
+            || executableName == "zsh"
+            || executableName == "sh" {
+            return false
+        }
 
         let excludedFragments = [
             "codexswitch.app",
             "codexswitch-cli",
+            "codex-code-mode-host",
             "/contents/macos/codexswitch",
             "pgrep",
             " app-server",
@@ -401,13 +418,5 @@ enum CLIStatusChecker {
             || lower.hasSuffix("/codex")
             || lower.hasPrefix("codex ")
             || lower == "codex"
-    }
-
-    private nonisolated static func _readAuthAccountId() -> String? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
-              let authFile = try? JSONDecoder().decode(AuthFile.self, from: data) else {
-            return nil
-        }
-        return authFile.tokens.accountId
     }
 }

@@ -115,11 +115,7 @@ struct LinuxDevboxStatusTests {
 
     @Test("Remote usage report Python script compiles")
     func remoteUsageReportPythonScriptCompiles() throws {
-        let command = LinuxDevboxMonitor.remoteUsageReportCommand(days: 30)
-        let marker = "python3 - <<'PY'\n"
-        let start = try #require(command.range(of: marker)?.upperBound)
-        let end = try #require(command.range(of: "\nPY", options: .backwards)?.lowerBound)
-        let script = String(command[start..<end])
+        let script = try remoteUsageScript()
         let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("codexswitch-remote-usage-\(UUID().uuidString).py")
         defer { try? FileManager.default.removeItem(at: tempURL) }
@@ -132,6 +128,57 @@ struct LinuxDevboxStatusTests {
         )
 
         #expect(result.terminationStatus == 0)
+    }
+
+    @Test("Remote usage report keeps missing model evidence unknown and emits aggregates only")
+    func remoteUsageReportKeepsMissingModelEvidenceUnknown() throws {
+        let home = try isolatedHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sessions = home.appendingPathComponent(".codex/sessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let sessionID = "11111111-1111-1111-1111-aaaaaaaaaaaa"
+        let session = sessions.appendingPathComponent("rollout-\(sessionID).jsonl")
+        try """
+        {"timestamp":"2026-07-13T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"cached_input_tokens":800,"output_tokens":40,"reasoning_output_tokens":10}}}}
+        """.write(to: session, atomically: true, encoding: .utf8)
+
+        let (report, output) = try runRemoteUsageReport(home: home)
+
+        #expect(report.models.map(\.model) == ["unknown"])
+        #expect(report.total.inputTokens == 1_200)
+        #expect(!output.contains(sessionID))
+        #expect(!output.contains(session.path))
+    }
+
+    @Test("Remote usage report applies long-context capability to newer GPT-5 models")
+    func remoteUsageReportAccountsForNewerGPT5LongContext() throws {
+        let home = try isolatedHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let codexDirectory = home.appendingPathComponent(".codex")
+        try FileManager.default.createDirectory(at: codexDirectory, withIntermediateDirectories: true)
+        let database = codexDirectory.appendingPathComponent("logs_2.sqlite")
+        let response = """
+        {"type":"response.completed","response":{"id":"resp-sol","model":"gpt-5.6-sol","usage":{"input_tokens":300001,"input_tokens_details":{"cached_tokens":250000},"output_tokens":1000,"output_tokens_details":{"reasoning_tokens":250}}}}
+        """
+        let setup = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            arguments: [
+                "-c",
+                "import sqlite3,sys,time; c=sqlite3.connect(sys.argv[1]); c.execute('create table logs (ts integer, target text, feedback_log_body text)'); c.execute('insert into logs values (?, ?, ?)', (int(time.time()), 'fixture', sys.argv[2])); c.commit()",
+                database.path,
+                response,
+            ],
+            timeout: 5
+        )
+        try #require(setup.terminationStatus == 0)
+
+        let (report, _) = try runRemoteUsageReport(home: home)
+        let usage = try #require(report.models.first)
+
+        #expect(usage.model == "gpt-5.6-sol")
+        #expect(usage.longContextInputTokens == 300_001)
+        #expect(usage.longContextCachedInputTokens == 250_000)
+        #expect(usage.longContextOutputTokens == 1_000)
     }
 
     @Test("Remote account state script compiles and does not request token fields")
@@ -157,5 +204,38 @@ struct LinuxDevboxStatusTests {
         )
 
         #expect(result.terminationStatus == 0)
+    }
+
+    private func remoteUsageScript() throws -> String {
+        let command = LinuxDevboxMonitor.remoteUsageReportCommand(days: 30)
+        let marker = "python3 - <<'PY'\n"
+        let start = try #require(command.range(of: marker)?.upperBound)
+        let end = try #require(command.range(of: "\nPY", options: .backwards)?.lowerBound)
+        return String(command[start..<end])
+    }
+
+    private func isolatedHome() throws -> URL {
+        let home = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("codexswitch-remote-usage-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        return home
+    }
+
+    private func runRemoteUsageReport(home: URL) throws -> (CodexTokenUsageReport, String) {
+        let script = home.appendingPathComponent("remote-usage.py")
+        try remoteUsageScript().write(to: script, atomically: true, encoding: .utf8)
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            arguments: [script.path],
+            timeout: 5,
+            environment: [
+                "HOME": home.path,
+                "PATH": "/usr/bin:/bin",
+            ]
+        )
+        try #require(result.terminationStatus == 0)
+        let output = result.stdoutString
+        let report = try JSONDecoder().decode(CodexTokenUsageReport.self, from: result.stdout)
+        return (report, output)
     }
 }

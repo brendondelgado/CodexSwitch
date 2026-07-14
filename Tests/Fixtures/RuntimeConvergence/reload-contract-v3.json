@@ -1,0 +1,62 @@
+{
+  "requestArtifact": {
+    "binding": {
+      "contractVersion": 3,
+      "processIdentity": {
+        "pid": 4242,
+        "ownerUID": 501,
+        "executablePath": "/opt/codexswitch/runtime/codex",
+        "startSeconds": 1770000000,
+        "startMicroseconds": 123456
+      },
+      "kernelExecutableIdentity": {
+        "canonicalPath": "/opt/codexswitch/runtime/codex",
+        "device": 16777234,
+        "inode": 987654321
+      },
+      "runtimeKind": "external-app-server",
+      "authFileIdentity": {
+        "canonicalPath": "/Users/fixture/.codex/auth.json",
+        "device": 16777234,
+        "inode": 123456789,
+        "accountID": "provider-account-01",
+        "completeTokenFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "requestNonce": "fixture-request-0001",
+      "issuedAtUnixMilliseconds": 1770000001250
+    }
+  },
+  "acknowledgement": {
+    "binding": {
+      "contractVersion": 3,
+      "processIdentity": {
+        "pid": 4242,
+        "ownerUID": 501,
+        "executablePath": "/opt/codexswitch/runtime/codex",
+        "startSeconds": 1770000000,
+        "startMicroseconds": 123456
+      },
+      "kernelExecutableIdentity": {
+        "canonicalPath": "/opt/codexswitch/runtime/codex",
+        "device": 16777234,
+        "inode": 987654321
+      },
+      "runtimeKind": "external-app-server",
+      "authFileIdentity": {
+        "canonicalPath": "/Users/fixture/.codex/auth.json",
+        "device": 16777234,
+        "inode": 123456789,
+        "accountID": "provider-account-01",
+        "completeTokenFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "requestNonce": "fixture-request-0001",
+      "issuedAtUnixMilliseconds": 1770000001250
+    },
+    "acknowledgedAtUnixMilliseconds": 1770000001500,
+    "loadedTokenFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "activeTokenFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "frontendNotified": true,
+    "frontendWriteCount": 1,
+    "authGeneration": 17
+  }
+}

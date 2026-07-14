@@ -1,0 +1,19 @@
+[Unit]
+Description=SIGNUL Codex app-server remote-control endpoint
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/signul/SIGNUL
+Environment=CODEX_HOME=/home/signul/.codex
+EnvironmentFile=-/home/signul/SIGNUL/.env.vps.pipeline
+UMask=0077
+ExecStart=/usr/bin/flock --shared --no-fork %h/.local/share/codexswitch/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork %h/.codex/app-server-daemon/app-server.pid.lock %h/.local/share/codexswitch/current/patched-codex/codex -c features.local_thread_store_compression=true app-server --remote-control --listen ws://127.0.0.1:8390
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=120
+SendSIGKILL=no
+
+[Install]
+WantedBy=default.target

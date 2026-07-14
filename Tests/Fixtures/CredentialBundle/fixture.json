@@ -1,0 +1,17 @@
+{
+  "passphrase": "fixture-passphrase-2026",
+  "saltBase64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "nonceBase64": "ICEiIyQlJicoKSor",
+  "createdAt": "2099-01-01T00:00:00Z",
+  "expiresAt": "2099-01-01T00:30:00Z",
+  "hostName": "fixture-mac",
+  "account": {
+    "id": "11111111-2222-3333-4444-555555555555",
+    "email": "fixture@example.com",
+    "accessToken": "fixture-access-token",
+    "refreshToken": "fixture-refresh-token",
+    "idToken": "fixture-id-token",
+    "accountId": "fixture-account-id",
+    "planType": "plus"
+  }
+}

@@ -22,6 +22,18 @@ log() {
   chmod 600 "$LOG" 2>/dev/null || true
 }
 
+local_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
 : > "$LIST"
 chmod 600 "$LIST"
 if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "cd '$REMOTE_ROOT/outbox' 2>/dev/null && find . -maxdepth 1 -type f -print" > "$LIST.tmp"; then
@@ -41,11 +53,23 @@ if rsync -az --partial --timeout=30 -e ssh --files-from="$LIST" "$HOST:$REMOTE_R
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     name="${rel#./}"
-    case "$name" in ""|.|..|*/*|*\\*) log "skip-unsafe-delete name=$name"; continue ;; esac
+    case "$name" in ""|.|..|*[!A-Za-z0-9._-]*) log "skip-unsafe-delete name=$name"; continue ;; esac
     if [ -f "$DEST/$name" ]; then
-      printf '%s\n' "$name" >> "$DELETE_LIST"
+      local_hash="$(local_sha256 "$DEST/$name")"
       remote_path="$REMOTE_ROOT/outbox/$name"
-      ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "rm -f -- $(printf '%q' "$remote_path")" || log "remote-delete-failed name=$name"
+      delete_cmd=$(
+        # $actual is evaluated on the remote host.
+        # shellcheck disable=SC2016
+        printf 'set -e; actual=$(sha256sum -- %s | awk '\''{print $1}'\''); [ "$actual" = %s ]; rm -f -- %s' \
+          "$(shell_quote "$remote_path")" \
+          "$(shell_quote "$local_hash")" \
+          "$(shell_quote "$remote_path")"
+      )
+      if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "$delete_cmd"; then
+        printf '%s\n' "$name" >> "$DELETE_LIST"
+      else
+        log "remote-delete-refused name=$name reason=content_changed_or_unavailable"
+      fi
     else
       log "skip-delete-missing-local name=$name"
     fi

@@ -1,0 +1,13 @@
+{
+  "fiveHour": {
+    "usedPercent": 0,
+    "windowDurationMins": 0,
+    "resetsAt": 799048365.342368
+  },
+  "weekly": {
+    "usedPercent": 19,
+    "windowDurationMins": 10080,
+    "resetsAt": 799653165.342368
+  },
+  "fetchedAt": 799048365.342368
+}

@@ -58,7 +58,8 @@ struct DesktopRuntimeDiagnostics: Sendable, Equatable {
         let commandLine = String(parts[1])
         let lower = commandLine.lowercased()
         guard lower.contains(" app-server") else { return nil }
-        guard !lower.contains("codexswitch"), !lower.contains("pgrep") else { return nil }
+        guard !lower.contains("/applications/codexswitch.app/contents/macos/codexswitch"),
+              !lower.contains("pgrep") else { return nil }
 
         let executablePath = executablePath(fromAppServerCommandLine: commandLine)
         let classification = classifyAppServerPath(executablePath ?? commandLine)
@@ -74,7 +75,14 @@ struct DesktopRuntimeDiagnostics: Sendable, Equatable {
 
     nonisolated static func classifyAppServerPath(_ path: String) -> DesktopRuntimeAppServerClassification {
         let lower = path.lowercased()
+        if lower.contains("/applications/chatgpt.app/contents/resources/codex") {
+            return .desktopAppServer
+        }
         if lower.contains("/applications/codex.app/contents/resources/codex") {
+            return .desktopAppServer
+        }
+        if lower.contains("/.local/share/codexswitch/prepared-codex/")
+            || lower.contains("/.local/share/codexswitch/patched-codex/codex") {
             return .desktopAppServer
         }
         if lower.contains("/developer/codex/codex-rs/target/fork-release/codex") {
@@ -107,7 +115,10 @@ struct DesktopRuntimeDiagnostics: Sendable, Equatable {
         }
     }
 
-    private nonisolated static let codexAppPath = "/Applications/Codex.app"
+    private nonisolated static var codexAppPath: String {
+        CodexDesktopAppLocator.locate()?.appPath
+            ?? CodexDesktopAppLocator.defaultAppPaths[0]
+    }
 
     private nonisolated static func executablePath(fromAppServerCommandLine commandLine: String) -> String? {
         guard let range = commandLine.range(of: " app-server") else { return nil }

@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import os
 from unittest.mock import patch
 import tempfile
@@ -20,6 +21,41 @@ FAST_FILE_CONTENT = (
     'function G(e){return e.additionalSpeedTiers?.includes(qe)===!0}'
     'function Qe(){let t=Xe(),{data:n}=Ve(),r;return r=t&&(n?.modelsByType.models.some(G)??!1),r}'
     'export{Qe as H};'
+)
+
+CHATGPT_2670751957_FAST_CONTENT = (
+    'import{a as o}from"./runtime.js";'
+    'import{b as r}from"./models.js";'
+    'function XJt(e){let a=e.authMethod===`chatgpt`,u=e.isLoading,c=e.accountInfo,'
+    'd=a&&!u&&c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1;'
+    'return{isServiceTierAllowed:d,isLoading:u}}'
+    'function QJt(e){return e?.requirements?.featureRequirements?.fast_mode!==!1}'
+    'function AD(e,t){let n=t?.trim().toLowerCase();'
+    'return e===`priority`||e===`fast`||n===`fast`?`fast`:null}'
+    'function TBt(e){return e.name}function EBt(e){return e.description}'
+    'var MD={standardDescription:`Default speed`,standardLabel:`Standard`};'
+    'function OBt(e){return[{description:MD.standardDescription,iconKind:null,'
+    'label:MD.standardLabel,tier:null,value:null},...(e?.serviceTiers??[]).map('
+    'e=>({description:EBt(e),iconKind:AD(e.id,e.name),label:TBt(e),tier:e,value:e.id}))]}'
+    'function XOa(e){let{isServiceTierAllowed:b}=XJt(e),'
+    'v={availableOptions:OBt(e.model)},'
+    'K=v.availableOptions.find(e=>e.iconKind===`fast`)?.value,'
+    'se=b&&v.availableOptions.length>1;'
+    'return{fast:K,serviceTierOptions:se?v.availableOptions:[],'
+    'onSelectServiceTier:se?e=>e:void 0}}export{XOa as X};'
+)
+
+CHATGPT_2670762119_SPLIT_FAST_CONTENT = (
+    'import{a as o}from"./runtime.js";'
+    'import{b as r}from"./models.js";'
+    'var vz={standardDescription:`Default speed`,standardLabel:`Standard`};'
+    'function Cdt(e){return e.name}function wdt(e){return e.description}'
+    'function gz(e,t){return e===`priority`||t===`Fast`?`fast`:null}'
+    'function Edt(e){return[{description:vz.standardDescription,iconKind:null,'
+    'label:vz.standardLabel,tier:null,value:null},...(e?.serviceTiers??[]).map('
+    'e=>({description:wdt(e),iconKind:gz(e.id,e.name),label:Cdt(e),tier:e,value:e.id}))]}'
+    'function Tdt(e,t){return e?.serviceTiers?.find(e=>e.id===t)??null}'
+    'export{Edt as E,Tdt as T};'
 )
 
 APP_SERVER_LAUNCHER_CONTENT = (
@@ -128,6 +164,158 @@ PLUGIN_LIST_RENDERER_CONTENT = (
     "\"list-plugins\":i9((e,{hostId:t,...n})=>e.sendRequest(`plugin/list`,n))"
 )
 
+REMOTE_RECENTS_CONTENT = (
+    "import{x as x}from\"./vscode-api.js\";"
+    "function N(e){return()=>{for(let t of e)t()}}"
+    "function P(e){return()=>{}}"
+    "function R(e){}"
+    "function I(e){return[]}"
+    "function z(e){return new Set(JSON.parse(e))}"
+    "function X(e){let t=(0,k.c)(23),n=i(o),s=V(),"
+    "{enabledRemoteHostIdSet:c}=T(),l;t[0]===c?l=t[1]:(l=B(c),t[0]=c,t[1]=l);"
+    "let u=l,d=r(w,`2413345355`),f=a(E),p=d?D:f,m=x(),h;"
+    "let g=(0,A.useRef)(h),_,v;"
+    "t[3]!==s||t[4]!==u||t[5]!==m||t[6]!==e||t[7]!==n||t[8]!==p?"
+    "(_=()=>{let t=()=>{let t=z(u);"
+    "m.setQueryData([e,p,u],I({appServerRegistry:s,enabledRemoteHostIds:t,sortKey:p})),"
+    "R({scope:n,appServerRegistry:s,sortKey:p,refreshesInFlightHostIds:g.current})};"
+    "return t(),P({appServerRegistry:s,onStoreChange:t,subscribeToManager:(t,n)=>{"
+    "switch(e){case`recent-conversations`:return t.addAnyConversationCallback(n);"
+    "case`recent-conversations-meta`:return t.addAnyConversationMetaCallback(n)}}})},"
+    "v=[s,u,m,e,n,p],t[3]=s,t[4]=u,t[5]=m,t[6]=e,t[7]=n,t[8]=p,t[9]=_,t[10]=v):"
+    "(_=t[9],v=t[10]),(0,A.useEffect)(_,v);"
+    "let O={queryKey:[e,p,u],staleTime:C.INFINITE,queryFn:async()=>[]};return b(O)}"
+    "function visible(){return `recent-conversations refresh-recent-conversations-for-host "
+    "hasFetchedRecentConversations addAnyConversationCallback`}"
+)
+
+CODEX_4753_REMOTE_RECENTS_CONTENT = (
+    "function W7(e){return()=>{for(let t of e)t()}}"
+    "function G7(e){return()=>{}}"
+    "function Rde(e){}"
+    "function Aie(e){return[]}"
+    "function J7(e){return new Set(JSON.parse(e))}"
+    "function Q7(e){let t=(0,$7.c)(23),n=Qt(L),r=Y7(),"
+    "{enabledRemoteHostIdSet:i}=c7(),a;t[0]===i?a=t[1]:(a=zde(i),t[0]=i,t[1]=a);"
+    "let o=a,s=yt(Ns,`12346831`),c=zt(O7),l=s?$A:c,u=rt(),d;"
+    "t[2]===Symbol.for(`react.memo_cache_sentinel`)?(d=new Set,t[2]=d):d=t[2];"
+    "let f=(0,e9.useRef)(d),p,m;"
+    "t[3]!==r||t[4]!==o||t[5]!==u||t[6]!==e||t[7]!==n||t[8]!==l?"
+    "(p=()=>{let t=()=>{let t=J7(o);"
+    "u.setQueryData([e,l,o],Aie({appServerRegistry:r,enabledRemoteHostIds:t,sortKey:l})),"
+    "Rde({scope:n,appServerRegistry:r,sortKey:l,refreshesInFlightHostIds:f.current})};"
+    "return t(),G7({appServerRegistry:r,onStoreChange:t,subscribeToManager:(t,n)=>{"
+    "switch(e){case`recent-conversations`:return t.addAnyConversationCallback(n);"
+    "case`recent-conversations-meta`:return t.addAnyConversationMetaCallback(n)}}})},"
+    "m=[r,o,u,e,n,l],t[3]=r,t[4]=o,t[5]=u,t[6]=e,t[7]=n,t[8]=l,t[9]=p,t[10]=m):"
+    "(p=t[9],m=t[10]),(0,e9.useEffect)(p,m);"
+    "return b({queryKey:[e,l,o],staleTime:C.INFINITE,queryFn:async()=>[]})}"
+    "function visible(){return `recent-conversations refresh-recent-conversations-for-host "
+    "hasFetchedRecentConversations addAnyConversationCallback`}"
+)
+
+CODEX_5018_REMOTE_RECENTS_SIGNAL_CONTENT = (
+    "function qmt(e,t,n,r){}"
+    "P5=qn(X,e=>[],{onMount:(e,t)=>{let{key:n}=t,r=[],"
+    "i=t.watch(({get:i})=>{let a=i(O5,n),o=i=>{e(i),qmt(t,n,r,i),r=i};"
+    "if(o(a?.getRecentConversations().map(({id:e})=>e)??[]),a!=null)"
+    "return a.addAnyConversationMetaCallback(e=>{o(e.map(({id:e})=>e))})});"
+    "return()=>{i(),qmt(t,n,r,[])}}});"
+    "class Host{refreshRecentConversations(e={}){return dH(`refresh-recent-conversations-for-host`,"
+    "{hostId:this.hostId,...e})}addAnyConversationCallback(e){return()=>{}}"
+    "get hasFetchedRecentConversations(){return true}}"
+    "function visible(){return `recent-conversations hasFetchedRecentConversations "
+    "addAnyConversationCallback`}"
+)
+
+CODEX_5042_MODEL_PICKER_CONTENT = (
+    "function DM(e){if(!e.trimStart().toLowerCase().startsWith(`gpt`))return e;"
+    "return e}"
+    "function A8n(e){return e?.flatMap(({displayName:e,model:t,"
+    "supportedReasoningEfforts:n})=>{let r=e==null?`Custom`:"
+    "DM(e).replace(/^GPT-/iu,``),i=n.flatMap(({reasoningEffort:e})=>[e]);"
+    "return i.map(e=>({id:`${t}:${e}`,model:t,modelLabel:r,"
+    "reasoningEffort:e}))})??[]}"
+    "var N8n=[{id:`gpt-5.6-sol:medium`,model:`gpt-5.6-sol`,"
+    "modelLabel:`5.6 Sol`,reasoningEffort:`medium`}];"
+)
+
+CODEX_5059_MODEL_AVAILABILITY_CONTENT = (
+    "function Jv({authMethod:e,availableModels:t,defaultModel:n,"
+    "enabledReasoningEfforts:r,includeUltraReasoningEffort:i,models:a,"
+    "useHiddenModels:o}){let s=[],c=null,l=o&&e!==`amazonBedrock`;"
+    "return a.forEach(n=>{if(l?t.has(n.model):!n.hidden){let a={...n};"
+    "s.push(a),n.isDefault&&(c=a)}}),{models:s,defaultModel:c}}"
+)
+
+CODEX_5059_MAX_EFFORT_CONTENT = (
+    "function Jv({authMethod:e,availableModels:t,defaultModel:n,"
+    "enabledReasoningEfforts:r,includeUltraReasoningEffort:i,models:a,"
+    "useHiddenModels:o}){let s=[],c=null,l=o&&e!==`amazonBedrock`,"
+    "u=a.some(e=>e.supportedReasoningEfforts.some(({reasoningEffort:e})=>e===`max`)),"
+    "d=i&&a.some(e=>e.supportedReasoningEfforts.some(({reasoningEffort:e})=>e===`ultra`));"
+    "return a.forEach(n=>{if(l?t.has(n.model):!n.hidden){let t=i?"
+    "n.supportedReasoningEfforts:n.supportedReasoningEfforts.filter("
+    "({reasoningEffort:e})=>e!==`ultra`),a=t.filter(({reasoningEffort:e})=>"
+    "vg(e)&&r.has(e)),o={...n,supportedReasoningEfforts:a};s.push(o)}}),"
+    "{models:s,defaultModel:c,hasModelSupportingMaxReasoningEffort:u,"
+    "hasModelSupportingUltraReasoningEffort:d}}"
+    "function PRe(e,t){return e.flatMap((e,n)=>t?.some(t=>t.model===e.model&&"
+    "t.supportedReasoningEfforts.some(({reasoningEffort:t})=>"
+    "t===e.reasoningEffort))?[{...e,powerSettingIndex:n}]:[])}"
+    "var FRe=[{id:`gpt-5.6-sol:xhigh`,model:`gpt-5.6-sol`,"
+    "modelLabel:`5.6 Sol`,reasoningEffort:`xhigh`},"
+    "{id:`gpt-5.6-sol:ultra`,model:`gpt-5.6-sol`,"
+    "modelLabel:`5.6 Sol`,reasoningEffort:`ultra`}];"
+)
+
+CODEX_5211_MODEL_FILTER_CONTENT = (
+    "function Ki(e){return e===`medium`||e===`xhigh`||e===`max`||e===`ultra`}"
+    "function Zi({authMethod:e,availableModels:t,defaultModel:n,"
+    "enabledReasoningEfforts:r,includeUltraReasoningEffort:i,models:a,"
+    "useHiddenModels:o}){let s=[],c=null,l=o&&e!==`amazonBedrock`,"
+    "u=a.some(e=>e.supportedReasoningEfforts.some(({reasoningEffort:e})=>e===`max`));"
+    "return a.forEach(n=>{if(l?t.has(n.model):!n.hidden){let t="
+    "n.supportedReasoningEfforts.filter(({reasoningEffort:e})=>Ki(e)&&r.has(e)),"
+    "o={...n,supportedReasoningEfforts:t};s.push(o)}}),"
+    "{models:s,defaultModel:c,hasModelSupportingMaxReasoningEffort:u}}"
+)
+
+CODEX_5211_POWER_PRESET_CONTENT = (
+    'import{a as o}from"./models.js";'
+    "var Is=[{id:`gpt-5.6-sol:xhigh`,model:`gpt-5.6-sol`,"
+    "modelLabel:`5.6 Sol`,reasoningEffort:`xhigh`}],"
+    "Ls={id:`gpt-5.6-sol:ultra`,model:`gpt-5.6-sol`,"
+    "modelLabel:`5.6 Sol`,reasoningEffort:`ultra`};"
+)
+
+CODEX_5059_SELECTED_MODEL_LABEL_CONTENT = (
+    "function zE(e){return e}"
+    "function o6(e){let t=cache(),{model:n,displayName:r,labelClassName:i,"
+    "serviceTierIconKind:a,stripGptPrefix:o}=e,s=a===void 0?null:a,"
+    "c=o===void 0?!1:o,l;if(r!=null){let e;if(t[0]!==r||t[1]!==c){"
+    "let n=zE(r);e=c?n.replace(/^GPT-/iu,``):n,t[0]=r,t[1]=c,t[2]=e}"
+    "else e=t[2];l=e}else if(n){let e;t[3]===Symbol.for(`react.memo_cache_sentinel`)"
+    "?(e=jsx(q,{id:`composer.mode.local.model.custom`,defaultMessage:`Custom`,"
+    "description:`Custom model from config`}),t[3]=e):e=t[3],l=e}else l=n;"
+    "return l}"
+)
+
+CODEX_5059_REMOTE_MODEL_RECONNECT_CONTENT = (
+    "function xhe(){let e=scope(),t=queryClient(),n=registry(),r=false,i=null,"
+    "a=null,o=null,s={current:new Map},c={current:new Set};"
+    "async function d(r){let a=s.current.get(r);if(a!=null&&await a,!c.current.has(r)){"
+    "c.current.add(r);try{await Promise.all(["
+    "t.invalidateQueries({queryKey:[`user-saved-config`]}),"
+    "t.invalidateQueries({queryKey:ES(r)}),"
+    "t.invalidateQueries({queryKey:bC(r)})]);"
+    "let a=n.getForHostIdOrThrow(r);log(`app_server_restart_recovery_done`,a)}"
+    "finally{c.current.delete(r)}}}"
+    "return jt(`codex-app-server-initialized`,e=>{r||d(e.hostId)},"
+    "[r,i,a,o?.roots,n,t,e]),null}"
+    "function listModels(e){return call(`list-models-for-host`,e)}"
+)
+
 MODERN_USE_AUTH_CONTENT = (
     'import{s as e}from"./chunk-Bj-mKKzh.js";'
     'import{Ho as t}from"./app-server-manager-signals-BOGyjFm3.js";'
@@ -158,16 +346,181 @@ MODERN_USE_AUTH_CONTENT = (
     "export{p as u};"
 )
 
+WEAKMAP_USE_AUTH_CONTENT = (
+    'import{s as e}from"./chunk-Cq_f4orQ.js";'
+    'import{n as t}from"./jsx-runtime-DXKlqYIQ.js";'
+    'import{R as n}from"./app-scope-DbsKKT7R.js";'
+    'import{ds as r}from"./app-server-manager-signals-DoSKsUgQ.js";'
+    'import{i}from"./app-server-manager-hooks-D3kQaoB-.js";'
+    'import{n as a}from"./use-is-copilot-api-available-BvFkK8hA.js";'
+    'import{t as o}from"./use-global-state-BKadSfwQ.js";'
+    "var s=e(t(),1),c=(0,s.createContext)(void 0),l=(0,s.createContext)(null),"
+    "u=n(),d=2e3,f=new WeakMap;"
+    "function p(e,t){let n=(0,u.c)(14),"
+    "{isCopilotApiAvailable:r,useCopilotAuthIfAvailable:i,"
+    "shouldUseWindowsStartupAuthTimeout:a,onLogout:o}=t,"
+    "[c,l]=(0,s.useState)(e!=null),[f,p]=(0,s.useState)(null),v,b;"
+    "let x,S;x=()=>{if(e==null)return;let t=!1,n=!1,s=null,"
+    "c=()=>{g(e).then(e=>{n=!0,s!=null&&clearTimeout(s),"
+    "!t&&(l(!1),p(y(e,{isCopilotApiAvailable:r,useCopilotAuthIfAvailable:i})))})"
+    ".catch(()=>{n=!0,s!=null&&clearTimeout(s),t||(l(!1),p(h))})};"
+    "a&&(s=setTimeout(()=>{t||n||(l(!1),p(m))},d)),c();"
+    "let u=e=>{p(t=>e.authMethod==null&&t?.authMethod!=null?(o?.(),_()):"
+    "t==null?e.authMethod==null?t:{..._(),authMethod:e.authMethod}:"
+    "{...t,authMethod:e.authMethod??null}),c()};"
+    "return e.addAuthStatusCallback(u),()=>{t=!0,s!=null&&clearTimeout(s),"
+    "e.removeAuthStatusCallback(u)}},S=[e,r,o,a,i],(0,s.useEffect)(x,S);"
+    "return{isLoading:c,authState:f}}"
+    "function g(e){let t=f.get(e);if(t!=null)return t;"
+    "let n=e.getAccount().finally(()=>{f.delete(e)});return f.set(e,n),n}"
+    "function _(){return{openAIAuth:null,authMethod:null,requiresAuth:!0,email:null}}"
+    "function y(e,t){return{authMethod:e.account?.type}}"
+    "function h(e){return e??_()}"
+    "function m(e){return e??_()}"
+    "export{l as a,p as i,c as o};"
+)
+
+CODEX_4753_WEAKMAP_AUTH_CONTENT = (
+    "function query(){let t=n();t.invalidateQueries({queryKey:r(`account-info`)})}"
+    "var hd,gd=e((()=>{sd(),hd=new WeakMap}));"
+    "function f9(e,t){let n=(0,m9.c)(14),"
+    "{isCopilotApiAvailable:r,useCopilotAuthIfAvailable:i,"
+    "shouldUseWindowsStartupAuthTimeout:a,onLogout:o}=t,"
+    "[s,c]=(0,h9.useState)(e!=null),[l,u]=(0,h9.useState)(null),d,f;"
+    "p=()=>{if(e==null)return;let t=!1,n=!1,s=null,"
+    "l=()=>{Zde(e).then(e=>{n=!0,u($de(e,{isCopilotApiAvailable:r,"
+    "useCopilotAuthIfAvailable:i}))}).catch(()=>{n=!0,u(Xde)})};"
+    "l();let d=e=>{u(t=>e.authMethod==null&&t?.authMethod!=null?"
+    "(o?.(),p9()):t==null?e.authMethod==null?t:{...p9(),authMethod:e.authMethod}:"
+    "{...t,authMethod:e.authMethod??null}),l()};"
+    "return e.addAuthStatusCallback(d),()=>{t=!0,s!=null&&clearTimeout(s),"
+    "e.removeAuthStatusCallback(d)}}}"
+    "function Zde(e){let t=_9.get(e);if(t!=null)return t;"
+    "let n=e.getAccount().finally(()=>{_9.delete(e)});return _9.set(e,n),n}"
+    "function p9(){return{openAIAuth:null,authMethod:null,requiresAuth:!0,email:null}}"
+    "function $de(e,t){return{authMethod:e.account?.type}}"
+    "function Xde(e){return e??p9()}"
+    "var m9,h9,g9,_9,v9=e((()=>{m9=Fe(),h9=n(S(),1),g9=2e3,_9=new WeakMap}));"
+    "export{f9 as i};"
+)
+
 
 class PatchAsarTests(unittest.TestCase):
-    def test_cli_has_sighup_patch_requires_marker_and_reload_log(self):
+    def test_resolve_asar_cmd_accepts_explicit_cached_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asar_js = Path(tmp) / "asar.js"
+            asar_js.write_text("// fixture")
+            with patch.dict(
+                os.environ,
+                {"CODEXSWITCH_ASAR_JS": str(asar_js)},
+            ), patch.object(
+                patch_asar.shutil,
+                "which",
+                return_value="/usr/local/bin/node",
+            ):
+                self.assertEqual(
+                    patch_asar.resolve_asar_cmd(),
+                    ["/usr/local/bin/node", str(asar_js)],
+                )
+
+    def test_resolve_default_app_path_prefers_unified_chatgpt_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "Codex.app"
+            unified = root / "ChatGPT.app"
+            legacy.mkdir()
+            unified.mkdir()
+
+            resolved = patch_asar.resolve_default_app_path([unified, legacy])
+
+            self.assertEqual(resolved, unified)
+
+    def test_cli_has_sighup_patch_requires_complete_runtime_contract(self):
+        required_markers = (
+            b"sighup-verified-tui",
+            b"SIGHUP: auth reloaded",
+            b"hotswap-ack",
+            b"CodexSwitch rotated accounts after a usage limit",
+            b"CodexSwitch rotated accounts after an auth failure",
+            b"Auth changed, opening new WebSocket with fresh credentials",
+            b"codexswitch-runtime-convergence-v3",
+            b"codexswitch-runtime-rotation-handoff-v1",
+            b"CodexSwitch account/updated frontend write acknowledged after auth reload",
+            b"codexswitch-hotswap-contract-v3",
+            b"codexswitch-hotswap-cli-contract-v3",
+            b"Usage: /goal <objective>",
+        )
         with tempfile.TemporaryDirectory() as tmp:
             cli = Path(tmp) / "codex"
-            cli.write_bytes(b"sighup-verified-tui\0SIGHUP: auth reloaded from disk")
+            complete_contract = b"\0".join(required_markers)
+            cli.write_bytes(complete_contract)
             self.assertTrue(patch_asar.cli_has_sighup_patch(cli))
 
-            cli.write_bytes(b"sighup-verified-tui only")
+            for missing_marker in required_markers:
+                with self.subTest(missing_marker=missing_marker):
+                    cli.write_bytes(
+                        b"\0".join(
+                            marker for marker in required_markers if marker != missing_marker
+                        )
+                    )
+                    self.assertFalse(patch_asar.cli_has_sighup_patch(cli))
+
+            cli.write_bytes(
+                complete_contract.replace(
+                    b"CodexSwitch account/updated frontend write acknowledged after auth reload",
+                    b"CodexSwitch account/updated broadcast after auth reload",
+                )
+            )
             self.assertFalse(patch_asar.cli_has_sighup_patch(cli))
+
+            cli.write_bytes(
+                complete_contract.replace(
+                    b"Usage: /goal <objective>",
+                    b"Pursuing goal\0thread/goal/set",
+                )
+            )
+            self.assertTrue(patch_asar.cli_has_sighup_patch(cli))
+
+    def test_cli_marker_scan_is_streaming_boundary_safe_and_reused(self):
+        markers = (
+            patch_asar.SIGHUP_CLI_MARKERS[0],
+            patch_asar.SIGHUP_RELOAD_MARKER,
+            *patch_asar.SIGHUP_REQUIRED_MARKERS,
+            patch_asar.GOAL_USAGE_MARKER,
+            patch_asar.GPT55_MODEL_MARKER,
+        )
+        chunk_size = 1024 * 1024
+        with tempfile.TemporaryDirectory() as tmp:
+            cli = Path(tmp) / "codex"
+            with cli.open("wb") as handle:
+                handle.truncate((len(markers) + 2) * chunk_size)
+                for index, marker in enumerate(markers, start=1):
+                    handle.seek(index * chunk_size - max(1, len(marker) // 2))
+                    handle.write(marker)
+
+            patch_asar._CLI_MARKER_SCAN_CACHE.clear()
+            original_open = Path.open
+            open_count = 0
+
+            def counting_open(path, *args, **kwargs):
+                nonlocal open_count
+                if path == cli:
+                    open_count += 1
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", counting_open), patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("whole-file reads are forbidden"),
+            ):
+                scan = patch_asar.scan_cli_markers(cli, chunk_size=chunk_size)
+                self.assertIsNotNone(scan)
+                self.assertTrue(scan.has_sighup_contract)
+                self.assertTrue(scan.supports_gpt55)
+                self.assertTrue(patch_asar.cli_has_sighup_patch(cli))
+                self.assertTrue(patch_asar.cli_supports_gpt55(cli))
+
+            self.assertEqual(open_count, 1)
 
     def test_ensure_bundled_cli_hot_swap_copies_verified_source(self):
         old_bundled_cli = patch_asar.BUNDLED_CLI_PATH
@@ -180,7 +533,9 @@ class PatchAsarTests(unittest.TestCase):
                 bundled.parent.mkdir(parents=True)
                 source.write_bytes(
                     b"patched binary\0sighup-verified-exec\0"
-                    b"SIGHUP: auth reloaded from disk\0gpt-5.5"
+                    b"SIGHUP: auth reloaded from disk\0gpt-5.5\0"
+                    + b"\0".join(patch_asar.SIGHUP_REQUIRED_MARKERS)
+                    + b"\0Usage: /goal <objective>"
                 )
                 bundled.write_bytes(b"stock binary")
                 os.chmod(source, 0o755)
@@ -213,7 +568,9 @@ class PatchAsarTests(unittest.TestCase):
                 bundled.parent.mkdir(parents=True)
                 source.write_bytes(
                     b"patched but older\0sighup-verified-exec\0"
-                    b"SIGHUP: auth reloaded from disk"
+                    b"SIGHUP: auth reloaded from disk\0"
+                    + b"\0".join(patch_asar.SIGHUP_REQUIRED_MARKERS)
+                    + b"\0Usage: /goal <objective>"
                 )
                 bundled.write_bytes(b"new stock binary\0gpt-5.5")
                 os.chmod(source, 0o755)
@@ -243,7 +600,9 @@ class PatchAsarTests(unittest.TestCase):
                 bundled.parent.mkdir(parents=True)
                 bundled.write_bytes(
                     b"already patched\0sighup-verified-tui\0"
-                    b"SIGHUP: auth reloaded from disk\0gpt-5.5"
+                    b"SIGHUP: auth reloaded from disk\0gpt-5.5\0"
+                    + b"\0".join(patch_asar.SIGHUP_REQUIRED_MARKERS)
+                    + b"\0Usage: /goal <objective>"
                 )
 
                 patch_asar.BUNDLED_CLI_PATH = bundled
@@ -277,7 +636,9 @@ class PatchAsarTests(unittest.TestCase):
                 bundled.write_bytes(b"locally signed patched cli")
                 source.write_bytes(
                     b"patched binary\0sighup-verified-exec\0"
-                    b"SIGHUP: auth reloaded from disk\0gpt-5.5"
+                    b"SIGHUP: auth reloaded from disk\0gpt-5.5\0"
+                    + b"\0".join(patch_asar.SIGHUP_REQUIRED_MARKERS)
+                    + b"\0Usage: /goal <objective>"
                 )
 
                 patch_asar.APP_PATH = app
@@ -341,6 +702,24 @@ class PatchAsarTests(unittest.TestCase):
 
             self.assertEqual(found, expected)
 
+    def test_find_auth_file_prefers_patchable_auth_hook_over_lifecycle_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            lifecycle = assets / "zzz-lifecycle-HASH.js"
+            lifecycle.write_text(
+                'import{S as i}from"./vscode-api-HASH.js";'
+                "class Host{addAuthStatusCallback(e){this.authStatusCallbacks.add(e)}"
+                "async getAccount(){return this.sendRequest(`account/read`)}"
+                "notifyAuthStatusCallbacks(e){for(let t of this.authStatusCallbacks)t({authMethod:e})}}"
+                "function refresh(){let t=i();t.invalidateQueries({queryKey:[`accounts`,`check`]})}"
+            )
+            expected = assets / "aaa-auth-hook-HASH.js"
+            expected.write_text(CODEX_4753_WEAKMAP_AUTH_CONTENT)
+
+            found = patch_asar.find_auth_file(assets)
+
+            self.assertEqual(found, expected)
+
     def test_apply_patch_supports_modern_use_auth_bundle_without_query_markers(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "use-auth-HASH.js"
@@ -360,6 +739,47 @@ class PatchAsarTests(unittest.TestCase):
             )
             self.assertIn("export{p as u};", patched)
 
+    def test_apply_patch_supports_weakmap_use_auth_bundle_without_vscode_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "use-auth-HASH.js"
+            target.write_text(WEAKMAP_USE_AUTH_CONTENT)
+
+            ok = patch_asar.apply_patch(target)
+
+            self.assertTrue(ok)
+            patched = target.read_text()
+            self.assertIn(patch_asar.PATCH_MARKER, patched)
+            self.assertIn(
+                "f=new WeakMap;function _invalidateAccountQueries(){f=new WeakMap}",
+                patched,
+            )
+            self.assertIn(
+                "}),_invalidateAccountQueries(),c()};return e.addAuthStatusCallback",
+                patched,
+            )
+            self.assertIn("export{l as a,p as i,c as o};", patched)
+
+    def test_apply_patch_supports_codex_4753_weakmap_bundle_with_unrelated_query_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_4753_WEAKMAP_AUTH_CONTENT)
+
+            ok = patch_asar.apply_patch(target)
+
+            self.assertTrue(ok)
+            patched = target.read_text()
+            self.assertIn(
+                "_9=new WeakMap;function _invalidateAccountQueries(){_9=new WeakMap}",
+                patched,
+            )
+            self.assertIn("hd=new WeakMap", patched)
+            self.assertNotIn("hd=new WeakMap;function _invalidateAccountQueries", patched)
+            self.assertIn(
+                "}),_invalidateAccountQueries(),l()};return e.addAuthStatusCallback",
+                patched,
+            )
+            self.assertIn("export{f9 as i};", patched)
+
     def test_find_fast_mode_file_matches_bundle_by_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)
@@ -369,6 +789,46 @@ class PatchAsarTests(unittest.TestCase):
             found = patch_asar.find_fast_mode_file(assets)
 
             self.assertEqual(found, assets / "font-settings-good.js")
+
+    def test_find_fast_mode_file_matches_2670751957_service_tier_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            target = assets / "app-initial-2670751957.js"
+            target.write_text(CHATGPT_2670751957_FAST_CONTENT)
+            (assets / "other.js").write_text("function nope(){}")
+
+            found = patch_asar.find_fast_mode_file(assets)
+
+            self.assertEqual(found, target)
+
+    def test_find_fast_mode_file_matches_2670762119_split_service_tier_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            entitlement = assets / "onboarding.js"
+            entitlement.write_text(
+                "function allowed(e){return "
+                "e?.requirements?.featureRequirements?.fast_mode!==!1}"
+            )
+            target = assets / "conversation.js"
+            target.write_text(CHATGPT_2670762119_SPLIT_FAST_CONTENT)
+
+            found = patch_asar.find_fast_mode_file(assets)
+
+            self.assertEqual(found, target)
+
+    def test_find_fast_mode_file_accepts_existing_split_patch_for_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            target = assets / "conversation.js"
+            target.write_text(CHATGPT_2670762119_SPLIT_FAST_CONTENT)
+            self.assertTrue(
+                patch_asar.apply_fast_mode_fallback_patch(
+                    target,
+                    {"gpt-5.6-sol"},
+                )
+            )
+
+            self.assertEqual(patch_asar.find_fast_mode_file(assets), target)
 
     def test_find_app_server_launcher_file_matches_by_behavior(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -382,6 +842,248 @@ class PatchAsarTests(unittest.TestCase):
             found = patch_asar.find_app_server_launcher_file(root)
 
             self.assertEqual(found, expected)
+
+    def test_find_remote_recents_file_matches_sidebar_recent_conversations_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            (assets / "irrelevant.js").write_text("recent-conversations only")
+            expected = assets / "app-server-manager-hooks-HASH.js"
+            expected.write_text(REMOTE_RECENTS_CONTENT)
+
+            found = patch_asar.find_remote_recents_file(assets)
+
+            self.assertEqual(found, expected)
+
+    def test_apply_remote_recents_refresh_patch_adds_timer_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-server-manager-hooks-HASH.js"
+            target.write_text(REMOTE_RECENTS_CONTENT)
+
+            ok = patch_asar.apply_remote_recents_refresh_patch(target)
+
+            self.assertTrue(ok)
+            patched = target.read_text()
+            self.assertIn(patch_asar.REMOTE_RECENTS_REFRESH_MARKER, patched)
+            self.assertIn("window.setInterval(t,15000)", patched)
+            self.assertIn("window.clearInterval(_csRemoteRecentRefreshTimer)", patched)
+            self.assertIn("return t(),N([P({appServerRegistry:s", patched)
+
+    def test_apply_remote_recents_refresh_patch_supports_codex_4753_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_4753_REMOTE_RECENTS_CONTENT)
+
+            ok = patch_asar.apply_remote_recents_refresh_patch(target)
+
+            self.assertTrue(ok)
+            patched = target.read_text()
+            self.assertIn(patch_asar.REMOTE_RECENTS_REFRESH_MARKER, patched)
+            self.assertIn("window.setInterval(t,15000)", patched)
+            self.assertIn("window.clearInterval(_csRemoteRecentRefreshTimer)", patched)
+            self.assertIn("return t(),W7([G7({appServerRegistry:r", patched)
+
+    def test_apply_remote_recents_refresh_patch_supports_codex_5018_signal_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_5018_REMOTE_RECENTS_SIGNAL_CONTENT)
+
+            ok = patch_asar.apply_remote_recents_refresh_patch(target)
+
+            self.assertTrue(ok)
+            patched = target.read_text()
+            self.assertIn(patch_asar.REMOTE_RECENTS_REFRESH_MARKER, patched)
+            self.assertIn("window.setInterval(_csRemoteRecentRefresh,15000)", patched)
+            self.assertIn("window.clearInterval(_csRemoteRecentRefreshTimer)", patched)
+            self.assertIn("let e=t.get(O5,n)", patched)
+            self.assertIn("e.refreshRecentConversations({})", patched)
+
+    def test_apply_remote_recents_refresh_patch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-server-manager-hooks-HASH.js"
+            target.write_text(REMOTE_RECENTS_CONTENT)
+
+            self.assertTrue(patch_asar.apply_remote_recents_refresh_patch(target))
+            first = target.read_text()
+            self.assertTrue(patch_asar.apply_remote_recents_refresh_patch(target))
+            second = target.read_text()
+
+            self.assertEqual(first, second)
+
+    def test_apply_model_label_fallback_patch_labels_gpt56_sol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_5042_MODEL_PICKER_CONTENT)
+
+            ok = patch_asar.apply_model_label_fallback_patch(target)
+
+            self.assertTrue(ok)
+            patched = target.read_text()
+            self.assertIn(patch_asar.MODEL_LABEL_FALLBACK_MARKER, patched)
+            self.assertNotIn("e==null?`Custom`", patched)
+            self.assertIn("DM(t).replace(/^GPT-/iu,``).replaceAll(`-`,` `)", patched)
+
+    def test_apply_model_label_fallback_patch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_5042_MODEL_PICKER_CONTENT)
+
+            self.assertTrue(patch_asar.apply_model_label_fallback_patch(target))
+            first = target.read_text()
+            self.assertTrue(patch_asar.apply_model_label_fallback_patch(target))
+
+            self.assertEqual(target.read_text(), first)
+
+    def test_find_model_label_file_accepts_existing_label_patch_for_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            target = assets / "app-initial-HASH.js"
+            target.write_text(CODEX_5042_MODEL_PICKER_CONTENT)
+            self.assertTrue(patch_asar.apply_model_label_fallback_patch(target))
+
+            self.assertEqual(patch_asar.find_model_label_file(assets), target)
+
+    def test_find_model_filter_file_supports_split_5211_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            target = assets / "thread-app-shell.js"
+            target.write_text(CODEX_5211_MODEL_FILTER_CONTENT)
+            (assets / "model-picker.js").write_text(CODEX_5211_POWER_PRESET_CONTENT)
+
+            self.assertEqual(patch_asar.find_model_filter_file(assets), target)
+
+    def test_apply_model_availability_fallback_keeps_server_advertised_gpt56(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_5059_MODEL_AVAILABILITY_CONTENT)
+
+            self.assertTrue(patch_asar.apply_model_availability_fallback_patch(target))
+            first = target.read_text()
+            self.assertIn(patch_asar.MODEL_AVAILABILITY_FALLBACK_MARKER, first)
+            self.assertIn(
+                "t.has(n.model)||n.model.startsWith(`gpt-5.6-`)",
+                first,
+            )
+            self.assertTrue(patch_asar.apply_model_availability_fallback_patch(target))
+            self.assertEqual(target.read_text(), first)
+
+    def test_gpt56_max_effort_patch_preserves_server_advertised_max(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_5059_MAX_EFFORT_CONTENT)
+
+            self.assertTrue(patch_asar.apply_gpt56_max_effort_patch(target))
+            first = target.read_text()
+
+            self.assertIn(patch_asar.GPT56_MAX_EFFORT_FALLBACK_MARKER, first)
+            self.assertIn(
+                "vg(e)&&(r.has(e)||(n.model.startsWith(`gpt-5.6-`)&&e===`max`))",
+                first,
+            )
+            self.assertTrue(patch_asar.apply_gpt56_max_effort_patch(target))
+            self.assertEqual(target.read_text(), first)
+
+    def test_gpt56_max_effort_patch_supports_split_5211_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_filter = Path(tmp) / "thread-app-shell.js"
+            model_filter.write_text(CODEX_5211_MODEL_FILTER_CONTENT)
+            power_presets = Path(tmp) / "model-picker.js"
+            power_presets.write_text(CODEX_5211_POWER_PRESET_CONTENT)
+
+            self.assertTrue(
+                patch_asar.apply_gpt56_max_effort_filter_patch(model_filter)
+            )
+            self.assertTrue(
+                patch_asar.apply_gpt56_max_effort_preset_patch(power_presets)
+            )
+
+            self.assertTrue(
+                patch_asar.has_gpt56_max_effort_filter_patch(
+                    model_filter.read_text()
+                )
+            )
+            self.assertTrue(
+                patch_asar.has_gpt56_max_effort_preset_patch(
+                    power_presets.read_text()
+                )
+            )
+
+    def test_gpt56_max_effort_patch_orders_sol_max_before_ultra(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_5059_MAX_EFFORT_CONTENT)
+
+            self.assertTrue(patch_asar.apply_gpt56_max_effort_patch(target))
+            patched = target.read_text()
+
+            xhigh = patched.index("id:`gpt-5.6-sol:xhigh`")
+            maximum = patched.index("id:`gpt-5.6-sol:max`")
+            ultra = patched.index("id:`gpt-5.6-sol:ultra`")
+            self.assertLess(xhigh, maximum)
+            self.assertLess(maximum, ultra)
+            self.assertIn(
+                "t.supportedReasoningEfforts.some(({reasoningEffort:t})=>"
+                "t===e.reasoningEffort)",
+                patched,
+            )
+
+    def test_gpt56_max_effort_patch_supports_separate_ultra_preset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            content = CODEX_5059_MAX_EFFORT_CONTENT
+            preset_start = content.index("var FRe=[")
+            ultra_start = content.index(",{", preset_start)
+            array_end = content.index("];", ultra_start)
+            split_layout = (
+                content[:ultra_start]
+                + "],URe="
+                + content[ultra_start + 1 : array_end]
+                + ";"
+                + content[array_end + 2 :]
+            )
+            target.write_text(split_layout)
+
+            self.assertTrue(patch_asar.apply_gpt56_max_effort_patch(target))
+            patched = target.read_text()
+
+            quote = chr(96)
+            xhigh = patched.index(f"reasoningEffort:{quote}xhigh{quote}")
+            maximum = patched.index(f"reasoningEffort:{quote}max{quote}")
+            ultra = patched.index(f"reasoningEffort:{quote}ultra{quote}")
+            self.assertLess(xhigh, maximum)
+            self.assertLess(maximum, ultra)
+            self.assertIn("],URe={", patched)
+            self.assertTrue(patch_asar.apply_gpt56_max_effort_patch(target))
+            self.assertEqual(target.read_text(), patched)
+
+    def test_apply_selected_model_label_fallback_labels_active_gpt56_sol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_5059_SELECTED_MODEL_LABEL_CONTENT)
+
+            self.assertTrue(patch_asar.apply_selected_model_label_fallback_patch(target))
+            first = target.read_text()
+
+            self.assertIn(patch_asar.SELECTED_MODEL_LABEL_FALLBACK_MARKER, first)
+            self.assertIn("n.startsWith(`gpt-5.6-`)", first)
+            self.assertIn("zE(n).replace(/^GPT-/iu,``).replaceAll(`-`,` `)", first)
+            self.assertTrue(patch_asar.apply_selected_model_label_fallback_patch(target))
+            self.assertEqual(target.read_text(), first)
+
+    def test_remote_model_refresh_invalidates_same_host_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-HASH.js"
+            target.write_text(CODEX_5059_REMOTE_MODEL_RECONNECT_CONTENT)
+
+            self.assertTrue(patch_asar.apply_remote_model_refresh_patch(target))
+            first = target.read_text()
+
+            self.assertIn(patch_asar.REMOTE_MODEL_REFRESH_MARKER, first)
+            self.assertIn(
+                "t.invalidateQueries({queryKey:[`models`,`list`,r]})",
+                first,
+            )
+            self.assertTrue(patch_asar.apply_remote_model_refresh_patch(target))
+            self.assertEqual(target.read_text(), first)
 
     def test_apply_fast_mode_fallback_patch_inserts_bundled_fast_model_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -417,6 +1119,154 @@ class PatchAsarTests(unittest.TestCase):
             second = target.read_text()
 
             self.assertEqual(first, second)
+
+    def test_apply_fast_mode_fallback_patch_repairs_2670751957_service_tiers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-2670751957.js"
+            target.write_text(CHATGPT_2670751957_FAST_CONTENT)
+
+            ok = patch_asar.apply_fast_mode_fallback_patch(
+                target,
+                {"gpt-5.6-sol", "gpt-5.4"},
+            )
+
+            self.assertTrue(ok)
+            patched = target.read_text()
+            self.assertIn(
+                "var _bundledFastModels=new Set([`gpt-5.4`,`gpt-5.6-sol`]);",
+                patched,
+            )
+            self.assertEqual(patched.count("var _bundledFastModels="), 1)
+            self.assertIn(
+                "e?.serviceTiers?.length?e.serviceTiers:"
+                "_bundledFastModels.has(e?.model)?"
+                "[{id:`priority`,name:`Fast`,description:"
+                "`1.5x speed, increased usage`}]:[]",
+                patched,
+            )
+            self.assertNotIn("(e?.serviceTiers??[]).map", patched)
+            self.assertEqual(patched.count("id:`priority`"), 1)
+
+    def test_service_tier_fast_patch_preserves_entitlement_and_server_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-2670751957.js"
+            target.write_text(CHATGPT_2670751957_FAST_CONTENT)
+
+            self.assertTrue(
+                patch_asar.apply_fast_mode_fallback_patch(
+                    target,
+                    {"gpt-5.6-sol"},
+                )
+            )
+            patched = target.read_text()
+
+            self.assertEqual(
+                patched.count("featureRequirements?.fast_mode!==!1"),
+                CHATGPT_2670751957_FAST_CONTENT.count(
+                    "featureRequirements?.fast_mode!==!1"
+                ),
+            )
+            self.assertIn(
+                "e?.serviceTiers?.length?e.serviceTiers:",
+                patched,
+            )
+            self.assertIn(
+                "_bundledFastModels.has(e?.model)?",
+                patched,
+            )
+
+    def test_service_tier_fast_patch_supports_split_entitlement_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "conversation.js"
+            target.write_text(CHATGPT_2670762119_SPLIT_FAST_CONTENT)
+
+            self.assertTrue(
+                patch_asar.apply_fast_mode_fallback_patch(
+                    target,
+                    {"gpt-5.6-sol"},
+                )
+            )
+            patched = target.read_text()
+
+            self.assertIn(
+                "e?.serviceTiers?.length?e.serviceTiers:",
+                patched,
+            )
+            self.assertIn("_bundledFastModels.has(e?.model)?", patched)
+            self.assertNotIn("featureRequirements?.fast_mode", patched)
+            self.assertTrue(
+                patch_asar.apply_fast_mode_fallback_patch(
+                    target,
+                    {"gpt-5.6-sol"},
+                )
+            )
+            self.assertEqual(target.read_text(), patched)
+
+    def test_bundled_fast_models_accept_service_tier_catalog_metadata(self):
+        payload = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "additional_speed_tiers": [],
+                    "service_tiers": [{"id": "priority", "name": "Fast"}],
+                },
+                {
+                    "slug": "gpt-5.4",
+                    "additional_speed_tiers": ["fast"],
+                    "service_tiers": [],
+                },
+                {
+                    "slug": "gpt-5.4-mini",
+                    "additional_speed_tiers": [],
+                    "service_tiers": [{"id": "default", "name": "Standard"}],
+                },
+            ]
+        }
+        with patch.object(patch_asar.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = patch_asar.json.dumps(payload)
+            run.return_value.stderr = ""
+
+            models = patch_asar.get_bundled_fast_model_slugs(Path("/tmp/codex"))
+
+        self.assertEqual(models, {"gpt-5.6-sol", "gpt-5.4"})
+
+    def test_required_fast_patch_uses_bundled_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-2670751957.js"
+            target.write_text(CHATGPT_2670751957_FAST_CONTENT)
+            with patch.object(
+                patch_asar,
+                "get_bundled_fast_model_slugs",
+                return_value={"gpt-5.6-sol"},
+            ):
+                self.assertTrue(patch_asar.apply_required_fast_mode_patch(target))
+
+            self.assertIn(patch_asar.FAST_FALLBACK_MARKER, target.read_text())
+
+    def test_required_renderer_patch_contract_includes_fast(self):
+        states = {
+            "auth": True,
+            "remote_recents": True,
+            "fast": True,
+            "model_label": True,
+            "model_availability": True,
+            "selected_model_label": True,
+            "gpt56_max_effort": True,
+            "remote_model_refresh": True,
+        }
+        self.assertTrue(patch_asar.required_renderer_patches_present(**states))
+
+        states["fast"] = False
+
+        self.assertFalse(patch_asar.required_renderer_patches_present(**states))
+
+    def test_main_requires_and_applies_fast_patch(self):
+        source = inspect.getsource(patch_asar.main)
+
+        self.assertIn("fast=fast_already_patched", source)
+        self.assertIn("apply_required_fast_mode_patch(fast_mode_file)", source)
+        self.assertNotIn("Skipping optional fast-mode fallback", source)
 
     def test_remove_headroom_env_patch_leaves_stock_launcher_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -505,6 +1355,16 @@ class PatchAsarTests(unittest.TestCase):
         with patch.object(patch_asar.subprocess, "run", return_value=completed):
             self.assertTrue(patch_asar.codex_app_is_running())
 
+    def test_codex_app_is_running_detects_unified_chatgpt_process(self):
+        completed = patch_asar.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="123 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n",
+            stderr="",
+        )
+        with patch.object(patch_asar.subprocess, "run", return_value=completed):
+            self.assertTrue(patch_asar.codex_app_is_running())
+
     def test_codex_app_is_running_ignores_pgrep_and_codexswitch(self):
         completed = patch_asar.subprocess.CompletedProcess(
             args=[],
@@ -541,6 +1401,27 @@ class PatchAsarTests(unittest.TestCase):
         with patch.object(patch_asar.subprocess, "run", return_value=completed):
             self.assertTrue(patch_asar.codex_app_is_running())
 
+    def test_list_codesign_targets_skips_asar_unpacked_native_prebuilds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "Codex.app"
+            foreign = (
+                app
+                / "Contents/Resources/app.asar.unpacked/node_modules/pkg/prebuilds/android-arm/node.napi.armv7.node"
+            )
+            darwin = (
+                app
+                / "Contents/Resources/app.asar.unpacked/node_modules/pkg/prebuilds/darwin-arm64/node.napi.armv8.node"
+            )
+            foreign.parent.mkdir(parents=True)
+            darwin.parent.mkdir(parents=True)
+            foreign.write_bytes(b"\x7fELFforeign")
+            darwin.write_bytes(b"\xcf\xfa\xed\xfe" + b"macho")
+
+            targets = patch_asar.list_codesign_targets(app)
+
+            self.assertNotIn(foreign.resolve(), targets)
+            self.assertNotIn(darwin.resolve(), targets)
+
     def test_codesign_team_identifier_normalizes_not_set(self):
         completed = patch_asar.subprocess.CompletedProcess(
             args=[],
@@ -551,7 +1432,22 @@ class PatchAsarTests(unittest.TestCase):
         with patch.object(patch_asar.subprocess, "run", return_value=completed):
             self.assertIsNone(patch_asar.codesign_team_identifier(Path("/tmp/Codex")))
 
-    def test_select_codesign_identity_prefers_apple_issued_over_self_signed_name(self):
+    def test_app_main_executable_uses_unified_bundle_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "ChatGPT.app"
+            executable = app / "Contents/MacOS/ChatGPT"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"binary")
+            info_plist = app / "Contents/Info.plist"
+            with info_plist.open("wb") as handle:
+                patch_asar.plistlib.dump({"CFBundleExecutable": "ChatGPT"}, handle)
+
+            self.assertEqual(
+                patch_asar.app_main_executable(app),
+                executable.resolve(),
+            )
+
+    def test_select_codesign_identity_accepts_apple_issued_iphone_developer_fallback(self):
         completed = patch_asar.subprocess.CompletedProcess(
             args=[],
             returncode=0,
@@ -571,6 +1467,58 @@ class PatchAsarTests(unittest.TestCase):
                 patch_asar.select_codesign_identity(),
                 "iPhone Developer: bd7349@gmail.com (856E75LLMU)",
             )
+
+    def test_select_or_repair_codesign_identity_imports_cached_identity(self):
+        with patch.object(
+            patch_asar,
+            "select_codesign_identity",
+            side_effect=["-", "iPhone Developer: bd7349@gmail.com (856E75LLMU)"],
+        ), patch.object(
+            patch_asar,
+            "import_cached_iphone_developer_identity",
+            return_value=True,
+        ) as importer:
+            self.assertEqual(
+                patch_asar.select_or_repair_codesign_identity(),
+                "iPhone Developer: bd7349@gmail.com (856E75LLMU)",
+            )
+
+        importer.assert_called_once_with()
+
+    def test_print_codesign_identity_is_read_only(self):
+        with patch.object(
+            patch_asar,
+            "select_codesign_identity",
+            return_value="Developer ID Application: Example",
+        ) as inspector, patch.object(
+            patch_asar,
+            "select_or_repair_codesign_identity",
+            return_value="unexpected repair",
+        ) as repairer:
+            self.assertEqual(
+                patch_asar.requested_codesign_identity(
+                    ["patch-asar.py", "--print-codesign-identity"]
+                ),
+                "Developer ID Application: Example",
+            )
+
+        inspector.assert_called_once_with()
+        repairer.assert_not_called()
+
+    def test_repair_codesign_identity_is_explicit(self):
+        with patch.object(
+            patch_asar,
+            "select_or_repair_codesign_identity",
+            return_value="iPhone Developer: Example",
+        ) as repairer:
+            self.assertEqual(
+                patch_asar.requested_codesign_identity(
+                    ["patch-asar.py", "--repair-codesign-identity"]
+                ),
+                "iPhone Developer: Example",
+            )
+
+        repairer.assert_called_once_with()
 
     def test_app_framework_executable_prefers_current_codex_framework_name(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -819,10 +1767,11 @@ class PatchAsarTests(unittest.TestCase):
                 bundled_cli.parent,
             ):
                 path.mkdir(parents=True, exist_ok=True)
-            main_executable.write_text("#!/bin/sh\n")
-            native_module.write_bytes(b"node")
-            dylib.write_bytes(b"dylib")
-            bundled_cli.write_text("#!/bin/sh\n")
+            macho = b"\xcf\xfa\xed\xfe" + b"binary"
+            main_executable.write_bytes(macho)
+            native_module.write_bytes(macho)
+            dylib.write_bytes(macho)
+            bundled_cli.write_bytes(macho)
             os.chmod(main_executable, 0o755)
             os.chmod(bundled_cli, 0o755)
 
@@ -968,8 +1917,12 @@ class PatchAsarTests(unittest.TestCase):
                 return_value="<string>2DC432GLL2.com.openai.sky.CUAService</string>",
             ), patch.object(
                 patch_asar,
-                "spctl_accepts",
+                "codesign_strictly_valid",
                 return_value=True,
+            ), patch.object(
+                patch_asar,
+                "spctl_assessment",
+                return_value="accepted",
             ):
                 self.assertFalse(
                     patch_asar.needs_computer_use_plugin_signature_repair(app)
@@ -1009,12 +1962,77 @@ class PatchAsarTests(unittest.TestCase):
                 return_value=entitlement_text,
             ), patch.object(
                 patch_asar,
-                "spctl_accepts",
-                return_value=False,
+                "codesign_strictly_valid",
+                return_value=True,
+            ), patch.object(
+                patch_asar,
+                "spctl_assessment",
+                return_value="rejected",
             ):
                 self.assertTrue(
                     patch_asar.needs_computer_use_plugin_signature_repair(app)
                 )
+
+    def test_computer_use_plugin_accepts_known_spctl_internal_error_after_strict_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = (Path(tmp) / "Codex.app").resolve()
+            computer_use_app = (
+                app
+                / "Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"
+            )
+            sky_client_app = (
+                computer_use_app
+                / "Contents/SharedSupport/SkyComputerUseClient.app"
+            )
+            sky_client_app.mkdir(parents=True)
+
+            with patch.object(
+                patch_asar,
+                "codesign_team_identifier",
+                return_value="2DC432GLL2",
+            ), patch.object(
+                patch_asar,
+                "codesign_entitlements_text",
+                return_value="<string>2DC432GLL2.com.openai.sky.CUAService</string>",
+            ), patch.object(
+                patch_asar,
+                "codesign_strictly_valid",
+                return_value=True,
+            ), patch.object(
+                patch_asar,
+                "spctl_assessment",
+                return_value="unavailable",
+            ):
+                self.assertFalse(
+                    patch_asar.needs_computer_use_plugin_signature_repair(app)
+                )
+
+    def test_spctl_assessment_distinguishes_internal_error_from_rejection(self):
+        unavailable = patch_asar.subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="internal error in Code Signing subsystem",
+        )
+        rejected = patch_asar.subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="rejected",
+            stderr="",
+        )
+        with patch.object(
+            patch_asar.subprocess,
+            "run",
+            side_effect=[unavailable, rejected],
+        ):
+            self.assertEqual(
+                patch_asar.spctl_assessment(Path("/tmp/one.app")),
+                "unavailable",
+            )
+            self.assertEqual(
+                patch_asar.spctl_assessment(Path("/tmp/two.app")),
+                "rejected",
+            )
 
     def test_app_signature_repair_needed_when_deep_verify_fails(self):
         failed = patch_asar.subprocess.CompletedProcess(
@@ -1040,6 +2058,102 @@ class PatchAsarTests(unittest.TestCase):
         self.assertNotIn("2DC432GLL2", text)
         self.assertNotIn("com.apple.application-identifier", text)
         self.assertNotIn("keychain-access-groups", text)
+
+    def test_codesign_app_fails_when_gatekeeper_rejects_signed_bundle(self):
+        app = Path("/Applications/Codex.app")
+        nested = app / "Contents/Frameworks/Sparkle.framework"
+        completed = patch_asar.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        with patch.object(patch_asar, "APP_PATH", app), patch.object(
+            patch_asar,
+            "select_or_repair_codesign_identity",
+            return_value="Developer ID Application: Example (TEAMID1234)",
+        ), patch.object(
+            patch_asar,
+            "list_codesign_targets",
+            return_value=[nested, app],
+        ), patch.object(
+            patch_asar,
+            "codesign_target",
+            return_value=True,
+        ), patch.object(
+            patch_asar,
+            "ensure_computer_use_plugin_signature_compatible",
+            return_value=True,
+        ), patch.object(
+            patch_asar,
+            "write_local_desktop_app_entitlements",
+            return_value=Path("/tmp/codex.entitlements.plist"),
+        ), patch.object(
+            patch_asar.subprocess,
+            "run",
+            return_value=completed,
+        ), patch.object(
+            patch_asar,
+            "executable_and_framework_team_ids_match",
+            return_value=True,
+        ), patch.object(
+            patch_asar,
+            "spctl_accepts",
+            return_value=False,
+        ) as spctl:
+            self.assertFalse(patch_asar.codesign_app())
+
+        spctl.assert_called_once_with(app)
+
+    def test_codesign_app_allows_iphone_developer_local_gatekeeper_fallback(self):
+        app = Path("/Applications/Codex.app")
+        nested = app / "Contents/Frameworks/Sparkle.framework"
+        completed = patch_asar.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        with patch.object(patch_asar, "APP_PATH", app), patch.object(
+            patch_asar,
+            "select_or_repair_codesign_identity",
+            return_value="iPhone Developer: bd7349@gmail.com (856E75LLMU)",
+        ), patch.object(
+            patch_asar,
+            "list_codesign_targets",
+            return_value=[nested, app],
+        ), patch.object(
+            patch_asar,
+            "codesign_target",
+            return_value=True,
+        ), patch.object(
+            patch_asar,
+            "ensure_computer_use_plugin_signature_compatible",
+            return_value=True,
+        ), patch.object(
+            patch_asar,
+            "write_local_desktop_app_entitlements",
+            return_value=Path("/tmp/codex.entitlements.plist"),
+        ), patch.object(
+            patch_asar.subprocess,
+            "run",
+            return_value=completed,
+        ), patch.object(
+            patch_asar,
+            "executable_and_framework_team_ids_match",
+            return_value=True,
+        ), patch.object(
+            patch_asar,
+            "spctl_accepts",
+            return_value=False,
+        ) as spctl, patch.object(
+            patch_asar,
+            "codesign_identity_is_apple_issued",
+            return_value=True,
+        ):
+            self.assertTrue(patch_asar.codesign_app())
+
+        spctl.assert_called_once_with(app)
 
     def test_codesign_target_with_entitlements_does_not_preserve_old_entitlements(self):
         completed = patch_asar.subprocess.CompletedProcess(

@@ -1,0 +1,47 @@
+{
+  "version": 2,
+  "allowed": true,
+  "limitReached": false,
+  "fetchedAt": 799048365.342368,
+  "windows": [
+    {
+      "kind": "fiveHour",
+      "durationSeconds": 604800,
+      "usedPercent": 19,
+      "resetsAt": 799653165.342368,
+      "source": {
+        "rateLimit": "additional",
+        "slot": "primary",
+        "limitName": "Codex",
+        "meteredFeature": "codex"
+      },
+      "hardLimitReached": false
+    },
+    {
+      "kind": "weekly",
+      "durationSeconds": 18000,
+      "usedPercent": 23,
+      "resetsAt": 799066365.342368,
+      "source": {
+        "rateLimit": "main",
+        "slot": "secondary",
+        "limitName": null,
+        "meteredFeature": null
+      },
+      "hardLimitReached": false
+    },
+    {
+      "kind": "weekly",
+      "durationSeconds": 86400,
+      "usedPercent": 41,
+      "resetsAt": 799134765.342368,
+      "source": {
+        "rateLimit": "additional",
+        "slot": "secondary",
+        "limitName": "Future Codex Window",
+        "meteredFeature": "codex"
+      },
+      "hardLimitReached": false
+    }
+  ]
+}

@@ -4,20 +4,6 @@ import Testing
 
 @Suite("Status refresh coordination")
 struct StatusRefreshTests {
-    @Test("Single-flight gate rejects overlapping work and reopens after completion")
-    func singleFlightGatePreventsOverlap() async {
-        let gate = SingleFlightGate()
-
-        let first = await gate.begin()
-        let second = await gate.begin()
-        await gate.end()
-        let third = await gate.begin()
-
-        #expect(first)
-        #expect(!second)
-        #expect(third)
-    }
-
     @Test("Process runner captures stderr and times out stalled commands")
     func processRunnerHandlesOutputAndTimeout() throws {
         let output = ProcessRunner.run(

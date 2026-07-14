@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 
@@ -23,12 +24,38 @@ struct LinuxDevboxReadiness: Codable, Equatable, Sendable {
     let daemonRunning: Bool?
     let accountCount: Int?
     let activeEmail: String?
+    let activeProviderAccountId: String?
     let readyCandidateCount: Int?
     let issues: [String]?
+
+    init(
+        ready: Bool,
+        summary: String,
+        accountStoreOk: Bool?,
+        authWritable: Bool?,
+        daemonRunning: Bool?,
+        accountCount: Int?,
+        activeEmail: String?,
+        activeProviderAccountId: String? = nil,
+        readyCandidateCount: Int?,
+        issues: [String]?
+    ) {
+        self.ready = ready
+        self.summary = summary
+        self.accountStoreOk = accountStoreOk
+        self.authWritable = authWritable
+        self.daemonRunning = daemonRunning
+        self.accountCount = accountCount
+        self.activeEmail = activeEmail
+        self.activeProviderAccountId = activeProviderAccountId
+        self.readyCandidateCount = readyCandidateCount
+        self.issues = issues
+    }
 }
 
-struct LinuxDevboxAccountState: Codable, Sendable {
+struct LinuxDevboxAccountState: Codable, Equatable, Sendable {
     let email: String
+    let providerAccountId: String?
     let isActive: Bool
     let quotaSnapshot: QuotaSnapshot?
     let planType: String?
@@ -37,12 +64,44 @@ struct LinuxDevboxAccountState: Codable, Sendable {
     let subscriptionExpiresAt: Date?
     let subscriptionWillRenew: Bool?
     let hasActiveSubscription: Bool?
+    var rateLimitResetBank: RateLimitResetBank? = nil
     var runtimeUnusableUntil: Date? = nil
     var runtimeUnusableReason: String? = nil
+
+    init(
+        email: String,
+        providerAccountId: String? = nil,
+        isActive: Bool,
+        quotaSnapshot: QuotaSnapshot?,
+        planType: String?,
+        lastRefreshed: Date?,
+        subscriptionRenewsAt: Date?,
+        subscriptionExpiresAt: Date?,
+        subscriptionWillRenew: Bool?,
+        hasActiveSubscription: Bool?,
+        rateLimitResetBank: RateLimitResetBank? = nil,
+        runtimeUnusableUntil: Date? = nil,
+        runtimeUnusableReason: String? = nil
+    ) {
+        self.email = email
+        self.providerAccountId = providerAccountId
+        self.isActive = isActive
+        self.quotaSnapshot = quotaSnapshot
+        self.planType = planType
+        self.lastRefreshed = lastRefreshed
+        self.subscriptionRenewsAt = subscriptionRenewsAt
+        self.subscriptionExpiresAt = subscriptionExpiresAt
+        self.subscriptionWillRenew = subscriptionWillRenew
+        self.hasActiveSubscription = hasActiveSubscription
+        self.rateLimitResetBank = rateLimitResetBank
+        self.runtimeUnusableUntil = runtimeUnusableUntil
+        self.runtimeUnusableReason = runtimeUnusableReason
+    }
 }
 
 private struct LinuxDevboxAccountStateReport: Codable, Sendable {
     let accounts: [LinuxDevboxAccountState]
+    let credentialSetFingerprint: String?
 }
 
 struct LinuxDevboxStatus: Equatable, Sendable {
@@ -57,17 +116,32 @@ struct LinuxDevboxStatus: Equatable, Sendable {
     let state: State
     let summary: String
     let activeEmail: String?
+    let activeProviderAccountId: String?
+
+    init(
+        state: State,
+        summary: String,
+        activeEmail: String?,
+        activeProviderAccountId: String? = nil
+    ) {
+        self.state = state
+        self.summary = summary
+        self.activeEmail = activeEmail
+        self.activeProviderAccountId = activeProviderAccountId
+    }
 
     static let notConfigured = LinuxDevboxStatus(
         state: .notConfigured,
         summary: "Linux devbox monitor is not configured",
-        activeEmail: nil
+        activeEmail: nil,
+        activeProviderAccountId: nil
     )
 
     static let checking = LinuxDevboxStatus(
         state: .checking,
         summary: "checking VPS hot-swap readiness...",
-        activeEmail: nil
+        activeEmail: nil,
+        activeProviderAccountId: nil
     )
 
     var isVisible: Bool {
@@ -114,19 +188,312 @@ struct LinuxDevboxStatus: Equatable, Sendable {
     }
 }
 
+enum CredentialSyncFailureDisposition: String, CaseIterable, Equatable, Sendable {
+    case notCredentialSync
+    case retryablePreExecution
+    case rejected
+    case outcomeUnknown
+    case cleanupUnresolved
+
+    var allowsAutomaticRetry: Bool {
+        self == .retryablePreExecution
+    }
+
+    var requiresPersistentHold: Bool {
+        self == .outcomeUnknown || self == .cleanupUnresolved
+    }
+}
+
 struct LinuxDevboxMonitorFailure: Error, Equatable, Sendable {
     let message: String
+    let credentialSyncDisposition: CredentialSyncFailureDisposition
+
+    init(
+        message: String,
+        credentialSyncDisposition: CredentialSyncFailureDisposition = .notCredentialSync
+    ) {
+        self.message = message
+        self.credentialSyncDisposition = credentialSyncDisposition
+    }
+}
+
+struct LinuxDevboxCredentialStateEvidence: Equatable, Sendable {
+    let accountIdentityFingerprint: String
+    let credentialSetFingerprint: String
+    let activeProviderAccountId: String
+    let activeTokenHashPrefix: String
+    let authMatchesActiveStoreToken: Bool
+}
+
+struct LinuxDevboxCredentialSyncOperation: Codable, Equatable, Sendable {
+    enum Phase: String, Codable, Equatable, Sendable {
+        case pending
+        case unresolved
+    }
+
+    static let schemaVersion = 2
+
+    let version: Int
+    let operationID: String
+    let targetFingerprint: String
+    let credentialFingerprint: String
+    let expectedAccountIdentityFingerprint: String
+    let expectedCredentialSetFingerprint: String
+    let expectedActiveProviderAccountId: String
+    let expectedActiveTokenHashPrefix: String
+    let baselineAccountIdentityFingerprint: String
+    let baselineCredentialSetFingerprint: String
+    let baselineActiveProviderAccountId: String
+    let baselineActiveTokenHashPrefix: String
+    let baselineAuthMatchesActiveStoreToken: Bool
+    let localDirectory: String
+    let remoteDirectory: String
+    let createdAt: Date
+    var phase: Phase
+    var reason: String
+
+    init(
+        operationID: String,
+        targetFingerprint: String,
+        credentialFingerprint: String,
+        expectedAccountIdentityFingerprint: String,
+        expectedCredentialSetFingerprint: String,
+        expectedActiveProviderAccountId: String,
+        expectedActiveTokenHashPrefix: String,
+        baseline: LinuxDevboxCredentialStateEvidence,
+        localDirectory: String,
+        remoteDirectory: String,
+        createdAt: Date,
+        phase: Phase = .pending,
+        reason: String
+    ) {
+        self.version = Self.schemaVersion
+        self.operationID = operationID
+        self.targetFingerprint = targetFingerprint
+        self.credentialFingerprint = credentialFingerprint
+        self.expectedAccountIdentityFingerprint = expectedAccountIdentityFingerprint
+        self.expectedCredentialSetFingerprint = expectedCredentialSetFingerprint
+        self.expectedActiveProviderAccountId = expectedActiveProviderAccountId
+        self.expectedActiveTokenHashPrefix = expectedActiveTokenHashPrefix
+        self.baselineAccountIdentityFingerprint = baseline.accountIdentityFingerprint
+        self.baselineCredentialSetFingerprint = baseline.credentialSetFingerprint
+        self.baselineActiveProviderAccountId = baseline.activeProviderAccountId
+        self.baselineActiveTokenHashPrefix = baseline.activeTokenHashPrefix
+        self.baselineAuthMatchesActiveStoreToken = baseline.authMatchesActiveStoreToken
+        self.localDirectory = localDirectory
+        self.remoteDirectory = remoteDirectory
+        self.createdAt = createdAt
+        self.phase = phase
+        self.reason = reason
+    }
+
+    var baseline: LinuxDevboxCredentialStateEvidence {
+        LinuxDevboxCredentialStateEvidence(
+            accountIdentityFingerprint: baselineAccountIdentityFingerprint,
+            credentialSetFingerprint: baselineCredentialSetFingerprint,
+            activeProviderAccountId: baselineActiveProviderAccountId,
+            activeTokenHashPrefix: baselineActiveTokenHashPrefix,
+            authMatchesActiveStoreToken: baselineAuthMatchesActiveStoreToken
+        )
+    }
+
+    var expected: LinuxDevboxCredentialStateEvidence {
+        LinuxDevboxCredentialStateEvidence(
+            accountIdentityFingerprint: expectedAccountIdentityFingerprint,
+            credentialSetFingerprint: expectedCredentialSetFingerprint,
+            activeProviderAccountId: expectedActiveProviderAccountId,
+            activeTokenHashPrefix: expectedActiveTokenHashPrefix,
+            authMatchesActiveStoreToken: true
+        )
+    }
+}
+
+enum LinuxDevboxCredentialSyncJournalError: Error, Equatable, LocalizedError {
+    case invalidRecord(String)
+    case operationAlreadyPending(String)
+    case operationChanged(expected: String, actual: String?)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidRecord(let reason):
+            return "Invalid Linux devbox credential-sync journal: \(reason)"
+        case .operationAlreadyPending(let operationID):
+            return "Linux devbox credential sync \(operationID) is already pending"
+        case .operationChanged(let expected, let actual):
+            return "Linux devbox credential-sync journal changed: expected \(expected), found \(actual ?? "none")"
+        }
+    }
+}
+
+struct LinuxDevboxCredentialSyncJournal: Sendable {
+    static let defaultPath = NSString(
+        string: "~/.codexswitch/linux-devbox-credential-sync.json"
+    ).expandingTildeInPath
+    private static let maximumRecordBytes = 64 * 1024
+
+    private let transaction: SecureAtomicFileTransaction
+
+    init(path: String = defaultPath) {
+        transaction = SecureAtomicFileTransaction(
+            path: path,
+            subject: "Linux devbox credential-sync journal"
+        )
+    }
+
+    func load() throws -> LinuxDevboxCredentialSyncOperation? {
+        try transaction.withExclusiveLock { lockedFile in
+            try decode(lockedFile.read().bytes)
+        }
+    }
+
+    func begin(_ operation: LinuxDevboxCredentialSyncOperation) throws {
+        try validate(operation)
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            if let pending = try decode(current.bytes) {
+                throw LinuxDevboxCredentialSyncJournalError.operationAlreadyPending(
+                    pending.operationID
+                )
+            }
+            _ = try lockedFile.replace(try encode(operation), expectedGeneration: current.generation)
+        }
+    }
+
+    func markUnresolved(operationID: String, reason: String) throws {
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            guard var operation = try decode(current.bytes), operation.operationID == operationID else {
+                throw LinuxDevboxCredentialSyncJournalError.operationChanged(
+                    expected: operationID,
+                    actual: try decode(current.bytes)?.operationID
+                )
+            }
+            operation.phase = .unresolved
+            operation.reason = reason
+            try validate(operation)
+            _ = try lockedFile.replace(try encode(operation), expectedGeneration: current.generation)
+        }
+    }
+
+    func clear(operationID: String) throws {
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            guard let operation = try decode(current.bytes), operation.operationID == operationID else {
+                throw LinuxDevboxCredentialSyncJournalError.operationChanged(
+                    expected: operationID,
+                    actual: try decode(current.bytes)?.operationID
+                )
+            }
+            _ = try lockedFile.remove(expectedGeneration: current.generation)
+        }
+    }
+
+    private func encode(_ operation: LinuxDevboxCredentialSyncOperation) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(operation)
+        guard data.count <= Self.maximumRecordBytes else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("record is too large")
+        }
+        return data
+    }
+
+    private func decode(_ data: Data?) throws -> LinuxDevboxCredentialSyncOperation? {
+        guard let data else { return nil }
+        guard data.count <= Self.maximumRecordBytes else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("record is too large")
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let operation = try decoder.decode(LinuxDevboxCredentialSyncOperation.self, from: data)
+        try validate(operation)
+        return operation
+    }
+
+    private func validate(_ operation: LinuxDevboxCredentialSyncOperation) throws {
+        guard operation.version == LinuxDevboxCredentialSyncOperation.schemaVersion else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("unsupported schema version")
+        }
+        guard let identifier = UUID(uuidString: operation.operationID),
+              identifier.uuidString.lowercased() == operation.operationID else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("operation identifier is not a UUID")
+        }
+        let expectedSuffix = operation.operationID.lowercased()
+        guard operation.remoteDirectory == "/tmp/codexswitch-auto-sync-\(expectedSuffix)",
+              (operation.localDirectory as NSString).lastPathComponent
+                == "codexswitch-linux-credential-sync-\(expectedSuffix)" else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("staging path does not match operation")
+        }
+        guard isLowercaseHex(operation.targetFingerprint, count: 64),
+              isLowercaseHex(operation.credentialFingerprint, count: 64),
+              isLowercaseHex(operation.expectedAccountIdentityFingerprint, count: 64),
+              isLowercaseHex(operation.baselineAccountIdentityFingerprint, count: 64),
+              isLowercaseHex(operation.expectedCredentialSetFingerprint, count: 64),
+              isLowercaseHex(operation.baselineCredentialSetFingerprint, count: 64),
+              isLowercaseHex(operation.expectedActiveTokenHashPrefix, count: 12),
+              isLowercaseHex(operation.baselineActiveTokenHashPrefix, count: 12),
+              !operation.expectedActiveProviderAccountId.isEmpty,
+              !operation.baselineActiveProviderAccountId.isEmpty,
+              operation.expectedActiveProviderAccountId.utf8.count <= 256,
+              operation.baselineActiveProviderAccountId.utf8.count <= 256,
+              operation.reason.utf8.count <= 4 * 1024,
+              !operation.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("required evidence is incomplete")
+        }
+    }
+
+    private func isLowercaseHex(_ value: String, count: Int) -> Bool {
+        value.count == count && value.utf8.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+        }
+    }
+}
+
+enum LinuxDevboxCredentialSyncReconciliation: Equatable, Sendable {
+    case committed
+    case safeToRetry
+    case unresolved(String)
 }
 
 enum LinuxDevboxMonitor {
-    enum ActiveAccountSyncMode: Equatable, Sendable {
+    static let maximumRemoteProviderAccountIdBytes = 256
+
+    enum SSHRetryPolicy: Equatable, Sendable {
+        case readOnly
+        case preExecutionTransportOnly
+    }
+
+    private enum RemoteCommandExecutionState: Equatable, Sendable {
+        case notStarted
+        case completed
+        case unknown
+    }
+
+    private struct SSHCommandOutcome: Sendable {
+        let result: ProcessRunResult
+        let executionState: RemoteCommandExecutionState
+    }
+
+    enum RemotePollingMode: Equatable, Sendable {
         case statusOnly
-        case mirrorVPS
+        case activeSession
     }
 
     static let tailscaleBinaryPath = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    static let remoteExecutionMarkerPrefix = "__CODEXSWITCH_REMOTE_COMMAND_STARTED_"
+    static let remoteCompletionMarkerPrefix = "__CODEXSWITCH_REMOTE_COMMAND_COMPLETED_"
+    static let remoteCleanupFailureMarker = "__CODEXSWITCH_REMOTE_CLEANUP_FAILED__"
     static let activeRemoteAccountStatePollInterval: TimeInterval = 5
     static let normalReadinessPollInterval: TimeInterval = 60
+    static let automaticCredentialBundleLifetime: TimeInterval = 10 * 60
+    static let pollAccountRetryPolicy: SSHRetryPolicy = .preExecutionTransportOnly
+
+    private struct RemoteAuthDiagnostics: Decodable, Sendable {
+        let activeAccountId: String?
+        let activeTokenHashPrefix: String?
+        let authMatchesActiveStoreToken: Bool
+    }
 
     static func credentialSyncFingerprint(accounts: [CodexAccount]) -> String {
         var hasher = SHA256()
@@ -140,25 +507,190 @@ enum LinuxDevboxMonitor {
             updateHash(&hasher, account.refreshToken)
             updateHash(&hasher, account.idToken)
             updateHash(&hasher, account.isActive ? "active" : "inactive")
+            updateHash(&hasher, account.planType ?? "")
+            updateHash(&hasher, account.subscriptionWillRenew.map(String.init) ?? "")
+            updateHash(&hasher, account.hasActiveSubscription.map(String.init) ?? "")
+            if let bank = account.rateLimitResetBank {
+                updateHash(&hasher, String(bank.availableCount))
+                updateHash(&hasher, String(bank.totalEarnedCount))
+                updateHash(&hasher, fingerprintDate(bank.fetchedAt))
+                for credit in bank.credits.sorted(by: { $0.id < $1.id }) {
+                    updateHash(&hasher, credit.id)
+                    updateHash(&hasher, credit.status)
+                    updateHash(&hasher, fingerprintDate(credit.expiresAt))
+                }
+            }
+            updateHash(&hasher, account.runtimeUnusableReason ?? "")
+            updateHash(&hasher, fingerprintDate(account.subscriptionRenewsAt))
+            updateHash(&hasher, fingerprintDate(account.subscriptionExpiresAt))
+            updateHash(&hasher, fingerprintDate(account.fiveHourPrimedAt))
+            updateHash(&hasher, fingerprintDate(account.runtimeUnusableUntil))
+            if let snapshot = account.quotaSnapshot {
+                updateHash(&hasher, fingerprintQuotaSnapshot(snapshot))
+            }
         }
         return hasher.finalize()
             .map { String(format: "%02x", $0) }
             .joined()
     }
 
-    static func activeAccountSyncMode(hasActiveRemoteSession: Bool) -> ActiveAccountSyncMode {
-        hasActiveRemoteSession ? .mirrorVPS : .statusOnly
+    static func credentialSyncTargetFingerprint(
+        settings: LinuxDevboxMonitorSettings
+    ) -> String {
+        var hasher = SHA256()
+        updateHash(&hasher, settings.user)
+        updateHash(&hasher, settings.host)
+        updateHash(&hasher, String(settings.port))
+        updateHash(&hasher, NSString(string: settings.sshKeyPath).expandingTildeInPath)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    static func shouldRunMacAutoSwap(
-        hasActiveRemoteSession: Bool,
-        accountMirrorHealthy: Bool,
-        localDesktopRuntimeRunning: Bool = false
-    ) -> Bool {
-        if localDesktopRuntimeRunning {
-            return true
+    static func credentialAccountIdentityFingerprint(accounts: [CodexAccount]) -> String {
+        var hasher = SHA256()
+        for account in accounts.sorted(by: { $0.accountId < $1.accountId }) {
+            updateHash(&hasher, account.accountId)
+            updateHash(&hasher, account.isActive ? "active" : "inactive")
         }
-        return !(hasActiveRemoteSession && accountMirrorHealthy)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func credentialAccountIdentityFingerprint(
+        states: [LinuxDevboxAccountState]
+    ) -> String? {
+        let identified = states.compactMap { state -> (String, Bool)? in
+            guard let accountID = state.providerAccountId, !accountID.isEmpty else { return nil }
+            return (accountID, state.isActive)
+        }
+        guard identified.count == states.count else { return nil }
+
+        var hasher = SHA256()
+        for (accountID, isActive) in identified.sorted(by: { $0.0 < $1.0 }) {
+            updateHash(&hasher, accountID)
+            updateHash(&hasher, isActive ? "active" : "inactive")
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func credentialSetFingerprint(accounts: [CodexAccount]) -> String? {
+        guard accounts.filter(\.isActive).count == 1,
+              Set(accounts.map(\.accountId)).count == accounts.count,
+              accounts.allSatisfy({
+                  !$0.accountId.isEmpty
+                      && !$0.idToken.isEmpty
+                      && !$0.accessToken.isEmpty
+                      && !$0.refreshToken.isEmpty
+              }) else {
+            return nil
+        }
+
+        var hasher = SHA256()
+        for account in accounts.sorted(by: { $0.accountId < $1.accountId }) {
+            updateLengthPrefixedHash(&hasher, account.accountId)
+            updateLengthPrefixedHash(&hasher, account.idToken)
+            updateLengthPrefixedHash(&hasher, account.accessToken)
+            updateLengthPrefixedHash(&hasher, account.refreshToken)
+            updateLengthPrefixedHash(&hasher, account.isActive ? "active" : "inactive")
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func activeTokenHashPrefix(accounts: [CodexAccount]) -> String? {
+        guard accounts.filter(\.isActive).count == 1,
+              let account = accounts.first(where: \.isActive) else {
+            return nil
+        }
+        let parts = [account.idToken, account.accessToken, account.refreshToken, account.accountId]
+        guard parts.allSatisfy({ !$0.isEmpty }) else { return nil }
+
+        var hasher = SHA256()
+        for part in parts {
+            updateLengthPrefixedHash(&hasher, part)
+        }
+        return String(hasher.finalize().map { String(format: "%02x", $0) }.joined().prefix(12))
+    }
+
+    static func makeCredentialSyncOperation(
+        settings: LinuxDevboxMonitorSettings,
+        accounts: [CodexAccount],
+        credentialFingerprint: String,
+        baseline: LinuxDevboxCredentialStateEvidence,
+        operationID: UUID = UUID(),
+        createdAt: Date = Date(),
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory
+    ) -> Result<LinuxDevboxCredentialSyncOperation, LinuxDevboxMonitorFailure> {
+        guard accounts.filter(\.isActive).count == 1,
+              let active = accounts.first(where: \.isActive),
+              let tokenHashPrefix = activeTokenHashPrefix(accounts: accounts),
+              let credentialSetFingerprint = credentialSetFingerprint(accounts: accounts) else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Credential sync requires exactly one active account with complete tokens",
+                credentialSyncDisposition: .rejected
+            ))
+        }
+
+        let identifier = operationID.uuidString.lowercased()
+        let localDirectory = temporaryDirectory
+            .appendingPathComponent(
+                "codexswitch-linux-credential-sync-\(identifier)",
+                isDirectory: true
+            )
+            .path
+        let remoteDirectory = "/tmp/codexswitch-auto-sync-\(identifier)"
+        return .success(LinuxDevboxCredentialSyncOperation(
+            operationID: identifier,
+            targetFingerprint: credentialSyncTargetFingerprint(settings: settings),
+            credentialFingerprint: credentialFingerprint,
+            expectedAccountIdentityFingerprint: credentialAccountIdentityFingerprint(accounts: accounts),
+            expectedCredentialSetFingerprint: credentialSetFingerprint,
+            expectedActiveProviderAccountId: active.accountId,
+            expectedActiveTokenHashPrefix: tokenHashPrefix,
+            baseline: baseline,
+            localDirectory: localDirectory,
+            remoteDirectory: remoteDirectory,
+            createdAt: createdAt,
+            reason: "Credential sync may have started; reconciliation is required after interruption"
+        ))
+    }
+
+    static func credentialSyncReconciliation(
+        operation: LinuxDevboxCredentialSyncOperation,
+        remoteStageAbsent: Bool,
+        observed: LinuxDevboxCredentialStateEvidence?
+    ) -> LinuxDevboxCredentialSyncReconciliation {
+        guard remoteStageAbsent else {
+            return .unresolved("Private remote credential staging still exists at \(operation.remoteDirectory)")
+        }
+        guard let observed else {
+            return .unresolved("Remote credential-state evidence is unavailable")
+        }
+        if observed == operation.expected {
+            return .committed
+        }
+        if observed == operation.baseline {
+            return .safeToRetry
+        }
+        return .unresolved("Remote credential state matches neither the expected commit nor the pre-mutation baseline")
+    }
+
+    static func credentialSyncOwnsLocalStagePath(
+        operation: LinuxDevboxCredentialSyncOperation,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory
+    ) -> Bool {
+        let directory = URL(fileURLWithPath: operation.localDirectory, isDirectory: true)
+            .standardizedFileURL
+        let actualParent = directory.deletingLastPathComponent()
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let expectedParent = temporaryDirectory
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        return actualParent.path == expectedParent.path
+            && directory.lastPathComponent
+                == "codexswitch-linux-credential-sync-\(operation.operationID)"
+    }
+
+    static func remotePollingMode(hasActiveRemoteSession: Bool) -> RemotePollingMode {
+        hasActiveRemoteSession ? .activeSession : .statusOnly
     }
 
     static func isInteractiveCodexVPSAttachRunning() -> Bool {
@@ -263,26 +795,192 @@ enum LinuxDevboxMonitor {
     private static func runSSH(
         settings: LinuxDevboxMonitorSettings,
         remoteCommand: String,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        retryPolicy: SSHRetryPolicy
     ) -> ProcessRunResult {
-        var lastResult: ProcessRunResult?
-        for candidate in sshArgumentCandidates(settings: settings) {
-            let arguments = candidate + [remoteCommand]
-            let result = ProcessRunner.run(
-                executableURL: URL(fileURLWithPath: "/usr/bin/ssh"),
-                arguments: arguments,
-                timeout: timeout
+        let outcome = runSSHOutcome(
+            settings: settings,
+            remoteCommand: remoteCommand,
+            timeout: timeout,
+            retryPolicy: retryPolicy
+        )
+        guard outcome.executionState != .unknown else {
+            return ProcessRunResult(
+                terminationStatus: -1,
+                stdout: outcome.result.stdout,
+                stderr: Data("Remote command completion could not be proven".utf8),
+                timedOut: outcome.result.timedOut,
+                stdoutTruncated: outcome.result.stdoutTruncated,
+                stderrTruncated: outcome.result.stderrTruncated
             )
-            if result.terminationStatus == 0, !result.timedOut {
-                return result
-            }
-            lastResult = result
         }
-        return lastResult ?? ProcessRunResult(
-            terminationStatus: -1,
-            stdout: Data(),
-            stderr: Data("No SSH candidates available".utf8),
-            timedOut: false
+        return outcome.result
+    }
+
+    private static func runSSHOutcome(
+        settings: LinuxDevboxMonitorSettings,
+        remoteCommand: String,
+        timeout: TimeInterval,
+        retryPolicy: SSHRetryPolicy
+    ) -> SSHCommandOutcome {
+        runSSHOutcomeWithCandidates(
+            sshArgumentCandidates(settings: settings),
+            remoteCommand: remoteCommand,
+            timeout: timeout,
+            retryPolicy: retryPolicy
+        ) { executableURL, arguments, commandTimeout in
+            ProcessRunner.run(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: commandTimeout
+            )
+        }
+    }
+
+    static func runSSHWithCandidates(
+        _ candidates: [[String]],
+        remoteCommand: String,
+        timeout: TimeInterval,
+        retryPolicy: SSHRetryPolicy,
+        executionToken: String = UUID().uuidString.lowercased(),
+        runner: (URL, [String], TimeInterval) -> ProcessRunResult
+    ) -> ProcessRunResult {
+        runSSHOutcomeWithCandidates(
+            candidates,
+            remoteCommand: remoteCommand,
+            timeout: timeout,
+            retryPolicy: retryPolicy,
+            executionToken: executionToken,
+            runner: runner
+        ).result
+    }
+
+    private static func runSSHOutcomeWithCandidates(
+        _ candidates: [[String]],
+        remoteCommand: String,
+        timeout: TimeInterval,
+        retryPolicy: SSHRetryPolicy,
+        executionToken: String = UUID().uuidString.lowercased(),
+        runner: (URL, [String], TimeInterval) -> ProcessRunResult
+    ) -> SSHCommandOutcome {
+        var lastOutcome: SSHCommandOutcome?
+        let executionMarker = remoteExecutionMarker(executionToken: executionToken)
+        let completionMarker = remoteCompletionMarker(executionToken: executionToken)
+        for (index, candidate) in candidates.enumerated() {
+            let markedCommand = """
+            printf '%s\\n' \(shellQuote(executionMarker)) >&2
+            ( \(remoteCommand) )
+            codexswitch_remote_status=$?
+            printf '%s %s\\n' \(shellQuote(completionMarker)) "$codexswitch_remote_status" >&2
+            exit "$codexswitch_remote_status"
+            """
+            let arguments = candidate + [markedCommand]
+            let rawResult = runner(URL(fileURLWithPath: "/usr/bin/ssh"), arguments, timeout)
+            let result = removingRemoteExecutionMarkers(
+                start: executionMarker,
+                completion: completionMarker,
+                from: rawResult
+            )
+            let executionState: RemoteCommandExecutionState
+            if remoteCommandCompletionIsProven(
+                completionMarker: completionMarker,
+                result: rawResult
+            ) {
+                executionState = .completed
+            } else if isDefiniteLocalProcessLaunchFailure(rawResult) {
+                executionState = .notStarted
+            } else {
+                executionState = .unknown
+            }
+            let outcome = SSHCommandOutcome(
+                result: result,
+                executionState: executionState
+            )
+            if result.terminationStatus == 0,
+               !result.timedOut,
+               executionState == .completed {
+                return outcome
+            }
+            lastOutcome = outcome
+            guard index + 1 < candidates.count else { break }
+            if retryPolicy == .preExecutionTransportOnly,
+               outcome.executionState != .notStarted {
+                break
+            }
+        }
+        return lastOutcome ?? SSHCommandOutcome(
+            result: ProcessRunResult(
+                terminationStatus: -1,
+                stdout: Data(),
+                stderr: Data("No SSH candidates available".utf8),
+                timedOut: false
+            ),
+            executionState: .notStarted
+        )
+    }
+
+    static func remoteExecutionMarker(executionToken: String) -> String {
+        "\(remoteExecutionMarkerPrefix)\(executionToken)__"
+    }
+
+    static func remoteCompletionMarker(executionToken: String) -> String {
+        "\(remoteCompletionMarkerPrefix)\(executionToken)__"
+    }
+
+    static func isDefiniteLocalProcessLaunchFailure(_ result: ProcessRunResult) -> Bool {
+        result.terminationStatus == -1 && !result.timedOut
+    }
+
+    static func remoteCommandCompletionIsProven(
+        completionMarker: String,
+        result: ProcessRunResult
+    ) -> Bool {
+        remoteCompletionStatus(
+            completionMarker: completionMarker,
+            stderr: result.stderrString
+        ) == result.terminationStatus
+    }
+
+    private static func remoteCompletionStatus(
+        completionMarker: String,
+        stderr: String
+    ) -> Int32? {
+        let prefix = "\(completionMarker) "
+        let values = stderr
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .compactMap { line -> Int32? in
+                let value = String(line)
+                guard value.hasPrefix(prefix) else { return nil }
+                return Int32(value.dropFirst(prefix.count))
+            }
+        guard values.count == 1 else { return nil }
+        return values[0]
+    }
+
+    private static func removingRemoteExecutionMarkers(
+        start executionMarker: String,
+        completion completionMarker: String,
+        from result: ProcessRunResult
+    ) -> ProcessRunResult {
+        guard result.stderrString.contains(executionMarker)
+                || result.stderrString.contains(completionMarker) else {
+            return result
+        }
+        let completionPrefix = "\(completionMarker) "
+        let cleaned = result.stderrString
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter {
+                let line = String($0)
+                return line != executionMarker && !line.hasPrefix(completionPrefix)
+            }
+            .joined(separator: "\n")
+        return ProcessRunResult(
+            terminationStatus: result.terminationStatus,
+            stdout: result.stdout,
+            stderr: Data(cleaned.utf8),
+            timedOut: result.timedOut,
+            stdoutTruncated: result.stdoutTruncated,
+            stderrTruncated: result.stderrTruncated
         )
     }
 
@@ -290,10 +988,12 @@ enum LinuxDevboxMonitor {
         settings: LinuxDevboxMonitorSettings,
         localPaths: [String],
         remoteDirectory: String,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        retryPolicy: SSHRetryPolicy = .preExecutionTransportOnly
     ) -> ProcessRunResult {
         var lastResult: ProcessRunResult?
-        for candidate in scpArgumentCandidates(settings: settings) {
+        let candidates = scpArgumentCandidates(settings: settings)
+        for (index, candidate) in candidates.enumerated() {
             let target = "\(settings.user)@\(settings.host):\(remoteDirectory)/"
             let result = ProcessRunner.run(
                 executableURL: URL(fileURLWithPath: "/usr/bin/scp"),
@@ -304,6 +1004,11 @@ enum LinuxDevboxMonitor {
                 return result
             }
             lastResult = result
+            guard index + 1 < candidates.count else { break }
+            if retryPolicy == .preExecutionTransportOnly,
+               !isDefiniteLocalProcessLaunchFailure(result) {
+                break
+            }
         }
         return lastResult ?? ProcessRunResult(
             terminationStatus: -1,
@@ -320,8 +1025,9 @@ enum LinuxDevboxMonitor {
 
         let result = runSSH(
             settings: settings,
-            remoteCommand: "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli doctor --json",
-            timeout: 20
+            remoteCommand: remoteReadinessCommand(),
+            timeout: 20,
+            retryPolicy: .readOnly
         )
 
         guard !result.timedOut else {
@@ -347,46 +1053,83 @@ enum LinuxDevboxMonitor {
             return .failure(LinuxDevboxMonitorFailure(message: "Linux devbox monitor is not configured"))
         }
 
-        let result = runSSH(
+        let outcome = runSSHOutcome(
             settings: settings,
             remoteCommand: "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli poll \(shellQuote(selector))",
-            timeout: 25
+            timeout: 25,
+            retryPolicy: pollAccountRetryPolicy
         )
+        let result = outcome.result
 
-        guard !result.timedOut else {
-            return .failure(LinuxDevboxMonitorFailure(message: "SSH timed out while polling Linux devbox account"))
+        guard !result.timedOut, outcome.executionState != .unknown else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox poll outcome is unknown and was not replayed",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
         }
         guard result.terminationStatus == 0 else {
             let message = result.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
-            return .failure(LinuxDevboxMonitorFailure(message: message.isEmpty ? "SSH poll failed with status \(result.terminationStatus)" : message))
+            let detail = message.isEmpty
+                ? "SSH poll failed with status \(result.terminationStatus)"
+                : message
+            let signalInterrupted = isCredentialMutationSignalStatus(
+                result.terminationStatus
+            )
+            return .failure(LinuxDevboxMonitorFailure(
+                message: signalInterrupted
+                    ? "Signal interrupted Linux devbox poll after it started; outcome is unknown"
+                    : "\(detail); persisted poll outcome is unknown",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
         }
         return .success(result.stdoutString.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     static func syncCredentials(
         settings: LinuxDevboxMonitorSettings,
-        accounts: [CodexAccount]
+        accounts: [CodexAccount],
+        operation: LinuxDevboxCredentialSyncOperation
     ) -> Result<String, LinuxDevboxMonitorFailure> {
         guard settings.isConfigured else {
-            return .failure(LinuxDevboxMonitorFailure(message: "Linux devbox monitor is not configured"))
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox monitor is not configured",
+                credentialSyncDisposition: .rejected
+            ))
+        }
+        guard credentialSyncOwnsLocalStagePath(operation: operation) else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Credential sync local staging path is not operation-owned",
+                credentialSyncDisposition: .rejected
+            ))
         }
         guard !accounts.isEmpty else {
-            return .failure(LinuxDevboxMonitorFailure(message: "No accounts are available to sync"))
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "No accounts are available to sync",
+                credentialSyncDisposition: .rejected
+            ))
+        }
+        guard operation.targetFingerprint == credentialSyncTargetFingerprint(settings: settings),
+              operation.credentialFingerprint == credentialSyncFingerprint(accounts: accounts),
+              operation.expectedAccountIdentityFingerprint
+                == credentialAccountIdentityFingerprint(accounts: accounts),
+              operation.expectedCredentialSetFingerprint
+                == credentialSetFingerprint(accounts: accounts),
+              operation.expectedActiveTokenHashPrefix == activeTokenHashPrefix(accounts: accounts),
+              operation.expectedActiveProviderAccountId
+                == accounts.first(where: \.isActive)?.accountId else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Credential sync operation no longer matches the account snapshot",
+                credentialSyncDisposition: .rejected
+            ))
         }
 
-        let remoteDirectory = "/tmp"
-        let syncId = UUID().uuidString.lowercased()
-        let bundleName = "codexswitch-auto-sync-\(syncId).csbundle"
-        let passphraseName = "codexswitch-auto-sync-\(syncId).passphrase"
-        let bundlePath = "\(remoteDirectory)/\(bundleName)"
-        let passphrasePath = "\(remoteDirectory)/\(passphraseName)"
-        let tempDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("codexswitch-linux-credential-sync-\(syncId)", isDirectory: true)
+        let bundleName = "codexswitch-auto-sync-\(operation.operationID).csbundle"
+        let passphraseName = "codexswitch-auto-sync-\(operation.operationID).passphrase"
+        let tempDirectory = URL(fileURLWithPath: operation.localDirectory, isDirectory: true)
+        let result: Result<String, LinuxDevboxMonitorFailure>
 
         do {
-            try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: tempDirectory) }
-
+            try createPrivateLocalCredentialStage(at: tempDirectory)
             let passphrase = try randomPassphrase()
             let bundleURL = tempDirectory.appendingPathComponent(bundleName)
             let passphraseURL = tempDirectory.appendingPathComponent(passphraseName)
@@ -394,43 +1137,193 @@ enum LinuxDevboxMonitor {
                 accounts: accounts,
                 passphrase: passphrase,
                 confirmation: passphrase,
-                lifetime: 10 * 60
+                lifetime: automaticCredentialBundleLifetime
             )
-            try bundle.data.write(to: bundleURL, options: .atomic)
-            try passphrase.write(to: passphraseURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bundleURL.path)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passphraseURL.path)
-
-            let copyResult = runSCP(
+            try writePrivateLocalCredentialFile(bundle.data, to: bundleURL)
+            try writePrivateLocalCredentialFile(Data(passphrase.utf8), to: passphraseURL)
+            result = transferCredentials(
                 settings: settings,
-                localPaths: [bundleURL.path, passphraseURL.path],
-                remoteDirectory: remoteDirectory,
-                timeout: 30
+                operation: operation,
+                bundleURL: bundleURL,
+                passphraseURL: passphraseURL
             )
-            guard !copyResult.timedOut else {
-                return .failure(LinuxDevboxMonitorFailure(message: "SSH timed out while copying Linux devbox credentials"))
-            }
-            guard copyResult.terminationStatus == 0 else {
-                let message = copyResult.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
-                return .failure(LinuxDevboxMonitorFailure(message: message.isEmpty ? "SCP credential sync failed with status \(copyResult.terminationStatus)" : message))
-            }
-
-            let importResult = runSSH(
-                settings: settings,
-                remoteCommand: remoteCredentialSyncCommand(bundlePath: bundlePath, passphrasePath: passphrasePath),
-                timeout: 45
-            )
-            guard !importResult.timedOut else {
-                return .failure(LinuxDevboxMonitorFailure(message: "SSH timed out while updating Linux devbox credentials"))
-            }
-            guard importResult.terminationStatus == 0 else {
-                let message = importResult.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
-                return .failure(LinuxDevboxMonitorFailure(message: message.isEmpty ? "Linux devbox credential update failed with status \(importResult.terminationStatus)" : message))
-            }
-
-            return .success(importResult.stdoutString.trimmingCharacters(in: .whitespacesAndNewlines))
         } catch {
-            return .failure(LinuxDevboxMonitorFailure(message: "Failed to prepare Linux devbox credential bundle: \(error.localizedDescription)"))
+            result = .failure(LinuxDevboxMonitorFailure(
+                message: "Failed to prepare Linux devbox credential bundle: \(error.localizedDescription)",
+                credentialSyncDisposition: .rejected
+            ))
+        }
+
+        if let cleanupFailure = cleanupLocalCredentialStage(at: tempDirectory) {
+            let original: String?
+            if case .failure(let failure) = result {
+                original = failure.message
+            } else {
+                original = nil
+            }
+            return .failure(LinuxDevboxMonitorFailure(
+                message: [original, cleanupFailure].compactMap { $0 }.joined(separator: "; "),
+                credentialSyncDisposition: .cleanupUnresolved
+            ))
+        }
+        return result
+    }
+
+    private static func transferCredentials(
+        settings: LinuxDevboxMonitorSettings,
+        operation: LinuxDevboxCredentialSyncOperation,
+        bundleURL: URL,
+        passphraseURL: URL
+    ) -> Result<String, LinuxDevboxMonitorFailure> {
+        let remoteDirectory = operation.remoteDirectory
+        let stageOutcome = runSSHOutcome(
+            settings: settings,
+            remoteCommand: remoteCredentialStagingCommand(remoteDirectory: remoteDirectory),
+            timeout: 20,
+            retryPolicy: .preExecutionTransportOnly
+        )
+        let stageResult = stageOutcome.result
+        guard !stageResult.timedOut, stageOutcome.executionState != .unknown else {
+            return .failure(failureAfterRemoteCleanup(
+                settings: settings,
+                remoteDirectory: remoteDirectory,
+                message: "Private Linux devbox staging outcome is unknown; credential sync was not retried",
+                disposition: .cleanupUnresolved
+            ))
+        }
+        guard stageResult.terminationStatus == 0 else {
+            let message = stageResult.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = message.isEmpty
+                ? "Private Linux devbox staging failed with status \(stageResult.terminationStatus)"
+                : message
+            if stageOutcome.executionState == .notStarted {
+                return .failure(LinuxDevboxMonitorFailure(
+                    message: detail,
+                    credentialSyncDisposition: .retryablePreExecution
+                ))
+            }
+            return .failure(failureAfterRemoteCleanup(
+                settings: settings,
+                remoteDirectory: remoteDirectory,
+                message: detail,
+                disposition: .rejected
+            ))
+        }
+
+        let copyResult = runSCP(
+            settings: settings,
+            localPaths: [bundleURL.path, passphraseURL.path],
+            remoteDirectory: remoteDirectory,
+            timeout: 30
+        )
+        guard !copyResult.timedOut else {
+            return .failure(failureAfterRemoteCleanup(
+                settings: settings,
+                remoteDirectory: remoteDirectory,
+                message: "Credential copy outcome is unknown; credential sync was not retried",
+                disposition: .cleanupUnresolved
+            ))
+        }
+        guard copyResult.terminationStatus == 0 else {
+            let message = copyResult.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .failure(failureAfterRemoteCleanup(
+                settings: settings,
+                remoteDirectory: remoteDirectory,
+                message: message.isEmpty
+                    ? "SCP credential sync failed with status \(copyResult.terminationStatus)"
+                    : message,
+                disposition: isDefiniteLocalProcessLaunchFailure(copyResult)
+                    ? .retryablePreExecution
+                    : .rejected
+            ))
+        }
+
+        let importOutcome = runSSHOutcome(
+            settings: settings,
+            remoteCommand: remoteCredentialSyncCommand(
+                remoteDirectory: remoteDirectory,
+                bundleName: bundleURL.lastPathComponent,
+                passphraseName: passphraseURL.lastPathComponent
+            ),
+            timeout: 45,
+            retryPolicy: .preExecutionTransportOnly
+        )
+        let importResult = importOutcome.result
+        if importResult.stderrString.contains(remoteCleanupFailureMarker) {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox credential update finished, but private staging cleanup is unresolved at \(remoteDirectory)",
+                credentialSyncDisposition: .cleanupUnresolved
+            ))
+        }
+        guard !importResult.timedOut else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "SSH timed out while updating Linux devbox credentials; outcome is unknown and the mutation was not retried",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
+        guard importOutcome.executionState != .unknown else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox credential update has no matching completion evidence; outcome is unknown and the mutation was not retried",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
+        guard importResult.terminationStatus == 0 else {
+            let message = importResult.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = message.isEmpty
+                ? "Linux devbox credential update failed with status \(importResult.terminationStatus)"
+                : message
+            if importOutcome.executionState != .notStarted,
+               completedCredentialImportFailureDisposition(importResult.terminationStatus)
+                == .outcomeUnknown {
+                return .failure(LinuxDevboxMonitorFailure(
+                    message: "\(detail); signal interrupted the remote mutation and its outcome is unknown",
+                    credentialSyncDisposition: .outcomeUnknown
+                ))
+            }
+            switch importOutcome.executionState {
+            case .notStarted:
+                return .failure(failureAfterRemoteCleanup(
+                    settings: settings,
+                    remoteDirectory: remoteDirectory,
+                    message: detail,
+                    disposition: .retryablePreExecution
+                ))
+            case .completed:
+                return .failure(LinuxDevboxMonitorFailure(
+                    message: detail,
+                    credentialSyncDisposition: .rejected
+                ))
+            case .unknown:
+                return .failure(LinuxDevboxMonitorFailure(
+                    message: "\(detail); remote mutation outcome is unknown and was not retried",
+                    credentialSyncDisposition: .outcomeUnknown
+                ))
+            }
+        }
+
+        return .success(importResult.stdoutString.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    static func isCredentialMutationSignalStatus(_ status: Int32) -> Bool {
+        status == 129 || status == 130 || status == 143
+    }
+
+    static func completedCredentialImportFailureDisposition(
+        _ status: Int32
+    ) -> CredentialSyncFailureDisposition {
+        isCredentialMutationSignalStatus(status) ? .outcomeUnknown : .rejected
+    }
+
+    static func credentialSyncHoldReason(
+        for failure: LinuxDevboxMonitorFailure
+    ) -> String {
+        switch failure.credentialSyncDisposition {
+        case .outcomeUnknown:
+            return "Remote credential mutation outcome is unknown; read-only reconciliation is required"
+        case .cleanupUnresolved:
+            return "Credential staging cleanup is unresolved; absence must be proven before reconciliation"
+        case .notCredentialSync, .retryablePreExecution, .rejected:
+            return failure.message
         }
     }
 
@@ -442,14 +1335,18 @@ enum LinuxDevboxMonitor {
             return .failure(LinuxDevboxMonitorFailure(message: "Linux devbox monitor is not configured"))
         }
 
-        let result = runSSH(
+        let outcome = runSSHOutcome(
             settings: settings,
             remoteCommand: remoteSwapCommand(selector: selector),
-            timeout: 30
+            timeout: 30,
+            retryPolicy: .preExecutionTransportOnly
         )
+        let result = outcome.result
 
-        guard !result.timedOut else {
-            return .failure(LinuxDevboxMonitorFailure(message: "SSH timed out while swapping Linux devbox account"))
+        guard !result.timedOut, outcome.executionState != .unknown else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox account swap outcome is unknown and the mutation was not retried"
+            ))
         }
         guard result.terminationStatus == 0 else {
             let message = result.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -469,7 +1366,8 @@ enum LinuxDevboxMonitor {
         let result = runSSH(
             settings: settings,
             remoteCommand: remoteUsageReportCommand(days: days),
-            timeout: 90
+            timeout: 90,
+            retryPolicy: .readOnly
         )
 
         guard !result.timedOut else {
@@ -490,6 +1388,17 @@ enum LinuxDevboxMonitor {
     static func fetchAccountStates(
         settings: LinuxDevboxMonitorSettings
     ) -> Result<[LinuxDevboxAccountState], LinuxDevboxMonitorFailure> {
+        switch fetchAccountStateReport(settings: settings) {
+        case .success(let report):
+            return .success(report.accounts)
+        case .failure(let failure):
+            return .failure(failure)
+        }
+    }
+
+    private static func fetchAccountStateReport(
+        settings: LinuxDevboxMonitorSettings
+    ) -> Result<LinuxDevboxAccountStateReport, LinuxDevboxMonitorFailure> {
         guard settings.isConfigured else {
             return .failure(LinuxDevboxMonitorFailure(message: "Linux devbox monitor is not configured"))
         }
@@ -497,7 +1406,8 @@ enum LinuxDevboxMonitor {
         let result = runSSH(
             settings: settings,
             remoteCommand: remoteAccountStateCommand(),
-            timeout: 20
+            timeout: 20,
+            retryPolicy: .readOnly
         )
 
         guard !result.timedOut else {
@@ -509,10 +1419,137 @@ enum LinuxDevboxMonitor {
         }
 
         do {
-            return .success(try decodeAccountStates(data: result.stdout))
+            return .success(try accountStateDecoder().decode(
+                LinuxDevboxAccountStateReport.self,
+                from: result.stdout
+            ))
         } catch {
             return .failure(LinuxDevboxMonitorFailure(message: "Failed to parse Linux devbox account state JSON: \(error.localizedDescription)"))
         }
+    }
+
+    static func captureCredentialStateEvidence(
+        settings: LinuxDevboxMonitorSettings
+    ) -> Result<LinuxDevboxCredentialStateEvidence, LinuxDevboxMonitorFailure> {
+        guard settings.isConfigured else {
+            return .failure(LinuxDevboxMonitorFailure(message: "Linux devbox monitor is not configured"))
+        }
+
+        let before: LinuxDevboxAccountStateReport
+        switch fetchAccountStateReport(settings: settings) {
+        case .success(let report):
+            before = report
+        case .failure(let failure):
+            return .failure(failure)
+        }
+
+        let diagnosticsResult = runSSH(
+            settings: settings,
+            remoteCommand: "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli auth-diagnostics --json",
+            timeout: 20,
+            retryPolicy: .readOnly
+        )
+        guard !diagnosticsResult.timedOut, diagnosticsResult.terminationStatus == 0 else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Remote auth diagnostics failed with status \(diagnosticsResult.terminationStatus)"
+            ))
+        }
+
+        let diagnostics: RemoteAuthDiagnostics
+        do {
+            diagnostics = try JSONDecoder().decode(
+                RemoteAuthDiagnostics.self,
+                from: diagnosticsResult.stdout
+            )
+        } catch {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Failed to parse remote auth diagnostics: \(error.localizedDescription)"
+            ))
+        }
+
+        let after: LinuxDevboxAccountStateReport
+        switch fetchAccountStateReport(settings: settings) {
+        case .success(let report):
+            after = report
+        case .failure(let failure):
+            return .failure(failure)
+        }
+        guard let beforeAccountFingerprint = credentialAccountIdentityFingerprint(
+                  states: before.accounts
+              ),
+              let accountFingerprint = credentialAccountIdentityFingerprint(
+                  states: after.accounts
+              ),
+              beforeAccountFingerprint == accountFingerprint,
+              let beforeCredentialSetFingerprint = before.credentialSetFingerprint,
+              let credentialSetFingerprint = after.credentialSetFingerprint,
+              beforeCredentialSetFingerprint == credentialSetFingerprint,
+              isLowercaseHex(credentialSetFingerprint, count: 64),
+              let activeAccountID = diagnostics.activeAccountId,
+              !activeAccountID.isEmpty,
+              after.accounts.filter(\.isActive).count == 1,
+              after.accounts.first(where: \.isActive)?.providerAccountId == activeAccountID,
+              let activeTokenHashPrefix = diagnostics.activeTokenHashPrefix,
+              isLowercaseHex(activeTokenHashPrefix, count: 12) else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Remote credential-state evidence is incomplete or changed while observed"
+            ))
+        }
+
+        return .success(LinuxDevboxCredentialStateEvidence(
+            accountIdentityFingerprint: accountFingerprint,
+            credentialSetFingerprint: credentialSetFingerprint,
+            activeProviderAccountId: activeAccountID,
+            activeTokenHashPrefix: activeTokenHashPrefix,
+            authMatchesActiveStoreToken: diagnostics.authMatchesActiveStoreToken
+        ))
+    }
+
+    static func reconcileCredentialSync(
+        settings: LinuxDevboxMonitorSettings,
+        operation: LinuxDevboxCredentialSyncOperation
+    ) -> LinuxDevboxCredentialSyncReconciliation {
+        guard credentialSyncTargetFingerprint(settings: settings) == operation.targetFingerprint else {
+            return .unresolved("Configured Linux devbox target changed while credential sync was pending")
+        }
+        guard credentialSyncOwnsLocalStagePath(operation: operation) else {
+            return .unresolved("Credential sync local staging path is not operation-owned")
+        }
+        if let cleanupFailure = cleanupLocalCredentialStage(
+            at: URL(fileURLWithPath: operation.localDirectory, isDirectory: true)
+        ) {
+            return .unresolved(cleanupFailure)
+        }
+
+        let stageResult = runSSH(
+            settings: settings,
+            remoteCommand: remoteCredentialStageAbsenceCommand(
+                remoteDirectory: operation.remoteDirectory
+            ),
+            timeout: 15,
+            retryPolicy: .readOnly
+        )
+        guard !stageResult.timedOut, stageResult.terminationStatus == 0 else {
+            if stageResult.terminationStatus == 75 {
+                return .unresolved(
+                    "Private remote credential staging still exists at \(operation.remoteDirectory)"
+                )
+            }
+            return .unresolved("Remote credential staging could not be inspected")
+        }
+
+        let observed: LinuxDevboxCredentialStateEvidence?
+        switch captureCredentialStateEvidence(settings: settings) {
+        case .success(let evidence):
+            observed = evidence
+        case .failure:
+            return .unresolved("Remote credential-state evidence could not be collected")
+        }
+        return credentialSyncReconciliation(
+            operation: operation,
+            remoteStageAbsent: true,
+            observed: observed
+        )
     }
 
     static func decodeAccountStates(data: Data) throws -> [LinuxDevboxAccountState] {
@@ -555,12 +1592,189 @@ enum LinuxDevboxMonitor {
         "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
-    static func remoteCredentialSyncCommand(bundlePath: String, passphrasePath: String) -> String {
-        let bundle = shellQuote(bundlePath)
-        let passphrase = shellQuote(passphrasePath)
+    static func remoteCredentialStageAbsenceCommand(remoteDirectory: String) -> String {
+        let stage = shellQuote(remoteDirectory)
+        return "if /usr/bin/test -e \(stage) || /usr/bin/test -L \(stage); then exit 75; fi"
+    }
+
+    static func remoteCredentialStagingCommand(remoteDirectory: String) -> String {
+        "umask 077; mkdir -m 700 -- \(shellQuote(remoteDirectory))"
+    }
+
+    static func remoteCredentialSyncCommand(
+        remoteDirectory: String,
+        bundleName: String,
+        passphraseName: String,
+        removeExecutable: String = "/bin/rm"
+    ) -> String {
+        let stage = shellQuote(remoteDirectory)
+        let bundle = shellQuote("\(remoteDirectory)/\(bundleName)")
+        let passphrase = shellQuote("\(remoteDirectory)/\(passphraseName)")
+        let remover = shellQuote(removeExecutable)
         return """
-        chmod 600 \(bundle) \(passphrase) 2>/dev/null || true; export PATH="$HOME/.local/bin:$PATH"; CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) codexswitch-cli update-bundle \(bundle) --ignore-expiry; status=$?; rm -f \(bundle) \(passphrase); if [ "$status" -eq 0 ]; then echo codex_app_server_reload=not_reloaded_credential_sync_only; fi; exit $status
+        stage=\(stage)
+        cleanup_with_status() {
+            status="$1"
+            trap - EXIT HUP INT TERM
+            if \(remover) -rf -- "$stage" && [ ! -e "$stage" ] && [ ! -L "$stage" ]; then
+                exit "$status"
+            fi
+            printf '%s %s\\n' '\(remoteCleanupFailureMarker)' "$stage" >&2
+            if [ "$status" -eq 0 ]; then
+                exit 74
+            fi
+            exit "$status"
+        }
+        trap 'cleanup_with_status "$?"' EXIT
+        trap 'cleanup_with_status 129' HUP
+        trap 'cleanup_with_status 130' INT
+        trap 'cleanup_with_status 143' TERM
+        set -eu
+        umask 077
+        chmod 600 \(bundle) \(passphrase)
+        export PATH="$HOME/.local/bin:$PATH"
+        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) codexswitch-cli update-bundle \(bundle)
         """
+    }
+
+    static func cleanupLocalCredentialStage(
+        at directory: URL,
+        removeItem: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) },
+        pathExists: (String) -> Bool = { pathExistsWithoutFollowingSymlinks($0) }
+    ) -> String? {
+        guard pathExists(directory.path) else { return nil }
+        do {
+            try removeItem(directory)
+        } catch {
+            return "Private local credential staging cleanup failed at \(directory.path): \(error.localizedDescription)"
+        }
+        guard !pathExists(directory.path) else {
+            return "Private local credential staging cleanup could not prove absence at \(directory.path)"
+        }
+        return nil
+    }
+
+    private static func failureAfterRemoteCleanup(
+        settings: LinuxDevboxMonitorSettings,
+        remoteDirectory: String,
+        message: String,
+        disposition: CredentialSyncFailureDisposition
+    ) -> LinuxDevboxMonitorFailure {
+        if let cleanupFailure = cleanupRemoteCredentialStage(
+            settings: settings,
+            remoteDirectory: remoteDirectory
+        ) {
+            return LinuxDevboxMonitorFailure(
+                message: "\(message); \(cleanupFailure)",
+                credentialSyncDisposition: .cleanupUnresolved
+            )
+        }
+        return LinuxDevboxMonitorFailure(
+            message: message,
+            credentialSyncDisposition: disposition
+        )
+    }
+
+    private static func cleanupRemoteCredentialStage(
+        settings: LinuxDevboxMonitorSettings,
+        remoteDirectory: String
+    ) -> String? {
+        let outcome = runSSHOutcome(
+            settings: settings,
+            remoteCommand: "stage=\(shellQuote(remoteDirectory)); /bin/rm -rf -- \"$stage\" && [ ! -e \"$stage\" ] && [ ! -L \"$stage\" ]",
+            timeout: 15,
+            retryPolicy: .preExecutionTransportOnly
+        )
+        let result = outcome.result
+        guard !result.timedOut,
+              result.terminationStatus == 0,
+              outcome.executionState == .completed else {
+            let detail = result.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
+            let reason = detail.isEmpty
+                ? "status \(result.terminationStatus)"
+                : detail
+            return "private staging cleanup is unresolved at \(remoteDirectory): \(reason)"
+        }
+        return nil
+    }
+
+    private static func pathExistsWithoutFollowingSymlinks(_ path: String) -> Bool {
+        var metadata = stat()
+        if lstat(path, &metadata) == 0 {
+            return true
+        }
+        return errno != ENOENT
+    }
+
+    static func createPrivateLocalCredentialStage(at directory: URL) throws {
+        guard mkdir(directory.path, mode_t(S_IRWXU)) == 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSFilePathErrorKey: directory.path]
+            )
+        }
+        var metadata = stat()
+        guard lstat(directory.path, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFDIR,
+              metadata.st_uid == geteuid(),
+              metadata.st_mode & mode_t(0o077) == 0 else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                "local credential staging is not a private current-user directory"
+            )
+        }
+    }
+
+    static func writePrivateLocalCredentialFile(_ data: Data, to url: URL) throws {
+        let descriptor = Darwin.open(
+            url.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(S_IRUSR | S_IWUSR)
+        )
+        guard descriptor >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSFilePathErrorKey: url.path]
+            )
+        }
+        defer { Darwin.close(descriptor) }
+
+        guard fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSFilePathErrorKey: url.path]
+            )
+        }
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(
+                    descriptor,
+                    bytes.baseAddress!.advanced(by: offset),
+                    bytes.count - offset
+                )
+                if count > 0 {
+                    offset += count
+                } else if count < 0, errno == EINTR {
+                    continue
+                } else {
+                    throw NSError(
+                        domain: NSPOSIXErrorDomain,
+                        code: Int(count == 0 ? EIO : errno),
+                        userInfo: [NSFilePathErrorKey: url.path]
+                    )
+                }
+            }
+        }
+        guard fsync(descriptor) == 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSFilePathErrorKey: url.path]
+            )
+        }
     }
 
     static func remoteSwapCommand(selector: String) -> String {
@@ -610,10 +1824,59 @@ enum LinuxDevboxMonitor {
         hasher.update(data: Data([0]))
     }
 
+    private static func updateLengthPrefixedHash(_ hasher: inout SHA256, _ value: String) {
+        let bytes = Data(value.utf8)
+        var length = UInt64(bytes.count).bigEndian
+        withUnsafeBytes(of: &length) { hasher.update(data: Data($0)) }
+        hasher.update(data: bytes)
+    }
+
+    private static func isLowercaseHex(_ value: String, count: Int) -> Bool {
+        value.count == count && value.utf8.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+        }
+    }
+
+    private static func fingerprintDate(_ date: Date?) -> String {
+        guard let date else { return "" }
+        return String(
+            format: "%.3f",
+            locale: Locale(identifier: "en_US_POSIX"),
+            date.timeIntervalSinceReferenceDate
+        )
+    }
+
+    private static func fingerprintQuotaSnapshot(_ snapshot: QuotaSnapshot) -> String {
+        let header = [
+            "allowed=\(snapshot.allowed.map(String.init) ?? "unknown")",
+            "limitReached=\(snapshot.limitReached.map(String.init) ?? "unknown")",
+        ]
+        return (header + snapshot.orderedWindows.map(fingerprintQuotaWindow))
+            .joined(separator: "|")
+    }
+
+    private static func fingerprintQuotaWindow(_ window: QuotaWindow) -> String {
+        [
+            window.kind.rawValue,
+            String(window.durationSeconds),
+            String(
+                format: "%.3f",
+                locale: Locale(identifier: "en_US_POSIX"),
+                window.usedPercent
+            ),
+            fingerprintDate(window.resetsAt),
+            window.hardLimitReached ? "hard" : "soft",
+            window.source.rateLimit.rawValue,
+            window.source.slot.rawValue,
+            window.source.limitName ?? "",
+            window.source.meteredFeature ?? "",
+        ].joined(separator: ":")
+    }
+
     static func remoteAccountStateCommand() -> String {
         """
         python3 - <<'PY'
-        import json, pathlib
+        import hashlib, json, pathlib
 
         home = pathlib.Path.home()
         path = home / ".codexswitch" / "accounts.json"
@@ -624,9 +1887,52 @@ enum LinuxDevboxMonitor {
                     return account.get(name)
             return None
 
+        def stable_id(value):
+            if not isinstance(value, str):
+                return None
+            value = value.strip()
+            if not value or len(value.encode("utf-8")) > 256:
+                return None
+            if any(ord(character) < 32 or ord(character) == 127 for character in value):
+                return None
+            return value
+
+        def credential_set_fingerprint(accounts):
+            normalized = []
+            for account in accounts:
+                account_id = stable_id(account_value(account, "accountId", "account_id"))
+                id_token = account_value(account, "idToken", "id_token")
+                access_token = account_value(account, "accessToken", "access_token")
+                refresh_token = account_value(account, "refreshToken", "refresh_token")
+                values = (account_id, id_token, access_token, refresh_token)
+                if any(not isinstance(value, str) or not value for value in values):
+                    return None
+                normalized.append((*values, bool(account_value(account, "isActive", "is_active"))))
+
+            account_ids = [account[0] for account in normalized]
+            if len(set(account_ids)) != len(account_ids):
+                return None
+            if sum(1 for account in normalized if account[4]) != 1:
+                return None
+
+            digest = hashlib.sha256()
+            for account_id, id_token, access_token, refresh_token, is_active in sorted(normalized):
+                for value in (
+                    account_id,
+                    id_token,
+                    access_token,
+                    refresh_token,
+                    "active" if is_active else "inactive",
+                ):
+                    encoded = value.encode("utf-8")
+                    digest.update(len(encoded).to_bytes(8, "big"))
+                    digest.update(encoded)
+            return digest.hexdigest()
+
         def sanitized(account):
             return {
                 "email": account_value(account, "email") or "",
+                "providerAccountId": stable_id(account_value(account, "accountId", "account_id")),
                 "isActive": bool(account_value(account, "isActive", "is_active")),
                 "quotaSnapshot": account_value(account, "quotaSnapshot", "quota_snapshot"),
                 "planType": account_value(account, "planType", "plan_type", "plan"),
@@ -635,6 +1941,7 @@ enum LinuxDevboxMonitor {
                 "subscriptionExpiresAt": account_value(account, "subscriptionExpiresAt", "subscription_expires_at"),
                 "subscriptionWillRenew": account_value(account, "subscriptionWillRenew", "subscription_will_renew"),
                 "hasActiveSubscription": account_value(account, "hasActiveSubscription", "has_active_subscription"),
+                "rateLimitResetBank": account_value(account, "rateLimitResetBank", "rate_limit_reset_bank"),
                 "runtimeUnusableUntil": account_value(account, "runtimeUnusableUntil", "runtime_unusable_until"),
                 "runtimeUnusableReason": account_value(account, "runtimeUnusableReason", "runtime_unusable_reason"),
             }
@@ -645,8 +1952,53 @@ enum LinuxDevboxMonitor {
 
         raw = json.loads(path.read_text())
         accounts = raw.get("accounts", []) if isinstance(raw, dict) else raw
-        accounts = [sanitized(account) for account in accounts if isinstance(account, dict) and account_value(account, "email")]
-        print(json.dumps({"accounts": accounts}, separators=(",", ":")))
+        accounts = [account for account in accounts if isinstance(account, dict)]
+        fingerprint = credential_set_fingerprint(accounts)
+        visible_accounts = [
+            sanitized(account)
+            for account in accounts
+            if account_value(account, "email")
+        ]
+        print(json.dumps({
+            "accounts": visible_accounts,
+            "credentialSetFingerprint": fingerprint,
+        }, separators=(",", ":")))
+        PY
+        """
+    }
+
+    static func remoteReadinessCommand() -> String {
+        """
+        export PATH="$HOME/.local/bin:$PATH"
+        python3 - <<'PY'
+        import json, subprocess
+
+        def run_json(arguments):
+            completed = subprocess.run(
+                arguments,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return json.loads(completed.stdout)
+
+        def stable_id(value):
+            if not isinstance(value, str):
+                return None
+            value = value.strip()
+            if not value or len(value.encode("utf-8")) > 256:
+                return None
+            if any(ord(character) < 32 or ord(character) == 127 for character in value):
+                return None
+            return value
+
+        readiness = run_json(["codexswitch-cli", "doctor", "--json"])
+        diagnostics = run_json(["codexswitch-cli", "auth-diagnostics", "--json"])
+        readiness["activeProviderAccountId"] = stable_id(
+            diagnostics.get("activeAccountId")
+        )
+        print(json.dumps(readiness, separators=(",", ":")))
         PY
         """
     }
@@ -660,6 +2012,9 @@ enum LinuxDevboxMonitor {
         DAYS = \(safeDays)
         REFERENCE = 978307200
         LONG_CONTEXT_THRESHOLD = 272000
+        MODEL_CAPABILITIES = (
+            (re.compile(r"^gpt-5(?:\\.\\d+)?(?:[-.].*)?$", re.I), frozenset(("long_context_pricing",))),
+        )
         home = pathlib.Path.home()
 
         def load_accounts():
@@ -722,7 +2077,24 @@ enum LinuxDevboxMonitor {
             return match.group(1) if match else None
 
         def normalize_model(model):
-            return (model or "gpt-5.5").split("}")[0].replace("\\n", " ").replace("\\t", " ").strip()
+            normalized = (model or "").split("}")[0].replace("\\n", " ").replace("\\t", " ").strip()
+            return normalized or "unknown"
+
+        def model_has_capability(model, capability):
+            normalized = normalize_model(model)
+            if normalized == "unknown":
+                return False
+            return any(
+                pattern.fullmatch(normalized) and capability in capabilities
+                for pattern, capabilities in MODEL_CAPABILITIES
+            )
+
+        def uses_long_context_pricing(event):
+            return (
+                event.get("kind") == "response"
+                and event["inputTokens"] > LONG_CONTEXT_THRESHOLD
+                and model_has_capability(event.get("model"), "long_context_pricing")
+            )
 
         def parse_json_object_usage(line):
             match = re.search(r'"type"\\s*:\\s*"response\\.completed"', line)
@@ -926,7 +2298,7 @@ enum LinuxDevboxMonitor {
                     except OSError:
                         continue
                     session_id = session_id_for(path)
-                    model = "gpt-5.5"
+                    model = "unknown"
                     best_line = None
                     best_score = -1
                     for raw_line in tail_lines(path):
@@ -979,7 +2351,7 @@ enum LinuxDevboxMonitor {
             usage["outputTokens"] += output_tokens
             usage["reasoningTokens"] += reasoning_tokens
             usage["completionCount"] += 1
-            if event.get("kind") == "response" and input_tokens > LONG_CONTEXT_THRESHOLD and model.lower() in ("gpt-5.5", "gpt-5.4"):
+            if uses_long_context_pricing(event):
                 usage["longContextInputTokens"] += input_tokens
                 usage["longContextCachedInputTokens"] += cached_tokens
                 usage["longContextOutputTokens"] += output_tokens
@@ -1073,7 +2445,7 @@ enum LinuxDevboxMonitor {
         for event in sorted(response_events, key=lambda item: item["timestamp"]):
             if event.get("kind") != "response":
                 continue
-            if not (event["inputTokens"] > LONG_CONTEXT_THRESHOLD and event["model"].lower() in ("gpt-5.5", "gpt-5.4")):
+            if not uses_long_context_pricing(event):
                 continue
             if event.get("sessionId") in aggregated_session_ids or event.get("turnId") in aggregated_turn_ids:
                 add_long_context_pricing(event)

@@ -24,13 +24,52 @@ struct PopoverContentView: View {
         }
     }
 
+    static func accountHeading(
+        activationState: AccountActivationState? = nil,
+        configuredAccountId: UUID? = nil,
+        now: Date = Date()
+    ) -> String {
+        guard let configuredAccountId,
+              activationState?.runtimeIsCurrent(
+                  for: configuredAccountId,
+                  at: now
+              ) == true else {
+            return "Mac Configured Account"
+        }
+        return "Mac Runtime Current"
+    }
+
+    static func activationStatusLabel(for state: AccountActivationState) -> String? {
+        switch state.phase {
+        case .preparing:
+            return "Mac local: activation commit pending; account changes paused"
+        case .committedDegraded where state.detail == .noLocalRuntime:
+            return "Mac local: configured only; start or restart Codex to confirm"
+        case .committedDegraded:
+            return "Mac local: runtime reload incomplete; restart Codex required"
+        case .manualReview where state.detail == .automaticRetryLimitReached:
+            return "Mac local: retry limit reached; manual retry or restart required"
+        case .manualReview:
+            return "Mac local: activation needs manual review; account changes paused"
+        case .confirmed:
+            return nil
+        }
+    }
+
     /// Find the non-active account whose weekly resets soonest (for "Next Available" fallback)
-    private static func nextWeeklyResetAccount(from accounts: [CodexAccount]) -> (account: CodexAccount, formattedTime: String)? {
+    static func nextWeeklyResetAccount(
+        from accounts: [CodexAccount],
+        now: Date = Date()
+    ) -> (account: CodexAccount, formattedTime: String)? {
         let candidates = accounts
-            .filter { !$0.isActive && $0.realQuotaSnapshot != nil }
             .compactMap { account -> (CodexAccount, TimeInterval)? in
-                guard let resetTime = account.realQuotaSnapshot?.weekly.resetsAt else { return nil }
-                let seconds = resetTime.timeIntervalSinceNow
+                guard !account.isActive,
+                      let snapshot = account.realQuotaSnapshot,
+                      let weekly = snapshot.weekly,
+                      snapshot.isDenied || weekly.isExhausted else {
+                    return nil
+                }
+                let seconds = weekly.resetsAt.timeIntervalSince(now)
                 guard seconds > 0 else { return nil }
                 return (account, seconds)
             }
@@ -71,8 +110,8 @@ struct PopoverContentView: View {
                 Text("CodexSwitch")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                if let active = manager.activeAccount {
-                    Text(active.email)
+                if let configured = manager.configuredAccount {
+                    Text(configured.email)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -140,7 +179,11 @@ struct PopoverContentView: View {
                             ForEach(manager.sortedAccounts) { account in
                                 AccountCardView(
                                     account: account,
+                                    isConfigured: manager.configuredAccount?.id == account.id,
+                                    isRuntimeCurrent: manager.runtimeCurrentAccount?.id == account.id,
+                                    vpsRuntimePresentation: manager.vpsRuntimePresentation(for: account),
                                     pollingError: manager.pollingErrors[account.id],
+                                    rateLimitResetPresentation: manager.rateLimitResetPresentations[account.id],
                                     onReauthenticate: {
                                         onReauthenticate(account.id)
                                     }
@@ -157,39 +200,75 @@ struct PopoverContentView: View {
                         Divider()
                         PooledUsageMeterView(
                             accounts: manager.accounts,
-                            tokenSavingsSummary: manager.tokenSavingsSummary
+                            tokenSavingsSummary: manager.tokenSavingsSummary,
+                            rateLimitResetPresentations: manager.rateLimitResetPresentations
                         )
                     }
 
                     // Current account + CLI status + Next up
-                    if let active = manager.activeAccount {
+                    if let active = manager.configuredAccount {
+                        let cliStatus = CLIStatusChecker.cachedCLIStatus
+                        let desktopStatus = CLIStatusChecker.cachedDesktopStatus
+                        let runtimeCurrent = manager.runtimeCurrentAccount?.id == active.id
+                        let vpsRuntime = manager.vpsRuntimePresentation(for: active)
+                        let ownership = AccountCardView.hostOwnershipLabels(
+                            isConfigured: true,
+                            isRuntimeCurrent: runtimeCurrent,
+                            vpsRuntimePresentation: vpsRuntime
+                        )
                         Divider()
 
                         // Current account
                         HStack(spacing: 6) {
                             Image(systemName: "person.circle.fill")
-                                .foregroundStyle(.green)
+                                .foregroundStyle(runtimeCurrent ? .green : .orange)
                                 .font(.system(size: 11))
                             VStack(alignment: .leading, spacing: 1) {
-                                Text("Current Account")
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundStyle(.secondary)
                                 Text(active.email)
                                     .font(.system(size: 10, weight: .semibold))
                                     .lineLimit(1)
                                     .truncationMode(.middle)
+                                Text(ownership.macConfigured)
+                                    .foregroundStyle(.orange)
+                                Text(ownership.macRuntime)
+                                    .foregroundStyle(runtimeCurrent ? .green : .secondary)
+                                Text(ownership.vpsRuntime)
+                                    .foregroundStyle(
+                                        vpsRuntime == .current
+                                            ? .blue
+                                            : .secondary
+                                    )
                             }
+                            .font(.system(size: 8.5, weight: .medium))
                             Spacer()
                             if let snapshot = active.realQuotaSnapshot {
-                                let fhPct = snapshot.fiveHour.remainingPercent
-                                let wkPct = snapshot.weekly.remainingPercent
-                                VStack(alignment: .trailing, spacing: 1) {
-                                    Text("\(Int(fhPct))% 5h")
-                                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                        .foregroundStyle(Self.quotaColor(for: fhPct))
-                                    Text("\(Int(wkPct))% wk")
-                                        .font(.system(size: 9, weight: .medium, design: .monospaced))
-                                        .foregroundStyle(Self.quotaColor(for: wkPct))
+                                switch QuotaSnapshotPresentation(snapshot: snapshot) {
+                                case .windows(let rows):
+                                    VStack(alignment: .trailing, spacing: 1) {
+                                        ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                                            Text("\(Int(row.percent))% \(row.label)")
+                                                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                                .foregroundStyle(Self.quotaColor(for: row.percent))
+                                        }
+                                    }
+                                case .denied(let message, let rows):
+                                    VStack(alignment: .trailing, spacing: 1) {
+                                        Text(message)
+                                            .font(.system(size: 9, weight: .semibold))
+                                            .foregroundStyle(.red)
+                                            .lineLimit(1)
+                                        if let resetAt = rows.map(\.resetsAt).min(), resetAt > Date() {
+                                            Text("Resets \(resetAt, style: .relative)")
+                                                .font(.system(size: 8, design: .monospaced))
+                                                .foregroundStyle(.orange)
+                                                .lineLimit(1)
+                                        }
+                                    }
+                                case .unknown(let message):
+                                    Text(message)
+                                        .font(.system(size: 9, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
                                 }
                             }
                         }
@@ -197,15 +276,48 @@ struct PopoverContentView: View {
                         .padding(.top, 6)
                         .padding(.bottom, 2)
 
+                        let activationStatusLabel = manager.activationNotice
+                            ?? manager.activationState.flatMap(Self.activationStatusLabel)
+                            ?? "Mac local: configured only; runtime confirmation pending"
+                        if !runtimeCurrent {
+                            let activationPhase = manager.activationState?.phase
+                            let canRetryActivation = activationPhase == .committedDegraded
+                                || (activationPhase == .manualReview
+                                    && manager.activationState?.detail == .automaticRetryLimitReached)
+                            HStack(spacing: 4) {
+                                Image(systemName: activationPhase == .manualReview
+                                    ? "exclamationmark.octagon.fill"
+                                    : "arrow.triangle.2.circlepath")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(activationPhase == .manualReview ? .red : .orange)
+                                Text(activationStatusLabel)
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundStyle(activationPhase == .manualReview ? .red : .orange)
+                                    .lineLimit(2)
+                                if canRetryActivation {
+                                    Button(action: { onForceSwap(active.id) }) {
+                                        Image(systemName: "arrow.clockwise")
+                                            .font(.system(size: 9, weight: .semibold))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Retry Mac runtime activation")
+                                    .accessibilityLabel("Retry Mac runtime activation")
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.leading, 17)
+                            .padding(.bottom, 2)
+                        }
+
                         // CLI connection status (read from cache, never block main thread)
-                        let cliStatus = CLIStatusChecker.cachedCLIStatus
                         HStack(spacing: 4) {
                             Image(systemName: cliStatus.icon)
                                 .font(.system(size: 9))
-                                .foregroundStyle(cliStatus.isHealthy ? .green : .orange)
+                                .foregroundStyle(runtimeCurrent && cliStatus.isHealthy ? .green : .orange)
                             Text(cliStatus.label)
                                 .font(.system(size: 9, weight: .medium))
-                                .foregroundStyle(cliStatus.isHealthy ? .green : .orange)
+                                .foregroundStyle(runtimeCurrent && cliStatus.isHealthy ? .green : .orange)
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                             Spacer(minLength: 0)
@@ -243,14 +355,13 @@ struct PopoverContentView: View {
                         }
 
                         // Desktop app connection status (read from cache)
-                        let desktopStatus = CLIStatusChecker.cachedDesktopStatus
                         HStack(spacing: 4) {
                             Image(systemName: desktopStatus.icon)
                                 .font(.system(size: 9))
-                                .foregroundStyle(desktopStatus.isHealthy ? .green : .secondary)
+                                .foregroundStyle(runtimeCurrent && desktopStatus.isHealthy ? .green : .secondary)
                             Text(desktopStatus.label)
                                 .font(.system(size: 9, weight: .medium))
-                                .foregroundStyle(desktopStatus.isHealthy ? .green : .secondary)
+                                .foregroundStyle(runtimeCurrent && desktopStatus.isHealthy ? .green : .secondary)
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                             Spacer(minLength: 0)
@@ -277,7 +388,8 @@ struct PopoverContentView: View {
                     }
 
                     // Next swap preview
-                    if let nextUp = SwapEngine.selectOptimalAccount(from: manager.accounts) {
+                    if manager.activationState?.authorizesAutomaticMutations(at: Date()) == true,
+                       let nextUp = SwapEngine.selectOptimalAccount(from: manager.accounts) {
                         HStack(spacing: 6) {
                             Image(systemName: "arrow.right.circle.fill")
                                 .foregroundStyle(.blue)
@@ -291,10 +403,12 @@ struct PopoverContentView: View {
                                         .font(.system(size: 10, weight: .semibold))
                                         .lineLimit(1)
                                         .truncationMode(.middle)
-                                    if let snapshot = nextUp.realQuotaSnapshot {
-                                        let pct = snapshot.fiveHour.remainingPercent
+                                    if let snapshot = nextUp.realQuotaSnapshot,
+                                       !snapshot.isDenied,
+                                       let window = snapshot.mostUrgentWindow {
+                                        let pct = window.effectiveRemainingPercent
                                         Spacer()
-                                        Text("\(Int(pct))%")
+                                        Text("\(Int(pct))% \(QuotaWindowDisplay.label(for: window))")
                                             .font(.system(size: 11, weight: .medium, design: .monospaced))
                                             .foregroundStyle(Self.quotaColor(for: pct))
                                     }
@@ -331,11 +445,19 @@ struct PopoverContentView: View {
                                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                                         .foregroundStyle(.orange)
                                 }
-                                Text("Weekly resets — will have \(Int(nextReset.account.realQuotaSnapshot?.fiveHour.remainingPercent ?? 0))% 5h ready")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.top, 2)
-                                    .lineLimit(2)
+                                if let fiveHour = nextReset.account.realQuotaSnapshot?.fiveHour {
+                                    Text("Weekly resets - \(Int(fiveHour.effectiveRemainingPercent))% 5h ready")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(.secondary)
+                                        .padding(.top, 2)
+                                        .lineLimit(2)
+                                } else {
+                                    Text("Weekly window resets")
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(.secondary)
+                                        .padding(.top, 2)
+                                        .lineLimit(1)
+                                }
                             }
                             Spacer(minLength: 0)
                         }

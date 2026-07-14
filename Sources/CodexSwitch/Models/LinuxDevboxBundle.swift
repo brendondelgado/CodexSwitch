@@ -20,8 +20,8 @@ struct LinuxDevboxEncryptedBundle: Codable, Equatable, Sendable {
     let format: String
     let schemaVersion: Int
     let kdf: String
+    let iterations: Int
     let cipher: String
-    let metadata: LinuxDevboxBundleMetadata
     let salt: String
     let nonce: String
     let ciphertext: String

@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "case": "candidate-order",
+  "now": 805550400,
+  "accounts": [
+    {
+      "id": "10000000-0000-4000-8000-000000000001",
+      "email": "active@example.com",
+      "accessToken": "access-active",
+      "refreshToken": "refresh-active",
+      "idToken": "id-active",
+      "accountId": "provider-active",
+      "quotaSnapshot": {
+        "version": 2,
+        "allowed": true,
+        "limitReached": true,
+        "fetchedAt": 805550400,
+        "windows": [{
+          "kind": "weekly",
+          "durationSeconds": 604800,
+          "usedPercent": 100,
+          "resetsAt": 806155200,
+          "source": {"rateLimit": "main", "slot": "primary"},
+          "hardLimitReached": true
+        }]
+      },
+      "planType": "plus",
+      "lastRefreshed": 805550400,
+      "subscriptionRenewsAt": null,
+      "subscriptionExpiresAt": null,
+      "subscriptionWillRenew": true,
+      "hasActiveSubscription": true,
+      "fiveHourPrimedAt": null,
+      "isActive": true
+    },
+    {
+      "id": "10000000-0000-4000-8000-000000000002",
+      "email": "plus-ready@example.com",
+      "accessToken": "access-plus",
+      "refreshToken": "refresh-plus",
+      "idToken": "id-plus",
+      "accountId": "provider-plus",
+      "quotaSnapshot": {
+        "version": 2,
+        "allowed": true,
+        "limitReached": false,
+        "fetchedAt": 805550400,
+        "windows": [{
+          "kind": "weekly",
+          "durationSeconds": 604800,
+          "usedPercent": 5,
+          "resetsAt": 806155200,
+          "source": {"rateLimit": "main", "slot": "primary"},
+          "hardLimitReached": false
+        }]
+      },
+      "planType": "plus",
+      "lastRefreshed": 805550400,
+      "subscriptionRenewsAt": null,
+      "subscriptionExpiresAt": null,
+      "subscriptionWillRenew": true,
+      "hasActiveSubscription": true,
+      "fiveHourPrimedAt": null,
+      "isActive": false
+    },
+    {
+      "id": "10000000-0000-4000-8000-000000000003",
+      "email": "pro-ready@example.com",
+      "accessToken": "access-pro",
+      "refreshToken": "refresh-pro",
+      "idToken": "id-pro",
+      "accountId": "provider-pro",
+      "quotaSnapshot": {
+        "version": 2,
+        "allowed": true,
+        "limitReached": false,
+        "fetchedAt": 805550400,
+        "windows": [{
+          "kind": "weekly",
+          "durationSeconds": 604800,
+          "usedPercent": 50,
+          "resetsAt": 806155200,
+          "source": {"rateLimit": "main", "slot": "primary"},
+          "hardLimitReached": false
+        }]
+      },
+      "planType": "pro",
+      "lastRefreshed": 805550400,
+      "subscriptionRenewsAt": null,
+      "subscriptionExpiresAt": null,
+      "subscriptionWillRenew": true,
+      "hasActiveSubscription": true,
+      "fiveHourPrimedAt": null,
+      "isActive": false
+    }
+  ],
+  "expectedCandidateOrder": [
+    "10000000-0000-4000-8000-000000000003",
+    "10000000-0000-4000-8000-000000000002"
+  ]
+}

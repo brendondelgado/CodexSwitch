@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import CodexSwitch
 
@@ -23,5 +24,20 @@ struct CodexSwitchKeepAliveTests {
         #expect(plist.contains("<key>RunAtLoad</key>"))
         #expect(plist.contains("<key>KeepAlive</key>"))
         #expect(plist.contains("/Users/me/.codexswitch/bin/codexswitch-watchdog.sh"))
+    }
+
+    @Test("Launch scheduling runs keepalive installation off the main actor")
+    func launchSchedulingRunsOffMain() async {
+        let observation = AsyncStream.makeStream(of: Bool.self)
+        let installTask = await MainActor.run {
+            AppDelegate.installKeepAliveOffMainActor {
+                observation.continuation.yield(Thread.isMainThread)
+                observation.continuation.finish()
+            }
+        }
+
+        let ranOnMainThread = await observation.stream.first(where: { _ in true })
+        await installTask.value
+        #expect(ranOnMainThread == false)
     }
 }

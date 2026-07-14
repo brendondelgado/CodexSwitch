@@ -1,0 +1,47 @@
+{
+  "version": 2,
+  "allowed": true,
+  "limitReached": false,
+  "fetchedAt": 799048365.342368,
+  "windows": [
+    {
+      "kind": "fiveHour",
+      "durationSeconds": 0,
+      "usedPercent": 0,
+      "resetsAt": 799048365.342368,
+      "source": {
+        "rateLimit": "main",
+        "slot": "primary",
+        "limitName": null,
+        "meteredFeature": null
+      },
+      "hardLimitReached": false
+    },
+    {
+      "kind": "unknown",
+      "durationSeconds": -60,
+      "usedPercent": 99,
+      "resetsAt": 799048365.342368,
+      "source": {
+        "rateLimit": "main",
+        "slot": "secondary",
+        "limitName": null,
+        "meteredFeature": null
+      },
+      "hardLimitReached": false
+    },
+    {
+      "kind": "weekly",
+      "durationSeconds": 604800,
+      "usedPercent": 19,
+      "resetsAt": 799653165.342368,
+      "source": {
+        "rateLimit": "main",
+        "slot": "secondary",
+        "limitName": null,
+        "meteredFeature": null
+      },
+      "hardLimitReached": false
+    }
+  ]
+}

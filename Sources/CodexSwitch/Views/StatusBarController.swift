@@ -11,32 +11,29 @@ final class StatusBarController {
         self.manager = manager
     }
 
-    /// Determine which limit is more urgent: 5h or weekly.
-    /// Uses depletion rate to estimate which hits zero first.
-    private func urgentWindow(from snapshot: QuotaSnapshot) -> QuotaWindow {
-        let fh = snapshot.fiveHour
-        let wk = snapshot.weekly
+    /// Determine which reported window is most likely to reach zero first.
+    private func urgentWindow(from snapshot: QuotaSnapshot) -> QuotaWindow? {
+        guard !snapshot.isDenied else { return nil }
+        return snapshot.orderedWindows.min { lhs, rhs in
+            estimatedTimeToZero(for: lhs) < estimatedTimeToZero(for: rhs)
+        }
+    }
 
-        // If either is already exhausted, it's the urgent one
-        if fh.isExhausted { return fh }
-        if wk.isExhausted { return wk }
+    private func estimatedTimeToZero(for window: QuotaWindow) -> TimeInterval {
+        if window.isExhausted { return 0 }
+        let timeLeft = max(0, window.timeUntilReset)
+        let elapsed = max(1, Double(window.durationSeconds) - timeLeft)
+        let rate = window.usedPercent / elapsed
+        return rate > 0 ? window.effectiveRemainingPercent / rate : .infinity
+    }
 
-        let fhTimeLeft = max(0, fh.timeUntilReset)
-        let wkTimeLeft = max(0, wk.timeUntilReset)
-
-        // Estimate time until each hits 0% based on current depletion rate
-        // rate = usedPercent / (windowDuration - timeUntilReset)
-        let fhElapsed = max(1, Double(fh.windowDurationMins * 60) - fhTimeLeft)
-        let wkElapsed = max(1, Double(wk.windowDurationMins * 60) - wkTimeLeft)
-
-        let fhRate = fh.usedPercent / fhElapsed  // percent per second
-        let wkRate = wk.usedPercent / wkElapsed
-
-        // Time until each would hit 100% used (0% remaining)
-        let fhTTZ = fhRate > 0 ? fh.remainingPercent / fhRate : .infinity
-        let wkTTZ = wkRate > 0 ? wk.remainingPercent / wkRate : .infinity
-
-        return fhTTZ <= wkTTZ ? fh : wk
+    static func accountScopeLabel(
+        configuredAccountId: UUID,
+        runtimeCurrentAccountId: UUID?
+    ) -> String {
+        runtimeCurrentAccountId == configuredAccountId
+            ? "Mac Configured; Mac Runtime Current"
+            : "Mac Configured; Mac Runtime Not Current"
     }
 
     /// Update the menu bar icon — circular ring with percentage
@@ -44,18 +41,44 @@ final class StatusBarController {
         guard let button = statusItem.button else { return }
 
         if manager.accounts.isEmpty {
+            button.toolTip = "No accounts"
             applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "--")
             return
         }
 
-        guard let active = manager.activeAccount,
+        guard let active = manager.configuredAccount,
               let snapshot = active.realQuotaSnapshot else {
+            if let configured = manager.configuredAccount {
+                let scope = Self.accountScopeLabel(
+                    configuredAccountId: configured.id,
+                    runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id
+                )
+                button.toolTip = "\(scope): rate limits unavailable"
+            } else {
+                button.toolTip = "Rate limits unavailable"
+            }
             applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "...")
             return
         }
+        let scope = Self.accountScopeLabel(
+            configuredAccountId: active.id,
+            runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id
+        )
 
-        let window = urgentWindow(from: snapshot)
-        let remaining = window.remainingPercent
+        if snapshot.isDenied {
+            let quota = snapshot.limitReached == true ? "quota exhausted" : "quota unavailable"
+            button.toolTip = "\(scope): \(quota)"
+            applyRingIcon(button: button, percent: 0, color: .systemRed, text: "!")
+            return
+        }
+
+        guard let window = urgentWindow(from: snapshot) else {
+            button.toolTip = "\(scope): quota unknown"
+            applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "--")
+            return
+        }
+
+        let remaining = window.effectiveRemainingPercent
         let color: NSColor
         switch remaining {
         case 50...: color = .systemGreen
@@ -64,6 +87,7 @@ final class StatusBarController {
         default: color = .systemRed
         }
 
+        button.toolTip = "\(scope): \(QuotaWindowDisplay.label(for: window)) \(Int(remaining))% remaining"
         applyRingIcon(button: button, percent: remaining, color: color, text: "\(Int(remaining))")
     }
 

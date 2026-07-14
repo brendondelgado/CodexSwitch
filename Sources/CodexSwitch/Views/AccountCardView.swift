@@ -1,9 +1,19 @@
 import AppKit
 import SwiftUI
 
+struct AccountCardHostOwnershipLabels: Equatable, Sendable {
+    let macConfigured: String
+    let macRuntime: String
+    let vpsRuntime: String
+}
+
 struct AccountCardView: View {
     let account: CodexAccount
+    var isConfigured: Bool = false
+    var isRuntimeCurrent: Bool = false
+    var vpsRuntimePresentation: VPSRuntimeAccountPresentation = .disconnected
     var pollingError: String? = nil
+    var rateLimitResetPresentation: RateLimitResetInventoryPresentation? = nil
     let onReauthenticate: (() -> Void)?
     let onForceSwap: (() -> Void)?
     @State private var isHovering = false
@@ -22,46 +32,97 @@ struct AccountCardView: View {
         return formatter
     }()
 
+    private static let resetExpiryFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("MMM d")
+        return formatter
+    }()
+
+    private static let resetHoldFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter
+    }()
+
     private var statusDot: Color {
         if needsReauthentication { return .red }
-        if account.isRuntimeUnusable { return .orange }
-        if account.isActive {
-            return account.quotaSnapshot?.hasBackendUsagePlaceholder == true ? .orange : Self.activeGreen
-        }
+        if account.hasHardRuntimeBlock { return .orange }
+        if isConfigured && account.quotaSnapshot?.hasBackendUsagePlaceholder == true { return .orange }
         guard let snapshot = account.realQuotaSnapshot else {
             return account.quotaSnapshot?.hasBackendUsagePlaceholder == true ? .orange : .gray
         }
+        if snapshot.isDenied { return .red }
+        if snapshot.windows.isEmpty { return .gray }
         if snapshot.hasExpiredExhaustedWindow() { return .orange }
-        if snapshot.weekly.isExhausted { return .red }    // Weekly gone = completely unusable
-        if snapshot.fiveHour.isExhausted { return .red }
-        if snapshot.fiveHour.remainingPercent < 20 { return .red }
-        if snapshot.weekly.remainingPercent < 20 { return .orange }
-        if snapshot.fiveHour.remainingPercent < 50 { return .yellow }
-        return .gray.opacity(0.4)
+        if snapshot.windows.contains(where: \.isExhausted) { return .red }
+        if let fiveHour = snapshot.fiveHour, fiveHour.effectiveRemainingPercent < 20 { return .red }
+        if let weekly = snapshot.weekly, weekly.effectiveRemainingPercent < 20 { return .orange }
+        if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 20 }) { return .orange }
+        if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 50 }) { return .yellow }
+        if isRuntimeCurrent { return Self.activeGreen }
+        return isConfigured ? .orange : .gray.opacity(0.4)
     }
 
     private var statusDotLabel: String {
         if needsReauthentication { return "Needs re-authentication" }
         if let runtimeStatus = account.runtimeStatusText { return runtimeStatus }
-        if account.isActive {
-            return account.quotaSnapshot?.hasBackendUsagePlaceholder == true ? "Active, rate limits unavailable" : "Active"
+        if isConfigured && account.quotaSnapshot?.hasBackendUsagePlaceholder == true {
+            return "Configured, rate limits unavailable"
         }
         guard let snapshot = account.realQuotaSnapshot else {
             return account.quotaSnapshot?.hasBackendUsagePlaceholder == true ? "Rate limits unavailable" : "No data"
         }
+        if snapshot.isDenied {
+            return snapshot.limitReached == true ? "Quota exhausted" : "Quota unavailable"
+        }
+        if snapshot.windows.isEmpty { return "Quota unknown" }
         if snapshot.hasExpiredExhaustedWindow() { return "Reset needs confirmation" }
-        if snapshot.weekly.isExhausted { return "Weekly exhausted" }
-        if snapshot.fiveHour.isExhausted { return "5h exhausted" }
-        if snapshot.fiveHour.remainingPercent < 20 { return "Low quota" }
-        return "Idle"
+        if let exhausted = snapshot.orderedWindows.first(where: \.isExhausted) {
+            return "\(QuotaWindowDisplay.label(for: exhausted)) exhausted"
+        }
+        if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 20 }) { return "Low quota" }
+        if isRuntimeCurrent { return "Mac Runtime Current" }
+        return isConfigured ? "Mac Configured" : "Idle"
+    }
+
+    static func vpsRuntimeLabel(_ presentation: VPSRuntimeAccountPresentation) -> String {
+        switch presentation {
+        case .current: return "VPS Runtime Current"
+        case .notCurrent: return "VPS Not Current"
+        case .unknown: return "VPS Runtime Unknown"
+        case .disconnected: return "VPS Disconnected"
+        }
+    }
+
+    static func hostOwnershipLabels(
+        isConfigured: Bool,
+        isRuntimeCurrent: Bool,
+        vpsRuntimePresentation: VPSRuntimeAccountPresentation
+    ) -> AccountCardHostOwnershipLabels {
+        AccountCardHostOwnershipLabels(
+            macConfigured: isConfigured ? "Mac Configured" : "Mac Not Configured",
+            macRuntime: isRuntimeCurrent
+                ? "Mac Runtime Current"
+                : "Mac Runtime Not Current",
+            vpsRuntime: vpsRuntimeLabel(vpsRuntimePresentation)
+        )
+    }
+
+    private var vpsRuntimeColor: Color {
+        switch vpsRuntimePresentation {
+        case .current: return .blue
+        case .notCurrent, .unknown: return .secondary
+        case .disconnected: return .orange
+        }
     }
 
     /// Higher contrast styles for the active card
     private var labelStyle: some ShapeStyle {
-        account.isActive ? .primary : .secondary
+        isRuntimeCurrent || isConfigured ? .primary : .secondary
     }
     private var sublabelStyle: some ShapeStyle {
-        account.isActive ? .secondary : .tertiary
+        isRuntimeCurrent || isConfigured ? .secondary : .tertiary
     }
 
     private var planLine: String {
@@ -80,8 +141,98 @@ struct AccountCardView: View {
     }
 
     private var fiveHourPrimedLine: String? {
-        guard let primedAt = account.fiveHourPrimedAt else { return nil }
+        guard account.realQuotaSnapshot?.fiveHour != nil,
+              let primedAt = account.fiveHourPrimedAt else {
+            return nil
+        }
         return "5h triggered \(Self.primedFormatter.string(from: primedAt))"
+    }
+
+    private var rateLimitResetLine: (text: String, color: Color, help: String)? {
+        guard let rateLimitResetPresentation else {
+            return nil
+        }
+
+        let nextExpirationText: String?
+        let holdUntilText: String?
+        let color: Color
+        let help: String
+        switch rateLimitResetPresentation {
+        case .current(_, let nextExpiration):
+            nextExpirationText = nextExpiration.map {
+                Self.resetExpiryFormatter.string(from: $0)
+            }
+            holdUntilText = nil
+            color = .teal
+            help = "Current reset inventory"
+        case .stale:
+            nextExpirationText = nil
+            holdUntilText = nil
+            color = .orange
+            help = "Last-known reset inventory"
+        case .externalHold(let until):
+            nextExpirationText = nil
+            holdUntilText = Self.resetHoldFormatter.string(from: until)
+            color = .orange
+            help = "Reset redemption is temporarily on hold"
+        case .redeeming:
+            nextExpirationText = nil
+            holdUntilText = nil
+            color = .blue
+            help = "Reset redemption is in progress"
+        case .reconciling:
+            nextExpirationText = nil
+            holdUntilText = nil
+            color = .orange
+            help = "Reset inventory is reconciling"
+        case .refreshing:
+            nextExpirationText = nil
+            holdUntilText = nil
+            color = .blue
+            help = "Reset inventory is refreshing"
+        }
+
+        return (
+            Self.rateLimitResetText(
+                for: rateLimitResetPresentation,
+                nextExpirationText: nextExpirationText,
+                holdUntilText: holdUntilText
+            ),
+            color,
+            help
+        )
+    }
+
+    static func rateLimitResetText(
+        for presentation: RateLimitResetInventoryPresentation,
+        nextExpirationText: String? = nil,
+        holdUntilText: String? = nil
+    ) -> String {
+        switch presentation {
+        case .redeeming:
+            return "Redeeming banked reset"
+        case .reconciling:
+            return "Reconciling reset inventory"
+        case .externalHold:
+            return holdUntilText.map { "Reset hold until \($0)" }
+                ?? "Reset redemption on hold"
+        case .refreshing:
+            return "Refreshing reset inventory"
+        case .stale(let lastKnownCount):
+            return "Last-known: \(resetCountText(lastKnownCount))"
+        case .current(let availableCount, _):
+            var text = resetCountText(availableCount)
+            if let nextExpirationText {
+                text += " • next expires \(nextExpirationText)"
+            }
+            return text
+        }
+    }
+
+    private static func resetCountText(_ count: Int) -> String {
+        let normalizedCount = max(0, count)
+        let noun = normalizedCount == 1 ? "reset" : "resets"
+        return "\(normalizedCount) banked \(noun)"
     }
 
     var requiresReauthentication: Bool {
@@ -120,7 +271,7 @@ struct AccountCardView: View {
             onReauthenticate()
             return true
         }
-        guard !account.isActive, let onForceSwap else { return false }
+        guard !isRuntimeCurrent, let onForceSwap else { return false }
         onForceSwap()
         return true
     }
@@ -147,7 +298,10 @@ struct AccountCardView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(account.email)
-                        .font(.system(size: 11, weight: account.isActive ? .bold : .medium))
+                        .font(.system(
+                            size: 11,
+                            weight: isRuntimeCurrent ? .bold : (isConfigured ? .semibold : .medium)
+                        ))
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(account.email)
@@ -165,6 +319,34 @@ struct AccountCardView: View {
                     .accessibilityLabel(statusDotLabel)
             }
 
+
+            VStack(alignment: .leading, spacing: 2) {
+                let ownership = Self.hostOwnershipLabels(
+                    isConfigured: isConfigured,
+                    isRuntimeCurrent: isRuntimeCurrent,
+                    vpsRuntimePresentation: vpsRuntimePresentation
+                )
+                Label(
+                    ownership.macConfigured,
+                    systemImage: "laptopcomputer"
+                )
+                .foregroundStyle(isConfigured ? .orange : .secondary)
+
+                Label(
+                    ownership.macRuntime,
+                    systemImage: "dot.radiowaves.left.and.right"
+                )
+                .foregroundStyle(isRuntimeCurrent ? Self.activeGreen : .secondary)
+
+                Label(
+                    ownership.vpsRuntime,
+                    systemImage: "server.rack"
+                )
+                .foregroundStyle(vpsRuntimeColor)
+            }
+            .font(.system(size: 8.5, weight: .medium))
+            .lineLimit(1)
+
             if let fiveHourPrimedLine {
                 HStack(spacing: 4) {
                     Image(systemName: "timer.circle.fill")
@@ -174,6 +356,18 @@ struct AccountCardView: View {
                         .lineLimit(1)
                 }
                 .foregroundStyle(.blue)
+            }
+
+            if let rateLimitResetLine {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.counterclockwise.circle.fill")
+                        .font(.system(size: 9))
+                    Text(rateLimitResetLine.text)
+                        .font(.system(size: 9, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(rateLimitResetLine.color)
+                .help(rateLimitResetLine.help)
             }
 
             if needsReauthentication {
@@ -203,18 +397,37 @@ struct AccountCardView: View {
                         .foregroundStyle(.tertiary)
                 }
             } else if let snapshot = account.realQuotaSnapshot {
-                DrainBarView(
-                    label: "5h",
-                    percent: snapshot.fiveHour.remainingPercent,
-                    resetsAt: snapshot.fiveHour.resetsAt,
-                    boostedContrast: account.isActive
-                )
-                DrainBarView(
-                    label: "Wk",
-                    percent: snapshot.weekly.remainingPercent,
-                    resetsAt: snapshot.weekly.resetsAt,
-                    boostedContrast: account.isActive
-                )
+                switch QuotaSnapshotPresentation(snapshot: snapshot) {
+                case .windows(let rows):
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        DrainBarView(
+                            label: row.label,
+                            percent: row.percent,
+                            resetsAt: row.resetsAt,
+                            boostedContrast: isRuntimeCurrent
+                        )
+                    }
+                case .denied(let message, let rows):
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label(message, systemImage: snapshot.limitReached == true ? "gauge.with.dots.needle.0percent" : "exclamationmark.circle")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                        ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                            DrainBarView(
+                                label: row.label,
+                                percent: snapshot.limitReached == true ? 0 : row.percent,
+                                resetsAt: row.resetsAt,
+                                boostedContrast: isRuntimeCurrent
+                            )
+                        }
+                    }
+                case .unknown(let message):
+                    Label(message, systemImage: "questionmark.circle")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             } else if account.quotaSnapshot?.hasBackendUsagePlaceholder == true {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Rate limits unavailable")
@@ -251,7 +464,7 @@ struct AccountCardView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(
-                    account.isActive ? Self.activeGreen : .clear,
+                    isRuntimeCurrent ? Self.activeGreen : (isConfigured ? .orange : .clear),
                     lineWidth: 2.5
                 )
         )
@@ -261,7 +474,12 @@ struct AccountCardView: View {
         .overlay {
             AccountCardHoverTrackingView(email: account.email, isHovering: $isHovering)
         }
-        .shadow(color: account.isActive ? Self.activeGreen.opacity(0.4) : .clear, radius: 5)
+        .shadow(
+            color: isRuntimeCurrent
+                ? Self.activeGreen.opacity(0.4)
+                : (isConfigured ? Color.orange.opacity(0.2) : .clear),
+            radius: 5
+        )
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .help(account.email)
         .zIndex(isHovering ? 1 : 0)
@@ -277,8 +495,8 @@ struct AccountCardView: View {
                     onReauthenticate?()
                 }
             }
-            if !account.isActive {
-                Button("Switch to this account") {
+            if !isRuntimeCurrent {
+                Button(isConfigured ? "Retry Mac runtime activation" : "Switch Mac to this account") {
                     onForceSwap?()
                 }
             }

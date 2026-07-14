@@ -6,6 +6,7 @@ struct DesktopRuntimeDiagnosticsTests {
     @Test("pgrep parser separates desktop app-server from Homebrew vendor CLI app-server")
     func parsesDesktopAndVendorAppServers() {
         let output = """
+        24017 /Applications/ChatGPT.app/Contents/Resources/codex app-server --analytics-default-enabled
         34109 /Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled
         80379 /Users/brendondelgado/Developer/codex/codex-rs/target/fork-release/codex app-server --analytics-default-enabled
         90722 /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex app-server --analytics-default-enabled
@@ -13,16 +14,32 @@ struct DesktopRuntimeDiagnosticsTests {
 
         let processes = DesktopRuntimeDiagnostics.parseAppServerProcesses(fromPGrepOutput: output)
 
-        #expect(processes.count == 3)
-        #expect(processes[0].pid == 34109)
-        #expect(processes[0].executablePath == "/Applications/Codex.app/Contents/Resources/codex")
+        #expect(processes.count == 4)
+        #expect(processes[0].pid == 24017)
+        #expect(processes[0].executablePath == "/Applications/ChatGPT.app/Contents/Resources/codex")
         #expect(processes[0].classification == .desktopAppServer)
-        #expect(processes[1].pid == 80379)
-        #expect(processes[1].executablePath == "/Users/brendondelgado/Developer/codex/codex-rs/target/fork-release/codex")
+        #expect(processes[1].pid == 34109)
         #expect(processes[1].classification == .desktopAppServer)
-        #expect(processes[2].pid == 90722)
-        #expect(processes[2].executablePath == "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex")
-        #expect(processes[2].classification == .vendorCLIAppServer)
+        #expect(processes[2].pid == 80379)
+        #expect(processes[2].executablePath == "/Users/brendondelgado/Developer/codex/codex-rs/target/fork-release/codex")
+        #expect(processes[2].classification == .desktopAppServer)
+        #expect(processes[3].pid == 90722)
+        #expect(processes[3].executablePath == "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex")
+        #expect(processes[3].classification == .vendorCLIAppServer)
+    }
+
+    @Test("pgrep parser keeps a configured prepared desktop app-server")
+    func parsesConfiguredPreparedDesktopAppServer() {
+        let output = """
+        78312 /Users/brendondelgado/.local/share/codexswitch/prepared-codex/0.144.1/codex -c features.code_mode_host=true app-server --analytics-default-enabled
+        """
+
+        let processes = DesktopRuntimeDiagnostics.parseAppServerProcesses(fromPGrepOutput: output)
+
+        #expect(processes.count == 1)
+        guard let process = processes.first else { return }
+        #expect(process.pid == 78312)
+        #expect(process.classification == .desktopAppServer)
     }
 
     @Test("pgrep parser ignores launchers and unrelated processes")

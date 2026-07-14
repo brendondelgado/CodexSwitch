@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "case": "terminal-non-consumption",
+  "consumeCodes": ["no_credit", "nothing_to_reset"],
+  "expected": {
+    "state": "terminal_not_applied",
+    "consumptionObserved": false,
+    "quotaReconciled": false,
+    "suppressesRedemption": false
+  }
+}

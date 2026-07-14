@@ -2,6 +2,7 @@ import Foundation
 
 enum UsageResponseParser {
     enum ParserError: Error, Equatable {
+        /// The backend allowed requests but exposed no usable quota telemetry.
         case placeholderRateLimitWindow
     }
 
@@ -63,89 +64,156 @@ enum UsageResponseParser {
         let planType: String
     }
 
-    static func parse(_ data: Data) throws -> ParseResult {
+    private struct SelectedRateLimit {
+        let details: RateLimitDetails
+        let source: QuotaWindowRateLimitSource
+        let limitName: String?
+        let meteredFeature: String?
+    }
+
+    static func parse(_ data: Data, fetchedAt: Date = Date()) throws -> ParseResult {
         let response = try JSONDecoder().decode(UsageResponse.self, from: data)
-        guard let rateLimit = selectedRateLimit(from: response) else {
+        guard let selected = selectedRateLimit(from: response) else {
             throw ParserError.placeholderRateLimitWindow
         }
 
-        let hardLimitReached = rateLimit.limitReached == true
-            || rateLimit.allowed == false
-        let backendAllowsRequests = rateLimit.allowed == true
-            && rateLimit.limitReached != true
-
-        // primary_window = 5-hour window, secondary_window = weekly window
-        let fiveHour = mapWindow(
-            rateLimit.primaryWindow,
-            fallbackWindowMins: 300,
-            hardLimitReached: hardLimitReached,
-            backendAllowsRequests: backendAllowsRequests
+        var windows = mappedWindows(from: selected)
+        if selected.source == .additional, let main = response.rateLimit {
+            let mainDiagnostics = mappedWindows(from: SelectedRateLimit(
+                details: main,
+                source: .main,
+                limitName: nil,
+                meteredFeature: nil
+            )).filter { $0.kind == .unknown }
+            windows.append(contentsOf: mainDiagnostics)
+        }
+        let snapshot = QuotaSnapshot(
+            allowed: selected.details.allowed,
+            limitReached: selected.details.limitReached,
+            fetchedAt: fetchedAt,
+            windows: windows
         )
 
-        let weekly = mapWindow(
-            rateLimit.secondaryWindow,
-            fallbackWindowMins: 10080,
-            hardLimitReached: false,
-            backendAllowsRequests: backendAllowsRequests
-        )
+        guard !windows.isEmpty || snapshot.isDenied else {
+            throw ParserError.placeholderRateLimitWindow
+        }
 
-        let snapshot = QuotaSnapshot(fiveHour: fiveHour, weekly: weekly, fetchedAt: Date())
         return ParseResult(snapshot: snapshot, planType: response.planType)
     }
 
-    private static func selectedRateLimit(from response: UsageResponse) -> RateLimitDetails? {
-        if let rateLimit = response.rateLimit,
-           isUsablePrimaryWindow(rateLimit.primaryWindow) {
-            return rateLimit
-        }
-        if let additional = response.additionalRateLimits?
-            .compactMap(\.rateLimit)
-            .first(where: { isUsablePrimaryWindow($0.primaryWindow) }) {
-            return additional
-        }
-        if response.rateLimit?.allowed == false || response.rateLimit?.limitReached == true {
-            return response.rateLimit
-        }
-        return nil
-    }
-
-    private static func isUsablePrimaryWindow(_ window: WindowSnapshot?) -> Bool {
-        guard let window else { return false }
-        return window.limitWindowSeconds > 0
-    }
-
-    private static func mapWindow(
-        _ window: WindowSnapshot?,
-        fallbackWindowMins: Int,
-        hardLimitReached: Bool,
-        backendAllowsRequests: Bool
-    ) -> QuotaWindow {
-        guard let window else {
-            return QuotaWindow(
-                usedPercent: 0,
-                windowDurationMins: fallbackWindowMins,
-                resetsAt: Date().addingTimeInterval(TimeInterval(fallbackWindowMins * 60)),
-                hardLimitReached: hardLimitReached
+    private static func selectedRateLimit(from response: UsageResponse) -> SelectedRateLimit? {
+        if let main = response.rateLimit,
+           hasRecognizedWindow(main) || isDenied(main) {
+            return SelectedRateLimit(
+                details: main,
+                source: .main,
+                limitName: nil,
+                meteredFeature: nil
             )
         }
 
-        let windowMins = window.limitWindowSeconds > 0
-            ? (window.limitWindowSeconds + 59) / 60
-            : fallbackWindowMins
-
-        // reset_at is a Unix timestamp
-        let resetsAt = Date(timeIntervalSince1970: TimeInterval(window.resetAt))
-
-        var usedPercent = max(0, min(100, Double(window.usedPercent)))
-        if backendAllowsRequests && !hardLimitReached && usedPercent >= 100 {
-            usedPercent = 100 - QuotaWindow.autoSwapThresholdPercent
+        let candidates = (response.additionalRateLimits ?? []).enumerated().compactMap { index, additional
+            -> (rank: Int, index: Int, selected: SelectedRateLimit)? in
+            guard let rank = codexMetadataRank(additional),
+                  let details = additional.rateLimit,
+                  hasPositiveWindow(details) || isDenied(details) else {
+                return nil
+            }
+            return (
+                rank,
+                index,
+                SelectedRateLimit(
+                    details: details,
+                    source: .additional,
+                    limitName: additional.limitName,
+                    meteredFeature: additional.meteredFeature
+                )
+            )
         }
 
-        return QuotaWindow(
-            usedPercent: usedPercent,
-            windowDurationMins: windowMins,
-            resetsAt: resetsAt,
-            hardLimitReached: hardLimitReached
-        )
+        let policyCandidates = candidates.filter {
+            hasRecognizedWindow($0.selected.details) || isDenied($0.selected.details)
+        }
+        if let selected = bestCandidate(policyCandidates) {
+            return selected
+        }
+
+        if let main = response.rateLimit, hasPositiveWindow(main) {
+            return SelectedRateLimit(
+                details: main,
+                source: .main,
+                limitName: nil,
+                meteredFeature: nil
+            )
+        }
+
+        return bestCandidate(candidates)
+    }
+
+    private static func bestCandidate(
+        _ candidates: [(rank: Int, index: Int, selected: SelectedRateLimit)]
+    ) -> SelectedRateLimit? {
+        candidates.min { lhs, rhs in
+            if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
+            return lhs.index < rhs.index
+        }?.selected
+    }
+
+    private static func hasPositiveWindow(_ details: RateLimitDetails) -> Bool {
+        [details.primaryWindow, details.secondaryWindow]
+            .compactMap { $0 }
+            .contains(where: { $0.limitWindowSeconds > 0 })
+    }
+
+    private static func hasRecognizedWindow(_ details: RateLimitDetails) -> Bool {
+        [details.primaryWindow, details.secondaryWindow]
+            .compactMap { $0 }
+            .contains {
+                $0.limitWindowSeconds > 0
+                    && QuotaWindowKind.classify(durationSeconds: $0.limitWindowSeconds) != .unknown
+            }
+    }
+
+    private static func isDenied(_ details: RateLimitDetails) -> Bool {
+        details.allowed == false || details.limitReached == true
+    }
+
+    private static func codexMetadataRank(_ additional: AdditionalRateLimit) -> Int? {
+        let limitName = additional.limitName?.lowercased() ?? ""
+        let meteredFeature = additional.meteredFeature?.lowercased() ?? ""
+        let isExcludedModelFamily = limitName.contains("spark")
+            || limitName.contains("bengalfox")
+            || meteredFeature.contains("spark")
+            || meteredFeature.contains("bengalfox")
+
+        guard !isExcludedModelFamily else { return nil }
+        if meteredFeature == "codex" { return 0 }
+        if meteredFeature.contains("codex") { return 1 }
+        if limitName.contains("codex") { return 2 }
+        return nil
+    }
+
+    private static func mappedWindows(from selected: SelectedRateLimit) -> [QuotaWindow] {
+        let candidates: [(WindowSnapshot?, QuotaWindowSlot)] = [
+            (selected.details.primaryWindow, .primary),
+            (selected.details.secondaryWindow, .secondary)
+        ]
+
+        return candidates.compactMap { window, slot in
+            guard let window, window.limitWindowSeconds > 0 else { return nil }
+
+            return QuotaWindow(
+                kind: QuotaWindowKind.classify(durationSeconds: window.limitWindowSeconds),
+                durationSeconds: window.limitWindowSeconds,
+                usedPercent: window.usedPercent,
+                resetsAt: Date(timeIntervalSince1970: TimeInterval(window.resetAt)),
+                source: QuotaWindowSourceMetadata(
+                    rateLimit: selected.source,
+                    slot: slot,
+                    limitName: selected.limitName,
+                    meteredFeature: selected.meteredFeature
+                )
+            )
+        }
     }
 }

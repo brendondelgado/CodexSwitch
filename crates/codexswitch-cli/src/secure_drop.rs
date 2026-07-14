@@ -1,18 +1,27 @@
+use crate::{bounded_command, secure_file};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::Subcommand;
-use ring::digest::{digest, SHA256};
+use ring::digest::{Context as DigestContext, SHA256};
 use serde::Serialize;
-use std::fs;
-use std::io::Read;
-use std::os::unix::fs::{symlink as unix_symlink, PermissionsExt};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{symlink as unix_symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const DEFAULT_HOST: &str = "signul-vps";
 const DEFAULT_REMOTE_ROOT: &str = "/home/signul/codexswitch-secure-files";
 const TRANSPORT: &str = "rsync-over-ssh";
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
+const MANIFEST_MAX_BYTES: usize = 16 * 1024;
+const AUDIT_ENTRY_MAX_BYTES: usize = 16 * 1024;
+const AUDIT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const AUDIT_LOG_RETENTION: usize = 3;
+const AUDIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Subcommand)]
 pub enum FilesCommand {
@@ -206,8 +215,9 @@ fn send(args: FilesSendArgs) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("source must have a UTF-8 file name")?;
-    let sha256 = sha256_file(&source)?;
-    let bytes = fs::metadata(&source)?.len();
+    let digest = sha256_file(&source)?;
+    let sha256 = digest.hex;
+    let bytes = digest.bytes;
     let manifest_path = write_manifest(&config, file_name, &sha256, bytes)?;
     let remote_final_dir = format!("{}/{folder}", config.remote_root);
     let transfer_id = Uuid::new_v4().to_string();
@@ -227,11 +237,7 @@ fn send(args: FilesSendArgs) -> Result<()> {
         rsync = rsync_upload_command(&config.host, &source, &remote_staging_dir),
         publish = ssh_command(
             &config.host,
-            &format!(
-                "chmod 600 {staged} && mv -f {staged} {final}",
-                staged = shell_quote(&remote_staged_file),
-                final = shell_quote(&remote_final_file)
-            )
+            &remote_publish_command(&remote_staged_file, &remote_final_file, &sha256)
         )
     );
     if !args.dry_run {
@@ -351,7 +357,7 @@ fn path(args: FilesPathArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Config {
     local_root: PathBuf,
     remote_root: String,
@@ -389,18 +395,32 @@ fn status_report(config: &Config) -> FilesStatus {
 }
 
 fn create_local_tree(config: &Config) -> Result<()> {
+    create_private_directory(&config.local_root)?;
     for name in ["inbox", "outbox", "manifests", "audit"] {
         let path = config.local_root.join(name);
-        fs::create_dir_all(&path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to chmod {}", path.display()))?;
+        create_private_directory(&path)?;
     }
-    fs::set_permissions(&config.local_root, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to chmod {}", config.local_root.display()))?;
     if config.uses_default_local_root {
         ensure_downloads_inbox_link(config)?;
     }
+    Ok(())
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "private directory is not a real directory: {}",
+            path.display()
+        );
+    }
+    if metadata.uid() != current_uid() {
+        bail!("private directory has the wrong owner: {}", path.display());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to chmod {}", path.display()))?;
     Ok(())
 }
 
@@ -473,12 +493,38 @@ fn write_manifest(config: &Config, file_name: &str, sha256: &str, bytes: u64) ->
         "{sha256}  {file_name}\nbytes={bytes}\ncreated_at={}\n",
         Utc::now().to_rfc3339()
     );
-    fs::write(&manifest, content)?;
-    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600))?;
+    let lock = secure_file::lock(&manifest, true)?;
+    let snapshot = lock.load(MANIFEST_MAX_BYTES, true)?;
+    lock.commit(
+        snapshot.generation(),
+        content.as_bytes(),
+        MANIFEST_MAX_BYTES,
+    )?;
     Ok(manifest)
 }
 
 fn append_audit(config: &Config, action: &str, source: &str, destination: &str) -> Result<()> {
+    append_audit_with_limits(
+        config,
+        action,
+        source,
+        destination,
+        AUDIT_LOG_MAX_BYTES,
+        AUDIT_LOG_RETENTION,
+    )
+}
+
+fn append_audit_with_limits(
+    config: &Config,
+    action: &str,
+    source: &str,
+    destination: &str,
+    max_bytes: u64,
+    retention: usize,
+) -> Result<()> {
+    let audit_directory = config.local_root.join("audit");
+    create_private_directory(&audit_directory)?;
+    let _lock = AuditLock::acquire(&audit_directory.join("transfers.lock"))?;
     let log = config.local_root.join("audit").join("transfers.jsonl");
     let entry = serde_json::json!({
         "timestamp": Utc::now().to_rfc3339(),
@@ -488,23 +534,252 @@ fn append_audit(config: &Config, action: &str, source: &str, destination: &str) 
         "host": config.host,
         "remoteRoot": config.remote_root,
     });
-    let mut existing = fs::read_to_string(&log).unwrap_or_default();
-    existing.push_str(&serde_json::to_string(&entry)?);
-    existing.push('\n');
-    fs::write(&log, existing)?;
-    fs::set_permissions(&log, fs::Permissions::from_mode(0o600))?;
+    let mut encoded = serde_json::to_vec(&entry)?;
+    encoded.push(b'\n');
+    if encoded.len() > AUDIT_ENTRY_MAX_BYTES {
+        bail!("SecureDrop audit entry exceeds the bounded entry size");
+    }
+
+    rotate_audit_if_needed(&audit_directory, &log, max_bytes, retention)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_APPEND)
+        .open(&log)
+        .with_context(|| format!("failed to open {}", log.display()))?;
+    validate_private_file(&file, &log)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod {}", log.display()))?;
+    file.write_all(&encoded)
+        .with_context(|| format!("failed to append {}", log.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", log.display()))?;
+    file.sync_data()
+        .with_context(|| format!("failed to sync {}", log.display()))?;
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(hex_digest(digest(&SHA256, &bytes).as_ref()))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileDigest {
+    hex: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<FileDigest> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let before_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !before_metadata.is_file() {
+        bail!("source must remain a regular file: {}", path.display());
+    }
+    let before = FileIdentity::from_metadata(&before_metadata);
+    let digest = sha256_reader(&mut file)?;
+    let after = FileIdentity::from_metadata(
+        &file
+            .metadata()
+            .with_context(|| format!("failed to re-inspect {}", path.display()))?,
+    );
+    if before != after || digest.bytes != before.bytes {
+        bail!("source changed while hashing: {}", path.display());
+    }
+    Ok(digest)
+}
+
+fn sha256_reader(reader: &mut impl Read) -> Result<FileDigest> {
+    let mut context = DigestContext::new(&SHA256);
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    let mut bytes = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .context("failed to stream SHA-256 input")?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .context("SHA-256 input length overflow")?;
+    }
+    Ok(FileDigest {
+        hex: hex_digest(context.finish().as_ref()),
+        bytes,
+    })
+}
+
+struct AuditLock {
+    file: fs::File,
+}
+
+impl AuditLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        validate_private_file(&file, path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+
+        let started = Instant::now();
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Self { file });
+            }
+            let error = std::io::Error::last_os_error();
+            let raw = error.raw_os_error();
+            if raw != Some(libc::EWOULDBLOCK) && raw != Some(libc::EAGAIN) {
+                return Err(error).with_context(|| format!("failed to lock {}", path.display()));
+            }
+            if started.elapsed() >= AUDIT_LOCK_TIMEOUT {
+                bail!("timed out locking {}", path.display());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for AuditLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn validate_private_file(file: &fs::File, path: &Path) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !metadata.is_file() || metadata.uid() != current_uid() {
+        bail!("private file has invalid identity: {}", path.display());
+    }
+    Ok(())
+}
+
+fn rotate_audit_if_needed(
+    audit_directory: &Path,
+    log: &Path,
+    max_bytes: u64,
+    retention: usize,
+) -> Result<()> {
+    let metadata = match private_path_metadata(log)? {
+        Some(metadata) => metadata,
+        None => return Ok(()),
+    };
+    if metadata.len() < max_bytes {
+        return Ok(());
+    }
+    if retention == 0 {
+        fs::remove_file(log).with_context(|| format!("failed to rotate {}", log.display()))?;
+        sync_directory(audit_directory)?;
+        return Ok(());
+    }
+
+    let oldest = rotated_audit_path(log, retention);
+    remove_private_file_if_present(&oldest)?;
+    for index in (1..retention).rev() {
+        let source = rotated_audit_path(log, index);
+        if private_path_metadata(&source)?.is_some() {
+            fs::rename(&source, rotated_audit_path(log, index + 1))
+                .with_context(|| format!("failed to rotate {}", source.display()))?;
+        }
+    }
+    fs::rename(log, rotated_audit_path(log, 1))
+        .with_context(|| format!("failed to rotate {}", log.display()))?;
+    sync_directory(audit_directory)?;
+    Ok(())
+}
+
+fn private_path_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != current_uid()
+            {
+                bail!("private path has invalid identity: {}", path.display());
+            }
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn remove_private_file_if_present(path: &Path) -> Result<()> {
+    if private_path_metadata(path)?.is_some() {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn rotated_audit_path(log: &Path, index: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{}", log.display(), index))
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))
+}
+
+fn current_uid() -> u32 {
+    unsafe { libc::geteuid() }
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn remote_publish_command(staged: &str, final_path: &str, sha256: &str) -> String {
+    let staged = shell_quote(staged);
+    format!(
+        "actual=$(sha256sum {staged} | awk '{{print $1}}') && if [ \"$actual\" != {expected} ]; then rm -f -- {staged}; exit 65; fi && chmod 600 {staged} && mv -f {staged} {final_path}",
+        expected = shell_quote(sha256),
+        final_path = shell_quote(final_path),
+    )
 }
 
 fn remote_mkdir_command(config: &Config) -> String {
@@ -531,7 +806,7 @@ fn remote_mkdir_command(config: &Config) -> String {
 
 fn rsync_upload_command(host: &str, source: &Path, remote_dir: &str) -> String {
     format!(
-        "rsync -az --partial -e ssh {} {}:{}",
+        "rsync -az --partial --timeout=30 -e ssh {} {}:{}",
         shell_quote(&source.display().to_string()),
         shell_quote(host),
         shell_quote(remote_dir)
@@ -540,7 +815,7 @@ fn rsync_upload_command(host: &str, source: &Path, remote_dir: &str) -> String {
 
 fn rsync_download_command(host: &str, remote_source: &str, local_destination: &Path) -> String {
     format!(
-        "rsync -az --partial -e ssh {}:{} {}",
+        "rsync -az --partial --timeout=30 -e ssh {}:{} {}",
         shell_quote(host),
         shell_quote(remote_source),
         shell_quote(&local_destination.display().to_string())
@@ -552,11 +827,11 @@ fn ssh_command(host: &str, remote_command: &str) -> String {
 }
 
 fn run_shell(command: &str) -> Result<()> {
-    let status = Command::new("bash")
-        .arg("-lc")
-        .arg(command)
-        .status()
-        .with_context(|| format!("failed to run: {command}"))?;
+    let status = bounded_command::status_inherited(
+        Command::new("bash").arg("-lc").arg(command),
+        Duration::from_secs(10 * 60),
+    )
+    .with_context(|| format!("failed to run: {command}"))?;
     if !status.success() {
         bail!("command failed with {status}: {command}");
     }
@@ -585,20 +860,24 @@ fn print_report(report: &TransferReport, json: bool) {
 }
 
 fn command_exists(name: &str) -> bool {
-    Command::new("bash")
-        .arg("-lc")
-        .arg(format!("command -v {} >/dev/null 2>&1", shell_quote(name)))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    bounded_command::status(
+        Command::new("bash")
+            .arg("-lc")
+            .arg(format!("command -v {} >/dev/null 2>&1", shell_quote(name))),
+        Duration::from_secs(5),
+    )
+    .map(|status| status.success())
+    .unwrap_or(false)
 }
 
 fn ssh_alias_configured(host: &str) -> bool {
-    Command::new("ssh")
-        .args(["-G", host])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    bounded_command::output(
+        Command::new("ssh").args(["-G", host]),
+        Duration::from_secs(5),
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
 }
 
 fn default_local_root() -> Result<PathBuf> {
@@ -633,6 +912,18 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::io::Cursor;
+    use std::sync::{Arc, Barrier};
+
+    fn test_config(root: &Path) -> Config {
+        Config {
+            local_root: root.to_path_buf(),
+            remote_root: "/home/signul/codexswitch-secure-files".to_string(),
+            host: "example.invalid".to_string(),
+            uses_default_local_root: false,
+        }
+    }
 
     #[test]
     fn rejects_path_traversal_segments() {
@@ -644,5 +935,138 @@ mod tests {
     #[test]
     fn shell_quotes_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn hashing_uses_a_fixed_size_streaming_buffer() -> Result<()> {
+        struct BoundedReader {
+            remaining: usize,
+        }
+
+        impl Read for BoundedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buffer.len() <= HASH_BUFFER_BYTES);
+                let count = self.remaining.min(buffer.len());
+                buffer[..count].fill(b'x');
+                self.remaining -= count;
+                Ok(count)
+            }
+        }
+
+        let byte_count = HASH_BUFFER_BYTES * 3 + 17;
+        let mut reader = BoundedReader {
+            remaining: byte_count,
+        };
+        let streamed = sha256_reader(&mut reader)?;
+        let expected = ring::digest::digest(&SHA256, &vec![b'x'; byte_count]);
+        assert_eq!(streamed.bytes, byte_count as u64);
+        assert_eq!(streamed.hex, hex_digest(expected.as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn file_hash_reports_the_opened_file_length() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("artifact.bin");
+        fs::write(&path, b"streamed artifact")?;
+
+        let observed = sha256_file(&path)?;
+        let expected = sha256_reader(&mut Cursor::new(b"streamed artifact"))?;
+        assert_eq!(observed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_audit_appends_do_not_lose_entries() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = Arc::new(test_config(temp.path()));
+        create_local_tree(&config)?;
+        let worker_count = 24;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+
+        for index in 0..worker_count {
+            let config = Arc::clone(&config);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                barrier.wait();
+                append_audit(&config, &format!("send-{index}"), "source", "destination")
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("audit worker panicked")?;
+        }
+
+        let log = fs::read_to_string(temp.path().join("audit/transfers.jsonl"))?;
+        let actions = log
+            .lines()
+            .map(|line| -> Result<String> {
+                Ok(serde_json::from_str::<serde_json::Value>(line)?["action"]
+                    .as_str()
+                    .context("audit action missing")?
+                    .to_string())
+            })
+            .collect::<Result<HashSet<_>>>()?;
+        assert_eq!(actions.len(), worker_count);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_rotation_is_bounded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = test_config(temp.path());
+        create_local_tree(&config)?;
+
+        for index in 0..6 {
+            append_audit_with_limits(
+                &config,
+                &format!("send-{index}"),
+                "source",
+                "destination",
+                1,
+                2,
+            )?;
+        }
+
+        let log = temp.path().join("audit/transfers.jsonl");
+        for path in [
+            &log,
+            &rotated_audit_path(&log, 1),
+            &rotated_audit_path(&log, 2),
+        ] {
+            let lines = fs::read_to_string(path)?;
+            assert_eq!(lines.lines().count(), 1);
+            serde_json::from_str::<serde_json::Value>(lines.trim())?;
+        }
+        assert!(!rotated_audit_path(&log, 3).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn audit_rejects_a_symlink_log_without_touching_its_referent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = test_config(temp.path());
+        create_local_tree(&config)?;
+        let outside = temp.path().join("outside.log");
+        fs::write(&outside, b"preserve")?;
+        unix_symlink(&outside, temp.path().join("audit/transfers.jsonl"))?;
+
+        assert!(append_audit(&config, "send", "source", "destination").is_err());
+        assert_eq!(fs::read(&outside)?, b"preserve");
+        Ok(())
+    }
+
+    #[test]
+    fn transfer_commands_use_timeout_and_hash_verified_publish() {
+        let upload = rsync_upload_command("host", Path::new("/tmp/a"), "/remote");
+        let download = rsync_download_command("host", "/remote/a", Path::new("/tmp"));
+        let publish = remote_publish_command("/stage/a", "/final/a", "abc123");
+
+        assert!(upload.contains("--timeout=30"));
+        assert!(download.contains("--timeout=30"));
+        assert!(publish.contains("sha256sum"));
+        assert!(publish.contains("rm -f -- '/stage/a'"));
+        assert!(publish.contains("mv -f '/stage/a' '/final/a'"));
+        assert!(publish.contains("'abc123'"));
     }
 }

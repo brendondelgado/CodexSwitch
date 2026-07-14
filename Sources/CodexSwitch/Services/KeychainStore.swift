@@ -7,10 +7,60 @@ private let logger = Logger(subsystem: "com.codexswitch", category: "AccountStor
 /// File-based account storage at ~/.codexswitch/accounts.json (600 permissions).
 /// Migrates from legacy Keychain on first load.
 struct KeychainStore: Sendable {
+    struct TestHooks: Sendable {
+        enum LegacyReadResult: Sendable {
+            case missing
+            case data(Data)
+            case invalidType
+            case failure(OSStatus)
+        }
+
+        struct LegacyCredentials: Sendable {
+            let read: @Sendable () throws -> LegacyReadResult
+            let delete: @Sendable () throws -> Void
+
+            init(
+                data: Data,
+                delete: @escaping @Sendable () throws -> Void
+            ) {
+                self.read = { .data(data) }
+                self.delete = delete
+            }
+
+            init(
+                read: @escaping @Sendable () throws -> LegacyReadResult,
+                delete: @escaping @Sendable () throws -> Void
+            ) {
+                self.read = read
+                self.delete = delete
+            }
+        }
+
+        var beforeGenerationCheck: (@Sendable () throws -> Void)? = nil
+        var beforeReadback: (@Sendable () throws -> Void)? = nil
+        var legacyCredentials: LegacyCredentials? = nil
+    }
+
+    private typealias StoreGeneration = SecureAtomicFileTransaction.Generation
+
+    private struct StoreSnapshot {
+        let accounts: [CodexAccount]
+        let bytes: Data?
+        let generation: StoreGeneration
+
+        static let missing = StoreSnapshot(
+            accounts: [],
+            bytes: nil,
+            generation: .missing
+        )
+    }
+
     let service: String
     private let storePath: String
-    private let storeDir: String
+    private let fileTransaction: SecureAtomicFileTransaction
+    private let testHooks: TestHooks
     private static let allAccountsKey = "all-accounts"
+    private static let nilUUID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
     private static let defaultStorePath: String = {
         let dir = NSString("~/.codexswitch").expandingTildeInPath
         return (dir as NSString).appendingPathComponent("accounts.json")
@@ -19,121 +69,310 @@ struct KeychainStore: Sendable {
         NSString("~/.codexswitch").expandingTildeInPath
     }()
 
-    init(service: String = "com.codexswitch.accounts", storePath: String? = nil) {
+    init(
+        service: String = "com.codexswitch.accounts",
+        storePath: String? = nil,
+        testHooks: TestHooks = TestHooks()
+    ) {
         self.service = service
-        if let storePath {
-            let expanded = NSString(string: storePath).expandingTildeInPath
-            self.storePath = expanded
-            self.storeDir = (expanded as NSString).deletingLastPathComponent
-        } else {
-            self.storePath = Self.defaultStorePath
-            self.storeDir = Self.defaultStoreDir
-        }
+        let expanded = NSString(string: storePath ?? Self.defaultStorePath).expandingTildeInPath
+        self.storePath = expanded
+        self.testHooks = testHooks
+        self.fileTransaction = SecureAtomicFileTransaction(
+            path: expanded,
+            subject: "store",
+            testHooks: .init(
+                beforeGenerationCheck: testHooks.beforeGenerationCheck,
+                beforeReadback: testHooks.beforeReadback
+            )
+        )
     }
 
     func save(_ account: CodexAccount) throws {
-        var accounts = try loadAll()
-        // Deduplicate by accountId (OpenAI account UUID), not local id
-        if let idx = accounts.firstIndex(where: { $0.accountId == account.accountId }) {
-            accounts[idx] = account
-        } else {
-            accounts.append(account)
+        try withExclusiveLock { lockedFile in
+            let snapshot = try loadSnapshotOrMigrate(lockedFile: lockedFile)
+            var accounts = snapshot.accounts
+            // Deduplicate by accountId (OpenAI account UUID), not local id.
+            if let index = accounts.firstIndex(where: { $0.accountId == account.accountId }) {
+                accounts[index] = account
+            } else {
+                accounts.append(account)
+            }
+            _ = try commit(
+                accounts,
+                expectedGeneration: snapshot.generation,
+                lockedFile: lockedFile
+            )
         }
-        try saveAll(accounts)
     }
 
     func loadAll() throws -> [CodexAccount] {
-        // Try file store first (no fileExists check — avoids TOCTOU race)
-        do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: storePath))
-            return Self.removingPlaceholderQuotaSnapshots(
-                try Self.accountDecoder.decode([CodexAccount].self, from: data)
+        try withExclusiveLock { lockedFile in
+            try loadSnapshotOrMigrate(lockedFile: lockedFile).accounts
+        }
+    }
+
+    func delete(_ accountId: UUID) throws {
+        try withExclusiveLock { lockedFile in
+            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+            if snapshot.bytes != nil {
+                let remaining = snapshot.accounts.filter { $0.id != accountId }
+                if remaining.isEmpty {
+                    try deleteStore(
+                        expectedGeneration: snapshot.generation,
+                        lockedFile: lockedFile
+                    )
+                    try deleteLegacyKeychainItem()
+                } else {
+                    _ = try commit(
+                        remaining,
+                        expectedGeneration: snapshot.generation,
+                        lockedFile: lockedFile
+                    )
+                    try deleteLegacyKeychainItem()
+                }
+                return
+            }
+
+            guard let legacyAccounts = try decodedLegacyAccounts(),
+                  legacyAccounts.contains(where: { $0.id == accountId }) else {
+                return
+            }
+
+            let remaining = legacyAccounts.filter { $0.id != accountId }
+            if remaining.isEmpty {
+                try deleteStore(
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
+            } else {
+                _ = try commit(
+                    remaining,
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
+            }
+            try deleteLegacyKeychainItem()
+        }
+    }
+
+    func deleteAll() throws {
+        try withExclusiveLock { lockedFile in
+            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+            try deleteStore(
+                expectedGeneration: snapshot.generation,
+                lockedFile: lockedFile
             )
-        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
-            // File doesn't exist — fall through to Keychain migration
+            try deleteLegacyKeychainItem()
+        }
+    }
+
+    func saveAll(_ accounts: [CodexAccount]) throws {
+        try withExclusiveLock { lockedFile in
+            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+            _ = try commit(
+                accounts,
+                expectedGeneration: snapshot.generation,
+                lockedFile: lockedFile
+            )
+        }
+    }
+
+    private func withExclusiveLock<T>(
+        _ operation: (SecureAtomicFileTransaction.LockedFile) throws -> T
+    ) throws -> T {
+        do {
+            return try fileTransaction.withExclusiveLock(operation)
+        } catch let error as SecureAtomicFileError {
+            throw Self.keychainError(from: error)
+        }
+    }
+
+    private func loadSnapshotOrMigrate(
+        lockedFile: SecureAtomicFileTransaction.LockedFile
+    ) throws -> StoreSnapshot {
+        let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+        guard snapshot.bytes == nil else {
+            return snapshot
         }
 
-        // Migrate from legacy Keychain if present
-        let legacyQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: Self.allAccountsKey,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var legacyResult: AnyObject?
-        let status = SecItemCopyMatching(legacyQuery as CFDictionary, &legacyResult)
+        guard let accounts = try decodedLegacyAccounts() else {
+            return snapshot
+        }
 
-        if status == errSecItemNotFound {
-            return []
-        }
-        if status != errSecSuccess {
-            // Keychain denied — may be a fresh build with no ACL.
-            // Return empty rather than throw, so app still launches.
-            logger.warning("Keychain read failed (status: \(status)) — returning empty. Re-add accounts to migrate.")
-            return []
-        }
-        guard let data = legacyResult as? Data else {
-            return []
+        logger.info("Migrating \(accounts.count) accounts from Keychain to file store")
+
+        let committed = try commit(
+            accounts,
+            expectedGeneration: snapshot.generation,
+            lockedFile: lockedFile
+        )
+        // Delete legacy credentials only after durable commit and readback proof.
+        try deleteLegacyKeychainItem()
+        return committed
+    }
+
+    private func decodedLegacyAccounts() throws -> [CodexAccount]? {
+        guard let data = try legacyCredentialData() else {
+            return nil
         }
 
         let accounts = Self.removingPlaceholderQuotaSnapshots(
             try Self.accountDecoder.decode([CodexAccount].self, from: data)
         )
-        logger.info("Migrating \(accounts.count) accounts from Keychain to file store")
-
-        // Save to file, then clean up Keychain
-        try saveAll(accounts)
-        SecItemDelete(legacyQuery as CFDictionary)
-
+        try Self.validate(accounts)
         return accounts
     }
 
-    func delete(_ accountId: UUID) throws {
-        var accounts = try loadAll()
-        accounts.removeAll { $0.id == accountId }
-        if accounts.isEmpty {
-            try deleteAll()
-        } else {
-            try saveAll(accounts)
-        }
+    private func readSnapshot(
+        lockedFile: SecureAtomicFileTransaction.LockedFile,
+        allowMissing: Bool
+    ) throws -> StoreSnapshot {
+        let raw = try lockedFile.read(allowMissing: allowMissing)
+        guard let data = raw.bytes else { return .missing }
+        let accounts = Self.removingPlaceholderQuotaSnapshots(
+            try Self.accountDecoder.decode([CodexAccount].self, from: data)
+        )
+        try Self.validate(accounts)
+
+        return StoreSnapshot(
+            accounts: accounts,
+            bytes: data,
+            generation: raw.generation
+        )
     }
 
-    func deleteAll() throws {
-        if FileManager.default.fileExists(atPath: storePath) {
-            try FileManager.default.removeItem(atPath: storePath)
-        }
-        // Also clean up legacy Keychain if present
-        let legacyQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: Self.allAccountsKey,
-        ]
-        SecItemDelete(legacyQuery as CFDictionary)
-    }
-
-    func saveAll(_ accounts: [CodexAccount]) throws {
-        let accounts = Self.removingPlaceholderQuotaSnapshots(accounts)
-
-        // Ensure directory exists
-        if !FileManager.default.fileExists(atPath: storeDir) {
-            try FileManager.default.createDirectory(
-                atPath: storeDir,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-        }
+    private func commit(
+        _ proposedAccounts: [CodexAccount],
+        expectedGeneration: StoreGeneration,
+        lockedFile: SecureAtomicFileTransaction.LockedFile
+    ) throws -> StoreSnapshot {
+        let accounts = Self.removingPlaceholderQuotaSnapshots(proposedAccounts)
+        try Self.validate(accounts)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(accounts)
-
-        // .atomic already writes to tmp + renames internally
-        try data.write(to: URL(fileURLWithPath: storePath), options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: storePath
+        let rawReadback = try lockedFile.replace(data, expectedGeneration: expectedGeneration)
+        guard rawReadback.bytes == data else {
+            throw KeychainError.readbackMismatch(path: storePath)
+        }
+        let decoded = Self.removingPlaceholderQuotaSnapshots(
+            try Self.accountDecoder.decode([CodexAccount].self, from: data)
         )
+        try Self.validate(decoded)
+        return StoreSnapshot(
+            accounts: decoded,
+            bytes: data,
+            generation: rawReadback.generation
+        )
+    }
+
+    private func deleteStore(
+        expectedGeneration: StoreGeneration,
+        lockedFile: SecureAtomicFileTransaction.LockedFile
+    ) throws {
+        let readback = try lockedFile.remove(expectedGeneration: expectedGeneration)
+        guard readback == .missing else {
+            throw KeychainError.readbackMismatch(path: storePath)
+        }
+    }
+
+    private func legacyKeychainQuery(returnData: Bool) -> [String: Any] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: Self.allAccountsKey,
+        ]
+        if returnData {
+            query[kSecReturnData as String] = true
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+        }
+        return query
+    }
+
+    private func legacyCredentialData() throws -> Data? {
+        let readResult: TestHooks.LegacyReadResult
+        if let injected = testHooks.legacyCredentials {
+            readResult = try injected.read()
+        } else {
+            let query = legacyKeychainQuery(returnData: true)
+            var rawResult: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &rawResult)
+            if status == errSecItemNotFound {
+                readResult = .missing
+            } else if status != errSecSuccess {
+                readResult = .failure(status)
+            } else if let data = rawResult as? Data {
+                readResult = .data(data)
+            } else {
+                readResult = .invalidType
+            }
+        }
+
+        switch readResult {
+        case .missing:
+            return nil
+        case .data(let data):
+            return data
+        case .invalidType:
+            throw KeychainError.invalidLegacyCredentialResult
+        case .failure(let status):
+            throw KeychainError.loadFailed(status)
+        }
+    }
+
+    private func deleteLegacyKeychainItem() throws {
+        if let injected = testHooks.legacyCredentials {
+            try injected.delete()
+            return
+        }
+
+        let status = SecItemDelete(legacyKeychainQuery(returnData: false) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError.deleteFailed(status)
+        }
+    }
+
+    private static func keychainError(from error: SecureAtomicFileError) -> KeychainError {
+        switch error {
+        case .lockFailed(let path, let operation, let code):
+            return .lockFailed(path: path, operation: operation, code: code)
+        case .operationFailed(let path, let operation, let code):
+            return .fileOperationFailed(path: path, operation: operation, code: code)
+        case .unsafePath(let path, let reason):
+            return .unsafePath(path: path, reason: reason)
+        case .staleGeneration(let expected, let actual):
+            return .staleGeneration(expected: expected, actual: actual)
+        case .readbackMismatch(let path):
+            return .readbackMismatch(path: path)
+        }
+    }
+
+    private static func validate(_ accounts: [CodexAccount]) throws {
+        var accountIds = Set<String>()
+        var localIds = Set<UUID>()
+
+        for account in accounts {
+            let accountId = account.accountId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !accountId.isEmpty else {
+                throw KeychainError.missingAccountId
+            }
+            guard account.id != Self.nilUUID, localIds.insert(account.id).inserted else {
+                if account.id == Self.nilUUID {
+                    throw KeychainError.missingLocalId
+                }
+                throw KeychainError.duplicateLocalId(account.id)
+            }
+            guard accountIds.insert(accountId).inserted else {
+                throw KeychainError.duplicateAccountId(accountId)
+            }
+        }
+
+        let activeCount = accounts.lazy.filter(\.isActive).count
+        guard accounts.isEmpty || activeCount == 1 else {
+            throw KeychainError.invalidActiveAccountCount(activeCount)
+        }
     }
 
     private static let accountDecoder: JSONDecoder = {
@@ -144,12 +383,15 @@ struct KeychainStore: Sendable {
                 return Date(timeIntervalSinceReferenceDate: timestamp)
             }
             let string = try container.decode(String.self)
+            if let timestamp = Double(string), timestamp.isFinite {
+                return Date(timeIntervalSince1970: timestamp)
+            }
             if let date = Self.decodeISO8601Date(string) {
                 return date
             }
             throw DecodingError.dataCorruptedError(
                 in: container,
-                debugDescription: "Expected Apple reference timestamp or ISO-8601 date string"
+                debugDescription: "Expected Apple reference timestamp, Unix timestamp string, or ISO-8601 date string"
             )
         }
         return decoder
@@ -180,16 +422,49 @@ struct KeychainStore: Sendable {
     }
 }
 
-enum KeychainError: Error, LocalizedError {
+enum KeychainError: Error, Equatable, LocalizedError {
     case saveFailed(OSStatus)
     case loadFailed(OSStatus)
     case deleteFailed(OSStatus)
+    case duplicateAccountId(String)
+    case duplicateLocalId(UUID)
+    case missingAccountId
+    case missingLocalId
+    case invalidLegacyCredentialResult
+    case invalidActiveAccountCount(Int)
+    case lockFailed(path: String, operation: String, code: Int32)
+    case fileOperationFailed(path: String, operation: String, code: Int32)
+    case unsafePath(path: String, reason: String)
+    case staleGeneration(expected: String, actual: String)
+    case readbackMismatch(path: String)
 
     var errorDescription: String? {
         switch self {
-        case .saveFailed(let s): return "Save failed: \(s)"
-        case .loadFailed(let s): return "Load failed: \(s)"
-        case .deleteFailed(let s): return "Delete failed: \(s)"
+        case .saveFailed(let status): return "Save failed: \(status)"
+        case .loadFailed(let status): return "Load failed: \(status)"
+        case .deleteFailed(let status): return "Delete failed: \(status)"
+        case .duplicateAccountId(let accountId):
+            return "Account store contains duplicate accountId identity: \(accountId)"
+        case .duplicateLocalId(let id):
+            return "Account store contains duplicate local id identity: \(id.uuidString)"
+        case .missingAccountId:
+            return "Account store contains a missing provider account identity"
+        case .missingLocalId:
+            return "Account store contains a missing local account identity"
+        case .invalidLegacyCredentialResult:
+            return "Legacy Keychain read succeeded without returning credential data"
+        case .invalidActiveAccountCount(let count):
+            return "A nonempty account store must contain exactly one active account; found \(count)"
+        case .lockFailed(let path, let operation, let code):
+            return "Account store lock \(operation) failed for \(path): errno \(code)"
+        case .fileOperationFailed(let path, let operation, let code):
+            return "Account store \(operation) failed for \(path): errno \(code)"
+        case .unsafePath(let path, let reason):
+            return "Unsafe account store path \(path): \(reason)"
+        case .staleGeneration(let expected, let actual):
+            return "Account store generation changed while locked: expected \(expected), found \(actual)"
+        case .readbackMismatch(let path):
+            return "Account store readback did not prove committed state for \(path)"
         }
     }
 }

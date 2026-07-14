@@ -1,0 +1,10 @@
+{
+  "cipher": "aes-256-gcm",
+  "ciphertext": "2fc3oDsKE+RLlZlNkzsFwleJU3Q9EBrnAjWqFjXXa19IET4c46Qwf5wfZsiaZV6D83z6mkQvUpRj74A/ghTC2kShi/5K0JRAHtclCu1cTbcwu5uepO18NyIXkRNfW32pivUl9KKeJ3kAnFKXI3Zl4UYdNTvImPeQ9L6OQbA4fnnB+eEjaLhwV01Q9wdN18zNp0/IG1YgAIYhrFF4YyWXEtYbRw8HT2RWJoYiGOamX5mDt6U/XkieeZ7VLi/8nGq8pUaCcAONmnTYVn70j1zL++1wacfwxKeMmxKoLiIkRWj2im+qXsqY5ELs+VFp141yS0OuW9hCCoEBh6Pze1jjgaJFO28s5OKt0BI09AUCNlUTuV4LZi4r2KQGHqeLn3km4GmnzQFJZ18ZjC2e5GdwOFhBBrJ4YspeMhdiSKQj6z/DNAhYb4+4pcJUIFrZo45gMS2CwfvjEG3Apy3XGOlE5uVhasB4m9SSRQPdHf+2UCm7uB7+Amwcz7IVrdS1zfSHyDBJJWovE4AsYJz1XpNfFFHYeaPRLOrHXPe1ELAeFtBN/Iiz9IFiA4sSszWOim3a80mluCdZcn4smI338EbIPc5LYqTKhRH/fnTxL5J5cZRJYCYDLBJtAFarj+HnI36+qDj5B4ZIS4WuPYQaHIyudnHU07YMIYu+WdmCZ3Sw3Jiu5+oD+1GgxOrEG46aVi/vGGHW24USaJHo9RSa8pqhG7HjAeAjBm0FnsbcP23r0LMMgn7Vz8SbSHxLdz6Zd+qt+Thy2YMxbSrWt3LoCB45ktmNen3pitomv1Usk1AeZxcnlZnxO/BGillZpD3NGAB0QNaTOze9R7O5r/E+a5QbCXQQCrROblurKVDKQnINIIRGSFf1TXT3Lf3CsCbxYN7rGx024On6ezcQl2Z8XuENvnuERWeVgaiRfdteB/pi",
+  "format": "codexswitch-linux-devbox-bundle",
+  "iterations": 600000,
+  "kdf": "pbkdf2-hmac-sha256-v2",
+  "nonce": "ICEiIyQlJicoKSor",
+  "salt": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "schemaVersion": 2
+}

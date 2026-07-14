@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "case": "natural-reset-guard",
+  "now": 805550400,
+  "active": {
+    "id": "20000000-0000-4000-8000-000000000001",
+    "email": "active-pro@example.com",
+    "accessToken": "access-active",
+    "refreshToken": "refresh-active",
+    "idToken": "id-active",
+    "accountId": "provider-active-pro",
+    "quotaSnapshot": {
+      "version": 2,
+      "allowed": true,
+      "limitReached": false,
+      "fetchedAt": 805550400,
+      "windows": [{
+        "kind": "weekly",
+        "durationSeconds": 604800,
+        "usedPercent": 100,
+        "resetsAt": 805554000,
+        "source": {"rateLimit": "main", "slot": "primary"},
+        "hardLimitReached": true
+      }]
+    },
+    "planType": "pro",
+    "lastRefreshed": 805550400,
+    "subscriptionRenewsAt": null,
+    "subscriptionExpiresAt": null,
+    "subscriptionWillRenew": true,
+    "hasActiveSubscription": true,
+    "fiveHourPrimedAt": null,
+    "isActive": true
+  },
+  "replacement": {
+    "id": "20000000-0000-4000-8000-000000000002",
+    "email": "ready-plus@example.com",
+    "accessToken": "access-ready",
+    "refreshToken": "refresh-ready",
+    "idToken": "id-ready",
+    "accountId": "provider-ready-plus",
+    "quotaSnapshot": {
+      "version": 2,
+      "allowed": true,
+      "limitReached": false,
+      "fetchedAt": 805550400,
+      "windows": [{
+        "kind": "weekly",
+        "durationSeconds": 604800,
+        "usedPercent": 10,
+        "resetsAt": 806155200,
+        "source": {"rateLimit": "main", "slot": "primary"},
+        "hardLimitReached": false
+      }]
+    },
+    "planType": "plus",
+    "lastRefreshed": 805550400,
+    "subscriptionRenewsAt": null,
+    "subscriptionExpiresAt": null,
+    "subscriptionWillRenew": true,
+    "hasActiveSubscription": true,
+    "fiveHourPrimedAt": null,
+    "isActive": false
+  },
+  "bank": {
+    "availableCount": 1,
+    "totalEarnedCount": 1,
+    "credits": [{
+      "id": "natural-reset-credit",
+      "resetType": "full",
+      "status": "available",
+      "grantedAt": 805464000,
+      "expiresAt": 806414400,
+      "redeemStartedAt": null,
+      "redeemedAt": null,
+      "title": "Full reset",
+      "description": null
+    }],
+    "fetchedAt": 805550400
+  },
+  "expected": {
+    "resetReason": null,
+    "preserveCredit": true
+  }
+}

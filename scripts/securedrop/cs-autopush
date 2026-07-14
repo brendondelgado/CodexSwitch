@@ -37,6 +37,27 @@ remote_sha256() {
     "sha256sum -- $(shell_quote "$remote_path") | awk '{print \$1}'" 2>/dev/null || true
 }
 
+local_sha256() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+remove_local_if_unchanged() {
+  local file="$1"
+  local expected_hash="$2"
+  local name="$3"
+  local current_hash
+  if [ ! -f "$file" ]; then
+    log "local-delete-skipped name=$name reason=missing_after_transfer"
+    return 1
+  fi
+  current_hash="$(local_sha256 "$file")"
+  if [ "$current_hash" != "$expected_hash" ]; then
+    log "local-delete-skipped name=$name reason=content_changed expected=$expected_hash current=$current_hash"
+    return 1
+  fi
+  rm -f -- "$file"
+}
+
 is_safe_name() {
   local name="$1"
   case "$name" in
@@ -64,7 +85,7 @@ while IFS= read -r -d '' file; do
     continue
   fi
 
-  local_hash="$(shasum -a 256 "$file" | awk '{print $1}')"
+  local_hash="$(local_sha256 "$file")"
   local_bytes="$(stat -f '%z' "$file")"
   incoming_dir="$REMOTE_ROOT/.incoming/autopush-$(date +%s)-$$"
   remote_incoming="$incoming_dir/$name"
@@ -73,7 +94,7 @@ while IFS= read -r -d '' file; do
   remote_final_hash="$(remote_sha256 "$remote_final")"
 
   if [ "$remote_final_hash" = "$local_hash" ]; then
-    rm -f -- "$file"
+    remove_local_if_unchanged "$file" "$local_hash" "$name" || continue
     sent_count=$((sent_count + 1))
     log "already-pushed name=$name bytes=$local_bytes sha256=$local_hash dest=$HOST:$remote_final"
     continue
@@ -118,7 +139,7 @@ while IFS= read -r -d '' file; do
     continue
   fi
 
-  rm -f -- "$file"
+  remove_local_if_unchanged "$file" "$local_hash" "$name" || continue
   sent_count=$((sent_count + 1))
   log "pushed name=$name bytes=$local_bytes sha256=$local_hash dest=$HOST:$remote_final"
 done < <(find "$SRC" -maxdepth 1 -type f -print0)

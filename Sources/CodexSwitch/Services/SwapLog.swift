@@ -127,17 +127,6 @@ enum SwapLog {
         }
     }
 
-    /// Read the last N lines from today's log.
-    static func recentEntries(count: Int = 50) -> [String] {
-        let dateStr = makeISOFormatter().string(from: Date()).prefix(10)
-        let logPath = "\(logDir)/codexswitch-\(String(dateStr)).log"
-        guard let content = try? String(contentsOfFile: logPath, encoding: .utf8) else {
-            return []
-        }
-        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
-        return Array(lines.suffix(count))
-    }
-
     /// Clean up logs older than 7 days.
     static func pruneOldLogs() {
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: logDir) else { return }

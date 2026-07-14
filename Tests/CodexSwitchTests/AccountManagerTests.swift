@@ -75,8 +75,90 @@ struct AccountManagerTests {
         #expect(manager.sortedAccounts.first?.id == plus.id)
     }
 
-    @Test("Refresh stored tokens imports rotated tokens for the currently active account")
-    func refreshStoredTokensImportsRotatedTokens() {
+    @Test("Sorted accounts treat weekly-only as usable and windowless as unavailable")
+    func sortedAccountsSupportWeeklyOnlyQuota() {
+        let manager = AccountManager()
+        let now = Date()
+        let weeklyOnly = CodexAccount(
+            email: "weekly@test.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "weekly",
+            quotaSnapshot: QuotaSnapshot(
+                allowed: true,
+                limitReached: false,
+                fetchedAt: now,
+                windows: [
+                    QuotaWindow(
+                        kind: .weekly,
+                        durationSeconds: 604_800,
+                        usedPercent: 30,
+                        resetsAt: now.addingTimeInterval(604_800),
+                        source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+                    ),
+                ]
+            ),
+            planType: "plus"
+        )
+        let windowless = CodexAccount(
+            email: "unknown@test.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "unknown",
+            quotaSnapshot: QuotaSnapshot(
+                allowed: true,
+                limitReached: false,
+                fetchedAt: now,
+                windows: []
+            ),
+            planType: "pro"
+        )
+
+        manager.accounts = [windowless, weeklyOnly]
+
+        #expect(manager.sortedAccounts.first?.id == weeklyOnly.id)
+    }
+
+    @Test("Weekly-only quota clears quarantined five-hour priming marker")
+    func weeklyOnlyQuotaClearsLegacyFiveHourMarker() {
+        let manager = AccountManager()
+        let now = Date()
+        let account = CodexAccount(
+            email: "weekly@test.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "weekly",
+            fiveHourPrimedAt: now.addingTimeInterval(-60)
+        )
+        manager.accounts = [account]
+
+        manager.updateQuota(
+            for: account.id,
+            snapshot: QuotaSnapshot(
+                allowed: true,
+                limitReached: false,
+                fetchedAt: now,
+                windows: [
+                    QuotaWindow(
+                        kind: .weekly,
+                        durationSeconds: 604_800,
+                        usedPercent: 30,
+                        resetsAt: now.addingTimeInterval(604_800),
+                        source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+                    ),
+                ]
+            ),
+            planType: "plus"
+        )
+
+        #expect(manager.accounts.first?.fiveHourPrimedAt == nil)
+    }
+
+    @Test("Generic credential upsert cannot mutate the configured account")
+    func genericCredentialUpsertRejectsConfiguredAccount() {
         let manager = AccountManager()
         var active = makeAccount(
             fiveHourRemaining: 80,
@@ -99,40 +181,16 @@ struct AccountManagerTests {
             lastRefreshed: Date()
         )
 
-        let refreshedId = manager.refreshStoredTokens(from: imported)
+        let result = manager.upsertInactiveAccount(imported)
 
-        #expect(refreshedId == active.id)
-        #expect(manager.activeAccount?.accessToken == "new-access")
-        #expect(manager.activeAccount?.refreshToken == "new-refresh")
-        #expect(manager.activeAccount?.idToken == "new-id")
+        #expect(result == .rejectedConfiguredAccount(active.id))
+        #expect(manager.configuredAccount?.accessToken == "old-access")
+        #expect(manager.configuredAccount?.refreshToken == "old-refresh")
+        #expect(manager.configuredAccount?.idToken == "old-id")
     }
 
-    @Test("Auth sync activates the matching account when auth.json points elsewhere")
-    func syncActivatesMatchingAccount() async {
-        let plus = makeAccount(
-            fiveHourRemaining: 90,
-            weeklyRemaining: 50,
-            planType: "plus",
-            isActive: true
-        )
-        let pro = makeAccount(
-            fiveHourRemaining: 40,
-            weeklyRemaining: 90,
-            planType: "pro"
-        )
-        let manager = AccountManager(authAccountIdProvider: {
-            pro.accountId
-        })
-        manager.accounts = [plus, pro]
-
-        let changedId = await manager.syncWithAuthJson()
-
-        #expect(changedId == pro.id)
-        #expect(manager.activeAccount?.id == pro.id)
-    }
-
-    @Test("Adding a re-authenticated account preserves the canonical local id")
-    func addAccountPreservesCanonicalLocalId() {
+    @Test("Insertion-only add cannot bypass configured credential activation")
+    func addAccountCannotMutateConfiguredCredentials() {
         let manager = AccountManager()
         var existing = makeAccount(
             fiveHourRemaining: 90,
@@ -157,21 +215,20 @@ struct AccountManagerTests {
         replacement.idToken = "new-id"
         replacement.lastRefreshed = Date()
 
-        manager.addAccount(replacement)
+        let inserted = manager.addAccount(replacement)
 
+        #expect(!inserted)
         #expect(manager.accounts.count == 1)
         #expect(manager.accounts[0].id == existing.id)
-        #expect(manager.activeAccount?.id == existing.id)
-        #expect(manager.activeAccount?.accessToken == "new-access")
-        #expect(manager.activeAccount?.refreshToken == "new-refresh")
-        #expect(manager.accounts[0].runtimeUnusableUntil == nil)
-        #expect(manager.accounts[0].runtimeUnusableReason == nil)
-        #expect(!manager.accounts[0].requiresReauthentication)
-        #expect(manager.pollingErrors[existing.id] == nil)
+        #expect(manager.configuredAccount?.id == existing.id)
+        #expect(manager.configuredAccount?.accessToken == "old-access")
+        #expect(manager.configuredAccount?.refreshToken == "old-refresh")
+        #expect(manager.accounts[0].requiresReauthentication)
+        #expect(manager.pollingErrors[existing.id] == "Re-authentication required")
     }
 
-    @Test("Re-authenticated account refresh preserves the canonical local id")
-    func refreshStoredTokensPreservesCanonicalLocalId() {
+    @Test("Inactive credential upsert preserves stable provider and local identity")
+    func inactiveCredentialUpsertPreservesStableIdentity() {
         let manager = AccountManager()
         var existing = makeAccount(
             fiveHourRemaining: 30,
@@ -193,21 +250,102 @@ struct AccountManagerTests {
             accessToken: "fresh-access",
             refreshToken: "fresh-refresh",
             idToken: "fresh-id",
-            accountId: "fresh-account",
+            accountId: "stale-account",
             lastRefreshed: Date()
         )
 
-        let refreshedId = manager.refreshStoredTokens(from: replacement)
+        let result = manager.upsertInactiveAccount(replacement)
 
-        #expect(refreshedId == existing.id)
+        #expect(result == .updated(existing.id))
         #expect(manager.accounts.count == 1)
         #expect(manager.accounts[0].id == existing.id)
         #expect(manager.accounts[0].email == "stale@example.com")
-        #expect(manager.accounts[0].accountId == "fresh-account")
+        #expect(manager.accounts[0].accountId == "stale-account")
         #expect(manager.accounts[0].runtimeUnusableUntil == nil)
         #expect(manager.accounts[0].runtimeUnusableReason == nil)
         #expect(!manager.accounts[0].requiresReauthentication)
         #expect(manager.pollingErrors[existing.id] == nil)
+    }
+
+    @Test("Same email with a different provider identity cannot overwrite configured credentials")
+    func reauthenticationIdentityMismatchStaysInactive() {
+        let manager = AccountManager()
+        var configured = makeAccount(
+            fiveHourRemaining: 80,
+            weeklyRemaining: 80,
+            planType: "pro",
+            isActive: true
+        )
+        configured.email = "same@example.com"
+        configured.accountId = "provider-a"
+        configured.accessToken = "old-access"
+        configured.refreshToken = "old-refresh"
+        manager.accounts = [configured]
+        manager.publishActivationState(.committedDegraded(
+            targetAccountId: configured.id,
+            detail: .activeCredentialMutation,
+            activationGeneration: UUID(),
+            retryAttempt: 0,
+            nextRetryAt: Date(),
+            at: Date()
+        ))
+        let replacement = CodexAccount(
+            email: configured.email,
+            accessToken: "new-access",
+            refreshToken: "new-refresh",
+            idToken: "new-id",
+            accountId: "provider-b"
+        )
+
+        let result = manager.upsertInactiveAccount(replacement)
+
+        #expect(result == .inserted(replacement.id))
+        #expect(manager.configuredAccount?.id == configured.id)
+        #expect(manager.configuredAccount?.accountId == "provider-a")
+        #expect(manager.configuredAccount?.accessToken == "old-access")
+        #expect(manager.accounts.first(where: { $0.id == replacement.id })?.isActive == false)
+    }
+
+    @Test("Generic insertion always clears configured intent")
+    func genericInsertionIsAlwaysInactive() {
+        let manager = AccountManager()
+        let requestedActive = makeAccount(
+            fiveHourRemaining: 50,
+            weeklyRemaining: 50,
+            planType: "plus",
+            isActive: true
+        )
+
+        #expect(manager.addAccount(requestedActive))
+        #expect(manager.accounts.first?.isActive == false)
+        #expect(manager.configuredAccount == nil)
+    }
+
+    @Test("Journal target is protected even when its model flag is inactive")
+    func genericUpsertRejectsJournalTargetWithoutLease() {
+        let manager = AccountManager()
+        var protected = makeAccount(
+            fiveHourRemaining: 50,
+            weeklyRemaining: 50,
+            planType: "plus"
+        )
+        protected.isActive = false
+        manager.accounts = [protected]
+        manager.publishActivationState(.preparing(
+            targetAccountId: protected.id,
+            at: Date()
+        ))
+        let imported = CodexAccount(
+            email: protected.email,
+            accessToken: "new-access",
+            refreshToken: "new-refresh",
+            idToken: "new-id",
+            accountId: protected.accountId
+        )
+
+        #expect(manager.upsertInactiveAccount(imported)
+            == .rejectedConfiguredAccount(protected.id))
+        #expect(manager.accounts.first?.accessToken == protected.accessToken)
     }
 
     @Test("Marking re-authentication required persists on the account record")
@@ -267,5 +405,44 @@ struct AccountManagerTests {
         #expect(manager.accounts[0].requiresReauthentication)
         #expect(manager.accounts[0].runtimeUnusableReason == "token_expired")
         #expect(manager.pollingErrors[account.id] == "Re-authentication required")
+    }
+
+    @Test("Quota refresh clears usage-limit runtime block")
+    func quotaRefreshClearsUsageLimitRuntimeBlock() {
+        let manager = AccountManager()
+        let account = makeAccount(
+            fiveHourRemaining: 0,
+            weeklyRemaining: 69,
+            planType: "pro"
+        )
+        manager.accounts = [account]
+        manager.markRuntimeUnusable(
+            for: account.id,
+            reason: "usage_limit",
+            until: Date().addingTimeInterval(6 * 60 * 60)
+        )
+
+        manager.updateQuota(
+            for: account.id,
+            snapshot: QuotaSnapshot(
+                fiveHour: QuotaWindow(
+                    usedPercent: 10,
+                    windowDurationMins: 300,
+                    resetsAt: Date().addingTimeInterval(3600)
+                ),
+                weekly: QuotaWindow(
+                    usedPercent: 31,
+                    windowDurationMins: 10080,
+                    resetsAt: Date().addingTimeInterval(14_400)
+                ),
+                fetchedAt: Date()
+            ),
+            planType: "pro"
+        )
+
+        #expect(!manager.accounts[0].isRuntimeUnusable)
+        #expect(manager.accounts[0].runtimeUnusableReason == nil)
+        #expect(manager.accounts[0].realQuotaSnapshot?.weekly?.remainingPercent == 69)
+        #expect(manager.pollingErrors[account.id] == nil)
     }
 }

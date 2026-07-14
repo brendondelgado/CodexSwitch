@@ -1,10 +1,66 @@
 import SwiftUI
 
+struct QuotaWindowDisplay: Equatable {
+    let kind: QuotaWindowKind
+    let label: String
+    let percent: Double
+    let resetsAt: Date
+
+    init(window: QuotaWindow) {
+        kind = window.kind
+        label = Self.label(for: window)
+        percent = window.effectiveRemainingPercent
+        resetsAt = window.resetsAt
+    }
+
+    static func label(for window: QuotaWindow) -> String {
+        switch window.kind {
+        case .fiveHour:
+            return "5h"
+        case .weekly:
+            return "Wk"
+        case .unknown:
+            return neutralDurationLabel(seconds: window.durationSeconds)
+        }
+    }
+
+    private static func neutralDurationLabel(seconds: Int) -> String {
+        guard seconds > 0 else { return "Window" }
+        if seconds.isMultiple(of: 86_400) {
+            return "\(seconds / 86_400)d"
+        }
+        if seconds >= 60 {
+            return "\((seconds + 59) / 60)m"
+        }
+        return "\(seconds)s"
+    }
+}
+
+enum QuotaSnapshotPresentation: Equatable {
+    case windows([QuotaWindowDisplay])
+    case denied(message: String, windows: [QuotaWindowDisplay])
+    case unknown(String)
+
+    init(snapshot: QuotaSnapshot) {
+        let rows = snapshot.orderedWindows.map(QuotaWindowDisplay.init)
+        if snapshot.isDenied {
+            self = .denied(
+                message: snapshot.limitReached == true ? "Quota exhausted" : "Quota unavailable",
+                windows: rows
+            )
+            return
+        }
+
+        self = rows.isEmpty ? .unknown("Quota unknown") : .windows(rows)
+    }
+}
+
 struct DrainBarView: View {
     let label: String
     let percent: Double       // 0-100 remaining
     let resetsAt: Date?
     var boostedContrast: Bool = false
+    static let countdownRefreshInterval: TimeInterval = 30
 
     private static let resetFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -26,10 +82,6 @@ struct DrainBarView: View {
         }
     }
 
-    private var resetText: String {
-        Self.resetText(percent: percent, resetsAt: resetsAt)
-    }
-
     static func resetText(percent: Double, resetsAt: Date?, now: Date = Date()) -> String {
         guard let resetsAt else { return "" }
         let remaining = resetsAt.timeIntervalSince(now)
@@ -44,11 +96,22 @@ struct DrainBarView: View {
     }
 
     var body: some View {
+        TimelineView(.periodic(from: .now, by: Self.countdownRefreshInterval)) { context in
+            content(now: context.date)
+        }
+    }
+
+    @ViewBuilder
+    private func content(now: Date) -> some View {
+        let liveResetText = Self.resetText(percent: percent, resetsAt: resetsAt, now: now)
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
                 Text(label)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(boostedContrast ? .primary : .secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .frame(width: 34, alignment: .leading)
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         RoundedRectangle(cornerRadius: 3)
@@ -64,8 +127,8 @@ struct DrainBarView: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .frame(width: 32, alignment: .trailing)
             }
-            if !resetText.isEmpty {
-                Text(resetText)
+            if !liveResetText.isEmpty {
+                Text(liveResetText)
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(boostedContrast ? .primary : .secondary)
             }

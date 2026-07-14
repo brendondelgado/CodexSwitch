@@ -3,6 +3,84 @@ import Testing
 
 @Suite("CLI status checker")
 struct CLIStatusCheckerTests {
+    private func runtimeEvidence(
+        pid: Int32 = 42,
+        observationRuntimeKind: HotSwapRuntimeKind = .localInteractiveCLI,
+        acknowledgementRuntimeKind: HotSwapRuntimeKind = .localInteractiveCLI,
+        accountID: String = "account-1"
+    ) -> CodexLocalRuntimeEvidence {
+        let identity = CodexSignalProcessIdentity(
+            pid: pid,
+            ownerUID: 501,
+            executablePath: "/Users/me/.local/share/codexswitch/prepared-codex/codex",
+            startSeconds: 1_000,
+            startMicroseconds: 1
+        )
+        let process = CodexIdentityBoundProcess(
+            identity: identity,
+            kernelExecutableIdentity: CodexKernelExecutableIdentity(
+                canonicalPath: identity.executablePath,
+                device: 7,
+                inode: 9_042
+            ),
+            arguments: ["codex", "resume", "thread-42"]
+        )
+        let auth = CodexAuthFileIdentity(
+            canonicalPath: "/Users/me/.codex/auth.json",
+            device: 8,
+            inode: 12_001,
+            accountID: accountID,
+            completeTokenFingerprint: String(repeating: "a", count: 64)
+        )
+        let observation = CodexRuntimeObservation(
+            target: CodexRuntimeTarget(
+                process: process,
+                runtimeKind: observationRuntimeKind
+            ),
+            authFileIdentity: auth
+        )
+        let binding = CodexReloadBinding(
+            processIdentity: identity,
+            kernelExecutableIdentity: process.kernelExecutableIdentity,
+            runtimeKind: acknowledgementRuntimeKind,
+            authFileIdentity: auth,
+            requestNonce: "nonce-42",
+            issuedAtUnixMilliseconds: 1_500_000
+        )
+        let isCLI = acknowledgementRuntimeKind == .localInteractiveCLI
+        return CodexLocalRuntimeEvidence(
+            observation: observation,
+            startupAcknowledgement: CodexReloadAcknowledgement(
+                binding: binding,
+                acknowledgedAtUnixMilliseconds: 1_500_100,
+                loadedTokenFingerprint: auth.completeTokenFingerprint,
+                activeTokenFingerprint: auth.completeTokenFingerprint,
+                frontendNotified: !isCLI,
+                frontendWriteCount: isCLI ? 0 : 1,
+                authGeneration: isCLI ? 1 : nil,
+                reconnectReady: isCLI ? true : nil
+            )
+        )
+    }
+
+    @Test("Account-swap invalidation prevents an older refresh from publishing")
+    func accountSwapInvalidationRejectsStaleRefreshGeneration() throws {
+        var gate = CLIStatusRefreshGeneration()
+        let accountARefreshCandidate = gate.begin()
+        let accountARefresh = try #require(accountARefreshCandidate)
+
+        gate.invalidate()
+        let accountBRefreshCandidate = gate.begin()
+        let accountBRefresh = try #require(accountBRefreshCandidate)
+
+        let staleRefreshCompleted = gate.complete(accountARefresh)
+        #expect(!staleRefreshCompleted)
+        #expect(gate.inFlightGeneration == accountBRefresh)
+        let currentRefreshCompleted = gate.complete(accountBRefresh)
+        #expect(currentRefreshCompleted)
+        #expect(gate.inFlightGeneration == nil)
+    }
+
     @Test("CLI status copy distinguishes local Mac sessions from VPS remote sessions")
     func cliStatusCopyDistinguishesLocalMacSessionsFromVPSRemoteSessions() {
         #expect(CLIStatus.cliNotRunning.label == "Mac CLI — No local session detected")
@@ -18,74 +96,114 @@ struct CLIStatusCheckerTests {
         65703 /Applications/CodexSwitch.app/Contents/MacOS/CodexSwitch
         """
 
-        #expect(CLIStatusChecker.codexCLIProcessPIDs(fromPGrepOutput: output).isEmpty)
+        for commandLine in output.components(separatedBy: "\n") where !commandLine.isEmpty {
+            #expect(!CLIStatusChecker.isCodexCLICommandLine(commandLine))
+        }
     }
 
-    @Test("CLI process detection keeps terminal launchers and native sessions")
-    func cliProcessDetectionKeepsTerminalSessions() {
+    @Test("CLI process detection ignores desktop code-mode helpers")
+    func cliProcessDetectionIgnoresDesktopCodeModeHelpers() {
         let output = """
-        50807 /Users/brendondelgado/.local/bin/headroom wrap codex
-        51098 node /opt/homebrew/bin/codex
-        51099 /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex
-        51100 /Users/brendondelgado/.local/share/codexswitch/remote-client/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex resume --yolo
-        51101 /Users/brendondelgado/.local/share/codexswitch/patched-codex/codex resume --yolo
-        71863 /Users/brendondelgado/.local/share/codexswitch/prepared-codex/0.128.0/codex resume --yolo
-        8746 /Users/brendondelgado/Developer/codex/codex-rs/target/fork-release/codex resume 019dcf51 --yolo
-        64525 /Users/brendondelgado/Developer/codex/codex-rs/target/fork-release/codex --remote ws://127.0.0.1:18390 resume 019ddf25
-        26584 /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex exec --ephemeral review
-        26585 /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex exec --model gpt-5.5 --config model_reasoning_effort=xhigh
-        23863 /Users/brendondelgado/.git-ai/bin/git-ai checkpoint codex --hook-input stdin
+        19401 /Users/brendondelgado/.local/share/codexswitch/prepared-codex/0.144.1/codex-code-mode-host
         """
 
-        #expect(CLIStatusChecker.codexCLIProcessPIDs(fromPGrepOutput: output) == [51098, 51099, 51100, 51101, 71863, 8746])
+        #expect(!CLIStatusChecker.isCodexCLICommandLine(output))
     }
 
-    @Test("CLI readiness requires marker support plus live ack")
-    func cliReadinessRequiresMarkerSupportPlusLiveAck() {
-        #expect(
-            CLIStatusChecker.codexCLIProcessPIDsAreHotSwapReady(
-                [42],
-                hotSwapSupport: { $0 == 42 },
-                hotSwapAck: { _ in false }
-            ) == false
+    @Test("CLI process detection ignores launcher parents and keeps native sessions")
+    func cliProcessDetectionKeepsNativeSessions() {
+        let accepted = [
+            "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex",
+            "/Users/me/.local/share/codexswitch/remote-client/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex resume --yolo",
+            "/Users/me/.local/share/codexswitch/patched-codex/codex resume --yolo",
+            "/Users/me/.local/share/codexswitch/prepared-codex/0.128.0/codex resume --yolo",
+            "/Users/me/Developer/codex/codex-rs/target/fork-release/codex resume thread --yolo",
+        ]
+        let rejected = [
+            "/Users/me/.local/bin/headroom wrap codex",
+            "node /opt/homebrew/bin/codex",
+            "/Users/me/Developer/codex/codex-rs/target/fork-release/codex --remote ws://127.0.0.1:18390 resume thread",
+            "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex exec --ephemeral review",
+            "/Users/me/.git-ai/bin/git-ai checkpoint codex --hook-input stdin",
+        ]
+
+        #expect(accepted.allSatisfy(CLIStatusChecker.isCodexCLICommandLine))
+        #expect(!rejected.contains(where: CLIStatusChecker.isCodexCLICommandLine))
+    }
+
+    @Test("CLI readiness requires a complete typed runtime evidence snapshot")
+    func cliReadinessRequiresCompleteTypedEvidence() {
+        let evidence = runtimeEvidence()
+        let incomplete = CodexLocalRuntimeEvidenceSnapshot(
+            runtimes: [evidence],
+            isComplete: false
         )
-        #expect(
-            CLIStatusChecker.codexCLIProcessPIDsAreHotSwapReady(
-                [42],
-                hotSwapSupport: { $0 == 42 },
-                hotSwapAck: { $0 == 42 }
-            )
+        #expect(!CLIStatusChecker.codexCLIRuntimeEvidenceIsHotSwapReady(incomplete).ready)
+        #expect(incomplete.runtimes.isEmpty)
+
+        let ready = CLIStatusChecker.codexCLIRuntimeEvidenceIsHotSwapReady(
+            CodexLocalRuntimeEvidenceSnapshot(runtimes: [evidence], isComplete: true)
         )
+        #expect(ready.ready)
     }
 
     @Test("CLI readiness reports the blocking process")
     func cliReadinessReportsBlockingProcess() {
-        let readiness = CLIStatusChecker.codexCLIProcessesAreHotSwapReady(
-            [
-                CodexCLIProcessInfo(
-                    pid: 42,
-                    commandLine: "/Users/me/.local/share/codexswitch/remote-client/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex resume --yolo"
-                )
-            ],
-            hotSwapSupport: { _ in false },
-            hotSwapAck: { _ in false },
-            detailProvider: { pid, _, missingPatch in
-                "pid=\(pid) missingPatch=\(missingPatch)"
+        let readiness = CLIStatusChecker.codexCLIRuntimeEvidenceIsHotSwapReady(
+            CodexLocalRuntimeEvidenceSnapshot(
+                runtimes: [runtimeEvidence(acknowledgementRuntimeKind: .externalAppServer)],
+                isComplete: true
+            ),
+            detailProvider: { pid, _ in
+                "pid=\(pid) incompleteEvidence=true"
             }
         )
 
         #expect(readiness.ready == false)
-        #expect(readiness.detail == "pid=42 missingPatch=true")
+        #expect(readiness.detail == "pid=42 incompleteEvidence=true")
     }
 
-    @Test("CLI status polling never bootstraps with SIGHUP")
-    func cliStatusPollingNeverBootstrapsWithSighup() throws {
-        let source = try String(
-            contentsOfFile: "Sources/CodexSwitch/Services/CLIStatusChecker.swift",
-            encoding: .utf8
+    @Test("CLI status evaluates injected observational evidence without bootstrapping")
+    func cliStatusUsesOnlyInjectedRuntimeEvidence() {
+        let readySnapshot = CodexLocalRuntimeEvidenceSnapshot(
+            runtimes: [runtimeEvidence(accountID: "account-1")],
+            isComplete: true
         )
+        var evidenceReads = 0
 
-        #expect(!source.contains("ensureCodexProcessHotSwapAck"))
+        let noAccount = CLIStatusChecker.cliCheckResult(activeAccountId: nil) {
+            evidenceReads += 1
+            return readySnapshot
+        }
+        #expect(noAccount == CLICheckResult(status: .noActiveAccount, detail: nil))
+        #expect(evidenceReads == 0)
+
+        let ready = CLIStatusChecker.cliCheckResult(activeAccountId: "account-1") {
+            evidenceReads += 1
+            return readySnapshot
+        }
+        #expect(ready == CLICheckResult(status: .ready, detail: nil))
+        #expect(evidenceReads == 1)
+
+        let mismatch = CLIStatusChecker.cliCheckResult(activeAccountId: "account-2") {
+            evidenceReads += 1
+            return readySnapshot
+        }
+        #expect(mismatch == CLICheckResult(status: .authMismatch, detail: nil))
+        #expect(evidenceReads == 2)
+
+        let inconsistent = CodexLocalRuntimeEvidenceSnapshot(
+            runtimes: [
+                runtimeEvidence(pid: 42, accountID: "account-1"),
+                runtimeEvidence(pid: 43, accountID: "account-2"),
+            ],
+            isComplete: true
+        )
+        let inconsistentResult = CLIStatusChecker.cliCheckResult(activeAccountId: "account-1") {
+            inconsistent
+        }
+
+        #expect(inconsistentResult.status == .hotSwapMissing)
     }
 
     @Test("Desktop status reports connected patched app as ready")

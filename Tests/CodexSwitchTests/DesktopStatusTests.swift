@@ -51,10 +51,10 @@ struct DesktopStatusTests {
             port: nil,
             hotSwapReady: false,
             patchInstalled: false,
-            patchMessage: "Desktop app patch blocked: Apple signing identity/private key is missing. Revoke and recreate Apple Development in Xcode."
+            patchMessage: "Desktop app patch blocked: Apple signing identity/private key is missing. Open Xcode account signing or restore the cached Apple-issued iPhone Developer keypair."
         )
         #expect(
-            stopped.label == "Codex desktop app not running: Desktop app patch blocked: Apple signing identity/private key is missing. Revoke and recreate Apple Development in Xcode."
+            stopped.label == "Codex desktop app not running: Desktop app patch blocked: Apple signing identity/private key is missing. Open Xcode account signing or restore the cached Apple-issued iPhone Developer keypair."
         )
     }
 
@@ -115,7 +115,7 @@ struct DesktopStatusTests {
     func authShellPatchWithPreservedComputerUseSignaturesIsDesktopReady() {
         let markers = DesktopPatchManager.InstalledMarkers(
             auth: true,
-            fast: false,
+            fast: true,
             bundledPluginListRoot: false,
             bundledCLI: false,
             versionCompatible: true,
@@ -141,7 +141,7 @@ struct DesktopStatusTests {
     func locallySignedShellWithPreservedComputerUseSignaturesIsDesktopReady() {
         let markers = DesktopPatchManager.InstalledMarkers(
             auth: true,
-            fast: false,
+            fast: true,
             bundledPluginListRoot: false,
             bundledCLI: false,
             versionCompatible: true,
@@ -157,6 +157,46 @@ struct DesktopStatusTests {
                 codexAppSignatureCompatible: false,
                 markers: markers
             ) == "Desktop app patch is installed, but live hot-swap is not confirmed."
+        )
+    }
+
+    @Test("Missing Fast compatibility keeps desktop patch pending")
+    func missingFastCompatibilityRequestsPatchWindow() {
+        let markers = DesktopPatchManager.InstalledMarkers(
+            auth: true,
+            fast: false,
+            bundledPluginListRoot: false,
+            bundledCLI: false,
+            versionCompatible: true,
+            computerUsePluginSignatureCompatible: true
+        )
+        let status = DesktopPatchStatus(
+            isCodexAppRunning: false,
+            codexAppSignatureCompatible: true,
+            codesignIdentityAvailable: true,
+            authPatchInstalled: true,
+            remoteRecentsPatchInstalled: true,
+            fastPatchInstalled: false,
+            bundledCLIHotSwapInstalled: false,
+            bundledCLIVersionCompatible: true,
+            computerUsePluginSignatureCompatible: true,
+            lastMessage: ""
+        )
+
+        #expect(!markers.required)
+        #expect(!markers.computerUsePreservedModeInstalled)
+        #expect(!markers.desktopIntegrationInstalled)
+        #expect(!status.computerUsePreservedModeInstalled)
+        #expect(!status.desktopIntegrationInstalled)
+        #expect(
+            DesktopPatchManager.statusMessage(
+                running: false,
+                runtimeState: .unknown,
+                automaticPatchingEnabled: true,
+                permissionDeniedBackoffActive: false,
+                codexAppSignatureCompatible: true,
+                markers: markers
+            ) == "Desktop app patch missing; will patch in background."
         )
     }
 
@@ -178,6 +218,31 @@ struct DesktopStatusTests {
                 automaticPatchingEnabled: false,
                 permissionDeniedBackoffActive: false,
                 codexAppSignatureCompatible: true,
+                markers: markers
+            ) == "Desktop app patch pending: Codex.app/app-server is still running; use ⌘Q to quit."
+        )
+    }
+
+    @Test("Auth patch without remote recents refresh still requests patch window")
+    func authPatchWithoutRemoteRecentsRefreshRequestsPatchWindow() {
+        let markers = DesktopPatchManager.InstalledMarkers(
+            auth: true,
+            remoteRecents: false,
+            fast: false,
+            bundledPluginListRoot: false,
+            bundledCLI: false,
+            versionCompatible: true,
+            computerUsePluginSignatureCompatible: true
+        )
+
+        #expect(!markers.desktopIntegrationInstalled)
+        #expect(
+            DesktopPatchManager.statusMessage(
+                running: true,
+                runtimeState: .unknown,
+                automaticPatchingEnabled: true,
+                permissionDeniedBackoffActive: false,
+                codexAppSignatureCompatible: false,
                 markers: markers
             ) == "Desktop app patch pending: Codex.app/app-server is still running; use ⌘Q to quit."
         )
@@ -249,7 +314,7 @@ struct DesktopStatusTests {
                 codexAppSignatureCompatible: true,
                 codesignIdentityAvailable: false,
                 markers: markers
-            ) == "Desktop app patch blocked: Apple signing identity/private key is missing. Revoke and recreate Apple Development in Xcode."
+            ) == "Desktop app patch blocked: Apple signing identity/private key is missing. Open Xcode account signing or restore the cached Apple-issued iPhone Developer keypair."
         )
     }
 
@@ -289,14 +354,12 @@ struct DesktopStatusTests {
                 #"1) 05F3F54B7BC635F239D9420690E1ED22C693FFD0 "Apple Development: Brendon Delgado (856E75LLMU)""#
             ) == true
         )
+        #expect(
+            DesktopPatchManager.allowedCodesignIdentityLine(
+                #"2) 9351EC70C5A219354618190A5C1541026B2F98B8 "iPhone Developer: bd7349@gmail.com (856E75LLMU)""#
+            ) == true
+        )
     }
-
-
-    @Test("Global vendor CLI repair is disabled")
-    func globalVendorCLIRepairIsDisabled() {
-        #expect(DesktopPatchManager.stockVendorCLIRepairAllowed() == false)
-    }
-
     @Test("Installed app fingerprint changes when Codex app payload changes")
     func installationFingerprintTracksInstalledPayloadChanges() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -351,6 +414,8 @@ struct DesktopStatusTests {
         #expect(DesktopPatchAttemptOutcome.permissionDeniedBackoff.shouldStopPostQuitRetry == false)
         #expect(DesktopPatchAttemptOutcome.permissionDenied.shouldStopPostQuitRetry == false)
         #expect(DesktopPatchAttemptOutcome.cooldownActive.shouldStopPostQuitRetry == false)
+        #expect(DesktopPatchAttemptOutcome.alreadyInProgress.shouldStopPostQuitRetry == false)
+        #expect(DesktopPatchAttemptOutcome.leaseUnavailable.shouldStopPostQuitRetry == false)
         #expect(DesktopPatchAttemptOutcome.timedOut.shouldStopPostQuitRetry == false)
         #expect(DesktopPatchAttemptOutcome.failed(1).shouldStopPostQuitRetry == false)
     }
@@ -362,6 +427,149 @@ struct DesktopStatusTests {
         #expect(DesktopPatchAttemptOutcome.missingSigningIdentity.shouldStopPostQuitRetry)
         #expect(DesktopPatchAttemptOutcome.scriptMissing.shouldStopPostQuitRetry)
         #expect(DesktopPatchAttemptOutcome.completed.shouldStopPostQuitRetry)
+    }
+
+    @Test("Desktop patch lease serializes local and cross-process attempts")
+    func desktopPatchLeaseSerializesAttempts() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let lockFile = directory.appendingPathComponent("desktop-patch.lock")
+        let readyFile = directory.appendingPathComponent("holder.ready")
+        let releaseFile = directory.appendingPathComponent("holder.release")
+        let holder = Process()
+        holder.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        holder.arguments = [
+            "-c",
+            """
+            import fcntl
+            import os
+            import pathlib
+            import sys
+            import time
+
+            lock_path, ready_path, release_path = sys.argv[1:]
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            pathlib.Path(ready_path).touch(mode=0o600)
+            while not os.path.exists(release_path):
+                time.sleep(0.01)
+            os.close(descriptor)
+            """,
+            lockFile.path,
+            readyFile.path,
+            releaseFile.path,
+        ]
+        holder.standardOutput = FileHandle.nullDevice
+        holder.standardError = FileHandle.nullDevice
+        try holder.run()
+        defer {
+            FileManager.default.createFile(atPath: releaseFile.path, contents: Data())
+            if holder.isRunning {
+                holder.terminate()
+            }
+            holder.waitUntilExit()
+        }
+        try #require(waitForFile(at: readyFile, process: holder, timeout: 5))
+
+        var crossProcessOperationRan = false
+        var crossProcessLog: [String] = []
+        let crossProcessOutcome = DesktopPatchManager.withDesktopPatchMutationLease(
+            lockPath: lockFile.path,
+            appendLog: { crossProcessLog.append($0) }
+        ) {
+            crossProcessOperationRan = true
+            return .completed
+        }
+        #expect(crossProcessOutcome == .alreadyInProgress)
+        #expect(crossProcessOutcome.logValue == "already_in_progress")
+        #expect(!crossProcessOperationRan)
+        #expect(
+            crossProcessLog == [
+                "desktop patch lease contention: another patch attempt is already in progress outcome=already_in_progress",
+            ]
+        )
+
+        FileManager.default.createFile(atPath: releaseFile.path, contents: Data())
+        holder.waitUntilExit()
+        #expect(holder.terminationStatus == 0)
+
+        let invalidParent = directory.appendingPathComponent("not-a-directory")
+        try Data().write(to: invalidParent)
+        let invalidLock = invalidParent.appendingPathComponent("desktop-patch.lock")
+        var unavailableOperationRan = false
+        var unavailableLog: [String] = []
+        let unavailableOutcome = DesktopPatchManager.withDesktopPatchMutationLease(
+            lockPath: invalidLock.path,
+            appendLog: { unavailableLog.append($0) }
+        ) {
+            unavailableOperationRan = true
+            return .completed
+        }
+        #expect(unavailableOutcome == .leaseUnavailable)
+        #expect(unavailableOutcome.logValue == "lease_unavailable")
+        #expect(!unavailableOperationRan)
+        #expect(
+            unavailableLog == [
+                "desktop patch lease unavailable at \(invalidLock.path): outcome=lease_unavailable",
+            ]
+        )
+
+        var nestedOutcome: DesktopPatchAttemptOutcome?
+        var nestedLog: [String] = []
+        let outerOutcome = DesktopPatchManager.withDesktopPatchMutationLease(
+            lockPath: lockFile.path,
+            appendLog: { _ in }
+        ) {
+            nestedOutcome = DesktopPatchManager.withDesktopPatchMutationLease(
+                lockPath: lockFile.path,
+                appendLog: { nestedLog.append($0) }
+            ) {
+                .completed
+            }
+            return .timedOut
+        }
+        #expect(outerOutcome == .timedOut)
+        #expect(nestedOutcome == .alreadyInProgress)
+        #expect(
+            nestedLog == [
+                "desktop patch lease contention: another patch attempt is already in progress outcome=already_in_progress",
+            ]
+        )
+
+        do {
+            _ = try DesktopPatchManager.withDesktopPatchMutationLease(
+                lockPath: lockFile.path,
+                appendLog: { _ in }
+            ) {
+                throw LeaseProbeError.expected
+            }
+            Issue.record("Expected the lease probe to throw")
+        } catch LeaseProbeError.expected {
+            // Expected: the next acquisition proves defer released the lease.
+        }
+
+        let finalOutcome = DesktopPatchManager.withDesktopPatchMutationLease(
+            lockPath: lockFile.path,
+            appendLog: { _ in }
+        ) {
+            .completed
+        }
+        #expect(finalOutcome == .completed)
+
+        let directoryAttributes = try FileManager.default.attributesOfItem(atPath: directory.path)
+        let fileAttributes = try FileManager.default.attributesOfItem(atPath: lockFile.path)
+        let directoryPermissions = try #require(directoryAttributes[.posixPermissions] as? NSNumber)
+        let filePermissions = try #require(fileAttributes[.posixPermissions] as? NSNumber)
+        #expect(directoryPermissions.intValue & 0o777 == 0o700)
+        #expect(filePermissions.intValue & 0o777 == 0o600)
     }
 
     @Test("Marker scan does not require loading whole file")
@@ -403,5 +611,23 @@ struct DesktopStatusTests {
             options: 0
         )
         try data.write(to: url)
+    }
+
+    private enum LeaseProbeError: Error {
+        case expected
+    }
+
+    private func waitForFile(at url: URL, process: Process, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if FileManager.default.fileExists(atPath: url.path) {
+                return true
+            }
+            if !process.isRunning {
+                return false
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return FileManager.default.fileExists(atPath: url.path)
     }
 }

@@ -21,9 +21,18 @@ version_control:
   branch: feat/codex-native
   base_commit: 58da612
   created: 2026-04-30
+  status: superseded
+  superseded_by:
+    - ../../architecture/credential-bundle-format.md
+    - ../../architecture/runtime-and-host-ownership.md
 ---
 
 # Desktop And Linux Token Transfer Implementation Plan
+
+> Historical plan. It is not an implementation contract. Use
+> `docs/architecture/credential-bundle-format.md` and
+> `docs/architecture/runtime-and-host-ownership.md` for the current bundle and
+> host-ownership rules.
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 

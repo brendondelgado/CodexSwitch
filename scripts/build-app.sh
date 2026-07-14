@@ -6,13 +6,58 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="$PROJECT_DIR/.build/release"
+BUILD_CONFIGURATION="${CODEXSWITCH_BUILD_CONFIGURATION:-release}"
+case "$BUILD_CONFIGURATION" in
+    debug|release) ;;
+    *)
+        echo "error: CODEXSWITCH_BUILD_CONFIGURATION must be debug or release" >&2
+        exit 2
+        ;;
+esac
 APP_NAME="CodexSwitch"
+BUILD_DIR="$PROJECT_DIR/.build/$BUILD_CONFIGURATION"
+BUILD_BINARY="$BUILD_DIR/$APP_NAME"
 APP_BUNDLE="$PROJECT_DIR/build/${APP_NAME}.app"
-IDENTIFIER="com.codexswitch"
 APP_VERSION="${CODEXSWITCH_VERSION:-1.0.0}"
 BUILD_NUMBER="${CODEXSWITCH_BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}"
-SOURCE_REVISION="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+source_tree_fingerprint() {
+    python3 - "$PROJECT_DIR" <<'PYEOF'
+import hashlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+paths = [path for path in (root / "Sources").rglob("*") if path.is_file()]
+paths.extend([root / "Package.swift", root / "scripts" / "patch-asar.py"])
+
+digest = hashlib.sha256()
+for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
+    relative = path.relative_to(root).as_posix().encode()
+    digest.update(relative)
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+print(digest.hexdigest()[:12])
+PYEOF
+}
+
+source_revision() {
+    if [[ -n "${CODEXSWITCH_SOURCE_REVISION:-}" ]]; then
+        printf '%s\n' "$CODEXSWITCH_SOURCE_REVISION"
+        return
+    fi
+
+    local commit
+    commit="$(git -C "$PROJECT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+    if [[ -n "$(git -C "$PROJECT_DIR" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+        printf '%s-dirty.%s\n' "$commit" "$(source_tree_fingerprint)"
+    else
+        printf '%s\n' "$commit"
+    fi
+}
+
+SOURCE_REVISION="$(source_revision)"
 
 select_codesign_identity() {
     if [[ -n "${CODEXSWITCH_CODESIGN_IDENTITY:-}" ]]; then
@@ -24,10 +69,20 @@ select_codesign_identity() {
         return
     fi
 
+    local patcher="$PROJECT_DIR/scripts/patch-asar.py"
+    if [[ -f "$patcher" ]]; then
+        local selected
+        selected="$(python3 "$patcher" --repair-codesign-identity 2>/dev/null | tail -n 1 || true)"
+        if [[ -n "$selected" && "$selected" != "-" ]]; then
+            printf '%s\n' "$selected"
+            return
+        fi
+    fi
+
     local identities
     identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
     local preferred
-    preferred="$(printf '%s\n' "$identities" | sed -nE 's/.*"((Developer ID Application|Apple Development|Mac Developer)[^"]+)".*/\1/p' | head -n 1)"
+    preferred="$(printf '%s\n' "$identities" | sed -nE 's/.*"((Developer ID Application|Apple Distribution|Apple Development|Mac Developer|iPhone Developer)[^"]+)".*/\1/p' | head -n 1)"
     if [[ -n "$preferred" ]]; then
         printf '%s\n' "$preferred"
     else
@@ -37,18 +92,38 @@ select_codesign_identity() {
 
 cd "$PROJECT_DIR"
 
-echo "Building ${APP_NAME} (release)..."
-swift_build_flags=()
+# The macOS 27 Command Line Tools SDK references SwiftUI macros that are only
+# shipped with full Xcode. Prefer the newest installed SDK that remains
+# self-contained when the macro host plugin is absent.
+if [[ -z "${SDKROOT:-}" \
+    && ! -f /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib \
+    && -d /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ]]; then
+    export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+    echo "Using self-contained SDK: $SDKROOT"
+fi
+
+echo "Building ${APP_NAME} (${BUILD_CONFIGURATION})..."
+swift_build_flags=(--jobs "${CODEXSWITCH_SWIFTPM_JOBS:-1}")
 if [[ "${CODEXSWITCH_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
     swift_build_flags+=(--disable-sandbox)
 fi
 if [[ -n "${CODEXSWITCH_SWIFTPM_CACHE_PATH:-}" ]]; then
     swift_build_flags+=(--cache-path "$CODEXSWITCH_SWIFTPM_CACHE_PATH")
 fi
-if (( ${#swift_build_flags[@]} )); then
-    swift build -c release "${swift_build_flags[@]}" --quiet
+if [[ "${CODEXSWITCH_SKIP_SWIFT_BUILD:-0}" == "1" ]]; then
+    legacy_build_binary="$PROJECT_DIR/.build/arm64-apple-macosx/$BUILD_CONFIGURATION/$APP_NAME"
+    if [[ ! -x "$BUILD_BINARY" && -x "$legacy_build_binary" ]]; then
+        BUILD_BINARY="$legacy_build_binary"
+    fi
+    if [[ ! -x "$BUILD_BINARY" ]]; then
+        echo "error: no existing ${BUILD_CONFIGURATION} executable at $BUILD_BINARY" >&2
+        exit 2
+    fi
+    echo "Using existing tested executable at $BUILD_BINARY"
+elif (( ${#swift_build_flags[@]} )); then
+    swift build -c "$BUILD_CONFIGURATION" "${swift_build_flags[@]}" --quiet
 else
-    swift build -c release --quiet
+    swift build -c "$BUILD_CONFIGURATION" --quiet
 fi
 
 echo "Creating app bundle..."
@@ -57,11 +132,10 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 # Copy binary
-cp "$BUILD_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
-cp "$PROJECT_DIR/scripts/patch-asar.py" "$APP_BUNDLE/Contents/Resources/"
+cp "$BUILD_BINARY" "$APP_BUNDLE/Contents/MacOS/"
 
-# Bundle the desktop patcher used by CodexAutoPatchMonitor. Keeping this inside
-# the installed app avoids depending on whichever checkout happens to exist.
+# Bundle the desktop patcher once. Keeping it inside the installed app avoids
+# depending on whichever checkout happens to exist.
 cp "$PROJECT_DIR/scripts/patch-asar.py" "$APP_BUNDLE/Contents/Resources/patch-asar.py"
 chmod 755 "$APP_BUNDLE/Contents/Resources/patch-asar.py"
 
@@ -243,6 +317,15 @@ if result.returncode == 0:
     shutil.rmtree(iconset)
 else:
     print(f"Warning: iconutil failed: {result.stderr}", file=sys.stderr)
+    existing_icon = "/Applications/CodexSwitch.app/Contents/Resources/AppIcon.icns"
+    if os.path.exists(existing_icon):
+        import shutil
+        shutil.copy2(existing_icon, os.path.join(out_dir, "AppIcon.icns"))
+        shutil.rmtree(iconset)
+        print("  Reused existing AppIcon.icns")
+    else:
+        print("Error: unable to create AppIcon.icns and no existing icon fallback was found", file=sys.stderr)
+        sys.exit(1)
 PYEOF
 
 # Sign the app. Prefer a real Apple signing identity when Xcode has installed
@@ -253,7 +336,10 @@ if [[ "$SIGN_IDENTITY" == "-" ]]; then
 else
     echo "Signing app with identity: $SIGN_IDENTITY"
 fi
-codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE" 2>/dev/null || true
+if ! codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"; then
+    echo "Error: failed to sign $APP_BUNDLE" >&2
+    exit 1
+fi
 
 echo ""
 echo "Built: $APP_BUNDLE"
@@ -262,11 +348,147 @@ echo ""
 # Install if requested
 if [[ "${1:-}" == "--install" ]]; then
     INSTALL_PATH="/Applications/${APP_NAME}.app"
+    if [[ -L "$INSTALL_PATH" ]]; then
+        echo "Error: refusing to replace symlinked install path $INSTALL_PATH" >&2
+        exit 1
+    fi
+
+    verify_bundle() {
+        local bundle="$1"
+        if [[ ! -x "$bundle/Contents/MacOS/$APP_NAME" ]]; then
+            echo "Error: staged bundle has no executable: $bundle" >&2
+            return 1
+        fi
+        if /usr/bin/strings "$bundle/Contents/MacOS/$APP_NAME" \
+            | /usr/bin/grep -E 'LINUX_DEVBOX_ACTIVE_PUSH|pendingLinuxDevboxActive|pushLinuxDevboxActiveAccount' >/dev/null; then
+            echo "Error: bundle still contains removed VPS active-push code: $bundle" >&2
+            return 1
+        fi
+        /usr/bin/codesign --verify --strict --verbose=4 "$bundle"
+    }
+
+    INSTALL_WORKDIR="$(/usr/bin/mktemp -d /Applications/.codexswitch-install.XXXXXX)" || {
+        echo "Error: cannot create a staging directory in /Applications; installed app was not changed" >&2
+        exit 1
+    }
+    STAGED_PATH="$INSTALL_WORKDIR/${APP_NAME}.app"
+    FAILED_PATH="$INSTALL_WORKDIR/${APP_NAME}.failed.app"
+    HAD_PREVIOUS=0
+    SWAPPED=0
+    ACTIVATED=0
+    PRESERVE_WORKDIR=0
+
+    atomic_swap_paths() {
+        python3 - "$1" "$2" <<'PYEOF'
+import ctypes
+import os
+import sys
+
+AT_FDCWD = -2
+RENAME_SWAP = 0x00000002
+libc = ctypes.CDLL(None, use_errno=True)
+renameatx_np = libc.renameatx_np
+renameatx_np.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameatx_np.restype = ctypes.c_int
+
+left = os.fsencode(sys.argv[1])
+right = os.fsencode(sys.argv[2])
+if renameatx_np(AT_FDCWD, left, AT_FDCWD, right, RENAME_SWAP) != 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error), f"{sys.argv[1]} <-> {sys.argv[2]}")
+PYEOF
+    }
+
+    cleanup_install() {
+        if [[ "$ACTIVATED" != "1" && "$SWAPPED" == "1" && "$HAD_PREVIOUS" == "1" \
+            && -e "$INSTALL_PATH" && -e "$STAGED_PATH" ]]; then
+            if ! atomic_swap_paths "$INSTALL_PATH" "$STAGED_PATH"; then
+                PRESERVE_WORKDIR=1
+                echo "Critical: rollback failed; preserving recovery bundle at $STAGED_PATH" >&2
+            fi
+        fi
+        if [[ "$PRESERVE_WORKDIR" != "1" ]]; then
+            /bin/rm -rf "$INSTALL_WORKDIR"
+        fi
+    }
+
+    rollback_activation() {
+        if [[ "$HAD_PREVIOUS" == "1" ]]; then
+            if ! atomic_swap_paths "$INSTALL_PATH" "$STAGED_PATH"; then
+                PRESERVE_WORKDIR=1
+                echo "Critical: automatic rollback failed; recovery bundle is $STAGED_PATH" >&2
+                return 1
+            fi
+        else
+            /bin/mv "$INSTALL_PATH" "$FAILED_PATH" || return 1
+        fi
+        SWAPPED=0
+    }
+    trap cleanup_install EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     echo "Installing to $INSTALL_PATH..."
-    rm -rf "$INSTALL_PATH"
-    cp -R "$APP_BUNDLE" "$INSTALL_PATH"
-    echo "Installed. You can now:"
-    echo "  - Find it in /Applications"
-    echo "  - Drag it to your Dock"
-    echo "  - Launch at Login is in Settings (already built in)"
+    /usr/bin/ditto --noextattr --noqtn "$APP_BUNDLE" "$STAGED_PATH"
+    verify_bundle "$STAGED_PATH"
+
+    /bin/launchctl bootout "gui/$(id -u)/com.codexswitch.watchdog" >/dev/null 2>&1 || true
+    /usr/bin/osascript -e 'tell application "CodexSwitch" to quit' >/dev/null 2>&1 || true
+    for _ in {1..20}; do
+        if ! /usr/bin/pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+            break
+        fi
+        /bin/sleep 0.25
+    done
+    if /usr/bin/pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+        echo "Error: $APP_NAME is still running; refusing to replace its installed bundle" >&2
+        exit 1
+    fi
+
+    if [[ -e "$INSTALL_PATH" ]]; then
+        HAD_PREVIOUS=1
+        if ! atomic_swap_paths "$STAGED_PATH" "$INSTALL_PATH"; then
+            echo "Error: failed to atomically activate staged app; installed app was not changed" >&2
+            exit 1
+        fi
+    elif ! /bin/mv "$STAGED_PATH" "$INSTALL_PATH"; then
+        echo "Error: failed to activate staged app" >&2
+        exit 1
+    fi
+    SWAPPED=1
+
+    if ! verify_bundle "$INSTALL_PATH"; then
+        rollback_activation || exit 1
+        echo "Error: installed verification failed; previous app was restored" >&2
+        exit 1
+    fi
+
+    if ! /usr/bin/open "$INSTALL_PATH"; then
+        rollback_activation || exit 1
+        if [[ "$HAD_PREVIOUS" == "1" ]]; then
+            /usr/bin/open "$INSTALL_PATH" >/dev/null 2>&1 || true
+        fi
+        echo "Error: replacement app did not launch; previous app was restored" >&2
+        exit 1
+    fi
+
+    for _ in {1..20}; do
+        if /usr/bin/pgrep -f "$INSTALL_PATH/Contents/MacOS/$APP_NAME" >/dev/null 2>&1; then
+            break
+        fi
+        /bin/sleep 0.25
+    done
+    if ! /usr/bin/pgrep -f "$INSTALL_PATH/Contents/MacOS/$APP_NAME" >/dev/null 2>&1; then
+        rollback_activation || exit 1
+        if [[ "$HAD_PREVIOUS" == "1" ]]; then
+            /usr/bin/open "$INSTALL_PATH" >/dev/null 2>&1 || true
+        fi
+        echo "Error: replacement app exited during launch; previous app was restored" >&2
+        exit 1
+    fi
+
+    ACTIVATED=1
+    trap - EXIT INT TERM
+    /bin/rm -rf "$INSTALL_WORKDIR"
+    echo "Installed and relaunched."
 fi

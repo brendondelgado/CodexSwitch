@@ -1,7 +1,4 @@
 import Foundation
-import os
-
-private let logger = Logger(subsystem: "com.codexswitch", category: "VersionChecker")
 
 @MainActor
 @Observable
@@ -18,26 +15,18 @@ final class CodexVersionChecker {
     var forkRebuilding = false
     private var lastCheckStarted: Date?
 
-    private nonisolated static let versionJsonPath = NSString("~/.codex/version.json").expandingTildeInPath
     private nonisolated static let forkMarkerPath = NSString("~/.codexswitch/sighup-enabled").expandingTildeInPath
-    private nonisolated static let forkSourcePath = NSString("~/Developer/codex/codex-rs").expandingTildeInPath
-    private nonisolated static let forkBinaryPath = NSString("~/Developer/codex/codex-rs/target/fork-release/codex").expandingTildeInPath
-    private nonisolated static let managedPatchedCodexPath = NSString("~/.local/share/codexswitch/patched-codex/codex").expandingTildeInPath
     private nonisolated static let preparedCodexRootPath = NSString("~/.local/share/codexswitch/prepared-codex").expandingTildeInPath
-    private nonisolated static let syncedClientPath = NSString("~/.local/share/codexswitch/remote-client/node_modules/.bin/codex").expandingTildeInPath
     private nonisolated static let localLauncherPath = NSString("~/.local/bin/codex").expandingTildeInPath
-    private nonisolated static let stockBinaryDir = "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex"
-    private nonisolated static let stockBinaryPath = "\(stockBinaryDir)/codex"
+    nonisolated static let updaterCLIPath = NSString("~/.local/bin/codexswitch-cli").expandingTildeInPath
+    private nonisolated static let updaterCheckTimeout: TimeInterval = 60
+    private nonisolated static let updaterStatusTimeout: TimeInterval = 10
+    private nonisolated static let updaterInstallTimeout: TimeInterval = 10 * 60
+    private nonisolated static let preparedInstallCommand = "codexswitch-cli install-prepared-codex"
+    nonisolated static let automaticUpdateCheckInterval: TimeInterval = 15 * 60
+    nonisolated static let automaticUpdateFailureBackoff: TimeInterval = 6 * 60 * 60
+    nonisolated static let automaticRuntimeRepairInterval: TimeInterval = 5 * 60
     private nonisolated static let homebrewCodexPath = "/opt/homebrew/bin/codex"
-    private nonisolated static let homebrewNpmEntryPath = "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js"
-    private nonisolated static let desktopAppNativePath = "/Applications/Codex.app/Contents/Resources/codex"
-    private nonisolated static let cliRepairCooldownPath = NSString("~/.codexswitch/cli-repair-last-attempt").expandingTildeInPath
-    private nonisolated static let cliRepairCooldownSeconds: TimeInterval = 10 * 60
-
-    struct CodexUpdateTarget: Sendable, Equatable {
-        let version: String
-        let npmSpecifier: String
-    }
 
     struct CodexCLIRepairResult: Sendable, Equatable {
         let attempted: Bool
@@ -52,15 +41,72 @@ final class CodexVersionChecker {
         let terminationStatus: Int32
     }
 
-    private struct SemanticVersion: Equatable {
-        let major: Int
-        let minor: Int
-        let patch: Int
-        let prerelease: String?
+    enum CodexUpdateStatus: String, Decodable, Sendable, Equatable {
+        case idle
+        case checking
+        case preparing
+        case installing
+        case readyToInstall = "ready_to_install"
+        case installed
+        case failed
+    }
+
+    struct CodexUpdateReport: Decodable, Sendable, Equatable {
+        let status: CodexUpdateStatus
+        let summary: String
+        let lastCheckedAt: String?
+        let latestStableVersion: String?
+        let installedVersion: String?
+        let preparedVersion: String?
+        let preparedSourcePath: String?
+        let preparedBinaryPath: String?
+        let installCommand: String?
+        let error: String?
+    }
+
+    enum CodexUpdaterOperation: Sendable, Equatable {
+        case check(force: Bool)
+        case status
+        case installPrepared
+    }
+
+    struct CodexUpdaterCommand: Sendable, Equatable {
+        let executablePath: String
+        let arguments: [String]
+        let timeout: TimeInterval
+        let environmentOverrides: [String: String]
+    }
+
+    enum CodexUpdaterInvocationResult: Sendable, Equatable {
+        case report(CodexUpdateReport)
+        case failure(String)
+    }
+
+    struct CodexUpdateOutcome: Sendable, Equatable {
+        let success: Bool
+        let installedVersion: String?
+        let message: String
+    }
+
+    struct CodexExplicitUpdateResult: Sendable, Equatable {
+        let preparationReport: CodexUpdateReport?
+        let installationReport: CodexUpdateReport?
+        let outcome: CodexUpdateOutcome
+    }
+
+    enum PreparedBinaryPathValidation: Sendable, Equatable {
+        case valid(String)
+        case invalid(String)
+    }
+
+    enum AutomaticUpdateDisposition: Sendable, Equatable {
+        case upToDate(version: String)
+        case deferred(String)
+        case failed(String)
     }
 
     func checkVersions(force: Bool = false) {
-        if isChecking {
+        if isChecking || isUpdating {
             return
         }
         let now = Date()
@@ -70,11 +116,27 @@ final class CodexVersionChecker {
         lastCheckStarted = now
         isChecking = true
         updateResult = nil
+        updateSucceeded = false
 
         Task.detached {
-            _ = Self.repairBrokenGlobalCLIIfNeeded()
+            let checkResult = Self._runUpdater(.check(force: force))
+            let report: CodexUpdateReport?
+            let failureMessage: String?
+            switch checkResult {
+            case .report(let checkedReport):
+                report = checkedReport
+                failureMessage = nil
+            case .failure(let message):
+                failureMessage = message
+                if case .report(let statusReport) = Self._runUpdater(.status) {
+                    report = statusReport
+                } else {
+                    report = nil
+                }
+            }
+
             let installed = Self._getInstalledVersion()
-            let latest = Self._getLatestVersion()
+            let latest = Self.nonEmptyString(report?.latestStableVersion) ?? "?"
             let hasFork = FileManager.default.fileExists(atPath: Self.forkMarkerPath)
             let finishedAt = Date()
 
@@ -84,70 +146,43 @@ final class CodexVersionChecker {
                 self?.lastChecked = finishedAt
                 self?.isChecking = false
                 self?.forkInstalled = hasFork
-                self?.updateAvailable = (installed != latest && latest != "?" && installed != "?")
+                self?.updateAvailable = Self.shouldOfferUpdate(
+                    installedVersion: installed,
+                    latestVersion: latest
+                )
+                self?.updateResult = failureMessage.map { "Update check failed: \($0)" }
             }
         }
     }
 
     func runUpdate() {
+        if isUpdating || isChecking {
+            return
+        }
         isUpdating = true
         updateResult = nil
         updateSucceeded = false
+        forkRebuilding = false
 
         Task.detached {
-            let updateTarget = Self._getPreferredUpdateTarget()
+            let result = Self.performExplicitUpdate()
+            let installed = result.outcome.installedVersion ?? Self._getInstalledVersion()
+            let latest = Self.nonEmptyString(result.installationReport?.latestStableVersion)
+                ?? Self.nonEmptyString(result.preparationReport?.latestStableVersion)
+                ?? "?"
 
-            // Step 1: npm update
-            let npmResult = Self._performNpmUpdate(target: updateTarget)
-            guard npmResult.success else {
-                await MainActor.run { [weak self] in
-                    self?.isUpdating = false
-                    self?.updateSucceeded = false
-                    self?.updateResult = npmResult.message
-                }
-                return
-            }
-
-            let newNpmVersion = updateTarget?.version ?? Self._getNpmPackageVersion()
-
-            // Step 2: If fork is installed, rebuild it with the new version
-            let hasFork = FileManager.default.fileExists(atPath: Self.forkMarkerPath)
-            if hasFork {
-                await MainActor.run { [weak self] in
-                    self?.forkRebuilding = true
-                    self?.updateResult = "Updated npm package. Rebuilding SIGHUP fork (this takes a few minutes)..."
-                }
-
-                let forkResult = Self._rebuildFork(version: newNpmVersion)
-
-                let installed = Self._getInstalledVersion()
-                let latest = Self._getLatestVersion()
-
-                await MainActor.run { [weak self] in
-                    self?.installedVersion = installed
-                    self?.latestVersion = latest
-                    self?.isUpdating = false
-                    self?.forkRebuilding = false
-                    self?.updateAvailable = (installed != latest && latest != "?" && installed != "?")
-                    self?.updateSucceeded = forkResult.success
-                    self?.updateResult = forkResult.success
-                        ? "Updated to v\(newNpmVersion) with SIGHUP fork"
-                        : "npm updated but fork rebuild failed: \(forkResult.message). Run `codex` manually to use stock binary."
-                    self?.lastChecked = Date()
-                }
-            } else {
-                let installed = Self._getInstalledVersion()
-                let latest = Self._getLatestVersion()
-
-                await MainActor.run { [weak self] in
-                    self?.installedVersion = installed
-                    self?.latestVersion = latest
-                    self?.isUpdating = false
-                    self?.updateAvailable = (installed != latest && latest != "?" && installed != "?")
-                    self?.updateSucceeded = true
-                    self?.updateResult = "Updated to v\(newNpmVersion)"
-                    self?.lastChecked = Date()
-                }
+            await MainActor.run { [weak self] in
+                self?.installedVersion = installed
+                self?.latestVersion = latest
+                self?.isUpdating = false
+                self?.forkRebuilding = false
+                self?.updateAvailable = Self.shouldOfferUpdate(
+                    installedVersion: installed,
+                    latestVersion: latest
+                )
+                self?.updateSucceeded = result.outcome.success
+                self?.updateResult = result.outcome.message
+                self?.lastChecked = Date()
             }
         }
     }
@@ -155,279 +190,577 @@ final class CodexVersionChecker {
     // MARK: - Private (nonisolated for background execution)
 
     private nonisolated static func _getInstalledVersion() -> String {
-        installedHotSwapVersion(
-            preparedRootPath: preparedCodexRootPath,
-            managedPatchedCodexPath: managedPatchedCodexPath,
-            forkBinaryPath: forkBinaryPath
-        ) ?? "?"
+        installedHotSwapVersion() ?? "?"
     }
 
-    nonisolated static func shouldRepairGlobalCLI(packageVersion: String, health: CodexCLIHealth) -> Bool {
-        isPrereleaseVersion(packageVersion) || !health.healthy
+    nonisolated static func shouldOfferUpdate(
+        installedVersion: String,
+        latestVersion: String
+    ) -> Bool {
+        if installedVersion == "?" {
+            return true
+        }
+        return latestVersion != "?" && installedVersion != latestVersion
+    }
+
+    nonisolated static func automaticMetadataDisposition(
+        report: CodexUpdateReport,
+        installedHotSwapVersion: String?
+    ) -> AutomaticUpdateDisposition {
+        guard let latestVersion = nonEmptyString(report.latestStableVersion) else {
+            return .deferred("stable update version is unavailable")
+        }
+        if installedHotSwapVersion == latestVersion {
+            return .upToDate(version: latestVersion)
+        }
+
+        switch report.status {
+        case .checking, .preparing, .installing:
+            return .deferred("Codex update is already in progress")
+        case .failed:
+            return .deferred(nonEmptyString(report.error) ?? report.summary)
+        case .readyToInstall, .idle, .installed:
+            return .deferred(
+                "Codex \(latestVersion) is available; use the explicit Update command to install it"
+            )
+        }
+    }
+
+    nonisolated static func automaticUpdateShouldStart(
+        now: Date,
+        lastAttemptAt: Date?,
+        lastFailureAt: Date?,
+        isInFlight: Bool,
+        runtimeRepairRequired: Bool = false,
+        checkInterval: TimeInterval = automaticUpdateCheckInterval,
+        failureBackoff: TimeInterval = automaticUpdateFailureBackoff,
+        runtimeRepairInterval: TimeInterval = automaticRuntimeRepairInterval
+    ) -> Bool {
+        guard !isInFlight else { return false }
+        let effectiveCheckInterval = runtimeRepairRequired
+            ? min(checkInterval, runtimeRepairInterval)
+            : checkInterval
+        let effectiveFailureBackoff = runtimeRepairRequired
+            ? min(failureBackoff, runtimeRepairInterval)
+            : failureBackoff
+        if let lastFailureAt, now.timeIntervalSince(lastFailureAt) < effectiveFailureBackoff {
+            return false
+        }
+        if let lastAttemptAt, now.timeIntervalSince(lastAttemptAt) < effectiveCheckInterval {
+            return false
+        }
+        return true
+    }
+
+    nonisolated static func performAutomaticUpdateIfNeeded(
+        runUpdater: (CodexUpdaterOperation) -> CodexUpdaterInvocationResult = { operation in
+            _runUpdater(operation)
+        },
+        installedVersionProvider: () -> String? = {
+            installedHotSwapVersion()
+        }
+    ) -> AutomaticUpdateDisposition {
+        let checkResult = runUpdater(.check(force: false))
+        guard case .report(let report) = checkResult else {
+            if case .failure(let message) = checkResult {
+                return .failed(message)
+            }
+            return .failed("Codex update check returned no report")
+        }
+
+        return automaticMetadataDisposition(
+            report: report,
+            installedHotSwapVersion: installedVersionProvider()
+        )
+    }
+
+    nonisolated static func performExplicitUpdate(
+        runUpdater: (CodexUpdaterOperation) -> CodexUpdaterInvocationResult = { operation in
+            _runUpdater(operation)
+        },
+        validatePreparedBinary: (CodexUpdateReport) -> PreparedBinaryPathValidation = { report in
+            validatePreparedBinaryPath(in: report)
+        },
+        repairLauncher: (String) -> CodexCLIRepairResult = { preparedBinaryPath in
+            verifyInstalledLauncherRoute(expectedPreparedBinaryPath: preparedBinaryPath)
+        },
+        installedVersionProvider: () -> String? = {
+            installedHotSwapVersion()
+        }
+    ) -> CodexExplicitUpdateResult {
+        let statusInvocation = runUpdater(.status)
+        let preparationInvocation: CodexUpdaterInvocationResult
+        if case .report(let statusReport) = statusInvocation,
+           statusReport.status == .installing {
+            // The native installer owns activation-journal recovery. Do not let
+            // a metadata check overwrite an interrupted transaction first.
+            preparationInvocation = .report(statusReport)
+        } else {
+            preparationInvocation = runUpdater(.check(force: true))
+        }
+        guard case .report(let preparationReport) = preparationInvocation else {
+            let detail: String
+            if case .failure(let message) = preparationInvocation {
+                detail = message
+            } else {
+                detail = "Codex preparation returned no report"
+            }
+            return CodexExplicitUpdateResult(
+                preparationReport: nil,
+                installationReport: nil,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex preparation failed: \(detail)"
+                )
+            )
+        }
+
+        guard preparationReport.status == .readyToInstall
+            || preparationReport.status == .installing else {
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: nil,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex preparation did not produce a ready runtime (status: \(preparationReport.status.rawValue)): \(preparationReport.summary)"
+                )
+            )
+        }
+        if preparationReport.status == .readyToInstall,
+           nonEmptyString(preparationReport.installCommand) != preparedInstallCommand {
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: nil,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex preparation did not authorize the guarded install-prepared-codex command"
+                )
+            )
+        }
+
+        var preparedBinaryPath: String?
+        if preparationReport.status == .readyToInstall {
+            switch validatePreparedBinary(preparationReport) {
+            case .valid(let path):
+                preparedBinaryPath = path
+            case .invalid(let message):
+                return CodexExplicitUpdateResult(
+                    preparationReport: preparationReport,
+                    installationReport: nil,
+                    outcome: CodexUpdateOutcome(
+                        success: false,
+                        installedVersion: nil,
+                        message: "Codex prepared runtime is invalid: \(message)"
+                    )
+                )
+            }
+        }
+
+        let installationInvocation = runUpdater(.installPrepared)
+        guard case .report(let installationReport) = installationInvocation else {
+            let detail: String
+            if case .failure(let message) = installationInvocation {
+                detail = message
+            } else {
+                detail = "Codex installation returned no report"
+            }
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: nil,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex update failed: \(detail)"
+                )
+            )
+        }
+
+        guard installationReport.status == .installed else {
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: installationReport,
+                outcome: verifiedUpdateOutcome(
+                    report: installationReport,
+                    launcherRepair: nil,
+                    installedHotSwapVersion: nil
+                )
+            )
+        }
+        if preparedBinaryPath == nil {
+            switch validatePreparedBinary(preparationReport) {
+            case .valid(let path):
+                preparedBinaryPath = path
+            case .invalid(let message):
+                return CodexExplicitUpdateResult(
+                    preparationReport: preparationReport,
+                    installationReport: installationReport,
+                    outcome: CodexUpdateOutcome(
+                        success: false,
+                        installedVersion: nil,
+                        message: "Codex recovered activation, but its prepared runtime is invalid: \(message)"
+                    )
+                )
+            }
+        }
+        guard let preparedBinaryPath else {
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: installationReport,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex recovered activation without a prepared runtime path"
+                )
+            )
+        }
+        guard let preparedVersion = nonEmptyString(preparationReport.preparedVersion),
+              nonEmptyString(installationReport.installedVersion) == preparedVersion else {
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: installationReport,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex installer reported installed without the prepared version"
+                )
+            )
+        }
+        if let installedPreparedPath = nonEmptyString(installationReport.preparedBinaryPath),
+           installedPreparedPath != preparedBinaryPath {
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: installationReport,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex installer changed the prepared runtime path; launcher repair was refused"
+                )
+            )
+        }
+        switch validatePreparedBinary(preparationReport) {
+        case .valid(let revalidatedPath) where revalidatedPath == preparedBinaryPath:
+            break
+        case .valid:
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: installationReport,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex prepared runtime path changed after installation; launcher repair was refused"
+                )
+            )
+        case .invalid(let message):
+            return CodexExplicitUpdateResult(
+                preparationReport: preparationReport,
+                installationReport: installationReport,
+                outcome: CodexUpdateOutcome(
+                    success: false,
+                    installedVersion: nil,
+                    message: "Codex installed runtime failed path revalidation: \(message)"
+                )
+            )
+        }
+
+        let launcherRepair = repairLauncher(preparedBinaryPath)
+        let verifiedVersion = launcherRepair.success ? installedVersionProvider() : nil
+        return CodexExplicitUpdateResult(
+            preparationReport: preparationReport,
+            installationReport: installationReport,
+            outcome: verifiedUpdateOutcome(
+                report: installationReport,
+                launcherRepair: launcherRepair,
+                installedHotSwapVersion: verifiedVersion
+            )
+        )
+    }
+
+    nonisolated static func validatePreparedBinaryPath(
+        in report: CodexUpdateReport,
+        preparedRootPath: String = preparedCodexRootPath,
+        fileManager: FileManager = .default
+    ) -> PreparedBinaryPathValidation {
+        guard report.status == .readyToInstall || report.status == .installing else {
+            return .invalid("updater status does not identify a prepared activation")
+        }
+        guard let preparedVersion = nonEmptyString(report.preparedVersion),
+              isStableVersion(preparedVersion) else {
+            return .invalid("preparedVersion is missing or is not a stable version")
+        }
+        guard let rawPath = report.preparedBinaryPath,
+              rawPath == rawPath.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawPath.isEmpty,
+              !rawPath.contains("\0"),
+              (rawPath as NSString).isAbsolutePath else {
+            return .invalid("preparedBinaryPath must be a non-empty absolute path")
+        }
+
+        let normalizedRoot = (preparedRootPath as NSString).standardizingPath
+        let normalizedPath = (rawPath as NSString).standardizingPath
+        guard (normalizedRoot as NSString).isAbsolutePath,
+              normalizedPath == rawPath else {
+            return .invalid("preparedBinaryPath must already be normalized")
+        }
+        guard let relativeComponents = relativePathComponents(
+            of: normalizedPath,
+            under: normalizedRoot
+        ), relativeComponents.count == 3,
+           relativeComponents[0] == preparedVersion,
+           isSimpleUUID(relativeComponents[1]),
+           relativeComponents[2] == "codex" else {
+            return .invalid("preparedBinaryPath is not the reported attempt-scoped generation")
+        }
+
+        let rootURL = URL(fileURLWithPath: normalizedRoot, isDirectory: true)
+        let binaryURL = URL(fileURLWithPath: normalizedPath, isDirectory: false)
+        let resolvedRoot = rootURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let resolvedBinary = binaryURL.resolvingSymlinksInPath().standardizedFileURL.path
+        guard relativePathComponents(of: resolvedBinary, under: resolvedRoot) == relativeComponents else {
+            return .invalid("preparedBinaryPath escapes its generation through a symlink")
+        }
+
+        do {
+            let values = try binaryURL.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+            ])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                return .invalid("preparedBinaryPath is not a regular file")
+            }
+        } catch {
+            return .invalid("preparedBinaryPath could not be inspected as a regular file")
+        }
+        guard fileManager.isExecutableFile(atPath: normalizedPath) else {
+            return .invalid("preparedBinaryPath is not executable")
+        }
+        return .valid(normalizedPath)
+    }
+
+    nonisolated static func updaterCommand(
+        for operation: CodexUpdaterOperation,
+        executablePath: String = updaterCLIPath
+    ) -> CodexUpdaterCommand {
+        switch operation {
+        case .check(let force):
+            return CodexUpdaterCommand(
+                executablePath: executablePath,
+                arguments: force
+                    ? ["check-codex-update", "--force", "--json"]
+                    : ["check-codex-update", "--json"],
+                timeout: updaterCheckTimeout,
+                environmentOverrides: [:]
+            )
+        case .status:
+            return CodexUpdaterCommand(
+                executablePath: executablePath,
+                arguments: ["codex-update-status", "--json"],
+                timeout: updaterStatusTimeout,
+                environmentOverrides: [:]
+            )
+        case .installPrepared:
+            return CodexUpdaterCommand(
+                executablePath: executablePath,
+                arguments: ["install-prepared-codex", "--json"],
+                timeout: updaterInstallTimeout,
+                environmentOverrides: [:]
+            )
+        }
+    }
+
+    nonisolated static func updaterCLIIsNativeExecutable(at path: String) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: path),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            return false
+        }
+        return binaryIsMachOExecutableData(data)
+    }
+
+    nonisolated static func decodeUpdaterReport(_ data: Data) throws -> CodexUpdateReport {
+        try JSONDecoder().decode(CodexUpdateReport.self, from: data)
+    }
+
+    nonisolated static func interpretUpdaterResult(
+        _ result: ProcessRunResult,
+        command: CodexUpdaterCommand
+    ) -> CodexUpdaterInvocationResult {
+        let operation = command.arguments.first ?? "codex updater"
+        if result.timedOut {
+            return .failure("\(operation) timed out after \(Int(command.timeout)) seconds")
+        }
+        guard result.terminationStatus == 0 else {
+            let detail = updaterDiagnostic(from: result)
+            return .failure("\(operation) exited with status \(result.terminationStatus): \(detail)")
+        }
+
+        let report: CodexUpdateReport
+        do {
+            report = try decodeUpdaterReport(result.stdout)
+        } catch {
+            return .failure("\(operation) returned invalid JSON: \(error.localizedDescription)")
+        }
+        if report.status == .failed {
+            return .failure(nonEmptyString(report.error) ?? report.summary)
+        }
+        return .report(report)
+    }
+
+    nonisolated static func verifiedUpdateOutcome(
+        report: CodexUpdateReport,
+        launcherRepair: CodexCLIRepairResult?,
+        installedHotSwapVersion: String?
+    ) -> CodexUpdateOutcome {
+        guard report.status == .installed else {
+            return CodexUpdateOutcome(
+                success: false,
+                installedVersion: nil,
+                message: "Codex updater did not install a hot-swap runtime (status: \(report.status.rawValue)): \(report.summary)"
+            )
+        }
+        guard let reportedVersion = nonEmptyString(report.installedVersion) else {
+            return CodexUpdateOutcome(
+                success: false,
+                installedVersion: nil,
+                message: "Codex updater reported installed without an installedVersion"
+            )
+        }
+        guard let launcherRepair, launcherRepair.success else {
+            let detail = launcherRepair?.message ?? "launcher verification was unavailable"
+            return CodexUpdateOutcome(
+                success: false,
+                installedVersion: nil,
+                message: "Codex update could not verify the journaled launcher route: \(detail)"
+            )
+        }
+        guard let verifiedVersion = nonEmptyString(installedHotSwapVersion) else {
+            return CodexUpdateOutcome(
+                success: false,
+                installedVersion: nil,
+                message: "Codex update completed, but no installed hot-swap version could be verified"
+            )
+        }
+        guard verifiedVersion == reportedVersion else {
+            return CodexUpdateOutcome(
+                success: false,
+                installedVersion: nil,
+                message: "Codex updater reported v\(reportedVersion), but the installed launcher route verifies v\(verifiedVersion)"
+            )
+        }
+        if let latestVersion = nonEmptyString(report.latestStableVersion),
+           latestVersion != verifiedVersion {
+            return CodexUpdateOutcome(
+                success: false,
+                installedVersion: nil,
+                message: "Codex updater reported latest v\(latestVersion), but the installed launcher route verifies v\(verifiedVersion)"
+            )
+        }
+        return CodexUpdateOutcome(
+            success: true,
+            installedVersion: verifiedVersion,
+            message: "Installed and verified Codex hot-swap runtime v\(verifiedVersion)"
+        )
+    }
+
+    private nonisolated static func _runUpdater(
+        _ operation: CodexUpdaterOperation
+    ) -> CodexUpdaterInvocationResult {
+        let command = updaterCommand(for: operation)
+        guard updaterCLIIsNativeExecutable(at: command.executablePath) else {
+            return .failure("native updater unavailable at \(command.executablePath)")
+        }
+
+        let environment = updaterEnvironment(
+            overrides: command.environmentOverrides
+        )
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: command.executablePath),
+            arguments: command.arguments,
+            timeout: command.timeout,
+            environment: environment
+        )
+        return interpretUpdaterResult(result, command: command)
+    }
+
+    nonisolated static func updaterEnvironment(
+        overrides: [String: String],
+        base: [String: String] = ProcessInfo.processInfo.environment,
+        homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path
+    ) -> [String: String] {
+        var environment = base
+        environment["HOME"] = homeDirectory
+        for (key, value) in overrides {
+            environment[key] = value
+        }
+        return environment
+    }
+
+    private nonisolated static func updaterDiagnostic(from result: ProcessRunResult) -> String {
+        let stderr = result.stderrString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stdout = result.stdoutString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = stderr.isEmpty ? stdout : stderr
+        return detail.isEmpty ? "no diagnostic output" : String(detail.prefix(400))
+    }
+
+    private nonisolated static func nonEmptyString(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private nonisolated static func relativePathComponents(
+        of candidatePath: String,
+        under rootPath: String
+    ) -> [String]? {
+        let rootComponents = URL(fileURLWithPath: rootPath, isDirectory: true).pathComponents
+        let candidateComponents = URL(fileURLWithPath: candidatePath, isDirectory: false).pathComponents
+        guard candidateComponents.count > rootComponents.count,
+              candidateComponents.starts(with: rootComponents) else {
+            return nil
+        }
+        return Array(candidateComponents.dropFirst(rootComponents.count))
+    }
+
+    private nonisolated static func isSimpleUUID(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        guard bytes.count == 32 else { return false }
+        return bytes.allSatisfy { byte in
+            (48...57).contains(byte) || (97...102).contains(byte)
+        }
+    }
+
+    private nonisolated static func isStableVersion(_ value: String) -> Bool {
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        return components.count == 3 && components.allSatisfy { UInt64($0) != nil }
     }
 
     @discardableResult
-    nonisolated static func repairBrokenGlobalCLIIfNeeded(force: Bool = false) -> CodexCLIRepairResult {
-        if let launcherResult = repairSighupLauncherIfAvailable(force: force),
-           launcherResult.success || launcherResult.attempted {
-            return launcherResult
+    nonisolated static func repairBrokenGlobalCLIIfNeeded(force _: Bool = false) -> CodexCLIRepairResult {
+        if let version = installedHotSwapVersion() {
+            return CodexCLIRepairResult(
+                attempted: false,
+                success: true,
+                message: "Managed Codex launcher route verifies v\(version)"
+            )
         }
-
-        let packageVersion = _getNpmPackageVersion()
-
-        // If the installed package is prerelease, do not execute it just to prove
-        // it is broken; this is the class of binary that previously triggered
-        // macOS SIGKILL/UE hangs before `--version` could return.
-        let health = isPrereleaseVersion(packageVersion)
-            ? CodexCLIHealth(healthy: false, version: nil, timedOut: false, terminationStatus: -2)
-            : _codexCLIHealth(at: homebrewCodexPath)
-
-        guard shouldRepairGlobalCLI(packageVersion: packageVersion, health: health) else {
-            return CodexCLIRepairResult(attempted: false, success: true, message: "Global Codex CLI is healthy")
-        }
-        guard force || cliRepairCooldownExpired() else {
-            return CodexCLIRepairResult(attempted: false, success: false, message: "Global Codex CLI repair is in cooldown")
-        }
-        markCLIRepairAttempt()
-
-        guard let target = _getPreferredUpdateTarget() else {
-            return CodexCLIRepairResult(attempted: true, success: false, message: "No stable Codex npm target available for repair")
-        }
-
-        let result = _performNpmUpdate(target: target, allowRollback: false)
-        if result.success {
-            return CodexCLIRepairResult(attempted: true, success: true, message: "Repaired global Codex CLI with \(target.npmSpecifier)")
-        }
-        return CodexCLIRepairResult(attempted: true, success: false, message: result.message)
+        return CodexCLIRepairResult(
+            attempted: false,
+            success: false,
+            message: "No complete native Codex hot-swap runtime is installed"
+        )
     }
 
-    nonisolated static func launcherScript(
-        syncedClientPath: String = syncedClientPath,
-        managedPatchedCodexPath: String = managedPatchedCodexPath,
-        forkBinaryPath: String,
-        homebrewCodexPath: String = homebrewCodexPath,
-        desktopAppNativePath: String = desktopAppNativePath
-    ) -> String {
-        """
-        #!/bin/bash
-        set -euo pipefail
-        SYNCED_CODEX=\(shellSingleQuoted(syncedClientPath))
-        PATCHED_CODEX=\(shellSingleQuoted(managedPatchedCodexPath))
-        SIGHUP_FORK=\(shellSingleQuoted(forkBinaryPath))
-        BREW_NATIVE=\(shellSingleQuoted(homebrewCodexPath))
-        DESKTOP_APP_NATIVE=\(shellSingleQuoted(desktopAppNativePath))
-
-        can_run() {
-          local candidate="$1"
-          [[ -x "$candidate" ]] || return 1
-          "$candidate" --version >/dev/null 2>&1
-        }
-
-        codex_version_base() {
-          local candidate="$1"
-          "$candidate" --version 2>/dev/null | /usr/bin/awk '
-            {
-              for (i = 1; i <= NF; i++) {
-                if ($i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+/) {
-                  sub(/-.*/, "", $i)
-                  print $i
-                  exit
-                }
-              }
-            }
-          '
-        }
-
-        version_at_least_0128() {
-          local version major minor patch
-          version="$(codex_version_base "$1")"
-          IFS=. read -r major minor patch <<< "$version"
-          [[ "${major:-0}" =~ ^[0-9]+$ && "${minor:-0}" =~ ^[0-9]+$ && "${patch:-0}" =~ ^[0-9]+$ ]] || return 1
-          (( major > 0 || minor > 128 || (minor == 128 && patch >= 0) ))
-        }
-
-        can_run_goal_capable() {
-          local candidate="$1"
-          can_run "$candidate" && version_at_least_0128 "$candidate"
-        }
-
-        has_sighup_patch() {
-          local candidate="$1"
-          [[ -r "$candidate" ]] || return 1
-          /usr/bin/strings "$candidate" 2>/dev/null | /usr/bin/awk '
-            /sighup-verified/ { has_marker = 1 }
-            /SIGHUP: auth reloaded/ { has_reload = 1 }
-            /hotswap-ack/ { has_ack = 1 }
-            /CodexSwitch rotated accounts after a usage limit/ { has_usage_retry = 1 }
-            /Auth changed, opening new WebSocket with fresh credentials/ { has_auth_ws = 1 }
-            END { exit !(has_marker && has_reload && has_ack && has_usage_retry && has_auth_ws) }
-          '
-        }
-
-        has_goal_support() {
-          local candidate="$1"
-          [[ -r "$candidate" ]] || return 1
-          /usr/bin/strings "$candidate" 2>/dev/null | /usr/bin/awk '
-            /Usage: \\/goal <objective>/ { has_goal_usage = 1 }
-            /Pursuing goal/ { has_goal_status = 1 }
-            /thread\\/goal\\/set/ { has_goal_rpc = 1 }
-            END { exit !(has_goal_usage || (has_goal_status && has_goal_rpc)) }
-          '
-        }
-
-        args_request_remote() {
-          for arg in "$@"; do
-            [[ "$arg" == "--remote" || "$arg" == --remote=* ]] && return 0
-          done
-          return 1
-        }
-
-        if args_request_remote "$@" && can_run_goal_capable "$SYNCED_CODEX"; then
-          exec "$SYNCED_CODEX" "$@"
-        fi
-
-        if can_run_goal_capable "$PATCHED_CODEX" && has_sighup_patch "$PATCHED_CODEX" && has_goal_support "$PATCHED_CODEX"; then
-          exec "$PATCHED_CODEX" -c 'plugins."computer-use@openai-bundled".enabled=false' "$@"
-        fi
-
-        if can_run_goal_capable "$SIGHUP_FORK" && has_sighup_patch "$SIGHUP_FORK" && has_goal_support "$SIGHUP_FORK"; then
-          exec "$SIGHUP_FORK" -c 'plugins."computer-use@openai-bundled".enabled=false' "$@"
-        fi
-
-        if [[ -n "${CODEX_CLI_PATH:-}" && "${CODEX_CLI_PATH}" != "$0" ]] \
-          && can_run_goal_capable "${CODEX_CLI_PATH}"; then
-          exec "${CODEX_CLI_PATH}" "$@"
-        fi
-
-        if can_run_goal_capable "$SYNCED_CODEX"; then
-          exec "$SYNCED_CODEX" "$@"
-        fi
-
-        if can_run_goal_capable "$BREW_NATIVE"; then
-          exec "$BREW_NATIVE" "$@"
-        fi
-
-        if can_run_goal_capable "$DESKTOP_APP_NATIVE"; then
-          exec "$DESKTOP_APP_NATIVE" "$@"
-        fi
-
-        echo "codex: no working goal-capable native binary found" >&2
-        exit 1
-        """
-    }
-
-    nonisolated static func homebrewBridgeScript(
-        syncedClientPath: String = syncedClientPath,
-        managedPatchedCodexPath: String = managedPatchedCodexPath,
-        forkBinaryPath: String,
-        originalEntryPath: String = homebrewNpmEntryPath,
-        desktopAppNativePath: String = desktopAppNativePath
-    ) -> String {
-        """
-        #!/bin/bash
-        set -u
-        SYNCED_CODEX=\(shellSingleQuoted(syncedClientPath))
-        PATCHED_CODEX=\(shellSingleQuoted(managedPatchedCodexPath))
-        SIGHUP_FORK=\(shellSingleQuoted(forkBinaryPath))
-        ORIGINAL_NODE_ENTRY=\(shellSingleQuoted(originalEntryPath))
-        DESKTOP_APP_NATIVE=\(shellSingleQuoted(desktopAppNativePath))
-
-        can_run() {
-          local candidate="$1"
-          [[ -x "$candidate" ]] || return 1
-          "$candidate" --version >/dev/null 2>&1
-        }
-
-        codex_version_base() {
-          local candidate="$1"
-          "$candidate" --version 2>/dev/null | /usr/bin/awk '
-            {
-              for (i = 1; i <= NF; i++) {
-                if ($i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+/) {
-                  sub(/-.*/, "", $i)
-                  print $i
-                  exit
-                }
-              }
-            }
-          '
-        }
-
-        version_at_least_0128() {
-          local version major minor patch
-          version="$(codex_version_base "$1")"
-          IFS=. read -r major minor patch <<< "$version"
-          [[ "${major:-0}" =~ ^[0-9]+$ && "${minor:-0}" =~ ^[0-9]+$ && "${patch:-0}" =~ ^[0-9]+$ ]] || return 1
-          (( major > 0 || minor > 128 || (minor == 128 && patch >= 0) ))
-        }
-
-        can_run_goal_capable() {
-          local candidate="$1"
-          can_run "$candidate" && version_at_least_0128 "$candidate"
-        }
-
-        has_sighup_patch() {
-          local candidate="$1"
-          [[ -r "$candidate" ]] || return 1
-          /usr/bin/strings "$candidate" 2>/dev/null | /usr/bin/awk '
-            /sighup-verified/ { has_marker = 1 }
-            /SIGHUP: auth reloaded/ { has_reload = 1 }
-            /hotswap-ack/ { has_ack = 1 }
-            /CodexSwitch rotated accounts after a usage limit/ { has_usage_retry = 1 }
-            /Auth changed, opening new WebSocket with fresh credentials/ { has_auth_ws = 1 }
-            END { exit !(has_marker && has_reload && has_ack && has_usage_retry && has_auth_ws) }
-          '
-        }
-
-        has_goal_support() {
-          local candidate="$1"
-          [[ -r "$candidate" ]] || return 1
-          /usr/bin/strings "$candidate" 2>/dev/null | /usr/bin/awk '
-            /Usage: \\/goal <objective>/ { has_goal_usage = 1 }
-            /Pursuing goal/ { has_goal_status = 1 }
-            /thread\\/goal\\/set/ { has_goal_rpc = 1 }
-            END { exit !(has_goal_usage || (has_goal_status && has_goal_rpc)) }
-          '
-        }
-
-        args_request_remote() {
-          for arg in "$@"; do
-            [[ "$arg" == "--remote" || "$arg" == --remote=* ]] && return 0
-          done
-          return 1
-        }
-
-        if args_request_remote "$@" && can_run_goal_capable "$SYNCED_CODEX"; then
-          exec "$SYNCED_CODEX" "$@"
-        fi
-
-        if can_run_goal_capable "$PATCHED_CODEX" && has_sighup_patch "$PATCHED_CODEX" && has_goal_support "$PATCHED_CODEX"; then
-          exec "$PATCHED_CODEX" -c 'plugins."computer-use@openai-bundled".enabled=false' "$@"
-        fi
-
-        if can_run_goal_capable "$SIGHUP_FORK" && has_sighup_patch "$SIGHUP_FORK" && has_goal_support "$SIGHUP_FORK"; then
-          exec "$SIGHUP_FORK" -c 'plugins."computer-use@openai-bundled".enabled=false' "$@"
-        fi
-
-        if can_run_goal_capable "$SYNCED_CODEX"; then
-          exec "$SYNCED_CODEX" "$@"
-        fi
-
-        if [[ -x "$ORIGINAL_NODE_ENTRY" ]] && can_run_goal_capable "$ORIGINAL_NODE_ENTRY"; then
-          exec "$ORIGINAL_NODE_ENTRY" "$@"
-        fi
-
-        echo "codex: no working goal-capable Homebrew Codex entry found" >&2
-        exit 1
-        """
-    }
+    private nonisolated static let goalMarkers = [
+        "Usage: /goal <objective>",
+        "Pursuing goal",
+        "thread/goal/set",
+    ]
 
     nonisolated static func binaryHasSighupSupportData(_ data: Data) -> Bool {
-        data.range(of: Data("sighup-verified".utf8)) != nil
-            && data.range(of: Data("SIGHUP: auth reloaded".utf8)) != nil
-            && data.range(of: Data("hotswap-ack".utf8)) != nil
-            && data.range(of: Data("CodexSwitch rotated accounts after a usage limit".utf8)) != nil
-            && data.range(of: Data("Auth changed, opening new WebSocket with fresh credentials".utf8)) != nil
+        RuntimeHotSwapContract.fullMarkers.allSatisfy { marker in
+            data.range(of: Data(marker.utf8)) != nil
+        }
     }
 
     nonisolated static func binaryHasGoalSupportData(_ data: Data) -> Bool {
@@ -438,153 +771,392 @@ final class CodexVersionChecker {
             )
     }
 
-    private nonisolated static func repairSighupLauncherIfAvailable(force: Bool) -> CodexCLIRepairResult? {
-        let preferredHotSwapBinary = preferredHotSwapBinaryPath()
-        let health = preferredHotSwapBinary.map { _codexCLIHealth(at: $0) }
-        if let health, !health.healthy {
-            return CodexCLIRepairResult(
-                attempted: true,
-                success: false,
-                message: "SIGHUP fork exists but failed launch health check"
-            )
+    nonisolated static func binaryIsMachOExecutableData(_ data: Data) -> Bool {
+        guard let magic = readUInt32(from: data, at: 0, bigEndian: true) else {
+            return false
         }
 
-        let launcherHotSwapPath = preferredHotSwapBinary ?? managedPatchedCodexPath
-        let desired = launcherScript(
-            managedPatchedCodexPath: launcherHotSwapPath,
-            forkBinaryPath: forkBinaryPath
-        )
-        let desiredHomebrewBridge = homebrewBridgeScript(
-            managedPatchedCodexPath: launcherHotSwapPath,
-            forkBinaryPath: forkBinaryPath
-        )
-        let desiredLaunchctlPath: String
-        if let preferredHotSwapBinary,
-           FileManager.default.isExecutableFile(atPath: preferredHotSwapBinary) {
-            desiredLaunchctlPath = preferredHotSwapBinary
-        } else if FileManager.default.isExecutableFile(atPath: syncedClientPath) {
-            desiredLaunchctlPath = syncedClientPath
-        } else if FileManager.default.isExecutableFile(atPath: desktopAppNativePath) {
-            desiredLaunchctlPath = desktopAppNativePath
-        } else {
-            desiredLaunchctlPath = forkBinaryPath
+        switch magic {
+        case 0xCEFAEDFE, 0xCFFAEDFE:
+            return readUInt32(from: data, at: 12, bigEndian: false) == 2
+        case 0xFEEDFACE, 0xFEEDFACF:
+            return readUInt32(from: data, at: 12, bigEndian: true) == 2
+        case 0xCAFEBABE:
+            return fatMachOContainsOnlyExecutables(data, is64Bit: false, bigEndian: true)
+        case 0xBEBAFECA:
+            return fatMachOContainsOnlyExecutables(data, is64Bit: false, bigEndian: false)
+        case 0xCAFEBABF:
+            return fatMachOContainsOnlyExecutables(data, is64Bit: true, bigEndian: true)
+        case 0xBFBAFECA:
+            return fatMachOContainsOnlyExecutables(data, is64Bit: true, bigEndian: false)
+        default:
+            return false
         }
-        let current = (try? String(contentsOfFile: localLauncherPath, encoding: .utf8)) ?? ""
-        let currentHomebrewBridge = (try? String(contentsOfFile: homebrewCodexPath, encoding: .utf8)) ?? ""
-        let envCurrent = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/bin/launchctl"),
-            arguments: ["getenv", "CODEX_CLI_PATH"],
-            timeout: 2
-        ).stdoutString.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
-        guard force || current != desired || currentHomebrewBridge != desiredHomebrewBridge || envCurrent != desiredLaunchctlPath else {
-            return CodexCLIRepairResult(
-                attempted: false,
-                success: true,
-                message: "Codex launchers already route CLI to synced Codex and desktop to bundled Codex"
-            )
+    nonisolated static func localHotSwapUnitIsStructurallyValid(at path: String) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: path),
+              binaryFileHasRequiredRuntimeMarkers(at: path) else {
+            return false
         }
+
+        let companionPath = URL(fileURLWithPath: path)
+            .deletingLastPathComponent()
+            .appending(path: "codex-code-mode-host")
+            .path
+        return FileManager.default.isExecutableFile(atPath: companionPath)
+    }
+
+    nonisolated static func binaryFileHasRequiredRuntimeMarkers(
+        at path: String,
+        chunkSize: Int = 1024 * 1024
+    ) -> Bool {
+        guard chunkSize > 0,
+              let handle = FileHandle(forReadingAtPath: path) else {
+            return false
+        }
+        defer { try? handle.close() }
 
         do {
-            let launcherURL = URL(fileURLWithPath: localLauncherPath)
-            try FileManager.default.createDirectory(
-                at: launcherURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try desired.write(to: launcherURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localLauncherPath)
+            let header = try handle.read(upToCount: 4096) ?? Data()
+            guard binaryIsMachOExecutableData(header) else { return false }
+            try handle.seek(toOffset: 0)
 
-            if FileManager.default.fileExists(atPath: homebrewCodexPath) {
-                try FileManager.default.removeItem(atPath: homebrewCodexPath)
+            let hotSwapMarkers = RuntimeHotSwapContract.fullMarkers.map { Data($0.utf8) }
+            let goalMarkerData = goalMarkers.map { Data($0.utf8) }
+            var hotSwapFound = Array(repeating: false, count: hotSwapMarkers.count)
+            var goalFound = Array(repeating: false, count: goalMarkerData.count)
+            let longestMarker = (hotSwapMarkers + goalMarkerData).map(\.count).max() ?? 1
+            let overlapCount = max(0, longestMarker - 1)
+            var overlap = Data()
+
+            while let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty {
+                var window = Data()
+                window.reserveCapacity(overlap.count + chunk.count)
+                window.append(overlap)
+                window.append(chunk)
+
+                for index in hotSwapMarkers.indices where !hotSwapFound[index] {
+                    hotSwapFound[index] = window.range(of: hotSwapMarkers[index]) != nil
+                }
+                for index in goalMarkerData.indices where !goalFound[index] {
+                    goalFound[index] = window.range(of: goalMarkerData[index]) != nil
+                }
+
+                let hasGoalSupport = goalFound[0] || (goalFound[1] && goalFound[2])
+                if hotSwapFound.allSatisfy({ $0 }) && hasGoalSupport {
+                    return true
+                }
+                overlap = Data(window.suffix(overlapCount))
             }
-            try desiredHomebrewBridge.write(
-                to: URL(fileURLWithPath: homebrewCodexPath),
-                atomically: true,
-                encoding: .utf8
-            )
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: homebrewCodexPath)
         } catch {
+            return false
+        }
+        return false
+    }
+
+    private nonisolated static func verifyInstalledLauncherRoute(
+        expectedPreparedBinaryPath: String
+    ) -> CodexCLIRepairResult {
+        let expected = (expectedPreparedBinaryPath as NSString).standardizingPath
+        guard let routed = routedHotSwapBinaryPath(
+            localLauncherPath: localLauncherPath,
+            homebrewBridgePath: homebrewCodexPath
+        ), routed == expected else {
             return CodexCLIRepairResult(
-                attempted: true,
+                attempted: false,
                 success: false,
-                message: "Failed to repair Codex launchers: \(error.localizedDescription)"
+                message: "The Rust activation transaction did not publish the expected launcher route"
+            )
+        }
+        guard completeHotSwapBinaryIsLaunchable(at: routed) else {
+            return CodexCLIRepairResult(
+                attempted: false,
+                success: false,
+                message: "The installed prepared Codex runtime is not complete and launchable"
             )
         }
 
-        _ = ProcessRunner.run(
+        let launchctl = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/bin/launchctl"),
-            arguments: ["setenv", "CODEX_CLI_PATH", desiredLaunchctlPath],
+            arguments: ["setenv", "CODEX_CLI_PATH", localLauncherPath],
             timeout: 3
         )
-        SwapLog.append(.debug("CODEX_CLI_LAUNCHER_REPAIRED synced=\(syncedClientPath) hotswap=\(launcherHotSwapPath) fork=\(forkBinaryPath) version=\(health?.version ?? "unknown") homebrew_bridge=\(homebrewCodexPath) launchctl=\(desiredLaunchctlPath)"))
+        guard !launchctl.timedOut, launchctl.terminationStatus == 0 else {
+            return CodexCLIRepairResult(
+                attempted: true,
+                success: false,
+                message: "The launcher route is valid, but CODEX_CLI_PATH could not be published"
+            )
+        }
+        SwapLog.append(.debug(
+            "CODEX_CLI_ROUTE_VERIFIED target=\(routed) local=\(localLauncherPath) homebrew=\(homebrewCodexPath)"
+        ))
         return CodexCLIRepairResult(
             attempted: true,
             success: true,
-            message: "Codex launchers route CLI to patched Codex and desktop to bundled Codex"
+            message: "Verified the journaled Codex launcher route"
         )
     }
 
-    private nonisolated static func preferredHotSwapBinaryPath() -> String? {
-        let candidates = [
-            latestPreparedHotSwapBinaryPath(),
-            managedPatchedCodexPath,
-            forkBinaryPath
-        ].compactMap { $0 }
-
-        for path in candidates {
-            guard completeHotSwapBinaryIsLaunchable(at: path) else {
-                continue
-            }
-            return path
-        }
-        if FileManager.default.fileExists(atPath: forkMarkerPath) {
-            return nil
-        }
-        return nil
-    }
-
-    nonisolated static func latestPreparedHotSwapBinaryPath(
-        rootPath: String = preparedCodexRootPath
-    ) -> String? {
-        guard let versions = try? FileManager.default.contentsOfDirectory(atPath: rootPath) else {
-            return nil
-        }
-
-        return versions
-            .filter { parseSemanticVersion($0) != nil }
-            .sorted { compareSemanticVersions($0, $1) == .orderedDescending }
-            .map { "\(rootPath)/\($0)/codex" }
-            .first { completeHotSwapBinaryIsLaunchable(at: $0) }
-    }
-
     nonisolated static func installedHotSwapVersion(
-        preparedRootPath: String = preparedCodexRootPath,
-        managedPatchedCodexPath: String = managedPatchedCodexPath,
-        forkBinaryPath: String = forkBinaryPath
+        localLauncherPath: String = CodexVersionChecker.localLauncherPath,
+        homebrewBridgePath: String = CodexVersionChecker.homebrewCodexPath
     ) -> String? {
-        let candidates = [
-            latestPreparedHotSwapBinaryPath(rootPath: preparedRootPath),
-            managedPatchedCodexPath,
-            forkBinaryPath
-        ].compactMap { $0 }
-
-        for path in candidates where completeHotSwapBinaryIsLaunchable(at: path) {
-            let health = _codexCLIHealth(at: path)
-            if let version = health.version, !version.isEmpty {
-                return version
-            }
+        guard let path = routedHotSwapBinaryPath(
+            localLauncherPath: localLauncherPath,
+            homebrewBridgePath: homebrewBridgePath
+        ), completeHotSwapBinaryIsLaunchable(at: path) else {
+            return nil
         }
-        return nil
+        return _codexCLIHealth(at: path).version
+    }
+
+    nonisolated static func routedHotSwapBinaryPath(
+        localLauncherPath: String,
+        homebrewBridgePath: String
+    ) -> String? {
+        guard let localScript = try? String(contentsOfFile: localLauncherPath, encoding: .utf8),
+              let bridgeScript = try? String(contentsOfFile: homebrewBridgePath, encoding: .utf8),
+              let localManaged = launcherManagedCodexTarget(from: localScript),
+              let bridgeManaged = launcherManagedCodexTarget(from: bridgeScript) else {
+            return nil
+        }
+
+        let normalizedLocalManaged = (localManaged as NSString).standardizingPath
+        let normalizedBridgeManaged = (bridgeManaged as NSString).standardizingPath
+        guard normalizedLocalManaged == normalizedBridgeManaged,
+              let managedScript = try? String(
+                contentsOfFile: normalizedLocalManaged,
+                encoding: .utf8
+              ),
+              let runtimeTarget = launcherPatchedCodexTarget(from: managedScript) else {
+            return nil
+        }
+        return (runtimeTarget as NSString).standardizingPath
+    }
+
+    nonisolated static func launcherManagedCodexTarget(from script: String) -> String? {
+        let lines = script.components(separatedBy: "\n")
+        guard lines.count == 9,
+              let managed = launcherSingleQuotedValue(
+                in: lines[2],
+                prefix: "MANAGED_CODEX="
+              ), let normalizedManaged = normalizedAbsoluteLauncherPath(managed),
+              script == rustBridgeLauncherScript(managedLauncher: normalizedManaged) else {
+            return nil
+        }
+        return normalizedManaged
+    }
+
+    nonisolated static func launcherPatchedCodexTarget(from script: String) -> String? {
+        let lines = script.components(separatedBy: "\n")
+        guard lines.count == 25,
+              let patched = launcherSingleQuotedValue(
+                in: lines[2],
+                prefix: "\tPATCHED_CODEX="
+              ), let normalizedPatched = normalizedAbsoluteLauncherPath(patched),
+              let helper = launcherSingleQuotedValue(
+                in: lines[3],
+                prefix: "\tPATCHED_HELPER="
+              ), let normalizedHelper = normalizedAbsoluteLauncherPath(helper),
+              let runtimeSHA256 = launcherSingleQuotedValue(
+                in: lines[4],
+                prefix: "\tEXPECTED_CODEX_SHA256="
+              ), isLowercaseSHA256(runtimeSHA256),
+              let helperSHA256 = launcherSingleQuotedValue(
+                in: lines[5],
+                prefix: "\tEXPECTED_HELPER_SHA256="
+              ), isLowercaseSHA256(helperSHA256) else {
+            return nil
+        }
+        let expectedHelper = URL(fileURLWithPath: normalizedPatched)
+            .deletingLastPathComponent()
+            .appending(path: "codex-code-mode-host")
+            .path
+        guard normalizedHelper == expectedHelper,
+              script == rustManagedLauncherScript(
+                patchedBinary: normalizedPatched,
+                runtimeSHA256: runtimeSHA256,
+                helperSHA256: helperSHA256
+              ) else {
+            return nil
+        }
+        return normalizedPatched
+    }
+
+    private nonisolated static func launcherSingleQuotedValue(
+        in line: String,
+        prefix: String
+    ) -> String? {
+        let quotedPrefix = "\(prefix)'"
+        guard line.hasPrefix(quotedPrefix), line.hasSuffix("'") else {
+            return nil
+        }
+        let value = String(line.dropFirst(quotedPrefix.count).dropLast())
+        guard !value.isEmpty,
+              !value.contains("'"),
+              !value.contains("\0"),
+              !value.contains("\r") else {
+            return nil
+        }
+        return value
+    }
+
+    private nonisolated static func normalizedAbsoluteLauncherPath(_ path: String) -> String? {
+        guard (path as NSString).isAbsolutePath,
+              (path as NSString).standardizingPath == path else {
+            return nil
+        }
+        return path
+    }
+
+    private nonisolated static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (97...102).contains(byte)
+        }
+    }
+
+    private nonisolated static func rustBridgeLauncherScript(
+        managedLauncher: String
+    ) -> String {
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "MANAGED_CODEX='\(managedLauncher)'",
+            #"if [[ ! -x "$MANAGED_CODEX" || -L "$MANAGED_CODEX" ]]; then"#,
+            #"  echo "codex: managed CodexSwitch launcher is unavailable at $MANAGED_CODEX; run 'codexswitch-cli codex-update-status'" >&2"#,
+            "  exit 1",
+            "fi",
+            #"exec "$MANAGED_CODEX" "$@""#,
+            "",
+        ].joined(separator: "\n")
+    }
+
+    private nonisolated static func rustManagedLauncherScript(
+        patchedBinary: String,
+        runtimeSHA256: String,
+        helperSHA256: String
+    ) -> String {
+        let helper = URL(fileURLWithPath: patchedBinary)
+            .deletingLastPathComponent()
+            .appending(path: "codex-code-mode-host")
+            .path
+        return [
+            "#!/usr/bin/env bash",
+            "\tset -euo pipefail",
+            "\tPATCHED_CODEX='\(patchedBinary)'",
+            "\tPATCHED_HELPER='\(helper)'",
+            "\tEXPECTED_CODEX_SHA256='\(runtimeSHA256)'",
+            "\tEXPECTED_HELPER_SHA256='\(helperSHA256)'",
+            #"\tCODEX_VPS="${CODEXSWITCH_CODEX_VPS:-$HOME/.local/bin/codex-vps}""#,
+            "",
+            #"\tif [[ "${1:-}" == "--remote" ]]; then"#,
+            "\t  shift",
+            #"\t  if [[ ! -x "$CODEX_VPS" ]]; then"#,
+            #"\t    echo "codex: --remote requires the provenance-checked codex-vps synced client: $CODEX_VPS" >&2"#,
+            "\t    exit 1",
+            "\t  fi",
+            #"\t  exec "$CODEX_VPS" --remote-client "$@""#,
+            "\tfi",
+            "",
+            #"\tif [[ -x "$PATCHED_CODEX" && -x "$PATCHED_HELPER" ]] \"#,
+            #"\t  && [[ ! -L "$PATCHED_CODEX" && ! -L "$PATCHED_HELPER" ]]; then"#,
+            #"\t  exec "$PATCHED_CODEX" "$@""#,
+            "\tfi",
+            "",
+            #"echo "codex: local runtime failed complete provenance/hot-swap validation at $PATCHED_CODEX; run 'codexswitch-cli codex-update-status' and explicitly prepare/install a verified runtime" >&2"#,
+            "exit 1",
+            "",
+        ].joined(separator: "\n")
     }
 
     private nonisolated static func completeHotSwapBinaryIsLaunchable(at path: String) -> Bool {
-        guard FileManager.default.isExecutableFile(atPath: path),
-              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              binaryHasSighupSupportData(data),
-              binaryHasGoalSupportData(data) else {
+        guard localHotSwapUnitIsStructurallyValid(at: path) else {
             return false
         }
         return _codexCLIHealth(at: path).healthy
+    }
+
+    private nonisolated static func fatMachOContainsOnlyExecutables(
+        _ data: Data,
+        is64Bit: Bool,
+        bigEndian: Bool
+    ) -> Bool {
+        guard let architectureCount = readUInt32(from: data, at: 4, bigEndian: bigEndian),
+              architectureCount > 0,
+              architectureCount <= 64 else {
+            return false
+        }
+
+        let entrySize = is64Bit ? 32 : 20
+        guard data.count >= 8 + Int(architectureCount) * entrySize else {
+            return false
+        }
+
+        for index in 0..<Int(architectureCount) {
+            let entryOffset = 8 + index * entrySize
+            let sliceOffset: UInt64?
+            if is64Bit {
+                sliceOffset = readUInt64(from: data, at: entryOffset + 8, bigEndian: bigEndian)
+            } else {
+                sliceOffset = readUInt32(from: data, at: entryOffset + 8, bigEndian: bigEndian).map(UInt64.init)
+            }
+
+            guard let sliceOffset,
+                  sliceOffset <= UInt64(Int.max - 16),
+                  thinMachOIsExecutable(data, at: Int(sliceOffset)) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private nonisolated static func thinMachOIsExecutable(_ data: Data, at offset: Int) -> Bool {
+        guard offset >= 0,
+              data.count >= 16,
+              offset <= data.count - 16,
+              let magic = readUInt32(from: data, at: offset, bigEndian: true) else {
+            return false
+        }
+        switch magic {
+        case 0xCEFAEDFE, 0xCFFAEDFE:
+            return readUInt32(from: data, at: offset + 12, bigEndian: false) == 2
+        case 0xFEEDFACE, 0xFEEDFACF:
+            return readUInt32(from: data, at: offset + 12, bigEndian: true) == 2
+        default:
+            return false
+        }
+    }
+
+    private nonisolated static func readUInt32(
+        from data: Data,
+        at offset: Int,
+        bigEndian: Bool
+    ) -> UInt32? {
+        guard offset >= 0, data.count >= 4, offset <= data.count - 4 else {
+            return nil
+        }
+        let bytes = (0..<4).map { data[data.index(data.startIndex, offsetBy: offset + $0)] }
+        if bigEndian {
+            return bytes.reduce(0) { ($0 << 8) | UInt32($1) }
+        }
+        return bytes.reversed().reduce(0) { ($0 << 8) | UInt32($1) }
+    }
+
+    private nonisolated static func readUInt64(
+        from data: Data,
+        at offset: Int,
+        bigEndian: Bool
+    ) -> UInt64? {
+        guard offset >= 0, data.count >= 8, offset <= data.count - 8 else {
+            return nil
+        }
+        let bytes = (0..<8).map { data[data.index(data.startIndex, offsetBy: offset + $0)] }
+        if bigEndian {
+            return bytes.reduce(0) { ($0 << 8) | UInt64($1) }
+        }
+        return bytes.reversed().reduce(0) { ($0 << 8) | UInt64($1) }
     }
 
     private nonisolated static func _codexCLIHealth(at path: String) -> CodexCLIHealth {
@@ -609,293 +1181,4 @@ final class CodexVersionChecker {
         return CodexCLIHealth(healthy: !version.isEmpty, version: version, timedOut: false, terminationStatus: 0)
     }
 
-    private nonisolated static func shellSingleQuoted(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
-    }
-
-    private nonisolated static func _getNpmPackageVersion() -> String {
-        let packageJsonPath = "/opt/homebrew/lib/node_modules/@openai/codex/package.json"
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: packageJsonPath)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = json["version"] as? String else {
-            return "?"
-        }
-        return version
-    }
-
-    private nonisolated static func _getLatestVersion() -> String {
-        if let target = _getPreferredUpdateTarget() {
-            return target.version
-        }
-
-        // Fall back to ~/.codex/version.json if npm dist-tags are unavailable.
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: versionJsonPath)),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let latest = json["latest_version"] as? String {
-            return latest
-        }
-
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/opt/homebrew/bin/npm"),
-            arguments: ["view", "@openai/codex", "version"],
-            timeout: 8
-        )
-        guard !result.timedOut, result.terminationStatus == 0 else {
-            return "?"
-        }
-        let output = result.stdoutString.trimmingCharacters(in: .whitespacesAndNewlines)
-        return output.isEmpty ? "?" : output
-    }
-
-    private nonisolated static func _getPreferredUpdateTarget() -> CodexUpdateTarget? {
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/opt/homebrew/bin/npm"),
-            arguments: ["view", "@openai/codex", "dist-tags", "--json"],
-            timeout: 8
-        )
-        guard !result.timedOut, result.terminationStatus == 0 else {
-            return nil
-        }
-        let data = Data(result.stdoutString.utf8)
-        guard let tags = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return nil
-        }
-        return preferredUpdateTarget(distTags: tags)
-    }
-
-    nonisolated static func preferredUpdateTarget(distTags: [String: String]) -> CodexUpdateTarget? {
-        // Only install the stable npm channel automatically. Alpha/prerelease native
-        // binaries can be valid npm packages while still being killed by macOS at
-        // launch, which breaks every downstream tool that shells out to `codex`.
-        guard let latest = distTags["latest"],
-              !isPrereleaseVersion(latest) else {
-            return nil
-        }
-        return CodexUpdateTarget(version: latest, npmSpecifier: "@openai/codex@latest")
-    }
-
-    private struct ActionResult {
-        let success: Bool
-        let message: String
-    }
-
-    private nonisolated static func _performNpmUpdate(
-        target: CodexUpdateTarget?,
-        allowRollback: Bool = true
-    ) -> ActionResult {
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-        let npmSpecifier = target?.npmSpecifier ?? "@openai/codex@latest"
-        let previousVersion = _getNpmPackageVersion()
-
-        let result = _npmInstallCodex(specifier: npmSpecifier, environment: env)
-        if result.timedOut {
-            return ActionResult(success: false, message: "npm update timed out")
-        }
-        guard result.terminationStatus == 0 else {
-            return ActionResult(
-                success: false,
-                message: "npm update failed: \(String(result.stderrString.prefix(200)))"
-            )
-        }
-
-        let health = _codexCLIHealth(at: homebrewCodexPath)
-        guard health.healthy else {
-            if allowRollback, !previousVersion.isEmpty, previousVersion != "?", !isPrereleaseVersion(previousVersion) {
-                _ = _npmInstallCodex(specifier: "@openai/codex@\(previousVersion)", environment: env)
-            }
-            return ActionResult(
-                success: false,
-                message: "npm update produced an unusable Codex CLI (status=\(health.terminationStatus), timedOut=\(health.timedOut)); rolled back if a stable previous version was available"
-            )
-        }
-        return ActionResult(success: true, message: "npm update succeeded and Codex CLI passed launch health check")
-    }
-
-    private nonisolated static func _npmInstallCodex(
-        specifier: String,
-        environment: [String: String]
-    ) -> ProcessRunResult {
-        ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/opt/homebrew/bin/npm"),
-            arguments: ["install", "-g", specifier],
-            timeout: 600,
-            environment: environment
-        )
-    }
-
-    nonisolated static func replacingWorkspaceVersion(in content: String, with version: String) -> String? {
-        guard let range = content.range(
-            of: #"version = "\d+\.\d+\.\d+(?:-[^"]+)?""#,
-            options: .regularExpression
-        ) else {
-            return nil
-        }
-        var updated = content
-        updated.replaceSubrange(range, with: "version = \"\(version)\"")
-        return updated
-    }
-
-    private nonisolated static func compareSemanticVersions(_ lhs: String, _ rhs: String) -> ComparisonResult {
-        guard let left = parseSemanticVersion(lhs), let right = parseSemanticVersion(rhs) else {
-            return lhs.compare(rhs, options: .numeric)
-        }
-
-        for pair in [(left.major, right.major), (left.minor, right.minor), (left.patch, right.patch)] {
-            if pair.0 < pair.1 { return .orderedAscending }
-            if pair.0 > pair.1 { return .orderedDescending }
-        }
-
-        switch (left.prerelease, right.prerelease) {
-        case (nil, nil):
-            return .orderedSame
-        case (nil, _?):
-            return .orderedDescending
-        case (_?, nil):
-            return .orderedAscending
-        case let (leftPre?, rightPre?):
-            return comparePrerelease(leftPre, rightPre)
-        }
-    }
-
-
-    private nonisolated static func isPrereleaseVersion(_ version: String) -> Bool {
-        parseSemanticVersion(version)?.prerelease != nil
-    }
-
-    private nonisolated static func cliRepairCooldownExpired(now: Date = Date()) -> Bool {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: cliRepairCooldownPath),
-              let modified = attrs[.modificationDate] as? Date else {
-            return true
-        }
-        return now.timeIntervalSince(modified) >= cliRepairCooldownSeconds
-    }
-
-    private nonisolated static func markCLIRepairAttempt() {
-        let path = URL(fileURLWithPath: cliRepairCooldownPath)
-        try? FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: path.path, contents: Data())
-        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: path.path)
-    }
-
-    private nonisolated static func parseSemanticVersion(_ version: String) -> SemanticVersion? {
-        let pattern = /^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9.-]+))?$/
-        guard let match = version.firstMatch(of: pattern) else { return nil }
-        return SemanticVersion(
-            major: Int(match.output.1) ?? 0,
-            minor: Int(match.output.2) ?? 0,
-            patch: Int(match.output.3) ?? 0,
-            prerelease: match.output.4.map(String.init)
-        )
-    }
-
-    private nonisolated static func comparePrerelease(_ lhs: String, _ rhs: String) -> ComparisonResult {
-        let leftParts = lhs.split(separator: ".").map(String.init)
-        let rightParts = rhs.split(separator: ".").map(String.init)
-        let count = max(leftParts.count, rightParts.count)
-
-        for index in 0..<count {
-            guard index < leftParts.count else { return .orderedAscending }
-            guard index < rightParts.count else { return .orderedDescending }
-
-            let left = leftParts[index]
-            let right = rightParts[index]
-            if let leftNumber = Int(left), let rightNumber = Int(right) {
-                if leftNumber < rightNumber { return .orderedAscending }
-                if leftNumber > rightNumber { return .orderedDescending }
-            } else {
-                let comparison = left.compare(right, options: .numeric)
-                if comparison != .orderedSame { return comparison }
-            }
-        }
-        return .orderedSame
-    }
-
-    private nonisolated static func _forkWorktreeIsClean() -> Bool {
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
-            arguments: ["-C", forkSourcePath, "status", "--porcelain"],
-            timeout: 5
-        )
-        guard !result.timedOut, result.terminationStatus == 0 else {
-            return false
-        }
-        return result.stdoutString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// Rebuild the SIGHUP fork binary against the current source with the given version.
-    ///
-    /// This intentionally does not install the rebuilt binary over the global
-    /// Homebrew/npm Codex executable. A bad native binary there breaks Codex.app,
-    /// Codex CLI, no-mistakes, and every subprocess that expects `codex` to launch.
-    private nonisolated static func _rebuildFork(version: String) -> ActionResult {
-        let cargoTomlPath = "\(forkSourcePath)/Cargo.toml"
-
-        // Step 1: Only rebase a clean fork. The SIGHUP fork often has local patches,
-        // and clobbering them would remove the hot-swap support CodexSwitch depends on.
-        if _forkWorktreeIsClean() {
-            _ = ProcessRunner.run(
-                executableURL: URL(fileURLWithPath: "/usr/bin/git"),
-                arguments: ["-C", forkSourcePath, "pull", "--rebase"],
-                timeout: 120
-            )
-        } else {
-            logger.info("Skipping fork rebase because codex-rs worktree has local changes")
-        }
-
-        // Step 2: Update version in workspace Cargo.toml (after any safe pull so it persists)
-        do {
-            let content = try String(contentsOfFile: cargoTomlPath, encoding: .utf8)
-            guard let updated = replacingWorkspaceVersion(in: content, with: version) else {
-                return ActionResult(success: false, message: "Failed to find workspace package version in Cargo.toml")
-            }
-            try updated.write(toFile: cargoTomlPath, atomically: true, encoding: .utf8)
-        } catch {
-            return ActionResult(success: false, message: "Failed to update Cargo.toml: \(error.localizedDescription)")
-        }
-
-        // Step 3: Rebuild
-        var env = ProcessInfo.processInfo.environment
-        let cargoDir = NSString("~/.cargo/bin").expandingTildeInPath
-        env["PATH"] = "\(cargoDir):/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-        let buildResult = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: NSString("~/.cargo/bin/cargo").expandingTildeInPath),
-            arguments: ["build", "--release", "-p", "codex-cli"],
-            timeout: 1800,
-            environment: env,
-            currentDirectoryURL: URL(fileURLWithPath: forkSourcePath)
-        )
-
-        if buildResult.timedOut {
-            return ActionResult(success: false, message: "Cargo build timed out")
-        }
-        guard buildResult.terminationStatus == 0 else {
-            return ActionResult(
-                success: false,
-                message: "Cargo build failed: \(String(buildResult.stderrString.suffix(300)))"
-            )
-        }
-
-        do {
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: forkBinaryPath)
-
-            let markerPath = forkMarkerPath
-            if FileManager.default.fileExists(atPath: markerPath) {
-                try FileManager.default.setAttributes(
-                    [.modificationDate: Date()],
-                    ofItemAtPath: markerPath
-                )
-            }
-
-            logger.info("Fork binary rebuilt for v\(version); global CLI install intentionally unchanged")
-            SwapLog.append(.debug("SIGHUP_FORK_REBUILT_NOT_INSTALLED version=\(version)"))
-            return ActionResult(
-                success: true,
-                message: "Fork rebuilt for v\(version); global Codex CLI left unchanged for safety"
-            )
-        } catch {
-            return ActionResult(success: false, message: "Fork validation failed: \(error.localizedDescription)")
-        }
-    }
 }

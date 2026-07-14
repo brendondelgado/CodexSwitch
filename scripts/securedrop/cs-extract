@@ -21,9 +21,65 @@ fi
 mkdir -p "$target"
 tmp="$target/.incoming-extract-$(date +%s)-$$"
 mkdir -p "$tmp"
-tar -xf "$tarball" -C "$tmp"
+chmod 700 "$tmp"
+trap 'rm -rf "$tmp"' EXIT
+python3 - "$tarball" "$tmp" <<'PY'
+import os
+import pathlib
+import re
+import shutil
+import sys
+import tarfile
+
+archive_path = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+max_members = int(os.environ.get("CODEXSWITCH_SECUREDROP_MAX_EXTRACT_MEMBERS", "100000"))
+max_bytes = int(os.environ.get("CODEXSWITCH_SECUREDROP_MAX_EXTRACT_BYTES", str(10 * 1024**3)))
+safe_top_level = re.compile(r"^[A-Za-z0-9._-]+$")
+
+with tarfile.open(archive_path, mode="r:*") as archive:
+    members = archive.getmembers()
+    if not members or len(members) > max_members:
+        raise SystemExit("cs-extract: archive member count is empty or exceeds the limit")
+
+    total_bytes = 0
+    top_levels = set()
+    validated = []
+    for member in members:
+        path = pathlib.PurePosixPath(member.name)
+        parts = path.parts
+        if not parts or path.is_absolute() or any(part in ("", ".", "..") for part in parts):
+            raise SystemExit(f"cs-extract: unsafe archive path: {member.name}")
+        if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
+            raise SystemExit(f"cs-extract: links and special files are not allowed: {member.name}")
+        if not safe_top_level.fullmatch(parts[0]) or parts[0] in (".", ".."):
+            raise SystemExit(f"cs-extract: invalid top-level name: {parts[0]}")
+        total_bytes += member.size
+        if total_bytes > max_bytes:
+            raise SystemExit("cs-extract: archive exceeds the uncompressed size limit")
+        top_levels.add(parts[0])
+        validated.append((member, parts))
+
+    if len(top_levels) != 1:
+        raise SystemExit("cs-extract: archive must contain one top-level directory/file")
+
+    for member, parts in validated:
+        output = destination.joinpath(*parts)
+        if member.isdir():
+            directory_mode = (member.mode & 0o777) | 0o700
+            output.mkdir(mode=directory_mode, parents=True, exist_ok=True)
+            output.chmod(directory_mode)
+            continue
+        output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit(f"cs-extract: failed to read archive member: {member.name}")
+        with source, output.open("xb") as sink:
+            shutil.copyfileobj(source, sink, length=1024 * 1024)
+        output.chmod((member.mode & 0o777) | 0o600)
+PY
 count=$(find "$tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
-[[ "$count" == 1 ]] || { echo "cs-extract: archive must contain one top-level directory/file" >&2; rm -rf "$tmp"; exit 1; }
+[[ "$count" == 1 ]] || { echo "cs-extract: archive must contain one top-level directory/file" >&2; exit 1; }
 item="$(find "$tmp" -mindepth 1 -maxdepth 1 -print -quit)"
 base="$(basename "$item")"; case "$base" in ""|.|..|*/*|*\\*) echo "cs-extract: invalid top-level name" >&2; rm -rf "$tmp"; exit 1;; esac
 dest="$target/$base"
@@ -34,4 +90,5 @@ if [[ -e "$dest" ]]; then
 fi
 mv "$item" "$dest"
 rmdir "$tmp" 2>/dev/null || true
+trap - EXIT
 echo "$dest"

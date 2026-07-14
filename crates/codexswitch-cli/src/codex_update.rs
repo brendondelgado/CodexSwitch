@@ -1,73 +1,73 @@
+use crate::bounded_command;
 use crate::patched_codex;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
+use std::io::{BufReader, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@openai%2Fcodex/latest";
 const CODEX_REPO_URL: &str = "https://github.com/openai/codex.git";
-const DAILY_CHECK_HOURS: i64 = 24;
+const AUTOMATIC_CHECK_INTERVAL_MINUTES: i64 = 15;
+const AUTOMATIC_FAILURE_BACKOFF_HOURS: i64 = 6;
+const CHECKING_STALE_AFTER_MINUTES: i64 = 5;
+const INSTALLING_STALE_AFTER_MINUTES: i64 = 15;
+const MINIMUM_SOURCE_PREPARE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const MANAGED_DAEMON_PROC_SCAN_TIMEOUT: Duration = Duration::from_secs(3);
+const MANAGED_DAEMON_PROC_SCAN_MAX_ENTRIES: usize = 200_000;
+const MANAGED_DAEMON_PID_RECORD_MAX_BYTES: u64 = 4 * 1024;
+const MANAGED_DAEMON_CMDLINE_MAX_BYTES: u64 = 64 * 1024;
+const UPDATE_STATE_MAX_BYTES: u64 = 1024 * 1024;
+const REGISTRY_METADATA_MAX_BYTES: u64 = 64 * 1024;
+const SOURCE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MANAGED_APP_SERVER_UNIT: &str = "signul-codex-app-server.service";
+const UPDATER_RETENTION_MAX_ENUM_ENTRIES: usize = 200_000;
+const SOURCE_TREE_MAX_COUNT: usize = 3;
+const SOURCE_TREE_MAX_TOTAL_BYTES: u64 = 60 * 1024 * 1024 * 1024;
+const SOURCE_TREE_MAX_AGE: Duration = Duration::from_secs(45 * 24 * 60 * 60);
+const PREPARED_TREE_MAX_COUNT: usize = 4;
+const PREPARED_TREE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const PREPARED_TREE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const UPDATE_LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+const UPDATE_LOG_MAX_COUNT: usize = 4;
+const UPDATE_LOG_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
+const UPDATE_LOG_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const BACKGROUND_UPDATE_DEADLINE: Duration = Duration::from_secs(75 * 60);
+const BACKGROUND_UPDATE_MARKER: &str = "CODEXSWITCH_BOUNDED_BACKGROUND_UPDATE";
+const RUNTIME_START_INSTALL_GUARD: &str = "runtime-start-install.lock";
+const RUNTIME_INSTALL_JOURNAL: &str = "codex-runtime-install.json";
+const MACOS_LAUNCHER_INSTALL_JOURNAL: &str = "macos-runtime-activation.json";
+const BUILD_TARGET_CLEANUP_ATTEMPTS: usize = 3;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UpdateStatus {
-    Idle,
-    Checking,
-    Preparing,
-    Installing,
-    ReadyToInstall,
-    Installed,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodexUpdateState {
-    pub status: UpdateStatus,
-    pub last_checked_at: Option<DateTime<Utc>>,
-    pub latest_stable_version: Option<String>,
-    pub installed_version: Option<String>,
-    pub prepared_version: Option<String>,
-    pub prepared_source_path: Option<String>,
-    pub prepared_binary_path: Option<String>,
-    pub error: Option<String>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodexUpdateReport {
-    pub status: UpdateStatus,
-    pub summary: String,
-    pub last_checked_at: Option<DateTime<Utc>>,
-    pub latest_stable_version: Option<String>,
-    pub installed_version: Option<String>,
-    pub prepared_version: Option<String>,
-    pub prepared_source_path: Option<String>,
-    pub prepared_binary_path: Option<String>,
-    pub install_command: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NpmLatest {
-    version: String,
-}
-
+include!("codex_update/state.rs");
+include!("codex_update/transaction.rs");
+include!("codex_update/macos_activation.rs");
 impl Default for CodexUpdateState {
     fn default() -> Self {
         Self {
             status: UpdateStatus::Idle,
             last_checked_at: None,
             latest_stable_version: None,
-            installed_version: installed_codex_version(),
+            installed_version: None,
+            installed_artifact_manifest_sha256: None,
             prepared_version: None,
             prepared_source_path: None,
             prepared_binary_path: None,
+            prepared_artifact_manifest_sha256: None,
+            failed_prepare_version: None,
+            prepare_retry_not_before: None,
+            failed_install_version: None,
+            install_retry_not_before: None,
+            cleanup_pending_target_path: None,
+            unresolved_failure: None,
+            install_transaction: None,
             error: None,
             updated_at: Utc::now(),
         }
@@ -75,61 +75,175 @@ impl Default for CodexUpdateState {
 }
 
 pub fn status_report() -> Result<CodexUpdateReport> {
+    let data_dir = codexswitch_data_dir()?;
+    status_report_at(
+        &data_dir.join("codex-update.lock"),
+        &data_dir.join("codex-cli-update.json"),
+        installed_codex_version,
+        reconcile_installed_state,
+    )
+}
+
+fn deferred_status_report() -> Result<CodexUpdateReport> {
     let mut state = load_state()?;
-    state.installed_version = installed_codex_version();
-    let changed = reconcile_installed_state(&mut state);
-    if changed {
-        save_state(&state)?;
+    restore_unresolved_failure(&mut state);
+    Ok(report_from_state(state))
+}
+
+fn status_report_at<Installed, Reconcile>(
+    lock_path: &Path,
+    state_path: &Path,
+    installed_version: Installed,
+    reconcile: Reconcile,
+) -> Result<CodexUpdateReport>
+where
+    Installed: FnOnce() -> Option<String>,
+    Reconcile: FnOnce(&mut CodexUpdateState) -> bool,
+{
+    let Some(_operation_lock) = UpdaterOperationLock::try_acquire_at(lock_path)? else {
+        let mut state = load_state_at(state_path)?;
+        restore_unresolved_failure(&mut state);
+        return Ok(report_from_state(state));
+    };
+    let mut state = load_state_at(state_path)?;
+    let observed_installed_version = installed_version();
+    let mut changed = state.installed_version != observed_installed_version;
+    state.installed_version = observed_installed_version;
+    if state.unresolved_failure.is_some() {
+        changed |= restore_unresolved_failure(&mut state);
+    } else {
+        changed |= reconcile(&mut state);
     }
-    let report = report_from_state(state);
-    Ok(report)
+    if changed {
+        save_state_at(state_path, &state)?;
+    }
+    Ok(report_from_state(state))
 }
 
 pub fn check_for_update(force: bool, prepare: bool) -> Result<CodexUpdateReport> {
+    let Some(_operation_lock) = UpdaterOperationLock::try_acquire()? else {
+        return deferred_status_report();
+    };
+    check_for_update_with_lock_held(force, prepare)
+}
+
+fn check_for_update_with_lock_held(force: bool, prepare: bool) -> Result<CodexUpdateReport> {
+    dispatch_update_check(
+        prepare,
+        || check_metadata_with_lock_held(force, false),
+        || check_with_artifact_maintenance_lock_held(force),
+    )
+}
+
+fn dispatch_update_check<T, Metadata, Maintenance>(
+    maintenance_requested: bool,
+    metadata_only: Metadata,
+    with_maintenance: Maintenance,
+) -> Result<T>
+where
+    Metadata: FnOnce() -> Result<T>,
+    Maintenance: FnOnce() -> Result<T>,
+{
+    if maintenance_requested {
+        with_maintenance()
+    } else {
+        metadata_only()
+    }
+}
+
+fn check_with_artifact_maintenance_lock_held(force: bool) -> Result<CodexUpdateReport> {
+    let mut state = load_state()?;
+    let data_dir = codexswitch_data_dir()?;
+    enforce_updater_retention_at(&state, &data_dir, SystemTime::now())?;
+    if cleanup_pending_target_at(&mut state, &data_dir)? {
+        save_state(&state)?;
+    }
+    if cleanup_stale_preparation_artifacts(&mut state, Utc::now())? {
+        save_state(&state)?;
+    }
+    check_metadata_with_lock_held(force, true)
+}
+
+fn check_metadata_with_lock_held(
+    force: bool,
+    prepare_requested: bool,
+) -> Result<CodexUpdateReport> {
     let mut state = load_state()?;
     if !force && !check_due(&state) {
-        state.installed_version = installed_codex_version();
         return Ok(report_from_state(state));
     }
 
+    let checked_at = Utc::now();
+    let status_before_check = state.status.clone();
+    if status_before_check == UpdateStatus::Failed && state.unresolved_failure.is_none() {
+        let failed_at = state.updated_at;
+        let failed_version = state
+            .failed_install_version
+            .clone()
+            .or_else(|| state.failed_prepare_version.clone());
+        let failure_kind = failure_kind_from_state(&state);
+        record_unresolved_failure(&mut state, failure_kind, failed_at, failed_version, None);
+    }
     state.status = UpdateStatus::Checking;
-    state.last_checked_at = Some(Utc::now());
-    state.error = None;
+    state.last_checked_at = Some(checked_at);
+    state.updated_at = checked_at;
+    if state.failed_prepare_version.is_none()
+        && state.failed_install_version.is_none()
+        && !matches!(
+            status_before_check,
+            UpdateStatus::Installing | UpdateStatus::Failed
+        )
+    {
+        state.error = None;
+    }
     save_state(&state)?;
 
     match fetch_latest_stable_version() {
         Ok(latest) => {
-            state.latest_stable_version = Some(latest.clone());
-            state.installed_version = installed_codex_version();
-            if !version_is_stable(&latest) {
-                state.status = UpdateStatus::Failed;
-                state.error = Some(format!(
-                    "registry latest resolved to non-stable version {latest}; refusing"
-                ));
-            } else if state.installed_version.as_deref() == Some(latest.as_str()) {
-                state.status = UpdateStatus::Installed;
-                state.prepared_version = None;
-                state.prepared_source_path = None;
-                state.prepared_binary_path = None;
-            } else if state.prepared_version.as_deref() == Some(latest.as_str())
-                && state
-                    .prepared_binary_path
-                    .as_deref()
-                    .map(Path::new)
-                    .is_some_and(patched_codex::binary_has_hot_swap_markers)
-            {
-                state.status = UpdateStatus::ReadyToInstall;
-            } else if prepare {
-                save_state(&state)?;
-                return prepare_version(&latest);
+            let prepared_runtime_is_valid = if prepare_requested {
+                state.prepared_version.as_deref() == Some(latest.as_str())
+                    && state
+                        .prepared_binary_path
+                        .as_deref()
+                        .map(Path::new)
+                        .is_some_and(|path| prepared_runtime_is_valid(path, &latest))
             } else {
-                state.status = UpdateStatus::Idle;
+                status_before_check == UpdateStatus::ReadyToInstall
+                    && state.prepared_version.as_deref() == Some(latest.as_str())
+            };
+            let can_prepare = prepare_requested && current_source_prepare_capacity()?;
+            let installed_version = if prepare_requested {
+                installed_codex_version()
+            } else {
+                state.installed_version.clone()
+            };
+            if apply_successful_metadata_check(
+                &mut state,
+                &latest,
+                installed_version,
+                prepared_runtime_is_valid,
+                prepare_requested,
+                can_prepare,
+                status_before_check,
+                checked_at,
+            ) {
+                save_state(&state)?;
+                return prepare_version_with_lock_held(&latest);
             }
         }
         Err(error) => {
-            state.status = UpdateStatus::Failed;
-            state.error = Some(format!("{error:#}"));
+            apply_metadata_failure(&mut state, format!("{error:#}"), checked_at);
         }
+    }
+
+    if state.status == UpdateStatus::Failed && state.unresolved_failure.is_none() {
+        record_unresolved_failure(
+            &mut state,
+            UpdateFailureKind::Metadata,
+            checked_at,
+            None,
+            None,
+        );
     }
 
     state.updated_at = Utc::now();
@@ -137,15 +251,157 @@ pub fn check_for_update(force: bool, prepare: bool) -> Result<CodexUpdateReport>
     Ok(report_from_state(state))
 }
 
+fn apply_metadata_failure(state: &mut CodexUpdateState, error: String, checked_at: DateTime<Utc>) {
+    if state.unresolved_failure.is_some() {
+        restore_unresolved_failure(state);
+        return;
+    }
+    state.status = UpdateStatus::Failed;
+    state.error = Some(error);
+    record_unresolved_failure(state, UpdateFailureKind::Metadata, checked_at, None, None);
+}
+
+fn apply_successful_metadata_check(
+    state: &mut CodexUpdateState,
+    latest: &str,
+    installed_version: Option<String>,
+    prepared_runtime_is_valid: bool,
+    prepare_requested: bool,
+    can_prepare: bool,
+    status_before_check: UpdateStatus,
+    now: DateTime<Utc>,
+) -> bool {
+    state.last_checked_at = Some(now);
+    state.latest_stable_version = Some(latest.to_string());
+    state.installed_version = installed_version;
+    if version_is_stable(latest)
+        && state
+            .unresolved_failure
+            .as_ref()
+            .is_some_and(|failure| failure.kind == UpdateFailureKind::Metadata)
+    {
+        clear_unresolved_failure(state);
+        state.error = None;
+    }
+    let preserve_same_version_observation = state.installed_version.as_deref() == Some(latest)
+        && same_version_observation_must_preserve_failure(state, latest, &status_before_check);
+    if !preserve_same_version_observation {
+        if has_prepare_failure_for_version(state, latest)
+            && state.prepare_retry_not_before.is_none()
+        {
+            state.prepare_retry_not_before =
+                Some(state.updated_at + ChronoDuration::hours(AUTOMATIC_FAILURE_BACKOFF_HOURS));
+        }
+        if has_install_failure_for_version(state, latest)
+            && state.install_retry_not_before.is_none()
+        {
+            state.install_retry_not_before =
+                Some(state.updated_at + ChronoDuration::hours(AUTOMATIC_FAILURE_BACKOFF_HOURS));
+        }
+        clear_obsolete_prepare_failure(state, latest);
+        clear_obsolete_install_failure(state, latest);
+    }
+
+    if !version_is_stable(latest) {
+        state.status = UpdateStatus::Failed;
+        state.error = Some(format!(
+            "registry latest resolved to non-stable version {latest}; refusing"
+        ));
+    } else if state.installed_version.as_deref() == Some(latest) {
+        if preserve_same_version_observation {
+            if !restore_unresolved_failure(state) {
+                state.status = status_before_check;
+            }
+        } else {
+            mark_version_installed(state, latest, now);
+        }
+    } else if state.prepared_version.as_deref() == Some(latest) && prepared_runtime_is_valid {
+        if has_install_failure_for_version(state, latest)
+            && status_before_check == UpdateStatus::Failed
+        {
+            state.status = UpdateStatus::Failed;
+        } else {
+            state.status = UpdateStatus::ReadyToInstall;
+            if !has_install_failure_for_version(state, latest) {
+                state.error = None;
+            }
+        }
+    } else if prepare_retry_active_for_version(state, latest, now) {
+        state.status = UpdateStatus::Failed;
+        if state.error.is_none() {
+            state.error = Some(format!(
+                "preparation of Codex {latest} is deferred until the retry deadline"
+            ));
+        }
+    } else {
+        state.status = UpdateStatus::Idle;
+        state.error = None;
+    }
+    state.updated_at = now;
+    if state.unresolved_failure.is_some() {
+        restore_unresolved_failure(state);
+    }
+
+    prepare_requested
+        && can_prepare
+        && state.status == UpdateStatus::Idle
+        && !prepare_retry_active_for_version(state, latest, now)
+}
+
 pub fn prepare_version(version: &str) -> Result<CodexUpdateReport> {
+    let Some(_operation_lock) = UpdaterOperationLock::try_acquire()? else {
+        return deferred_status_report();
+    };
+    prepare_version_with_lock_held(version)
+}
+
+fn prepare_version_with_lock_held(version: &str) -> Result<CodexUpdateReport> {
+    if HostPlatform::current() == HostPlatform::MacOs {
+        bail!(
+            "local Codex source builds are disabled on macOS; use the attested remote macOS runtime artifact workflow"
+        );
+    }
     if !version_is_stable(version) {
         bail!("refusing to prepare non-stable Codex version {version}");
     }
 
-    let source_dir = codexswitch_data_dir()?.join(format!("codex-source-stable-{version}"));
-    let prepared_dir = codexswitch_data_dir()?.join("prepared-codex").join(version);
-    let prepared_binary = prepared_dir.join("codex");
     let mut state = load_state()?;
+    let now = Utc::now();
+    let data_dir = codexswitch_data_dir()?;
+    enforce_updater_retention_at(&state, &data_dir, SystemTime::now())?;
+    if cleanup_pending_target_at(&mut state, &data_dir)? {
+        save_state(&state)?;
+    }
+    if cleanup_stale_preparation_artifacts(&mut state, now)? {
+        save_state(&state)?;
+    }
+    if reconcile_requested_version_as_installed(&mut state, version, installed_codex_version(), now)
+    {
+        save_state(&state)?;
+        return Ok(report_from_state(state));
+    }
+    match reconcile_or_cleanup_existing_prepared_runtime(&mut state, version, now, &data_dir)? {
+        ExistingPreparedRuntimeDisposition::Reused => {
+            save_state(&state)?;
+            return Ok(report_from_state(state));
+        }
+        ExistingPreparedRuntimeDisposition::ClearedInvalid => save_state(&state)?,
+        ExistingPreparedRuntimeDisposition::Absent => {}
+    }
+    if prepare_retry_active_for_version(&state, version, now)
+        || busy_update_state_is_fresh(&state, now)
+    {
+        save_state(&state)?;
+        return Ok(report_from_state(state));
+    }
+    if !current_source_prepare_capacity()? {
+        save_state(&state)?;
+        return Ok(report_from_state(state));
+    }
+
+    let source_dir = data_dir.join(format!("codex-source-stable-{version}"));
+    let prepared_dir = new_prepared_generation_dir(&data_dir, version);
+    let prepared_binary = prepared_dir.join("codex");
     state.status = UpdateStatus::Preparing;
     state.latest_stable_version = Some(version.to_string());
     state.prepared_version = Some(version.to_string());
@@ -154,48 +410,70 @@ pub fn prepare_version(version: &str) -> Result<CodexUpdateReport> {
     state.error = None;
     state.updated_at = Utc::now();
     save_state(&state)?;
+    enforce_updater_retention_at(&state, &data_dir, SystemTime::now())?;
 
-    let result = (|| -> Result<()> {
+    let workspace = source_dir.join("codex-rs");
+    let result = run_with_build_target_cleanup(&workspace, || -> Result<()> {
         checkout_stable_source(version, &source_dir)?;
         patch_codex_source(&source_dir)?;
-        let workspace = source_dir.join("codex-rs");
         let built_binary = patched_codex::build_codex(&workspace)?;
-        fs::create_dir_all(&prepared_dir)?;
-        fs::copy(&built_binary, &prepared_binary).with_context(|| {
-            format!(
-                "failed to stage {} at {}",
-                built_binary.display(),
-                prepared_binary.display()
-            )
-        })?;
-        set_executable(&prepared_binary)?;
-        if !patched_codex::binary_has_hot_swap_markers(&prepared_binary) {
-            bail!(
-                "staged Codex binary is missing hot-swap markers: {}",
-                prepared_binary.display()
-            );
-        }
-        let prepared_version = patched_codex::codex_version(&prepared_binary)
-            .context("staged Codex has no version")?;
-        if prepared_version != version {
-            bail!("staged Codex version {prepared_version} did not match expected {version}");
-        }
+        stage_and_validate_prepared_runtime(&built_binary, &prepared_dir, version)?;
         Ok(())
-    })();
+    });
 
     match result {
-        Ok(()) => {
+        Ok(BuildTargetCleanupOutcome {
+            value: (),
+            cleanup_warning,
+        }) => {
             state.status = UpdateStatus::ReadyToInstall;
             state.installed_version = installed_codex_version();
-            state.error = None;
+            resolve_prepare_failure_for_version(&mut state, version);
+            match cleanup_warning {
+                Some(error) => {
+                    state.cleanup_pending_target_path =
+                        Some(workspace.join("target").display().to_string());
+                    state.error = Some(format!(
+                        "Codex {version} is ready to install, but its build target could not be cleaned: {error:#}"
+                    ));
+                }
+                None => {
+                    state.cleanup_pending_target_path = None;
+                    state.error = None;
+                }
+            }
         }
         Err(error) => {
             state.status = UpdateStatus::Failed;
             state.error = Some(format!("{error:#}"));
+            if fs::symlink_metadata(workspace.join("target")).is_ok() {
+                state.cleanup_pending_target_path =
+                    Some(workspace.join("target").display().to_string());
+            }
+            if matches!(
+                fs::symlink_metadata(&prepared_dir),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                clear_prepared_state(&mut state);
+            }
+            state.failed_prepare_version = Some(version.to_string());
+            state.prepare_retry_not_before =
+                Some(Utc::now() + ChronoDuration::hours(AUTOMATIC_FAILURE_BACKOFF_HOURS));
+            record_unresolved_failure(
+                &mut state,
+                UpdateFailureKind::Preparation,
+                Utc::now(),
+                Some(version.to_string()),
+                None,
+            );
         }
+    }
+    if state.unresolved_failure.is_some() {
+        restore_unresolved_failure(&mut state);
     }
     state.updated_at = Utc::now();
     save_state(&state)?;
+    enforce_updater_retention_at(&state, &data_dir, SystemTime::now())?;
 
     if state.status == UpdateStatus::Failed {
         bail!(
@@ -209,102 +487,930 @@ pub fn prepare_version(version: &str) -> Result<CodexUpdateReport> {
     Ok(report_from_state(state))
 }
 
+include!("codex_update/preparation.rs");
+include!("codex_update/retention.rs");
+
 pub fn install_prepared() -> Result<CodexUpdateReport> {
-    let mut state = load_state()?;
-    if state.status != UpdateStatus::ReadyToInstall {
-        bail!("no patched Codex update is ready to install");
+    let Some(_operation_lock) = UpdaterOperationLock::try_acquire()? else {
+        return deferred_status_report();
+    };
+    install_prepared_with_lock_held()
+}
+
+fn install_prepared_with_lock_held() -> Result<CodexUpdateReport> {
+    let platform = HostPlatform::current();
+    match platform {
+        HostPlatform::MacOs => return install_prepared_macos_with_lock_held(),
+        HostPlatform::Linux => {}
+        HostPlatform::Other => {
+            bail!("prepared Codex installation is supported only on macOS and Linux")
+        }
     }
+    let mut state = load_state()?;
+    if state.status == UpdateStatus::Installed {
+        return Ok(report_from_state(state));
+    }
+    let now = Utc::now();
+    let data_dir = codexswitch_data_dir()?;
+    enforce_updater_retention_at(&state, &data_dir, SystemTime::now())?;
+    let pending_cleanup_error = cleanup_pending_target_at(&mut state, &data_dir).err();
     let prepared_binary = state
         .prepared_binary_path
         .as_deref()
         .map(PathBuf::from)
         .context("update state is missing prepared binary path")?;
+    let expected_version = state
+        .prepared_version
+        .clone()
+        .context("update state is missing prepared version")?;
+    if !matches!(
+        state.status,
+        UpdateStatus::ReadyToInstall | UpdateStatus::Installing | UpdateStatus::Failed
+    ) {
+        bail!("no patched Codex update is ready to install");
+    }
+    if let Err(error) = validate_prepared_runtime(&prepared_binary, &expected_version) {
+        let cleanup_error = cleanup_prepared_generation(&state).err();
+        let cleanup_succeeded = cleanup_error.is_none();
+        state.status = UpdateStatus::Failed;
+        state.error = Some(match cleanup_error {
+            Some(cleanup_error) => format!(
+                "prepared Codex {expected_version} failed validation: {error:#}; cleanup also failed: {cleanup_error:#}"
+            ),
+            None => format!("prepared Codex {expected_version} failed validation: {error:#}"),
+        });
+        if cleanup_succeeded {
+            clear_prepared_state(&mut state);
+        }
+        state.failed_prepare_version = Some(expected_version.clone());
+        state.prepare_retry_not_before =
+            Some(now + ChronoDuration::hours(AUTOMATIC_FAILURE_BACKOFF_HOURS));
+        record_unresolved_failure(
+            &mut state,
+            UpdateFailureKind::Preparation,
+            now,
+            Some(expected_version.clone()),
+            None,
+        );
+        state.updated_at = now;
+        save_state(&state)?;
+        bail!("{}", state.error.clone().unwrap_or_default());
+    }
+
     let installed_binary = patched_codex::default_installed_binary()?;
-    let user_launcher = patched_codex::default_user_launcher()?;
-    let prepared_version =
-        patched_codex::codex_version(&prepared_binary).context("prepared Codex has no version")?;
+    let current_runtime = installed_runtime_binary(&installed_binary).with_context(|| {
+        format!(
+            "installed local Codex entry {} does not resolve to one provenance-pinned complete runtime",
+            installed_binary.display()
+        )
+    })?;
+    let state_path = state_path()?;
+    let install_journal_path = data_dir.join(RUNTIME_INSTALL_JOURNAL);
+    if platform == HostPlatform::Linux {
+        let install_journal_exists = match fs::symlink_metadata(&install_journal_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect runtime install journal {}",
+                        install_journal_path.display()
+                    )
+                });
+            }
+        };
+        if install_journal_exists {
+            let recovery_activity = observe_managed_runtime_activity(platform, &current_runtime);
+            if let Some(reason) = managed_runtime_block_reason(&recovery_activity) {
+                record_interrupted_install_block(
+                    &mut state,
+                    format!(
+                        "interrupted Codex installation requires recovery, but runtime inactivity is not proven: {reason}"
+                    ),
+                );
+                save_state_at(&state_path, &state)?;
+                return Ok(report_from_state(state));
+            }
+            let daemon_reservation =
+                managed_daemon_codex_home().map(|home| managed_daemon_reservation_path(&home));
+            let guards = match daemon_reservation.as_ref() {
+                Ok(path) => RuntimeCommitGuards::try_acquire_at(
+                    &runtime_start_install_guard_path(&data_dir),
+                    path,
+                ),
+                Err(error) => GuardAcquire::Blocked(format!(
+                    "managed daemon reservation path could not be resolved ({error:#})"
+                )),
+            };
+            let _guards = match guards {
+                GuardAcquire::Acquired(guards) => guards,
+                GuardAcquire::Blocked(reason) => {
+                    record_interrupted_install_block(
+                        &mut state,
+                        format!("interrupted Codex installation remains journaled: {reason}"),
+                    );
+                    save_state_at(&state_path, &state)?;
+                    return Ok(report_from_state(state));
+                }
+            };
+            let final_activity =
+                observe_managed_runtime_activity_with_reservation(platform, &current_runtime, true);
+            if let Some(reason) = managed_runtime_block_reason(&final_activity) {
+                record_interrupted_install_block(
+                    &mut state,
+                    format!(
+                        "interrupted Codex installation remains journaled because runtime activity changed before recovery: {reason}"
+                    ),
+                );
+                save_state_at(&state_path, &state)?;
+                return Ok(report_from_state(state));
+            }
+            recover_runtime_install_transaction_at(
+                &install_journal_path,
+                &state_path,
+                &mut state,
+                &installed_binary,
+                &installed_binary.with_file_name("codex-code-mode-host"),
+                verify_installed_runtime_pair,
+            )?;
+            return Ok(report_from_state(state));
+        }
+        if let Some(transaction) = state.install_transaction.clone() {
+            if transaction.phase == InstallTransactionStatePhase::Committed
+                && state.installed_version.as_deref() == Some(transaction.version.as_str())
+                && verify_installed_runtime_pair(
+                    &installed_binary,
+                    &installed_binary.with_file_name("codex-code-mode-host"),
+                    &transaction.version,
+                )
+                .is_ok()
+            {
+                state.install_transaction = None;
+                if state.unresolved_failure.is_some() {
+                    restore_unresolved_failure(&mut state);
+                }
+                save_state_at(&state_path, &state)?;
+            } else {
+                bail!(
+                    "updater state contains interrupted install transaction {} without its recovery journal",
+                    transaction.id
+                );
+            }
+        }
+    }
+    let runtime_activity = observe_managed_runtime_activity(platform, &current_runtime);
+    let install_outcome = {
+        let start_install_guard = runtime_start_install_guard_path(&data_dir);
+        let daemon_reservation =
+            managed_daemon_codex_home().map(|home| managed_daemon_reservation_path(&home));
+        install_staged_if_still_inactive(
+            &runtime_activity,
+            || StagedLinuxRuntimeInstall::prepare(&prepared_binary, &installed_binary),
+            || match daemon_reservation.as_ref() {
+                Ok(path) => RuntimeCommitGuards::try_acquire_at(&start_install_guard, path),
+                Err(error) => GuardAcquire::Blocked(format!(
+                    "managed daemon reservation path could not be resolved ({error:#})"
+                )),
+            },
+            |_| observe_managed_runtime_activity_with_reservation(platform, &current_runtime, true),
+            |staged, _| {
+                staged.commit_journaled_with(
+                    &install_journal_path,
+                    &state_path,
+                    &mut state,
+                    &expected_version,
+                    verify_installed_runtime_pair,
+                    |_| Ok(()),
+                )
+            },
+        )
+    };
 
-    patched_codex::install_prepared_binary(&prepared_binary, &installed_binary, &user_launcher)?;
-    restart_managed_app_server_after_install()?;
-
-    state.status = UpdateStatus::Installed;
-    state.installed_version = Some(prepared_version);
-    state.prepared_version = None;
-    state.prepared_source_path = None;
-    state.prepared_binary_path = None;
-    state.error = None;
-    state.updated_at = Utc::now();
-    save_state(&state)?;
-    Ok(report_from_state(state))
+    match install_outcome {
+        Ok(OfflineInstallOutcome::Installed) => {
+            if let Some(error) = pending_cleanup_error {
+                if state.unresolved_failure.is_none() {
+                    state.error = Some(format!(
+                        "Codex {expected_version} installed, but prior build target cleanup remains pending: {error:#}"
+                    ));
+                }
+            }
+            save_state_at(&state_path, &state)?;
+            enforce_updater_retention_at(&state, &data_dir, SystemTime::now())?;
+            Ok(report_from_state(state))
+        }
+        Ok(OfflineInstallOutcome::Staged(reason)) => {
+            if state.unresolved_failure.is_some() {
+                restore_unresolved_failure(&mut state);
+            } else {
+                state.status = UpdateStatus::ReadyToInstall;
+                state.error = Some(format!(
+                    "Codex {expected_version} remains staged: {reason}; stop the active managed runtime or repair the failed probe during an approved idle window, then rerun `codexswitch-cli install-prepared-codex`"
+                ));
+            }
+            state.updated_at = Utc::now();
+            save_state(&state)?;
+            Ok(report_from_state(state))
+        }
+        Err(error) => {
+            state.failed_install_version = Some(expected_version.clone());
+            state.install_retry_not_before =
+                Some(Utc::now() + ChronoDuration::hours(AUTOMATIC_FAILURE_BACKOFF_HOURS));
+            if state.unresolved_failure.is_none() {
+                state.status = UpdateStatus::Failed;
+                state.error = Some(format!(
+                    "failed to install Codex {expected_version}: {error:#}"
+                ));
+                state.updated_at = Utc::now();
+                let failed_at = state.updated_at;
+                let transaction_id = state
+                    .install_transaction
+                    .as_ref()
+                    .map(|transaction| transaction.id.clone());
+                record_unresolved_failure(
+                    &mut state,
+                    UpdateFailureKind::Installation,
+                    failed_at,
+                    Some(expected_version.clone()),
+                    transaction_id,
+                );
+            } else {
+                restore_unresolved_failure(&mut state);
+            }
+            save_state(&state)?;
+            enforce_updater_retention_at(&state, &data_dir, SystemTime::now())?;
+            Err(error).with_context(|| format!("failed to install Codex {expected_version}"))
+        }
+    }
 }
 
 pub fn auto_install_update() -> Result<CodexUpdateReport> {
-    let report = check_for_update(true, true)?;
-    if report.status == UpdateStatus::ReadyToInstall {
-        install_prepared()
-    } else {
-        Ok(report)
+    let state_path = state_path()?;
+    let available_bytes = available_disk_bytes(&codexswitch_data_dir()?).unwrap_or(0);
+    automatic_update_entrypoint_at_with(
+        &state_path,
+        Utc::now(),
+        AutomaticUpdateContext::current(available_bytes),
+        installed_codex_version,
+        || check_for_update(false, false),
+        |version| {
+            if std::env::var_os("CARGO_BUILD_JOBS")
+                .is_some_and(|jobs| jobs != std::ffi::OsStr::new("1"))
+            {
+                bail!("automatic Codex preparation requires CARGO_BUILD_JOBS=1");
+            }
+            prepare_version(version)
+        },
+    )
+}
+
+fn automatic_update_entrypoint_at_with<Installed, Metadata, Prepare>(
+    state_path: &Path,
+    now: DateTime<Utc>,
+    context: AutomaticUpdateContext,
+    installed: Installed,
+    metadata: Metadata,
+    prepare: Prepare,
+) -> Result<CodexUpdateReport>
+where
+    Installed: FnOnce() -> Option<String>,
+    Metadata: FnOnce() -> Result<CodexUpdateReport>,
+    Prepare: FnOnce(&str) -> Result<CodexUpdateReport>,
+{
+    let mut state = load_state_at(state_path)?;
+    if context.policy.permits_preparation(context.platform) && state.installed_version.is_none() {
+        state.installed_version = installed();
     }
+    match automatic_update_decision(&state, now, context) {
+        AutomaticUpdateDecision::None => Ok(report_from_state(state)),
+        AutomaticUpdateDecision::CheckStableChannel => metadata(),
+        AutomaticUpdateDecision::PrepareStableVersion(version) => prepare(&version),
+    }
+}
+
+pub fn arm_background_update_deadline() {
+    if std::env::var_os(BACKGROUND_UPDATE_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(BACKGROUND_UPDATE_DEADLINE);
+        std::process::exit(124);
+    });
 }
 
 pub fn maybe_spawn_daily_auto_install() -> Result<()> {
     let state = load_state()?;
-    let pending_update = state_has_pending_stable_update(&state);
-    if (!pending_update && !check_due(&state))
-        || matches!(
-            state.status,
-            UpdateStatus::Checking | UpdateStatus::Preparing | UpdateStatus::Installing
-        )
-    {
+    let now = Utc::now();
+    let data_dir = codexswitch_data_dir()?;
+    let available_bytes = available_disk_bytes(&data_dir).unwrap_or(0);
+    let decision = automatic_update_decision(
+        &state,
+        now,
+        AutomaticUpdateContext::current(available_bytes),
+    );
+    if decision == AutomaticUpdateDecision::None {
         return Ok(());
     }
 
-    let mut state = state;
-    state.status = if state.status == UpdateStatus::ReadyToInstall {
-        UpdateStatus::Installing
-    } else {
-        UpdateStatus::Checking
-    };
-    state.last_checked_at = Some(Utc::now());
-    state.updated_at = Utc::now();
-    save_state(&state)?;
-
     let exe = background_update_executable().context("failed to resolve current executable")?;
-    let log_path = codexswitch_data_dir()?.join("codex-update.log");
+    let log_path = data_dir.join("codex-update.log");
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let stdout = OpenOptions::new()
+    let maintain_artifacts = automatic_decision_permits_artifact_maintenance(&decision);
+    if maintain_artifacts {
+        rotate_and_retain_update_logs_at(&data_dir, SystemTime::now())?;
+    }
+    let args = background_update_args(&decision);
+
+    let spawn = Command::new(exe)
+        .args(&args)
+        .env(BACKGROUND_UPDATE_MARKER, "1")
+        .env("CARGO_BUILD_JOBS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match spawn {
+        Ok(child) => {
+            append_update_log_event(
+                &log_path,
+                &format!(
+                    "{} spawned bounded-output updater pid={} operation={decision:?}\n",
+                    Utc::now().to_rfc3339(),
+                    child.id()
+                ),
+            )?;
+            if maintain_artifacts {
+                rotate_and_retain_update_logs_at(&data_dir, SystemTime::now())?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let mut failed_state = load_state()?;
+            if !matches!(
+                failed_state.status,
+                UpdateStatus::Preparing | UpdateStatus::Installing
+            ) {
+                failed_state.status = UpdateStatus::Failed;
+                failed_state.error =
+                    Some(format!("failed to spawn background Codex update: {error}"));
+                failed_state.updated_at = Utc::now();
+                let failed_at = failed_state.updated_at;
+                record_unresolved_failure(
+                    &mut failed_state,
+                    UpdateFailureKind::Metadata,
+                    failed_at,
+                    None,
+                    None,
+                );
+                save_state(&failed_state)?;
+            }
+            Err(error).context("failed to spawn background Codex update")
+        }
+    }
+}
+
+fn append_update_log_event(path: &Path, event: &str) -> Result<()> {
+    if event.len() > 1024 {
+        bail!("Codex update log event exceeds the 1024 byte limit");
+    }
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open {}", log_path.display()))?;
-    let stderr = stdout.try_clone()?;
-    Command::new(exe)
-        .args(background_auto_install_args())
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("failed to spawn background Codex auto-update")?;
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(event.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
-fn background_auto_install_args() -> [&'static str; 2] {
-    ["auto-install-codex-update", "--json"]
+fn clear_prepared_state(state: &mut CodexUpdateState) {
+    state.prepared_version = None;
+    state.prepared_source_path = None;
+    state.prepared_binary_path = None;
+    state.prepared_artifact_manifest_sha256 = None;
 }
 
-fn state_has_pending_stable_update(state: &CodexUpdateState) -> bool {
-    if state.status == UpdateStatus::ReadyToInstall {
-        return true;
+fn clear_prepare_failure(state: &mut CodexUpdateState) {
+    state.failed_prepare_version = None;
+    state.prepare_retry_not_before = None;
+}
+
+fn clear_install_failure(state: &mut CodexUpdateState) {
+    state.failed_install_version = None;
+    state.install_retry_not_before = None;
+}
+
+fn unresolved_failure_from_state(
+    state: &CodexUpdateState,
+    kind: UpdateFailureKind,
+    failed_at: DateTime<Utc>,
+    version: Option<String>,
+    transaction_id: Option<String>,
+) -> UnresolvedUpdateFailure {
+    UnresolvedUpdateFailure {
+        kind,
+        error: state
+            .error
+            .clone()
+            .unwrap_or_else(|| "Codex updater failed without an error message".to_string()),
+        failed_at,
+        version,
+        transaction_id,
+        failed_prepare_version: state.failed_prepare_version.clone(),
+        prepare_retry_not_before: state.prepare_retry_not_before,
+        failed_install_version: state.failed_install_version.clone(),
+        install_retry_not_before: state.install_retry_not_before,
     }
-    if state.status != UpdateStatus::Idle {
-        return false;
+}
+
+fn record_unresolved_failure(
+    state: &mut CodexUpdateState,
+    kind: UpdateFailureKind,
+    failed_at: DateTime<Utc>,
+    version: Option<String>,
+    transaction_id: Option<String>,
+) {
+    if state.unresolved_failure.is_some() {
+        restore_unresolved_failure(state);
+        return;
     }
-    let Some(latest) = state.latest_stable_version.as_deref() else {
+    let failure = unresolved_failure_from_state(state, kind, failed_at, version, transaction_id);
+    state.unresolved_failure = Some(failure);
+}
+
+fn record_interrupted_install_block(state: &mut CodexUpdateState, error: String) {
+    if state.unresolved_failure.is_some() {
+        restore_unresolved_failure(state);
+        return;
+    }
+    let transaction = state.install_transaction.clone();
+    let version = transaction
+        .as_ref()
+        .map(|transaction| transaction.version.clone())
+        .or_else(|| state.prepared_version.clone());
+    let transaction_id = transaction.map(|transaction| transaction.id);
+    let failed_at = Utc::now();
+    state.status = UpdateStatus::Failed;
+    state.error = Some(error);
+    state.failed_install_version = version.clone();
+    state.install_retry_not_before = Some(failed_at);
+    state.updated_at = failed_at;
+    record_unresolved_failure(
+        state,
+        UpdateFailureKind::Installation,
+        failed_at,
+        version,
+        transaction_id,
+    );
+}
+
+fn failure_kind_from_state(state: &CodexUpdateState) -> UpdateFailureKind {
+    if state.failed_install_version.is_some() {
+        UpdateFailureKind::Installation
+    } else if state.failed_prepare_version.is_some() {
+        UpdateFailureKind::Preparation
+    } else {
+        UpdateFailureKind::Activation
+    }
+}
+
+fn preserve_legacy_failure_if_needed(state: &mut CodexUpdateState) {
+    if state.status == UpdateStatus::Failed && state.unresolved_failure.is_none() {
+        let failure = unresolved_failure_from_state(
+            state,
+            failure_kind_from_state(state),
+            state.updated_at,
+            state
+                .failed_install_version
+                .clone()
+                .or_else(|| state.failed_prepare_version.clone()),
+            None,
+        );
+        state.unresolved_failure = Some(failure);
+    }
+}
+
+fn restore_unresolved_failure(state: &mut CodexUpdateState) -> bool {
+    let Some(failure) = state.unresolved_failure.clone() else {
         return false;
     };
-    version_is_stable(latest) && state.installed_version.as_deref() != Some(latest)
+    let changed = state.status != UpdateStatus::Failed
+        || state.error.as_deref() != Some(failure.error.as_str())
+        || state.failed_prepare_version != failure.failed_prepare_version
+        || state.prepare_retry_not_before != failure.prepare_retry_not_before
+        || state.failed_install_version != failure.failed_install_version
+        || state.install_retry_not_before != failure.install_retry_not_before;
+    state.status = UpdateStatus::Failed;
+    state.error = Some(failure.error);
+    state.failed_prepare_version = failure.failed_prepare_version;
+    state.prepare_retry_not_before = failure.prepare_retry_not_before;
+    state.failed_install_version = failure.failed_install_version;
+    state.install_retry_not_before = failure.install_retry_not_before;
+    changed
+}
+
+fn clear_unresolved_failure(state: &mut CodexUpdateState) {
+    state.unresolved_failure = None;
+}
+
+fn resolve_prepare_failure_for_version(state: &mut CodexUpdateState, version: &str) {
+    let resolves_snapshot = state.unresolved_failure.as_ref().is_some_and(|failure| {
+        failure.kind == UpdateFailureKind::Preparation
+            && failure.version.as_deref() == Some(version)
+            && failure.failed_prepare_version.as_deref() == Some(version)
+            && failure.failed_install_version.is_none()
+    });
+    clear_prepare_failure(state);
+    if resolves_snapshot {
+        clear_unresolved_failure(state);
+    }
+}
+
+fn clear_obsolete_prepare_failure(state: &mut CodexUpdateState, latest: &str) {
+    if state
+        .failed_prepare_version
+        .as_deref()
+        .is_some_and(|failed| version_is_strictly_newer(latest, failed))
+    {
+        clear_prepare_failure(state);
+    }
+}
+
+fn clear_obsolete_install_failure(state: &mut CodexUpdateState, latest: &str) {
+    if state
+        .failed_install_version
+        .as_deref()
+        .is_some_and(|failed| version_is_strictly_newer(latest, failed))
+    {
+        clear_install_failure(state);
+    }
+}
+
+fn mark_version_installed(state: &mut CodexUpdateState, version: &str, now: DateTime<Utc>) {
+    state.installed_artifact_manifest_sha256 = None;
+    if state.unresolved_failure.is_some() {
+        restore_unresolved_failure(state);
+        state.installed_version = Some(version.to_string());
+        state.updated_at = now;
+        return;
+    }
+    state.status = UpdateStatus::Installed;
+    state.installed_version = Some(version.to_string());
+    clear_prepared_state(state);
+    if state
+        .failed_prepare_version
+        .as_deref()
+        .is_some_and(|failed| version_is_at_least(version, failed))
+    {
+        clear_prepare_failure(state);
+    }
+    if state
+        .failed_install_version
+        .as_deref()
+        .is_some_and(|failed| version_is_at_least(version, failed))
+    {
+        clear_install_failure(state);
+    }
+    clear_unresolved_failure(state);
+    state.error = None;
+    state.updated_at = now;
+}
+
+fn mark_version_installed_for_transaction(
+    state: &mut CodexUpdateState,
+    version: &str,
+    transaction_id: &str,
+    now: DateTime<Utc>,
+) {
+    state.installed_version = Some(version.to_string());
+    state.installed_artifact_manifest_sha256 = None;
+    clear_prepared_state(state);
+    let resolves_install_failure = state.unresolved_failure.as_ref().is_some_and(|failure| {
+        failure.kind == UpdateFailureKind::Installation
+            && failure.version.as_deref() == Some(version)
+            && failure.transaction_id.as_deref() == Some(transaction_id)
+    });
+    if resolves_install_failure {
+        clear_install_failure(state);
+        clear_unresolved_failure(state);
+    }
+    if let Some(transaction) = state.install_transaction.as_mut() {
+        if transaction.id == transaction_id && transaction.version == version {
+            transaction.phase = InstallTransactionStatePhase::Committed;
+        }
+    }
+    if state.unresolved_failure.is_some() {
+        restore_unresolved_failure(state);
+    } else {
+        state.status = UpdateStatus::Installed;
+        state.error = None;
+    }
+    state.updated_at = now;
+}
+
+fn same_version_observation_must_preserve_failure(
+    state: &CodexUpdateState,
+    version: &str,
+    observed_status: &UpdateStatus,
+) -> bool {
+    state.unresolved_failure.is_some()
+        || *observed_status == UpdateStatus::Failed
+        || has_install_failure_for_version(state, version)
+        || (*observed_status == UpdateStatus::Installing
+            && state.prepared_version.as_deref() == Some(version))
+}
+
+fn reconcile_requested_version_as_installed(
+    state: &mut CodexUpdateState,
+    requested_version: &str,
+    installed_version: Option<String>,
+    now: DateTime<Utc>,
+) -> bool {
+    state.installed_version = installed_version;
+    if state.installed_version.as_deref() != Some(requested_version) {
+        return false;
+    }
+
+    state.latest_stable_version = Some(requested_version.to_string());
+    if same_version_observation_must_preserve_failure(state, requested_version, &state.status) {
+        restore_unresolved_failure(state);
+        state.updated_at = now;
+    } else {
+        mark_version_installed(state, requested_version, now);
+    }
+    true
+}
+
+fn reconcile_requested_version_as_prepared(
+    state: &mut CodexUpdateState,
+    requested_version: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let valid = state.prepared_version.as_deref() == Some(requested_version)
+        && state
+            .prepared_binary_path
+            .as_deref()
+            .map(Path::new)
+            .is_some_and(|path| prepared_runtime_is_valid(path, requested_version));
+    if !valid {
+        return false;
+    }
+    if state.unresolved_failure.is_some()
+        || (has_install_failure_for_version(state, requested_version)
+            && state.status == UpdateStatus::Failed)
+    {
+        restore_unresolved_failure(state);
+        state.status = UpdateStatus::Failed;
+    } else {
+        state.status = UpdateStatus::ReadyToInstall;
+        if !has_install_failure_for_version(state, requested_version) {
+            state.error = None;
+        }
+    }
+    state.updated_at = now;
+    true
+}
+
+fn reconcile_or_cleanup_existing_prepared_runtime(
+    state: &mut CodexUpdateState,
+    requested_version: &str,
+    now: DateTime<Utc>,
+    data_dir: &Path,
+) -> Result<ExistingPreparedRuntimeDisposition> {
+    if state.prepared_binary_path.is_none() {
+        return Ok(ExistingPreparedRuntimeDisposition::Absent);
+    }
+    if reconcile_requested_version_as_prepared(state, requested_version, now) {
+        return Ok(ExistingPreparedRuntimeDisposition::Reused);
+    }
+    cleanup_prepared_generation_at(state, data_dir)?;
+    clear_prepared_state(state);
+    Ok(ExistingPreparedRuntimeDisposition::ClearedInvalid)
+}
+
+fn has_prepare_failure_for_version(state: &CodexUpdateState, version: &str) -> bool {
+    state.failed_prepare_version.as_deref() == Some(version)
+}
+
+fn prepare_retry_not_before_for_version(
+    state: &CodexUpdateState,
+    version: &str,
+) -> Option<DateTime<Utc>> {
+    if !has_prepare_failure_for_version(state, version) {
+        return None;
+    }
+    state.prepare_retry_not_before.or(Some(
+        state.updated_at + ChronoDuration::hours(AUTOMATIC_FAILURE_BACKOFF_HOURS),
+    ))
+}
+
+fn prepare_retry_active_for_version(
+    state: &CodexUpdateState,
+    version: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    prepare_retry_not_before_for_version(state, version).is_some_and(|deadline| now < deadline)
+}
+
+fn has_install_failure_for_version(state: &CodexUpdateState, version: &str) -> bool {
+    state.failed_install_version.as_deref() == Some(version)
+}
+
+fn busy_update_state_is_fresh(state: &CodexUpdateState, now: DateTime<Utc>) -> bool {
+    let stale_after = match state.status {
+        UpdateStatus::Checking => ChronoDuration::minutes(CHECKING_STALE_AFTER_MINUTES),
+        UpdateStatus::Preparing => ChronoDuration::hours(AUTOMATIC_FAILURE_BACKOFF_HOURS),
+        UpdateStatus::Installing => ChronoDuration::minutes(INSTALLING_STALE_AFTER_MINUTES),
+        _ => return false,
+    };
+    now.signed_duration_since(state.updated_at) < stale_after
+}
+
+fn automatic_update_decision(
+    state: &CodexUpdateState,
+    now: DateTime<Utc>,
+    context: AutomaticUpdateContext,
+) -> AutomaticUpdateDecision {
+    if let Some(version) = state.prepared_version.as_deref() {
+        if has_install_failure_for_version(state, version) {
+            if automatic_check_due(state, now) {
+                return AutomaticUpdateDecision::CheckStableChannel;
+            }
+            return AutomaticUpdateDecision::None;
+        }
+    }
+
+    match state.status {
+        UpdateStatus::ReadyToInstall => {
+            return AutomaticUpdateDecision::None;
+        }
+        UpdateStatus::Checking | UpdateStatus::Preparing | UpdateStatus::Installing => {
+            if busy_update_state_is_fresh(state, now) {
+                return AutomaticUpdateDecision::None;
+            }
+            return AutomaticUpdateDecision::CheckStableChannel;
+        }
+        UpdateStatus::Failed => {
+            if state
+                .latest_stable_version
+                .as_deref()
+                .is_some_and(|version| has_prepare_failure_for_version(state, version))
+            {
+                if automatic_check_due(state, now) {
+                    return AutomaticUpdateDecision::CheckStableChannel;
+                }
+                if state
+                    .latest_stable_version
+                    .as_deref()
+                    .is_some_and(|version| prepare_retry_active_for_version(state, version, now))
+                {
+                    return AutomaticUpdateDecision::None;
+                }
+            } else {
+                if now.signed_duration_since(state.updated_at)
+                    < ChronoDuration::hours(AUTOMATIC_FAILURE_BACKOFF_HOURS)
+                {
+                    return AutomaticUpdateDecision::None;
+                }
+                return AutomaticUpdateDecision::CheckStableChannel;
+            }
+        }
+        UpdateStatus::Idle | UpdateStatus::Installed => {}
+    }
+
+    if automatic_check_due(state, now) {
+        return AutomaticUpdateDecision::CheckStableChannel;
+    }
+
+    let Some(latest) = state.latest_stable_version.as_deref() else {
+        return AutomaticUpdateDecision::None;
+    };
+    if !version_is_stable(latest) || state.installed_version.as_deref() == Some(latest) {
+        return AutomaticUpdateDecision::None;
+    }
+    if prepare_retry_active_for_version(state, latest, now) {
+        return AutomaticUpdateDecision::None;
+    }
+    if !context.policy.permits_preparation(context.platform)
+        || !source_prepare_allowed(context.available_bytes)
+    {
+        return AutomaticUpdateDecision::None;
+    }
+
+    AutomaticUpdateDecision::PrepareStableVersion(latest.to_string())
+}
+
+fn automatic_check_due(state: &CodexUpdateState, now: DateTime<Utc>) -> bool {
+    state
+        .last_checked_at
+        .map(|checked| {
+            now.signed_duration_since(checked)
+                >= ChronoDuration::minutes(AUTOMATIC_CHECK_INTERVAL_MINUTES)
+        })
+        .unwrap_or(true)
+}
+
+fn source_prepare_allowed(available_bytes: u64) -> bool {
+    available_bytes >= MINIMUM_SOURCE_PREPARE_BYTES
+}
+
+fn current_source_prepare_capacity() -> Result<bool> {
+    let data_dir = codexswitch_data_dir()?;
+    Ok(source_prepare_allowed(
+        available_disk_bytes(&data_dir).unwrap_or(0),
+    ))
+}
+
+fn background_update_args(decision: &AutomaticUpdateDecision) -> Vec<String> {
+    match decision {
+        AutomaticUpdateDecision::None => Vec::new(),
+        AutomaticUpdateDecision::CheckStableChannel => {
+            vec![
+                "check-codex-update".to_string(),
+                "--force".to_string(),
+                "--json".to_string(),
+            ]
+        }
+        AutomaticUpdateDecision::PrepareStableVersion(version) => vec![
+            "prepare-codex-update".to_string(),
+            "--version".to_string(),
+            version.clone(),
+            "--json".to_string(),
+        ],
+    }
+}
+
+fn automatic_decision_permits_artifact_maintenance(decision: &AutomaticUpdateDecision) -> bool {
+    matches!(decision, AutomaticUpdateDecision::PrepareStableVersion(_))
+}
+
+#[cfg(unix)]
+fn available_disk_bytes(path: &Path) -> Result<u64> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let probe_path = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .unwrap_or(Path::new("/"));
+    let path = CString::new(probe_path.as_os_str().as_bytes())
+        .context("disk probe path contained a NUL byte")?;
+    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to inspect free space for {}", probe_path.display()));
+    }
+    let stats = unsafe { stats.assume_init() };
+    let block_size = if stats.f_frsize > 0 {
+        stats.f_frsize
+    } else {
+        stats.f_bsize
+    };
+    (stats.f_bavail as u64)
+        .checked_mul(block_size)
+        .context("available disk byte count overflowed")
+}
+
+#[cfg(not(unix))]
+fn available_disk_bytes(path: &Path) -> Result<u64> {
+    let probe_path = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .unwrap_or(Path::new("/"));
+    let output = bounded_command::output(
+        Command::new("df").args(["-Pk"]).arg(probe_path),
+        PROBE_COMMAND_TIMEOUT,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .with_context(|| format!("failed to inspect free space for {}", probe_path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect free space for {}: {}",
+            probe_path.display(),
+            output.status
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("df emitted non-UTF-8 output")?;
+    let data_line = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .last()
+        .context("df output did not contain a filesystem row")?;
+    let available_kib = data_line
+        .split_whitespace()
+        .nth(3)
+        .context("df output did not contain an available-space column")?
+        .parse::<u64>()
+        .context("df available-space column was not an integer")?;
+    available_kib
+        .checked_mul(1024)
+        .context("available disk byte count overflowed")
 }
 
 fn report_from_state(state: CodexUpdateState) -> CodexUpdateReport {
@@ -320,40 +1426,59 @@ fn report_from_state(state: CodexUpdateState) -> CodexUpdateReport {
         last_checked_at: state.last_checked_at,
         latest_stable_version: state.latest_stable_version,
         installed_version: state.installed_version,
+        installed_artifact_manifest_sha256: state.installed_artifact_manifest_sha256,
         prepared_version: state.prepared_version,
         prepared_source_path: state.prepared_source_path,
         prepared_binary_path: state.prepared_binary_path,
+        prepared_artifact_manifest_sha256: state.prepared_artifact_manifest_sha256,
+        failed_prepare_version: state.failed_prepare_version,
+        prepare_retry_not_before: state.prepare_retry_not_before,
+        failed_install_version: state.failed_install_version,
+        install_retry_not_before: state.install_retry_not_before,
+        cleanup_pending_target_path: state.cleanup_pending_target_path,
         install_command,
         error: state.error,
     }
 }
 
 fn reconcile_installed_state(state: &mut CodexUpdateState) -> bool {
-    if state.status != UpdateStatus::ReadyToInstall {
+    let Ok(installed_binary) = patched_codex::default_installed_binary() else {
         return false;
-    }
+    };
+    reconcile_installed_state_at(state, &installed_binary)
+}
+
+fn reconcile_installed_state_at(state: &mut CodexUpdateState, installed_binary: &Path) -> bool {
     let Some(prepared_version) = state.prepared_version.as_deref() else {
         return false;
     };
     if state.installed_version.as_deref() != Some(prepared_version) {
         return false;
     }
-    let Ok(installed_binary) = patched_codex::default_installed_binary() else {
+    let Ok(runtime_binary) = installed_runtime_binary(installed_binary) else {
         return false;
     };
-    if !patched_codex::binary_has_hot_swap_markers(&installed_binary) {
+    let Some(prepared_binary) = state.prepared_binary_path.as_deref().map(Path::new) else {
+        return false;
+    };
+    if !patched_codex::binary_has_hot_swap_markers(&runtime_binary)
+        || !patched_codex::runtime_has_valid_code_mode_host(&runtime_binary)
+    {
         return false;
     }
-    if patched_codex::codex_version(&installed_binary).as_deref() != Some(prepared_version) {
+    if patched_codex::codex_version(&runtime_binary).as_deref() != Some(prepared_version) {
+        return false;
+    }
+    if !runtime_matches_prepared_runtime(&runtime_binary, prepared_binary) {
+        return false;
+    }
+    if same_version_observation_must_preserve_failure(state, prepared_version, &state.status) {
+        restore_unresolved_failure(state);
         return false;
     }
 
-    state.status = UpdateStatus::Installed;
-    state.prepared_version = None;
-    state.prepared_source_path = None;
-    state.prepared_binary_path = None;
-    state.error = None;
-    state.updated_at = Utc::now();
+    let installed_version = prepared_version.to_string();
+    mark_version_installed(state, &installed_version, Utc::now());
     true
 }
 
@@ -373,12 +1498,25 @@ fn background_update_executable() -> Result<PathBuf> {
 }
 
 fn summary_for_state(state: &CodexUpdateState, install_command: Option<&str>) -> String {
+    summary_for_state_on_platform(state, install_command, HostPlatform::current())
+}
+
+fn summary_for_state_on_platform(
+    state: &CodexUpdateState,
+    install_command: Option<&str>,
+    platform: HostPlatform,
+) -> String {
     match state.status {
         UpdateStatus::ReadyToInstall => format!(
-            "updated and patched Codex CLI {} is ready to install{}",
+            "updated and patched Codex CLI {} is ready to install{}{}",
             state.prepared_version.as_deref().unwrap_or("unknown"),
             install_command
                 .map(|command| format!(" ({command})"))
+                .unwrap_or_default(),
+            state
+                .error
+                .as_deref()
+                .map(|warning| format!("; warning: {warning}"))
                 .unwrap_or_default()
         ),
         UpdateStatus::Preparing => format!(
@@ -390,7 +1528,7 @@ fn summary_for_state(state: &CodexUpdateState, install_command: Option<&str>) ->
                 .unwrap_or("unknown")
         ),
         UpdateStatus::Installing => format!(
-            "installing stable patched Codex CLI {} in the background",
+            "installing stable patched Codex CLI {} offline",
             state
                 .prepared_version
                 .as_deref()
@@ -398,68 +1536,81 @@ fn summary_for_state(state: &CodexUpdateState, install_command: Option<&str>) ->
                 .unwrap_or("unknown")
         ),
         UpdateStatus::Checking => "checking for a stable Codex CLI update".to_string(),
-        UpdateStatus::Installed => format!(
-            "stable patched Codex CLI {} is installed",
+        UpdateStatus::Installed if platform == HostPlatform::MacOs => format!(
+            "attested stable Codex CLI {} route is installed and verified",
             state.installed_version.as_deref().unwrap_or("unknown")
         ),
-        UpdateStatus::Failed => format!(
-            "Codex CLI update failed: {}",
-            state.error.as_deref().unwrap_or("unknown error")
+        UpdateStatus::Installed => format!(
+            "stable patched Codex CLI {} is installed on disk; runtime activation is separate",
+            state.installed_version.as_deref().unwrap_or("unknown")
         ),
+        UpdateStatus::Failed => {
+            if let (Some(version), Some(deadline)) = (
+                state.failed_prepare_version.as_deref(),
+                state.prepare_retry_not_before,
+            ) {
+                if Utc::now() < deadline {
+                    return format!(
+                        "Codex CLI {version} preparation failed; automatic retry deferred until {}: {}",
+                        deadline.to_rfc3339(),
+                        state.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+            }
+            format!(
+                "Codex CLI update failed: {}",
+                state.error.as_deref().unwrap_or("unknown error")
+            )
+        }
+        UpdateStatus::Idle if platform == HostPlatform::MacOs => {
+            match (&state.latest_stable_version, &state.installed_version) {
+                (Some(latest), Some(installed)) if latest != installed => format!(
+                    "stable Codex CLI {latest} is available; build the attested remote macOS runtime artifact, then run scripts/install-macos-cli-artifact.sh"
+                ),
+                (Some(latest), _) => {
+                    format!("latest stable Codex CLI is {latest}; no attested artifact is staged")
+                }
+                (None, None) => "local Codex runtime is missing or fails complete provenance/hot-swap validation; build and activate an attested remote macOS runtime artifact".to_string(),
+                _ => "Codex CLI stable update has not checked yet".to_string(),
+            }
+        }
         UpdateStatus::Idle => match (&state.latest_stable_version, &state.installed_version) {
             (Some(latest), Some(installed)) if latest != installed => {
                 format!("stable Codex CLI {latest} is available; run codexswitch-cli check-codex-update --prepare")
             }
             (Some(latest), _) => format!("latest stable Codex CLI is {latest}; no staged update"),
+            (None, None) => "local Codex runtime is missing or fails complete provenance/hot-swap validation; run `codexswitch-cli check-codex-update --prepare`, then explicitly install the verified generation while runtimes are inactive".to_string(),
             _ => "Codex CLI stable update has not checked yet".to_string(),
         },
     }
 }
 
-fn restart_managed_app_server_after_install() -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        return Ok(());
-    }
-    if !managed_app_server_service_is_active() {
-        return Ok(());
-    }
-
-    let status = Command::new("systemctl")
-        .arg("--user")
-        .arg("restart")
-        .arg("signul-codex-app-server.service")
-        .status()
-        .context("failed to restart signul-codex-app-server.service after Codex update")?;
-    if !status.success() {
-        bail!("failed to restart signul-codex-app-server.service after Codex update: {status}");
-    }
-    Ok(())
-}
-
-fn managed_app_server_service_is_active() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-    Command::new("systemctl")
-        .arg("--user")
-        .arg("is-active")
-        .arg("--quiet")
-        .arg("signul-codex-app-server.service")
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
+include!("codex_update/runtime_discovery.rs");
 fn fetch_latest_stable_version() -> Result<String> {
-    let package = Client::builder()
+    let response = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()?
         .get(NPM_LATEST_URL)
         .send()
         .context("failed to fetch @openai/codex latest metadata")?
         .error_for_status()
-        .context("npm registry returned an error for @openai/codex/latest")?
-        .json::<NpmLatest>()
+        .context("npm registry returned an error for @openai/codex/latest")?;
+    decode_latest_stable_metadata(response)
+}
+
+fn decode_latest_stable_metadata(reader: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(REGISTRY_METADATA_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("failed to read bounded @openai/codex latest metadata")?;
+    if bytes.len() as u64 > REGISTRY_METADATA_MAX_BYTES {
+        bail!(
+            "@openai/codex latest metadata exceeded the {} byte limit",
+            REGISTRY_METADATA_MAX_BYTES
+        );
+    }
+    let package = serde_json::from_slice::<NpmLatest>(&bytes)
         .context("failed to parse @openai/codex latest metadata")?;
     if !version_is_stable(&package.version) {
         bail!(
@@ -470,778 +1621,114 @@ fn fetch_latest_stable_version() -> Result<String> {
     Ok(package.version)
 }
 
-fn checkout_stable_source(version: &str, source_dir: &Path) -> Result<()> {
-    let tag = stable_source_tag(version)?;
-    if source_dir.join(".git").exists() {
-        let status = Command::new("git")
-            .arg("fetch")
-            .arg("--tags")
-            .arg("--force")
-            .current_dir(source_dir)
-            .status()
-            .with_context(|| format!("failed to fetch tags in {}", source_dir.display()))?;
-        if !status.success() {
-            bail!("git fetch failed with {status}");
-        }
-        let status = Command::new("git")
-            .arg("checkout")
-            .arg("--force")
-            .arg(&tag)
-            .current_dir(source_dir)
-            .status()
-            .with_context(|| format!("failed to checkout {tag} in {}", source_dir.display()))?;
-        if !status.success() {
-            bail!("git checkout {tag} failed with {status}");
-        }
-        return Ok(());
-    }
-
-    if let Some(parent) = source_dir.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let status = Command::new("git")
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .arg("--branch")
-        .arg(&tag)
-        .arg(CODEX_REPO_URL)
-        .arg(source_dir)
-        .status()
-        .with_context(|| format!("failed to clone Codex source tag {tag}"))?;
-    if !status.success() {
-        bail!("git clone {tag} failed with {status}");
-    }
-    Ok(())
-}
-
-fn patch_codex_source(source_dir: &Path) -> Result<()> {
-    let app_server = source_dir.join("codex-rs/app-server/src/lib.rs");
-    let in_process_app_server = source_dir.join("codex-rs/app-server/src/in_process.rs");
-    let auth_manager = source_dir.join("codex-rs/login/src/auth/manager.rs");
-    let client = source_dir.join("codex-rs/core/src/client.rs");
-    let turn = source_dir.join("codex-rs/core/src/session/turn.rs");
-    let tui = source_dir.join("codex-rs/tui/src/lib.rs");
-    patch_auth_manager_source(&auth_manager)?;
-    patch_client_websocket_source(&client)?;
-    patch_file_after_any(
-        &app_server,
-        &[
-            "let processor_handle = tokio::spawn({\n        let auth_manager =\n            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;",
-            "let auth_manager =\n        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;",
-        ],
-        r#"
-        #[cfg(unix)]
-        {
-            let codexswitch_marker_dir = std::env::var_os("HOME").map(|home| {
-                let marker_dir = std::path::PathBuf::from(home).join(".codexswitch");
-                let _ = std::fs::create_dir_all(&marker_dir);
-                let _ = std::fs::create_dir_all(marker_dir.join("hotswap-ack"));
-                let _ = std::fs::write(marker_dir.join("sighup-verified"), "app-server\n");
-                marker_dir
-            });
-
-            let auth_for_signal = auth_manager.clone();
-            tokio::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sighup = match signal(SignalKind::hangup()) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::error!("Failed to register SIGHUP handler: {err}");
-                        return;
-                    }
-                };
-                loop {
-                    if sighup.recv().await.is_none() {
-                        break;
-                    }
-                    tracing::info!("SIGHUP: auth reload signal received");
-                    let changed = auth_for_signal.reload().await;
-                    if let Some(marker_dir) = codexswitch_marker_dir.as_ref() {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|duration| duration.as_secs().to_string())
-                            .unwrap_or_else(|_| "unknown".to_string());
-                        let _ = std::fs::write(marker_dir.join("sighup-last-received"), now);
-                        let pid = std::process::id();
-                        let auth_hash = format!("generation:{}", auth_for_signal.auth_generation());
-                        let ack = format!(
-                            "{{\"pid\":{},\"timestampUnix\":{},\"loadedAuthHash\":\"{}\",\"activeAuthHash\":\"{}\"}}",
-                            pid,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|duration| duration.as_secs())
-                                .unwrap_or(0),
-                            auth_hash,
-                            auth_hash
-                        );
-                        let _ = std::fs::write(
-                            marker_dir
-                                .join("hotswap-ack")
-                                .join(format!("{pid}.json")),
-                            ack,
-                        );
-                    }
-                    if changed {
-                        tracing::info!("SIGHUP: auth reloaded from disk (tokens changed)");
-                    } else {
-                        tracing::debug!("SIGHUP: auth reloaded from disk (no change)");
-                    }
-                }
-            });
-        }
-"#,
-        "hotswap-ack",
-    )?;
-    if in_process_app_server.exists() {
-        patch_file_after(
-            &in_process_app_server,
-            "let auth_manager =\n            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n                .await;",
-            r#"
-        #[cfg(unix)]
-        {
-            let codexswitch_marker_dir = std::env::var_os("HOME").map(|home| {
-                let marker_dir = std::path::PathBuf::from(home).join(".codexswitch");
-                let _ = std::fs::create_dir_all(&marker_dir);
-                let _ = std::fs::create_dir_all(marker_dir.join("hotswap-ack"));
-                let _ = std::fs::write(marker_dir.join("sighup-verified"), "in-process\n");
-                marker_dir
-            });
-
-            let auth_for_signal = auth_manager.clone();
-            tokio::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sighup = match signal(SignalKind::hangup()) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::error!("Failed to register in-process SIGHUP handler: {err}");
-                        return;
-                    }
-                };
-                loop {
-                    if sighup.recv().await.is_none() {
-                        break;
-                    }
-                    tracing::info!("SIGHUP: auth reload signal received by in-process app-server");
-                    let changed = auth_for_signal.reload().await;
-                    if let Some(marker_dir) = codexswitch_marker_dir.as_ref() {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|duration| duration.as_secs().to_string())
-                            .unwrap_or_else(|_| "unknown".to_string());
-                        let _ = std::fs::write(marker_dir.join("sighup-last-received"), now);
-                        let pid = std::process::id();
-                        let auth_hash = format!("generation:{}", auth_for_signal.auth_generation());
-                        let ack = format!(
-                            "{{\"pid\":{},\"timestampUnix\":{},\"loadedAuthHash\":\"{}\",\"activeAuthHash\":\"{}\"}}",
-                            pid,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|duration| duration.as_secs())
-                                .unwrap_or(0),
-                            auth_hash,
-                            auth_hash
-                        );
-                        let _ = std::fs::write(
-                            marker_dir
-                                .join("hotswap-ack")
-                                .join(format!("{pid}.json")),
-                            ack,
-                        );
-                    }
-                    if changed {
-                        tracing::info!("SIGHUP: auth reloaded from disk (tokens changed)");
-                    } else {
-                        tracing::debug!("SIGHUP: auth reloaded from disk (no change)");
-                    }
-                }
-            });
-        }
-"#,
-            "SIGHUP: auth reload signal received by in-process app-server",
-        )?;
-    }
-    patch_file_before_any(
-        &turn,
-        &[
-            "/// Takes a user message as input and runs a loop where, at each sampling request, the model",
-            "/// Takes initial turn input and runs a loop where, at each sampling request,",
-        ],
-        r#"#[cfg(unix)]
-async fn codexswitch_rotate_after_usage_limit(sess: &Session, turn_context: &TurnContext) -> bool {
-    let cli = std::env::var("CODEXSWITCH_CLI").unwrap_or_else(|_| "codexswitch-cli".to_string());
-    let rotate = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new(cli)
-            .arg("rotate-now")
-            .arg("--reason")
-            .arg("usage_limit")
-            .arg("--cooldown-seconds")
-            .arg("21600")
-            .arg("--json")
-            .output(),
-    )
-    .await;
-
-    let Ok(Ok(output)) = rotate else {
-        warn!("CodexSwitch usage-limit rotation failed or timed out");
-        return false;
-    };
-    if !output.status.success() {
-        warn!(
-            "CodexSwitch usage-limit rotation exited with status {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return false;
-    }
-
-    if let Some(auth_manager) = turn_context.auth_manager.as_ref() {
-        auth_manager.reload().await;
-    }
-    sess.send_event(
-        turn_context,
-        EventMsg::Warning(WarningEvent {
-            message: "CodexSwitch rotated accounts after a usage limit and is retrying this turn.".to_string(),
-        }),
-    )
-    .await;
-    true
-}
-
-#[cfg(not(unix))]
-async fn codexswitch_rotate_after_usage_limit(_sess: &Session, _turn_context: &TurnContext) -> bool {
-    false
-}
-
-"#,
-        "codexswitch_rotate_after_usage_limit",
-    )?;
-    patch_file_after(
-        &turn,
-        "    let mut retries = 0;",
-        r#"
-    let mut codexswitch_usage_limit_retry_attempted = false;"#,
-        "codexswitch_usage_limit_retry_attempted",
-    )?;
-    patch_file_after(
-        &turn,
-        "                if let Some(rate_limits) = rate_limits {\n                    sess.update_rate_limits(&turn_context, *rate_limits).await;\n                }",
-        r#"
-                if !codexswitch_usage_limit_retry_attempted
-                    && codexswitch_rotate_after_usage_limit(&sess, &turn_context).await
-        {
-            codexswitch_usage_limit_retry_attempted = true;
-            continue;
-        }"#,
-        "&& codexswitch_rotate_after_usage_limit",
-    )?;
-    patch_file_before(
-        &tui,
-        "    // Initialize high-fidelity session event logging if enabled.",
-        r#"    #[cfg(unix)]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            let marker_dir = std::path::PathBuf::from(home).join(".codexswitch");
-            let _ = std::fs::create_dir_all(&marker_dir);
-            let _ = std::fs::write(marker_dir.join("sighup-verified-tui"), "tui\n");
-        }
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::error!("Failed to register SIGHUP handler: {err}");
-                    return;
-                }
-            };
-            loop {
-                if sighup.recv().await.is_none() {
-                    break;
-                }
-                tracing::debug!(
-                    "SIGHUP: auth reloaded from disk (foreground session ignores signal; app-server reloads auth)"
-                );
-            }
-        });
-    }
-
-"#,
-        "sighup-verified-tui",
-    )?;
-    Ok(())
-}
-
-fn patch_auth_manager_source(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    patch_file_after(
-        path,
-        "use std::sync::RwLock;",
-        r#"
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;"#,
-        "use std::sync::atomic::AtomicU64;",
-    )?;
-    patch_file_after(
-        path,
-        "    external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,",
-        r#"
-    /// Monotonically increasing counter incremented on every auth change.
-    /// WebSocket sessions compare this to avoid reusing credentials after SIGHUP.
-    auth_generation: AtomicU64,"#,
-        "auth_generation: AtomicU64",
-    )?;
-    patch_auth_generation_none_initializers(path)?;
-    patch_all(
-        path,
-        "            external_auth: RwLock::new(Some(\n                Arc::new(BearerTokenRefresher::new(config)) as Arc<dyn ExternalAuth>\n            )),\n        })",
-        "            external_auth: RwLock::new(Some(\n                Arc::new(BearerTokenRefresher::new(config)) as Arc<dyn ExternalAuth>\n            )),\n            auth_generation: AtomicU64::new(0),\n        })",
-    )?;
-    patch_file_before(
-        path,
-        "    /// Current cached auth (clone) without attempting a refresh.",
-        r#"    /// Current auth generation counter. Incremented whenever cached auth changes.
-    pub fn auth_generation(&self) -> u64 {
-        self.auth_generation.load(Ordering::Acquire)
-    }
-
-"#,
-        "pub fn auth_generation(&self) -> u64",
-    )?;
-    patch_file_after(
-        path,
-        "            tracing::info!(\"Reloaded auth, changed: {changed}\");\n            guard.auth = new_auth;",
-        r#"
-            if auth_changed_for_refresh {
-                self.auth_generation.fetch_add(1, Ordering::AcqRel);
-            }"#,
-        "self.auth_generation.fetch_add",
-    )?;
-    Ok(())
-}
-
-fn patch_auth_generation_none_initializers(path: &Path) -> Result<()> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut updated = String::with_capacity(content.len() + 512);
-    let lines = content.lines().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        updated.push_str(line);
-        updated.push('\n');
-
-        if line.contains("external_auth: RwLock::new(None),") {
-            let lookahead_end = (index + 8).min(lines.len());
-            let has_generation = lines[index + 1..lookahead_end]
-                .iter()
-                .any(|next| next.contains("auth_generation: AtomicU64::new(0),"));
-            if !has_generation {
-                updated.push_str("            auth_generation: AtomicU64::new(0),\n");
-            }
-        }
-
-        index += 1;
-    }
-    if updated != content {
-        fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn patch_client_websocket_source(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    patch_file_after(
-        path,
-        "    connection: Option<ApiWebSocketConnection>,",
-        r#"
-    /// Auth generation that produced this cached connection.
-    /// If auth_generation changes after SIGHUP, the connection must be reopened.
-    auth_generation_at_creation: u64,"#,
-        "auth_generation_at_creation",
-    )?;
-    patch_all(
-        path,
-        r#"    fn take_cached_websocket_session(&self) -> WebsocketSession {
-        let mut cached_websocket_session = self
-            .state
-            .cached_websocket_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *cached_websocket_session)
-    }"#,
-        r#"    fn take_cached_websocket_session(&self) -> WebsocketSession {
-        let mut cached_websocket_session = self
-            .state
-            .cached_websocket_session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cached = std::mem::take(&mut *cached_websocket_session);
-        if let Some(auth_manager) = self.state.provider.auth_manager() {
-            let current_gen = auth_manager.auth_generation();
-            if cached.auth_generation_at_creation != current_gen && cached.connection.is_some() {
-                tracing::info!(
-                    "Auth generation changed ({} -> {}), discarding cached WebSocket",
-                    cached.auth_generation_at_creation,
-                    current_gen
-                );
-                return WebsocketSession {
-                    auth_generation_at_creation: current_gen,
-                    ..WebsocketSession::default()
-                };
-            }
-        }
-        cached
-    }"#,
-    )?;
-    patch_file_after(
-        path,
-        r#"        let client_setup = self.client.current_client_setup().await.map_err(|err| {
-            ApiError::Stream(format!(
-                "failed to build websocket prewarm client setup: {err}"
-            ))
-        })?;"#,
-        r#"
-        let generation_at_resolve = self
-            .client
-            .state
-            .provider
-            .auth_manager()
-            .as_ref()
-            .map(|am| am.auth_generation());"#,
-        "generation_at_resolve",
-    )?;
-    patch_all(
-        path,
-        r#"        self.websocket_session.connection = Some(connection);
-        self.websocket_session
-            .set_connection_reused(/*connection_reused*/ false);
-        Ok(())"#,
-        r#"        self.websocket_session.connection = Some(connection);
-        self.websocket_session
-            .set_connection_reused(/*connection_reused*/ false);
-        if let Some(auth_gen) = generation_at_resolve {
-            self.websocket_session.auth_generation_at_creation = auth_gen;
-        }
-        Ok(())"#,
-    )?;
-    patch_all(
-        path,
-        r#"        if needs_new {
-            self.websocket_session.last_request = None;
-            self.websocket_session.last_response_rx = None;
-            let turn_state = options
-                .turn_state
-                .clone()
-                .unwrap_or_else(|| Arc::clone(&self.turn_state));
-            let new_conn = match self
-                .client
-                .connect_websocket(
-                    session_telemetry,
-                    api_provider,
-                    api_auth,
-                    Some(turn_state),
-                    turn_metadata_header,
-                    auth_context,
-                    request_route_telemetry,
-                )
-                .await
-            {
-                Ok(new_conn) => new_conn,
-                Err(err) => {
-                    if matches!(err, ApiError::Transport(TransportError::Timeout)) {
-                        self.reset_websocket_session();
-                    }
-                    return Err(err);
-                }
-            };
-            self.websocket_session.connection = Some(new_conn);
-            self.websocket_session
-                .set_connection_reused(/*connection_reused*/ false);
-        } else {
-            self.websocket_session
-                .set_connection_reused(/*connection_reused*/ true);
-        }"#,
-        r#"        let current_auth_gen = self
-            .client
-            .state
-            .provider
-            .auth_manager()
-            .as_ref()
-            .map(|am| am.auth_generation());
-        let auth_changed = current_auth_gen
-            .is_some_and(|ag| ag != self.websocket_session.auth_generation_at_creation);
-
-        if needs_new || auth_changed {
-            if auth_changed {
-                tracing::info!("Auth changed, opening new WebSocket with fresh credentials");
-            }
-            self.websocket_session.last_request = None;
-            self.websocket_session.last_response_rx = None;
-            let turn_state = options
-                .turn_state
-                .clone()
-                .unwrap_or_else(|| Arc::clone(&self.turn_state));
-            let (use_provider, use_auth, use_gen, use_auth_context) = if auth_changed {
-                let fresh = self.client.current_client_setup().await.map_err(|err| {
-                    ApiError::Stream(format!(
-                        "failed to re-resolve auth after SIGHUP: {err}"
-                    ))
-                })?;
-                let fresh_gen = self
-                    .client
-                    .state
-                    .provider
-                    .auth_manager()
-                    .as_ref()
-                    .map(|am| am.auth_generation());
-                let fresh_auth_context = AuthRequestTelemetryContext::new(
-                    fresh.auth.as_ref().map(CodexAuth::auth_mode),
-                    fresh.api_auth.as_ref(),
-                    PendingUnauthorizedRetry::default(),
-                );
-                (fresh.api_provider, fresh.api_auth, fresh_gen, fresh_auth_context)
-            } else {
-                (api_provider, api_auth, current_auth_gen, auth_context)
-            };
-            let new_conn = match self
-                .client
-                .connect_websocket(
-                    session_telemetry,
-                    use_provider,
-                    use_auth,
-                    Some(turn_state),
-                    turn_metadata_header,
-                    use_auth_context,
-                    request_route_telemetry,
-                )
-                .await
-            {
-                Ok(new_conn) => new_conn,
-                Err(err) => {
-                    if matches!(err, ApiError::Transport(TransportError::Timeout)) {
-                        self.reset_websocket_session();
-                    }
-                    return Err(err);
-                }
-            };
-            self.websocket_session.connection = Some(new_conn);
-            self.websocket_session
-                .set_connection_reused(/*connection_reused*/ false);
-            if let Some(ag) = use_gen {
-                self.websocket_session.auth_generation_at_creation = ag;
-            }
-        } else {
-            self.websocket_session
-                .set_connection_reused(/*connection_reused*/ true);
-        }"#,
-    )?;
-    patch_all(
-        path,
-        r#"        if needs_new {
-            self.websocket_session.last_request = None;
-            self.websocket_session.last_response_rx = None;
-            self.websocket_session.last_response_from_untraced_warmup = false;
-            let turn_state = options
-                .turn_state
-                .clone()
-                .unwrap_or_else(|| Arc::clone(&self.turn_state));
-            let new_conn = match self
-                .client
-                .connect_websocket(
-                    session_telemetry,
-                    api_provider,
-                    api_auth,
-                    Some(turn_state),
-                    turn_metadata_header,
-                    auth_context,
-                    request_route_telemetry,
-                )
-                .await
-            {
-                Ok(new_conn) => new_conn,
-                Err(err) => {
-                    if matches!(err, ApiError::Transport(TransportError::Timeout)) {
-                        self.reset_websocket_session();
-                    }
-                    return Err(err);
-                }
-            };
-            self.websocket_session.connection = Some(new_conn);
-            self.websocket_session
-                .set_connection_reused(/*connection_reused*/ false);
-        } else {
-            self.websocket_session
-                .set_connection_reused(/*connection_reused*/ true);
-        }"#,
-        r#"        let current_auth_gen = self
-            .client
-            .state
-            .provider
-            .auth_manager()
-            .as_ref()
-            .map(|am| am.auth_generation());
-        let auth_changed = current_auth_gen
-            .is_some_and(|ag| ag != self.websocket_session.auth_generation_at_creation);
-
-        if needs_new || auth_changed {
-            if auth_changed {
-                tracing::info!("Auth changed, opening new WebSocket with fresh credentials");
-            }
-            self.websocket_session.last_request = None;
-            self.websocket_session.last_response_rx = None;
-            self.websocket_session.last_response_from_untraced_warmup = false;
-            let turn_state = options
-                .turn_state
-                .clone()
-                .unwrap_or_else(|| Arc::clone(&self.turn_state));
-            let (use_provider, use_auth, use_gen, use_auth_context) = if auth_changed {
-                let fresh = self.client.current_client_setup().await.map_err(|err| {
-                    ApiError::Stream(format!(
-                        "failed to re-resolve auth after SIGHUP: {err}"
-                    ))
-                })?;
-                let fresh_gen = self
-                    .client
-                    .state
-                    .provider
-                    .auth_manager()
-                    .as_ref()
-                    .map(|am| am.auth_generation());
-                let fresh_auth_context = AuthRequestTelemetryContext::new(
-                    fresh.auth.as_ref().map(CodexAuth::auth_mode),
-                    fresh.api_auth.as_ref(),
-                    PendingUnauthorizedRetry::default(),
-                );
-                (fresh.api_provider, fresh.api_auth, fresh_gen, fresh_auth_context)
-            } else {
-                (api_provider, api_auth, current_auth_gen, auth_context)
-            };
-            let new_conn = match self
-                .client
-                .connect_websocket(
-                    session_telemetry,
-                    use_provider,
-                    use_auth,
-                    Some(turn_state),
-                    turn_metadata_header,
-                    use_auth_context,
-                    request_route_telemetry,
-                )
-                .await
-            {
-                Ok(new_conn) => new_conn,
-                Err(err) => {
-                    if matches!(err, ApiError::Transport(TransportError::Timeout)) {
-                        self.reset_websocket_session();
-                    }
-                    return Err(err);
-                }
-            };
-            self.websocket_session.connection = Some(new_conn);
-            self.websocket_session
-                .set_connection_reused(/*connection_reused*/ false);
-            if let Some(ag) = use_gen {
-                self.websocket_session.auth_generation_at_creation = ag;
-            }
-        } else {
-            self.websocket_session
-                .set_connection_reused(/*connection_reused*/ true);
-        }"#,
-    )?;
-    Ok(())
-}
-
-fn patch_file_after(path: &Path, needle: &str, insertion: &str, marker: &str) -> Result<()> {
-    patch_file_after_any(path, &[needle], insertion, marker)
-}
-
-fn patch_file_after_any(
-    path: &Path,
-    needles: &[&str],
-    insertion: &str,
-    marker: &str,
-) -> Result<()> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if content.contains(marker) {
-        return Ok(());
-    }
-    let Some((index, needle)) = needles
-        .iter()
-        .find_map(|needle| content.find(needle).map(|index| (index, *needle)))
-    else {
-        bail!("patch anchor not found in {}", path.display());
-    };
-    let insert_at = index + needle.len();
-    let updated = format!(
-        "{}{}{}",
-        &content[..insert_at],
-        insertion,
-        &content[insert_at..]
-    );
-    fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
-fn patch_all(path: &Path, needle: &str, replacement: &str) -> Result<()> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if !content.contains(needle) {
-        return Ok(());
-    }
-    let updated = content.replace(needle, replacement);
-    fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
-fn patch_file_before(path: &Path, needle: &str, insertion: &str, marker: &str) -> Result<()> {
-    patch_file_before_any(path, &[needle], insertion, marker)
-}
-
-fn patch_file_before_any(
-    path: &Path,
-    needles: &[&str],
-    insertion: &str,
-    marker: &str,
-) -> Result<()> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if content.contains(marker) {
-        return Ok(());
-    }
-    let Some(index) = needles.iter().find_map(|needle| content.find(needle)) else {
-        bail!("patch anchor not found in {}", path.display());
-    };
-    let updated = format!("{}{}{}", &content[..index], insertion, &content[index..]);
-    fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
+// Kept in the parent module so source-generation helpers and their deterministic
+// tests share the same private types without widening the updater API.
+include!("codex_update/source_patching.rs");
 fn load_state() -> Result<CodexUpdateState> {
     let path = state_path()?;
-    if !path.exists() {
-        return Ok(CodexUpdateState::default());
+    load_state_at(&path)
+}
+
+fn load_state_at(path: &Path) -> Result<CodexUpdateState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CodexUpdateState::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("Codex update state must be a regular non-symlink file");
     }
-    let state = serde_json::from_slice::<CodexUpdateState>(
-        &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
-    )
-    .with_context(|| format!("failed to decode {}", path.display()))?;
+    if metadata.len() > UPDATE_STATE_MAX_BYTES {
+        bail!(
+            "Codex update state exceeds the {} byte limit",
+            UPDATE_STATE_MAX_BYTES
+        );
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let opened = file.metadata()?;
+    if opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.mode() != metadata.mode()
+    {
+        bail!("Codex update state changed identity while it was opened");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(UPDATE_STATE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() as u64 > UPDATE_STATE_MAX_BYTES {
+        bail!(
+            "Codex update state exceeded the {} byte limit while reading",
+            UPDATE_STATE_MAX_BYTES
+        );
+    }
+    let mut state = serde_json::from_slice::<CodexUpdateState>(&bytes)
+        .with_context(|| format!("failed to decode {}", path.display()))?;
+    preserve_legacy_failure_if_needed(&mut state);
     Ok(state)
 }
 
 fn save_state(state: &CodexUpdateState) -> Result<()> {
     let path = state_path()?;
+    save_state_at(&path, state)
+}
+
+fn save_state_at(path: &Path, state: &CodexUpdateState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, serde_json::to_vec_pretty(state)?)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    let parent = path.parent().context("update state path has no parent")?;
+    let temp_path = parent.join(format!(
+        ".codex-cli-update.json.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let encoded = serde_json::to_vec_pretty(state)?;
+    if encoded.len() as u64 > UPDATE_STATE_MAX_BYTES {
+        bail!(
+            "Codex update state exceeds the {} byte limit",
+            UPDATE_STATE_MAX_BYTES
+        );
+    }
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        file.write_all(&encoded)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -1258,37 +1745,63 @@ fn installed_codex_version() -> Option<String> {
 }
 
 fn installed_codex_version_from_path(installed_binary: &Path) -> Option<String> {
-    if patched_codex::binary_has_hot_swap_markers(installed_binary) {
-        return patched_codex::codex_version(installed_binary);
-    }
-    let launcher_target = launcher_patched_codex_target(installed_binary)?;
-    if !patched_codex::binary_has_hot_swap_markers(&launcher_target) {
+    let runtime_binary = installed_runtime_binary(installed_binary).ok()?;
+    if !patched_codex::binary_has_hot_swap_markers(&runtime_binary)
+        || !patched_codex::runtime_has_valid_code_mode_host(&runtime_binary)
+    {
         return None;
     }
-    patched_codex::codex_version(&launcher_target)
+    patched_codex::codex_version(&runtime_binary)
 }
 
-fn launcher_patched_codex_target(launcher: &Path) -> Option<PathBuf> {
-    let content = fs::read_to_string(launcher).ok()?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("PATCHED_CODEX='") {
-            let path = value.strip_suffix('\'')?;
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
+fn installed_runtime_binary(installed_binary: &Path) -> Result<PathBuf> {
+    patched_codex::resolve_installed_runtime(installed_binary)
 }
 
 fn check_due(state: &CodexUpdateState) -> bool {
     state
         .last_checked_at
-        .map(|checked| Utc::now() - checked >= ChronoDuration::hours(DAILY_CHECK_HOURS))
+        .map(|checked| {
+            Utc::now() - checked >= ChronoDuration::minutes(AUTOMATIC_CHECK_INTERVAL_MINUTES)
+        })
         .unwrap_or(true)
 }
 
 pub fn version_is_stable(version: &str) -> bool {
-    !version.contains('-') && version.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+    parse_stable_version(version).is_some()
+}
+
+fn version_is_strictly_newer(candidate: &str, previous: &str) -> bool {
+    match (
+        parse_stable_version(candidate),
+        parse_stable_version(previous),
+    ) {
+        (Some(candidate), Some(previous)) => candidate > previous,
+        _ => false,
+    }
+}
+
+fn version_is_at_least(candidate: &str, previous: &str) -> bool {
+    match (
+        parse_stable_version(candidate),
+        parse_stable_version(previous),
+    ) {
+        (Some(candidate), Some(previous)) => candidate >= previous,
+        _ => false,
+    }
+}
+
+fn parse_stable_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut components = version.split('.');
+    let parsed = (
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+    );
+    if components.next().is_some() {
+        return None;
+    }
+    Some(parsed)
 }
 
 pub fn stable_source_tag(version: &str) -> Result<String> {
@@ -1315,454 +1828,4 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stable_source_tags_refuse_alpha_versions() {
-        assert_eq!(stable_source_tag("0.128.0").unwrap(), "rust-v0.128.0");
-        assert!(stable_source_tag("0.129.0-alpha.1").is_err());
-    }
-
-    #[test]
-    fn stable_version_filter_rejects_prereleases() {
-        assert!(version_is_stable("0.128.0"));
-        assert!(!version_is_stable("0.128.0-alpha.15"));
-        assert!(!version_is_stable("latest"));
-    }
-
-    #[test]
-    fn ready_status_names_install_command_and_version() {
-        let state = CodexUpdateState {
-            status: UpdateStatus::ReadyToInstall,
-            last_checked_at: None,
-            latest_stable_version: Some("0.128.0".to_string()),
-            installed_version: Some("0.126.0".to_string()),
-            prepared_version: Some("0.128.0".to_string()),
-            prepared_source_path: None,
-            prepared_binary_path: None,
-            error: None,
-            updated_at: Utc::now(),
-        };
-        let report = report_from_state(state);
-        assert!(report.summary.contains("0.128.0"));
-        assert_eq!(
-            report.install_command.as_deref(),
-            Some("codexswitch-cli install-prepared-codex")
-        );
-    }
-
-    #[test]
-    fn daemon_background_update_command_installs_after_prepare() {
-        assert_eq!(
-            background_auto_install_args(),
-            ["auto-install-codex-update", "--json"]
-        );
-    }
-
-    #[test]
-    fn idle_state_with_known_update_is_pending_even_before_daily_check() {
-        let state = CodexUpdateState {
-            status: UpdateStatus::Idle,
-            last_checked_at: Some(Utc::now()),
-            latest_stable_version: Some("0.134.0".to_string()),
-            installed_version: Some("0.133.0".to_string()),
-            prepared_version: None,
-            prepared_source_path: None,
-            prepared_binary_path: None,
-            error: None,
-            updated_at: Utc::now(),
-        };
-
-        assert!(state_has_pending_stable_update(&state));
-    }
-
-    #[test]
-    fn installing_status_describes_background_install() {
-        let state = CodexUpdateState {
-            status: UpdateStatus::Installing,
-            last_checked_at: None,
-            latest_stable_version: Some("0.134.0".to_string()),
-            installed_version: Some("0.133.0".to_string()),
-            prepared_version: Some("0.134.0".to_string()),
-            prepared_source_path: None,
-            prepared_binary_path: None,
-            error: None,
-            updated_at: Utc::now(),
-        };
-        let report = report_from_state(state);
-        assert!(report.summary.contains("installing"));
-        assert!(report.summary.contains("0.134.0"));
-        assert_eq!(report.install_command, None);
-    }
-
-    #[test]
-    fn installed_version_ignores_launcher_or_wrapper_without_hot_swap_markers() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let binary = temp_dir.path().join("codex");
-        fs::write(&binary, "#!/bin/sh\necho 'codex-cli 0.130.0'\n").unwrap();
-        set_executable(&binary).unwrap();
-
-        assert_eq!(installed_codex_version_from_path(&binary), None);
-    }
-
-    #[test]
-    fn installed_version_follows_macos_launcher_to_prepared_binary() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let prepared = temp_dir.path().join("prepared-codex/0.130.0/codex");
-        fs::create_dir_all(prepared.parent().unwrap()).unwrap();
-        fs::write(
-            &prepared,
-            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit Auth changed, opening new WebSocket with fresh credentials Usage: /goal <objective>\necho 'codex-cli 0.130.0'\n",
-        )
-        .unwrap();
-        set_executable(&prepared).unwrap();
-
-        let launcher = temp_dir.path().join("patched-codex/codex");
-        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
-        fs::write(
-            &launcher,
-            format!(
-                "#!/bin/sh\nPATCHED_CODEX='{}'\nexec \"$PATCHED_CODEX\" \"$@\"\n",
-                prepared.display()
-            ),
-        )
-        .unwrap();
-        set_executable(&launcher).unwrap();
-
-        assert_eq!(
-            installed_codex_version_from_path(&launcher).as_deref(),
-            Some("0.130.0")
-        );
-    }
-
-    #[test]
-    fn app_server_sighup_patch_targets_processor_auth_manager() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let source_dir = temp_dir.path();
-        let app_server_dir = source_dir.join("codex-rs/app-server/src");
-        let turn_dir = source_dir.join("codex-rs/core/src/session");
-        let tui_dir = source_dir.join("codex-rs/tui/src");
-        fs::create_dir_all(&app_server_dir).unwrap();
-        fs::create_dir_all(&turn_dir).unwrap();
-        fs::create_dir_all(&tui_dir).unwrap();
-        fs::write(
-            app_server_dir.join("lib.rs"),
-            r#"
-async fn preload() {
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-    config_manager.replace_cloud_requirements_loader(auth_manager, config.chatgpt_base_url);
-}
-
-async fn run_processor() {
-    let processor_handle = tokio::spawn({
-        let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-        let processor = MessageProcessor::new(auth_manager.clone());
-    });
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            app_server_dir.join("in_process.rs"),
-            r#"
-fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
-    let runtime_handle = tokio::spawn(async move {
-        let auth_manager =
-            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)
-                .await;
-        let processor = MessageProcessor::new(auth_manager.clone());
-    });
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            turn_dir.join("turn.rs"),
-            r#"
-use codex_protocol::error::CodexErr;
-
-/// Takes initial turn input and runs a loop where, at each sampling request,
-async fn run_turn() {
-    let mut retries = 0;
-    loop {
-        match try_run_sampling_request().await {
-            Ok(output) => return Ok(output),
-            Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
-                }
-                return Err(CodexErr::UsageLimitReached(e));
-            }
-            Err(err) => err,
-        };
-    }
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            tui_dir.join("lib.rs"),
-            "pub async fn main() {\n    // Initialize high-fidelity session event logging if enabled.\n}\n",
-        )
-        .unwrap();
-
-        patch_codex_source(source_dir).unwrap();
-
-        let patched = fs::read_to_string(app_server_dir.join("lib.rs")).unwrap();
-        let processor_index = patched.find("let processor_handle").unwrap();
-        let marker_index = patched.find("sighup-verified").unwrap();
-        assert!(
-            marker_index > processor_index,
-            "SIGHUP reload must patch the auth manager captured by MessageProcessor, not the preload auth manager"
-        );
-        assert!(patched.contains("SIGHUP: auth reload signal received"));
-        assert!(patched.contains("hotswap-ack"));
-        assert_eq!(patched.matches("SIGHUP: auth reloaded").count(), 2);
-
-        let in_process_patched = fs::read_to_string(app_server_dir.join("in_process.rs")).unwrap();
-        let auth_index = in_process_patched
-            .find("AuthManager::shared_from_config")
-            .unwrap();
-        let in_process_ack_index = in_process_patched
-            .find("SIGHUP: auth reload signal received by in-process app-server")
-            .unwrap();
-        assert!(
-            in_process_ack_index > auth_index,
-            "foreground CLI uses the in-process app-server, so its auth manager must acknowledge SIGHUP"
-        );
-        assert!(in_process_patched.contains("hotswap-ack"));
-    }
-
-    #[test]
-    fn app_server_sighup_patch_accepts_shared_auth_manager_anchor() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let source_dir = temp_dir.path();
-        let app_server_dir = source_dir.join("codex-rs/app-server/src");
-        let turn_dir = source_dir.join("codex-rs/core/src/session");
-        let tui_dir = source_dir.join("codex-rs/tui/src");
-        fs::create_dir_all(&app_server_dir).unwrap();
-        fs::create_dir_all(&turn_dir).unwrap();
-        fs::create_dir_all(&tui_dir).unwrap();
-        fs::write(
-            app_server_dir.join("lib.rs"),
-            r#"
-async fn run_app_server() {
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-
-    let remote_control_requested = runtime_options.remote_control_enabled;
-    let processor_handle = tokio::spawn({
-        let auth_manager = Arc::clone(&auth_manager);
-        let processor = MessageProcessor::new(MessageProcessorArgs {
-            auth_manager,
-        });
-    });
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            turn_dir.join("turn.rs"),
-            r#"
-use codex_protocol::error::CodexErr;
-
-/// Takes a user message as input and runs a loop where, at each sampling request, the model
-async fn run_turn() {
-    let mut retries = 0;
-    loop {
-        match try_run_sampling_request().await {
-            Ok(output) => return Ok(output),
-            Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
-                }
-                return Err(CodexErr::UsageLimitReached(e));
-            }
-            Err(err) => err,
-        };
-    }
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            tui_dir.join("lib.rs"),
-            "pub async fn main() {\n    // Initialize high-fidelity session event logging if enabled.\n}\n",
-        )
-        .unwrap();
-
-        patch_codex_source(source_dir).unwrap();
-
-        let patched = fs::read_to_string(app_server_dir.join("lib.rs")).unwrap();
-        let shared_auth_index = patched.find("AuthManager::shared_from_config").unwrap();
-        let marker_index = patched.find("SIGHUP: auth reload signal received").unwrap();
-        let remote_control_index = patched.find("remote_control_requested").unwrap();
-        assert!(marker_index > shared_auth_index);
-        assert!(marker_index < remote_control_index);
-        assert!(patched.contains("hotswap-ack"));
-    }
-
-    #[test]
-    fn app_server_patch_upgrades_legacy_sighup_without_ack() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let source_dir = temp_dir.path();
-        let app_server_dir = source_dir.join("codex-rs/app-server/src");
-        let turn_dir = source_dir.join("codex-rs/core/src/session");
-        let tui_dir = source_dir.join("codex-rs/tui/src");
-        fs::create_dir_all(&app_server_dir).unwrap();
-        fs::create_dir_all(&turn_dir).unwrap();
-        fs::create_dir_all(&tui_dir).unwrap();
-        fs::write(
-            app_server_dir.join("lib.rs"),
-            r#"
-async fn preload() {
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-    #[cfg(unix)]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            let marker_dir = std::path::PathBuf::from(home).join(".codexswitch");
-            let _ = std::fs::create_dir_all(&marker_dir);
-            let _ = std::fs::write(marker_dir.join("sighup-verified"), "app-server\n");
-        }
-
-        let auth_for_signal = auth_manager.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sighup = signal(SignalKind::hangup()).unwrap();
-            while sighup.recv().await.is_some() {
-                let changed = auth_for_signal.reload().await;
-                if changed {
-                    tracing::info!("SIGHUP: auth reloaded from disk (tokens changed)");
-                } else {
-                    tracing::debug!("SIGHUP: auth reloaded from disk (no change)");
-                }
-            }
-        });
-    }
-    config_manager.replace_cloud_requirements_loader(auth_manager, config.chatgpt_base_url);
-}
-
-async fn run_processor() {
-    let processor_handle = tokio::spawn({
-        let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-        let processor = MessageProcessor::new(auth_manager.clone());
-    });
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            turn_dir.join("turn.rs"),
-            r#"
-use codex_protocol::error::CodexErr;
-
-/// Takes a user message as input and runs a loop where, at each sampling request, the model
-async fn run_turn() {
-    let mut retries = 0;
-    loop {
-        match try_run_sampling_request().await {
-            Ok(output) => return Ok(output),
-            Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
-                }
-                return Err(CodexErr::UsageLimitReached(e));
-            }
-            Err(err) => err,
-        };
-    }
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            tui_dir.join("lib.rs"),
-            "pub async fn main() {\n    // Initialize high-fidelity session event logging if enabled.\n}\n",
-        )
-        .unwrap();
-
-        patch_codex_source(source_dir).unwrap();
-
-        let patched = fs::read_to_string(app_server_dir.join("lib.rs")).unwrap();
-        let processor_index = patched.find("let processor_handle").unwrap();
-        let ack_index = patched.find("hotswap-ack").unwrap();
-        assert!(
-            ack_index > processor_index,
-            "legacy SIGHUP-only patches must be upgraded at the processor auth manager"
-        );
-        assert!(patched.contains("SIGHUP: auth reload signal received"));
-    }
-
-    #[test]
-    fn core_turn_patch_rotates_and_retries_once_on_usage_limit() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let source_dir = temp_dir.path();
-        let app_server_dir = source_dir.join("codex-rs/app-server/src");
-        let turn_dir = source_dir.join("codex-rs/core/src/session");
-        let tui_dir = source_dir.join("codex-rs/tui/src");
-        fs::create_dir_all(&app_server_dir).unwrap();
-        fs::create_dir_all(&turn_dir).unwrap();
-        fs::create_dir_all(&tui_dir).unwrap();
-        fs::write(
-            app_server_dir.join("lib.rs"),
-            r#"
-async fn run_processor() {
-    let processor_handle = tokio::spawn({
-        let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-        let processor = MessageProcessor::new(auth_manager.clone());
-    });
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            turn_dir.join("turn.rs"),
-            r#"
-use codex_protocol::error::CodexErr;
-
-/// Takes a user message as input and runs a loop where, at each sampling request, the model
-async fn run_turn() {
-    let mut retries = 0;
-    loop {
-        match try_run_sampling_request().await {
-            Ok(output) => return Ok(output),
-            Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
-                }
-                return Err(CodexErr::UsageLimitReached(e));
-            }
-            Err(err) => err,
-        };
-    }
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            tui_dir.join("lib.rs"),
-            "pub async fn main() {\n    // Initialize high-fidelity session event logging if enabled.\n}\n",
-        )
-        .unwrap();
-
-        patch_codex_source(source_dir).unwrap();
-
-        let patched = fs::read_to_string(turn_dir.join("turn.rs")).unwrap();
-        assert!(patched.contains("codexswitch_rotate_after_usage_limit"));
-        assert!(patched.contains("codexswitch_usage_limit_retry_attempted"));
-        assert!(patched.contains("rotate-now"));
-        assert!(patched.contains("usage_limit"));
-        assert!(patched.contains("continue;"));
-    }
-}
+include!("codex_update/tests.rs");

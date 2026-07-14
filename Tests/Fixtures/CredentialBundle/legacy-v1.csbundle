@@ -1,0 +1,20 @@
+{
+  "format": "codexswitch-linux-devbox-bundle",
+  "schemaVersion": 1,
+  "kdf": "sha256-passphrase-salt-v1",
+  "cipher": "aes-256-gcm",
+  "metadata": {
+    "accountCount": 1,
+    "activeEmail": "fixture@example.com",
+    "createdAt": "2099-01-01T00:00:00Z",
+    "emails": [
+      "fixture@example.com"
+    ],
+    "expiresAt": "2099-01-01T00:30:00Z",
+    "exportedByHost": "fixture-mac",
+    "schemaVersion": 1
+  },
+  "salt": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "nonce": "ICEiIyQlJicoKSor",
+  "ciphertext": "XPMdn8eDn5t9VFbwmaM5KEiFosEnrID1DAE4B3RqSY1X9CTSJWIDWGnRq1MVbYSt+C7iok7pqnC0/LVAzjKzBSo6EmWsPlHYFaCLNU2jiJlJ0qvxloSEpA17Zb7EC+I10dPDOd8NSOa5sVJ1wQvQMWQijFr4ojcmJSQEUrEs4GN+dGy4mm3dpChG9IdsYFv/m0a1Op41apbPEPpIj2tuDLlLb7XhbZ9ymjvNGyXj3LxVfzshsGUv/cDqlRU7OcLq+oID/EN3Lgi1ffWzxBy/C59jYkI5UFuMYov00LhtjbH7c2yG5ZDe8xzbKyiEQqXP2uhQFuUQOeIUZj60hcOfwJ4bugQrtwdEyep8hE/WyzkHa9n+gKta4/4l2eWaxc6d6NMRnSAGU7gwezhe48Ye262KhPNRty/1JMZsHErkx84TkJO89h/wkla6SR2khpW1KHFPxGI5f/6ZTS8TUvt/NGrN1UXFhNhzFEkJynjFE9oYYd/FeYbi0bpvDq6a21Q1Le1HF/MH+epFNsEgHSpEyMcsSMFcySjXNbDvjiDnTGQgqy8l7NSgj4h9KNSWNS9N6fI8pGnk+LRIRn0ne3TuI0zSpCEgE7mJccREexGVsAPHWYhLA6YvbGxh+v/BD5BWlXA1Wc4dLh9Hs03xwof3eW0Eu/OgsYrjeaXEL3AqwRR93rhwLxwTjtoonzPES83r5+J/iIUUsHE8UuyITwgTiz2SIV2wG4efHGokaaevkL84woCLfdvfMx1pwNC5gzYnl2qKmOBaeRwgLGegtgViNnnZcAxnwetUMIWoySwPMzBMeVX9KiMQfCqsFi3ePIAzuthWmDFxkfS57TD3zoz3UFLTltU/E83a0ricFu6JCmI="
+}

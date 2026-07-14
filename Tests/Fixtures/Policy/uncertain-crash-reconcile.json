@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "case": "uncertain-crash-reconcile",
+  "now": 805550400,
+  "beforeBank": {
+    "availableCount": 1,
+    "totalEarnedCount": 1,
+    "credits": [{
+      "id": "crash-credit",
+      "resetType": "full",
+      "status": "available",
+      "grantedAt": 805464000,
+      "expiresAt": 806414400,
+      "redeemStartedAt": null,
+      "redeemedAt": null,
+      "title": "Full reset",
+      "description": null
+    }],
+    "fetchedAt": 805550400
+  },
+  "afterBank": {
+    "availableCount": 0,
+    "totalEarnedCount": 1,
+    "credits": [{
+      "id": "crash-credit",
+      "resetType": "full",
+      "status": "redeemed",
+      "grantedAt": 805464000,
+      "expiresAt": 806414400,
+      "redeemStartedAt": 805550401,
+      "redeemedAt": 805550402,
+      "title": "Full reset",
+      "description": null
+    }],
+    "fetchedAt": 805550402
+  },
+  "quotaFetchedAt": 805550403,
+  "expected": {
+    "postCount": 1,
+    "state": "reconciled_usable",
+    "consumptionObserved": true,
+    "quotaReconciled": true
+  }
+}

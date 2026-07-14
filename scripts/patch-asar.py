@@ -37,16 +37,32 @@ import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-DEFAULT_APP_PATH = Path("/Applications/Codex.app")
-APP_PATH = Path(os.environ.get("CODEXSWITCH_CODEX_APP_PATH", str(DEFAULT_APP_PATH))).expanduser()
+UNIFIED_APP_PATH = Path("/Applications/ChatGPT.app")
+LEGACY_APP_PATH = Path("/Applications/Codex.app")
+
+
+def resolve_default_app_path(candidates: list[Path] | None = None) -> Path:
+    override = os.environ.get("CODEXSWITCH_CODEX_APP_PATH") or os.environ.get("CODEX_APP")
+    if override:
+        return Path(override).expanduser()
+
+    ordered = candidates or [UNIFIED_APP_PATH, LEGACY_APP_PATH]
+    return next((path for path in ordered if path.exists()), ordered[0])
+
+
+DEFAULT_APP_PATH = resolve_default_app_path()
+APP_PATH = DEFAULT_APP_PATH
 INFO_PLIST_PATH = APP_PATH / "Contents" / "Info.plist"
 APP_RESOURCES = APP_PATH / "Contents" / "Resources"
 ASAR_PATH = APP_RESOURCES / "app.asar"
@@ -59,7 +75,12 @@ SKY_COMPUTER_USE_CLIENT_APP_RELATIVE = (
     COMPUTER_USE_PLUGIN_APP_RELATIVE
     / "Contents/SharedSupport/SkyComputerUseClient.app"
 )
-BACKUP_ROOT = Path.home() / ".codexswitch" / "backups" / "Codex.app"
+BACKUP_ROOT = Path(
+    os.environ.get(
+        "CODEXSWITCH_BACKUP_ROOT",
+        str(Path.home() / ".codexswitch" / "backups" / APP_PATH.name),
+    )
+).expanduser()
 ASAR_BACKUP = BACKUP_ROOT / "app.asar.bak"
 
 # Marker to detect if already patched
@@ -71,24 +92,65 @@ HEADROOM_GLOBAL_ENV_MARKER = "CODEXSWITCH_HEADROOM_GLOBAL_ENV_PATCH"
 DESKTOP_CLI_PATH_GUARD_MARKER = "CODEXSWITCH_DESKTOP_CLI_PATH_GUARD"
 BUNDLED_PLUGIN_SYNC_COMPAT_MARKER = "CODEXSWITCH_BUNDLED_PLUGIN_SYNC_COMPAT"
 BUNDLED_PLUGIN_LIST_ROOT_MARKER = "CODEXSWITCH_BUNDLED_PLUGIN_LIST_ROOT_PATCH"
+REMOTE_RECENTS_REFRESH_MARKER = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH"
+MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_MODEL_LABEL_FALLBACK"
+MODEL_AVAILABILITY_FALLBACK_MARKER = "CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK"
+SELECTED_MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK"
+REMOTE_MODEL_REFRESH_MARKER = "CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH"
+GPT56_MAX_EFFORT_FALLBACK_MARKER = "CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK"
 BUNDLED_PLUGIN_MARKETPLACE_ROOT = str(
     APP_PATH / "Contents/Resources/plugins/openai-bundled"
 )
 OPENAI_TEAM_ID = "2DC432GLL2"
 OFFICIAL_CODEX_DMG_URL = "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg"
+IPHONE_DEVELOPER_PREFIX = "iPhone Developer"
+CODESIGN_IDENTITY_PREFIXES = (
+    "Developer ID Application",
+    "Apple Distribution",
+    "Apple Development",
+    "Mac Developer",
+    IPHONE_DEVELOPER_PREFIX,
+)
+ILOADER_KEY_ROOT = Path.home() / "Library/Application Support/me.nabdev.iloader/keys"
 SIGHUP_CLI_MARKERS = (
     b"sighup-verified",
     b"sighup-verified-tui",
     b"sighup-verified-exec",
 )
 SIGHUP_RELOAD_MARKER = b"SIGHUP: auth reloaded"
+SIGHUP_REQUIRED_MARKERS = (
+    b"hotswap-ack",
+    b"CodexSwitch rotated accounts after a usage limit",
+    b"CodexSwitch rotated accounts after an auth failure",
+    b"Auth changed, opening new WebSocket with fresh credentials",
+    b"codexswitch-runtime-convergence-v3",
+    b"codexswitch-runtime-rotation-handoff-v1",
+    b"CodexSwitch account/updated frontend write acknowledged after auth reload",
+    b"codexswitch-hotswap-contract-v3",
+    b"codexswitch-hotswap-cli-contract-v3",
+)
+GOAL_USAGE_MARKER = b"Usage: /goal <objective>"
+GOAL_STATUS_MARKER = b"Pursuing goal"
+GOAL_RPC_MARKER = b"thread/goal/set"
 GPT55_MODEL_MARKER = b"gpt-5.5"
 MIN_GPT55_VERSION = (0, 125, 0)
+CLI_MARKER_SCAN_CHUNK_SIZE = 1024 * 1024
+CLI_MARKER_SCAN_CACHE_LIMIT = 64
 
 # Glob pattern for asar --unpack: native .node modules + node-pty spawn-helper
 UNPACK_GLOB = "{*.node,spawn-helper}"
 BUNDLE_CODE_SUFFIXES = {".app", ".framework", ".xpc"}
 FILE_CODE_SUFFIXES = {".dylib", ".so", ".node"}
+MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
+}
 RESOURCE_EXECUTABLE_NAMES = {
     "codex",
     "node",
@@ -109,15 +171,96 @@ LOCAL_DESKTOP_APP_ENTITLEMENTS = {
 }
 
 
-def cli_has_sighup_patch(path: Path) -> bool:
-    """Return true when a Codex CLI binary contains the SIGHUP hot-swap patch."""
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return False
-    return any(marker in data for marker in SIGHUP_CLI_MARKERS) and (
-        SIGHUP_RELOAD_MARKER in data
+class CLIMarkerScan(NamedTuple):
+    has_sighup_contract: bool
+    supports_gpt55: bool
+
+
+_CLI_MARKER_SCAN_CACHE: OrderedDict[
+    tuple[int, int, int, int, int], CLIMarkerScan
+] = OrderedDict()
+
+
+def _cli_marker_stat_key(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
     )
+
+
+def scan_cli_markers(
+    path: Path,
+    *,
+    chunk_size: int = CLI_MARKER_SCAN_CHUNK_SIZE,
+) -> CLIMarkerScan | None:
+    """Inspect CLI capabilities with bounded reads and identity-keyed reuse."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    try:
+        before = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(before.st_mode):
+        return None
+
+    cache_key = _cli_marker_stat_key(before)
+    cached = _CLI_MARKER_SCAN_CACHE.get(cache_key)
+    if cached is not None:
+        _CLI_MARKER_SCAN_CACHE.move_to_end(cache_key)
+        return cached
+
+    markers = set(SIGHUP_CLI_MARKERS)
+    markers.add(SIGHUP_RELOAD_MARKER)
+    markers.update(SIGHUP_REQUIRED_MARKERS)
+    markers.update(
+        (GOAL_USAGE_MARKER, GOAL_STATUS_MARKER, GOAL_RPC_MARKER, GPT55_MODEL_MARKER)
+    )
+    found: set[bytes] = set()
+    overlap_size = max(len(marker) for marker in markers) - 1
+    overlap = b""
+
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(chunk_size):
+                window = overlap + chunk
+                for marker in markers - found:
+                    if marker in window:
+                        found.add(marker)
+                overlap = window[-overlap_size:] if overlap_size else b""
+        after = path.stat()
+    except OSError:
+        return None
+
+    if _cli_marker_stat_key(after) != cache_key:
+        return None
+
+    result = CLIMarkerScan(
+        has_sighup_contract=(
+            any(marker in found for marker in SIGHUP_CLI_MARKERS)
+            and SIGHUP_RELOAD_MARKER in found
+            and all(marker in found for marker in SIGHUP_REQUIRED_MARKERS)
+            and (
+                GOAL_USAGE_MARKER in found
+                or (GOAL_STATUS_MARKER in found and GOAL_RPC_MARKER in found)
+            )
+        ),
+        supports_gpt55=GPT55_MODEL_MARKER in found,
+    )
+    _CLI_MARKER_SCAN_CACHE[cache_key] = result
+    _CLI_MARKER_SCAN_CACHE.move_to_end(cache_key)
+    while len(_CLI_MARKER_SCAN_CACHE) > CLI_MARKER_SCAN_CACHE_LIMIT:
+        _CLI_MARKER_SCAN_CACHE.popitem(last=False)
+    return result
+
+
+def cli_has_sighup_patch(path: Path) -> bool:
+    """Return true when a Codex CLI satisfies the patched runtime contract."""
+    scan = scan_cli_markers(path)
+    return scan is not None and scan.has_sighup_contract
 
 
 def parse_cli_version(text: str) -> tuple[int, int, int] | None:
@@ -143,12 +286,8 @@ def read_cli_version(path: Path) -> tuple[int, int, int] | None:
 
 
 def cli_supports_gpt55(path: Path) -> bool:
-    try:
-        data = path.read_bytes()
-    except OSError:
-        data = b""
-
-    if GPT55_MODEL_MARKER in data:
+    scan = scan_cli_markers(path)
+    if scan is not None and scan.supports_gpt55:
         return True
 
     version = read_cli_version(path)
@@ -323,13 +462,7 @@ def select_codesign_identity() -> str:
             identities.append(match.group(1))
 
     ranked_identities = []
-    for prefix in (
-        "Developer ID Application",
-        "Apple Distribution",
-        "Apple Development",
-        "Mac Developer",
-        "iPhone Developer",
-    ):
+    for prefix in CODESIGN_IDENTITY_PREFIXES:
         for identity in identities:
             if identity.startswith(prefix):
                 ranked_identities.append(identity)
@@ -337,7 +470,7 @@ def select_codesign_identity() -> str:
     for identity in ranked_identities:
         if codesign_identity_is_apple_issued(identity):
             return identity
-    return ranked_identities[0] if ranked_identities else "-"
+    return "-"
 
 
 def codesign_identity_is_apple_issued(identity: str) -> bool:
@@ -382,13 +515,144 @@ def codesign_identity_is_apple_issued(identity: str) -> bool:
     return False
 
 
-def usable_codesign_identity_available() -> bool:
+def certificate_is_apple_issued_iphone_developer(cert_path: Path) -> bool:
+    try:
+        decoded = subprocess.run(
+            ["openssl", "x509", "-noout", "-subject", "-issuer", "-in", str(cert_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if decoded.returncode != 0:
+        return False
+    output = decoded.stdout + "\n" + decoded.stderr
+    subject = re.search(r"^subject=(.+)$", output, flags=re.MULTILINE)
+    issuer = re.search(r"^issuer=(.+)$", output, flags=re.MULTILINE)
+    subject_text = subject.group(1).strip() if subject else ""
+    issuer_text = issuer.group(1).strip() if issuer else ""
+    return (
+        IPHONE_DEVELOPER_PREFIX in subject_text
+        and "Apple" in issuer_text
+        and issuer_text != subject_text
+    )
+
+
+def cached_iphone_developer_keypairs(root: Path = ILOADER_KEY_ROOT) -> list[tuple[Path, Path]]:
+    if not root.exists():
+        return []
+    pairs: list[tuple[Path, Path]] = []
+    for cert_path in sorted(root.glob("*/cert.pem")):
+        key_path = cert_path.with_name("key.pem")
+        if not key_path.exists():
+            continue
+        if certificate_is_apple_issued_iphone_developer(cert_path):
+            pairs.append((cert_path, key_path))
+    return pairs
+
+
+def import_cached_iphone_developer_identity() -> bool:
+    """Import the cached Apple-issued iPhone Developer cert/key if Keychain forgot it."""
+    keypairs = cached_iphone_developer_keypairs()
+    if not keypairs:
+        return False
+
+    keychain = Path.home() / "Library/Keychains/login.keychain-db"
+    for cert_path, key_path in keypairs:
+        with tempfile.TemporaryDirectory(prefix="codexswitch-signing.") as tmp:
+            p12_path = Path(tmp) / "iphone-developer.p12"
+            # macOS 26's security import can reject empty-password PKCS#12 files
+            # with a bogus MAC verification failure. This password only protects
+            # the temporary local package, not the underlying cached key file.
+            p12_password = "codexswitch-local-import"
+            exported = subprocess.run(
+                [
+                    "openssl",
+                    "pkcs12",
+                    "-legacy",
+                    "-export",
+                    "-inkey",
+                    str(key_path),
+                    "-in",
+                    str(cert_path),
+                    "-out",
+                    str(p12_path),
+                    "-passout",
+                    f"pass:{p12_password}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if exported.returncode != 0:
+                print(
+                    "WARNING: Failed to export cached iPhone Developer signing identity: "
+                    + exported.stderr.strip()
+                )
+                continue
+
+            imported = subprocess.run(
+                [
+                    "security",
+                    "import",
+                    str(p12_path),
+                    "-k",
+                    str(keychain),
+                    "-P",
+                    p12_password,
+                    "-A",
+                    "-T",
+                    "/usr/bin/codesign",
+                    "-T",
+                    "/usr/bin/security",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if imported.returncode == 0:
+                print(f"Imported cached Apple-issued iPhone Developer identity from {cert_path.parent}")
+                return True
+            print(
+                "WARNING: Failed to import cached iPhone Developer signing identity: "
+                + (imported.stderr.strip() or imported.stdout.strip())
+            )
+    return False
+
+
+def select_or_repair_codesign_identity() -> str:
     identity = select_codesign_identity()
+    if identity != "-":
+        return identity
+    if import_cached_iphone_developer_identity():
+        return select_codesign_identity()
+    return "-"
+
+
+def requested_codesign_identity(argv: list[str]) -> str | None:
+    """Return an identity only for an explicit inspection or repair command."""
+    if "--print-codesign-identity" in argv:
+        return select_codesign_identity()
+    if "--repair-codesign-identity" in argv:
+        return select_or_repair_codesign_identity()
+    return None
+
+
+def identity_allows_local_execute_assessment_fallback(identity: str) -> bool:
+    return identity.startswith(IPHONE_DEVELOPER_PREFIX) and codesign_identity_is_apple_issued(
+        identity
+    )
+
+
+def usable_codesign_identity_available() -> bool:
+    identity = select_or_repair_codesign_identity()
     if identity == "-":
         print(
             "ERROR: No usable non-ad-hoc code signing identity is available. "
             "Refusing to patch Codex.app because ad-hoc signing makes the app "
-            "unopenable on this Mac."
+            "unopenable on this Mac. Checked Developer ID, Apple Development, "
+            "Mac Developer, and cached Apple-issued iPhone Developer fallback identities."
         )
         return False
     return True
@@ -397,6 +661,11 @@ def usable_codesign_identity_available() -> bool:
 def resolve_asar_cmd() -> list[str]:
     """Use a cached asar CLI when disk pressure makes `npx` unreliable."""
     node = shutil.which("node")
+    override = os.environ.get("CODEXSWITCH_ASAR_JS")
+    if node and override:
+        asar_js = Path(override).expanduser()
+        if asar_js.is_file():
+            return [node, str(asar_js)]
     if node:
         npm_dir = Path.home() / ".npm" / "_npx"
         for asar_js in sorted(
@@ -412,7 +681,7 @@ ASAR_CMD = resolve_asar_cmd()
 
 
 def codex_app_is_running() -> bool:
-    """Return true when the desktop host or app-server is live.
+    """Return true when the ChatGPT/Codex desktop host or app-server is live.
 
     Crashpad, Computer Use, and a standalone CLI launched from the bundle do not
     load the desktop ASAR/app-server runtime and should not block an offline
@@ -426,11 +695,17 @@ def codex_app_is_running() -> bool:
     )
     if result.returncode != 0:
         return False
+    desktop_hosts = {
+        str(APP_PATH / "Contents/MacOS/ChatGPT").lower(),
+        str(APP_PATH / "Contents/MacOS/Codex").lower(),
+        "/applications/chatgpt.app/contents/macos/chatgpt",
+        "/applications/codex.app/contents/macos/codex",
+    }
     for line in result.stdout.splitlines():
         lower = line.lower()
         if "pgrep" in lower or "codexswitch" in lower:
             continue
-        if "/applications/codex.app/contents/macos/codex" in lower:
+        if any(host in lower for host in desktop_hosts):
             return True
         if " codex app-server" in lower or lower.endswith(" codex app-server"):
             return True
@@ -615,56 +890,131 @@ def find_auth_file(assets_dir: Path) -> Path | None:
     stronger_markers = (".invalidateQueries", "queryKey:")
     auth_hook_markers = (*content_markers, "authMethod")
 
+    def auth_hook_score(path: Path, content: str) -> int:
+        if not all(m in content for m in auth_hook_markers):
+            return 0
+        score = 1
+        if path.name.startswith("use-auth"):
+            score += 100
+        if find_weakmap_account_cache_var(content):
+            score += 80
+        if re.search(
+            r'\}\),[A-Za-z_$][\w$]*\(\)\};return\s*'
+            r'[A-Za-z_$][\w$]*\.addAuthStatusCallback\(',
+            content,
+        ):
+            score += 80
+        if all(m in content for m in stronger_markers):
+            score += 10
+        if "account-info" in content or "accounts`,`check`" in content:
+            score += 5
+        return score
+
+    def best_auth_hook(candidates: list[Path]) -> Path | None:
+        scored: list[tuple[int, str, Path]] = []
+        for f in candidates:
+            content = f.read_text()
+            score = auth_hook_score(f, content)
+            if score > 0:
+                scored.append((score, f.name, f))
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return scored[0][2]
+
     # Primary: Codex's auth hook keeps this name even when the bundle shape
     # moves React Query invalidation into sibling chunks.
-    for pattern in ("use-auth-*.js", "use-auth*.js"):
-        for f in assets_dir.glob(pattern):
-            content = f.read_text()
-            if all(m in content for m in auth_hook_markers):
-                return f
+    primary = best_auth_hook(
+        [
+            f
+            for pattern in ("use-auth-*.js", "use-auth*.js")
+            for f in assets_dir.glob(pattern)
+        ]
+    )
+    if primary:
+        return primary
 
     # Secondary: known filename patterns (fast — avoids reading every JS file)
-    for pattern in (
-        "invalidate-queries-and-broadcast*.js",
-        "app-server-manager-hooks-*.js",
-    ):
-        for f in assets_dir.glob(pattern):
-            content = f.read_text()
-            if all(m in content for m in content_markers) and all(
-                m in content for m in stronger_markers
-            ):
-                return f
+    secondary = best_auth_hook(
+        [
+            f
+            for pattern in (
+                "invalidate-queries-and-broadcast*.js",
+                "app-server-manager-hooks-*.js",
+            )
+            for f in assets_dir.glob(pattern)
+        ]
+    )
+    if secondary:
+        return secondary
+
     # Fallback: search all JS files (survives any future rename)
-    for f in assets_dir.glob("*.js"):
-        content = f.read_text()
-        if (
-            all(m in content for m in content_markers)
-            and "authMethod" in content
-            and all(m in content for m in stronger_markers)
-        ):
-            return f
-    for f in assets_dir.glob("*.js"):
-        content = f.read_text()
-        if f.name.startswith("use-auth") and all(m in content for m in auth_hook_markers):
-            return f
-    return None
+    return best_auth_hook(list(assets_dir.glob("*.js")))
+
+
+def find_weakmap_account_cache_var(content: str) -> str | None:
+    """Return the WeakMap variable that caches getAccount() promises, if present."""
+    match = re.search(
+        r'let\s+[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\.get\(([A-Za-z_$][\w$]*)\);'
+        r'if\([^;]+?!=null\)return\s+[A-Za-z_$][\w$]*;'
+        r'let\s+[A-Za-z_$][\w$]*=\2\.getAccount\(\)\.finally\(\(\)=>\{\1\.delete\(\2\)\}\);'
+        r'return\s+\1\.set\(\2,',
+        content,
+    )
+    if not match:
+        return None
+
+    weakmap_var = match.group(1)
+    if not re.search(rf'{re.escape(weakmap_var)}=new WeakMap(?=[,;}}])', content):
+        return None
+    return weakmap_var
 
 
 def find_fast_mode_file(assets_dir: Path) -> Path | None:
-    """Find the bundled model-settings JS file that gates `/fast` availability."""
+    """Find either supported renderer layout that gates Fast Mode."""
     if not assets_dir.exists():
         return None
-    content_markers = ("additionalSpeedTiers", "modelsByType")
+
+    candidates: list[Path] = []
     for pattern in ("font-settings-*.js", "font-settings*.js"):
-        for f in assets_dir.glob(pattern):
-            content = f.read_text()
-            if all(m in content for m in content_markers):
-                return f
-    for f in assets_dir.glob("*.js"):
+        candidates.extend(sorted(assets_dir.glob(pattern)))
+    candidates.extend(sorted(assets_dir.glob("*.js")))
+
+    seen: set[Path] = set()
+    patched_candidates: list[Path] = []
+    for f in candidates:
+        if f in seen:
+            continue
+        seen.add(f)
         content = f.read_text()
-        if all(m in content for m in content_markers) and "function Qe()" in content:
+        if FAST_FALLBACK_MARKER in content:
+            patched_candidates.append(f)
+            continue
+        if fast_mode_layout(content) is not None:
             return f
+    return patched_candidates[0] if len(patched_candidates) == 1 else None
+
+
+def fast_mode_layout(content: str) -> str | None:
+    legacy_markers = ("additionalSpeedTiers", "modelsByType", "function Qe()")
+    if find_service_tier_option_mapper(content) is not None:
+        return "service_tiers"
+    if all(marker in content for marker in legacy_markers):
+        return "legacy"
     return None
+
+
+def find_service_tier_option_mapper(content: str):
+    """Return the unique service-tier option source in a renderer chunk."""
+    source_pattern = re.compile(
+        r"\((?P<model>[A-Za-z_$][\w$]*)\?\.serviceTiers\?\?\[\]\)(?=\.map\()"
+    )
+    matches = []
+    for match in source_pattern.finditer(content):
+        mapper = content[match.end() : match.end() + 500]
+        if all(marker in mapper for marker in ("iconKind:", "tier:", "value:")):
+            matches.append(match)
+    return matches[0] if len(matches) == 1 else None
 
 
 def find_app_server_launcher_file(extract_dir: Path) -> Path | None:
@@ -709,8 +1059,91 @@ def find_bundled_plugin_list_files(extract_dir: Path) -> list[Path]:
             or "function Im(e,t){return e.sendRequest(`plugin/list`,t)}" in content
             or '"list-plugins":' in content
         ):
-            matches.append(f)
+                matches.append(f)
     return matches
+
+
+def find_remote_recents_file(assets_dir: Path) -> Path | None:
+    """Find the renderer hook that feeds the sidebar recent-conversations list."""
+    if not assets_dir.exists():
+        return None
+    for pattern in ("app-server-manager-hooks-*.js", "app-server-manager-hooks*.js"):
+        for f in assets_dir.glob(pattern):
+            content = f.read_text()
+            if (
+                "recent-conversations" in content
+                and "refresh-recent-conversations-for-host" in content
+                and "hasFetchedRecentConversations" in content
+                and "addAnyConversationCallback" in content
+            ):
+                return f
+    for f in assets_dir.glob("*.js"):
+        content = f.read_text()
+        if (
+            "recent-conversations" in content
+            and "refresh-recent-conversations-for-host" in content
+            and "hasFetchedRecentConversations" in content
+            and "addAnyConversationCallback" in content
+        ):
+            return f
+    return None
+
+
+def find_model_label_file(assets_dir: Path) -> Path | None:
+    """Find the unified desktop model picker that renders missing names as Custom."""
+    if not assets_dir.exists():
+        return None
+    for f in assets_dir.glob("*.js"):
+        content = f.read_text()
+        if (
+            "supportedReasoningEfforts" in content
+            and "gpt-5.6-sol" in content
+            and (
+                "==null?`Custom`" in content
+                or MODEL_LABEL_FALLBACK_MARKER in content
+            )
+        ):
+            return f
+    return None
+
+
+def find_model_filter_file(assets_dir: Path) -> Path | None:
+    """Find the renderer chunk that filters app-server model metadata."""
+    if not assets_dir.exists():
+        return None
+    candidates = []
+    for f in assets_dir.glob("*.js"):
+        content = f.read_text()
+        if (
+            "availableModels:" in content
+            and "useHiddenModels:" in content
+            and "hasModelSupportingMaxReasoningEffort" in content
+            and (
+                "supportedReasoningEfforts" in content
+                or GPT56_MAX_EFFORT_FALLBACK_MARKER in content
+            )
+        ):
+            candidates.append(f)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def find_remote_model_refresh_file(assets_dir: Path) -> Path | None:
+    """Find the app-server initialization recovery hook for model cache refresh."""
+    if not assets_dir.exists():
+        return None
+    for f in assets_dir.glob("*.js"):
+        content = f.read_text()
+        if (
+            "app_server_restart_recovery_done" in content
+            and "codex-app-server-initialized" in content
+            and "list-models-for-host" in content
+            and (
+                "user-saved-config" in content
+                or REMOTE_MODEL_REFRESH_MARKER in content
+            )
+        ):
+            return f
+    return None
 
 
 def has_shadowed_bundled_plugin_sync_fallback(content: str) -> bool:
@@ -735,6 +1168,19 @@ def has_bundled_plugin_list_root_patch(content: str) -> bool:
     )
 
 
+def has_remote_recents_refresh_patch(content: str) -> bool:
+    return REMOTE_RECENTS_REFRESH_MARKER in content
+
+
+def find_array_cleanup_function(content: str) -> str | None:
+    """Find the minified helper that combines multiple unsubscribe callbacks."""
+    match = re.search(
+        r'function\s+([A-Za-z_$][\w$]*)\(e\)\{return\(\)=>\{for\(let t of e\)t\(\)\}\}',
+        content,
+    )
+    return match.group(1) if match else None
+
+
 def get_bundled_fast_model_slugs(
     codex_path: Path = APP_RESOURCES / "codex",
 ) -> set[str]:
@@ -756,7 +1202,16 @@ def get_bundled_fast_model_slugs(
     fast_models = set()
     for model in payload.get("models", []):
         speed_tiers = model.get("additional_speed_tiers") or []
-        if "fast" in speed_tiers:
+        service_tiers = model.get("service_tiers") or []
+        has_fast_service_tier = any(
+            isinstance(tier, dict)
+            and (
+                str(tier.get("id", "")).strip().lower() in {"fast", "priority"}
+                or str(tier.get("name", "")).strip().lower() == "fast"
+            )
+            for tier in service_tiers
+        )
+        if "fast" in speed_tiers or has_fast_service_tier:
             slug = model.get("slug")
             if slug:
                 fast_models.add(slug)
@@ -823,8 +1278,7 @@ def apply_modern_use_auth_patch(file_path: Path) -> bool:
         content,
     )
     if not vscode_import:
-        print("ERROR: Cannot find vscode-api import in modern use-auth bundle")
-        return False
+        return apply_weakmap_use_auth_patch(file_path, content)
 
     spec = vscode_import.group(1)
     source = vscode_import.group(2)
@@ -869,7 +1323,7 @@ def apply_modern_use_auth_patch(file_path: Path) -> bool:
         return False
 
     callback_tail_re = re.compile(
-        r'\}\),([A-Za-z_$][\w$]*)\(\)\};return '
+        r'\}\),([A-Za-z_$][\w$]*)\(\)\};return\s*'
         r'([A-Za-z_$][\w$]*)\.addAuthStatusCallback\('
     )
     patched, callback_count = callback_tail_re.subn(
@@ -904,6 +1358,68 @@ def apply_modern_use_auth_patch(file_path: Path) -> bool:
     return True
 
 
+def apply_weakmap_use_auth_patch(file_path: Path, content: str | None = None) -> bool:
+    """Patch Codex builds where use-auth refreshes getAccount() directly.
+
+    Current desktop builds no longer expose React Query helpers in use-auth.
+    They keep only an in-flight getAccount() promise cache in a WeakMap, so the
+    durable auth-refresh repair is to clear that cache before the existing
+    addAuthStatusCallback refresh function runs.
+    """
+    content = content if content is not None else file_path.read_text()
+    weakmap_var = find_weakmap_account_cache_var(content)
+    if not weakmap_var:
+        print("ERROR: Cannot find modern use-auth WeakMap account cache")
+        return False
+
+    patched = content
+    cache_patch = (
+        f'{weakmap_var}=new WeakMap;'
+        f'function {PATCH_MARKER}(){{{weakmap_var}=new WeakMap}}'
+    )
+    patched, cache_count = re.subn(
+        rf'{re.escape(weakmap_var)}=new WeakMap(?=[,;}}])',
+        cache_patch,
+        patched,
+        count=1,
+    )
+    if cache_count != 1:
+        print("ERROR: Could not insert WeakMap cache invalidation helper")
+        return False
+
+    callback_tail_re = re.compile(
+        r'\}\),([A-Za-z_$][\w$]*)\(\)\};return\s*'
+        r'([A-Za-z_$][\w$]*)\.addAuthStatusCallback\('
+    )
+    patched, callback_count = callback_tail_re.subn(
+        rf'}}),{PATCH_MARKER}(),\1()}};return \2.addAuthStatusCallback(',
+        patched,
+        count=1,
+    )
+    if callback_count != 1:
+        print("ERROR: Cannot find WeakMap auth status callback refresh tail")
+        idx = patched.find("addAuthStatusCallback")
+        if idx >= 0:
+            context_start = max(0, idx - 200)
+            context_end = min(len(patched), idx + 200)
+            print(f"  Context: ...{patched[context_start:context_end]}...")
+        return False
+
+    if PATCH_MARKER not in patched:
+        print("ERROR: Patch marker not found after WeakMap patching")
+        return False
+    if "addAuthStatusCallback" not in patched or "getAccount" not in patched:
+        print("ERROR: WeakMap auth structure disappeared after patching")
+        return False
+    if "export{" not in patched:
+        print("ERROR: export statement disappeared after patching")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched WeakMap use-auth bundle: {file_path.name}")
+    return True
+
+
 def apply_patch(file_path: Path) -> bool:
     """Apply the React Query cache invalidation patch.
 
@@ -929,7 +1445,7 @@ def apply_patch(file_path: Path) -> bool:
         "addAuthStatusCallback" in content
         and "getAccount" in content
         and "authMethod" in content
-        and ".invalidateQueries" not in content
+        and (".invalidateQueries" not in content or find_weakmap_account_cache_var(content))
     ):
         return apply_modern_use_auth_patch(file_path)
 
@@ -1081,12 +1597,11 @@ def apply_fast_mode_fallback_patch(
     file_path: Path,
     bundled_fast_models: set[str],
 ) -> bool:
-    """Restore `/fast` when refreshed model metadata omits fast-tier fields.
+    """Restore Fast Mode when refreshed model metadata omits fast-tier fields.
 
-    Recent Codex refreshes can return model metadata with empty or missing
-    `additionalSpeedTiers`, even though the bundled catalog still marks
-    `gpt-5.4` as supporting the fast service tier. The desktop UI hides the
-    `/fast` slash command entirely when this happens.
+    Legacy bundles use `additionalSpeedTiers`. Unified ChatGPT bundles use
+    `serviceTiers` plus an account entitlement gate. The service-tier fallback
+    repairs only an empty model metadata list and leaves that gate untouched.
     """
     content = file_path.read_text()
 
@@ -1096,6 +1611,11 @@ def apply_fast_mode_fallback_patch(
 
     if not bundled_fast_models:
         print("WARNING: No bundled fast-tier models found; skipping fast fallback patch")
+        return False
+
+    layout = fast_mode_layout(content)
+    if layout is None:
+        print("ERROR: Cannot identify supported fast-mode layout")
         return False
 
     last_import_match = None
@@ -1113,28 +1633,93 @@ def apply_fast_mode_fallback_patch(
         + content[insert_pos:]
     )
 
+    if layout == "legacy":
+        patched = apply_legacy_fast_mode_fallback(patched)
+    else:
+        patched = apply_service_tier_fast_mode_fallback(patched)
+    if patched is None:
+        return False
+
+    if FAST_FALLBACK_MARKER not in patched:
+        print("ERROR: Fast fallback marker missing after patch")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched fast-mode fallback ({layout}): {file_path.name}")
+    return True
+
+
+def apply_legacy_fast_mode_fallback(content: str) -> str | None:
     old_gate = "function G(e){return e.additionalSpeedTiers?.includes(qe)===!0}"
     new_gate = (
         "function G(e){return e.additionalSpeedTiers?.includes(qe)===!0||"
         f"{FAST_FALLBACK_MARKER}.has(e.model)&&"
         "(!(e.additionalSpeedTiers?.length>0))}"
     )
-    if old_gate not in patched:
-        print("ERROR: Cannot find fast-tier gate to patch")
-        return False
+    if content.count(old_gate) != 1:
+        print("ERROR: Cannot identify one legacy fast-tier gate to patch")
+        return None
+    return content.replace(old_gate, new_gate, 1)
 
-    patched = patched.replace(old_gate, new_gate, 1)
 
-    if FAST_FALLBACK_MARKER not in patched:
-        print("ERROR: Fast fallback marker missing after patch")
-        return False
-    if "function Qe()" not in patched:
-        print("ERROR: Fast availability function disappeared after patch")
-        return False
+def apply_service_tier_fast_mode_fallback(content: str) -> str | None:
+    """Synthesize priority/Fast only when a fast-capable model has no tiers.
 
-    file_path.write_text(patched)
-    print(f"  Patched fast-mode fallback: {file_path.name}")
-    return True
+    Newer bundles split this mapper from the account entitlement gate. The
+    patch changes only model metadata and preserves any gate present verbatim.
+    """
+    prohibition_pattern = re.compile(
+        r"featureRequirements\?\.fast_mode!==!1"
+    )
+    prohibitions = prohibition_pattern.findall(content)
+    match = find_service_tier_option_mapper(content)
+    if match is None:
+        print("ERROR: Cannot identify one service-tier option mapper to patch")
+        return None
+
+    model = match.group("model")
+    fallback = (
+        f"({model}?.serviceTiers?.length?{model}.serviceTiers:"
+        f"{FAST_FALLBACK_MARKER}.has({model}?.model)?"
+        "[{id:`priority`,name:`Fast`,description:`1.5x speed, increased usage`}]:[])"
+    )
+    patched = content[: match.start()] + fallback + content[match.end() :]
+    if prohibition_pattern.findall(patched) != prohibitions:
+        print("ERROR: Fast-mode entitlement gate changed during metadata patch")
+        return None
+    return patched
+
+
+def apply_required_fast_mode_patch(file_path: Path) -> bool:
+    return apply_fast_mode_fallback_patch(
+        file_path,
+        get_bundled_fast_model_slugs(),
+    )
+
+
+def required_renderer_patches_present(
+    *,
+    auth: bool,
+    remote_recents: bool,
+    fast: bool,
+    model_label: bool,
+    model_availability: bool,
+    selected_model_label: bool,
+    gpt56_max_effort: bool,
+    remote_model_refresh: bool,
+) -> bool:
+    return all(
+        (
+            auth,
+            remote_recents,
+            fast,
+            model_label,
+            model_availability,
+            selected_model_label,
+            gpt56_max_effort,
+            remote_model_refresh,
+        )
+    )
 
 
 def has_legacy_headroom_env_bridge(content: str) -> bool:
@@ -1451,6 +2036,505 @@ def apply_bundled_plugin_list_root_patch(file_path: Path) -> bool:
     return True
 
 
+def apply_remote_recents_refresh_patch(file_path: Path) -> bool:
+    """Refresh remote sidebar recents even when the desktop misses a notification.
+
+    Codex.app's sidebar query uses an infinite stale time and normally depends
+    on AppServerManager conversation callbacks. Agent-created VPS threads can
+    be created by another app-server client while the Mac sidebar is already
+    mounted; this timer is a lightweight safety net that re-runs the same
+    existing `refreshRecentConversations()` path for enabled remote hosts.
+    """
+    content = file_path.read_text()
+    if has_remote_recents_refresh_patch(content):
+        print(f"  Already patched remote recent conversation refresh: {file_path.name}")
+        return True
+
+    old = (
+        "let t=()=>{let t=z(u);"
+        "m.setQueryData([e,p,u],I({appServerRegistry:s,enabledRemoteHostIds:t,sortKey:p})),"
+        "R({scope:n,appServerRegistry:s,sortKey:p,refreshesInFlightHostIds:g.current})};"
+        "return t(),P({appServerRegistry:s,onStoreChange:t,subscribeToManager:(t,n)=>{"
+        "switch(e){case`recent-conversations`:return t.addAnyConversationCallback(n);"
+        "case`recent-conversations-meta`:return t.addAnyConversationMetaCallback(n)}}})"
+    )
+    new = (
+        "let t=()=>{let t=z(u);"
+        "m.setQueryData([e,p,u],I({appServerRegistry:s,enabledRemoteHostIds:t,sortKey:p})),"
+        "R({scope:n,appServerRegistry:s,sortKey:p,refreshesInFlightHostIds:g.current})};"
+        f'"{REMOTE_RECENTS_REFRESH_MARKER}";'
+        "let _csRemoteRecentRefreshTimer=u!==`[]`?window.setInterval(t,15000):null;"
+        "return t(),N([P({appServerRegistry:s,onStoreChange:t,subscribeToManager:(t,n)=>{"
+        "switch(e){case`recent-conversations`:return t.addAnyConversationCallback(n);"
+        "case`recent-conversations-meta`:return t.addAnyConversationMetaCallback(n)}}}),"
+        "()=>{_csRemoteRecentRefreshTimer!=null&&window.clearInterval(_csRemoteRecentRefreshTimer)}])"
+    )
+
+    if old not in content:
+        signal_effect_re = re.compile(
+            r'let\{key:(?P<key>[A-Za-z_$][\w$]*)\}=t,'
+            r'(?P<ids>[A-Za-z_$][\w$]*)=\[\],'
+            r'(?P<watch>[A-Za-z_$][\w$]*)=t\.watch\(\(\{get:(?P<get>[A-Za-z_$][\w$]*)\}\)=>\{'
+            r'let (?P<manager>[A-Za-z_$][\w$]*)=(?P=get)\((?P<manager_atom>[A-Za-z_$][\w$]*),(?P=key)\),'
+            r'(?P<update>[A-Za-z_$][\w$]*)=(?P<update_arg>[A-Za-z_$][\w$]*)=>\{'
+            r'e\((?P=update_arg)\),(?P<cleanup>[A-Za-z_$][\w$]*)\(t,(?P=key),(?P=ids),(?P=update_arg)\),'
+            r'(?P=ids)=(?P=update_arg)\};'
+            r'if\((?P=update)\((?P=manager)\?\.getRecentConversations\(\)\.map\(\(\{id:e\}\)=>e\)\?\?\[\]\),'
+            r'(?P=manager)!=null\)'
+            r'return (?P=manager)\.addAnyConversationMetaCallback\(e=>\{'
+            r'(?P=update)\(e\.map\(\(\{id:e\}\)=>e\)\)\}\)\}\);'
+            r'return\(\)=>\{(?P=watch)\(\),(?P=cleanup)\(t,(?P=key),(?P=ids),\[\]\)\}'
+        )
+
+        def replace_signal_effect(match: re.Match[str]) -> str:
+            key = match.group("key")
+            ids = match.group("ids")
+            watch = match.group("watch")
+            get_alias = match.group("get")
+            manager = match.group("manager")
+            manager_atom = match.group("manager_atom")
+            update = match.group("update")
+            update_arg = match.group("update_arg")
+            cleanup = match.group("cleanup")
+            watch_call = (
+                f'{watch}=t.watch(({{get:{get_alias}}})=>{{'
+                f'let {manager}={get_alias}({manager_atom},{key}),'
+                f'{update}={update_arg}=>{{e({update_arg}),'
+                f'{cleanup}(t,{key},{ids},{update_arg}),{ids}={update_arg}}};'
+                f'if({update}({manager}?.getRecentConversations().map(({{id:e}})=>e)??[]),'
+                f'{manager}!=null)return {manager}.addAnyConversationMetaCallback(e=>{{'
+                f'{update}(e.map(({{id:e}})=>e))}})}})'
+            )
+            return (
+                f'let{{key:{key}}}=t,{ids}=[],_csRemoteRecentRefreshTimer=null,'
+                f'_csRemoteRecentRefresh=()=>{{let e=t.get({manager_atom},{key});'
+                'e?.refreshRecentConversations&&'
+                'Promise.resolve(e.refreshRecentConversations({})).catch(()=>{})},'
+                f'{watch_call};"{REMOTE_RECENTS_REFRESH_MARKER}";'
+                f'{key}!==`local`&&(_csRemoteRecentRefreshTimer='
+                'window.setInterval(_csRemoteRecentRefresh,15000),'
+                '_csRemoteRecentRefresh());'
+                f'return()=>{{{watch}(),_csRemoteRecentRefreshTimer!=null&&'
+                'window.clearInterval(_csRemoteRecentRefreshTimer),'
+                f'{cleanup}(t,{key},{ids},[])}}'
+            )
+
+        patched, replace_count = signal_effect_re.subn(
+            replace_signal_effect,
+            content,
+            count=1,
+        )
+        if replace_count != 1:
+            cleanup_fn = find_array_cleanup_function(content)
+            if not cleanup_fn:
+                print("ERROR: Cannot find recent-conversations cleanup helper")
+                idx = content.find("recent-conversations")
+                if idx >= 0:
+                    print(f"  Context: ...{content[max(0, idx - 400):idx + 900]}...")
+                return False
+
+            effect_re = re.compile(
+                r'(?P<prefix>'
+                r'(?:let\s+)?[A-Za-z_$][\w$]*=\(\)=>\{let\s+(?P<refresh>[A-Za-z_$][\w$]*)=\(\)=>\{'
+                r'let\s+(?P=refresh)=(?P<to_set>[A-Za-z_$][\w$]*)\((?P<enabled>[A-Za-z_$][\w$]*)\);'
+                r'(?P<query>[A-Za-z_$][\w$]*)\.setQueryData\(\[e,(?P<sort>[A-Za-z_$][\w$]*),(?P=enabled)\],'
+                r'(?P<mapper>[A-Za-z_$][\w$]*)\(\{appServerRegistry:(?P<registry>[A-Za-z_$][\w$]*),'
+                r'enabledRemoteHostIds:(?P=refresh),sortKey:(?P=sort)\}\)\),'
+                r'(?P<refresh_remote>[A-Za-z_$][\w$]*)\(\{scope:(?P<scope>[A-Za-z_$][\w$]*),'
+                r'appServerRegistry:(?P=registry),sortKey:(?P=sort),'
+                r'refreshesInFlightHostIds:(?P<inflight>[A-Za-z_$][\w$]*)\.current\}\)\};'
+                r')return\s+(?P=refresh)\(\),(?P<subscribe>'
+                r'[A-Za-z_$][\w$]*\(\{appServerRegistry:(?P=registry),onStoreChange:(?P=refresh),'
+                r'subscribeToManager:\(t,n\)=>\{switch\(e\)\{case`recent-conversations`:'
+                r'return t\.addAnyConversationCallback\(n\);case`recent-conversations-meta`:'
+                r'return t\.addAnyConversationMetaCallback\(n\)\}\}\}\))'
+            )
+
+            def replace_effect(match: re.Match[str]) -> str:
+                refresh_fn = match.group("refresh")
+                enabled_var = match.group("enabled")
+                subscribe_call = match.group("subscribe")
+                return (
+                    match.group("prefix")
+                    + f'"{REMOTE_RECENTS_REFRESH_MARKER}";'
+                    + f'let _csRemoteRecentRefreshTimer={enabled_var}!==`[]`?'
+                    + f'window.setInterval({refresh_fn},15000):null;'
+                    + f'return {refresh_fn}(),{cleanup_fn}([{subscribe_call},'
+                    + '()=>{_csRemoteRecentRefreshTimer!=null&&'
+                    + 'window.clearInterval(_csRemoteRecentRefreshTimer)}])'
+                )
+
+            patched, replace_count = effect_re.subn(replace_effect, content, count=1)
+            if replace_count != 1:
+                print("ERROR: Cannot find recent-conversations effect to patch")
+                idx = content.find("recent-conversations")
+                if idx >= 0:
+                    print(f"  Context: ...{content[max(0, idx - 400):idx + 900]}...")
+                return False
+    else:
+        patched = content.replace(old, new, 1)
+    if not has_remote_recents_refresh_patch(patched):
+        print("ERROR: Remote recent conversation refresh marker missing after patch")
+        return False
+    if (
+        "window.setInterval(t,15000)" not in patched
+        and "window.setInterval(_csRemoteRecentRefresh,15000)" not in patched
+    ):
+        print("ERROR: Remote recent conversation refresh timer missing after patch")
+        return False
+    if "window.clearInterval(_csRemoteRecentRefreshTimer)" not in patched:
+        print("ERROR: Remote recent conversation refresh cleanup missing after patch")
+        return False
+    if "recent-conversations" not in patched or "refresh-recent-conversations-for-host" not in patched:
+        print("ERROR: recent conversation refresh path disappeared after patch")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched remote recent conversation refresh: {file_path.name}")
+    return True
+
+
+def apply_model_label_fallback_patch(file_path: Path) -> bool:
+    """Derive a readable known-model label while displayName is unavailable."""
+    content = file_path.read_text()
+    if MODEL_LABEL_FALLBACK_MARKER in content:
+        return True
+
+    pattern = re.compile(
+        r"let (?P<label>[A-Za-z_$][\w$]*)=(?P<display>[A-Za-z_$][\w$]*)"
+        r"==null\?`Custom`:(?P<formatter>[A-Za-z_$][\w$]*)"
+        r"\((?P=display)\)\.replace\(/\^GPT-/iu,``\)"
+    )
+    match = pattern.search(content)
+    if not match:
+        print(f"ERROR: Could not find model label fallback shape in {file_path.name}")
+        return False
+
+    prefix = content[max(0, match.start() - 240) : match.start()]
+    model_matches = list(re.finditer(r"model:([A-Za-z_$][\w$]*)", prefix))
+    if not model_matches:
+        print(f"ERROR: Could not identify model slug variable in {file_path.name}")
+        return False
+
+    model_var = model_matches[-1].group(1)
+    label_var = match.group("label")
+    display_var = match.group("display")
+    formatter = match.group("formatter")
+    replacement = (
+        f"let {label_var}=/*{MODEL_LABEL_FALLBACK_MARKER}*/"
+        f"{display_var}==null?{formatter}({model_var}).replace(/^GPT-/iu,``)"
+        f".replaceAll(`-`,` `):{formatter}({display_var}).replace(/^GPT-/iu,``)"
+    )
+    patched, count = pattern.subn(replacement, content, count=1)
+    if count != 1 or MODEL_LABEL_FALLBACK_MARKER not in patched:
+        print(f"ERROR: Failed to apply model label fallback in {file_path.name}")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched model label fallback: {file_path.name}")
+    return True
+
+
+def apply_selected_model_label_fallback_patch(file_path: Path) -> bool:
+    """Label a selected GPT-5.6 slug while its catalog metadata is unavailable."""
+    content = file_path.read_text()
+    if SELECTED_MODEL_LABEL_FALLBACK_MARKER in content:
+        return True
+
+    pattern = re.compile(
+        r"(?P<label>[A-Za-z_$][\w$]*)=(?P<value>[A-Za-z_$][\w$]*)}"
+        r"else if\((?P<model>[A-Za-z_$][\w$]*)\)\{let "
+        r"(?P<custom>[A-Za-z_$][\w$]*);"
+        r"(?P<cache>[A-Za-z_$][\w$]*)\[3\]==="
+        r"Symbol\.for\(`react\.memo_cache_sentinel`\)"
+    )
+    matches = [
+        match
+        for match in pattern.finditer(content)
+        if "composer.mode.local.model.custom"
+        in content[match.start() : match.end() + 500]
+    ]
+    if len(matches) != 1:
+        print(
+            f"ERROR: Expected one selected model label branch in {file_path.name}, "
+            f"found {len(matches)}"
+        )
+        return False
+
+    match = matches[0]
+    prefix = content[max(0, match.start() - 800) : match.start()]
+    formatter_matches = list(
+        re.finditer(
+            r"let [A-Za-z_$][\w$]*=(?P<formatter>[A-Za-z_$][\w$]*)"
+            r"\((?P<display>[A-Za-z_$][\w$]*)\);",
+            prefix,
+        )
+    )
+    if not formatter_matches:
+        print(f"ERROR: Could not identify selected model label formatter in {file_path.name}")
+        return False
+
+    formatter = formatter_matches[-1].group("formatter")
+    label = match.group("label")
+    value = match.group("value")
+    model = match.group("model")
+    custom = match.group("custom")
+    old = f"{label}={value}}}else if({model}){{let {custom};"
+    new = (
+        f"{label}={value}}}else if({model}.startsWith(`gpt-5.6-`))"
+        f"{label}=/*{SELECTED_MODEL_LABEL_FALLBACK_MARKER}*/"
+        f"{formatter}({model}).replace(/^GPT-/iu,``).replaceAll(`-`,` `);"
+        f"else if({model}){{let {custom};"
+    )
+    if content.count(old) != 1:
+        print(f"ERROR: Selected model label replacement became ambiguous in {file_path.name}")
+        return False
+
+    patched = content.replace(old, new, 1)
+    if SELECTED_MODEL_LABEL_FALLBACK_MARKER not in patched:
+        print(f"ERROR: Failed to apply selected model label fallback in {file_path.name}")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched selected model label fallback: {file_path.name}")
+    return True
+
+
+def apply_model_availability_fallback_patch(file_path: Path) -> bool:
+    """Keep app-server-advertised GPT-5.6 models visible through stale allowlists."""
+    content = file_path.read_text()
+    if MODEL_AVAILABILITY_FALLBACK_MARKER in content:
+        return True
+
+    pattern = re.compile(
+        r"if\((?P<gate>[A-Za-z_$][\w$]*)\?"
+        r"(?P<allowlist>[A-Za-z_$][\w$]*)\.has\("
+        r"(?P<entry>[A-Za-z_$][\w$]*)\.model\):!"
+        r"(?P=entry)\.hidden\)\{"
+    )
+    match = pattern.search(content)
+    if not match:
+        print(f"ERROR: Could not find model availability filter in {file_path.name}")
+        return False
+
+    context = content[max(0, match.start() - 500) : match.start()]
+    if "availableModels:" not in context or "useHiddenModels:" not in context:
+        print(f"ERROR: Refusing ambiguous model availability patch in {file_path.name}")
+        return False
+
+    gate = match.group("gate")
+    allowlist = match.group("allowlist")
+    entry = match.group("entry")
+    replacement = (
+        f"if({gate}?/*{MODEL_AVAILABILITY_FALLBACK_MARKER}*/"
+        f"({allowlist}.has({entry}.model)||"
+        f"{entry}.model.startsWith(`gpt-5.6-`)):!{entry}.hidden){{"
+    )
+    patched, count = pattern.subn(replacement, content, count=1)
+    if count != 1 or MODEL_AVAILABILITY_FALLBACK_MARKER not in patched:
+        print(f"ERROR: Failed to apply model availability fallback in {file_path.name}")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched model availability fallback: {file_path.name}")
+    return True
+
+
+def has_gpt56_max_effort_filter_patch(content: str) -> bool:
+    return GPT56_MAX_EFFORT_FALLBACK_MARKER in content
+
+
+def has_gpt56_max_effort_preset_patch(content: str) -> bool:
+    max_preset = "id:`gpt-5.6-sol:max`"
+    xhigh_preset = "id:`gpt-5.6-sol:xhigh`"
+    ultra_preset = "id:`gpt-5.6-sol:ultra`"
+    required = (xhigh_preset, max_preset, ultra_preset)
+    if not all(value in content for value in required):
+        return False
+    return content.index(xhigh_preset) < content.index(max_preset) < content.index(ultra_preset)
+
+
+def has_gpt56_max_effort_patch(content: str) -> bool:
+    return (
+        has_gpt56_max_effort_filter_patch(content)
+        and has_gpt56_max_effort_preset_patch(content)
+    )
+
+
+def apply_gpt56_max_effort_filter_patch(file_path: Path) -> bool:
+    """Preserve server-advertised GPT-5.6 max in the model filter."""
+    content = file_path.read_text()
+    if has_gpt56_max_effort_filter_patch(content):
+        return True
+
+    effort_filter = re.compile(
+        r"(?P<validator>[A-Za-z_$][\w$]*)\((?P<effort>[A-Za-z_$][\w$]*)\)"
+        r"&&(?P<enabled>[A-Za-z_$][\w$]*)\.has\((?P=effort)\)"
+    )
+    matches = []
+    for match in effort_filter.finditer(content):
+        context = content[max(0, match.start() - 1200) : match.end() + 1200]
+        if (
+            "supportedReasoningEfforts" in context
+            and "hasModelSupportingMaxReasoningEffort" in context
+        ):
+            matches.append(match)
+    if len(matches) != 1:
+        print(
+            f"ERROR: Expected one GPT-5.6 max effort filter in {file_path.name}, "
+            f"found {len(matches)}"
+        )
+        return False
+
+    match = matches[0]
+    prefix = content[max(0, match.start() - 1200) : match.start()]
+    model_matches = list(
+        re.finditer(r"\.forEach\((?P<model>[A-Za-z_$][\w$]*)=>\{", prefix)
+    )
+    if not model_matches:
+        print(f"ERROR: Could not identify max-effort model variable in {file_path.name}")
+        return False
+
+    model = model_matches[-1].group("model")
+    validator = match.group("validator")
+    effort = match.group("effort")
+    enabled = match.group("enabled")
+    replacement = (
+        f"/*{GPT56_MAX_EFFORT_FALLBACK_MARKER}*/{validator}({effort})&&"
+        f"({enabled}.has({effort})||"
+        f"({model}.model.startsWith(`gpt-5.6-`)&&{effort}===`max`))"
+    )
+    patched = content[: match.start()] + replacement + content[match.end() :]
+    if not has_gpt56_max_effort_filter_patch(patched):
+        print(f"ERROR: Failed to apply GPT-5.6 max effort filter in {file_path.name}")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched GPT-5.6 max effort filter: {file_path.name}")
+    return True
+
+
+def apply_gpt56_max_effort_preset_patch(file_path: Path) -> bool:
+    """Place the Sol max power preset between xhigh and ultra."""
+    content = file_path.read_text()
+    if has_gpt56_max_effort_preset_patch(content):
+        return True
+
+    max_preset = (
+        "{id:`gpt-5.6-sol:max`,model:`gpt-5.6-sol`,"
+        "modelLabel:`5.6 Sol`,reasoningEffort:`max`}"
+    )
+    xhigh_preset = (
+        "{id:`gpt-5.6-sol:xhigh`,model:`gpt-5.6-sol`,"
+        "modelLabel:`5.6 Sol`,reasoningEffort:`xhigh`}"
+    )
+    ultra_preset = (
+        "{id:`gpt-5.6-sol:ultra`,model:`gpt-5.6-sol`,"
+        "modelLabel:`5.6 Sol`,reasoningEffort:`ultra`}"
+    )
+    adjacent_presets = f"{xhigh_preset},{ultra_preset}"
+    split_ultra_pattern = re.compile(
+        re.escape(xhigh_preset)
+        + r"\],(?P<ultra_alias>[A-Za-z_$][\w$]*)="
+        + re.escape(ultra_preset)
+    )
+    inline_count = content.count(adjacent_presets)
+    split_matches = list(split_ultra_pattern.finditer(content))
+    if inline_count + len(split_matches) != 1:
+        print(
+            f"ERROR: Could not identify one Sol xhigh/ultra preset ordering "
+            f"in {file_path.name}"
+        )
+        return False
+    if inline_count == 1:
+        patched = content.replace(
+            adjacent_presets,
+            f"{xhigh_preset},{max_preset},{ultra_preset}",
+            1,
+        )
+    else:
+        patched = split_ultra_pattern.sub(
+            lambda match: (
+                f"{xhigh_preset},{max_preset}],"
+                f"{match.group('ultra_alias')}={ultra_preset}"
+            ),
+            content,
+            count=1,
+        )
+
+    if not has_gpt56_max_effort_preset_patch(patched):
+        print(f"ERROR: Failed to apply GPT-5.6 max effort preset in {file_path.name}")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched GPT-5.6 max effort preset: {file_path.name}")
+    return True
+
+
+def apply_gpt56_max_effort_patch(file_path: Path) -> bool:
+    """Patch a legacy combined model filter and power-preset chunk."""
+    return (
+        apply_gpt56_max_effort_filter_patch(file_path)
+        and apply_gpt56_max_effort_preset_patch(file_path)
+    )
+
+
+def apply_remote_model_refresh_patch(file_path: Path) -> bool:
+    """Invalidate the host model catalog whenever an app-server reinitializes."""
+    content = file_path.read_text()
+    if REMOTE_MODEL_REFRESH_MARKER in content:
+        return True
+
+    pattern = re.compile(
+        r"(?P<client>[A-Za-z_$][\w$]*)\.invalidateQueries\("
+        r"\{queryKey:\[`user-saved-config`\]\}\)"
+    )
+    matches = []
+    for match in pattern.finditer(content):
+        context = content[max(0, match.start() - 1200) : match.end() + 2500]
+        if "app_server_restart_recovery_done" in context:
+            matches.append(match)
+    if len(matches) != 1:
+        print(
+            f"ERROR: Expected one app-server model refresh branch in {file_path.name}, "
+            f"found {len(matches)}"
+        )
+        return False
+
+    match = matches[0]
+    prefix = content[max(0, match.start() - 1200) : match.start()]
+    host_matches = list(
+        re.finditer(
+            r"async function [A-Za-z_$][\w$]*\("
+            r"(?P<host>[A-Za-z_$][\w$]*)\)",
+            prefix,
+        )
+    )
+    if not host_matches:
+        print(f"ERROR: Could not identify app-server host variable in {file_path.name}")
+        return False
+
+    client = match.group("client")
+    host = host_matches[-1].group("host")
+    old = match.group(0)
+    new = (
+        f"{old},/*{REMOTE_MODEL_REFRESH_MARKER}*/"
+        f"{client}.invalidateQueries({{queryKey:[`models`,`list`,{host}]}})"
+    )
+    patched = content[: match.start()] + new + content[match.end() :]
+    if (
+        REMOTE_MODEL_REFRESH_MARKER not in patched
+        or f"{client}.invalidateQueries({{queryKey:[`models`,`list`,{host}]}})"
+        not in patched
+    ):
+        print(f"ERROR: Failed to apply remote model refresh patch in {file_path.name}")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched remote model refresh: {file_path.name}")
+    return True
+
+
 def remove_headroom_global_env_patch(file_path: Path) -> bool:
     """Remove CodexSwitch Headroom propagation from the shared env sanitizer."""
     content = file_path.read_text()
@@ -1526,7 +2610,7 @@ def codesign_app():
     Instead, sign nested code objects first, then container bundles, then the
     app itself.
     """
-    identity = select_codesign_identity()
+    identity = select_or_repair_codesign_identity()
     if identity == "-":
         print(
             "ERROR: No usable non-ad-hoc code signing identity is available. "
@@ -1564,6 +2648,21 @@ def codesign_app():
         return False
     if not executable_and_framework_team_ids_match(app_path):
         return False
+    if not spctl_accepts(app_path):
+        if identity_allows_local_execute_assessment_fallback(identity):
+            print(
+                "WARNING: Gatekeeper rejected the iPhone Developer-signed Codex.app, "
+                "but codesign verification and Team ID checks passed. Continuing with "
+                "the local Apple-issued signing fallback that this Mac uses for patched "
+                "Codex.app launches."
+            )
+        else:
+            print(
+                "ERROR: Gatekeeper rejected the re-signed Codex.app. "
+                "Refusing to leave a locally patched bundle that cannot pass "
+                "macOS execute assessment."
+            )
+            return False
     return True
 
 
@@ -1660,12 +2759,31 @@ def computer_use_plugin_signing_targets(app_path: Path) -> list[Path]:
     return [path for path in (sky_client_app, computer_use_app) if path.exists()]
 
 
-def spctl_accepts(path: Path) -> bool:
+def spctl_assessment(path: Path) -> str:
     result = subprocess.run(
         ["spctl", "--assess", "--type", "execute", str(path)],
         capture_output=True,
         text=True,
         timeout=30,
+    )
+    if result.returncode == 0:
+        return "accepted"
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    if "internal error in code signing subsystem" in output:
+        return "unavailable"
+    return "rejected"
+
+
+def spctl_accepts(path: Path) -> bool:
+    return spctl_assessment(path) == "accepted"
+
+
+def codesign_strictly_valid(path: Path) -> bool:
+    result = subprocess.run(
+        ["codesign", "--verify", "--strict", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     return result.returncode == 0
 
@@ -1686,10 +2804,39 @@ def app_framework_executable(app_path: Path) -> Path | None:
     return None
 
 
+def app_main_executable(app_path: Path) -> Path | None:
+    app_path = app_path.resolve()
+    info_plist = app_path / "Contents/Info.plist"
+    try:
+        with info_plist.open("rb") as handle:
+            executable_name = plistlib.load(handle).get("CFBundleExecutable")
+    except (OSError, plistlib.InvalidFileException):
+        executable_name = None
+
+    if (
+        isinstance(executable_name, str)
+        and executable_name
+        and Path(executable_name).name == executable_name
+    ):
+        candidate = app_path / "Contents/MacOS" / executable_name
+        if candidate.is_file():
+            return candidate
+
+    macos_dir = app_path / "Contents/MacOS"
+    for name in ("ChatGPT", "Codex"):
+        candidate = macos_dir / name
+        if candidate.is_file():
+            return candidate
+    return next((path for path in sorted(macos_dir.glob("*")) if path.is_file()), None)
+
+
 def executable_and_framework_team_ids_match(app_path: Path) -> bool:
     app_path = app_path.resolve()
-    main_executable = app_path / "Contents/MacOS/Codex"
+    main_executable = app_main_executable(app_path)
     electron_framework = app_framework_executable(app_path)
+    if main_executable is None:
+        print(f"ERROR: Could not find the desktop app executable under {app_path}")
+        return False
     if electron_framework is None:
         print(f"ERROR: Could not find Codex/Electron framework executable under {app_path}")
         return False
@@ -1721,7 +2868,18 @@ def computer_use_plugin_signature_preserved(app_path: Path) -> bool:
         return False
     if any(OPENAI_TEAM_ID not in codesign_entitlements_text(target) for target in targets):
         return False
-    return all(spctl_accepts(target) for target in targets)
+    if any(not codesign_strictly_valid(target) for target in targets):
+        return False
+    assessments = [spctl_assessment(target) for target in targets]
+    if any(assessment == "rejected" for assessment in assessments):
+        return False
+    if any(assessment == "unavailable" for assessment in assessments):
+        print(
+            "WARNING: Gatekeeper assessment is unavailable because macOS returned "
+            "an internal Code Signing subsystem error; strict OpenAI signature "
+            "verification passed."
+        )
+    return True
 
 
 def restore_official_bundled_cli(app_path: Path) -> tuple[bool, bool]:
@@ -1993,6 +3151,22 @@ def _is_bundled_plugin_code(path: Path, app_path: Path) -> bool:
     return relative.parts[:3] == ("Contents", "Resources", "plugins")
 
 
+def _is_asar_unpacked_resource(path: Path, app_path: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(app_path.resolve())
+    except ValueError:
+        return False
+    return relative.parts[:3] == ("Contents", "Resources", "app.asar.unpacked")
+
+
+def _is_macho_file(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) in MACHO_MAGICS
+    except OSError:
+        return False
+
+
 def list_codesign_targets(app_path: Path) -> list[Path]:
     """Return nested code objects in inside-out signing order.
 
@@ -2005,6 +3179,8 @@ def list_codesign_targets(app_path: Path) -> list[Path]:
     for path in app_path.rglob("*"):
         if path == app_path:
             continue
+        if _is_asar_unpacked_resource(path, app_path):
+            continue
         if _is_bundled_plugin_code(path, app_path):
             continue
         if (
@@ -2015,7 +3191,7 @@ def list_codesign_targets(app_path: Path) -> list[Path]:
         if path.is_dir() and path.suffix in BUNDLE_CODE_SUFFIXES:
             targets.add(path)
             continue
-        if path.is_file() and (
+        if path.is_file() and _is_macho_file(path) and (
             path.suffix in FILE_CODE_SUFFIXES
             or _is_signable_resource_binary(path)
             or _is_signable_macos_binary(path, app_path)
@@ -2038,13 +3214,18 @@ def list_codesign_targets(app_path: Path) -> list[Path]:
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    requested_identity = requested_codesign_identity(sys.argv)
+    if requested_identity is not None:
+        print(requested_identity)
+        sys.exit(0)
+
     if not ASAR_PATH.exists():
-        print(f"Codex.app not found at {APP_PATH}")
+        print(f"OpenAI desktop app not found at {APP_PATH}")
         sys.exit(3)
     app_path = APP_PATH
     if codex_app_is_running() and os.environ.get("CODEXSWITCH_ALLOW_LIVE_DESKTOP_PATCH") != "1":
         print(
-            "ERROR: Codex.app is running. Refusing to patch or re-sign the live "
+            f"ERROR: {APP_PATH.name} is running. Refusing to patch or re-sign the live "
             "desktop app because that can SIGKILL the app-server and reset macOS "
             "permission trust. Quit Codex.app first, or set "
             "CODEXSWITCH_ALLOW_LIVE_DESKTOP_PATCH=1 for a deliberate emergency override."
@@ -2091,18 +3272,65 @@ def main():
         sys.exit(2)
     fast_mode_file = find_fast_mode_file(assets_dir)
     if not fast_mode_file:
-        print("WARNING: Could not find fast-mode JS file -- skipping optional fast fallback patch")
-
+        print("WARNING: Could not find fast-mode JS file -- app structure may have changed")
+        sys.exit(2)
+    remote_recents_file = find_remote_recents_file(assets_dir)
+    if not remote_recents_file:
+        print("WARNING: Could not find remote recents JS file -- skipping optional remote sidebar refresh patch")
+    model_label_file = find_model_label_file(assets_dir)
+    if not model_label_file:
+        print("WARNING: Could not find model picker JS file -- app structure may have changed")
+        sys.exit(2)
+    model_filter_file = find_model_filter_file(assets_dir)
+    if not model_filter_file:
+        print("WARNING: Could not find model filter JS file -- app structure may have changed")
+        sys.exit(2)
+    remote_model_refresh_file = find_remote_model_refresh_file(assets_dir)
+    if not remote_model_refresh_file:
+        print("WARNING: Could not find remote model refresh JS file -- app structure may have changed")
+        sys.exit(2)
     print(f"Found auth file: {auth_file.name}")
-    if fast_mode_file:
-        print(f"Found fast-mode file: {fast_mode_file.name}")
-    print("Desktop patch scope: auth hot-swap only; bundled CLI and plugin files are preserved.")
+    print(f"Found fast-mode file: {fast_mode_file.name}")
+    if remote_recents_file:
+        print(f"Found remote recents file: {remote_recents_file.name}")
+    print(f"Found model picker file: {model_label_file.name}")
+    print(f"Found model filter file: {model_filter_file.name}")
+    print(f"Found remote model refresh file: {remote_model_refresh_file.name}")
+    print("Desktop patch scope: auth hot-swap, Fast Mode metadata, remote sidebar/model refresh, and known-model availability/labels/efforts; bundled CLI and plugin files are preserved.")
 
     auth_already_patched = PATCH_MARKER in auth_file.read_text()
-    fast_already_patched = bool(
-        fast_mode_file and FAST_FALLBACK_MARKER in fast_mode_file.read_text()
+    fast_already_patched = FAST_FALLBACK_MARKER in fast_mode_file.read_text()
+    remote_recents_already_patched = bool(
+        remote_recents_file
+        and has_remote_recents_refresh_patch(remote_recents_file.read_text())
     )
-    if auth_already_patched:
+    model_file_content = model_label_file.read_text()
+    model_filter_content = model_filter_file.read_text()
+    model_label_already_patched = MODEL_LABEL_FALLBACK_MARKER in model_file_content
+    model_availability_already_patched = (
+        MODEL_AVAILABILITY_FALLBACK_MARKER in model_filter_content
+    )
+    selected_model_label_already_patched = (
+        SELECTED_MODEL_LABEL_FALLBACK_MARKER in model_file_content
+    )
+    gpt56_max_effort_already_patched = (
+        has_gpt56_max_effort_filter_patch(model_filter_content)
+        and has_gpt56_max_effort_preset_patch(model_file_content)
+    )
+    remote_model_refresh_already_patched = (
+        REMOTE_MODEL_REFRESH_MARKER in remote_model_refresh_file.read_text()
+    )
+    all_required_patches_present = required_renderer_patches_present(
+        auth=auth_already_patched,
+        remote_recents=remote_recents_file is None or remote_recents_already_patched,
+        fast=fast_already_patched,
+        model_label=model_label_already_patched,
+        model_availability=model_availability_already_patched,
+        selected_model_label=selected_model_label_already_patched,
+        gpt56_max_effort=gpt56_max_effort_already_patched,
+        remote_model_refresh=remote_model_refresh_already_patched,
+    )
+    if all_required_patches_present:
         print("Already patched; verifying ASAR integrity metadata...")
         integrity_changed = update_electron_asar_integrity(ASAR_PATH)
         plugin_signature_repair_needed = needs_computer_use_plugin_signature_repair(
@@ -2142,9 +3370,37 @@ def main():
     if not auth_already_patched and not apply_patch(auth_file):
         print("ERROR: Patch failed")
         sys.exit(1)
-    if fast_mode_file and not fast_already_patched:
-        print("Skipping optional fast-mode fallback patch; hot-swap patch does not require it.")
-
+    if not fast_already_patched:
+        if not apply_required_fast_mode_patch(fast_mode_file):
+            print("ERROR: Required Fast Mode fallback patch failed")
+            sys.exit(1)
+    if remote_recents_file and not remote_recents_already_patched:
+        if not apply_remote_recents_refresh_patch(remote_recents_file):
+            print("ERROR: Remote sidebar refresh patch failed")
+            sys.exit(1)
+    if not model_label_already_patched:
+        if not apply_model_label_fallback_patch(model_label_file):
+            print("ERROR: Model label fallback patch failed")
+            sys.exit(1)
+    if not model_availability_already_patched:
+        if not apply_model_availability_fallback_patch(model_filter_file):
+            print("ERROR: Model availability fallback patch failed")
+            sys.exit(1)
+    if not selected_model_label_already_patched:
+        if not apply_selected_model_label_fallback_patch(model_label_file):
+            print("ERROR: Selected model label fallback patch failed")
+            sys.exit(1)
+    if not gpt56_max_effort_already_patched:
+        if not apply_gpt56_max_effort_filter_patch(model_filter_file):
+            print("ERROR: GPT-5.6 max effort filter patch failed")
+            sys.exit(1)
+        if not apply_gpt56_max_effort_preset_patch(model_label_file):
+            print("ERROR: GPT-5.6 max effort preset patch failed")
+            sys.exit(1)
+    if not remote_model_refresh_already_patched:
+        if not apply_remote_model_refresh_patch(remote_model_refresh_file):
+            print("ERROR: Remote model refresh patch failed")
+            sys.exit(1)
     # ---- Repack ----
     print("Repacking app.asar (with --unpack for native modules)...")
     repacked_asar = workdir / "repacked.asar"

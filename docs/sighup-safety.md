@@ -56,7 +56,7 @@ SIGHUP eligibility is also version-gated:
 
 - a `~/.codexswitch/sighup-verified*` marker must exist
 - the candidate executable must contain the `sighup-verified` and `SIGHUP: auth reloaded` markers before app-bundled CLI sessions are eligible
-- `patch-asar.py` refuses to replace a bundled CLI that supports `gpt-5.5` with an older SIGHUP-capable binary that does not
+- `patch-asar.py` refuses to replace a bundled CLI with an older SIGHUP-capable binary whose model/catalog capabilities are behind the installed runtime
 - `patch-asar.py` searches the local SIGHUP fork at `~/Developer/codex/codex-rs/target/release/codex` before falling back to stock install paths
 - the desktop ASAR patch deletes inherited `CODEX_CLI_PATH` before resolving the app-server binary and from sanitized child-process env, so a launchd or shell override cannot hijack Codex.app onto a stale Homebrew wrapper
 - CodexSwitch repairs the Homebrew vendor CLI from a verified SIGHUP-capable source while Codex.app is running, so npm/Homebrew updates do not permanently strand CLI hot-swap

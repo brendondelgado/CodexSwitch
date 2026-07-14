@@ -1,3 +1,21 @@
+---
+title: Sparkle integration
+description: Reference guide for CodexSwitch application updates through Sparkle.
+toc:
+  - Add Sparkle via Swift Package Manager
+  - Info.plist Keys
+  - Generate Signing Keys
+  - Integrate SPUStandardUpdaterController
+  - Build and Distribution
+cross_dependencies:
+  - Package.swift
+  - Sources/CodexSwitch/App/AppDelegate.swift
+  - scripts/build-app.sh
+version_control:
+  status: reference
+  last_updated: 2026-07-12
+---
+
 # Sparkle Auto-Updater Integration Guide
 
 This document describes how to add Sparkle (https://sparkle-project.org) auto-update
@@ -156,7 +174,7 @@ Example appcast.xml structure:
       <description><![CDATA[
         <h2>What's New</h2>
         <ul>
-          <li>Added first-run onboarding</li>
+          <li>Improved empty-account setup in the menu-bar popover</li>
           <li>Bug fixes and performance improvements</li>
         </ul>
       ]]></description>
