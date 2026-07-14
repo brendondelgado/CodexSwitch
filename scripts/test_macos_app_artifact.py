@@ -196,6 +196,9 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
     def test_installer_has_atomic_swap_and_both_rollback_paths(self) -> None:
         installer = self.installer
         rollback = installer[installer.index("rollback_activation() {") :]
+        self.assertIn("local exit_status=$?", installer)
+        self.assertIn('return "$exit_status"', installer)
+        self.assertNotIn("local status=$?", installer)
         self.assertIn("RENAME_SWAP = 0x00000002", installer)
         self.assertIn('atomic_swap_paths "$install_path" "$staged_path"', rollback)
         self.assertIn('/bin/mv "$install_path" "$failed_path"', rollback)

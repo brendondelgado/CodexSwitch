@@ -88,7 +88,7 @@ rollback_activation() {
 }
 
 cleanup() {
-  local status=$?
+  local exit_status=$?
   if [[ "$activated" != "1" && "$swapped" == "1" ]]; then
     rollback_activation || true
   fi
@@ -103,7 +103,7 @@ cleanup() {
   fi
   /bin/chmod -R u+w "$work_dir" 2>/dev/null || true
   /bin/rm -rf -- "$work_dir"
-  return "$status"
+  return "$exit_status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
