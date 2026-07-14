@@ -90,15 +90,42 @@ The Codex runtime build names both packages in one Cargo invocation:
 `codex-cli` and `codex-code-mode-host`. The ephemeral checkout and build targets
 are not uploaded.
 
-GitHub Actions may retain the Cargo registry, git database, and target
-directories in a repository-scoped cache keyed by the target architecture,
-exact upstream commit, and CodexSwitch commit. A new CodexSwitch commit restores
-the newest cache for the same upstream commit, then Cargo revalidates every
-object against the current source and flags. Cache restore and save failures are
-non-fatal because provenance never depends on the cache. The cache remains on
-GitHub infrastructure; no build target is downloaded to or retained on the Mac.
-The artifact still comes only from the clean `--locked` build and passes the
-same source-diff, binary, manifest, and attestation gates.
+GitHub Actions uses two independent, repository-scoped Cargo caches:
+
+- A broad download-only cache may restore the Cargo registry index, registry
+  archives, and git database across source revisions. It never contains a Cargo
+  target directory. Restore and save failures are non-fatal, and a failed build
+  may still seed this cache because it contains downloads rather than compiled
+  release output.
+- An exact-only upstream target cache may restore `UPSTREAM_TARGET_DIR` only
+  when its complete v2 key matches. The key binds the runner architecture,
+  effective upstream Rust and Cargo versions, macOS and Xcode versions, SDK
+  version and path, Clang version, target triple, upstream SHA, patched-source
+  SHA-256, CodexSwitch SHA, build epoch, release profile, job count, codegen-unit
+  count, LTO setting, and incremental setting. It has no fallback restore key.
+  The control-plane target remains uncached.
+
+After patching and hashing the exact upstream source, the workflow normalizes
+every tracked upstream file mtime to `SOURCE_DATE_EPOCH` without following
+symlinks. This makes Cargo's mtime-based freshness inputs stable for one exact
+cache identity; it does not mean Cargo broadly revalidates every cached object
+against source content. Never broaden the compiled-target key or add fallback
+restore keys while mtime normalization is active.
+
+The workflow can create the exact upstream target cache only after source and
+binary validation, manifest verification, attestation, artifact upload, and
+build-evidence recording have all succeeded, and only when the exact key missed.
+It then removes the ephemeral target. A failed build can never seed compiled
+output. Cache transport failures remain non-fatal and do not change the exact
+four-member artifact contract.
+
+GitHub Actions caches are immutable optimization state, not signed provenance
+or verified build evidence. An actor able to write a repository-scoped cache is
+inside this cache's trust boundary, and the release validators do not turn a
+restored target into a cryptographically source-authenticated build. For a
+strict clean-room rebuild, bump or disable the target-cache namespace and accept
+a cold compile. The cache remains on GitHub infrastructure; no target directory
+is downloaded to or retained on the Mac.
 
 If the v3 patch adds a direct dependency to an upstream member crate, the patch
 driver updates that member's `Cargo.lock` entry in canonical sorted order before

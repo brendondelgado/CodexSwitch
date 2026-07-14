@@ -131,8 +131,8 @@ jobs:
           command -v shasum >/dev/null
           command -v lipo >/dev/null
 
-      - name: Restore remote Cargo cache
-        id: cargo_cache
+      - name: Restore remote Cargo downloads
+        id: cargo_download_cache
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -140,11 +140,10 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            ${{ runner.temp }}/codexswitch-target/
-            ${{ runner.temp }}/codex-target/
-          key: macos-runtime-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-${{ github.sha }}
+          key: macos-runtime-downloads-v2-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-${{ github.sha }}
           restore-keys: |
-            macos-runtime-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-
+            macos-runtime-downloads-v2-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-
+            macos-runtime-downloads-v2-${{ runner.arch }}-
 
       - name: Verify the Swift app and test suite
         run: |
@@ -281,6 +280,92 @@ jobs:
           fi
           printf 'sha256=%s\n' "$patch_sha256" >> "$GITHUB_OUTPUT"
 
+      - name: Normalize patched upstream source mtimes
+        env:
+          EXPECTED_PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          export TZ=UTC
+          source_stamp="$(date -u -r "$SOURCE_DATE_EPOCH" '+%Y%m%d%H%M.%S')"
+          if [[ ! "$source_stamp" =~ ^[0-9]{12}\.[0-9]{2}$ ]]; then
+            echo "::error::failed to derive the deterministic upstream source timestamp"
+            exit 1
+          fi
+
+          (
+            cd "$UPSTREAM_SOURCE_DIR"
+            git ls-files -z | xargs -0 touch -h -t "$source_stamp"
+          )
+
+          observed_patch_sha256="$(
+            git -C "$UPSTREAM_SOURCE_DIR" diff --binary HEAD \
+              | shasum -a 256 \
+              | awk '{print $1}'
+          )"
+          if [[ "$observed_patch_sha256" != "$EXPECTED_PATCH_SHA256" ]]; then
+            echo "::error::mtime normalization changed the patched-source identity"
+            exit 1
+          fi
+
+      - name: Derive exact upstream target cache ABI
+        id: target_cache_abi
+        working-directory: ${{ runner.temp }}/codex-upstream/codex-rs
+        env:
+          PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          abi_input="$RUNNER_TEMP/upstream-target-cache-abi.txt"
+          {
+            printf 'format=codexswitch-upstream-target-cache-abi-v2\n'
+            printf 'runnerArch=%s\n' "$(uname -m)"
+            printf 'rustcVv<<EOF\n'
+            rustc -Vv
+            printf 'EOF\n'
+            printf 'cargoV<<EOF\n'
+            cargo -V
+            printf 'EOF\n'
+            printf 'swVers<<EOF\n'
+            sw_vers
+            printf 'EOF\n'
+            printf 'xcodebuildVersion<<EOF\n'
+            xcodebuild -version
+            printf 'EOF\n'
+            printf 'sdkVersion=%s\n' "$(xcrun --sdk macosx --show-sdk-version)"
+            printf 'sdkPath=%s\n' "$(xcrun --sdk macosx --show-sdk-path)"
+            printf 'clangVersion<<EOF\n'
+            xcrun clang --version
+            printf 'EOF\n'
+            printf 'targetTriple=%s\n' "$TARGET_TRIPLE"
+            printf 'upstreamSha=%s\n' "$UPSTREAM_SHA"
+            printf 'patchSha256=%s\n' "$PATCH_SHA256"
+            printf 'codexSwitchSha=%s\n' "$CODEXSWITCH_SOURCE_SHA"
+            printf 'sourceDateEpoch=%s\n' "$SOURCE_DATE_EPOCH"
+            printf 'cargoFlags=--locked --release --target %s\n' "$TARGET_TRIPLE"
+            printf 'cargoPackages=codex-cli,codex-code-mode-host\n'
+            printf 'CARGO_BUILD_JOBS=%s\n' "$CARGO_BUILD_JOBS"
+            printf 'CARGO_PROFILE_RELEASE_LTO=%s\n' "$CARGO_PROFILE_RELEASE_LTO"
+            printf 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=%s\n' "$CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+            printf 'CARGO_INCREMENTAL=%s\n' "$CARGO_INCREMENTAL"
+          } > "$abi_input"
+
+          cache_abi_sha256="$(shasum -a 256 "$abi_input" | awk '{print $1}')"
+          if [[ ! "$cache_abi_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::failed to derive the upstream target cache ABI"
+            exit 1
+          fi
+          printf 'sha256=%s\n' "$cache_abi_sha256" >> "$GITHUB_OUTPUT"
+          echo "Upstream target cache ABI: $cache_abi_sha256"
+
+      - name: Restore exact upstream Cargo target cache
+        id: upstream_target_cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/codex-target/
+          key: macos-runtime-target-v2-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}-${{ steps.provenance.outputs.source_sha }}
+
       - name: Build the patched Codex runtime pair
         working-directory: ${{ runner.temp }}/codex-upstream/codex-rs
         run: |
@@ -355,7 +440,6 @@ jobs:
             fi
             install -m 0755 "$source_path" "$ARTIFACT_DIR/$name"
           done
-          rm -rf -- "$UPSTREAM_TARGET_DIR"
 
       - name: Validate architecture and runtime contracts
         run: |
@@ -614,8 +698,20 @@ jobs:
             jq -r '.files[] | "| `\(.name)` | \(.bytes) | `\(.sha256)` |"' "$ARTIFACT_DIR/manifest.json"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Save remote Cargo cache
-        if: ${{ always() && steps.cargo_cache.outputs.cache-hit != 'true' }}
+      - name: Save verified upstream Cargo target cache
+        if: ${{ success() && steps.upstream_target_cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/codex-target/
+          key: macos-runtime-target-v2-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}-${{ steps.provenance.outputs.source_sha }}
+
+      - name: Remove ephemeral upstream Cargo target
+        if: ${{ always() }}
+        run: rm -rf -- "$RUNNER_TEMP/codex-target"
+
+      - name: Save remote Cargo downloads
+        if: ${{ always() && steps.cargo_download_cache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -623,6 +719,4 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            ${{ runner.temp }}/codexswitch-target/
-            ${{ runner.temp }}/codex-target/
-          key: macos-runtime-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-${{ github.sha }}
+          key: macos-runtime-downloads-v2-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-${{ github.sha }}
