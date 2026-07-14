@@ -42,11 +42,11 @@ struct AccountMutationLeaseCoordinatorTests {
                 )
             ) { _ in
                 activationStarted.continuation.yield()
-                _ = await releaseActivation.stream.first(where: { _ in true })
+                _ = await nextElement(from: releaseActivation.stream)
                 return true
             }
         }
-        _ = await activationStarted.stream.first(where: { _ in true })
+        _ = await nextElement(from: activationStarted.stream)
 
         let reset = await coordinator.withLease(
             .resetRedemption(
@@ -102,7 +102,7 @@ struct AccountMutationLeaseCoordinatorTests {
                 return true
             }
         }
-        _ = await started.stream.first(where: { _ in true })
+        _ = await nextElement(from: started.stream)
         owner.cancel()
         do {
             _ = try await owner.value

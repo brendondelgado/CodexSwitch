@@ -36,7 +36,7 @@ struct CodexSwitchKeepAliveTests {
             }
         }
 
-        let ranOnMainThread = await observation.stream.first(where: { _ in true })
+        let ranOnMainThread = await nextElement(from: observation.stream)
         await installTask.value
         #expect(ranOnMainThread == false)
     }

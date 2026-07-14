@@ -255,11 +255,11 @@ struct AccountActivationTransactionTests {
                 activationGeneration: generation
             ) { lease in
                 entered.continuation.yield()
-                _ = await unwind.stream.first(where: { _ in true })
+                _ = await nextElement(from: unwind.stream)
                 return transaction.ownsSynchronously(lease)
             }
         }
-        _ = await entered.stream.first(where: { _ in true })
+        _ = await nextElement(from: entered.stream)
 
         transaction.invalidateCurrentActivationSynchronously(targetAccountId: target)
         let overlappingReset = await transaction.withResetLease(
@@ -320,7 +320,7 @@ struct AccountActivationTransactionTests {
                         route: route,
                         authorize: {
                             entered.continuation.yield()
-                            _ = await resume.stream.first(where: { _ in true })
+                            _ = await nextElement(from: resume.stream)
                             guard let effectPermit = transaction.makeEffectPermit(
                                 lease: lease,
                                 targetAccountId: target.id,
@@ -344,7 +344,7 @@ struct AccountActivationTransactionTests {
                     )
                 }
             }
-            _ = await entered.stream.first(where: { _ in true })
+            _ = await nextElement(from: entered.stream)
             transaction.invalidateCurrentActivationSynchronously(targetAccountId: target.id)
             resume.continuation.yield()
 
