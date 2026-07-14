@@ -66,73 +66,103 @@ private actor ArchiveTransportFake: DesktopArchiveHTTPTransport {
 }
 
 private final class ConcurrentBundlePathProbe: @unchecked Sendable {
-    private let lock = NSLock()
-    private let started = DispatchSemaphore(value: 0)
-    private let observed = DispatchSemaphore(value: 0)
-    private let finished = DispatchSemaphore(value: 0)
-    private var shouldStop = false
-    private var didObserve = false
-    private var didFinish = false
-    private var invalidObservation = false
-    private var observations = Set<String>()
+    private var process: Process?
+    private var observationsURL: URL?
+    private var stopURL: URL?
 
     func start(destination: URL) -> Bool {
-        let worker = Thread { [self] in
-            started.signal()
-            while !lock.withLock({ shouldStop }) {
-                let marker = destination.appendingPathComponent("marker")
-                guard let data = try? Data(contentsOf: marker) else {
-                    lock.withLock {
-                        invalidObservation = true
-                        signalFirstObservationIfNeeded()
-                    }
-                    continue
-                }
-                let value = String(decoding: data, as: UTF8.self)
-                lock.withLock {
-                    observations.insert(value)
-                    signalFirstObservationIfNeeded()
-                    if value != "old" && value != "new" {
-                        invalidObservation = true
-                    }
-                }
-            }
-            lock.withLock { didFinish = true }
-            finished.signal()
-        }
-        worker.name = "CodexDesktopAppUpdaterTests.ConcurrentBundlePathProbe"
-        worker.start()
+        let root = destination.deletingLastPathComponent()
+        let marker = destination.appendingPathComponent("marker")
+        let identifier = UUID().uuidString
+        let observations = root.appendingPathComponent("probe-\(identifier).observations")
+        let ready = root.appendingPathComponent("probe-\(identifier).ready")
+        let stop = root.appendingPathComponent("probe-\(identifier).stop")
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sh")
+        child.arguments = [
+            "-c",
+            #"""
+            marker="$1"
+            observations="$2"
+            ready="$3"
+            stop="$4"
+            while [ ! -e "$stop" ]; do
+              if value="$(/bin/cat "$marker" 2>/dev/null)"; then
+                printf '%s\n' "$value" >> "$observations"
+              else
+                printf '%s\n' '__missing__' >> "$observations"
+              fi
+              if [ ! -e "$ready" ]; then
+                : > "$ready"
+              fi
+            done
+            """#,
+            "codexswitch-bundle-probe",
+            marker.path,
+            observations.path,
+            ready.path,
+            stop.path,
+        ]
+        child.standardOutput = FileHandle.nullDevice
+        child.standardError = FileHandle.nullDevice
 
-        guard started.wait(timeout: .now() + 5) == .success,
-              observed.wait(timeout: .now() + 5) == .success else {
-            _ = stop()
+        do {
+            try Data().write(to: observations, options: .withoutOverwriting)
+            try child.run()
+        } catch {
+            try? FileManager.default.removeItem(at: observations)
             return false
         }
-        return true
+        process = child
+        observationsURL = observations
+        stopURL = stop
+
+        let deadline = Date().addingTimeInterval(5)
+        while !FileManager.default.fileExists(atPath: ready.path),
+              child.isRunning,
+              Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        let readyWasObserved = FileManager.default.fileExists(atPath: ready.path)
+        if !readyWasObserved { _ = stop() }
+        return readyWasObserved
     }
 
     func stop() -> Bool {
-        let shouldWait = lock.withLock { () -> Bool in
-            if didFinish { return false }
-            shouldStop = true
-            return true
+        guard let process else { return true }
+        if let stopURL { try? Data().write(to: stopURL, options: .withoutOverwriting) }
+
+        let deadline = Date().addingTimeInterval(5)
+        while process.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
         }
-        guard shouldWait else { return true }
-        return finished.wait(timeout: .now() + 5) == .success
+        guard !process.isRunning else {
+            process.terminate()
+            let terminationDeadline = Date().addingTimeInterval(1)
+            while process.isRunning, Date() < terminationDeadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            self.process = nil
+            return false
+        }
+        self.process = nil
+        return process.terminationStatus == 0
     }
 
     var sawInvalidPathState: Bool {
-        lock.withLock { invalidObservation }
+        !observedValues.isSubset(of: ["old", "new"])
     }
 
     var observedValues: Set<String> {
-        lock.withLock { observations }
-    }
-
-    private func signalFirstObservationIfNeeded() {
-        guard !didObserve else { return }
-        didObserve = true
-        observed.signal()
+        guard let observationsURL,
+              let data = try? Data(contentsOf: observationsURL) else {
+            return []
+        }
+        return Set(
+            String(decoding: data, as: UTF8.self)
+                .split(whereSeparator: \.isNewline)
+                .map(String.init)
+        )
     }
 }
 
@@ -2964,10 +2994,7 @@ struct CodexDesktopAppUpdaterTests {
                 simulatedLaunchAfterFinalProbe = true
                 #expect(probe.start(destination: destination))
             },
-            validate: { candidate, _, _, _ in
-                if candidate == destination { #expect(probe.stop()) }
-                return .valid
-            }
+            validate: { _, _, _, _ in .valid }
         )
         #expect(probe.stop())
 
