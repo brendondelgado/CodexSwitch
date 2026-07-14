@@ -117,16 +117,16 @@ done
 verify_frozen_snapshot
 
 for name in codex codex-code-mode-host codexswitch-cli; do
-  path="$artifact_dir/$name"
-  [[ "$(/usr/bin/lipo -archs "$path")" == "arm64" ]] || {
+  member_path="$artifact_dir/$name"
+  [[ "$(/usr/bin/lipo -archs "$member_path")" == "arm64" ]] || {
     print -u2 "artifact member is not a thin arm64 executable: $name"
     exit 1
   }
-  /usr/bin/file -b "$path" | /usr/bin/grep -Fq "Mach-O 64-bit executable arm64" || {
+  /usr/bin/file -b "$member_path" | /usr/bin/grep -Fq "Mach-O 64-bit executable arm64" || {
     print -u2 "artifact member has the wrong Mach-O shape: $name"
     exit 1
   }
-  /usr/bin/codesign --verify --strict "$path"
+  /usr/bin/codesign --verify --strict "$member_path"
 done
 
 [[ "$("$control_cli" --version)" == "$expected_build_version" ]] || {

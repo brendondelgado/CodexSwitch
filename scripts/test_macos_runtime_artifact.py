@@ -335,12 +335,13 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
     def test_installer_preserves_path_for_final_launcher_probe(self) -> None:
         installer = INSTALLER.read_text()
 
+        self.assertIn('member_path="$artifact_dir/$name"', installer)
         self.assertIn(
             'for route_path in "$installed_cli" "$local_launcher" '
             '"$homebrew_launcher" "$managed_launcher"; do',
             installer,
         )
-        self.assertNotIn('for path in "$installed_cli"', installer)
+        self.assertNotRegex(installer, r"(?m)^\s*(?:local\s+)?path=")
         self.assertLess(
             installer.index("for route_path in"),
             installer.index('"$local_launcher" --version'),

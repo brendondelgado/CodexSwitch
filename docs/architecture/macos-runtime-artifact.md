@@ -249,9 +249,10 @@ Later metadata and status observations preserve that committed identity when
 the installed version is unchanged. A changed installed-version observation or
 reconciliation of a source-built prepared runtime clears it, so neither routine
 polling nor stale provenance can rewrite the truth.
-The repository installer preserves its original `PATH` through final route
-validation; in zsh, the special `path` array must never be reused as a scalar
-loop variable before the launcher smoke test.
+The repository installer preserves its original `PATH` through artifact and
+route validation. In zsh, the special `path` array must never be reused as a
+scalar variable anywhere in the installer because even an earlier artifact
+member check would replace `PATH` before the final launcher smoke test.
 
 The running CLI process is not signalled or replaced in memory. After successful
 activation, one explicit exit and resume starts the new executable set.
