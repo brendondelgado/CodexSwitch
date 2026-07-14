@@ -1,21 +1,28 @@
 ---
 title: macOS runtime artifact
-description: Provenance, validation, staging, and activation contract for the remote-built macOS CodexSwitch runtime set.
+description: Provenance, validation, staging, and activation contracts for remote-built CodexSwitch macOS runtime and app artifacts.
 toc:
   - macOS Runtime Artifact
   - Purpose
+  - App Artifact Boundary
   - Build Gate
   - Trust Bootstrap
   - Manifest
+  - App Manifest
   - Staging
   - Activation
+  - App Installation
   - Failure Contract
 cross_dependencies:
   - ../../crates/codexswitch-cli/src/codex_update/macos_activation.rs
   - ../../crates/codexswitch-cli/src/codex_update/preparation.rs
   - ../../crates/codexswitch-cli/src/main.rs
+  - ../../scripts/build-app.sh
   - ../../scripts/install-macos-cli-artifact.sh
+  - ../../scripts/install-macos-app-artifact.sh
+  - ../../scripts/test_macos_app_artifact.py
   - ../../.github/workflows/build-fork.yml
+  - ../../.github/workflows/build-macos-app.yml
   - macos-cli-launcher.md
   - runtime-and-host-ownership.md
 version_control:
@@ -33,6 +40,29 @@ A complete macOS hot-swap runtime has three coupled executables: `codex`,
 CodexSwitch commit on native Apple Silicon, transferred as one artifact, staged
 as one immutable generation, and activated by one journaled transaction. Mixing
 one new executable with an older member is prohibited.
+
+## App Artifact Boundary
+
+The menu-bar application is a separate sidecar artifact. It is never placed in
+the runtime artifact directory and does not change the runtime artifact's exact
+four-member contract. The app-only artifact directory contains exactly two
+regular, non-symlink files: `CodexSwitch.app.zip` and `manifest.json`.
+
+The dedicated manual workflow builds from one exact clean commit on
+`refs/heads/main` using a native `macos-15` arm64 runner. It runs the complete
+Swift test suite serially, then invokes the existing `scripts/build-app.sh`
+without installation using release configuration, one SwiftPM job, the full
+commit as `CODEXSWITCH_SOURCE_REVISION`, the commit epoch as
+`CODEXSWITCH_BUILD_NUMBER`, version `1.0.0`, and explicit ad-hoc signing. The
+workflow never compiles the Rust runtime, installs the app, modifies a release,
+or mutates a host outside its ephemeral runner.
+
+Both uploaded members receive GitHub build-provenance attestations before the
+artifact is uploaded. Ad-hoc code signing proves bundle integrity after
+extraction; GitHub attestation and the exact clean source checkout establish
+publisher and source identity. The app ZIP must remain independent from the
+coupled CLI runtime artifact so either can be reviewed and activated without
+silently authorizing the other.
 
 ## Build Gate
 
@@ -124,6 +154,54 @@ File names are exact and unique. Unknown files, links, special files, zero-byte
 members, malformed versions, unknown targets, and hash or length mismatches are
 rejected before updater state changes.
 
+## App Manifest
+
+The app artifact manifest format is `codexswitch-macos-app-artifact-v1`:
+
+```json
+{
+  "format": "codexswitch-macos-app-artifact-v1",
+  "codexSwitchGitSha": "40 lowercase hexadecimal characters",
+  "appVersion": "1.0.0",
+  "buildEpoch": 1783915200,
+  "bundleIdentifier": "com.codexswitch",
+  "bundleName": "CodexSwitch.app",
+  "architecture": "arm64",
+  "signing": "adhoc",
+  "archive": {
+    "name": "CodexSwitch.app.zip",
+    "bytes": 1,
+    "sha256": "64 lowercase hexadecimal characters"
+  },
+  "bundleFiles": [
+    {
+      "path": "Contents/MacOS/CodexSwitch",
+      "bytes": 1,
+      "sha256": "64 lowercase hexadecimal characters"
+    },
+    {
+      "path": "Contents/Resources/patch-asar.py",
+      "bytes": 1,
+      "sha256": "64 lowercase hexadecimal characters"
+    }
+  ]
+}
+```
+
+The manifest is at most 64 KiB and the ZIP is at most 512 MiB. The executable
+is at most 256 MiB, the bundled patcher is at most 4 MiB, and archive inspection
+allows at most 4,096 entries and 1 GiB of total uncompressed data. Paths must be
+relative descendants of the single `CodexSwitch.app` root. Encrypted entries,
+links, special files, duplicate paths, traversal components, and unexpected
+top-level members are rejected before extraction. Hashes and lengths for the
+archive, executable, and patcher must all match the manifest.
+
+Before packaging and again after a fresh extraction, the workflow verifies the
+exact plist source revision, build epoch, app version, bundle identifier, and
+executable name; a thin arm64 Mach-O executable; a strict deep ad-hoc code
+signature; byte equality between the bundled and source `patch-asar.py`; and
+absence of the removed VPS active-push markers.
+
 ## Staging
 
 `codexswitch-cli activate-macos-runtime-artifact --directory <path>` is the
@@ -170,6 +248,32 @@ read-only with its generation; executable members are frozen read/execute-only.
 
 The running CLI process is not signalled or replaced in memory. After successful
 activation, one explicit exit and resume starts the new executable set.
+
+## App Installation
+
+`scripts/install-macos-app-artifact.sh <directory>` is the only app-sidecar
+activation path. It requires a clean local `main` checkout at the manifest's
+exact commit. Before interacting with the installed app, it copies both
+downloaded members through no-follow file descriptors into a private snapshot,
+checks the exact member set and bounds, validates the strict manifest and all
+hashes, and verifies both GitHub attestations against
+`brendondelgado/CodexSwitch`, the pinned app workflow, `refs/heads/main`, the
+exact source digest, and a GitHub-hosted runner.
+
+The installer then inspects the ZIP for unsafe entries, extracts it into a new
+private directory, and repeats every workflow bundle validation against the
+clean source checkout. It does not compile, download, patch, or re-sign. Any
+failure through this point leaves `/Applications/CodexSwitch.app` and its
+running process untouched.
+
+Activation copies the already validated bundle into a same-filesystem staging
+directory under `/Applications`, validates that copy, asks the old app to quit,
+and refuses replacement while its executable remains live. An existing app is
+replaced with `renameatx_np(..., RENAME_SWAP)` so the previous bundle remains
+the rollback object. A first installation uses one same-filesystem rename.
+Installed validation or relaunch failure restores the previous bundle, or
+removes the failed first installation, before returning an error. A rollback
+failure preserves the recovery directory and reports its exact path.
 
 ## Failure Contract
 

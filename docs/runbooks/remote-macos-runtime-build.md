@@ -1,6 +1,6 @@
 ---
 title: Remote macOS runtime build
-description: Operator procedure for producing a provenance-locked CodexSwitch macOS arm64 runtime artifact with GitHub Actions.
+description: Operator procedure for producing provenance-locked CodexSwitch macOS arm64 runtime and app artifacts with GitHub Actions.
 toc:
   - Remote macOS Runtime Build
   - Purpose
@@ -10,10 +10,18 @@ toc:
   - Dispatch
   - Verify The Run
   - Download And Inspect
+  - App-Only Artifact
+  - Dispatch The App Build
+  - Verify The App Build
+  - Download And Install The App
   - Failure Handling
 cross_dependencies:
   - ../../.github/workflows/build-fork.yml
+  - ../../.github/workflows/build-macos-app.yml
   - ../../Tests/Fixtures/BuildFork/patch_codex_source.rs
+  - ../../scripts/build-app.sh
+  - ../../scripts/install-macos-app-artifact.sh
+  - ../../scripts/test_macos_app_artifact.py
   - ../architecture/macos-runtime-artifact.md
   - ../architecture/macos-cli-launcher.md
   - ../architecture/runtime-and-host-ownership.md
@@ -241,6 +249,113 @@ Do not merge binaries from different runs. Do not add notes, archives, checksum
 sidecars, or logs to this directory. The manifest is the only metadata member
 allowed by the canonical format.
 
+## App-Only Artifact
+
+Use the separate `Build macOS App Artifact` workflow when the menu-bar app must
+be updated without rebuilding or mixing it into the three-executable runtime
+set. The app workflow accepts only one input: the full CodexSwitch commit SHA
+selected by the dispatch ref. It requires `refs/heads/main`, a clean exact
+checkout, and a native arm64 `macos-15` runner.
+
+The workflow first runs the complete Swift suite with `--jobs 1 --no-parallel`
+in a private temporary directory. It then calls `scripts/build-app.sh` without
+`--install` using these deterministic values:
+
+```text
+CODEXSWITCH_BUILD_CONFIGURATION=release
+CODEXSWITCH_SWIFTPM_JOBS=1
+CODEXSWITCH_SOURCE_REVISION=<full dispatched commit>
+CODEXSWITCH_BUILD_NUMBER=<commit epoch>
+CODEXSWITCH_VERSION=1.0.0
+CODEXSWITCH_CODESIGN_IDENTITY=-
+```
+
+The resulting app is validated before packaging and after a fresh ZIP
+round-trip. `ditto` packages the bundle without resource forks, extended
+attributes, quarantine, or ACL metadata. The workflow uploads exactly
+`CodexSwitch.app.zip` and `manifest.json` as a dedicated artifact; it attests
+both members first and never uploads `.build`, `build`, test output, or runtime
+executables.
+
+## Dispatch The App Build
+
+Resolve and review the exact clean main commit:
+
+```bash
+DISPATCH_REF=main
+CODEXSWITCH_SHA="$(git rev-parse "${DISPATCH_REF}^{commit}")"
+test "${#CODEXSWITCH_SHA}" -eq 40
+test -z "$(git status --porcelain --untracked-files=normal)"
+```
+
+Dispatch the app-only workflow at that same ref:
+
+```bash
+gh workflow run build-macos-app.yml \
+  --ref "$DISPATCH_REF" \
+  -f codexswitch_git_sha="$CODEXSWITCH_SHA"
+```
+
+Moving branch tips do not silently change the selected source: the job requires
+the dispatch SHA, checked-out `HEAD`, and requested SHA to be identical before
+tests or compilation.
+
+## Verify The App Build
+
+The completed run must prove:
+
+1. The dispatch ref is `refs/heads/main`, and checkout SHA equals the requested
+   full SHA with no tracked or untracked changes.
+2. The runner is native arm64 and the serialized Swift suite passed before the
+   release app build began.
+3. `CFBundleSourceRevision` is the full SHA, `CFBundleVersion` is the commit
+   epoch, `CFBundleShortVersionString` is `1.0.0`, and the bundle identifier and
+   executable are canonical.
+4. The executable is a nonempty thin arm64 Mach-O within its size bound.
+5. Strict deep code-signature verification succeeds and reports an ad-hoc
+   signature.
+6. Bundled `patch-asar.py` exactly matches the dispatched source, and its hash
+   and the executable hash match the manifest.
+7. The executable contains none of `LINUX_DEVBOX_ACTIVE_PUSH`,
+   `pendingLinuxDevboxActive`, or `pushLinuxDevboxActiveAccount`.
+8. ZIP preflight accepts only bounded, relative, non-link entries under
+   `CodexSwitch.app`, and all bundle checks pass after extraction into a fresh
+   directory.
+9. The source checkout is clean at the exact SHA after build output has been
+   removed.
+10. Pinned official actions attest both exact members before the separate
+    artifact is uploaded.
+
+## Download And Install The App
+
+Locate and download the app-only artifact into an empty directory:
+
+```bash
+gh run list --workflow build-macos-app.yml --event workflow_dispatch
+gh run view <run-id>
+gh run download <run-id> --name <artifact-name> --dir <empty-directory>
+```
+
+The download directory must contain exactly:
+
+```text
+CodexSwitch.app.zip
+manifest.json
+```
+
+From a clean local `main` checkout at the manifest's exact commit, run:
+
+```bash
+scripts/install-macos-app-artifact.sh <empty-directory>
+```
+
+The installer snapshots and attests both members, validates the strict manifest
+and archive bounds, safely extracts the ZIP, and repeats the complete bundle
+contract before it creates an `/Applications` staging directory or asks the
+running app to quit. It never recompiles or re-signs the bundle. Replacement is
+transactional: validation or launch failure restores and relaunches the prior
+app, while a preactivation failure leaves the installed app unchanged.
+
 ## Failure Handling
 
 A provenance mismatch, changed upstream patch anchor, Cargo failure, missing
@@ -253,3 +368,11 @@ not authorize activation by itself. The workflow never executes
 `activate-macos-runtime-artifact` or `install-prepared-codex`; it uses only
 their `--help` paths to prove that the control plane exposes guarded activation
 and recovery commands.
+
+For the app-only path, a plist mismatch, non-arm64 executable, invalid
+signature, patcher drift, removed-code marker, unsafe ZIP entry, manifest
+mismatch, source-tree drift, or attestation failure likewise stops before
+upload or activation. Do not re-sign, edit, or repack a failed download. Build
+a new artifact from the corrected exact commit. If post-swap app validation or
+launch fails, retain the installer error and any reported recovery path; do not
+delete a preserved rollback directory by hand.

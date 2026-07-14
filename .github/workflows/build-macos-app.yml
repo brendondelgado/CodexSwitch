@@ -1,0 +1,442 @@
+name: Build macOS App Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      codexswitch_git_sha:
+        description: Exact 40-character CodexSwitch commit selected by the dispatch ref
+        required: true
+        type: string
+
+permissions:
+  attestations: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: macos-app-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build native arm64 CodexSwitch app
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      APP_VERSION: "1.0.0"
+      APP_ARCHITECTURE: arm64
+
+    steps:
+      - name: Require a native Apple Silicon runner
+        run: |
+          set -euo pipefail
+          runner_arch="$(uname -m)"
+          if [[ "$runner_arch" != "arm64" ]]; then
+            echo "::error::macos-15 did not provide a native arm64 runner: $runner_arch"
+            exit 1
+          fi
+          echo "Runner: $(sw_vers -productVersion) / $runner_arch"
+
+      - name: Check out the dispatched CodexSwitch commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Lock CodexSwitch app provenance
+        id: provenance
+        env:
+          EXPECTED_CODEXSWITCH_SHA: ${{ inputs.codexswitch_git_sha }}
+        run: |
+          set -euo pipefail
+          sha_pattern='^[0-9a-f]{40}$'
+          if [[ ! "$EXPECTED_CODEXSWITCH_SHA" =~ $sha_pattern ]]; then
+            echo "::error::codexswitch_git_sha must be 40 lowercase hexadecimal characters"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::app artifacts may be dispatched only from refs/heads/main"
+            exit 1
+          fi
+
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" == "$GITHUB_SHA" && "$actual_sha" == "$EXPECTED_CODEXSWITCH_SHA" ]]; then
+            :
+          else
+            echo "::error::dispatch, checkout, and requested CodexSwitch SHAs do not match"
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+            echo "::error::CodexSwitch checkout is not clean before the app build"
+            exit 1
+          fi
+
+          build_epoch="$(git show -s --format=%ct HEAD)"
+          if [[ ! "$build_epoch" =~ ^[0-9]+$ ]]; then
+            echo "::error::CodexSwitch commit has an invalid build epoch"
+            exit 1
+          fi
+          if [[ "$build_epoch" == "0" ]]; then
+            echo "::error::CodexSwitch commit has a zero build epoch"
+            exit 1
+          fi
+          short_sha="${actual_sha:0:12}"
+          artifact_name="codexswitch-macos-app-${short_sha}-arm64-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            printf 'source_sha=%s\n' "$actual_sha"
+            printf 'build_epoch=%s\n' "$build_epoch"
+            printf 'artifact_name=%s\n' "$artifact_name"
+          } >> "$GITHUB_OUTPUT"
+          {
+            printf 'SOURCE_DATE_EPOCH=%s\n' "$build_epoch"
+            printf 'CODEXSWITCH_SOURCE_SHA=%s\n' "$actual_sha"
+            printf 'APP_ARTIFACT_DIR=%s/codexswitch-macos-app-artifact\n' "$RUNNER_TEMP"
+            printf 'APP_ARCHIVE=%s/codexswitch-macos-app-artifact/CodexSwitch.app.zip\n' "$RUNNER_TEMP"
+            printf 'APP_ROUNDTRIP_DIR=%s/codexswitch-macos-app-roundtrip\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify the app artifact contract
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null
+          command -v shasum >/dev/null
+          command -v lipo >/dev/null
+          command -v codesign >/dev/null
+          command -v ditto >/dev/null
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.test_macos_app_artifact
+
+      - name: Verify the Swift app and test suite
+        run: |
+          set -euo pipefail
+          test_tmp="$RUNNER_TEMP/codexswitch-app-tests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          install -d -m 0700 "$test_tmp"
+          cleanup() {
+            rm -rf -- .build "$test_tmp"
+          }
+          trap cleanup EXIT
+          swift --version
+          CODEXSWITCH_TEST_TMPDIR="$test_tmp" \
+            TMPDIR="$test_tmp" \
+            swift test --jobs 1 --no-parallel
+
+      - name: Build the deterministic release app
+        run: |
+          set -euo pipefail
+          CODEXSWITCH_BUILD_CONFIGURATION=release \
+            CODEXSWITCH_SWIFTPM_JOBS=1 \
+            CODEXSWITCH_SOURCE_REVISION="$CODEXSWITCH_SOURCE_SHA" \
+            CODEXSWITCH_BUILD_NUMBER="$SOURCE_DATE_EPOCH" \
+            CODEXSWITCH_VERSION="$APP_VERSION" \
+            CODEXSWITCH_CODESIGN_IDENTITY=- \
+            ./scripts/build-app.sh
+
+      - name: Validate, package, and round-trip the app
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$1"
+            return 1
+          }
+          file_bytes() {
+            /usr/bin/stat -f '%z' "$1"
+          }
+          file_sha256() {
+            /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+          }
+          plist_value() {
+            /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist"
+          }
+          validate_bundle() {
+            local bundle="$1"
+            local executable="$bundle/Contents/MacOS/CodexSwitch"
+            local patcher="$bundle/Contents/Resources/patch-asar.py"
+            local linked special signature
+
+            [[ -d "$bundle" && ! -L "$bundle" ]] || fail "app bundle is missing or linked: $bundle"
+            linked="$(find "$bundle" -type l -print -quit)"
+            [[ -z "$linked" ]] || fail "app bundle contains a symlink: $linked"
+            special="$(find "$bundle" -mindepth 1 ! -type f ! -type d -print -quit)"
+            [[ -z "$special" ]] || fail "app bundle contains a special file: $special"
+            [[ -f "$executable" && ! -L "$executable" && -x "$executable" && -s "$executable" ]] \
+              || fail "app executable is missing, linked, or not executable"
+            [[ -f "$patcher" && ! -L "$patcher" && -s "$patcher" ]] \
+              || fail "bundled patch-asar.py is missing or linked"
+            (( $(file_bytes "$executable") <= 268435456 )) || fail "app executable exceeds 256 MiB"
+            (( $(file_bytes "$patcher") <= 4194304 )) || fail "bundled patch-asar.py exceeds 4 MiB"
+
+            [[ "$(plist_value "$bundle" CFBundleSourceRevision)" == "$CODEXSWITCH_SOURCE_SHA" ]] \
+              || fail "app plist has the wrong source revision"
+            [[ "$(plist_value "$bundle" CFBundleVersion)" == "$SOURCE_DATE_EPOCH" ]] \
+              || fail "app plist has the wrong build number"
+            [[ "$(plist_value "$bundle" CFBundleShortVersionString)" == "$APP_VERSION" ]] \
+              || fail "app plist has the wrong version"
+            [[ "$(plist_value "$bundle" CFBundleIdentifier)" == "com.codexswitch" ]] \
+              || fail "app plist has the wrong bundle identifier"
+            [[ "$(plist_value "$bundle" CFBundleExecutable)" == "CodexSwitch" ]] \
+              || fail "app plist has the wrong executable name"
+
+            [[ "$(/usr/bin/lipo -archs "$executable")" == "$APP_ARCHITECTURE" ]] \
+              || fail "app executable is not thin arm64"
+            /usr/bin/file -b "$executable" | /usr/bin/grep -Fq "Mach-O 64-bit executable arm64" \
+              || fail "app executable has the wrong Mach-O shape"
+            /usr/bin/codesign --verify --deep --strict --verbose=4 "$bundle"
+            signature="$(/usr/bin/codesign --display --verbose=4 "$bundle" 2>&1)"
+            /usr/bin/grep -Fxq "Signature=adhoc" <<< "$signature" \
+              || fail "app bundle is not explicitly ad-hoc signed"
+            /usr/bin/cmp -s scripts/patch-asar.py "$patcher" \
+              || fail "bundled patch-asar.py differs from the dispatched source"
+            if /usr/bin/strings "$executable" \
+              | /usr/bin/grep -E 'LINUX_DEVBOX_ACTIVE_PUSH|pendingLinuxDevboxActive|pushLinuxDevboxActiveAccount' >/dev/null; then
+              fail "app executable still contains removed VPS active-push code"
+            fi
+          }
+
+          app_bundle="$GITHUB_WORKSPACE/build/CodexSwitch.app"
+          rm -rf -- "$APP_ARTIFACT_DIR" "$APP_ROUNDTRIP_DIR"
+          install -d -m 0700 "$APP_ARTIFACT_DIR" "$APP_ROUNDTRIP_DIR"
+          validate_bundle "$app_bundle"
+
+          /usr/bin/ditto \
+            -c -k \
+            --norsrc --noextattr --noqtn --noacl --nopersistRootless \
+            --keepParent \
+            "$app_bundle" "$APP_ARCHIVE"
+          [[ -f "$APP_ARCHIVE" && ! -L "$APP_ARCHIVE" && -s "$APP_ARCHIVE" ]] \
+            || fail "ditto did not create a regular nonempty app archive"
+          (( $(file_bytes "$APP_ARCHIVE") <= 536870912 )) || fail "app archive exceeds 512 MiB"
+
+          /usr/bin/python3 - "$APP_ARCHIVE" <<'PY'
+          import pathlib
+          import stat
+          import sys
+          import zipfile
+
+          archive = pathlib.Path(sys.argv[1])
+          with zipfile.ZipFile(archive) as handle:
+              entries = handle.infolist()
+              if not entries or len(entries) > 4096:
+                  raise SystemExit("app archive has an invalid entry count")
+              seen = set()
+              total = 0
+              for entry in entries:
+                  name = entry.filename
+                  if not name or "\\" in name or name.startswith("/"):
+                      raise SystemExit(f"unsafe app archive path: {name!r}")
+                  raw_name = name[:-1] if name.endswith("/") else name
+                  raw_parts = raw_name.split("/")
+                  if "\x00" in name or any(part in ("", ".", "..") for part in raw_parts):
+                      raise SystemExit(f"unsafe app archive component: {name}")
+                  path = pathlib.PurePosixPath(raw_name)
+                  if not path.parts or path.parts[0] != "CodexSwitch.app":
+                      raise SystemExit(f"unexpected app archive root: {name}")
+                  normalized = path.as_posix()
+                  if normalized in seen:
+                      raise SystemExit(f"duplicate app archive path: {normalized}")
+                  seen.add(normalized)
+                  if entry.flag_bits & 0x1:
+                      raise SystemExit(f"encrypted app archive entry: {name}")
+                  mode = (entry.external_attr >> 16) & 0xFFFF
+                  kind = stat.S_IFMT(mode)
+                  if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                      raise SystemExit(f"linked or special app archive entry: {name}")
+                  if entry.file_size > 536870912:
+                      raise SystemExit(f"oversized app archive entry: {name}")
+                  total += entry.file_size
+                  if total > 1073741824:
+                      raise SystemExit("app archive expands beyond 1 GiB")
+              required = {
+                  "CodexSwitch.app/Contents/Info.plist",
+                  "CodexSwitch.app/Contents/MacOS/CodexSwitch",
+                  "CodexSwitch.app/Contents/Resources/patch-asar.py",
+              }
+              if not required.issubset(seen):
+                  raise SystemExit("app archive is missing a required bundle member")
+          PY
+
+          /usr/bin/ditto \
+            -x -k \
+            --norsrc --noextattr --noqtn --noacl --nopersistRootless \
+            "$APP_ARCHIVE" "$APP_ROUNDTRIP_DIR"
+          top_level="$RUNNER_TEMP/codexswitch-app-roundtrip-members.txt"
+          find "$APP_ROUNDTRIP_DIR" -mindepth 1 -maxdepth 1 -exec basename {} \; \
+            | LC_ALL=C sort > "$top_level"
+          printf '%s\n' CodexSwitch.app | diff -u - "$top_level"
+          validate_bundle "$APP_ROUNDTRIP_DIR/CodexSwitch.app"
+
+          executable="$APP_ROUNDTRIP_DIR/CodexSwitch.app/Contents/MacOS/CodexSwitch"
+          patcher="$APP_ROUNDTRIP_DIR/CodexSwitch.app/Contents/Resources/patch-asar.py"
+          archive_bytes="$(file_bytes "$APP_ARCHIVE")"
+          archive_sha256="$(file_sha256 "$APP_ARCHIVE")"
+          executable_bytes="$(file_bytes "$executable")"
+          executable_sha256="$(file_sha256 "$executable")"
+          patcher_bytes="$(file_bytes "$patcher")"
+          patcher_sha256="$(file_sha256 "$patcher")"
+
+          jq -n \
+            --arg format "codexswitch-macos-app-artifact-v1" \
+            --arg sourceSha "$CODEXSWITCH_SOURCE_SHA" \
+            --arg appVersion "$APP_VERSION" \
+            --argjson buildEpoch "$SOURCE_DATE_EPOCH" \
+            --arg bundleIdentifier "com.codexswitch" \
+            --arg bundleName "CodexSwitch.app" \
+            --arg architecture "$APP_ARCHITECTURE" \
+            --arg signing "adhoc" \
+            --arg archiveName "CodexSwitch.app.zip" \
+            --argjson archiveBytes "$archive_bytes" \
+            --arg archiveSha256 "$archive_sha256" \
+            --arg executablePath "Contents/MacOS/CodexSwitch" \
+            --argjson executableBytes "$executable_bytes" \
+            --arg executableSha256 "$executable_sha256" \
+            --arg patcherPath "Contents/Resources/patch-asar.py" \
+            --argjson patcherBytes "$patcher_bytes" \
+            --arg patcherSha256 "$patcher_sha256" \
+            '{
+              format: $format,
+              codexSwitchGitSha: $sourceSha,
+              appVersion: $appVersion,
+              buildEpoch: $buildEpoch,
+              bundleIdentifier: $bundleIdentifier,
+              bundleName: $bundleName,
+              architecture: $architecture,
+              signing: $signing,
+              archive: {
+                name: $archiveName,
+                bytes: $archiveBytes,
+                sha256: $archiveSha256
+              },
+              bundleFiles: [
+                {path: $executablePath, bytes: $executableBytes, sha256: $executableSha256},
+                {path: $patcherPath, bytes: $patcherBytes, sha256: $patcherSha256}
+              ]
+            }' > "$APP_ARTIFACT_DIR/manifest.json"
+          chmod 0644 "$APP_ARCHIVE" "$APP_ARTIFACT_DIR/manifest.json"
+          (( $(file_bytes "$APP_ARTIFACT_DIR/manifest.json") <= 65536 )) \
+            || fail "app manifest exceeds 64 KiB"
+
+          jq -e \
+            --arg sourceSha "$CODEXSWITCH_SOURCE_SHA" \
+            --arg appVersion "$APP_VERSION" \
+            --argjson buildEpoch "$SOURCE_DATE_EPOCH" \
+            --argjson archiveBytes "$archive_bytes" \
+            --arg archiveSha256 "$archive_sha256" \
+            --argjson executableBytes "$executable_bytes" \
+            --arg executableSha256 "$executable_sha256" \
+            --argjson patcherBytes "$patcher_bytes" \
+            --arg patcherSha256 "$patcher_sha256" \
+            '
+              type == "object" and
+              (keys == ["appVersion", "architecture", "archive", "buildEpoch", "bundleFiles", "bundleIdentifier", "bundleName", "codexSwitchGitSha", "format", "signing"]) and
+              .format == "codexswitch-macos-app-artifact-v1" and
+              .codexSwitchGitSha == $sourceSha and
+              (.codexSwitchGitSha | test("^[0-9a-f]{40}$")) and
+              .appVersion == $appVersion and
+              (.appVersion | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+              .buildEpoch == $buildEpoch and
+              (.buildEpoch | (type == "number" and . > 0)) and
+              .bundleIdentifier == "com.codexswitch" and
+              .bundleName == "CodexSwitch.app" and
+              .architecture == "arm64" and
+              .signing == "adhoc" and
+              (.archive | keys == ["bytes", "name", "sha256"]) and
+              .archive.name == "CodexSwitch.app.zip" and
+              (.archive.bytes | (type == "number" and . > 0 and . <= 536870912)) and
+              .archive.bytes == $archiveBytes and
+              .archive.sha256 == $archiveSha256 and
+              ([.bundleFiles[].path] == ["Contents/MacOS/CodexSwitch", "Contents/Resources/patch-asar.py"]) and
+              (.bundleFiles[0].bytes | (type == "number" and . > 0 and . <= 268435456)) and
+              .bundleFiles[0].bytes == $executableBytes and
+              .bundleFiles[0].sha256 == $executableSha256 and
+              (.bundleFiles[1].bytes | (type == "number" and . > 0 and . <= 4194304)) and
+              .bundleFiles[1].bytes == $patcherBytes and
+              .bundleFiles[1].sha256 == $patcherSha256 and
+              (all(.bundleFiles[];
+                (keys == ["bytes", "path", "sha256"]) and
+                (.sha256 | test("^[0-9a-f]{64}$"))
+              ))
+            ' "$APP_ARTIFACT_DIR/manifest.json" >/dev/null
+
+          expected_names="$RUNNER_TEMP/expected-app-artifact-files.txt"
+          actual_names="$RUNNER_TEMP/actual-app-artifact-files.txt"
+          printf '%s\n' CodexSwitch.app.zip manifest.json | LC_ALL=C sort > "$expected_names"
+          find "$APP_ARTIFACT_DIR" -mindepth 1 -maxdepth 1 -exec basename {} \; \
+            | LC_ALL=C sort > "$actual_names"
+          diff -u "$expected_names" "$actual_names"
+          while IFS= read -r member; do
+            [[ -f "$APP_ARTIFACT_DIR/$member" && ! -L "$APP_ARTIFACT_DIR/$member" ]] \
+              || fail "app artifact member is not a regular non-symlink file: $member"
+          done < "$expected_names"
+
+      - name: Revalidate the clean source checkout
+        run: |
+          set -euo pipefail
+          rm -rf -- .build build
+          [[ "$(git rev-parse HEAD)" == "$CODEXSWITCH_SOURCE_SHA" ]]
+          if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+            echo "::error::CodexSwitch checkout changed during the app build"
+            git status --short
+            exit 1
+          fi
+
+      - name: Attest every exact app artifact member
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/codexswitch-macos-app-artifact/CodexSwitch.app.zip
+            ${{ runner.temp }}/codexswitch-macos-app-artifact/manifest.json
+
+      - name: Upload the verified app artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.provenance.outputs.artifact_name }}
+          path: ${{ runner.temp }}/codexswitch-macos-app-artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: false
+
+      - name: Record app build evidence
+        env:
+          ARTIFACT_NAME: ${{ steps.provenance.outputs.artifact_name }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## macOS App Artifact"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Dispatch ref | \`$GITHUB_REF\` |"
+            echo "| CodexSwitch SHA | \`$CODEXSWITCH_SOURCE_SHA\` |"
+            echo "| App version | \`$APP_VERSION\` |"
+            echo "| Build number | \`$SOURCE_DATE_EPOCH\` |"
+            echo "| Architecture | \`$APP_ARCHITECTURE\` |"
+            echo "| Signing | \`adhoc\` |"
+            echo "| Artifact | \`$ARTIFACT_NAME\` |"
+            echo "| Upload digest | \`$ARTIFACT_DIGEST\` |"
+            echo "| Retention | 7 days |"
+            echo "| Installation | Not performed |"
+            echo
+            echo "### Members"
+            echo
+            echo "| Name | Bytes | SHA-256 |"
+            echo "| --- | ---: | --- |"
+            jq -r '.archive | "| `\(.name)` | \(.bytes) | `\(.sha256)` |"' "$APP_ARTIFACT_DIR/manifest.json"
+            manifest_bytes="$(/usr/bin/stat -f '%z' "$APP_ARTIFACT_DIR/manifest.json")"
+            manifest_sha="$(/usr/bin/shasum -a 256 "$APP_ARTIFACT_DIR/manifest.json" | /usr/bin/awk '{print $1}')"
+            echo "| \`manifest.json\` | $manifest_bytes | \`$manifest_sha\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove ephemeral app build output
+        if: ${{ always() }}
+        run: |
+          rm -rf -- .build build
+          if [[ -n "${APP_ROUNDTRIP_DIR:-}" && -n "${APP_ARTIFACT_DIR:-}" ]]; then
+            rm -rf -- "$APP_ROUNDTRIP_DIR" "$APP_ARTIFACT_DIR"
+          fi
