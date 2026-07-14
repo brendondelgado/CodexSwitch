@@ -1,0 +1,24 @@
+Tests/CodexSwitchTests/SharedPolicyFixtureTests.swift
+  s_70c8e194852bb5::t_08c811851ee456 128-131,140-143
+  s_70c8e194852bb5::t_4f2859611f88bc 73
+Tests/CodexSwitchTests/RateLimitResetTestSupport.swift
+  s_70c8e194852bb5::t_4f2859611f88bc 1-79
+Tests/CodexSwitchTests/AccountActivationTransactionTests.swift
+  s_70c8e194852bb5::t_609c405b16c2aa 94
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "eec5da9602e44d07ce14b268616b19d6dd66162b",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
