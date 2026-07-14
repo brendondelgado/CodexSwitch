@@ -52,6 +52,13 @@ access, ownership, or permissions use this explicit root instead of Foundation's
 platform temp-directory APIs. The temporary directory and `.build` output are
 removed whether the gate succeeds or fails.
 
+The source patch may add direct dependencies that already exist in the
+upstream workspace but are not listed by the patched member crates. Immediately
+after patching, the workflow refreshes `codex-rs/Cargo.lock` with offline Cargo
+metadata resolution. That lockfile change is part of the hashed source patch;
+the release build still uses `--locked`, and post-build provenance revalidates
+the same complete patch hash.
+
 ## Trust Bootstrap
 
 The downloaded `codexswitch-cli` is untrusted until the repository installer

@@ -244,6 +244,10 @@ jobs:
         run: |
           set -euo pipefail
           "$PATCH_DRIVER" "$UPSTREAM_SOURCE_DIR"
+          (
+            cd "$UPSTREAM_SOURCE_DIR/codex-rs"
+            cargo metadata --offline --no-deps --format-version 1 >/dev/null
+          )
           git -C "$UPSTREAM_SOURCE_DIR" diff --check
 
           if git -C "$UPSTREAM_SOURCE_DIR" diff --quiet; then

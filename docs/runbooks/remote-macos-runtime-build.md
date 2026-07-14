@@ -82,6 +82,11 @@ The Codex runtime build names both packages in one Cargo invocation:
 `codex-cli` and `codex-code-mode-host`. The ephemeral checkout and build targets
 are not uploaded.
 
+If the v3 patch adds a direct dependency to an upstream member crate, the
+workflow resolves the resulting lockfile change offline before calculating the
+source-patch digest. The runtime compile remains `--locked`; a lockfile that
+would change during compilation is a release failure.
+
 ## Resolve Provenance
 
 The workflow requires three inputs:

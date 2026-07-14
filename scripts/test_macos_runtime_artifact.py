@@ -113,6 +113,20 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         self.assertIn('observed_patch_sha256=', workflow[post_build:manifest])
         self.assertIn('!= "$EXPECTED_PATCH_SHA256"', workflow[post_build:manifest])
 
+    def test_patched_lockfile_is_refreshed_offline_then_built_locked(self) -> None:
+        workflow = WORKFLOW.read_text()
+        patch_step = workflow.index("Apply the dispatched v3 source patches")
+        build_step = workflow.index("Build the patched Codex runtime pair")
+        revalidation_step = workflow.index("Revalidate both source trees after compilation")
+        patch_contract = workflow[patch_step:build_step]
+        build_contract = workflow[build_step:revalidation_step]
+
+        lock_refresh = "cargo metadata --offline --no-deps --format-version 1"
+        patch_hash = "diff --binary HEAD"
+        self.assertIn(lock_refresh, patch_contract)
+        self.assertLess(patch_contract.index(lock_refresh), patch_contract.index(patch_hash))
+        self.assertIn("--locked", build_contract)
+
     def test_installer_verifies_attestations_before_one_activation(self) -> None:
         installer = INSTALLER.read_text()
         snapshot = installer.index('"$artifact_verifier" snapshot')
