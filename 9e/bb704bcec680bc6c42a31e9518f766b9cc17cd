@@ -1,0 +1,55 @@
+Tests/CodexSwitchTests/AccountCardViewTests.swift
+  s_70c8e194852bb5::t_d6b24c0819d470 67-86
+  s_70c8e194852bb5::t_dda6ef9343cdee 47,49,52-61
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_d6b24c0819d470 1900-1929,1988,1992,1995-2008
+Tests/CodexSwitchTests/CodexDesktopAppUpdaterTests.swift
+  s_70c8e194852bb5::t_b62f110ed361c0 1178-1179,1185,1716,1721,1743-1744,1912-1913,2439,4909-4910,4936-4943
+Tests/CodexSwitchTests/CodexPatchingTests.swift
+  s_70c8e194852bb5::t_3197865d35bc02 9,39,44,47,142,235-251
+  s_70c8e194852bb5::t_4ef99e7aeb474a 252
+docs/architecture/macos-runtime-artifact.md
+  s_70c8e194852bb5::t_fcb950a9c66b57 7,37-50
+  s_70c8e194852bb5::t_c78550d5055955 51
+Sources/CodexSwitch/Services/DesktopBundleInstaller.swift
+  s_70c8e194852bb5::t_241af42ae774fd 1399-1406
+docs/architecture/desktop-update-storage.md
+  s_70c8e194852bb5::t_7fef19794f1165 354-358
+.github/workflows/build-fork.yml
+  s_70c8e194852bb5::t_fcb950a9c66b57 137-142,144
+Tests/CodexSwitchTests/AccountManagerSyncTests.swift
+  s_70c8e194852bb5::t_bd03ff8718a556 208,264,308,652
+Tests/CodexSwitchTests/LinuxDevboxStatusTests.swift
+  s_70c8e194852bb5::t_bd03ff8718a556 184-185,191-193,201-206,227,229-236,239-245,252-255
+  s_70c8e194852bb5::t_0993e1e7f2709d 208-215,222-226
+  s_70c8e194852bb5::t_61a597ce08f359 196,228
+  s_70c8e194852bb5::t_d6b24c0819d470 207,216-221,246-251,256-300
+docs/architecture/credential-bundle-format.md
+  s_70c8e194852bb5::t_d6b24c0819d470 186-190
+scripts/test_macos_runtime_artifact.py
+  s_a93b2e7803ea1b::t_c905cd89ea94cc 72-88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "9ebb704bcec680bc6c42a31e9518f766b9cc17cd",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    },
+    "s_a93b2e7803ea1b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5f5b-5b77-7751-8bc2-8f4701356006",
+        "model": "unknown"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
