@@ -499,20 +499,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         lastCLIRepairCheck = now
         globalCLIRepairInFlight = true
-        Task.detached { [weak self] in
+        let finish: @MainActor @Sendable (
+            CodexVersionChecker.CodexCLIRepairResult
+        ) -> Void = { [weak self] result in
+            self?.finishGlobalCLIRepair(result)
+        }
+        Task.detached {
             let result = CodexVersionChecker.repairBrokenGlobalCLIIfNeeded(force: force)
             if result.attempted {
                 SwapLog.append(.debug("GLOBAL_CODEX_CLI_REPAIR success=\(result.success) message=\(result.message)"))
             }
-            await MainActor.run {
-                guard let self else { return }
-                self.completeCodexHotSwapRuntimeMissing = !result.success
-                    && result.message == "No complete native Codex hot-swap runtime is installed"
-                self.globalCLIRepairInFlight = false
-                if self.completeCodexHotSwapRuntimeMissing {
-                    self.scheduleAutomaticCodexUpdateIfNeeded()
-                }
-            }
+            await finish(result)
+        }
+    }
+
+    private func finishGlobalCLIRepair(
+        _ result: CodexVersionChecker.CodexCLIRepairResult
+    ) {
+        completeCodexHotSwapRuntimeMissing = !result.success
+            && result.message == "No complete native Codex hot-swap runtime is installed"
+        globalCLIRepairInFlight = false
+        if completeCodexHotSwapRuntimeMissing {
+            scheduleAutomaticCodexUpdateIfNeeded()
         }
     }
 
@@ -528,31 +536,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         lastAutomaticCodexUpdateAttemptAt = now
         UserDefaults.standard.set(now, forKey: Self.automaticCodexUpdateLastAttemptKey)
-        automaticCodexUpdateTask = Task.detached(priority: .utility) { [weak self] in
+        let finish: @MainActor @Sendable (
+            CodexVersionChecker.AutomaticUpdateDisposition
+        ) -> Void = { [weak self] disposition in
+            self?.finishAutomaticCodexUpdate(disposition)
+        }
+        automaticCodexUpdateTask = Task.detached(priority: .utility) {
             let disposition = CodexVersionChecker.performAutomaticUpdateIfNeeded()
-            await MainActor.run {
-                guard let self else { return }
-                self.automaticCodexUpdateTask = nil
-                guard !self.isExiting else { return }
+            await finish(disposition)
+        }
+    }
 
-                switch disposition {
-                case .upToDate(let version):
-                    self.completeCodexHotSwapRuntimeMissing = false
-                    self.clearAutomaticCodexUpdateFailure()
-                    SwapLog.append(.debug("CODEX_AUTO_UPDATE status=up_to_date version=\(version)"))
-                case .deferred(let reason):
-                    self.clearAutomaticCodexUpdateFailure()
-                    SwapLog.append(.debug("CODEX_AUTO_UPDATE status=deferred reason=\(reason)"))
-                case .failed(let reason):
-                    let failedAt = Date()
-                    self.lastAutomaticCodexUpdateFailureAt = failedAt
-                    UserDefaults.standard.set(
-                        failedAt,
-                        forKey: Self.automaticCodexUpdateLastFailureKey
-                    )
-                    SwapLog.append(.debug("CODEX_AUTO_UPDATE status=failed backoff_hours=6 reason=\(reason)"))
-                }
-            }
+    private func finishAutomaticCodexUpdate(
+        _ disposition: CodexVersionChecker.AutomaticUpdateDisposition
+    ) {
+        automaticCodexUpdateTask = nil
+        guard !isExiting else { return }
+
+        switch disposition {
+        case .upToDate(let version):
+            completeCodexHotSwapRuntimeMissing = false
+            clearAutomaticCodexUpdateFailure()
+            SwapLog.append(.debug("CODEX_AUTO_UPDATE status=up_to_date version=\(version)"))
+        case .deferred(let reason):
+            clearAutomaticCodexUpdateFailure()
+            SwapLog.append(.debug("CODEX_AUTO_UPDATE status=deferred reason=\(reason)"))
+        case .failed(let reason):
+            let failedAt = Date()
+            lastAutomaticCodexUpdateFailureAt = failedAt
+            UserDefaults.standard.set(
+                failedAt,
+                forKey: Self.automaticCodexUpdateLastFailureKey
+            )
+            SwapLog.append(.debug("CODEX_AUTO_UPDATE status=failed backoff_hours=6 reason=\(reason)"))
         }
     }
 
@@ -715,12 +731,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func scheduleConfigMaintenanceIfNeeded(removeStaleCopies: Bool = false) {
         guard configMaintenanceTask == nil else { return }
-        configMaintenanceTask = Task.detached(priority: .utility) { [weak self] in
-            CodexConfigRepair.repairDefaultConfigIfNeeded(removeStaleCopies: removeStaleCopies)
-            await MainActor.run {
-                self?.configMaintenanceTask = nil
-            }
+        let finish: @MainActor @Sendable () -> Void = { [weak self] in
+            self?.finishConfigMaintenance()
         }
+        configMaintenanceTask = Task.detached(priority: .utility) {
+            CodexConfigRepair.repairDefaultConfigIfNeeded(removeStaleCopies: removeStaleCopies)
+            await finish()
+        }
+    }
+
+    private func finishConfigMaintenance() {
+        configMaintenanceTask = nil
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -1548,17 +1569,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastLinuxDevboxCredentialSyncAttemptAt = now
         pendingLinuxDevboxCredentialSyncFingerprint = nil
         let journal = linuxDevboxCredentialSyncJournal
-        Task.detached { [weak self] in
+        let deferSync: @MainActor @Sendable () -> Void = { [weak self] in
+            self?.deferLinuxDevboxCredentialSync(
+                fingerprint: fingerprint,
+                context: context
+            )
+        }
+        let finishSync: @MainActor @Sendable (
+            Result<String, LinuxDevboxMonitorFailure>
+        ) -> Void = { [weak self] result in
+            self?.finishLinuxDevboxCredentialSync(
+                result: result,
+                fingerprint: fingerprint,
+                accountsCount: accounts.count,
+                context: context
+            )
+        }
+        Task.detached {
             if !Self.shouldBypassLinuxDevboxCredentialSyncNetworkBackoff(for: context),
                await NetworkBackoffGuard.shared.shouldDeferNonCriticalProbe(
                    operation: "linux_devbox_credential_sync"
                ) {
-                await MainActor.run {
-                    guard let self else { return }
-                    self.linuxDevboxCredentialSyncInFlight = false
-                    self.pendingLinuxDevboxCredentialSyncFingerprint = fingerprint
-                    SwapLog.append(.debug("LINUX_DEVBOX_CREDENTIAL_SYNC_DEFERRED context=\(context)"))
-                }
+                await deferSync()
                 return
             }
 
@@ -1567,15 +1599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .success(let evidence):
                 baseline = evidence
             case .failure(let failure):
-                await MainActor.run {
-                    guard let self else { return }
-                    self.finishLinuxDevboxCredentialSync(
-                        result: .failure(failure),
-                        fingerprint: fingerprint,
-                        accountsCount: accounts.count,
-                        context: context
-                    )
-                }
+                await finishSync(.failure(failure))
                 return
             }
 
@@ -1589,33 +1613,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .success(let value):
                 operation = value
             case .failure(let failure):
-                await MainActor.run {
-                    guard let self else { return }
-                    self.finishLinuxDevboxCredentialSync(
-                        result: .failure(failure),
-                        fingerprint: fingerprint,
-                        accountsCount: accounts.count,
-                        context: context
-                    )
-                }
+                await finishSync(.failure(failure))
                 return
             }
 
             do {
                 try journal.begin(operation)
             } catch {
-                await MainActor.run {
-                    guard let self else { return }
-                    self.finishLinuxDevboxCredentialSync(
-                        result: .failure(LinuxDevboxMonitorFailure(
-                            message: "Credential-sync journal could not be committed; no remote mutation was attempted: \(error.localizedDescription)",
-                            credentialSyncDisposition: .rejected
-                        )),
-                        fingerprint: fingerprint,
-                        accountsCount: accounts.count,
-                        context: context
-                    )
-                }
+                await finishSync(.failure(LinuxDevboxMonitorFailure(
+                    message: "Credential-sync journal could not be committed; no remote mutation was attempted: \(error.localizedDescription)",
+                    credentialSyncDisposition: .rejected
+                )))
                 return
             }
 
@@ -1643,16 +1651,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ))
             }
 
-            await MainActor.run {
-                guard let self else { return }
-                self.finishLinuxDevboxCredentialSync(
-                    result: result,
-                    fingerprint: fingerprint,
-                    accountsCount: accounts.count,
-                    context: context
-                )
-            }
+            await finishSync(result)
         }
+    }
+
+    private func deferLinuxDevboxCredentialSync(
+        fingerprint: String,
+        context: String
+    ) {
+        linuxDevboxCredentialSyncInFlight = false
+        pendingLinuxDevboxCredentialSyncFingerprint = fingerprint
+        SwapLog.append(.debug("LINUX_DEVBOX_CREDENTIAL_SYNC_DEFERRED context=\(context)"))
     }
 
     private func finishLinuxDevboxCredentialSync(
@@ -1729,7 +1738,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
               !linuxDevboxCredentialSyncReconciliationInFlight else { return }
         linuxDevboxCredentialSyncReconciliationInFlight = true
         let journal = linuxDevboxCredentialSyncJournal
-        Task.detached { [weak self] in
+        let finish: @MainActor @Sendable (
+            LinuxDevboxCredentialSyncReconciliation
+        ) -> Void = { [weak self] reconciliation in
+            self?.finishLinuxDevboxCredentialSyncReconciliation(
+                reconciliation,
+                operation: operation
+            )
+        }
+        Task.detached {
             var reconciliation = LinuxDevboxMonitor.reconcileCredentialSync(
                 settings: settings,
                 operation: operation
@@ -1749,49 +1766,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     "Credential-sync reconciliation could not update its journal: \(error.localizedDescription)"
                 )
             }
+            await finish(reconciliation)
+        }
+    }
 
-            await MainActor.run {
-                guard let self else { return }
-                self.linuxDevboxCredentialSyncReconciliationInFlight = false
-                switch reconciliation {
-                case .committed:
-                    UserDefaults.standard.set(
-                        operation.credentialFingerprint,
-                        forKey: linuxDevboxLastCredentialSyncFingerprintKey
-                    )
-                    self.clearLegacyLinuxDevboxCredentialSyncHold()
-                    SwapLog.append(.debug(
-                        "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=committed"
-                    ))
-                    self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "load-restore")
-                case .safeToRetry:
-                    self.clearLegacyLinuxDevboxCredentialSyncHold()
-                    let fingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(
-                        accounts: self.accountManager.accounts
-                    )
-                    self.scheduleLinuxDevboxCredentialSyncRetry(
-                        LinuxDevboxCredentialSyncRetryPlan(
-                            context: "credential-retry-reconciled",
-                            fingerprint: fingerprint,
-                            delay: Self.linuxDevboxCredentialSyncRetryDelay
-                        )
-                    )
-                case .unresolved(let reason):
-                    UserDefaults.standard.set(
-                        operation.credentialFingerprint,
-                        forKey: linuxDevboxCredentialSyncUnresolvedFingerprintKey
-                    )
-                    UserDefaults.standard.set(
-                        reason,
-                        forKey: linuxDevboxCredentialSyncUnresolvedReasonKey
-                    )
-                    self.surfaceLinuxDevboxCredentialSyncHold(
-                        fingerprint: operation.credentialFingerprint,
-                        reason: reason,
-                        context: "reconciliation"
-                    )
-                }
-            }
+    private func finishLinuxDevboxCredentialSyncReconciliation(
+        _ reconciliation: LinuxDevboxCredentialSyncReconciliation,
+        operation: LinuxDevboxCredentialSyncOperation
+    ) {
+        linuxDevboxCredentialSyncReconciliationInFlight = false
+        switch reconciliation {
+        case .committed:
+            UserDefaults.standard.set(
+                operation.credentialFingerprint,
+                forKey: linuxDevboxLastCredentialSyncFingerprintKey
+            )
+            clearLegacyLinuxDevboxCredentialSyncHold()
+            SwapLog.append(.debug(
+                "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=committed"
+            ))
+            scheduleLinuxDevboxCredentialSyncIfNeeded(context: "load-restore")
+        case .safeToRetry:
+            clearLegacyLinuxDevboxCredentialSyncHold()
+            let fingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(
+                accounts: accountManager.accounts
+            )
+            scheduleLinuxDevboxCredentialSyncRetry(
+                LinuxDevboxCredentialSyncRetryPlan(
+                    context: "credential-retry-reconciled",
+                    fingerprint: fingerprint,
+                    delay: Self.linuxDevboxCredentialSyncRetryDelay
+                )
+            )
+        case .unresolved(let reason):
+            UserDefaults.standard.set(
+                operation.credentialFingerprint,
+                forKey: linuxDevboxCredentialSyncUnresolvedFingerprintKey
+            )
+            UserDefaults.standard.set(
+                reason,
+                forKey: linuxDevboxCredentialSyncUnresolvedReasonKey
+            )
+            surfaceLinuxDevboxCredentialSyncHold(
+                fingerprint: operation.credentialFingerprint,
+                reason: reason,
+                context: "reconciliation"
+            )
         }
     }
 
@@ -5005,7 +5025,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         tokenUsageRefreshSequence += 1
         let refreshSequence = tokenUsageRefreshSequence
 
-        Task.detached { [weak self] in
+        let finish: @MainActor @Sendable (CodexTokenSavingsSummary) -> Void = {
+            [weak self] summary in
+            self?.finishTokenUsageMetricsRefresh(
+                summary,
+                refreshSequence: refreshSequence
+            )
+        }
+        Task.detached {
             let localReport = CodexTokenUsageReader.localReport(accounts: accounts, days: 30)
             let settings = LinuxDevboxMonitor.settings()
             let remoteReport: CodexTokenUsageReport?
@@ -5033,31 +5060,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 remoteReport: remoteReport,
                 localTokenHashPrefixes: CodexTelemetryLogParser.tokenHashPrefixes(for: accounts)
             )
-
-            await MainActor.run {
-                guard let self else { return }
-                self.tokenUsageRefreshInFlight = false
-                guard refreshSequence == self.tokenUsageRefreshSequence else {
-                    SwapLog.append(.debug("TOKEN_USAGE_REFRESH_STALE ignored_sequence=\(refreshSequence) current_sequence=\(self.tokenUsageRefreshSequence)"))
-                    return
-                }
-                let stabilized = self.tokenSavingsStore.stabilizedSummary(
-                    current: self.accountManager.tokenSavingsSummary,
-                    candidate: summary
-                )
-                if stabilized.keptPrevious, let previous = stabilized.previous {
-                    self.accountManager.tokenSavingsSummary = stabilized.summary
-                    SwapLog.append(.debug("TOKEN_USAGE_REFRESH_NON_MONOTONIC_IGNORED previous_api=\(String(format: "%.4f", previous.apiValueUSD)) candidate_api=\(String(format: "%.4f", summary.apiValueUSD)) previous_completions=\(previous.total.completionCount) candidate_completions=\(summary.total.completionCount)"))
-                    self.updatePopoverContent()
-                    return
-                }
-                self.accountManager.tokenSavingsSummary = stabilized.summary
-                let sources = stabilized.summary.includedReports.map(\.source.rawValue).joined(separator: "+")
-                let staleHighWaterReplaced = stabilized.previous != nil && stabilized.summary.apiValueUSD + 0.01 < (stabilized.previous?.apiValueUSD ?? 0)
-                SwapLog.append(.debug("TOKEN_USAGE_REFRESH_ACCEPTED sequence=\(refreshSequence) api=\(String(format: "%.4f", stabilized.summary.apiValueUSD)) completions=\(stabilized.summary.total.completionCount) sources=\(sources) remote_included=\(stabilized.summary.includesRemoteUsage) stale_high_water_replaced=\(staleHighWaterReplaced)"))
-                self.updatePopoverContent()
-            }
+            await finish(summary)
         }
+    }
+
+    private func finishTokenUsageMetricsRefresh(
+        _ summary: CodexTokenSavingsSummary,
+        refreshSequence: Int
+    ) {
+        tokenUsageRefreshInFlight = false
+        guard refreshSequence == tokenUsageRefreshSequence else {
+            SwapLog.append(.debug("TOKEN_USAGE_REFRESH_STALE ignored_sequence=\(refreshSequence) current_sequence=\(tokenUsageRefreshSequence)"))
+            return
+        }
+        let stabilized = tokenSavingsStore.stabilizedSummary(
+            current: accountManager.tokenSavingsSummary,
+            candidate: summary
+        )
+        if stabilized.keptPrevious, let previous = stabilized.previous {
+            accountManager.tokenSavingsSummary = stabilized.summary
+            SwapLog.append(.debug("TOKEN_USAGE_REFRESH_NON_MONOTONIC_IGNORED previous_api=\(String(format: "%.4f", previous.apiValueUSD)) candidate_api=\(String(format: "%.4f", summary.apiValueUSD)) previous_completions=\(previous.total.completionCount) candidate_completions=\(summary.total.completionCount)"))
+            updatePopoverContent()
+            return
+        }
+        accountManager.tokenSavingsSummary = stabilized.summary
+        let sources = stabilized.summary.includedReports.map(\.source.rawValue).joined(separator: "+")
+        let staleHighWaterReplaced = stabilized.previous != nil
+            && stabilized.summary.apiValueUSD + 0.01
+                < (stabilized.previous?.apiValueUSD ?? 0)
+        SwapLog.append(.debug("TOKEN_USAGE_REFRESH_ACCEPTED sequence=\(refreshSequence) api=\(String(format: "%.4f", stabilized.summary.apiValueUSD)) completions=\(stabilized.summary.total.completionCount) sources=\(sources) remote_included=\(stabilized.summary.includesRemoteUsage) stale_high_water_replaced=\(staleHighWaterReplaced)"))
+        updatePopoverContent()
     }
 
     private func checkLinuxDevboxReadiness(force: Bool = false) {

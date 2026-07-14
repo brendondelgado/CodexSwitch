@@ -414,6 +414,12 @@ evidence.
 
 The observable account model remains `MainActor` isolated. Durable account and auth file operations execute on serial background actors or executors. Imports, activation changes, explicit deletion, security-state changes, and reset state transitions persist immediately and await durable proof before reporting success. Telemetry updates the in-memory model immediately, but whole-store telemetry persistence is coalesced behind a fixed one-minute minimum cadence. Poll results that differ only in `lastRefreshed`, quota `fetchedAt`, or reset-bank `fetchedAt` are suppressed; the latest freshness snapshot is written as a heartbeat no more than once every five minutes. A newer durable user or security mutation cancels and supersedes every older queued telemetry revision, so stale telemetry can never overwrite that durable revision. Only a successful save advances the persisted comparison baseline, leaving failed telemetry saves retryable. Explicit application-shutdown persistence is forced and bypasses telemetry suppression and cadence while retaining revision ordering.
 
+Detached workers capture only immutable `Sendable` inputs. They return their
+result through a dedicated `MainActor`-isolated completion method instead of
+capturing `AppDelegate` inside a `MainActor.run` closure. The background work
+therefore remains off the UI actor while the state mutation has one explicit
+actor boundary on every supported Swift 6 toolchain.
+
 - The menu app presents local account state and read-only VPS state separately.
 - Provider quota is shared, but runtime ownership is host-specific. Every account
   card presents simultaneous `Mac Configured`, `Mac Runtime`, and `VPS Runtime`
