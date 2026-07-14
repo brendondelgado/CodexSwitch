@@ -397,20 +397,21 @@ jobs:
           "$ARTIFACT_DIR/codexswitch-cli" activate-macos-runtime-artifact --help >/dev/null
           "$ARTIFACT_DIR/codexswitch-cli" install-prepared-codex --help >/dev/null
 
-          control_marker_dump="$RUNNER_TEMP/codexswitch-cli.strings"
-          strings -a "$ARTIFACT_DIR/codexswitch-cli" > "$control_marker_dump"
-          control_markers=(
-            "codexswitch-macos-runtime-artifact-v1"
-            "codexswitch-macos-runtime-activation-v1"
-            "activate-macos-runtime-artifact"
-            "install-prepared-codex"
-          )
-          for marker in "${control_markers[@]}"; do
-            if ! grep -Fq -- "$marker" "$control_marker_dump"; then
-              echo "::error::codexswitch-cli is missing required control-plane marker: $marker"
-              exit 1
-            fi
-          done
+          control_contract="$RUNNER_TEMP/codexswitch-cli-macos-runtime-contract.json"
+          "$ARTIFACT_DIR/codexswitch-cli" macos-runtime-contract > "$control_contract"
+          if ! jq -e '
+            type == "object" and
+            (keys == ["activationJournalFormat", "architecture", "artifactFormat", "commands", "contractFormat", "targetTriple"]) and
+            .contractFormat == "codexswitch-macos-runtime-contract-v1" and
+            .artifactFormat == "codexswitch-macos-runtime-artifact-v1" and
+            .activationJournalFormat == "codexswitch-macos-runtime-activation-v1" and
+            .targetTriple == "aarch64-apple-darwin" and
+            .architecture == "arm64" and
+            .commands == ["activate-macos-runtime-artifact", "install-prepared-codex"]
+          ' "$control_contract" >/dev/null; then
+            echo "::error::codexswitch-cli reported the wrong macOS runtime contract"
+            exit 1
+          fi
 
           marker_dump="$RUNNER_TEMP/codex-runtime.strings"
           strings -a "$ARTIFACT_DIR/codex" > "$marker_dump"

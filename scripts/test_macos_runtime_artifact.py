@@ -183,6 +183,7 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         self.assertNotIn('report.get("preparedArtifactManifestSha256")', installer)
         self.assertNotIn('attestation verify "$download_dir/', installer)
         self.assertNotIn('--directory "$download_dir"', installer)
+        self.assertIn('"$control_cli" macos-runtime-contract', installer)
         self.assertEqual(installer.count('"$control_cli" activate-macos-runtime-artifact'), 1)
         self.assertNotIn('"$control_cli" stage-macos-runtime-artifact', installer)
         self.assertNotIn('"$control_cli" install-prepared-codex', installer)
@@ -195,6 +196,23 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
             "--deny-self-hosted-runners",
         ):
             self.assertIn(policy, installer)
+
+    def test_control_plane_contract_is_executable_and_optimizer_independent(self) -> None:
+        workflow = WORKFLOW.read_text()
+        installer = INSTALLER.read_text()
+        activation = ACTIVATION.read_text()
+
+        self.assertIn(
+            '"$ARTIFACT_DIR/codexswitch-cli" macos-runtime-contract', workflow
+        )
+        self.assertIn('"$control_cli" macos-runtime-contract', installer)
+        self.assertIn(
+            'Command::new(control_cli).arg("macos-runtime-contract")', activation
+        )
+        self.assertIn("codexswitch-macos-runtime-contract-v1", workflow)
+        self.assertIn("codexswitch-macos-runtime-contract-v1", installer)
+        self.assertNotIn("codexswitch-cli.strings", workflow)
+        self.assertNotIn("control-markers", installer)
 
     def test_private_snapshot_is_frozen_and_independent_of_download_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

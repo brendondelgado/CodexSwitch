@@ -129,23 +129,29 @@ for name in codex codex-code-mode-host codexswitch-cli; do
   /usr/bin/codesign --verify --strict "$path"
 done
 
-marker_dump="$work_dir/control-markers"
-/usr/bin/strings -a "$control_cli" > "$marker_dump"
-for marker in \
-  codexswitch-macos-runtime-artifact-v1 \
-  codexswitch-macos-runtime-activation-v1 \
-  activate-macos-runtime-artifact \
-  install-prepared-codex; do
-  /usr/bin/grep -Fq -- "$marker" "$marker_dump" || {
-    print -u2 "artifact control plane is missing required marker: $marker"
-    exit 1
-  }
-done
-
 [[ "$("$control_cli" --version)" == "$expected_build_version" ]] || {
   print -u2 "artifact control-plane version does not match its manifest"
   exit 1
 }
+contract_report="$work_dir/macos-runtime-contract.json"
+"$control_cli" macos-runtime-contract > "$contract_report"
+/usr/bin/python3 - "$contract_report" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    report = json.load(handle)
+expected = {
+    "contractFormat": "codexswitch-macos-runtime-contract-v1",
+    "artifactFormat": "codexswitch-macos-runtime-artifact-v1",
+    "activationJournalFormat": "codexswitch-macos-runtime-activation-v1",
+    "targetTriple": "aarch64-apple-darwin",
+    "architecture": "arm64",
+    "commands": ["activate-macos-runtime-artifact", "install-prepared-codex"],
+}
+if report != expected:
+    raise SystemExit("artifact control plane reported the wrong macOS runtime contract")
+PY
 verify_frozen_snapshot
 activation_report="$work_dir/activation-report.json"
 "$control_cli" activate-macos-runtime-artifact \

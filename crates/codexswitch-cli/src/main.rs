@@ -123,6 +123,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(name = "macos-runtime-contract", hide = true)]
+    MacOsRuntimeContract,
     InstallPreparedCodex {
         #[arg(long)]
         json: bool,
@@ -228,6 +230,7 @@ fn main() -> Result<()> {
         Command::ActivateMacOsRuntimeArtifact { directory, json } => {
             activate_macos_runtime_artifact(&directory, json)
         }
+        Command::MacOsRuntimeContract => macos_runtime_contract(),
         Command::InstallPreparedCodex { json } => install_prepared_codex(json),
         Command::AutoInstallCodexUpdate { json } => auto_install_codex_update(json),
         Command::Swap { account } => swap(&store_path, &auth_path, &account),
@@ -491,6 +494,14 @@ pub(crate) fn activate_macos_runtime_artifact(directory: &Path, json_output: boo
             println!("installed version: {version}");
         }
     }
+    Ok(())
+}
+
+pub(crate) fn macos_runtime_contract() -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&codex_update::macos_runtime_contract_report())?
+    );
     Ok(())
 }
 

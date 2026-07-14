@@ -21,7 +21,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-13
+  last_updated: 2026-07-14
 ---
 
 # macOS Runtime Artifact
@@ -86,6 +86,15 @@ and retained manifest identity afterward. The mutable download directory is
 never executed. Generic code-signature integrity or a self-reported `--version`
 is never a trust anchor.
 
+After provenance verification, the installer executes the snapshot's hidden,
+read-only `macos-runtime-contract` command and requires an exact JSON report for
+the artifact format, activation-journal format, target, architecture, and
+guarded activation commands. Release optimization may encode string comparisons
+without retaining their source literals as contiguous binary strings, so
+`strings` output is not a valid control-plane contract check. The executable
+report is used by both CI and the installer; its bytes are already bound by the
+manifest and GitHub attestation before the installer runs it.
+
 ## Manifest
 
 The artifact directory contains exactly the three regular executable files and
@@ -127,13 +136,13 @@ activation.
 The staging phase validates the source directory without following links,
 verifies all hashes and Mach-O arm64 identities, checks the full runtime v3
 marker contract, verifies the helper, and proves that the control-plane binary
-exposes this artifact format and guarded activation command. It copies the
-three executables and the original `manifest.json` into one new attempt-ID
-generation. Existing signatures and manifest-approved bytes are preserved;
-the control plane never builds, downloads, or re-signs on the Mac. An existing
-same-version generation is reused only when a full revalidation proves the
-exact manifest and all three executable identities. Reuse refreshes the
-observed installed route before a journal records its rollback baseline.
+reports this artifact format and both guarded activation commands. It copies
+the three executables and the original `manifest.json` into one new attempt-ID
+generation. Existing signatures and manifest-approved bytes are preserved; the
+control plane never builds, downloads, or re-signs on the Mac. An existing
+same-version generation is reused only when a full revalidation proves the exact
+manifest and all three executable identities. Reuse refreshes the observed
+installed route before a journal records its rollback baseline.
 
 `stage-macos-runtime-artifact` remains a diagnostic operator command, but it
 fails closed on contention and does not authorize a later unrelated artifact.

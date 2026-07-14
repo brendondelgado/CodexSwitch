@@ -20,7 +20,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-13
+  last_updated: 2026-07-14
 ---
 
 # Remote macOS Runtime Build
@@ -172,7 +172,11 @@ The run must prove all of the following before upload:
    commit
    and build epoch, matches `codexSwitchBuildVersion`, and its help exposes both
    `activate-macos-runtime-artifact` and `install-prepared-codex` without
-   invoking either command.
+   invoking either command. Its hidden, read-only `macos-runtime-contract`
+   command must also return the exact artifact format, activation-journal
+   format, target, architecture, and command list as JSON. Do not substitute a
+   `strings` scan for this executable contract report; release optimization may
+   encode compared literals without preserving them as contiguous strings.
 10. `manifest.json` matches `codexswitch-macos-runtime-artifact-v1`, including
    the exact upstream commit, source-patch SHA-256, file names, byte lengths,
    and file SHA-256 values.

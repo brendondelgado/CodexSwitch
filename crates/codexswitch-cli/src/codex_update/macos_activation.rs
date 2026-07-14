@@ -1,5 +1,6 @@
 const MACOS_LAUNCHER_JOURNAL_FORMAT: &str = "codexswitch-macos-runtime-activation-v1";
 const MACOS_RUNTIME_ARTIFACT_FORMAT: &str = "codexswitch-macos-runtime-artifact-v1";
+const MACOS_RUNTIME_CONTRACT_FORMAT: &str = "codexswitch-macos-runtime-contract-v1";
 const MACOS_LAUNCHER_FILE_MAX_BYTES: u64 = 1024 * 1024;
 const MACOS_ARTIFACT_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
 const MACOS_ARTIFACT_EXECUTABLE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -25,6 +26,17 @@ struct MacOsRuntimeArtifactFile {
     name: String,
     bytes: u64,
     sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct MacOsRuntimeContractReport {
+    contract_format: String,
+    artifact_format: String,
+    activation_journal_format: String,
+    target_triple: String,
+    architecture: String,
+    commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,6 +80,20 @@ struct MacOsActivationJournal {
 enum MacOsActivationRecoveryOutcome {
     Committed,
     RolledBack,
+}
+
+pub(crate) fn macos_runtime_contract_report() -> MacOsRuntimeContractReport {
+    MacOsRuntimeContractReport {
+        contract_format: MACOS_RUNTIME_CONTRACT_FORMAT.to_string(),
+        artifact_format: MACOS_RUNTIME_ARTIFACT_FORMAT.to_string(),
+        activation_journal_format: MACOS_LAUNCHER_JOURNAL_FORMAT.to_string(),
+        target_triple: "aarch64-apple-darwin".to_string(),
+        architecture: "arm64".to_string(),
+        commands: vec![
+            "activate-macos-runtime-artifact".to_string(),
+            "install-prepared-codex".to_string(),
+        ],
+    }
 }
 
 pub fn stage_macos_runtime_artifact(directory: &Path) -> Result<CodexUpdateReport> {
@@ -983,20 +1009,29 @@ fn validate_macos_prepared_control_cli(
     {
         bail!("prepared codexswitch-cli is linked, special, empty, oversized, or not executable");
     }
-    if !binary_contains_all_markers(
-        control_cli,
-        &[
-            MACOS_RUNTIME_ARTIFACT_FORMAT.as_bytes(),
-            MACOS_LAUNCHER_JOURNAL_FORMAT.as_bytes(),
-            b"activate-macos-runtime-artifact",
-            b"install-prepared-codex",
-        ],
-    ) {
-        bail!("prepared codexswitch-cli is missing the macOS activation contract");
-    }
     #[cfg(target_os = "macos")]
     {
         validate_macos_artifact_native_executable(control_cli)?;
+    }
+    let contract_output = bounded_command::output(
+        Command::new(control_cli).arg("macos-runtime-contract"),
+        PROBE_COMMAND_TIMEOUT,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .with_context(|| {
+        format!(
+            "failed to run {} macos-runtime-contract",
+            control_cli.display()
+        )
+    })?;
+    if !contract_output.status.success() {
+        bail!("prepared codexswitch-cli runtime contract probe failed");
+    }
+    let observed_contract: MacOsRuntimeContractReport =
+        serde_json::from_slice(&contract_output.stdout)
+            .context("prepared codexswitch-cli runtime contract is not valid JSON")?;
+    if observed_contract != macos_runtime_contract_report() {
+        bail!("prepared codexswitch-cli reported the wrong macOS activation contract");
     }
     let output = bounded_command::output(
         Command::new(control_cli).arg("--version"),
@@ -1015,53 +1050,6 @@ fn validate_macos_prepared_control_cli(
         }
     }
     Ok(())
-}
-
-fn binary_contains_all_markers(path: &Path, markers: &[&[u8]]) -> bool {
-    if markers.is_empty() {
-        return true;
-    }
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-    else {
-        return false;
-    };
-    let overlap_bytes = markers
-        .iter()
-        .map(|marker| marker.len())
-        .max()
-        .unwrap_or(1)
-        .saturating_sub(1);
-    let mut found = vec![false; markers.len()];
-    let mut reader = BufReader::with_capacity(128 * 1024, file);
-    let mut chunk = vec![0_u8; 128 * 1024];
-    let mut overlap = Vec::with_capacity(overlap_bytes);
-    let mut scan = Vec::with_capacity(128 * 1024 + overlap_bytes);
-    loop {
-        let Ok(count) = reader.read(&mut chunk) else {
-            return false;
-        };
-        if count == 0 {
-            break;
-        }
-        scan.clear();
-        scan.extend_from_slice(&overlap);
-        scan.extend_from_slice(&chunk[..count]);
-        for (index, marker) in markers.iter().enumerate() {
-            if !found[index] {
-                found[index] = scan.windows(marker.len()).any(|window| window == *marker);
-            }
-        }
-        if found.iter().all(|present| *present) {
-            return true;
-        }
-        let keep = overlap_bytes.min(scan.len());
-        overlap.clear();
-        overlap.extend_from_slice(&scan[scan.len() - keep..]);
-    }
-    found.iter().all(|present| *present)
 }
 
 #[cfg(target_os = "macos")]
@@ -1544,7 +1532,7 @@ mod macos_activation_tests {
         fs::write(&helper, "#!/bin/sh\nexit 0\n")?;
         fs::write(
             &control_cli,
-            "#!/bin/sh\n# codexswitch-macos-runtime-artifact-v1 codexswitch-macos-runtime-activation-v1 activate-macos-runtime-artifact install-prepared-codex\nif [ \"${1:-}\" = --version ]; then echo 'codexswitch-cli 0.1.0 (git 0123456789abcdef0123456789abcdef01234567, built 1783915200)'; exit 0; fi\nexit 0\n",
+            "#!/bin/sh\nif [ \"${1:-}\" = macos-runtime-contract ]; then printf '%s\\n' '{\"contractFormat\":\"codexswitch-macos-runtime-contract-v1\",\"artifactFormat\":\"codexswitch-macos-runtime-artifact-v1\",\"activationJournalFormat\":\"codexswitch-macos-runtime-activation-v1\",\"targetTriple\":\"aarch64-apple-darwin\",\"architecture\":\"arm64\",\"commands\":[\"activate-macos-runtime-artifact\",\"install-prepared-codex\"]}'; exit 0; fi\nif [ \"${1:-}\" = --version ]; then echo 'codexswitch-cli 0.1.0 (git 0123456789abcdef0123456789abcdef01234567, built 1783915200)'; exit 0; fi\nexit 0\n",
         )?;
         set_executable(&runtime)?;
         set_executable(&helper)?;
@@ -1661,6 +1649,24 @@ mod macos_activation_tests {
         set_executable(&artifact.join("codex-code-mode-host"))?;
         assert!(!prepared_generation_matches_manifest(&runtime, &manifest));
         Ok(())
+    }
+
+    #[test]
+    fn macos_runtime_contract_report_is_exact() {
+        assert_eq!(
+            macos_runtime_contract_report(),
+            MacOsRuntimeContractReport {
+                contract_format: "codexswitch-macos-runtime-contract-v1".to_string(),
+                artifact_format: "codexswitch-macos-runtime-artifact-v1".to_string(),
+                activation_journal_format: "codexswitch-macos-runtime-activation-v1".to_string(),
+                target_triple: "aarch64-apple-darwin".to_string(),
+                architecture: "arm64".to_string(),
+                commands: vec![
+                    "activate-macos-runtime-artifact".to_string(),
+                    "install-prepared-codex".to_string(),
+                ],
+            }
+        );
     }
 
     #[test]
