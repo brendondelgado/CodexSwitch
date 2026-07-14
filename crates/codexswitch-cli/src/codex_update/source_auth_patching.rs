@@ -74,7 +74,7 @@ use std::sync::atomic::Ordering;"#,
     }
 
 "#,
-        "pub fn codexswitch_provider_account_id(&self)",
+        ".and_then(AuthDotJson::codexswitch_provider_account_id)",
     )?;
     patch_file_before(
         path,
@@ -244,7 +244,7 @@ use std::sync::atomic::Ordering;"#,
             .then(|| account_id.to_string())
     }
 "#,
-        "pub fn codexswitch_provider_account_id(&self)",
+        "self.tokens.as_ref()?.account_id.as_deref()?",
     )?;
     patch_file_after(
         path,

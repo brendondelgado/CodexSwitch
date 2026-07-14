@@ -63,6 +63,8 @@ only those source-local placeholder versions with the root
 that already have a non-placeholder version, are unchanged. These lockfile
 changes are part of the hashed source patch. The release build still uses
 `--locked`, and post-build provenance revalidates the same complete patch hash.
+Injected-method idempotence markers must identify the target implementation,
+not only a method name that can legitimately appear on multiple auth types.
 
 ## Trust Bootstrap
 

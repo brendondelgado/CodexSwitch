@@ -3353,6 +3353,7 @@ impl AuthManager {
         .unwrap();
 
         patch_auth_manager_source(&manager).unwrap();
+        patch_auth_manager_source(&manager).unwrap();
 
         let patched = fs::read_to_string(manager).unwrap();
         assert!(patched.contains("use std::sync::atomic::AtomicU64;"));
@@ -3361,7 +3362,13 @@ impl AuthManager {
             .contains("auth_generation: AtomicU64::new(0),\n            auth_route_config: None,"));
         assert!(patched.contains("pub fn auth_generation(&self) -> u64"));
         assert!(patched.contains("pub fn codexswitch_auth_fingerprint(&self)"));
-        assert!(patched.contains("pub fn codexswitch_provider_account_id(&self)"));
+        assert_eq!(
+            patched
+                .matches("pub fn codexswitch_provider_account_id(&self)")
+                .count(),
+            2
+        );
+        assert!(patched.contains("self.tokens.as_ref()?.account_id.as_deref()?"));
         assert!(patched.contains("pub fn codexswitch_fingerprint(&self)"));
         assert!(patched.contains("fn codexswitch_read_auth_json_bounded("));
         assert!(patched.contains("libc::O_NOFOLLOW | libc::O_CLOEXEC"));
