@@ -313,7 +313,7 @@ actor DesktopUpdateOperationOwner {
         _ operation: CodexDesktopUpdateOperation,
         epoch: DesktopUpdateRunEpoch,
         additionalMutationRoots: [URL] = [],
-        isCancelled: () -> Bool = { Task.isCancelled }
+        isCancelled: @Sendable () -> Bool = { Task.isCancelled }
     ) async -> DesktopUpdateOperationAcquisition {
         guard !isCancelled(), epoch.isCurrent() else { return .cancelled }
         guard let permit = await stateMachine.acquire(operation) else {

@@ -86,18 +86,20 @@ enum AccountCredentialMutationRoute: String, CaseIterable, Equatable, Sendable {
 enum AccountCredentialMutationBoundary {
     static func perform<Result>(
         route: AccountCredentialMutationRoute,
-        authorize: () async -> AccountCredentialMutationPermit?,
-        mutation: (AccountCredentialMutationPermit) throws -> Result
+        authorize: @MainActor @Sendable () async -> AccountCredentialMutationPermit?,
+        mutation: @MainActor @Sendable (AccountCredentialMutationPermit) throws -> Result
     ) async rethrows -> Result? {
         _ = route
         guard let permit = await authorize() else { return nil }
         return try mutation(permit)
     }
 
-    static func performAsync<Result>(
+    static func performAsync<Result: Sendable>(
         route: AccountCredentialMutationRoute,
-        authorize: () async -> AccountCredentialMutationPermit?,
-        mutation: (AccountCredentialMutationPermit) async throws -> Result
+        authorize: @MainActor @Sendable () async -> AccountCredentialMutationPermit?,
+        mutation: @MainActor @Sendable (
+            AccountCredentialMutationPermit
+        ) async throws -> Result
     ) async rethrows -> Result? {
         _ = route
         guard let permit = await authorize() else { return nil }

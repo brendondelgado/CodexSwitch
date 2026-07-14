@@ -49,7 +49,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-13
+  last_updated: 2026-07-14
 ---
 
 # Runtime And Host Ownership
@@ -234,7 +234,10 @@ generation. In the Mac app, the lease coordinator owns exclusion on its actor,
 while the lease-scoped activation or reset callback remains explicitly isolated
 to `MainActor` for observable account and application state. Durable file and
 network work still crosses into its dedicated actor or executor and returns only
-verified results to that callback. Immediately before each account-store,
+verified `Sendable` results to that callback. Generic asynchronous credential
+mutation boundaries require their result type to be `Sendable`; this makes every
+executor crossing explicit and keeps the contract valid across supported Swift
+6 toolchains. Immediately before each account-store,
 auth-file, activation-journal,
 or runtime effect, the owner revalidates the lease, exact target, activation
 generation, and required phase. The same checks run after every preceding

@@ -32,7 +32,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: implemented_focused_verification
-  last_updated: 2026-07-13
+  last_updated: 2026-07-14
 ---
 
 # Desktop Update Storage
@@ -79,6 +79,11 @@ publication, installation or recovery, rejection-ledger mutation, retention,
 and final status publication. Neither recovery nor stock restoration has an
 alternate lease-free entry point. Both tokens remain alive until the operation
 has finished all durable mutation and bounded cleanup.
+
+Cancellation probes passed into the actor-owned operation lease are explicitly
+`@Sendable` and may capture only thread-safe lifetime or epoch state. This keeps
+the lease boundary race-free and compile-time enforced across supported Swift 6
+toolchains.
 
 An irrevocably committed install reports installation success even when old
 bundle cleanup is pending. That cleanup state is returned through the updater
