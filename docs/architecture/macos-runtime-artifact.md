@@ -4,6 +4,7 @@ description: Provenance, validation, staging, and activation contract for the re
 toc:
   - macOS Runtime Artifact
   - Purpose
+  - Build Gate
   - Trust Bootstrap
   - Manifest
   - Staging
@@ -32,6 +33,21 @@ A complete macOS hot-swap runtime has three coupled executables: `codex`,
 CodexSwitch commit on native Apple Silicon, transferred as one artifact, staged
 as one immutable generation, and activated by one journaled transaction. Mixing
 one new executable with an older member is prohibited.
+
+## Build Gate
+
+The native artifact workflow must compile and run the complete Swift app test
+suite before building any release executable. Compilation uses one job, and
+test execution is explicitly non-parallel because the suite exercises shared
+process state, subprocess admission, signal delivery, and updater leases.
+Swift Testing executes tests concurrently by default; limiting SwiftPM build
+jobs alone does not serialize those tests.
+
+The workflow provides the test process with a private temporary directory under
+the GitHub runner's canonical workspace temp root. Security tests must not be
+made dependent on the runner's `/var` compatibility symlink, and concurrent
+workflow runs must not share test paths. The temporary directory and `.build`
+output are removed whether the gate succeeds or fails.
 
 ## Trust Bootstrap
 

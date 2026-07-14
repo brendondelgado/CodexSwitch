@@ -351,6 +351,11 @@ identity is captured. The moved source is revalidated before preservation, and
 its private rollback copy is independently subjected to the same official
 validation before that copy's identity is captured. Retained descriptors prove
 that the validated roots are the roots subsequently compared and published.
+After the private staging directory is moved to its published generation name,
+the installer must acquire a new retained descriptor chain from that published
+path before the final identity comparison and pointer commit. A retained bundle
+whose ancestor path names the former staging location is not publication
+authority, even when its open file descriptors still reference the same inodes.
 
 Publishing a newer rollback generation retains one descriptor chain from the
 update root through the generation directory and bundle root, writes a unique

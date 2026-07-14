@@ -69,6 +69,23 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
                 workflow[attestation:upload],
             )
 
+    def test_workflow_serializes_swift_tests_in_a_private_temp_root(self) -> None:
+        workflow = WORKFLOW.read_text()
+        verify_step = workflow.index("Verify the Swift app and test suite")
+        build_step = workflow.index("Build the CodexSwitch control plane")
+        swift_gate = workflow[verify_step:build_step]
+
+        self.assertIn(
+            'test_tmp="$RUNNER_TEMP/codexswitch-swift-tests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"',
+            swift_gate,
+        )
+        self.assertIn('install -d -m 0700 "$test_tmp"', swift_gate)
+        self.assertIn(
+            'TMPDIR="$test_tmp" swift test --jobs 1 --no-parallel',
+            swift_gate,
+        )
+        self.assertIn('rm -rf -- .build "$test_tmp"', swift_gate)
+
     def test_manifest_binds_full_source_upstream_and_patch_provenance(self) -> None:
         workflow = WORKFLOW.read_text()
         activation = ACTIVATION.read_text()

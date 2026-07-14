@@ -1396,7 +1396,14 @@ struct DesktopBundleInstaller: @unchecked Sendable {
                 incoming.lastPathComponent,
                 isDirectory: true
             )
-            return (publishedApp, retainedCopy, copiedIdentities.bound)
+            guard let retainedPublishedCopy = DesktopRetainedBundleTree(
+                appURL: publishedApp
+            ) else {
+                throw installerError(
+                    "Published rollback generation could not be retained"
+                )
+            }
+            return (publishedApp, retainedPublishedCopy, copiedIdentities.bound)
         }
         guard DesktopBundleTreeIntegrity.makeBundleIdentity(
             retained: retainedCopy,

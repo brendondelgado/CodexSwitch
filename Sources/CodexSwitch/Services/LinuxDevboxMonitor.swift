@@ -1897,6 +1897,36 @@ enum LinuxDevboxMonitor {
                 return None
             return value
 
+        def public_value(value):
+            if isinstance(value, dict):
+                visible = {}
+                for key, nested in value.items():
+                    normalized_key = "".join(
+                        character.lower()
+                        for character in str(key)
+                        if character.isalnum()
+                    )
+                    if "token" in normalized_key:
+                        continue
+                    visible[key] = public_value(nested)
+                return visible
+            if isinstance(value, list):
+                return [public_value(nested) for nested in value]
+            return value
+
+        def contains_credential_value(value, credentials):
+            if isinstance(value, dict):
+                return any(
+                    contains_credential_value(nested, credentials)
+                    for nested in value.values()
+                )
+            if isinstance(value, list):
+                return any(
+                    contains_credential_value(nested, credentials)
+                    for nested in value
+                )
+            return isinstance(value, str) and value in credentials
+
         def credential_set_fingerprint(accounts):
             normalized = []
             for account in accounts:
@@ -1955,14 +1985,27 @@ enum LinuxDevboxMonitor {
         accounts = [account for account in accounts if isinstance(account, dict)]
         fingerprint = credential_set_fingerprint(accounts)
         visible_accounts = [
-            sanitized(account)
+            public_value(sanitized(account))
             for account in accounts
             if account_value(account, "email")
         ]
-        print(json.dumps({
+        payload = {
             "accounts": visible_accounts,
             "credentialSetFingerprint": fingerprint,
-        }, separators=(",", ":")))
+        }
+        credentials = {
+            value
+            for account in accounts
+            for value in (
+                account_value(account, "idToken", "id_token"),
+                account_value(account, "accessToken", "access_token"),
+                account_value(account, "refreshToken", "refresh_token"),
+            )
+            if isinstance(value, str) and value
+        }
+        if contains_credential_value(payload, credentials):
+            raise SystemExit(74)
+        print(json.dumps(payload, separators=(",", ":")))
         PY
         """
     }

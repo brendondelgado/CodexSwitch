@@ -1175,11 +1175,14 @@ struct CodexDesktopAppUpdaterTests {
         let service = DesktopUpdateStagingService(root: root)
         var downloadCount = 0
         var validationCount = 0
+        let checkTime = try #require(staged.validationSeal).validatedAt
+            .addingTimeInterval(1)
 
         for _ in 0..<2 {
             let result = await service.prepare(
                 release: release,
                 installed: nil,
+                now: checkTime,
                 fullValidation: { _, _, _ in
                     validationCount += 1
                     return .valid
@@ -1710,11 +1713,12 @@ struct CodexDesktopAppUpdaterTests {
             includeSeal: false
         )
         var fullValidationCount = 0
+        let validationTime = Date(timeIntervalSince1970: 10_000)
 
         let first = CodexDesktopUpdateStorage.resolveAuthoritativeGeneration(
             staged,
             in: root,
-            now: Date(timeIntervalSince1970: 10_000)
+            now: validationTime
         ) { _, _, _ in
             fullValidationCount += 1
             return .valid
@@ -1736,7 +1740,8 @@ struct CodexDesktopAppUpdaterTests {
 
         let second = CodexDesktopUpdateStorage.resolveAuthoritativeGeneration(
             reloaded,
-            in: root
+            in: root,
+            now: validationTime.addingTimeInterval(1)
         ) { _, _, _ in
             fullValidationCount += 1
             return .invalid("should not run")
@@ -1904,7 +1909,8 @@ struct CodexDesktopAppUpdaterTests {
             in: root,
             bundleVersion: "5211",
             legacyLayout: false,
-            includeSeal: true
+            includeSeal: true,
+            asarModificationDate: Date(timeIntervalSince1970: 10_000)
         )
         let seal = try #require(staged.validationSeal)
         let asarSeal = try #require(
@@ -2430,7 +2436,7 @@ struct CodexDesktopAppUpdaterTests {
         let now = Date().addingTimeInterval(CodexDesktopTemporaryWorkspace.staleAge + 60)
         try FileManager.default.setAttributes(
             [.modificationDate: now],
-            ofItemAtPath: freshStage.appendingPathComponent("marker").path
+            ofItemAtPath: freshStage.path
         )
 
         let report = try CodexDesktopTemporaryWorkspace.cleanupStaleDirectories(
@@ -4900,7 +4906,8 @@ struct CodexDesktopAppUpdaterTests {
         )!,
         archiveSHA256: String? = nil,
         archiveLength: Int64? = nil,
-        marker: String? = nil
+        marker: String? = nil,
+        asarModificationDate: Date? = nil
     ) throws -> CodexDesktopStagedUpdate {
         let generationIdentifier = legacyLayout ? nil : UUID().uuidString
         let generationDirectory = generationIdentifier.map {
@@ -4926,7 +4933,14 @@ struct CodexDesktopAppUpdaterTests {
             options: 0
         )
         try infoData.write(to: contents.appendingPathComponent("Info.plist"))
-        try Data("asar".utf8).write(to: resources.appendingPathComponent("app.asar"))
+        let asar = resources.appendingPathComponent("app.asar")
+        try Data("asar".utf8).write(to: asar)
+        if let asarModificationDate {
+            try FileManager.default.setAttributes(
+                [.modificationDate: asarModificationDate],
+                ofItemAtPath: asar.path
+            )
+        }
         try Data("signature".utf8).write(to: signature.appendingPathComponent("CodeResources"))
         if let marker {
             try Data(marker.utf8).write(to: app.appendingPathComponent("marker"))

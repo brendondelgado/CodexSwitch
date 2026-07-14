@@ -44,17 +44,44 @@ struct AccountCardViewTests {
         #expect(didSwap)
     }
 
-    @Test("Primary click ignores the active account")
+    @Test("Primary click ignores the runtime-current account")
     @MainActor
-    func primaryClickIgnoresActiveAccount() {
+    func primaryClickIgnoresRuntimeCurrentAccount() {
         let account = makeAccount(isActive: true)
         var didSwap = false
-        let view = AccountCardView(account: account, pollingError: nil, onReauthenticate: nil, onForceSwap: {
-            didSwap = true
-        })
+        let view = AccountCardView(
+            account: account,
+            isConfigured: true,
+            isRuntimeCurrent: true,
+            pollingError: nil,
+            onReauthenticate: nil,
+            onForceSwap: {
+                didSwap = true
+            }
+        )
 
         #expect(!view.handlePrimaryClick())
         #expect(!didSwap)
+    }
+
+    @Test("Primary click retries a configured account whose runtime is not current")
+    @MainActor
+    func primaryClickRetriesConfiguredNonCurrentAccount() {
+        let account = makeAccount(isActive: true)
+        var didSwap = false
+        let view = AccountCardView(
+            account: account,
+            isConfigured: true,
+            isRuntimeCurrent: false,
+            pollingError: nil,
+            onReauthenticate: nil,
+            onForceSwap: {
+                didSwap = true
+            }
+        )
+
+        #expect(view.handlePrimaryClick())
+        #expect(didSwap)
     }
 
     @Test("Primary click triggers re-authentication for stale accounts")

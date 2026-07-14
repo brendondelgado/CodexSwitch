@@ -205,6 +205,7 @@ struct AccountManagerSyncTests {
             isActive: true
         )
         manager.addAccount(account)
+        manager.setConfiguredAccount(account.id)
 
         let result = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
@@ -260,6 +261,7 @@ struct AccountManagerSyncTests {
             isActive: true
         )
         manager.addAccount(account)
+        manager.setConfiguredAccount(account.id)
 
         _ = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
@@ -303,6 +305,7 @@ struct AccountManagerSyncTests {
             isActive: true
         )
         manager.addAccount(account)
+        manager.setConfiguredAccount(account.id)
 
         let state = LinuxDevboxAccountState(
                 email: "apps7349@gmail.com",
@@ -646,6 +649,7 @@ struct AccountManagerSyncTests {
 
         manager.addAccount(exhaustedPro)
         manager.addAccount(usablePlus)
+        manager.setConfiguredAccount(exhaustedPro.id)
 
         #expect(manager.sortedAccounts.first?.id == usablePlus.id)
     }

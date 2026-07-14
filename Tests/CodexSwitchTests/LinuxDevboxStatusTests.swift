@@ -181,29 +181,123 @@ struct LinuxDevboxStatusTests {
         #expect(usage.longContextOutputTokens == 1_000)
     }
 
-    @Test("Remote account state script compiles and does not request token fields")
-    func remoteAccountStatePythonScriptCompilesWithoutTokenFields() throws {
+    @Test("Remote account state script compiles, fingerprints credentials, and omits token fields")
+    func remoteAccountStatePythonScriptCompilesWithoutEmittingTokenFields() throws {
         let command = LinuxDevboxMonitor.remoteAccountStateCommand()
-        #expect(!command.contains("accessToken"))
-        #expect(!command.contains("refreshToken"))
-        #expect(!command.contains("idToken"))
-
         let marker = "python3 - <<'PY'\n"
         let start = try #require(command.range(of: marker)?.upperBound)
         let end = try #require(command.range(of: "\nPY", options: .backwards)?.lowerBound)
         let script = String(command[start..<end])
-        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("codexswitch-remote-account-state-\(UUID().uuidString).py")
-        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let home = try isolatedHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let tempURL = home.appendingPathComponent("remote-account-state.py")
         try script.write(to: tempURL, atomically: true, encoding: .utf8)
 
-        let result = ProcessRunner.run(
+        let compile = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
             arguments: ["-m", "py_compile", tempURL.path],
             timeout: 5
         )
+        #expect(compile.terminationStatus == 0)
+
+        let store = home.appendingPathComponent(".codexswitch/accounts.json")
+        try FileManager.default.createDirectory(
+            at: store.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let accountStoreFixture = """
+        {
+          "accounts": [{
+            "email": "fixture@example.com",
+            "accountId": "acct-fixture",
+            "idToken": "secret-id",
+            "accessToken": "secret-access",
+            "refreshToken": "secret-refresh",
+            "quotaSnapshot": {
+              "nested": {
+                "accessToken": "secret-access",
+                "id_token": "secret-id"
+              }
+            },
+            "isActive": true
+          }]
+        }
+        """
+        try accountStoreFixture.write(to: store, atomically: true, encoding: .utf8)
+
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            arguments: [tempURL.path],
+            timeout: 5,
+            environment: [
+                "HOME": home.path,
+                "PATH": "/usr/bin:/bin",
+            ]
+        )
 
         #expect(result.terminationStatus == 0)
+        let payload = try #require(
+            JSONSerialization.jsonObject(with: result.stdout) as? [String: Any]
+        )
+        let accounts = try #require(payload["accounts"] as? [[String: Any]])
+        let visibleAccount = try #require(accounts.first)
+        let tokenKeys = Set(["accessToken", "refreshToken", "idToken"])
+        #expect(tokenKeys.isDisjoint(with: visibleAccount.keys))
+        let serializedVisibleAccount = try JSONSerialization.data(
+            withJSONObject: visibleAccount,
+            options: [.sortedKeys]
+        )
+        let visibleAccountText = String(decoding: serializedVisibleAccount, as: UTF8.self)
+        #expect(!visibleAccountText.lowercased().contains("token"))
+        #expect(!result.stdoutString.contains("secret-access"))
+        #expect(!result.stdoutString.contains("secret-refresh"))
+        #expect(!result.stdoutString.contains("secret-id"))
+        #expect((payload["credentialSetFingerprint"] as? String)?.count == 64)
+    }
+
+    @Test("Remote account state fails closed before emitting a credential value")
+    func remoteAccountStatePythonScriptRejectsCredentialValueAlias() throws {
+        let command = LinuxDevboxMonitor.remoteAccountStateCommand()
+        let marker = "python3 - <<'PY'\n"
+        let start = try #require(command.range(of: marker)?.upperBound)
+        let end = try #require(command.range(of: "\nPY", options: .backwards)?.lowerBound)
+        let home = try isolatedHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let script = home.appendingPathComponent("remote-account-state.py")
+        try String(command[start..<end]).write(to: script, atomically: true, encoding: .utf8)
+
+        let store = home.appendingPathComponent(".codexswitch/accounts.json")
+        try FileManager.default.createDirectory(
+            at: store.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try """
+        {
+          "accounts": [{
+            "email": "fixture@example.com",
+            "accountId": "acct-fixture",
+            "idToken": "secret-id",
+            "accessToken": "secret-access",
+            "refreshToken": "secret-refresh",
+            "runtimeUnusableReason": "secret-access",
+            "isActive": true
+          }]
+        }
+        """.write(to: store, atomically: true, encoding: .utf8)
+
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            arguments: [script.path],
+            timeout: 5,
+            environment: [
+                "HOME": home.path,
+                "PATH": "/usr/bin:/bin",
+            ]
+        )
+
+        #expect(result.terminationStatus == 74)
+        #expect(result.stdout.isEmpty)
+        #expect(result.stderr.isEmpty)
     }
 
     private func remoteUsageScript() throws -> String {

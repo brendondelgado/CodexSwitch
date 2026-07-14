@@ -134,9 +134,14 @@ jobs:
       - name: Verify the Swift app and test suite
         run: |
           set -euo pipefail
-          trap 'rm -rf -- .build' EXIT
+          test_tmp="$RUNNER_TEMP/codexswitch-swift-tests-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          install -d -m 0700 "$test_tmp"
+          cleanup() {
+            rm -rf -- .build "$test_tmp"
+          }
+          trap cleanup EXIT
           swift --version
-          swift test --jobs 1
+          TMPDIR="$test_tmp" swift test --jobs 1 --no-parallel
 
       - name: Build the CodexSwitch control plane
         id: control_plane

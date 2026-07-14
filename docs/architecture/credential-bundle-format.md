@@ -183,6 +183,11 @@ token tuple, and active flag; raw credentials never leave the VPS. It may
 classify the operation as committed only when that complete credential-set
 fingerprint, the active provider identifier, active token-hash prefix,
 auth/store agreement, and account-identity fingerprint all match the journal.
+Remote account-state output reconstructs only the explicit status fields,
+recursively removes token-named members from nested status objects, and fails
+closed before writing stdout if any raw credential value would otherwise
+survive in the payload. A malformed or hostile account-store extension cannot
+turn a read-only status probe into credential export.
 It may classify the operation as safe to retry only when the stage is absent and
 all remote evidence exactly matches the recorded pre-mutation baseline. Missing,
 malformed, changing, conflicting, or unreachable evidence keeps the hold.

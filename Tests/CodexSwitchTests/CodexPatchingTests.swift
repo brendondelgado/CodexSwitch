@@ -6,8 +6,7 @@ import Testing
 struct CodexPatchingTests {
     @Test("Desktop app locator prefers the unified ChatGPT bundle")
     func desktopAppLocatorPrefersUnifiedChatGPTBundle() throws {
-        let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
 
         let unified = temp.appendingPathComponent("ChatGPT.app", isDirectory: true)
@@ -37,16 +36,15 @@ struct CodexPatchingTests {
 
     @Test("Desktop updater accepts the unified ChatGPT archive layout")
     func desktopUpdaterAcceptsUnifiedArchiveLayout() throws {
-        let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
         let unified = temp.appendingPathComponent("ChatGPT.app", isDirectory: true)
         try FileManager.default.createDirectory(at: unified, withIntermediateDirectories: true)
 
-        let extracted = CodexDesktopAppUpdater.findDesktopApp(in: temp)
+        let extracted = try #require(CodexDesktopAppUpdater.findDesktopApp(in: temp))
 
         #expect(extracted == unified)
-        #expect(CodexDesktopAppUpdater.installationPath(for: extracted!) == "/Applications/ChatGPT.app")
+        #expect(CodexDesktopAppUpdater.installationPath(for: extracted) == "/Applications/ChatGPT.app")
     }
 
     @Test("Desktop appcast parser extracts the latest release")
@@ -141,8 +139,7 @@ struct CodexPatchingTests {
 
     @Test("Desktop app locator requires auth, recents, model, Fast, and reconnect markers")
     func desktopAppLocatorRequiresCurrentDesktopPatchMarkers() throws {
-        let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = temporaryDirectory()
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temp) }
 
@@ -234,5 +231,23 @@ struct CodexPatchingTests {
         #expect(guardRange.lowerBound < refusalRange.lowerBound)
         #expect(refusalRange.lowerBound < activationRange.lowerBound)
         #expect(!script.contains("rm -rf \"$INSTALL_PATH\""))
+    }
+
+    private func temporaryDirectory() -> URL {
+        let temporaryPath = (
+            FileManager.default.temporaryDirectory.path as NSString
+        ).standardizingPath
+        let canonicalPath: String
+        if temporaryPath == "/tmp" || temporaryPath.hasPrefix("/tmp/")
+            || temporaryPath == "/var" || temporaryPath.hasPrefix("/var/") {
+            canonicalPath = "/private\(temporaryPath)"
+        } else {
+            canonicalPath = temporaryPath
+        }
+        return URL(fileURLWithPath: canonicalPath, isDirectory: true)
+            .appendingPathComponent(
+                "CodexPatchingTests-\(UUID().uuidString)",
+                isDirectory: true
+            )
     }
 }
