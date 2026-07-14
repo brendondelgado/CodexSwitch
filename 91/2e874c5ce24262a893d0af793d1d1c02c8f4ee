@@ -1,0 +1,27 @@
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_06a18ec125b8ce 5069
+  s_70c8e194852bb5::t_a2b976e00f012c 745,1665,5028-5035,5063-5065,5067-5068,5070-5074,5076-5092
+  s_70c8e194852bb5::t_5bb30045584de5 1572-1588,1593,1602,1616,1623-1626,1654,1658-1664
+  s_70c8e194852bb5::t_68a672cdf9436d 502-507,512-523,539-544,546-548,550-571,734-737,739,743-744
+  s_70c8e194852bb5::t_4392020a1d7dd3 1741-1749,1769-1771,1773-1814
+  s_70c8e194852bb5::t_974c96e5f460ef 746
+  s_70c8e194852bb5::t_1306899e270f17 1666
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_788ed902a58aea 417-422
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "912e874c5ce24262a893d0af793d1d1c02c8f4ee",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
