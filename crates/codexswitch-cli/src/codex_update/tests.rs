@@ -3519,6 +3519,52 @@ impl AuthManager {
     }
 
     #[test]
+    fn source_patch_updates_injected_libc_lock_entries_idempotently() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile = temp_dir.path().join("Cargo.lock");
+        fs::write(
+            &lockfile,
+            r#"version = 4
+
+[[package]]
+name = "codex-app-server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "opentelemetry",
+]
+
+[[package]]
+name = "codex-login"
+version = "0.0.0"
+dependencies = [
+ "keyring",
+ "once_cell",
+]
+
+[[package]]
+name = "codex-mcp"
+version = "0.0.0"
+"#,
+        )
+        .unwrap();
+
+        for package in ["codex-app-server", "codex-login"] {
+            patch_lockfile_dependency_if_present(&lockfile, package, "libc").unwrap();
+            patch_lockfile_dependency_if_present(&lockfile, package, "libc").unwrap();
+        }
+
+        let patched = fs::read_to_string(lockfile).unwrap();
+        assert_eq!(patched.matches(" \"libc\",\n").count(), 2);
+        assert!(patched.contains(
+            "name = \"codex-app-server\"\nversion = \"0.0.0\"\ndependencies = [\n \"anyhow\",\n \"libc\",\n \"opentelemetry\",\n]"
+        ));
+        assert!(patched.contains(
+            "name = \"codex-login\"\nversion = \"0.0.0\"\ndependencies = [\n \"keyring\",\n \"libc\",\n \"once_cell\",\n]"
+        ));
+    }
+
+    #[test]
     fn app_server_sighup_patch_targets_processor_auth_manager() {
         let temp_dir = tempfile::tempdir().unwrap();
         let source_dir = temp_dir.path();

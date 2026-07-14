@@ -13,6 +13,10 @@ WORKFLOW = ROOT / ".github/workflows/build-fork.yml"
 INSTALLER = ROOT / "scripts/install-macos-cli-artifact.sh"
 BUILD_RS = ROOT / "crates/codexswitch-cli/build.rs"
 ACTIVATION = ROOT / "crates/codexswitch-cli/src/codex_update/macos_activation.rs"
+SOURCE_PATCHING = ROOT / "crates/codexswitch-cli/src/codex_update/source_patching.rs"
+SOURCE_AUTH_PATCHING = (
+    ROOT / "crates/codexswitch-cli/src/codex_update/source_auth_patching.rs"
+)
 VERIFIER = ROOT / "scripts/verify_macos_runtime_artifact.py"
 
 
@@ -113,18 +117,22 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         self.assertIn('observed_patch_sha256=', workflow[post_build:manifest])
         self.assertIn('!= "$EXPECTED_PATCH_SHA256"', workflow[post_build:manifest])
 
-    def test_patched_lockfile_is_refreshed_offline_then_built_locked(self) -> None:
+    def test_source_patch_updates_direct_dependencies_and_lockfile_together(self) -> None:
         workflow = WORKFLOW.read_text()
-        patch_step = workflow.index("Apply the dispatched v3 source patches")
         build_step = workflow.index("Build the patched Codex runtime pair")
         revalidation_step = workflow.index("Revalidate both source trees after compilation")
-        patch_contract = workflow[patch_step:build_step]
         build_contract = workflow[build_step:revalidation_step]
+        source_patching = SOURCE_PATCHING.read_text()
+        source_auth_patching = SOURCE_AUTH_PATCHING.read_text()
 
-        lock_refresh = "cargo metadata --offline --no-deps --format-version 1"
-        patch_hash = "diff --binary HEAD"
-        self.assertIn(lock_refresh, patch_contract)
-        self.assertLess(patch_contract.index(lock_refresh), patch_contract.index(patch_hash))
+        self.assertIn('source_dir.join("codex-rs/Cargo.lock")', source_patching)
+        for package in ("codex-app-server", "codex-login"):
+            self.assertIn(
+                f'patch_lockfile_dependency_if_present(&lockfile, "{package}", "libc")',
+                source_patching,
+            )
+        self.assertIn("dependencies.sort();", source_auth_patching)
+        self.assertIn("dependencies.dedup();", source_auth_patching)
         self.assertIn("--locked", build_contract)
 
     def test_installer_verifies_attestations_before_one_activation(self) -> None:
