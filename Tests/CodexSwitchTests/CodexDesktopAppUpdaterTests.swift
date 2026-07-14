@@ -76,7 +76,7 @@ private final class ConcurrentBundlePathProbe: @unchecked Sendable {
         let identifier = UUID().uuidString
         let observations = root.appendingPathComponent("probe-\(identifier).observations")
         let ready = root.appendingPathComponent("probe-\(identifier).ready")
-        let stop = root.appendingPathComponent("probe-\(identifier).stop")
+        let stopSignal = root.appendingPathComponent("probe-\(identifier).stop")
         let child = Process()
         child.executableURL = URL(fileURLWithPath: "/bin/sh")
         child.arguments = [
@@ -101,7 +101,7 @@ private final class ConcurrentBundlePathProbe: @unchecked Sendable {
             marker.path,
             observations.path,
             ready.path,
-            stop.path,
+            stopSignal.path,
         ]
         child.standardOutput = FileHandle.nullDevice
         child.standardError = FileHandle.nullDevice
@@ -115,7 +115,7 @@ private final class ConcurrentBundlePathProbe: @unchecked Sendable {
         }
         process = child
         observationsURL = observations
-        stopURL = stop
+        stopURL = stopSignal
 
         let deadline = Date().addingTimeInterval(5)
         while !FileManager.default.fileExists(atPath: ready.path),
