@@ -14,8 +14,8 @@ INSTALLER = ROOT / "scripts/install-macos-cli-artifact.sh"
 BUILD_RS = ROOT / "crates/codexswitch-cli/build.rs"
 ACTIVATION = ROOT / "crates/codexswitch-cli/src/codex_update/macos_activation.rs"
 SOURCE_PATCHING = ROOT / "crates/codexswitch-cli/src/codex_update/source_patching.rs"
-SOURCE_AUTH_PATCHING = (
-    ROOT / "crates/codexswitch-cli/src/codex_update/source_auth_patching.rs"
+SOURCE_CARGO_PATCHING = (
+    ROOT / "crates/codexswitch-cli/src/codex_update/source_cargo_patching.rs"
 )
 VERIFIER = ROOT / "scripts/verify_macos_runtime_artifact.py"
 
@@ -123,16 +123,24 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         revalidation_step = workflow.index("Revalidate both source trees after compilation")
         build_contract = workflow[build_step:revalidation_step]
         source_patching = SOURCE_PATCHING.read_text()
-        source_auth_patching = SOURCE_AUTH_PATCHING.read_text()
+        source_cargo_patching = SOURCE_CARGO_PATCHING.read_text()
 
+        self.assertIn('source_dir.join("codex-rs/Cargo.toml")', source_patching)
         self.assertIn('source_dir.join("codex-rs/Cargo.lock")', source_patching)
+        self.assertIn(
+            "patch_placeholder_workspace_lock_versions_if_present",
+            source_patching,
+        )
         for package in ("codex-app-server", "codex-login"):
             self.assertIn(
                 f'patch_lockfile_dependency_if_present(&lockfile, "{package}", "libc")',
                 source_patching,
             )
-        self.assertIn("dependencies.sort();", source_auth_patching)
-        self.assertIn("dependencies.dedup();", source_auth_patching)
+        self.assertIn("[workspace.package]", source_cargo_patching)
+        self.assertIn('placeholder = "\\nversion = \\"0.0.0\\"\\n"', source_cargo_patching)
+        self.assertIn('!package.contains("\\nsource = ")', source_cargo_patching)
+        self.assertIn("dependencies.sort();", source_cargo_patching)
+        self.assertIn("dependencies.dedup();", source_cargo_patching)
         self.assertIn("--locked", build_contract)
 
     def test_installer_verifies_attestations_before_one_activation(self) -> None:

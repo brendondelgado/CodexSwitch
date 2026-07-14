@@ -55,9 +55,14 @@ removed whether the gate succeeds or fails.
 The source patch may add direct dependencies that already exist in the
 upstream workspace but are not listed by the patched member crates. The patch
 driver updates those member entries in `codex-rs/Cargo.lock` deterministically
-and in canonical sorted order. That lockfile change is part of the hashed source
-patch; the release build still uses `--locked`, and post-build provenance
-revalidates the same complete patch hash.
+and in canonical sorted order. Release tags may also carry `0.0.0` placeholders
+for source-local workspace packages after the root workspace version has been
+set to the release version. Before adding dependencies, the driver replaces
+only those source-local placeholder versions with the root
+`[workspace.package]` version; registry and git packages, and local packages
+that already have a non-placeholder version, are unchanged. These lockfile
+changes are part of the hashed source patch. The release build still uses
+`--locked`, and post-build provenance revalidates the same complete patch hash.
 
 ## Trust Bootstrap
 

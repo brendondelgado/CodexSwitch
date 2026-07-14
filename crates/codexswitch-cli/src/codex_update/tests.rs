@@ -3519,6 +3519,50 @@ impl AuthManager {
     }
 
     #[test]
+    fn source_patch_reconciles_placeholder_workspace_lock_versions_idempotently() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest = temp_dir.path().join("Cargo.toml");
+        let lockfile = temp_dir.path().join("Cargo.lock");
+        fs::write(
+            &manifest,
+            "[workspace]\nmembers = []\n\n[workspace.package]\nversion = \"0.144.4\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &lockfile,
+            r#"version = 4
+
+[[package]]
+name = "codex-app-server"
+version = "0.0.0"
+
+[[package]]
+name = "codex-login"
+version = "0.0.0"
+
+[[package]]
+name = "local-explicit-version"
+version = "7.8.9"
+
+[[package]]
+name = "registry-placeholder"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+"#,
+        )
+        .unwrap();
+
+        patch_placeholder_workspace_lock_versions_if_present(&manifest, &lockfile).unwrap();
+        patch_placeholder_workspace_lock_versions_if_present(&manifest, &lockfile).unwrap();
+
+        let patched = fs::read_to_string(lockfile).unwrap();
+        assert_eq!(patched.matches("version = \"0.144.4\"").count(), 2);
+        assert!(patched.contains("name = \"local-explicit-version\"\nversion = \"7.8.9\""));
+        assert!(patched.contains("name = \"registry-placeholder\"\nversion = \"0.0.0\"\nsource = "));
+    }
+
+    #[test]
     fn source_patch_updates_injected_libc_lock_entries_idempotently() {
         let temp_dir = tempfile::tempdir().unwrap();
         let lockfile = temp_dir.path().join("Cargo.lock");

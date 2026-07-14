@@ -84,9 +84,11 @@ are not uploaded.
 
 If the v3 patch adds a direct dependency to an upstream member crate, the patch
 driver updates that member's `Cargo.lock` entry in canonical sorted order before
-the workflow calculates the source-patch digest. The runtime compile remains
-`--locked`; a lockfile that would change during compilation is a release
-failure.
+the workflow calculates the source-patch digest. The driver also reconciles
+source-local `0.0.0` lockfile placeholders with the release version declared in
+the root `[workspace.package]` table. It does not rewrite sourced packages or
+non-placeholder local versions. The runtime compile remains `--locked`; a
+lockfile that would change during compilation is a release failure.
 
 ## Resolve Provenance
 

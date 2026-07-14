@@ -3,10 +3,12 @@ include!("source_app_server_template.rs");
 include!("source_turn_template.rs");
 include!("source_app_server_patching.rs");
 include!("source_auth_patching.rs");
+include!("source_cargo_patching.rs");
 include!("source_websocket_patching.rs");
 include!("source_patch_helpers.rs");
 
 fn patch_codex_source(source_dir: &Path) -> Result<()> {
+    let workspace_manifest = source_dir.join("codex-rs/Cargo.toml");
     let lockfile = source_dir.join("codex-rs/Cargo.lock");
     let app_server = source_dir.join("codex-rs/app-server/src/lib.rs");
     let app_server_manifest = source_dir.join("codex-rs/app-server/Cargo.toml");
@@ -18,6 +20,7 @@ fn patch_codex_source(source_dir: &Path) -> Result<()> {
     let client = source_dir.join("codex-rs/core/src/client.rs");
     let turn = source_dir.join("codex-rs/core/src/session/turn.rs");
     let tui = source_dir.join("codex-rs/tui/src/lib.rs");
+    patch_placeholder_workspace_lock_versions_if_present(&workspace_manifest, &lockfile)?;
     patch_workspace_dependency_if_present(&app_server_manifest, "libc")?;
     patch_lockfile_dependency_if_present(&lockfile, "codex-app-server", "libc")?;
     patch_app_server_shutdown_signal_source(&app_server)?;
