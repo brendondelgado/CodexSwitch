@@ -1,0 +1,27 @@
+Sources/CodexSwitch/Services/DesktopUpdateOperationOwnership.swift
+  s_70c8e194852bb5::t_072f3848b646c3 316
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_f40fec613b06fa 52,237-240
+Sources/CodexSwitch/Services/AccountActivationRuntimeEvidence.swift
+  s_70c8e194852bb5::t_072f3848b646c3 97
+  s_70c8e194852bb5::t_b34f60cddc1ede 89-90,99-102
+docs/architecture/desktop-update-storage.md
+  s_70c8e194852bb5::t_f40fec613b06fa 35,83-86
+  s_70c8e194852bb5::t_782c2fba7abfd1 87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "d7dd7a45594d2c192b1a0f36479da613f1748019",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
