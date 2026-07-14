@@ -1744,11 +1744,8 @@ struct SwapEngineTests {
     @Test("Structured request persistence writes the complete binding")
     func structuredRequestPersistenceWritesCompleteBinding() throws {
         let fileManager = FileManager.default
-        let home = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-            .appendingPathComponent("codexswitch-binding-\(UUID().uuidString)", isDirectory: true)
+        let home = try makeSecureTestDirectoryURL(prefix: "codexswitch-binding")
         defer { try? fileManager.removeItem(at: home) }
-        try fileManager.createDirectory(at: home, withIntermediateDirectories: false)
-        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: home.path)
         let root = home.appendingPathComponent(".codexswitch", isDirectory: true)
         try fileManager.createDirectory(at: root, withIntermediateDirectories: false)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
@@ -1756,7 +1753,11 @@ struct SwapEngineTests {
         let binding = reloadBinding(
             target: runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI)
         )
-        #expect(SwapEngine.persistReloadRequest(binding, homeDirectory: home))
+        #expect(SwapEngine.persistReloadRequest(
+            binding,
+            homeDirectory: home,
+            bindingIsCurrent: { $0 == binding }
+        ))
 
         let requestURL = root
             .appendingPathComponent("hotswap-request", isDirectory: true)
@@ -1774,11 +1775,8 @@ struct SwapEngineTests {
     @Test("Request binding drift after lock leaves the request unchanged and suppresses signal")
     func requestWriteRevalidatesInsideExclusiveLock() throws {
         let fileManager = FileManager.default
-        let home = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-            .appendingPathComponent("codexswitch-request-drift-\(UUID().uuidString)", isDirectory: true)
+        let home = try makeSecureTestDirectoryURL(prefix: "codexswitch-request-drift")
         defer { try? fileManager.removeItem(at: home) }
-        try fileManager.createDirectory(at: home, withIntermediateDirectories: false)
-        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: home.path)
         let root = home.appendingPathComponent(".codexswitch", isDirectory: true)
         let requestDirectory = root.appendingPathComponent("hotswap-request", isDirectory: true)
         try fileManager.createDirectory(at: requestDirectory, withIntermediateDirectories: true)
@@ -1846,11 +1844,8 @@ struct SwapEngineTests {
     @Test("Auth evidence is complete, bounded, mode checked, and no-follow")
     func authEvidenceUsesSecureCompleteTokenFingerprint() throws {
         let fileManager = FileManager.default
-        let home = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-            .appendingPathComponent("codexswitch-auth-evidence-\(UUID().uuidString)", isDirectory: true)
+        let home = try makeSecureTestDirectoryURL(prefix: "codexswitch-auth-evidence")
         defer { try? fileManager.removeItem(at: home) }
-        try fileManager.createDirectory(at: home, withIntermediateDirectories: false)
-        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: home.path)
         let authDirectory = home.appendingPathComponent(".codex", isDirectory: true)
         try fileManager.createDirectory(at: authDirectory, withIntermediateDirectories: false)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: authDirectory.path)
@@ -1905,11 +1900,8 @@ struct SwapEngineTests {
     @Test("Identical auth replacement inode fails signaling ACKs and evidence")
     func identicalAuthReplacementFailsEveryAuthorizationPath() throws {
         let fileManager = FileManager.default
-        let home = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-            .appendingPathComponent("codexswitch-auth-inode-\(UUID().uuidString)", isDirectory: true)
+        let home = try makeSecureTestDirectoryURL(prefix: "codexswitch-auth-inode")
         defer { try? fileManager.removeItem(at: home) }
-        try fileManager.createDirectory(at: home, withIntermediateDirectories: false)
-        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: home.path)
         let authDirectory = home.appendingPathComponent(".codex", isDirectory: true)
         try fileManager.createDirectory(at: authDirectory, withIntermediateDirectories: false)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: authDirectory.path)

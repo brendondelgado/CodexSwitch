@@ -72,44 +72,53 @@ private final class ConcurrentBundlePathProbe: @unchecked Sendable {
     private let finished = DispatchSemaphore(value: 0)
     private var shouldStop = false
     private var didObserve = false
+    private var didFinish = false
     private var invalidObservation = false
     private var observations = Set<String>()
 
-    func start(destination: URL) {
-        DispatchQueue.global(qos: .userInitiated).async { [self] in
+    func start(destination: URL) -> Bool {
+        let worker = Thread { [self] in
             started.signal()
             while !lock.withLock({ shouldStop }) {
                 let marker = destination.appendingPathComponent("marker")
                 guard let data = try? Data(contentsOf: marker) else {
-                    lock.withLock { invalidObservation = true }
+                    lock.withLock {
+                        invalidObservation = true
+                        signalFirstObservationIfNeeded()
+                    }
                     continue
                 }
                 let value = String(decoding: data, as: UTF8.self)
                 lock.withLock {
                     observations.insert(value)
-                    if !didObserve {
-                        didObserve = true
-                        observed.signal()
-                    }
+                    signalFirstObservationIfNeeded()
                     if value != "old" && value != "new" {
                         invalidObservation = true
                     }
                 }
             }
+            lock.withLock { didFinish = true }
             finished.signal()
         }
-        _ = started.wait(timeout: .now() + 2)
-        _ = observed.wait(timeout: .now() + 2)
+        worker.name = "CodexDesktopAppUpdaterTests.ConcurrentBundlePathProbe"
+        worker.start()
+
+        guard started.wait(timeout: .now() + 5) == .success,
+              observed.wait(timeout: .now() + 5) == .success else {
+            _ = stop()
+            return false
+        }
+        return true
     }
 
-    func stop() {
+    func stop() -> Bool {
         let shouldWait = lock.withLock { () -> Bool in
-            if shouldStop { return false }
+            if didFinish { return false }
             shouldStop = true
             return true
         }
-        guard shouldWait else { return }
-        _ = finished.wait(timeout: .now() + 2)
+        guard shouldWait else { return true }
+        return finished.wait(timeout: .now() + 5) == .success
     }
 
     var sawInvalidPathState: Bool {
@@ -118,6 +127,12 @@ private final class ConcurrentBundlePathProbe: @unchecked Sendable {
 
     var observedValues: Set<String> {
         lock.withLock { observations }
+    }
+
+    private func signalFirstObservationIfNeeded() {
+        guard !didObserve else { return }
+        didObserve = true
+        observed.signal()
     }
 }
 
@@ -200,6 +215,20 @@ private func makeTestOperationScope(
             userInfo: [NSLocalizedDescriptionKey: message]
         )
     }
+}
+
+private func makeDesktopUpdaterTestSubprocess(
+    filter: String,
+    environment additions: [String: String]
+) throws -> Process {
+    let process = Process()
+    try configureSwiftTestingSubprocess(process, filter: filter)
+    process.environment = ProcessInfo.processInfo.environment.merging(additions) {
+        _, childValue in childValue
+    }
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    return process
 }
 
 private actor SuspendedDesktopUpdateExecutor: CodexDesktopUpdateExecuting {
@@ -387,19 +416,33 @@ struct CodexDesktopAppUpdaterTests {
         )
         try first.lifetime.enter(.download)
 
+        let child = try makeDesktopUpdaterTestSubprocess(
+            filter: "operationLeaseDownloadChildProcess",
+            environment: [
+                "CODEXSWITCH_DOWNLOAD_LEASE_CHILD": "contender",
+                "CODEXSWITCH_DOWNLOAD_LEASE_ROOT": root.path,
+                "CODEXSWITCH_DOWNLOAD_LEASE_DESTINATION": destination.path,
+                "CODEXSWITCH_DOWNLOAD_LEASE_PATH": leaseURL.path,
+            ]
+        )
+        try child.run()
+        defer {
+            if child.isRunning { child.terminate() }
+        }
+        let exitDeadline = ContinuousClock.now + .seconds(10)
+        while child.isRunning, ContinuousClock.now < exitDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(!child.isRunning)
+        #expect(child.terminationStatus == 0)
+
+        _ = await first.owner.finish(first.lifetime)
         let secondOwner = DesktopUpdateOperationOwner(
             stateMachine: CodexDesktopUpdateStateMachine(),
             leaseURL: leaseURL,
             updateRoot: root,
             allowedDestinations: [destination]
         )
-        let collision = await secondOwner.acquire(.staging, epoch: .standalone())
-        guard case .busy = collision else {
-            Issue.record("A competing updater must remain busy during download")
-            return
-        }
-
-        _ = await first.owner.finish(first.lifetime)
         let next = await secondOwner.acquire(.staging, epoch: .standalone())
         guard case .acquired(let nextLifetime) = next else {
             Issue.record("The operation lease must become available after completion")
@@ -416,19 +459,17 @@ struct CodexDesktopAppUpdaterTests {
         let leaseURL = root.appendingPathComponent("shared-download-operation.lock")
         let ready = root.appendingPathComponent("download-child-ready")
         let release = root.appendingPathComponent("download-child-release")
-        let child = Process()
-        child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-        child.arguments = ["--filter", "operationLeaseDownloadChildProcess"]
-        child.environment = ProcessInfo.processInfo.environment.merging([
-            "CODEXSWITCH_DOWNLOAD_LEASE_CHILD": "1",
-            "CODEXSWITCH_DOWNLOAD_LEASE_ROOT": root.path,
-            "CODEXSWITCH_DOWNLOAD_LEASE_DESTINATION": destination.path,
-            "CODEXSWITCH_DOWNLOAD_LEASE_PATH": leaseURL.path,
-            "CODEXSWITCH_DOWNLOAD_LEASE_READY": ready.path,
-            "CODEXSWITCH_DOWNLOAD_LEASE_RELEASE": release.path,
-        ]) { _, childValue in childValue }
-        child.standardOutput = FileHandle.nullDevice
-        child.standardError = FileHandle.nullDevice
+        let child = try makeDesktopUpdaterTestSubprocess(
+            filter: "operationLeaseDownloadChildProcess",
+            environment: [
+                "CODEXSWITCH_DOWNLOAD_LEASE_CHILD": "holder",
+                "CODEXSWITCH_DOWNLOAD_LEASE_ROOT": root.path,
+                "CODEXSWITCH_DOWNLOAD_LEASE_DESTINATION": destination.path,
+                "CODEXSWITCH_DOWNLOAD_LEASE_PATH": leaseURL.path,
+                "CODEXSWITCH_DOWNLOAD_LEASE_READY": ready.path,
+                "CODEXSWITCH_DOWNLOAD_LEASE_RELEASE": release.path,
+            ]
+        )
         try child.run()
         defer {
             if child.isRunning {
@@ -468,7 +509,7 @@ struct CodexDesktopAppUpdaterTests {
     @Test("Download lease child process helper")
     func operationLeaseDownloadChildProcess() async throws {
         let environment = ProcessInfo.processInfo.environment
-        guard environment["CODEXSWITCH_DOWNLOAD_LEASE_CHILD"] == "1" else { return }
+        guard let role = environment["CODEXSWITCH_DOWNLOAD_LEASE_CHILD"] else { return }
         let root = URL(
             fileURLWithPath: try #require(environment["CODEXSWITCH_DOWNLOAD_LEASE_ROOT"])
         )
@@ -480,12 +521,6 @@ struct CodexDesktopAppUpdaterTests {
         let leaseURL = URL(
             fileURLWithPath: try #require(environment["CODEXSWITCH_DOWNLOAD_LEASE_PATH"])
         )
-        let ready = URL(
-            fileURLWithPath: try #require(environment["CODEXSWITCH_DOWNLOAD_LEASE_READY"])
-        )
-        let release = URL(
-            fileURLWithPath: try #require(environment["CODEXSWITCH_DOWNLOAD_LEASE_RELEASE"])
-        )
         let owner = DesktopUpdateOperationOwner(
             stateMachine: CodexDesktopUpdateStateMachine(),
             leaseURL: leaseURL,
@@ -493,10 +528,27 @@ struct CodexDesktopAppUpdaterTests {
             allowedDestinations: [destination]
         )
         let acquisition = await owner.acquire(.staging, epoch: .standalone())
+        if role == "contender" {
+            guard case .busy = acquisition else {
+                Issue.record("A competing updater must remain busy during download")
+                return
+            }
+            return
+        }
+        guard role == "holder" else {
+            Issue.record("Unknown download lease child role: \(role)")
+            return
+        }
         guard case .acquired(let lifetime) = acquisition else {
             Issue.record("Download child could not acquire the operation lease")
             return
         }
+        let ready = URL(
+            fileURLWithPath: try #require(environment["CODEXSWITCH_DOWNLOAD_LEASE_READY"])
+        )
+        let release = URL(
+            fileURLWithPath: try #require(environment["CODEXSWITCH_DOWNLOAD_LEASE_RELEASE"])
+        )
         try lifetime.enter(.download)
         try Data().write(to: ready)
         while !FileManager.default.fileExists(atPath: release.path) {
@@ -513,19 +565,17 @@ struct CodexDesktopAppUpdaterTests {
         let leaseURL = root.appendingPathComponent("shared-publication-operation.lock")
         let ready = root.appendingPathComponent("publication-child-ready")
         let release = root.appendingPathComponent("publication-child-release")
-        let child = Process()
-        child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-        child.arguments = ["--filter", "operationLeasePublicationChildProcess"]
-        child.environment = ProcessInfo.processInfo.environment.merging([
-            "CODEXSWITCH_PUBLICATION_LEASE_CHILD": "1",
-            "CODEXSWITCH_PUBLICATION_LEASE_ROOT": root.path,
-            "CODEXSWITCH_PUBLICATION_LEASE_DESTINATION": destination.path,
-            "CODEXSWITCH_PUBLICATION_LEASE_PATH": leaseURL.path,
-            "CODEXSWITCH_PUBLICATION_LEASE_READY": ready.path,
-            "CODEXSWITCH_PUBLICATION_LEASE_RELEASE": release.path,
-        ]) { _, childValue in childValue }
-        child.standardOutput = FileHandle.nullDevice
-        child.standardError = FileHandle.nullDevice
+        let child = try makeDesktopUpdaterTestSubprocess(
+            filter: "operationLeasePublicationChildProcess",
+            environment: [
+                "CODEXSWITCH_PUBLICATION_LEASE_CHILD": "1",
+                "CODEXSWITCH_PUBLICATION_LEASE_ROOT": root.path,
+                "CODEXSWITCH_PUBLICATION_LEASE_DESTINATION": destination.path,
+                "CODEXSWITCH_PUBLICATION_LEASE_PATH": leaseURL.path,
+                "CODEXSWITCH_PUBLICATION_LEASE_READY": ready.path,
+                "CODEXSWITCH_PUBLICATION_LEASE_RELEASE": release.path,
+            ]
+        )
         try child.run()
         defer {
             if child.isRunning { child.terminate() }
@@ -1154,24 +1204,16 @@ struct CodexDesktopAppUpdaterTests {
             archiveSHA256: digest,
             archiveLength: 123
         )
-        let original = try writeFakeStagedUpdate(
+        let staged = try writeFakeStagedUpdate(
             in: root,
             bundleVersion: release.bundleVersion,
             legacyLayout: false,
-            includeSeal: true
-        )
-        let staged = CodexDesktopStagedUpdate(
-            shortVersion: original.shortVersion,
-            bundleVersion: original.bundleVersion,
-            downloadURL: original.downloadURL,
-            appPath: original.appPath,
-            stagedAt: original.stagedAt,
-            generationIdentifier: original.generationIdentifier,
-            validationSeal: original.validationSeal,
+            includeSeal: true,
             archiveSHA256: digest,
             archiveLength: 123
         )
-        try CodexDesktopUpdateStorage.saveAuthoritativeUpdate(staged, in: root)
+        #expect(staged.matches(release))
+        #expect(CodexDesktopUpdateStorage.loadAuthoritativeUpdate(in: root) == staged)
         let service = DesktopUpdateStagingService(root: root)
         var downloadCount = 0
         var validationCount = 0
@@ -2920,14 +2962,14 @@ struct CodexDesktopAppUpdaterTests {
             desktopRuntimeRunning: { false },
             beforeAtomicCommit: {
                 simulatedLaunchAfterFinalProbe = true
-                probe.start(destination: destination)
+                #expect(probe.start(destination: destination))
             },
             validate: { candidate, _, _, _ in
-                if candidate == destination { probe.stop() }
+                if candidate == destination { #expect(probe.stop()) }
                 return .valid
             }
         )
-        probe.stop()
+        #expect(probe.stop())
 
         #expect(result == .installed(cancellationDeferred: false, cleanupDeferred: false))
         #expect(simulatedLaunchAfterFinalProbe)
@@ -3727,20 +3769,18 @@ struct CodexDesktopAppUpdaterTests {
             marker: "new"
         )
 
-        let child = Process()
-        child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-        child.arguments = ["--filter", "installerLeaseChildProcess"]
-        child.environment = ProcessInfo.processInfo.environment.merging([
-            "CODEXSWITCH_INSTALLER_CHILD": "1",
-            "CODEXSWITCH_INSTALLER_TRANSACTION_ROOT": transactionRoot.path,
-            "CODEXSWITCH_INSTALLER_DESTINATION": destination.path,
-            "CODEXSWITCH_INSTALLER_SOURCE": source.path,
-            "CODEXSWITCH_INSTALLER_READY": ready.path,
-            "CODEXSWITCH_INSTALLER_RELEASE": release.path,
-            "CODEXSWITCH_INSTALLER_LEASE": leaseURL.path,
-        ]) { _, childValue in childValue }
-        child.standardOutput = FileHandle.nullDevice
-        child.standardError = FileHandle.nullDevice
+        let child = try makeDesktopUpdaterTestSubprocess(
+            filter: "installerLeaseChildProcess",
+            environment: [
+                "CODEXSWITCH_INSTALLER_CHILD": "1",
+                "CODEXSWITCH_INSTALLER_TRANSACTION_ROOT": transactionRoot.path,
+                "CODEXSWITCH_INSTALLER_DESTINATION": destination.path,
+                "CODEXSWITCH_INSTALLER_SOURCE": source.path,
+                "CODEXSWITCH_INSTALLER_READY": ready.path,
+                "CODEXSWITCH_INSTALLER_RELEASE": release.path,
+                "CODEXSWITCH_INSTALLER_LEASE": leaseURL.path,
+            ]
+        )
         try child.run()
         defer {
             if child.isRunning {
@@ -4126,19 +4166,17 @@ struct CodexDesktopAppUpdaterTests {
         let leaseURL = fixture.root.appendingPathComponent("shared-recovery-operation.lock")
         let ready = fixture.root.appendingPathComponent("recovery-child-ready")
         let release = fixture.root.appendingPathComponent("recovery-child-release")
-        let child = Process()
-        child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-        child.arguments = ["--filter", "operationLeaseRecoveryChildProcess"]
-        child.environment = ProcessInfo.processInfo.environment.merging([
-            "CODEXSWITCH_RECOVERY_LEASE_CHILD": "1",
-            "CODEXSWITCH_RECOVERY_LEASE_ROOT": fixture.root.path,
-            "CODEXSWITCH_RECOVERY_LEASE_DESTINATION": fixture.destination.path,
-            "CODEXSWITCH_RECOVERY_LEASE_PATH": leaseURL.path,
-            "CODEXSWITCH_RECOVERY_LEASE_READY": ready.path,
-            "CODEXSWITCH_RECOVERY_LEASE_RELEASE": release.path,
-        ]) { _, childValue in childValue }
-        child.standardOutput = FileHandle.nullDevice
-        child.standardError = FileHandle.nullDevice
+        let child = try makeDesktopUpdaterTestSubprocess(
+            filter: "operationLeaseRecoveryChildProcess",
+            environment: [
+                "CODEXSWITCH_RECOVERY_LEASE_CHILD": "1",
+                "CODEXSWITCH_RECOVERY_LEASE_ROOT": fixture.root.path,
+                "CODEXSWITCH_RECOVERY_LEASE_DESTINATION": fixture.destination.path,
+                "CODEXSWITCH_RECOVERY_LEASE_PATH": leaseURL.path,
+                "CODEXSWITCH_RECOVERY_LEASE_READY": ready.path,
+                "CODEXSWITCH_RECOVERY_LEASE_RELEASE": release.path,
+            ]
+        )
         try child.run()
         defer {
             if child.isRunning { child.terminate() }
@@ -5045,17 +5083,9 @@ struct CodexDesktopAppUpdaterTests {
     }
 
     private func temporaryDirectory() -> URL {
-        let temporaryPath = (
-            FileManager.default.temporaryDirectory.path as NSString
-        ).standardizingPath
-        let canonicalPath: String
-        if temporaryPath == "/tmp" || temporaryPath.hasPrefix("/tmp/")
-            || temporaryPath == "/var" || temporaryPath.hasPrefix("/var/") {
-            canonicalPath = "/private\(temporaryPath)"
-        } else {
-            canonicalPath = temporaryPath
-        }
-        return URL(fileURLWithPath: canonicalPath, isDirectory: true).appendingPathComponent(
+        let configuredRoot = ProcessInfo.processInfo.environment["CODEXSWITCH_TEST_TMPDIR"]
+        let rootPath = configuredRoot.flatMap { $0.isEmpty ? nil : $0 } ?? "/private/tmp"
+        return URL(fileURLWithPath: rootPath, isDirectory: true).appendingPathComponent(
             "CodexDesktopAppUpdaterTests-\(UUID().uuidString)",
             isDirectory: true
         )

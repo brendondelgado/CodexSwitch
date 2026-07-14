@@ -479,7 +479,8 @@ struct LinuxDevboxMonitorTests {
         let command = LinuxDevboxMonitor.remoteCredentialSyncCommand(
             remoteDirectory: stage.path,
             bundleName: "sync.csbundle",
-            passphraseName: "sync.passphrase"
+            passphraseName: "sync.passphrase",
+            removeExecutable: fakeRM.path
         )
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path

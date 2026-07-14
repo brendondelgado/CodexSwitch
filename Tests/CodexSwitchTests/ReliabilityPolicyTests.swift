@@ -535,7 +535,12 @@ struct AccountPersistenceCoordinatorTests {
     func freshnessOnlyTelemetryUsesHeartbeat() async throws {
         let recorder = PersistenceRecorder()
         let clock = PersistenceClock()
-        let initial = telemetryAccount(id: "quota", fetchedAt: clock.now())
+        let localAccountId = UUID()
+        let initial = telemetryAccount(
+            localAccountId: localAccountId,
+            id: "quota",
+            fetchedAt: clock.now()
+        )
         let coordinator = AccountPersistenceCoordinator(
             telemetryDelay: .seconds(60),
             now: { clock.now() },
@@ -546,7 +551,11 @@ struct AccountPersistenceCoordinatorTests {
         _ = try await coordinator.loadAll()
 
         await coordinator.queueTelemetry(
-            telemetryAccount(id: "quota", fetchedAt: clock.now().addingTimeInterval(30)),
+            telemetryAccount(
+                localAccountId: localAccountId,
+                id: "quota",
+                fetchedAt: clock.now().addingTimeInterval(30)
+            ),
             revision: 1
         )
         clock.advance(by: 60)
@@ -555,7 +564,11 @@ struct AccountPersistenceCoordinatorTests {
 
         clock.advance(by: 240)
         await coordinator.queueTelemetry(
-            telemetryAccount(id: "quota", fetchedAt: clock.now()),
+            telemetryAccount(
+                localAccountId: localAccountId,
+                id: "quota",
+                fetchedAt: clock.now()
+            ),
             revision: 2
         )
         #expect(try await coordinator.flushTelemetryIfDue())
@@ -567,7 +580,11 @@ struct AccountPersistenceCoordinatorTests {
 
         clock.advance(by: 60)
         await coordinator.queueTelemetry(
-            telemetryAccount(id: "quota", fetchedAt: clock.now()),
+            telemetryAccount(
+                localAccountId: localAccountId,
+                id: "quota",
+                fetchedAt: clock.now()
+            ),
             revision: 3
         )
         #expect(try await coordinator.flushTelemetryIfDue() == false)
@@ -687,8 +704,13 @@ struct AccountPersistenceCoordinatorTests {
         )
     }
 
-    private func telemetryAccount(id: String, fetchedAt: Date) -> [CodexAccount] {
+    private func telemetryAccount(
+        localAccountId: UUID = UUID(),
+        id: String,
+        fetchedAt: Date
+    ) -> [CodexAccount] {
         [CodexAccount(
+            id: localAccountId,
             email: "\(id)@example.com",
             accessToken: "access",
             refreshToken: "refresh",

@@ -348,7 +348,9 @@ struct AccountActivationTransactionTests {
             transaction.invalidateCurrentActivationSynchronously(targetAccountId: target.id)
             resume.continuation.yield()
 
-            #expect(try await owner.value == nil)
+            let leaseResult = try await owner.value
+            let mutationResult = try #require(leaseResult)
+            #expect(mutationResult == nil)
             #expect(!effects.contains(route.rawValue))
             try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent())
         }

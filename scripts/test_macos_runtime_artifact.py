@@ -81,7 +81,15 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         )
         self.assertIn('install -d -m 0700 "$test_tmp"', swift_gate)
         self.assertIn(
-            'TMPDIR="$test_tmp" swift test --jobs 1 --no-parallel',
+            'CODEXSWITCH_TEST_TMPDIR="$test_tmp"',
+            swift_gate,
+        )
+        self.assertIn(
+            'TMPDIR="$test_tmp"',
+            swift_gate,
+        )
+        self.assertIn(
+            'swift test --jobs 1 --no-parallel',
             swift_gate,
         )
         self.assertIn('rm -rf -- .build "$test_tmp"', swift_gate)

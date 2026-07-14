@@ -141,7 +141,9 @@ jobs:
           }
           trap cleanup EXIT
           swift --version
-          TMPDIR="$test_tmp" swift test --jobs 1 --no-parallel
+          CODEXSWITCH_TEST_TMPDIR="$test_tmp" \
+            TMPDIR="$test_tmp" \
+            swift test --jobs 1 --no-parallel
 
       - name: Build the CodexSwitch control plane
         id: control_plane

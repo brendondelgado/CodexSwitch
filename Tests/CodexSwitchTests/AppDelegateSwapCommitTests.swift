@@ -155,11 +155,9 @@ struct AppDelegateSwapCommitTests {
     @Test("Auth readback verifies the complete token set")
     func authReadbackVerifiesCompleteTokenSet() throws {
         let account = makeAccount()
-        let url = makeSecureTestFileURL(
-            prefix: "codexswitch-app-delegate-auth",
-            fileName: "auth.json"
-        )
-        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let root = try makeSecureTestDirectoryURL(prefix: "codexswitch-app-delegate-auth")
+        let url = root.appendingPathComponent("auth.json")
+        defer { try? FileManager.default.removeItem(at: root) }
 
         try SwapEngine.writeAuthFile(for: account, path: url.path)
         #expect(AppDelegate.authFileMatches(account: account, atPath: url.path))

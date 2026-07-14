@@ -46,8 +46,11 @@ jobs alone does not serialize those tests.
 The workflow provides the test process with a private temporary directory under
 the GitHub runner's canonical workspace temp root. Security tests must not be
 made dependent on the runner's `/var` compatibility symlink, and concurrent
-workflow runs must not share test paths. The temporary directory and `.build`
-output are removed whether the gate succeeds or fails.
+workflow runs must not share test paths. The workflow exports that directory as
+`CODEXSWITCH_TEST_TMPDIR`; fixtures that exercise retained paths, no-follow
+access, ownership, or permissions use this explicit root instead of Foundation's
+platform temp-directory APIs. The temporary directory and `.build` output are
+removed whether the gate succeeds or fails.
 
 ## Trust Bootstrap
 

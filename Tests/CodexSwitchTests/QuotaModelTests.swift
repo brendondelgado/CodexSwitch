@@ -324,8 +324,10 @@ struct QuotaModelTests {
         let manager = AccountManager()
         let a1 = CodexAccount(email: "a@test.com", accessToken: "t1", refreshToken: "r1", idToken: "i1", accountId: "acc1", isActive: true)
         let a2 = CodexAccount(email: "b@test.com", accessToken: "t2", refreshToken: "r2", idToken: "i2", accountId: "acc2", isActive: false)
-        manager.addAccount(a1)
-        manager.addAccount(a2)
+        #expect(manager.addAccount(a1))
+        #expect(manager.addAccount(a2))
+        #expect(manager.configuredAccount == nil)
+        manager.setConfiguredAccount(a1.id)
         #expect(manager.configuredAccount?.email == "a@test.com")
         manager.setConfiguredAccount(a2.id)
         #expect(manager.configuredAccount?.email == "b@test.com")
@@ -341,15 +343,17 @@ struct QuotaModelTests {
         #expect(manager.uiRefreshRevision == 2)
     }
 
-    @Test("AccountManager deduplicates by accountId")
+    @Test("AccountManager rejects duplicate additions by accountId")
     @MainActor func deduplication() {
         let manager = AccountManager()
         let a1 = CodexAccount(email: "a@test.com", accessToken: "old", refreshToken: "r1", idToken: "i1", accountId: "same-id")
         let a2 = CodexAccount(email: "a@test.com", accessToken: "new", refreshToken: "r1", idToken: "i1", accountId: "same-id")
-        manager.addAccount(a1)
-        manager.addAccount(a2)
+        #expect(manager.addAccount(a1))
+        #expect(!manager.addAccount(a2))
         #expect(manager.accounts.count == 1)
-        #expect(manager.accounts[0].accessToken == "new")
+        #expect(manager.accounts[0].id == a1.id)
+        #expect(manager.accounts[0].accessToken == "old")
+        #expect(!manager.accounts[0].isActive)
     }
 
     @Test("AuthFile JSON decoding")

@@ -29,12 +29,7 @@ struct AccountImporterObservationTests {
 
     @Test("Absent auth is distinct from invalid and unreadable auth")
     func typedAbsenceAndUnreadableOutcomes() throws {
-        let root = makeSecureTestFileURL(
-            prefix: "codexswitch-auth-observation",
-            fileName: "auth.json"
-        ).deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        chmod(root.path, 0o700)
+        let root = try makeSecureTestDirectoryURL(prefix: "codexswitch-auth-observation")
         defer { try? FileManager.default.removeItem(at: root) }
         let absent = root.appendingPathComponent("missing.json")
         guard case .absent = AccountImporter.observeCurrentAccount(from: absent.path) else {
@@ -158,16 +153,8 @@ struct AccountImporterObservationTests {
     }
 
     private func temporaryAuthURL() throws -> URL {
-        let url = makeSecureTestFileURL(
-            prefix: "codexswitch-auth-observation",
-            fileName: "auth.json"
-        )
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        chmod(url.deletingLastPathComponent().path, 0o700)
-        return url
+        try makeSecureTestDirectoryURL(prefix: "codexswitch-auth-observation")
+            .appendingPathComponent("auth.json")
     }
 
     private func writeAuth(to url: URL) throws {
