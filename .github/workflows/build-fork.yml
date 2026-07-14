@@ -131,6 +131,21 @@ jobs:
           command -v shasum >/dev/null
           command -v lipo >/dev/null
 
+      - name: Restore remote Cargo cache
+        id: cargo_cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ runner.temp }}/codexswitch-target/
+            ${{ runner.temp }}/codex-target/
+          key: macos-runtime-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-${{ github.sha }}
+          restore-keys: |
+            macos-runtime-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-
+
       - name: Verify the Swift app and test suite
         run: |
           set -euo pipefail
@@ -597,3 +612,16 @@ jobs:
             echo "| --- | ---: | --- |"
             jq -r '.files[] | "| `\(.name)` | \(.bytes) | `\(.sha256)` |"' "$ARTIFACT_DIR/manifest.json"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save remote Cargo cache
+        if: ${{ always() && steps.cargo_cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ runner.temp }}/codexswitch-target/
+            ${{ runner.temp }}/codex-target/
+          key: macos-runtime-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-${{ github.sha }}

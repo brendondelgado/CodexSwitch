@@ -82,6 +82,16 @@ The Codex runtime build names both packages in one Cargo invocation:
 `codex-cli` and `codex-code-mode-host`. The ephemeral checkout and build targets
 are not uploaded.
 
+GitHub Actions may retain the Cargo registry, git database, and target
+directories in a repository-scoped cache keyed by the target architecture,
+exact upstream commit, and CodexSwitch commit. A new CodexSwitch commit restores
+the newest cache for the same upstream commit, then Cargo revalidates every
+object against the current source and flags. Cache restore and save failures are
+non-fatal because provenance never depends on the cache. The cache remains on
+GitHub infrastructure; no build target is downloaded to or retained on the Mac.
+The artifact still comes only from the clean `--locked` build and passes the
+same source-diff, binary, manifest, and attestation gates.
+
 If the v3 patch adds a direct dependency to an upstream member crate, the patch
 driver updates that member's `Cargo.lock` entry in canonical sorted order before
 the workflow calculates the source-patch digest. The driver also reconciles

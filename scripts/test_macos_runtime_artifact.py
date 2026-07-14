@@ -98,6 +98,31 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         )
         self.assertIn('rm -rf -- .build "$test_tmp"', swift_gate)
 
+    def test_workflow_uses_failure_safe_remote_cargo_cache(self) -> None:
+        workflow = WORKFLOW.read_text()
+        restore = workflow.index("Restore remote Cargo cache")
+        build = workflow.index("Build the patched Codex runtime pair")
+        save = workflow.index("Save remote Cargo cache")
+
+        self.assertLess(restore, build)
+        self.assertLess(build, save)
+        self.assertIn(
+            "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+            workflow[restore:build],
+        )
+        self.assertIn(
+            "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+            workflow[save:],
+        )
+        self.assertIn("${{ runner.temp }}/codex-target/", workflow[restore:build])
+        self.assertIn("${{ inputs.upstream_codex_git_sha }}", workflow[restore:build])
+        self.assertIn("${{ github.sha }}", workflow[restore:build])
+        self.assertIn(
+            "if: ${{ always() && steps.cargo_cache.outputs.cache-hit != 'true' }}",
+            workflow[save:],
+        )
+        self.assertGreaterEqual(workflow.count("continue-on-error: true"), 2)
+
     def test_manifest_binds_full_source_upstream_and_patch_provenance(self) -> None:
         workflow = WORKFLOW.read_text()
         activation = ACTIVATION.read_text()
