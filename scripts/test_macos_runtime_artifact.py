@@ -332,6 +332,20 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         ):
             self.assertIn(policy, installer)
 
+    def test_installer_preserves_path_for_final_launcher_probe(self) -> None:
+        installer = INSTALLER.read_text()
+
+        self.assertIn(
+            'for route_path in "$installed_cli" "$local_launcher" '
+            '"$homebrew_launcher" "$managed_launcher"; do',
+            installer,
+        )
+        self.assertNotIn('for path in "$installed_cli"', installer)
+        self.assertLess(
+            installer.index("for route_path in"),
+            installer.index('"$local_launcher" --version'),
+        )
+
     def test_control_plane_contract_is_executable_and_optimizer_independent(self) -> None:
         workflow = WORKFLOW.read_text()
         installer = INSTALLER.read_text()

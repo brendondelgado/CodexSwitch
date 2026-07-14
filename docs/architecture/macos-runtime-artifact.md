@@ -245,6 +245,9 @@ state. The committed state records `installedArtifactManifestSha256`; prepared
 artifact identity is cleared independently so an installed report cannot
 confuse completed provenance with pending work. `manifest.json` is frozen
 read-only with its generation; executable members are frozen read/execute-only.
+The repository installer preserves its original `PATH` through final route
+validation; in zsh, the special `path` array must never be reused as a scalar
+loop variable before the launcher smoke test.
 
 The running CLI process is not signalled or replaced in memory. After successful
 activation, one explicit exit and resume starts the new executable set.

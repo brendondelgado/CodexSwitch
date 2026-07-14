@@ -173,9 +173,9 @@ if report.get("error") is not None:
     raise SystemExit("macOS runtime activation reported an error")
 PY
 
-for path in "$installed_cli" "$local_launcher" "$homebrew_launcher" "$managed_launcher"; do
-  [[ -f "$path" && -x "$path" && ! -L "$path" ]] || {
-    print -u2 "activated CodexSwitch route is missing, linked, or not executable: $path"
+for route_path in "$installed_cli" "$local_launcher" "$homebrew_launcher" "$managed_launcher"; do
+  [[ -f "$route_path" && -x "$route_path" && ! -L "$route_path" ]] || {
+    print -u2 "activated CodexSwitch route is missing, linked, or not executable: $route_path"
     exit 1
   }
 done
