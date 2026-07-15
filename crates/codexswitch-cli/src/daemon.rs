@@ -483,7 +483,22 @@ where
         }
     }
 
-    refresh_inactive_watch_accounts(&mut accounts, &fetch_quota_fn, &refresh_token_fn);
+    let watch_now = Utc::now();
+    let active_is_healthy = active_poll_succeeded
+        && !force_swap
+        && quota_availability_at(&accounts[active_index], watch_now) == QuotaAvailability::Usable;
+    let cached_plan_upgrade_before_watch =
+        active_is_healthy && select_plan_upgrade_candidate(&accounts, watch_now).is_some();
+    if active_is_healthy && !cached_plan_upgrade_before_watch {
+        let rotation_interval = next_poll_interval_for(&accounts[active_index], base_interval);
+        refresh_inactive_watch_account(
+            &mut accounts,
+            watch_now,
+            rotation_interval,
+            &fetch_quota_fn,
+            &refresh_token_fn,
+        );
+    }
 
     let now = Utc::now();
     let active_availability = quota_availability_at(&accounts[active_index], now);
@@ -491,6 +506,8 @@ where
     let cached_plan_upgrade_exists = !force_swap
         && active_availability == QuotaAvailability::Usable
         && select_plan_upgrade_candidate(&accounts, now).is_some();
+    // A required rotation still needs current observations from every candidate;
+    // stale quota and plan ranks cannot safely authorize a short-circuit.
     let candidate_observations = (force_swap
         || active_availability != QuotaAvailability::Usable
         || cached_plan_upgrade_exists)
@@ -818,36 +835,60 @@ where
     }
 }
 
-fn refresh_inactive_watch_accounts<F, T>(
+fn refresh_inactive_watch_account<F, T>(
     accounts: &mut [CodexAccount],
+    now: chrono::DateTime<Utc>,
+    rotation_interval: Duration,
     fetch_quota_fn: &F,
     refresh_token_fn: &T,
 ) where
     F: Fn(&CodexAccount) -> Result<FetchResult>,
     T: Fn(&mut CodexAccount) -> Result<()>,
 {
-    let now = Utc::now();
-    for account in accounts {
-        if !should_probe_inactive_account(account, now) {
-            continue;
-        }
-
-        match fetch_quota_with_refresh(account, fetch_quota_fn, refresh_token_fn) {
-            Ok(result) => apply_fetch_result(account, result),
-            Err(error) => {
-                eprintln!(
-                    "warning: failed to probe inactive account {}: {error:#}",
-                    account.email
-                );
-                if let Some((reason, cooldown)) = poll_error_runtime_block(&error) {
-                    let until = runtime_block_until(account, reason, cooldown);
-                    mark_runtime_unusable(account, reason, until);
-                } else if real_quota_snapshot(account).is_none() {
-                    account.last_refreshed = Some(crate::quota::now_swift_reference_value());
-                }
+    let Some(index) = inactive_watch_account_index(accounts, now, rotation_interval) else {
+        return;
+    };
+    let account = &mut accounts[index];
+    match fetch_quota_with_refresh(account, fetch_quota_fn, refresh_token_fn) {
+        Ok(result) => apply_fetch_result(account, result),
+        Err(error) => {
+            eprintln!(
+                "warning: failed to probe inactive account {}: {error:#}",
+                account.email
+            );
+            if let Some((reason, cooldown)) = poll_error_runtime_block(&error) {
+                let until = runtime_block_until(account, reason, cooldown);
+                mark_runtime_unusable(account, reason, until);
             }
         }
     }
+}
+
+fn inactive_watch_account_index(
+    accounts: &[CodexAccount],
+    now: chrono::DateTime<Utc>,
+    rotation_interval: Duration,
+) -> Option<usize> {
+    let mut eligible = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, account)| should_probe_inactive_account(account, now))
+        .collect::<Vec<_>>();
+    // For a stable eligible set, consecutive buckets visit every account once
+    // before repeating while preserving a deterministic identity order.
+    eligible.sort_unstable_by(|(_, left), (_, right)| {
+        left.account_id
+            .cmp(&right.account_id)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let eligible_count = i64::try_from(eligible.len()).ok()?;
+    if eligible_count == 0 {
+        return None;
+    }
+    let bucket_seconds = i64::try_from(rotation_interval.as_secs().max(1)).unwrap_or(i64::MAX);
+    let bucket = now.timestamp().div_euclid(bucket_seconds);
+    let slot = bucket.rem_euclid(eligible_count) as usize;
+    eligible.get(slot).map(|(index, _)| *index)
 }
 
 fn refresh_stale_reset_bank_observations<B>(
@@ -2092,6 +2133,124 @@ mod tests {
             Some(100.0)
         );
         Ok(())
+    }
+
+    #[test]
+    fn healthy_tick_bounds_many_stale_inactive_quota_probes() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let stale_at = chrono::DateTime::<Utc>::from_timestamp(
+            Utc::now().timestamp()
+                - crate::account_store::QUOTA_OBSERVATION_MAX_AGE.num_seconds()
+                - 1,
+            0,
+        )
+        .unwrap();
+        let mut accounts = vec![active.clone()];
+        for index in 0..12 {
+            let mut inactive = account(
+                &format!("inactive-{index:02}@example.com"),
+                false,
+                10.0,
+                10.0,
+            );
+            inactive.quota_snapshot.as_mut().unwrap().fetched_at = stale_at;
+            inactive.last_refreshed = None;
+            accounts.push(inactive);
+        }
+        save_accounts(&store_path, &accounts)?;
+        write_auth_file(&auth_path, &active)?;
+
+        let fetched = Arc::new(Mutex::new(Vec::new()));
+        let fetched_for_closure = Arc::clone(&fetched);
+        let tick = run_once_report_with(
+            &store_path,
+            &auth_path,
+            Duration::from_secs(5),
+            move |account| {
+                fetched_for_closure
+                    .lock()
+                    .unwrap()
+                    .push(account.email.clone());
+                if account.is_active {
+                    ready_fetch(account)
+                } else {
+                    bail!("simulated slow quota timeout")
+                }
+            },
+            |_| Ok(()),
+            |_| Ok(verified_reload_summary()),
+        )?;
+
+        assert!(!tick.swapped);
+        let fetched = fetched.lock().unwrap();
+        assert_eq!(
+            fetched.first().map(String::as_str),
+            Some("active@example.com")
+        );
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(
+            fetched
+                .iter()
+                .filter(|email| email.as_str() != "active@example.com")
+                .count(),
+            1
+        );
+        drop(fetched);
+
+        for inactive in load_accounts(&store_path)?
+            .into_iter()
+            .filter(|account| !account.is_active)
+        {
+            assert!(inactive.last_refreshed.is_none());
+            assert_eq!(inactive.quota_snapshot.unwrap().fetched_at, stale_at);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_watch_scheduling_is_fair_across_successive_time_buckets() {
+        const INACTIVE_COUNT: usize = 7;
+        let rotation_interval = Duration::from_secs(5);
+        let bucket_seconds = i64::try_from(rotation_interval.as_secs()).unwrap();
+        let first_bucket = Utc::now().timestamp().div_euclid(bucket_seconds);
+        let first_time =
+            chrono::DateTime::<Utc>::from_timestamp(first_bucket * bucket_seconds, 0).unwrap();
+        let stale_at = first_time
+            - crate::account_store::QUOTA_OBSERVATION_MAX_AGE
+            - ChronoDuration::seconds(1);
+        let mut accounts = vec![account("active@example.com", true, 10.0, 10.0)];
+        for index in 0..INACTIVE_COUNT {
+            let mut inactive = account(
+                &format!("inactive-{index:02}@example.com"),
+                false,
+                10.0,
+                10.0,
+            );
+            inactive.quota_snapshot.as_mut().unwrap().fetched_at = stale_at;
+            inactive.last_refreshed = None;
+            accounts.push(inactive);
+        }
+
+        let selected = (0..INACTIVE_COUNT * 2)
+            .map(|offset| {
+                let now = first_time + ChronoDuration::seconds(bucket_seconds * offset as i64);
+                let index =
+                    inactive_watch_account_index(&accounts, now, rotation_interval).unwrap();
+                accounts[index].email.clone()
+            })
+            .collect::<Vec<_>>();
+        let mut unique_first_cycle = selected[..INACTIVE_COUNT].to_vec();
+        unique_first_cycle.sort_unstable();
+        unique_first_cycle.dedup();
+
+        assert_eq!(unique_first_cycle.len(), INACTIVE_COUNT);
+        assert_eq!(
+            &selected[..INACTIVE_COUNT],
+            &selected[INACTIVE_COUNT..INACTIVE_COUNT * 2]
+        );
     }
 
     #[test]

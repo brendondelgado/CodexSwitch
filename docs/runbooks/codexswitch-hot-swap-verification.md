@@ -566,7 +566,15 @@ The daemon may use a slower normal polling interval while the active account has
 
 When the user-visible status would round remaining quota to `1%`, or when any hard runtime usage-limit signal appears, it must rotate before the next user request depends on that exhausted account.
 
-Inactive accounts need a separate upgrade-watch cadence because plan purchases happen out-of-band while CodexSwitch is already running. Any inactive account below Pro is re-polled at least every `15s`; if either window is exhausted, it is re-polled every `5s`. When the Mac app detects a plan-type change, it also asks the configured Linux devbox to poll that same account immediately so both stores converge without waiting for the next VPS daemon tick.
+Inactive accounts need a separate upgrade watch because plan purchases happen
+out-of-band while CodexSwitch is already running. On a healthy no-rotation tick,
+the daemon probes at most one due inactive account and selects it with a stable,
+fair rotation across polling buckets. A timeout or transient failure leaves the
+old freshness timestamp unchanged. This bound prevents a large inactive pool
+from delaying the next active-account safety poll. Once a swap or plan upgrade
+is actually required, candidate refresh is exhaustive before ranking. When the
+Mac app detects a plan-type change, it also asks the configured Linux devbox to
+poll that same account immediately instead of waiting for background rotation.
 
 ## Mac Menubar VPS Freshness
 
@@ -658,7 +666,9 @@ Every future hot-swap change must include tests for:
   descriptor-anchored generation CAS, exact readback, symlink rejection, and
   concurrent-writer manual-review preservation.
 - Active quota at or below 5% uses 2-second polling, at or below 2% uses 1-second polling, and quota displayed as `1%` rotates immediately.
-- Inactive below-Pro accounts are re-polled for out-of-band plan upgrades within 15 seconds, and exhausted below-Pro accounts within 5 seconds.
+- A healthy daemon tick performs no more than one due inactive maintenance
+  probe, rotates that opportunity fairly, preserves freshness on failure, and
+  still refreshes every required candidate before a swap decision.
 - Mac plan changes trigger a safe `codexswitch-cli poll <account>` on the configured Linux devbox without transferring or logging secrets.
 - Mac menubar active-account display follows VPS account-state within a few seconds while a Codex.app or CLI `--remote` VPS session is active.
 - Desktop discovery and updates cover `/Applications/ChatGPT.app` and the legacy `/Applications/Codex.app` without maintaining divergent path constants.

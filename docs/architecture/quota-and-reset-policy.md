@@ -7,6 +7,7 @@ toc:
   - Quota Model
   - Weekly-only Operation
   - Account Usability
+  - Background Polling
   - Candidate Ranking
   - Banked Reset Policy
   - Durable Redemption
@@ -20,6 +21,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/RateLimitResetService.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../crates/codexswitch-cli/src/quota.rs
+  - ../../crates/codexswitch-cli/src/daemon.rs
   - ../../crates/codexswitch-cli/src/rate_limit_resets.rs
   - ../codexswitch-banked-resets.md
   - ../codexswitch-quota-priming.md
@@ -80,6 +82,19 @@ Unknown and stale accounts are observable but cannot outrank confirmed usable ac
 The switching and reset paths share the same candidate eligibility and deterministic ranking implementation. Semantic entry points may narrow that common candidate set, for example to higher plan tiers, but must not reimplement freshness, usability, or ordering.
 
 Reset conservation evaluates every immediately usable account, including the active account. Switching may exclude the active account because it cannot be its own destination, but that exclusion must not hide usable capacity when deciding whether another account may spend a reset.
+
+## Background Polling
+
+The active account is always the first quota observation on a healthy daemon
+tick. Background maintenance must not delay that safety check by polling every
+stale inactive account serially.
+
+When the active account remains usable and no cached plan upgrade requires a
+rotation, a tick may probe at most one due inactive account. Selection is
+deterministic and fair across successive polling buckets, and a failed probe
+does not advance that account's quota freshness. A required rotation is
+different: before ranking a destination, CodexSwitch refreshes every candidate
+whose current observation cannot safely authorize selection.
 
 ## Candidate Ranking
 

@@ -369,6 +369,7 @@ fn daemon_is_running_via_ps() -> Result<bool> {
     ))
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
 fn ps_output_has_codexswitch_daemon(ps_output: &str, current_uid: u32, current_pid: i32) -> bool {
     ps_output.lines().any(|line| {
         let Some((pid_text, rest)) = split_first_ps_field(line) else {
@@ -389,6 +390,7 @@ fn ps_output_has_codexswitch_daemon(ps_output: &str, current_uid: u32, current_p
     })
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
 fn split_first_ps_field(input: &str) -> Option<(&str, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {

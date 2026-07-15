@@ -1,5 +1,6 @@
 #[cfg(test)]
 use crate::auth::auth_file_fingerprint;
+#[cfg(not(target_os = "linux"))]
 use crate::bounded_command;
 use anyhow::{bail, Context, Result};
 #[cfg(not(target_os = "linux"))]
@@ -14,6 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -114,6 +116,7 @@ const HOT_SWAP_ARTIFACT_RETENTION: HotSwapArtifactRetention = HotSwapArtifactRet
     max_scan_time: HOT_SWAP_ARTIFACT_MAX_SCAN_TIME,
     max_metadata_bytes: HOT_SWAP_ARTIFACT_MAX_METADATA_BYTES,
 };
+#[cfg(not(target_os = "linux"))]
 const PS_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 static HOT_SWAP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
