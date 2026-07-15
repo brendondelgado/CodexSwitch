@@ -761,6 +761,42 @@ struct LinuxDevboxMonitorTests {
         ))
     }
 
+    @Test("remote command envelope preserves heredoc terminators and completion proof")
+    func remoteCommandEnvelopePreservesHeredocs() {
+        let command = """
+        python3 - <<'PY'
+        import json
+        print(json.dumps({"active": "vps-account"}, separators=(",", ":")))
+        PY
+        """
+        let result = LinuxDevboxMonitor.runSSHWithCandidates(
+            [["fixture"]],
+            remoteCommand: command,
+            timeout: 5,
+            retryPolicy: .readOnly,
+            executionToken: "heredoc-fixture"
+        ) { _, arguments, timeout in
+            guard let envelope = arguments.last else {
+                return ProcessRunResult(
+                    terminationStatus: -1,
+                    stdout: Data(),
+                    stderr: Data("missing envelope".utf8),
+                    timedOut: false
+                )
+            }
+            return ProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", envelope],
+                timeout: timeout
+            )
+        }
+
+        #expect(result.terminationStatus == 0)
+        #expect(!result.timedOut)
+        #expect(result.stdoutString == "{\"active\":\"vps-account\"}\n")
+        #expect(result.stderrString.isEmpty)
+    }
+
     @Test("poll is treated as mutating because it persists account state")
     func pollUsesMutatingRetryPolicy() {
         #expect(LinuxDevboxMonitor.pollAccountRetryPolicy == .preExecutionTransportOnly)

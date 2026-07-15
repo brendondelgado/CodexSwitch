@@ -867,13 +867,11 @@ enum LinuxDevboxMonitor {
         let executionMarker = remoteExecutionMarker(executionToken: executionToken)
         let completionMarker = remoteCompletionMarker(executionToken: executionToken)
         for (index, candidate) in candidates.enumerated() {
-            let markedCommand = """
-            printf '%s\\n' \(shellQuote(executionMarker)) >&2
-            ( \(remoteCommand) )
-            codexswitch_remote_status=$?
-            printf '%s %s\\n' \(shellQuote(completionMarker)) "$codexswitch_remote_status" >&2
-            exit "$codexswitch_remote_status"
-            """
+            let markedCommand = remoteCommandEnvelope(
+                remoteCommand: remoteCommand,
+                executionMarker: executionMarker,
+                completionMarker: completionMarker
+            )
             let arguments = candidate + [markedCommand]
             let rawResult = runner(URL(fileURLWithPath: "/usr/bin/ssh"), arguments, timeout)
             let result = removingRemoteExecutionMarkers(
@@ -925,6 +923,20 @@ enum LinuxDevboxMonitor {
 
     static func remoteCompletionMarker(executionToken: String) -> String {
         "\(remoteCompletionMarkerPrefix)\(executionToken)__"
+    }
+
+    static func remoteCommandEnvelope(
+        remoteCommand: String,
+        executionMarker: String,
+        completionMarker: String
+    ) -> String {
+        """
+        printf '%s\\n' \(shellQuote(executionMarker)) >&2
+        /bin/sh -c \(shellQuote(remoteCommand))
+        codexswitch_remote_status=$?
+        printf '%s %s\\n' \(shellQuote(completionMarker)) "$codexswitch_remote_status" >&2
+        exit "$codexswitch_remote_status"
+        """
     }
 
     static func isDefiniteLocalProcessLaunchFailure(_ result: ProcessRunResult) -> Bool {

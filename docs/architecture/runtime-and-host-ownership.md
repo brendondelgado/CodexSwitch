@@ -520,6 +520,10 @@ actor boundary on every supported Swift 6 toolchain.
 `codex-vps` provides a short, reliable operator path while preserving explicit behavior:
 
 - `--check` observes transport, authentication, service health, and version provenance.
+- Mac-to-VPS observation commands run as one shell-quoted `/bin/sh -c` child
+  inside the execution-marker envelope. The envelope never appends grouping
+  syntax directly to a command body, because doing so can corrupt heredoc
+  terminators and hide an otherwise successful command's completion marker.
 - Status and help do not install packages, start services, create tunnels unnecessarily, or rewrite thread state.
 - Thread UUIDs are validated before network or persistence use.
 - Automatic thread healing is retired; repair is an explicit lease-backed operation.
