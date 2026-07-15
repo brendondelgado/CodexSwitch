@@ -288,6 +288,13 @@ Supported reload mechanisms are ordered by runtime capability:
 2. Verified Codex CLI/app-server SIGHUP implementation with request/ack evidence.
 3. Explicit operator restart when the running version lacks a safe reload contract.
 
+On Linux, both account-bearing app-server modes are reload targets: the
+repository-owned WebSocket service and the built-in SSH remote daemon listening
+on `unix://`. A `codex app-server proxy` process only transports a client to an
+app-server and is never a credential owner or signal target. Runtime convergence
+requires acknowledgements from every discovered account-bearing listener, so a
+successful port-8390 reload cannot conceal a stale ChatGPT SSH daemon.
+
 The desktop reload client owns one admitted transaction: JSON-RPC submission,
 identity readback, and its strict acknowledgement all use the same discovery and
 admission. AppDelegate never follows that result with an independent desktop
@@ -474,6 +481,9 @@ actor boundary on every supported Swift 6 toolchain.
 
 - One Rust coordinator owns automatic VPS account activation.
 - The CLI and daemon share domain functions; they do not implement independent rotation policies.
+- The port-8390 WebSocket service and the built-in SSH `unix://` app-server are
+  separate account-bearing runtimes. Both participate in discovery and verified
+  reload whenever they are running; `app-server proxy` helpers never do.
 - Service status is readable without starting the service.
 - Remote usage aggregation preserves the model identity supplied by runtime
   evidence. Missing model evidence is reported as `unknown`; it is never

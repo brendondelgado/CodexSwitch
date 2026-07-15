@@ -1644,12 +1644,6 @@ pub fn is_codex_app_server_command_line(command_line: &str) -> bool {
     if app_server_args.first().is_some_and(|arg| *arg == "proxy") {
         return false;
     }
-    if app_server_args
-        .windows(2)
-        .any(|window| window[0] == "--listen" && window[1].starts_with("unix://"))
-    {
-        return false;
-    }
     true
 }
 
@@ -1915,7 +1909,7 @@ mod tests {
         assert!(is_codex_app_server_command_line(
             "/Applications/ChatGPT.app/Contents/Resources/codex app-server --analytics-default-enabled"
         ));
-        assert!(!is_codex_app_server_command_line(
+        assert!(is_codex_app_server_command_line(
             "/home/me/.local/share/codexswitch/patched-codex/codex app-server --listen unix://"
         ));
         assert!(!is_codex_app_server_command_line(
@@ -1938,6 +1932,31 @@ mod tests {
         ));
         assert!(is_codex_cli_command_line(
             "/home/me/.npm/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex/codex"
+        ));
+    }
+
+    #[test]
+    fn built_in_ssh_daemon_is_a_reload_target_but_its_proxy_is_not() {
+        let command_line = "/home/signul/.local/share/codexswitch/patched-codex/codex -c features.code_mode_host=true app-server --listen unix://";
+        assert!(is_codex_app_server_command_line(command_line));
+        assert_eq!(
+            hot_swap_runtime_kind(&CodexProcess {
+                pid: 42,
+                owner_uid: 1001,
+                start_identity: "linux:123".to_string(),
+                started_at_unix: 1,
+                command_line: command_line.to_string(),
+                executable: PathBuf::from(
+                    "/home/signul/.local/share/codexswitch/patched-codex/codex",
+                ),
+            }),
+            Some(HotSwapRuntimeKind::ExternalAppServer)
+        );
+        assert!(!is_codex_app_server_command_line(
+            "/home/signul/.local/share/codexswitch/patched-codex/codex app-server proxy"
+        ));
+        assert!(!is_codex_app_server_command_line(
+            "/home/signul/.local/share/codexswitch/patched-codex/codex app-server proxy --sock /tmp/control.sock"
         ));
     }
 
@@ -2390,6 +2409,7 @@ mod tests {
     #[test]
     fn sighup_request_writes_nested_v3_binding_to_pid_json() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
         let request_path = dir.path().join("hotswap-request/42.json");
         let auth_path = dir.path().join("custom/auth.json");
         let executable = dir.path().join("runtime/codex");

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INSTALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCHER_MAX_BYTES: u64 = 1024 * 1024;
@@ -858,8 +858,8 @@ mod tests {
     fn codex_build_command_is_single_job_bounded_and_timeout_owns_the_writer() {
         let command = codex_build_command();
 
-        assert_eq!(BUILD_COMMAND_TIMEOUT, Duration::from_secs(10 * 60));
-        assert!(BUILD_COMMAND_TIMEOUT < Duration::from_secs(30 * 60));
+        assert_eq!(BUILD_COMMAND_TIMEOUT, Duration::from_secs(30 * 60));
+        assert!(BUILD_COMMAND_TIMEOUT < Duration::from_secs(75 * 60));
         assert!(command.contains("CARGO_BUILD_JOBS=1"));
         assert!(!command.contains("CARGO_BUILD_JOBS:-"));
         assert!(command.contains("CODEXSWITCH_BUILD_NICE=\"${CODEXSWITCH_BUILD_NICE:-10}\""));

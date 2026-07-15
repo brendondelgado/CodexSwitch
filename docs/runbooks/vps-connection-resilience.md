@@ -126,7 +126,7 @@ wire example.
 ## Updater Runtime Gate
 
 Automatic patched-Codex updates on Linux may check metadata and prepare one
-source build with one Cargo job and a ten-minute build deadline. The bounded
+source build with one Cargo job and a 30-minute build deadline. The bounded
 build shell replaces itself with the resource-limited Cargo process in a
 dedicated process group, so a timeout kills and reaps Cargo and its compiler
 descendants before bounded, idempotent target cleanup. A persistent cleanup
