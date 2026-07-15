@@ -160,7 +160,7 @@ Build execution runs in a transient user systemd scope with explicit
 `MemoryHigh`, `MemoryMax`, and `MemorySwapMax`, in addition to one Cargo job,
 niceness, and idle IO. Before building, the installer checks available bytes
 and current build-root use. It rechecks build-root and staged-release maximums
-before publication. The repository Cargo build has a hard 30-minute deadline
+before publication. The repository Cargo build has a hard 60-minute deadline
 and runs in both a named user scope and a dedicated process group under a
 subreaping owner. Timeout or an unexpectedly surviving writer kills the whole
 scope and process group, reaps descendants, and records local reap proof before
@@ -370,7 +370,7 @@ CODEX_AUTO_UPDATE status=failed backoff_hours=6 reason=also failed to clean upda
 ```
 
 Automatic macOS work is metadata-only, so it never enters that local build
-path. Explicit source preparation has a 30-minute maximum and one Cargo job.
+path. Explicit source preparation has a 60-minute maximum and one Cargo job.
 The bounded child must replace its shell with the resource-limited Cargo
 command and run in a dedicated process group. Timeout termination kills and
 reaps that group, including compiler descendants that can write `target`; no
