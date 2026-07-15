@@ -41,6 +41,7 @@ const INACTIVE_EXHAUSTED_PLAN_UPGRADE_POLL_SECONDS: u64 = 5;
 const INACTIVE_PLAN_UPGRADE_POLL_SECONDS: u64 = 15;
 const INACTIVE_MISSING_QUOTA_POLL_SECONDS: u64 = 30;
 const DEGRADED_ACTIVATION_RETRY_SECONDS: u64 = 60;
+const DEGRADED_ACTIVATION_INACTIVE_QUOTA_POLL_LIMIT: usize = 4;
 const UNIX_TO_SWIFT_REFERENCE_SECONDS: f64 = 978_307_200.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +443,16 @@ where
     if let Some(outcome) = reconcile_pending_activation_unlocked(store_path, auth_path, &reload_fn)?
     {
         if let Some(tick) = pending_activation_tick(&outcome, base_interval) {
+            if outcome.state == ActivationState::CommittedDegraded {
+                if let Err(error) = refresh_quota_observations_during_activation_barrier(
+                    store_path,
+                    &fetch_quota_fn,
+                ) {
+                    eprintln!(
+                        "warning: degraded activation quota maintenance was skipped: {error:#}"
+                    );
+                }
+            }
             return Ok(tick);
         }
         require_confirmed_activation(outcome)?;
@@ -833,6 +844,110 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+fn refresh_quota_observations_during_activation_barrier<F>(
+    store_path: &Path,
+    fetch_quota_fn: &F,
+) -> Result<()>
+where
+    F: Fn(&CodexAccount) -> Result<FetchResult>,
+{
+    refresh_quota_observations_during_activation_barrier_at(store_path, fetch_quota_fn, Utc::now())
+}
+
+fn refresh_quota_observations_during_activation_barrier_at<F>(
+    store_path: &Path,
+    fetch_quota_fn: &F,
+    now: chrono::DateTime<Utc>,
+) -> Result<()>
+where
+    F: Fn(&CodexAccount) -> Result<FetchResult>,
+{
+    let (snapshot, expected_target) = {
+        let store_lock = lock_account_store(store_path)?;
+        let record = read_activation_record(&store_lock)?
+            .context("degraded activation record disappeared before quota maintenance")?;
+        if record.state != ActivationState::CommittedDegraded {
+            bail!("activation is no longer committed-degraded; skipping quota maintenance");
+        }
+        (store_lock.load()?, record.target_account_id)
+    };
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let active_index = accounts
+        .iter()
+        .position(|account| account.is_active)
+        .context("no active account in store during degraded quota maintenance")?;
+    if accounts[active_index].account_id != expected_target {
+        bail!("degraded activation target no longer matches the active account");
+    }
+    let inactive_indices = degraded_activation_inactive_quota_indices(&accounts, now);
+
+    let mut indices = Vec::with_capacity(1 + inactive_indices.len());
+    indices.push(active_index);
+    indices.extend(inactive_indices);
+
+    let mut changed = false;
+    for index in indices {
+        match fetch_quota_fn(&accounts[index]) {
+            Ok(result) => {
+                apply_fetch_result(&mut accounts[index], result);
+                changed = true;
+            }
+            Err(error) => eprintln!(
+                "warning: observational quota poll failed during degraded activation for {}: {error:#}",
+                accounts[index].email
+            ),
+        }
+    }
+    if changed {
+        let store_lock = lock_account_store(store_path)?;
+        let current = store_lock.load()?;
+        if current.generation != generation {
+            bail!("account store changed during degraded quota maintenance");
+        }
+        let record = read_activation_record(&store_lock)?
+            .context("degraded activation record disappeared during quota maintenance")?;
+        if record.state != ActivationState::CommittedDegraded
+            || record.target_account_id != expected_target
+        {
+            bail!("activation changed during degraded quota maintenance");
+        }
+        commit_accounts(&store_lock, &mut generation, &accounts)?;
+    }
+    Ok(())
+}
+
+fn degraded_activation_inactive_quota_indices(
+    accounts: &[CodexAccount],
+    now: chrono::DateTime<Utc>,
+) -> Vec<usize> {
+    let mut eligible = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, account)| should_probe_inactive_account(account, now))
+        .collect::<Vec<_>>();
+    eligible.sort_unstable_by(|(_, left), (_, right)| {
+        right
+            .plan_priority()
+            .cmp(&left.plan_priority())
+            .then_with(|| left.account_id.cmp(&right.account_id))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    let count = eligible.len();
+    let width = count.min(DEGRADED_ACTIVATION_INACTIVE_QUOTA_POLL_LIMIT);
+    let bucket = now
+        .timestamp()
+        .div_euclid(DEGRADED_ACTIVATION_RETRY_SECONDS as i64)
+        .rem_euclid(count as i64) as usize;
+    let start = bucket.saturating_mul(DEGRADED_ACTIVATION_INACTIVE_QUOTA_POLL_LIMIT) % count;
+    (0..width)
+        .map(|offset| eligible[(start + offset) % count].0)
+        .collect()
 }
 
 fn refresh_inactive_watch_account<F, T>(
@@ -1744,6 +1859,232 @@ mod tests {
     }
 
     #[test]
+    fn degraded_barrier_quota_maintenance_is_observational() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let mut active = account("active@example.com", true, 10.0, 10.0);
+        let mut fallback = account("fallback@example.com", false, 0.0, 0.0);
+        let stale_at = Utc::now()
+            - crate::account_store::QUOTA_OBSERVATION_MAX_AGE
+            - ChronoDuration::milliseconds(1);
+        active.quota_snapshot.as_mut().unwrap().fetched_at = stale_at;
+        fallback.quota_snapshot.as_mut().unwrap().fetched_at = stale_at;
+        save_accounts(&store_path, &[active, fallback])?;
+        let first_tick = run_once_report_with(
+            &store_path,
+            &auth_path,
+            Duration::ZERO,
+            ready_fetch,
+            |_| Ok(()),
+            |_| {
+                Ok(ReloadSummary {
+                    skipped: vec![(42, "ack timeout".to_string())],
+                    ..ReloadSummary::default()
+                })
+            },
+        )?;
+        assert_eq!(
+            first_tick.next_interval,
+            Duration::from_secs(DEGRADED_ACTIVATION_RETRY_SECONDS)
+        );
+        let mut original = load_accounts(&store_path)?;
+        for account in &mut original {
+            account.quota_snapshot.as_mut().unwrap().fetched_at = stale_at;
+            account.last_refreshed = None;
+        }
+        save_accounts(&store_path, &original)?;
+        let auth_before = std::fs::read(&auth_path)?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed_calls = Arc::clone(&calls);
+
+        refresh_quota_observations_during_activation_barrier(&store_path, &move |account| {
+            observed_calls.lock().unwrap().push(account.email.clone());
+            let mut result = ready_fetch(account)?;
+            result.snapshot.weekly_mut().unwrap().used_percent = 25.0;
+            Ok(result)
+        })?;
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "active@example.com".to_string(),
+                "fallback@example.com".to_string()
+            ]
+        );
+        assert_eq!(std::fs::read(&auth_path)?, auth_before);
+        let stored = load_accounts(&store_path)?;
+        assert_eq!(
+            active_account(&stored).map(|account| account.email.as_str()),
+            Some("active@example.com")
+        );
+        for (before, after) in original.iter().zip(&stored) {
+            assert_eq!(after.access_token, before.access_token);
+            assert_eq!(after.refresh_token, before.refresh_token);
+            assert_eq!(after.id_token, before.id_token);
+            assert_eq!(after.account_id, before.account_id);
+            assert_eq!(
+                quota_availability_at(after, Utc::now()),
+                QuotaAvailability::Usable
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn degraded_barrier_inactive_quota_maintenance_is_bounded_and_fair() {
+        const INACTIVE_COUNT: usize = 9;
+        let bucket_seconds = DEGRADED_ACTIVATION_RETRY_SECONDS as i64;
+        let first_bucket = Utc::now().timestamp().div_euclid(bucket_seconds);
+        let first_time =
+            chrono::DateTime::<Utc>::from_timestamp(first_bucket * bucket_seconds, 0).unwrap();
+        let stale_at = first_time
+            - crate::account_store::QUOTA_OBSERVATION_MAX_AGE
+            - ChronoDuration::milliseconds(1);
+        let mut accounts = vec![account("active@example.com", true, 10.0, 10.0)];
+        for index in 0..INACTIVE_COUNT {
+            let mut inactive = account(
+                &format!("inactive-{index:02}@example.com"),
+                false,
+                10.0,
+                10.0,
+            );
+            inactive.quota_snapshot.as_mut().unwrap().fetched_at = stale_at;
+            inactive.last_refreshed = None;
+            accounts.push(inactive);
+        }
+
+        let mut visited = Vec::new();
+        for offset in 0..3 {
+            let selected = degraded_activation_inactive_quota_indices(
+                &accounts,
+                first_time + ChronoDuration::seconds(bucket_seconds * offset),
+            );
+            assert_eq!(
+                selected.len(),
+                DEGRADED_ACTIVATION_INACTIVE_QUOTA_POLL_LIMIT
+            );
+            visited.extend(
+                selected
+                    .into_iter()
+                    .map(|index| accounts[index].email.clone()),
+            );
+            // Leaving every snapshot unchanged models a full failed-probe pass.
+        }
+        visited.sort_unstable();
+        visited.dedup();
+        assert_eq!(visited.len(), INACTIVE_COUNT);
+    }
+
+    #[test]
+    fn degraded_quota_generation_race_preserves_newer_store_and_backoff() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        save_accounts(
+            &store_path,
+            &[
+                account("active@example.com", true, 10.0, 10.0),
+                account("fallback@example.com", false, 0.0, 0.0),
+            ],
+        )?;
+
+        let first_tick = run_once_report_with(
+            &store_path,
+            &auth_path,
+            Duration::ZERO,
+            ready_fetch,
+            |_| Ok(()),
+            |_| {
+                Ok(ReloadSummary {
+                    skipped: vec![(42, "ack timeout".to_string())],
+                    ..ReloadSummary::default()
+                })
+            },
+        )?;
+        assert_eq!(
+            first_tick.next_interval,
+            Duration::from_secs(DEGRADED_ACTIVATION_RETRY_SECONDS)
+        );
+
+        let raced = Arc::new(Mutex::new(false));
+        let raced_for_fetch = Arc::clone(&raced);
+        let race_store_path = store_path.clone();
+        let refresh_calls = Arc::new(Mutex::new(0usize));
+        let reset_bank_calls = Arc::new(Mutex::new(0usize));
+        let reset_consume_calls = Arc::new(Mutex::new(0usize));
+        let tick = run_once_report_with_resets(
+            DaemonTickContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                base_interval: Duration::from_secs(5),
+                consume_banked_resets: false,
+            },
+            DaemonTickDependencies::new(
+                move |account| {
+                    let mut raced = raced_for_fetch.lock().unwrap();
+                    if !*raced {
+                        let mut concurrent = load_accounts(&race_store_path)?;
+                        concurrent[0].subscription_will_renew = Some(false);
+                        save_accounts(&race_store_path, &concurrent)?;
+                        *raced = true;
+                    }
+                    ready_fetch(account)
+                },
+                {
+                    let calls = Arc::clone(&refresh_calls);
+                    move |_| {
+                        *calls.lock().unwrap() += 1;
+                        Ok(())
+                    }
+                },
+                {
+                    let calls = Arc::clone(&reset_bank_calls);
+                    move |_| {
+                        *calls.lock().unwrap() += 1;
+                        Ok(reset_bank(0, Utc::now()))
+                    }
+                },
+                {
+                    let calls = Arc::clone(&reset_consume_calls);
+                    move |_account, _bank, _request_id| {
+                        *calls.lock().unwrap() += 1;
+                        bail!("reset consumption must remain unreachable")
+                    }
+                },
+                |_| {
+                    Ok(ReloadSummary {
+                        skipped: vec![(42, "ack timeout".to_string())],
+                        ..ReloadSummary::default()
+                    })
+                },
+            ),
+        )?;
+
+        assert_eq!(
+            tick.next_interval,
+            Duration::from_secs(DEGRADED_ACTIVATION_RETRY_SECONDS)
+        );
+        assert!(!tick.allow_ack_bootstrap);
+        assert!(*raced.lock().unwrap());
+        assert_eq!(*refresh_calls.lock().unwrap(), 0);
+        assert_eq!(*reset_bank_calls.lock().unwrap(), 0);
+        assert_eq!(*reset_consume_calls.lock().unwrap(), 0);
+        let stored = load_accounts(&store_path)?;
+        assert_eq!(
+            active_account(&stored).map(|account| account.email.as_str()),
+            Some("active@example.com")
+        );
+        assert_eq!(stored[0].subscription_will_renew, Some(false));
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            read_activation_record(&store_lock)?.unwrap().state,
+            ActivationState::CommittedDegraded
+        );
+        Ok(())
+    }
+
+    #[test]
     fn degraded_activation_stays_degraded_until_a_later_verified_ack() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
@@ -1786,6 +2127,7 @@ mod tests {
                 .state,
             crate::activation::ActivationState::CommittedDegraded
         );
+        let generation_after_first = store_lock.load()?.generation;
         drop(store_lock);
 
         let second_tick = run_once_report_with(
@@ -1815,6 +2157,7 @@ mod tests {
                 .state,
             crate::activation::ActivationState::CommittedDegraded
         );
+        assert_ne!(store_lock.load()?.generation, generation_after_first);
         drop(store_lock);
 
         let converged = run_once_report_with(
@@ -2306,7 +2649,7 @@ mod tests {
         let mut pro = account("stale-pro@example.com", false, 10.0, 10.0);
         pro.plan_type = Some("pro".to_string());
         pro.quota_snapshot.as_mut().unwrap().fetched_at =
-            now - crate::account_store::QUOTA_OBSERVATION_MAX_AGE;
+            now - crate::account_store::QUOTA_OBSERVATION_MAX_AGE - ChronoDuration::milliseconds(1);
         pro.last_refreshed = None;
 
         assert_eq!(quota_availability_at(&pro, now), QuotaAvailability::Unknown);

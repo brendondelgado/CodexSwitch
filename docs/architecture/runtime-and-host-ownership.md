@@ -323,6 +323,15 @@ must fail before quota polling, reset redemption, replacement selection, or a
 new activation report. Offline mode may create `FileOnly` only for the current
 request; it does not waive convergence of an older barrier.
 
+A typed `CommittedDegraded` barrier continues bounded observational quota GETs
+for the active account and a small set of due inactive accounts. This exception
+may update provider-derived quota, plan, subscription, and runtime-usability
+telemetry only. It receives no token-refresh,
+reset-redemption, auth-write, reload, or target-selection capability, and the
+barrier continues to block every account mutation until runtime convergence is
+confirmed. `FileOnly`, `ManualReview`, corrupt journal, and unreadable-state
+failures do not receive this observational exception.
+
 Activation ownership is bound to the stable provider account identifier, while
 the token fingerprint proves one observed credential generation. A normal token
 refresh may replace the complete access, refresh, and identity token set without

@@ -361,7 +361,7 @@ pub(crate) fn status(store_path: &Path) -> Result<()> {
     let accounts = load_accounts(store_path)?;
     for account in &accounts {
         let marker = if account.is_active { "*" } else { " " };
-        let quota_status = quota_status_fields(account.quota_snapshot.as_ref());
+        let quota_status = quota_status_fields(account.quota_snapshot.as_ref(), Utc::now());
         let reset_status = account
             .rate_limit_reset_bank
             .as_ref()
@@ -399,10 +399,13 @@ pub(crate) fn status(store_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn quota_status_fields(snapshot: Option<&QuotaSnapshot>) -> String {
+fn quota_status_fields(snapshot: Option<&QuotaSnapshot>, now: chrono::DateTime<Utc>) -> String {
     let Some(snapshot) = snapshot else {
         return "quota=?".to_string();
     };
+    if !snapshot.is_fresh_at(now) {
+        return "quota=stale".to_string();
+    }
     let mut fields = snapshot
         .ordered_windows()
         .into_iter()
@@ -1440,11 +1443,23 @@ mod tests {
             .windows
             .retain(|window| window.kind == QuotaWindowKind::Weekly);
 
-        let fields = quota_status_fields(weekly_only.quota_snapshot.as_ref());
+        let now = weekly_only.quota_snapshot.as_ref().unwrap().fetched_at;
+        let fields = quota_status_fields(weekly_only.quota_snapshot.as_ref(), now);
         assert_eq!(fields, "weekly=63%");
         assert!(!fields.contains("5h="));
 
-        assert_eq!(quota_status_fields(None), "quota=?");
+        assert_eq!(quota_status_fields(None, now), "quota=?");
+    }
+
+    #[test]
+    fn status_fields_label_stale_quota_instead_of_cached_full_capacity() {
+        let account = account("stale@example.com", false, 0.0, 0.0);
+        let snapshot = account.quota_snapshot.as_ref().unwrap();
+        let stale_at = snapshot.fetched_at
+            + crate::account_store::QUOTA_OBSERVATION_MAX_AGE
+            + chrono::Duration::milliseconds(1);
+
+        assert_eq!(quota_status_fields(Some(snapshot), stale_at), "quota=stale");
     }
 
     #[test]

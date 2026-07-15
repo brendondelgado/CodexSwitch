@@ -170,6 +170,8 @@ Reconciliation uses stable provider account identity so a changed local UUID can
 ## Presentation Rules
 
 - Render only observed windows.
+- Render an observation older than the runtime freshness contract as
+  `quota=stale`; never print its cached percentages as current capacity.
 - Label weekly-only operation through the meter itself; do not show an alarming missing-five-hour error.
 - Separate local Mac status from VPS status.
 - Separate remaining quota from reset inventory.

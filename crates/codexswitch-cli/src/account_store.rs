@@ -19,7 +19,7 @@ const AUTO_SWAP_DISPLAYED_ONE_PERCENT_THRESHOLD: f64 = 2.0;
 const RESET_TIE_FIVE_HOUR_TOLERANCE: f64 = 2.0;
 const RESET_TIE_WEEKLY_TOLERANCE: f64 = 5.0;
 const UNIX_TO_SWIFT_REFERENCE_SECONDS: i64 = 978_307_200;
-pub const QUOTA_OBSERVATION_MAX_AGE: ChronoDuration = ChronoDuration::minutes(2);
+pub const QUOTA_OBSERVATION_MAX_AGE: ChronoDuration = ChronoDuration::minutes(15);
 const ACCOUNT_STORE_FILE_MODE: u32 = 0o600;
 const ACCOUNT_STORE_DIRECTORY_MODE: u32 = 0o700;
 const ACCOUNT_STORE_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -477,9 +477,13 @@ impl QuotaSnapshot {
             .reduce(f64::min)
     }
 
-    pub fn availability_at(&self, now: DateTime<Utc>) -> QuotaAvailability {
+    pub fn is_fresh_at(&self, now: DateTime<Utc>) -> bool {
         let age = now.signed_duration_since(self.fetched_at);
-        if age < ChronoDuration::zero() || age >= QUOTA_OBSERVATION_MAX_AGE {
+        age >= ChronoDuration::zero() && age <= QUOTA_OBSERVATION_MAX_AGE
+    }
+
+    pub fn availability_at(&self, now: DateTime<Utc>) -> QuotaAvailability {
+        if !self.is_fresh_at(now) {
             return QuotaAvailability::Unknown;
         }
         if self.is_denied() || !self.blocking_windows().is_empty() {
@@ -2632,12 +2636,35 @@ mod tests {
         );
 
         let mut stale = account("stale@example.com", 20.0, 20.0, false);
-        stale.quota_snapshot.as_mut().unwrap().fetched_at = now - QUOTA_OBSERVATION_MAX_AGE;
+        stale.quota_snapshot.as_mut().unwrap().fetched_at =
+            now - QUOTA_OBSERVATION_MAX_AGE - ChronoDuration::milliseconds(1);
         assert_eq!(
             quota_availability_at(&stale, now),
             QuotaAvailability::Unknown
         );
         assert_eq!(score(&stale, now), -1.0);
+    }
+
+    #[test]
+    fn quota_freshness_includes_exact_boundary_and_rejects_outside_it() {
+        let now = Utc::now();
+        let mut account = account("freshness@example.com", 20.0, 20.0, false);
+        let snapshot = account.quota_snapshot.as_mut().unwrap();
+
+        snapshot.fetched_at = now - QUOTA_OBSERVATION_MAX_AGE + ChronoDuration::milliseconds(1);
+        assert!(snapshot.is_fresh_at(now));
+
+        snapshot.fetched_at = now - QUOTA_OBSERVATION_MAX_AGE;
+        assert!(snapshot.is_fresh_at(now));
+        assert_eq!(snapshot.availability_at(now), QuotaAvailability::Usable);
+
+        snapshot.fetched_at = now - QUOTA_OBSERVATION_MAX_AGE - ChronoDuration::milliseconds(1);
+        assert!(!snapshot.is_fresh_at(now));
+        assert_eq!(snapshot.availability_at(now), QuotaAvailability::Unknown);
+
+        snapshot.fetched_at = now + ChronoDuration::milliseconds(1);
+        assert!(!snapshot.is_fresh_at(now));
+        assert_eq!(snapshot.availability_at(now), QuotaAvailability::Unknown);
     }
 
     #[test]
