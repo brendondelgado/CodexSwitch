@@ -1,0 +1,24 @@
+Tests/CodexSwitchTests/LinuxDevboxMonitorTests.swift
+  s_70c8e194852bb5::t_fdf42309418756 764-799
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_fdf42309418756 870-874,928-939
+  s_70c8e194852bb5::t_2d5af5a8eaca2a 940-941
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_fdf42309418756 523-526
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "8dfb2ea1d1ab5c2612f53bad3a06997e20b6a06a",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
