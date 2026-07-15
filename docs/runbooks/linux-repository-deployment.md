@@ -370,16 +370,18 @@ CODEX_AUTO_UPDATE status=failed backoff_hours=6 reason=also failed to clean upda
 ```
 
 Automatic macOS work is metadata-only, so it never enters that local build
-path. Explicit source preparation has a 60-minute maximum and one Cargo job.
-The bounded child must replace its shell with the resource-limited Cargo
-command and run in a dedicated process group. Timeout termination kills and
-reaps that group, including compiler descendants that can write `target`; no
-descendant may continue refilling storage after the updater reports failure.
-Target cleanup treats an already-absent tree as success and
-retries a transient `Directory not empty` result a small bounded number of
-times. A persistent failure remains recorded as pending cleanup and is retried
-only by a preparation or maintenance operation, never by a metadata tick or
-detached cleanup task.
+path. Explicit source preparation uses one Cargo job and a three-hour runaway
+ceiling inside a four-hour outer watchdog. The bounded child must replace its
+shell with the resource-limited Cargo command and run in a dedicated process
+group. Timeout termination kills and reaps that group, including compiler
+descendants that can write `target`; no descendant may continue refilling
+storage after the updater reports failure. A same-version target is resumable
+only when its atomic provenance record matches the exact upstream commit,
+patched diff, and build recipe and is neither future-dated nor older than the
+source-retention bound. A bounded build failure refreshes and preserves that
+matching record. Missing, malformed, stale, or mismatched provenance triggers
+bounded target cleanup before another writer starts. Metadata ticks never run
+that cleanup or refill the target.
 
 The same incident window repeatedly logged
 `DESKTOP_UPDATE_STAGED version=5211 reason=periodic` from the legacy desktop

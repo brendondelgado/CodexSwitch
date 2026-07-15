@@ -49,7 +49,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-14
+  last_updated: 2026-07-15
 ---
 
 # Runtime And Host Ownership
@@ -344,6 +344,16 @@ not as v3 rotation evidence, and are never eligible for automatic repair.
 When a daemon tick rejects an activation barrier, the outer daemon loop must
 also skip auxiliary missing-ack bootstrap reloads for that tick; barrier failure
 is side-effect free across the complete production wrapper.
+The VPS daemon may hold the account-store lock only for a bounded read,
+generation revalidation, journal transition, or atomic commit. Provider quota
+requests, reset-inventory requests, token refresh, process discovery, signals,
+frontend delivery, and runtime acknowledgement waits all run without that
+lock. After any unlocked wait, the daemon reacquires the lock and requires the
+same store generation plus the same activation target and token fingerprint
+before committing. A `FileOnly` or `CommittedDegraded` result schedules runtime
+convergence no sooner than 60 seconds later and suppresses auxiliary ACK
+bootstrap for that iteration; it never immediately reacquires the store lock in
+a retry loop.
 An allowed missing-ack discovery attempt advances its monotonic 60-second
 cadence before probing, including when discovery finds no work or returns an
 error, so normal daemon polling cannot become a high-frequency process scan.

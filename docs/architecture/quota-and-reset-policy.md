@@ -26,7 +26,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-13
+  last_updated: 2026-07-15
 ---
 
 # Quota And Reset Policy
@@ -164,6 +164,13 @@ Reconciliation uses stable provider account identity so a changed local UUID can
   show the exhausted state and every observed natural-reset timestamp/countdown.
   A denial label must not discard usable recovery metadata.
 - Do not let a cached UI percentage override fresher runtime/API evidence.
+- Before rotating because of an apparent limit, poll the active account when
+  possible and persist the observation with its fetch time. A fresh provider
+  denial or typed runtime limit overrides an older cached 100-percent value;
+  the stale value must not keep an exhausted account selected.
+- Quota and reset-inventory network calls never hold the account-store lock.
+  Their results commit only after a generation recheck, so a slow poll cannot
+  block a manual swap and cannot overwrite a newer activation.
 
 ## Policy Examples
 

@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+// Single-job release builds have exceeded one hour on a contended 8-core host.
+pub(crate) const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 const INSTALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCHER_MAX_BYTES: u64 = 1024 * 1024;
@@ -296,17 +297,8 @@ pub fn build_codex(workspace: &Path) -> Result<PathBuf> {
         bail!("Codex Rust workspace not found at {}", workspace.display());
     }
     ensure_linux_build_prerequisites()?;
-    let build_status = bounded_command::status_inherited(
-        Command::new("bash")
-            .arg("-lc")
-            .arg(codex_build_command())
-            .current_dir(workspace),
-        BUILD_COMMAND_TIMEOUT,
-    )
-    .with_context(|| format!("failed to build Codex at {}", workspace.display()))?;
-    if !build_status.success() {
-        bail!("Codex build failed with {build_status}");
-    }
+    run_codex_build_command(workspace, codex_build_command(), BUILD_COMMAND_TIMEOUT)
+        .with_context(|| format!("failed to build Codex at {}", workspace.display()))?;
     let built_binary = workspace.join("target/release/codex");
     let built_code_mode_host = workspace.join("target/release/codex-code-mode-host");
     if !built_code_mode_host.is_file() {
@@ -322,6 +314,20 @@ pub fn build_codex(workspace: &Path) -> Result<PathBuf> {
         );
     }
     Ok(built_binary)
+}
+
+fn run_codex_build_command(workspace: &Path, script: &str, timeout: Duration) -> Result<()> {
+    let build_status = bounded_command::status_inherited(
+        Command::new("bash")
+            .arg("-lc")
+            .arg(script)
+            .current_dir(workspace),
+        timeout,
+    )?;
+    if !build_status.success() {
+        bail!("Codex build failed with {build_status}");
+    }
+    Ok(())
 }
 
 fn codex_build_command() -> &'static str {
@@ -340,6 +346,14 @@ fn codex_build_command() -> &'static str {
      CARGO_PROFILE_RELEASE_LTO=false \
      CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
      build_codex_with_limits"
+}
+
+pub(crate) fn build_recipe_fingerprint() -> String {
+    ring::digest::digest(&ring::digest::SHA256, codex_build_command().as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn launcher_script_for_runtime(patched_binary: &Path) -> Result<String> {
@@ -858,8 +872,7 @@ mod tests {
     fn codex_build_command_is_single_job_bounded_and_timeout_owns_the_writer() {
         let command = codex_build_command();
 
-        assert_eq!(BUILD_COMMAND_TIMEOUT, Duration::from_secs(60 * 60));
-        assert!(BUILD_COMMAND_TIMEOUT < Duration::from_secs(75 * 60));
+        assert_eq!(BUILD_COMMAND_TIMEOUT, Duration::from_secs(3 * 60 * 60));
         assert!(command.contains("CARGO_BUILD_JOBS=1"));
         assert!(!command.contains("CARGO_BUILD_JOBS:-"));
         assert!(command.contains("CODEXSWITCH_BUILD_NICE=\"${CODEXSWITCH_BUILD_NICE:-10}\""));
@@ -870,5 +883,32 @@ mod tests {
         assert!(command.contains("-p codex-code-mode-host"));
         assert!(command.contains("exec ionice -c 3 nice -n \"$CODEXSWITCH_BUILD_NICE\""));
         assert!(command.contains("exec nice -n \"$CODEXSWITCH_BUILD_NICE\""));
+        assert_eq!(build_recipe_fingerprint().len(), 64);
+    }
+
+    #[test]
+    fn timed_out_build_reaps_descendant_writer_before_retry_starts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let marker = temp.path().join("writer");
+        let first_writer = format!(
+            "(sleep 0.25; printf old > {}) & wait",
+            shell_quote(&marker.display().to_string())
+        );
+
+        let error = run_codex_build_command(temp.path(), &first_writer, Duration::from_millis(50))
+            .expect_err("the first writer must hit its bounded deadline");
+        assert!(format!("{error:#}").contains("deadline"));
+
+        run_codex_build_command(
+            temp.path(),
+            &format!(
+                "printf new > {}",
+                shell_quote(&marker.display().to_string())
+            ),
+            Duration::from_secs(1),
+        )?;
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(fs::read(&marker)?, b"new");
+        Ok(())
     }
 }

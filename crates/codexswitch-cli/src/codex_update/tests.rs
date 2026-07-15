@@ -32,6 +32,21 @@ mod tests {
             .unwrap()
     }
 
+    fn test_build_target_provenance(
+        version: &str,
+        source_fingerprint: &str,
+        recipe_fingerprint: &str,
+        refreshed_at: DateTime<Utc>,
+    ) -> BuildTargetProvenance {
+        BuildTargetProvenance {
+            schema_version: BUILD_TARGET_PROVENANCE_SCHEMA,
+            version: version.to_string(),
+            source_fingerprint: source_fingerprint.to_string(),
+            build_recipe_fingerprint: recipe_fingerprint.to_string(),
+            refreshed_at,
+        }
+    }
+
     fn linux_automatic_context(available_bytes: u64) -> AutomaticUpdateContext {
         AutomaticUpdateContext {
             platform: HostPlatform::Linux,
@@ -1504,7 +1519,7 @@ esac
     }
 
     #[test]
-    fn build_target_is_cleaned_after_failed_prepare_operation() -> Result<()> {
+    fn non_build_prepare_failure_still_cleans_target() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("codex-rs");
         let target = workspace.join("target");
@@ -1512,13 +1527,144 @@ esac
         fs::write(target.join("release/codex"), b"artifact")?;
 
         let error = run_with_build_target_cleanup(&workspace, || -> Result<()> {
-            bail!("simulated build failure")
+            bail!("simulated staging failure")
         })
         .expect_err("the simulated preparation must fail");
 
-        assert!(error.to_string().contains("simulated build failure"));
+        assert!(error.to_string().contains("simulated staging failure"));
         assert!(!target.exists());
         Ok(())
+    }
+
+    #[test]
+    fn bounded_build_failure_preserves_and_resumes_matching_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("codex-rs");
+        fs::create_dir_all(&workspace)?;
+        let target = workspace.join("target");
+        let started_at = automatic_update_test_time();
+        let failed_at = started_at + ChronoDuration::hours(2);
+        let retry_at = failed_at + ChronoDuration::hours(6);
+        let provenance = test_build_target_provenance(
+            "0.144.4",
+            "upstream-and-patch-a",
+            "build-recipe-a",
+            started_at,
+        );
+        let mut preserved = false;
+
+        let error = run_resumable_build_attempt(
+            &workspace,
+            &provenance,
+            &mut preserved,
+            || failed_at,
+            || -> Result<PathBuf> {
+                fs::create_dir_all(target.join("debug/deps"))?;
+                fs::write(target.join("debug/deps/resumable.rmeta"), b"cargo-progress")?;
+                bail!("simulated bounded build deadline")
+            },
+            |_| Ok(()),
+        )
+        .expect_err("the bounded build must fail");
+
+        assert!(preserved);
+        assert!(format!("{error:#}").contains("preserved resumable Cargo target"));
+        assert_eq!(
+            fs::read(target.join("debug/deps/resumable.rmeta"))?,
+            b"cargo-progress"
+        );
+        let mut retry = provenance.clone();
+        retry.refreshed_at = retry_at;
+        assert_eq!(
+            prepare_resumable_build_target_at(&workspace, &retry, retry_at)?,
+            BuildTargetPreparation::Resumed
+        );
+        assert_eq!(
+            fs::read(target.join("debug/deps/resumable.rmeta"))?,
+            b"cargo-progress"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn different_or_stale_target_provenance_is_replaced_before_build() -> Result<()> {
+        let now = automatic_update_test_time();
+        for (case, recorded, expected) in [
+            (
+                "version",
+                test_build_target_provenance("0.144.3", "source-a", "recipe-a", now),
+                test_build_target_provenance("0.144.4", "source-a", "recipe-a", now),
+            ),
+            (
+                "source",
+                test_build_target_provenance("0.144.4", "source-a", "recipe-a", now),
+                test_build_target_provenance("0.144.4", "source-b", "recipe-a", now),
+            ),
+            (
+                "recipe",
+                test_build_target_provenance("0.144.4", "source-a", "recipe-a", now),
+                test_build_target_provenance("0.144.4", "source-a", "recipe-b", now),
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let workspace = temp.path().join(case).join("codex-rs");
+            fs::create_dir_all(&workspace)?;
+            assert_eq!(
+                prepare_resumable_build_target_at(&workspace, &recorded, now)?,
+                BuildTargetPreparation::Created
+            );
+            fs::write(workspace.join("target/old-progress"), case.as_bytes())?;
+
+            assert_eq!(
+                prepare_resumable_build_target_at(&workspace, &expected, now)?,
+                BuildTargetPreparation::Replaced
+            );
+            assert!(!workspace.join("target/old-progress").exists());
+            assert_eq!(
+                load_build_target_provenance(&workspace.join("target"))?,
+                Some(expected)
+            );
+        }
+
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("stale/codex-rs");
+        fs::create_dir_all(&workspace)?;
+        let recorded = test_build_target_provenance("0.144.4", "source-a", "recipe-a", now);
+        prepare_resumable_build_target_at(&workspace, &recorded, now)?;
+        fs::write(workspace.join("target/stale-progress"), b"stale")?;
+        let stale_at = now
+            + ChronoDuration::from_std(SOURCE_TREE_MAX_AGE)
+                .expect("source retention age must fit chrono duration");
+        let mut expected = recorded;
+        expected.refreshed_at = stale_at;
+
+        assert_eq!(
+            prepare_resumable_build_target_at(&workspace, &expected, stale_at)?,
+            BuildTargetPreparation::Replaced
+        );
+        assert!(!workspace.join("target/stale-progress").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn patched_source_fingerprint_changes_with_each_provenance_component() {
+        let baseline = source_fingerprint_from_parts("0.144.4", b"commit-a", b"patch-a");
+        assert_eq!(
+            baseline,
+            source_fingerprint_from_parts("0.144.4", b"commit-a", b"patch-a")
+        );
+        assert_ne!(
+            baseline,
+            source_fingerprint_from_parts("0.144.5", b"commit-a", b"patch-a")
+        );
+        assert_ne!(
+            baseline,
+            source_fingerprint_from_parts("0.144.4", b"commit-b", b"patch-a")
+        );
+        assert_ne!(
+            baseline,
+            source_fingerprint_from_parts("0.144.4", b"commit-a", b"patch-b")
+        );
     }
 
     #[test]
@@ -3044,6 +3190,18 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         assert_eq!(
             background_update_args(&decision),
             ["prepare-codex-update", "--version", "0.145.0", "--json"]
+        );
+    }
+
+    #[test]
+    fn background_deadline_leaves_room_for_inner_build_kill_and_reap() {
+        let worst_case_checkout = SOURCE_COMMAND_TIMEOUT + SOURCE_COMMAND_TIMEOUT;
+        let fingerprint_and_staging_margin = Duration::from_secs(10 * 60);
+        assert!(
+            BACKGROUND_UPDATE_DEADLINE
+                >= patched_codex::BUILD_COMMAND_TIMEOUT
+                    + worst_case_checkout
+                    + fingerprint_and_staging_margin
         );
     }
 

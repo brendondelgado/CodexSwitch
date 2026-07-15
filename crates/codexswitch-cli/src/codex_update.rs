@@ -39,12 +39,35 @@ const UPDATE_LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 const UPDATE_LOG_MAX_COUNT: usize = 4;
 const UPDATE_LOG_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
 const UPDATE_LOG_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const BACKGROUND_UPDATE_DEADLINE: Duration = Duration::from_secs(75 * 60);
+// This must outlast checkout plus the inner build bound so Cargo is killed and reaped first.
+const BACKGROUND_UPDATE_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
 const BACKGROUND_UPDATE_MARKER: &str = "CODEXSWITCH_BOUNDED_BACKGROUND_UPDATE";
 const RUNTIME_START_INSTALL_GUARD: &str = "runtime-start-install.lock";
 const RUNTIME_INSTALL_JOURNAL: &str = "codex-runtime-install.json";
 const MACOS_LAUNCHER_INSTALL_JOURNAL: &str = "macos-runtime-activation.json";
 const BUILD_TARGET_CLEANUP_ATTEMPTS: usize = 3;
+const BUILD_TARGET_PROVENANCE_SCHEMA: u32 = 1;
+const BUILD_TARGET_PROVENANCE_FILE: &str = ".codexswitch-build-target.json";
+const BUILD_TARGET_PROVENANCE_MAX_BYTES: u64 = 16 * 1024;
+const SOURCE_FINGERPRINT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SOURCE_FINGERPRINT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct BuildTargetProvenance {
+    schema_version: u32,
+    version: String,
+    source_fingerprint: String,
+    build_recipe_fingerprint: String,
+    refreshed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildTargetPreparation {
+    Created,
+    Resumed,
+    Replaced,
+}
 
 include!("codex_update/state.rs");
 include!("codex_update/transaction.rs");
@@ -413,13 +436,30 @@ fn prepare_version_with_lock_held(version: &str) -> Result<CodexUpdateReport> {
     enforce_updater_retention_at(&state, &data_dir, SystemTime::now())?;
 
     let workspace = source_dir.join("codex-rs");
-    let result = run_with_build_target_cleanup(&workspace, || -> Result<()> {
+    let mut resumable_target_preserved = false;
+    let result = (|| -> Result<BuildTargetCleanupOutcome<()>> {
         checkout_stable_source(version, &source_dir)?;
         patch_codex_source(&source_dir)?;
-        let built_binary = patched_codex::build_codex(&workspace)?;
-        stage_and_validate_prepared_runtime(&built_binary, &prepared_dir, version)?;
-        Ok(())
-    });
+        let source_fingerprint = patched_source_fingerprint(version, &source_dir)?;
+        let provenance = BuildTargetProvenance {
+            schema_version: BUILD_TARGET_PROVENANCE_SCHEMA,
+            version: version.to_string(),
+            source_fingerprint,
+            build_recipe_fingerprint: patched_codex::build_recipe_fingerprint(),
+            refreshed_at: Utc::now(),
+        };
+        run_resumable_build_attempt(
+            &workspace,
+            &provenance,
+            &mut resumable_target_preserved,
+            Utc::now,
+            || patched_codex::build_codex(&workspace),
+            |built_binary| {
+                stage_and_validate_prepared_runtime(&built_binary, &prepared_dir, version)
+                    .map(|_| ())
+            },
+        )
+    })();
 
     match result {
         Ok(BuildTargetCleanupOutcome {
@@ -446,9 +486,12 @@ fn prepare_version_with_lock_held(version: &str) -> Result<CodexUpdateReport> {
         Err(error) => {
             state.status = UpdateStatus::Failed;
             state.error = Some(format!("{error:#}"));
-            if fs::symlink_metadata(workspace.join("target")).is_ok() {
+            if !resumable_target_preserved && fs::symlink_metadata(workspace.join("target")).is_ok()
+            {
                 state.cleanup_pending_target_path =
                     Some(workspace.join("target").display().to_string());
+            } else if resumable_target_preserved {
+                state.cleanup_pending_target_path = None;
             }
             if matches!(
                 fs::symlink_metadata(&prepared_dir),
@@ -485,6 +528,272 @@ fn prepare_version_with_lock_held(version: &str) -> Result<CodexUpdateReport> {
         );
     }
     Ok(report_from_state(state))
+}
+
+fn run_resumable_build_attempt<T>(
+    workspace: &Path,
+    provenance: &BuildTargetProvenance,
+    target_preserved_on_failure: &mut bool,
+    failure_time: impl FnOnce() -> DateTime<Utc>,
+    build: impl FnOnce() -> Result<T>,
+    consume: impl FnOnce(T) -> Result<()>,
+) -> Result<BuildTargetCleanupOutcome<()>> {
+    *target_preserved_on_failure = false;
+    prepare_resumable_build_target_at(workspace, provenance, provenance.refreshed_at)?;
+    let built = match build() {
+        Ok(built) => built,
+        Err(error) => {
+            let failed_at = failure_time();
+            match retain_resumable_build_target_after_failure(workspace, provenance, failed_at) {
+                Ok(true) => {
+                    *target_preserved_on_failure = true;
+                    return Err(error).context(format!(
+                        "preserved resumable Cargo target for Codex {} after bounded build failure",
+                        provenance.version
+                    ));
+                }
+                Ok(false) => return Err(error),
+                Err(cleanup_error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "also failed to validate or clean Cargo target after bounded build failure: {cleanup_error:#}"
+                        )
+                    })
+                }
+            }
+        }
+    };
+
+    run_with_build_target_cleanup(workspace, || consume(built))
+}
+
+fn patched_source_fingerprint(version: &str, source_dir: &Path) -> Result<String> {
+    let commit = bounded_git_output(
+        source_dir,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        4 * 1024,
+    )?;
+    let commit = std::str::from_utf8(&commit)
+        .context("upstream Codex commit fingerprint was not UTF-8")?
+        .trim();
+    if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("upstream Codex commit fingerprint was not a hexadecimal object id");
+    }
+    let diff = bounded_git_output(
+        source_dir,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--no-color",
+            "--binary",
+            "--full-index",
+            "HEAD",
+            "--",
+            ".",
+        ],
+        SOURCE_FINGERPRINT_MAX_BYTES,
+    )?;
+    let untracked = bounded_git_output(
+        source_dir,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        SOURCE_FINGERPRINT_MAX_BYTES,
+    )?;
+    if !untracked.is_empty() {
+        bail!("patched Codex source contains untracked files; refusing an incomplete fingerprint");
+    }
+    Ok(source_fingerprint_from_parts(
+        version,
+        commit.as_bytes(),
+        &diff,
+    ))
+}
+
+fn bounded_git_output(
+    source_dir: &Path,
+    arguments: &[&str],
+    max_stream_bytes: usize,
+) -> Result<Vec<u8>> {
+    let output = bounded_command::output(
+        Command::new("git").args(arguments).current_dir(source_dir),
+        SOURCE_FINGERPRINT_COMMAND_TIMEOUT,
+        max_stream_bytes,
+    )
+    .with_context(|| {
+        format!(
+            "failed to fingerprint Codex source at {}",
+            source_dir.display()
+        )
+    })?;
+    if !output.status.success() {
+        bail!(
+            "git source fingerprint command failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn source_fingerprint_from_parts(version: &str, commit: &[u8], diff: &[u8]) -> String {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    for component in [version.as_bytes(), commit, diff] {
+        digest.update(&(component.len() as u64).to_le_bytes());
+        digest.update(component);
+    }
+    digest
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn prepare_resumable_build_target_at(
+    workspace: &Path,
+    expected: &BuildTargetProvenance,
+    now: DateTime<Utc>,
+) -> Result<BuildTargetPreparation> {
+    let target = workspace.join("target");
+    let existed = fs::symlink_metadata(&target).is_ok();
+    if existed {
+        let reusable = fs::symlink_metadata(&target)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            && load_build_target_provenance(&target)?
+                .as_ref()
+                .is_some_and(|recorded| build_target_provenance_matches(recorded, expected, now));
+        if reusable {
+            let mut refreshed = expected.clone();
+            refreshed.refreshed_at = now;
+            write_build_target_provenance(&target, &refreshed)?;
+            return Ok(BuildTargetPreparation::Resumed);
+        }
+        clean_build_target(workspace)?;
+    }
+
+    fs::create_dir(&target).with_context(|| {
+        format!(
+            "failed to create resumable Cargo target {}",
+            target.display()
+        )
+    })?;
+    let mut created = expected.clone();
+    created.refreshed_at = now;
+    write_build_target_provenance(&target, &created)?;
+    Ok(if existed {
+        BuildTargetPreparation::Replaced
+    } else {
+        BuildTargetPreparation::Created
+    })
+}
+
+fn retain_resumable_build_target_after_failure(
+    workspace: &Path,
+    expected: &BuildTargetProvenance,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let target = workspace.join("target");
+    let reusable = fs::symlink_metadata(&target)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        && load_build_target_provenance(&target)?
+            .as_ref()
+            .is_some_and(|recorded| build_target_provenance_matches(recorded, expected, now));
+    if !reusable {
+        clean_build_target(workspace)?;
+        return Ok(false);
+    }
+
+    let mut refreshed = expected.clone();
+    refreshed.refreshed_at = now;
+    write_build_target_provenance(&target, &refreshed)?;
+    Ok(true)
+}
+
+fn build_target_provenance_matches(
+    recorded: &BuildTargetProvenance,
+    expected: &BuildTargetProvenance,
+    now: DateTime<Utc>,
+) -> bool {
+    let age = now.signed_duration_since(recorded.refreshed_at);
+    let max_age = ChronoDuration::from_std(SOURCE_TREE_MAX_AGE)
+        .expect("source retention age must fit chrono duration");
+    recorded.schema_version == BUILD_TARGET_PROVENANCE_SCHEMA
+        && recorded.version == expected.version
+        && recorded.source_fingerprint == expected.source_fingerprint
+        && recorded.build_recipe_fingerprint == expected.build_recipe_fingerprint
+        && age >= ChronoDuration::zero()
+        && age < max_age
+}
+
+fn load_build_target_provenance(target: &Path) -> Result<Option<BuildTargetProvenance>> {
+    let path = target.join(BUILD_TARGET_PROVENANCE_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > BUILD_TARGET_PROVENANCE_MAX_BYTES
+    {
+        return Ok(None);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(BUILD_TARGET_PROVENANCE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() as u64 > BUILD_TARGET_PROVENANCE_MAX_BYTES {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+fn write_build_target_provenance(target: &Path, provenance: &BuildTargetProvenance) -> Result<()> {
+    let encoded = serde_json::to_vec_pretty(provenance)?;
+    if encoded.len() as u64 > BUILD_TARGET_PROVENANCE_MAX_BYTES {
+        bail!("Cargo target provenance exceeds its byte limit");
+    }
+    let path = target.join(BUILD_TARGET_PROVENANCE_FILE);
+    let temporary = target.join(format!(
+        ".{BUILD_TARGET_PROVENANCE_FILE}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(&encoded)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temporary.display()))?;
+        fs::rename(&temporary, &path).with_context(|| {
+            format!(
+                "failed to atomically replace Cargo target provenance {}",
+                path.display()
+            )
+        })?;
+        fs::File::open(target)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync Cargo target {}", target.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 include!("codex_update/preparation.rs");

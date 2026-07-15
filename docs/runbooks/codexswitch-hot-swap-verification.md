@@ -146,6 +146,16 @@ runtime is reported as skipped or unacknowledged. Writing auth state is not a
 successful hot swap, and callers must be able to distinguish configured state
 from runtime convergence using the process exit status.
 
+If `swap` blocks while `lslocks` shows the daemon owning
+`accounts.json.lock`, inspect the daemon journal before retrying. Runtime ACK
+waits and provider polling must not own that lock. Repeating
+`CommittedDegraded` messages with zero verified ACKs indicate a convergence
+barrier, not permission to retry immediately; stop the faulty daemon, preserve
+the activation journal for evidence, and keep configured state distinct from
+the account actually loaded by the runtime. Confirm quota with a fresh poll
+before selecting a replacement, because a cached 100-percent observation can
+outlive the provider's real allowance.
+
 The desktop JSON-RPC fallback verifies `account/login/start` with a subsequent
 `account/read`. Codex 0.144.1 does not return `chatgptAccountId` from that read;
 it returns an optional ChatGPT email and plan. Verification therefore requires

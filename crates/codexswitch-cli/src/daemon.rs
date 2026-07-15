@@ -2,7 +2,8 @@ use crate::account_store::{
     active_account, commit_accounts, lock_account_store, mark_runtime_unusable,
     quota_availability_at, real_quota_snapshot, select_auto_swap_candidate_from_observations,
     select_plan_upgrade_candidate, select_plan_upgrade_candidate_from_observations,
-    usage_limit_runtime_block_until, CodexAccount, CurrentQuotaObservations, QuotaAvailability,
+    usage_limit_runtime_block_until, AccountStoreGeneration, AccountStoreLock,
+    AccountStoreSnapshot, CodexAccount, CurrentQuotaObservations, QuotaAvailability,
 };
 #[cfg(test)]
 use crate::account_store::{load_accounts, save_accounts};
@@ -39,12 +40,66 @@ const CRITICAL_QUOTA_FAST_POLL_SECONDS: u64 = 1;
 const INACTIVE_EXHAUSTED_PLAN_UPGRADE_POLL_SECONDS: u64 = 5;
 const INACTIVE_PLAN_UPGRADE_POLL_SECONDS: u64 = 15;
 const INACTIVE_MISSING_QUOTA_POLL_SECONDS: u64 = 30;
+const DEGRADED_ACTIVATION_RETRY_SECONDS: u64 = 60;
 const UNIX_TO_SWIFT_REFERENCE_SECONDS: f64 = 978_307_200.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DaemonTick {
     swapped: bool,
     next_interval: Duration,
+    allow_ack_bootstrap: bool,
+}
+
+impl DaemonTick {
+    fn settled(swapped: bool, next_interval: Duration) -> Self {
+        Self {
+            swapped,
+            next_interval,
+            allow_ack_bootstrap: true,
+        }
+    }
+
+    fn runtime_convergence_pending(base_interval: Duration) -> Self {
+        Self {
+            swapped: false,
+            next_interval: std::cmp::max(
+                base_interval,
+                Duration::from_secs(DEGRADED_ACTIVATION_RETRY_SECONDS),
+            ),
+            allow_ack_bootstrap: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ObservedReload {
+    Success(ReloadSummary),
+    Failure(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingActivationIdentity {
+    target_account_id: String,
+    auth_fingerprint: Option<String>,
+}
+
+impl ObservedReload {
+    fn capture<R>(auth_path: &Path, reload: &R) -> Self
+    where
+        R: Fn(&Path) -> Result<ReloadSummary>,
+    {
+        match reload(auth_path) {
+            Ok(summary) => Self::Success(summary),
+            Err(error) => Self::Failure(format!("{error:#}")),
+        }
+    }
+
+    fn replay(&self) -> Result<ReloadSummary> {
+        match self {
+            Self::Success(summary) => Ok(summary.clone()),
+            Self::Failure(error) => bail!("{error}"),
+        }
+    }
 }
 
 struct DaemonTickContext<'a> {
@@ -85,6 +140,193 @@ where
             reload,
         }
     }
+}
+
+fn load_store_snapshot(store_path: &Path) -> Result<AccountStoreSnapshot> {
+    let store_lock = lock_account_store(store_path)?;
+    store_lock.load()
+}
+
+fn commit_daemon_accounts(
+    store_path: &Path,
+    generation: &mut AccountStoreGeneration,
+    accounts: &[CodexAccount],
+) -> Result<()> {
+    let store_lock = lock_account_store(store_path)?;
+    commit_accounts(&store_lock, generation, accounts)
+}
+
+fn activation_state(store_path: &Path) -> Result<Option<ActivationState>> {
+    let store_lock = lock_account_store(store_path)?;
+    Ok(read_activation_record(&store_lock)?.map(|record| record.state))
+}
+
+fn pending_activation_identity(store_lock: &AccountStoreLock) -> Result<PendingActivationIdentity> {
+    let record = read_activation_record(store_lock)?
+        .context("activation record disappeared while preparing runtime convergence")?;
+    Ok(PendingActivationIdentity {
+        target_account_id: record.target_account_id,
+        auth_fingerprint: record.auth_fingerprint,
+    })
+}
+
+fn ensure_pending_activation_unchanged(
+    store_lock: &AccountStoreLock,
+    expected: &PendingActivationIdentity,
+) -> Result<()> {
+    let current = pending_activation_identity(store_lock)?;
+    if &current != expected {
+        bail!(
+            "activation target changed while runtime reload was in flight; preserving the newer activation"
+        );
+    }
+    Ok(())
+}
+
+fn reconcile_pending_activation_unlocked<R>(
+    store_path: &Path,
+    auth_path: &Path,
+    reload: &R,
+) -> Result<Option<ActivationOutcome>>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    let prepared = {
+        let store_lock = lock_account_store(store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let outcome = reconcile_activation_barrier(
+            ActivationBarrierContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path,
+                reload_enabled: false,
+            },
+            |_| bail!("runtime reload was requested during locked activation preparation"),
+        )?;
+        match outcome {
+            Some(outcome) => Some((outcome, pending_activation_identity(&store_lock)?)),
+            None => None,
+        }
+    };
+    let Some((prepared, expected_identity)) = prepared else {
+        return Ok(None);
+    };
+    if prepared.is_confirmed() {
+        return Ok(Some(prepared));
+    }
+
+    let observed = ObservedReload::capture(auth_path, reload);
+    let store_lock = lock_account_store(store_path)?;
+    ensure_pending_activation_unchanged(&store_lock, &expected_identity)?;
+    let snapshot = store_lock.load()?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    reconcile_activation_barrier(
+        ActivationBarrierContext {
+            store_lock: &store_lock,
+            generation: &mut generation,
+            accounts: &mut accounts,
+            auth_path,
+            reload_enabled: true,
+        },
+        |_| observed.replay(),
+    )
+    .and_then(|outcome| {
+        outcome.context("activation record disappeared while runtime reload was in flight")
+    })
+    .map(Some)
+}
+
+fn activate_with_unlocked_reload<R>(
+    store_path: &Path,
+    auth_path: &Path,
+    generation: &mut AccountStoreGeneration,
+    accounts: &mut [CodexAccount],
+    target_id: Uuid,
+    reload: &R,
+) -> Result<ActivationOutcome>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    let (prepared, expected_identity) = {
+        let store_lock = lock_account_store(store_path)?;
+        let current = store_lock.load()?;
+        if current.generation != *generation {
+            bail!("account store changed during daemon polling; retrying from a fresh snapshot");
+        }
+        let outcome = activate_with(
+            ActivationContext {
+                store_lock: &store_lock,
+                generation,
+                accounts,
+                auth_path,
+                target_id,
+                reload_enabled: false,
+            },
+            |_| bail!("runtime reload was requested during locked activation preparation"),
+        )?;
+        let identity = matches!(
+            outcome.state,
+            ActivationState::FileOnly | ActivationState::CommittedDegraded
+        )
+        .then(|| pending_activation_identity(&store_lock))
+        .transpose()?;
+        (outcome, identity)
+    };
+    if !matches!(
+        prepared.state,
+        ActivationState::FileOnly | ActivationState::CommittedDegraded
+    ) {
+        return Ok(prepared);
+    }
+    let expected_identity = expected_identity
+        .context("activation record disappeared while preparing unlocked runtime convergence")?;
+
+    let observed = ObservedReload::capture(auth_path, reload);
+    let store_lock = lock_account_store(store_path)?;
+    ensure_pending_activation_unchanged(&store_lock, &expected_identity)?;
+    let snapshot = store_lock.load()?;
+    if snapshot.accounts.len() != accounts.len() {
+        bail!(
+            "account set changed while runtime reload was in flight; retry from a fresh snapshot"
+        );
+    }
+    *generation = snapshot.generation;
+    accounts.clone_from_slice(&snapshot.accounts);
+    reconcile_activation_barrier(
+        ActivationBarrierContext {
+            store_lock: &store_lock,
+            generation,
+            accounts,
+            auth_path,
+            reload_enabled: true,
+        },
+        |_| observed.replay(),
+    )?
+    .context("activation record disappeared while runtime reload was in flight")
+}
+
+fn pending_activation_tick(
+    outcome: &ActivationOutcome,
+    base_interval: Duration,
+) -> Option<DaemonTick> {
+    if !matches!(
+        outcome.state,
+        ActivationState::FileOnly | ActivationState::CommittedDegraded
+    ) {
+        return None;
+    }
+    let tick = DaemonTick::runtime_convergence_pending(base_interval);
+    eprintln!(
+        "activation remains unconfirmed ({:?}): {}; retrying runtime convergence in {}s",
+        outcome.state,
+        outcome.detail.as_deref().unwrap_or("no detail"),
+        tick.next_interval.as_secs()
+    );
+    Some(tick)
 }
 
 #[cfg(test)]
@@ -197,25 +439,16 @@ where
         consume_reset: consume_reset_fn,
         reload: reload_fn,
     } = dependencies;
-    let store_lock = lock_account_store(store_path)?;
-    let snapshot = store_lock.load()?;
+    if let Some(outcome) = reconcile_pending_activation_unlocked(store_path, auth_path, &reload_fn)?
+    {
+        if let Some(tick) = pending_activation_tick(&outcome, base_interval) {
+            return Ok(tick);
+        }
+        require_confirmed_activation(outcome)?;
+    }
+    let snapshot = load_store_snapshot(store_path)?;
     let mut generation = snapshot.generation;
     let mut accounts = snapshot.accounts;
-    if let Some(outcome) = reconcile_activation_barrier(
-        ActivationBarrierContext {
-            store_lock: &store_lock,
-            generation: &mut generation,
-            accounts: &mut accounts,
-            auth_path,
-            reload_enabled: true,
-        },
-        &reload_fn,
-    )? {
-        require_confirmed_activation(outcome)?;
-        let refreshed = store_lock.load()?;
-        generation = refreshed.generation;
-        accounts = refreshed.accounts;
-    }
     let active_id = active_account(&accounts)
         .map(|account| account.account_id.clone())
         .context("no active account in store")?;
@@ -309,53 +542,88 @@ where
         || direct_runtime_usage_limit
         || cached_reset_candidate_exists;
     if should_refresh_reset_bank {
-        match orchestrate_pool_reset_with_selection(
-            ResetOrchestrationContext {
-                store_lock: &store_lock,
-                accounts: &mut accounts,
-                active_index,
-                candidate_observations: candidate_observations.as_ref(),
-                allow_reset: consume_banked_resets,
-                direct_runtime_usage_limit,
-                refresh_strategy: ResetQuotaRefreshStrategy::RefreshExpiredToken,
-                now: Utc::now(),
-            },
-            ResetOrchestrationDependencies::new(
-                |account: &CodexAccount| fetch_reset_bank_fn(account),
-                |account: &mut CodexAccount, strategy| {
-                    debug_assert_eq!(strategy, ResetQuotaRefreshStrategy::RefreshExpiredToken);
-                    let result = fetch_quota_with_refresh(
-                        &mut *account,
-                        &fetch_quota_fn,
-                        &refresh_token_fn,
-                    )?;
-                    apply_fetch_result(account, result);
-                    Ok(())
+        // The production daemon never consumes a reset. Fetch its active
+        // inventory before entering the journal transaction so network I/O
+        // cannot monopolize the account-store lock.
+        let mut prefetched_active_bank =
+            (!consume_banked_resets).then(|| fetch_reset_bank_fn(&accounts[active_index]));
+        let reset_result = {
+            let store_lock = lock_account_store(store_path)?;
+            let current = store_lock.load()?;
+            if current.generation != generation {
+                bail!(
+                    "account store changed during daemon polling; retrying from a fresh snapshot"
+                );
+            }
+            orchestrate_pool_reset_with_selection(
+                ResetOrchestrationContext {
+                    store_lock: &store_lock,
+                    accounts: &mut accounts,
+                    active_index,
+                    candidate_observations: candidate_observations.as_ref(),
+                    allow_reset: consume_banked_resets,
+                    direct_runtime_usage_limit,
+                    refresh_strategy: ResetQuotaRefreshStrategy::RefreshExpiredToken,
+                    now: Utc::now(),
                 },
-                |account: &CodexAccount, bank: &RateLimitResetBank, request_id| {
-                    consume_reset_fn(account, bank, request_id)
-                },
-                |accounts: &mut [CodexAccount], reset_account_index: usize| {
-                    let target_id = accounts[reset_account_index].id;
-                    activate_with(
-                        ActivationContext {
-                            store_lock: &store_lock,
-                            generation: &mut generation,
-                            accounts,
-                            auth_path,
-                            target_id,
-                            reload_enabled: true,
-                        },
-                        &reload_fn,
-                    )
-                },
-            ),
-            &reset_selection_accounts,
-        ) {
+                ResetOrchestrationDependencies::new(
+                    |account: &CodexAccount| match prefetched_active_bank.take() {
+                        Some(result) => result,
+                        None => fetch_reset_bank_fn(account),
+                    },
+                    |account: &mut CodexAccount, strategy| {
+                        debug_assert_eq!(strategy, ResetQuotaRefreshStrategy::RefreshExpiredToken);
+                        let result = fetch_quota_with_refresh(
+                            &mut *account,
+                            &fetch_quota_fn,
+                            &refresh_token_fn,
+                        )?;
+                        apply_fetch_result(account, result);
+                        Ok(())
+                    },
+                    |account: &CodexAccount, bank: &RateLimitResetBank, request_id| {
+                        consume_reset_fn(account, bank, request_id)
+                    },
+                    |accounts: &mut [CodexAccount], reset_account_index: usize| {
+                        let target_id = accounts[reset_account_index].id;
+                        activate_with(
+                            ActivationContext {
+                                store_lock: &store_lock,
+                                generation: &mut generation,
+                                accounts,
+                                auth_path,
+                                target_id,
+                                reload_enabled: false,
+                            },
+                            |_| {
+                                bail!("runtime reload was requested during locked reset activation")
+                            },
+                        )
+                    },
+                ),
+                &reset_selection_accounts,
+            )
+        };
+        match reset_result {
             Ok(outcome) => match outcome.completion {
                 Some(activation) => {
                     let reset_account_index = outcome.account_index;
                     let swapped = reset_account_index != active_index;
+                    let activation = if activation.is_confirmed() {
+                        activation
+                    } else {
+                        reconcile_pending_activation_unlocked(
+                            store_path,
+                            auth_path,
+                            &reload_fn,
+                        )?
+                        .context("reset activation record disappeared before runtime convergence")?
+                    };
+                    let refreshed = load_store_snapshot(store_path)?;
+                    accounts = refreshed.accounts;
+                    if let Some(tick) = pending_activation_tick(&activation, base_interval) {
+                        return Ok(tick);
+                    }
                     require_confirmed_activation(activation)?;
                     println!(
                         "reconciled banked reset for {} ({}); {} reset(s) remain",
@@ -372,10 +640,7 @@ where
                     );
                     let next_interval =
                         next_poll_interval_for(&accounts[reset_account_index], base_interval);
-                    return Ok(DaemonTick {
-                        swapped,
-                        next_interval,
-                    });
+                    return Ok(DaemonTick::settled(swapped, next_interval));
                 }
                 None if outcome.flow.suppresses_redemption() => eprintln!(
                     "banked reset remains unreconciled for {}; new redemption is suppressed{}",
@@ -398,11 +663,11 @@ where
 
     let Some(target) = rotation_target else {
         if force_swap || active_is_blocked {
-            commit_accounts(&store_lock, &mut generation, &accounts)?;
+            commit_daemon_accounts(store_path, &mut generation, &accounts)?;
             bail!("active account is blocked but no freshly confirmed usable candidate exists");
         }
         if active_poll_succeeded {
-            let durable_state = read_activation_record(&store_lock)?.map(|record| record.state);
+            let durable_state = activation_state(store_path)?;
             let requires_runtime_convergence =
                 !auth_file_matches_account(auth_path, &accounts[active_index])
                     || durable_state.is_some_and(|state| {
@@ -416,29 +681,26 @@ where
                     });
             if requires_runtime_convergence {
                 let target_id = accounts[active_index].id;
-                let activation = activate_with(
-                    ActivationContext {
-                        store_lock: &store_lock,
-                        generation: &mut generation,
-                        accounts: &mut accounts,
-                        auth_path,
-                        target_id,
-                        reload_enabled: true,
-                    },
+                let activation = activate_with_unlocked_reload(
+                    store_path,
+                    auth_path,
+                    &mut generation,
+                    &mut accounts,
+                    target_id,
                     &reload_fn,
                 )?;
+                if let Some(tick) = pending_activation_tick(&activation, base_interval) {
+                    return Ok(tick);
+                }
                 require_confirmed_activation(activation)?;
             } else {
-                commit_accounts(&store_lock, &mut generation, &accounts)?;
+                commit_daemon_accounts(store_path, &mut generation, &accounts)?;
             }
         } else {
-            commit_accounts(&store_lock, &mut generation, &accounts)?;
+            commit_daemon_accounts(store_path, &mut generation, &accounts)?;
         }
         let next_interval = next_poll_interval_for(&accounts[active_index], base_interval);
-        return Ok(DaemonTick {
-            swapped: false,
-            next_interval,
-        });
+        return Ok(DaemonTick::settled(false, next_interval));
     };
 
     if plan_upgrade_target.is_some() {
@@ -451,28 +713,28 @@ where
         );
     }
     if target.account_id == active_id {
-        commit_accounts(&store_lock, &mut generation, &accounts)?;
+        commit_daemon_accounts(store_path, &mut generation, &accounts)?;
         bail!(
             "selected candidate {} is already active; refusing same-account reload storm",
             target.email
         );
     }
     if quota_availability_at(&target, Utc::now()) != QuotaAvailability::Usable {
-        commit_accounts(&store_lock, &mut generation, &accounts)?;
+        commit_daemon_accounts(store_path, &mut generation, &accounts)?;
         bail!("selected candidate was not freshly confirmed usable");
     }
 
-    let activation = activate_with(
-        ActivationContext {
-            store_lock: &store_lock,
-            generation: &mut generation,
-            accounts: &mut accounts,
-            auth_path,
-            target_id: target.id,
-            reload_enabled: true,
-        },
+    let activation = activate_with_unlocked_reload(
+        store_path,
+        auth_path,
+        &mut generation,
+        &mut accounts,
+        target.id,
         &reload_fn,
     )?;
+    if let Some(tick) = pending_activation_tick(&activation, base_interval) {
+        return Ok(tick);
+    }
     let summary = require_confirmed_activation(activation)?;
     println!(
         "swapped to {} and signaled {} Codex hot-swap process(es), restarted {}",
@@ -480,10 +742,7 @@ where
         summary.signaled.len(),
         summary.restarted.len()
     );
-    Ok(DaemonTick {
-        swapped: true,
-        next_interval: base_interval,
-    })
+    Ok(DaemonTick::settled(true, base_interval))
 }
 
 fn require_confirmed_activation(outcome: ActivationOutcome) -> Result<ReloadSummary> {
@@ -781,6 +1040,9 @@ where
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
     let tick_succeeded = tick_result.is_ok();
+    let allow_ack_bootstrap = tick_result
+        .as_ref()
+        .is_ok_and(|tick| tick.allow_ack_bootstrap);
     let sleep_interval = match tick_result {
         Ok(tick) => {
             let is_fast_polling = tick.next_interval < base_interval;
@@ -805,9 +1067,11 @@ where
     // Background repairs target interactive CLI sessions only. An app-server
     // without a live ACK is reported as not ready by doctor; repeatedly
     // signaling it can terminate the supervised WebSocket service. A failed
-    // tick is also a hard barrier for this auxiliary reload path.
+    // tick is also a hard barrier for this auxiliary reload path. A degraded
+    // activation already attempted convergence, so it must wait for its next
+    // scheduled retry instead of immediately launching a second ACK wait.
     match run_ack_bootstrap_if_due(
-        tick_succeeded,
+        tick_succeeded && allow_ack_bootstrap,
         last_ack_bootstrap,
         auth_path,
         discover_missing,
@@ -864,6 +1128,8 @@ mod tests {
     };
     use anyhow::bail;
     use serde_json::json;
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -941,6 +1207,30 @@ mod tests {
             signaled: vec![42],
             ..ReloadSummary::default()
         }
+    }
+
+    fn assert_store_lock_available(store_path: &Path) -> Result<()> {
+        let lock_path = store_path.with_extension("json.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            bail!(
+                "account-store lock was held during callback: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let unlock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        if unlock_result != 0 {
+            bail!(
+                "failed to release callback probe lock: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
     }
 
     fn reset_bank(available_count: u32, fetched_at: chrono::DateTime<Utc>) -> RateLimitResetBank {
@@ -1355,6 +1645,64 @@ mod tests {
     }
 
     #[test]
+    fn daemon_network_callbacks_run_without_the_account_store_lock() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        save_accounts(
+            &store_path,
+            &[
+                account("active@example.com", true, 100.0, 100.0),
+                account("replacement@example.com", false, 10.0, 10.0),
+            ],
+        )?;
+
+        let quota_store_path = store_path.clone();
+        let bank_store_path = store_path.clone();
+        let reload_store_path = store_path.clone();
+        let callback_kinds = Arc::new(Mutex::new(Vec::new()));
+        let quota_callbacks = Arc::clone(&callback_kinds);
+        let bank_callbacks = Arc::clone(&callback_kinds);
+        let reload_callbacks = Arc::clone(&callback_kinds);
+        let tick = run_once_report_with_resets(
+            DaemonTickContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                base_interval: Duration::from_secs(300),
+                consume_banked_resets: false,
+            },
+            DaemonTickDependencies::new(
+                move |account| {
+                    assert_store_lock_available(&quota_store_path)?;
+                    quota_callbacks.lock().unwrap().push("quota");
+                    ready_fetch(account)
+                },
+                |_| Ok(()),
+                move |_account| {
+                    assert_store_lock_available(&bank_store_path)?;
+                    bank_callbacks.lock().unwrap().push("reset_bank");
+                    Ok(reset_bank(0, Utc::now()))
+                },
+                |_account, _bank, _request_id| {
+                    bail!("the default daemon must not consume a banked reset")
+                },
+                move |_| {
+                    assert_store_lock_available(&reload_store_path)?;
+                    reload_callbacks.lock().unwrap().push("reload");
+                    Ok(verified_reload_summary())
+                },
+            ),
+        )?;
+
+        assert!(tick.swapped);
+        let callback_kinds = callback_kinds.lock().unwrap();
+        assert!(callback_kinds.contains(&"quota"));
+        assert!(callback_kinds.contains(&"reset_bank"));
+        assert!(callback_kinds.contains(&"reload"));
+        Ok(())
+    }
+
+    #[test]
     fn degraded_activation_stays_degraded_until_a_later_verified_ack() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
@@ -1367,21 +1715,29 @@ mod tests {
             ],
         )?;
 
-        let first_error = run_once_report_with(
+        let first_tick = run_once_report_with(
             &store_path,
             &auth_path,
-            Duration::from_secs(300),
+            Duration::ZERO,
             ready_fetch,
             |_| Ok(()),
-            |_| {
-                Ok(ReloadSummary {
-                    skipped: vec![(42, "ack timeout".to_string())],
-                    ..ReloadSummary::default()
-                })
+            {
+                let store_path = store_path.clone();
+                move |_| {
+                    assert_store_lock_available(&store_path)?;
+                    Ok(ReloadSummary {
+                        skipped: vec![(42, "ack timeout".to_string())],
+                        ..ReloadSummary::default()
+                    })
+                }
             },
-        )
-        .unwrap_err();
-        assert!(format!("{first_error:#}").contains("did not publish as swapped"));
+        )?;
+        assert!(!first_tick.swapped);
+        assert_eq!(
+            first_tick.next_interval,
+            Duration::from_secs(DEGRADED_ACTIVATION_RETRY_SECONDS)
+        );
+        assert!(!first_tick.allow_ack_bootstrap);
         let store_lock = lock_account_store(&store_path)?;
         assert_eq!(
             crate::activation::read_activation_record(&store_lock)?
@@ -1391,16 +1747,26 @@ mod tests {
         );
         drop(store_lock);
 
-        let second_error = run_once_report_with(
+        let second_tick = run_once_report_with(
             &store_path,
             &auth_path,
-            Duration::from_secs(300),
+            Duration::ZERO,
             ready_fetch,
             |_| Ok(()),
-            |_| Ok(ReloadSummary::default()),
-        )
-        .unwrap_err();
-        assert!(format!("{second_error:#}").contains("did not publish as swapped"));
+            {
+                let store_path = store_path.clone();
+                move |_| {
+                    assert_store_lock_available(&store_path)?;
+                    Ok(ReloadSummary::default())
+                }
+            },
+        )?;
+        assert!(!second_tick.swapped);
+        assert_eq!(
+            second_tick.next_interval,
+            Duration::from_secs(DEGRADED_ACTIVATION_RETRY_SECONDS)
+        );
+        assert!(!second_tick.allow_ack_bootstrap);
         let store_lock = lock_account_store(&store_path)?;
         assert_eq!(
             crate::activation::read_activation_record(&store_lock)?
@@ -1413,17 +1779,22 @@ mod tests {
         let converged = run_once_report_with(
             &store_path,
             &auth_path,
-            Duration::from_secs(300),
+            Duration::ZERO,
             ready_fetch,
             |_| Ok(()),
-            |_| {
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    ..ReloadSummary::default()
-                })
+            {
+                let store_path = store_path.clone();
+                move |_| {
+                    assert_store_lock_available(&store_path)?;
+                    Ok(ReloadSummary {
+                        signaled: vec![42],
+                        ..ReloadSummary::default()
+                    })
+                }
             },
         )?;
         assert!(!converged.swapped);
+        assert!(converged.allow_ack_bootstrap);
         let store_lock = lock_account_store(&store_path)?;
         assert_eq!(
             crate::activation::read_activation_record(&store_lock)?
@@ -1432,6 +1803,44 @@ mod tests {
             crate::activation::ActivationState::Confirmed
         );
         Ok(())
+    }
+
+    #[test]
+    fn degraded_activation_tick_backs_off_without_auxiliary_reload() {
+        let discovery_calls = Arc::new(Mutex::new(0usize));
+        let reload_calls = Arc::new(Mutex::new(0usize));
+        let mut last_ack_bootstrap = None;
+        let mut was_fast_polling = true;
+        let sleep_interval = complete_daemon_iteration(
+            Ok(DaemonTick::runtime_convergence_pending(Duration::ZERO)),
+            Duration::ZERO,
+            &mut was_fast_polling,
+            &mut last_ack_bootstrap,
+            Path::new("/tmp/degraded-auth.json"),
+            {
+                let calls = Arc::clone(&discovery_calls);
+                move |_| {
+                    *calls.lock().unwrap() += 1;
+                    Ok(true)
+                }
+            },
+            {
+                let calls = Arc::clone(&reload_calls);
+                move |_| {
+                    *calls.lock().unwrap() += 1;
+                    Ok(verified_reload_summary())
+                }
+            },
+        );
+
+        assert_eq!(
+            sleep_interval,
+            Duration::from_secs(DEGRADED_ACTIVATION_RETRY_SECONDS)
+        );
+        assert!(!was_fast_polling);
+        assert_eq!(*discovery_calls.lock().unwrap(), 0);
+        assert_eq!(*reload_calls.lock().unwrap(), 0);
+        assert!(last_ack_bootstrap.is_none());
     }
 
     #[test]

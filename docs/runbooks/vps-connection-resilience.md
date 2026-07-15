@@ -126,13 +126,14 @@ wire example.
 ## Updater Runtime Gate
 
 Automatic patched-Codex updates on Linux may check metadata and prepare one
-source build with one Cargo job and a 60-minute build deadline. The bounded
-build shell replaces itself with the resource-limited Cargo process in a
-dedicated process group, so a timeout kills and reaps Cargo and its compiler
-descendants before bounded, idempotent target cleanup. A persistent cleanup
-error stays durable for the next preparation or explicit maintenance;
-metadata-only ticks cannot run cleanup or refill the target. A validated
-generation remains
+source build with one Cargo job and a three-hour runaway ceiling. The outer
+watchdog allows four hours so the inner owner always kills and reaps Cargo and
+its compiler descendants first. Before building, the updater writes an atomic
+target-provenance record bound to the exact version, upstream commit, patched
+source diff, and build recipe. A bounded build failure preserves a matching
+target for the next retry; missing, malformed, future-dated, stale, or
+different-provenance targets are removed before reuse. Metadata-only ticks
+cannot clean or refill that target. A validated generation remains
 `ReadyToInstall`; automatic updater ticks never replace the live binary or
 activate a runtime, and they reuse rather than duplicate the staged payload.
 
