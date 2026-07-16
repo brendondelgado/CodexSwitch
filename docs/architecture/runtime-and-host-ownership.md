@@ -161,6 +161,21 @@ cannot acknowledge one configured account cannot pin the operator to that
 account indefinitely. `Confirmed` durably completes the barrier only for the
 lifetime of its evidence. Do not oscillate accounts automatically.
 
+An explicit manual cross-account switch is authorized by the operator request
+plus exact durable agreement between the current account store and `auth.json`;
+it does not require fresh runtime-current proof for the account being left.
+Requiring that proof would make recovery impossible precisely when a runtime is
+stale or cannot acknowledge. The newly selected account is still
+configured-only until strict target runtime convergence succeeds.
+
+If authorization fails before the credential mutation runs, no configured file
+has changed. The coordinator must restore the prior durable activation state
+under the same mutation lease instead of replacing it with a manual-review
+record for the uncommitted target. On restart, a historical
+`activation_file_commit_failed` record may be recovered only when the account
+store and `auth.json` agree exactly on one known account; recovery produces
+`CommittedDegraded`, never `Confirmed`.
+
 Every request decision first evaluates confirmation freshness at the request
 time. An expired `Confirmed` record is durably demoted to
 `CommittedDegraded` before either automatic or operator policy is evaluated.

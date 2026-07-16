@@ -104,7 +104,7 @@ struct AccountActivationTransactionTests {
                         )
                     }
                 )
-                guard case .prepared(let preparing) = decision else {
+                guard case .prepared(let preparing, previousState: _) = decision else {
                     return .failed(.mutationAuthorization)
                 }
 

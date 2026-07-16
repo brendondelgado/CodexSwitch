@@ -144,15 +144,84 @@ struct AccountActivationStateTests {
             kind: .manual,
             requestedActivationGeneration: other
         )
-        guard case .prepared(let preparing) = crossTarget else {
+        guard case .prepared(let preparing, let previousState) = crossTarget else {
             Issue.record("Manual cross-target mutation must begin a fresh activation")
             return
         }
+        #expect(previousState == degraded)
         #expect(preparing.phase == .preparing)
         #expect(preparing.configuredAccountId == other)
         #expect(preparing.activationGeneration == other)
         #expect(preparing.retryAttempt == 0)
         #expect(try await coordinator.load() == preparing)
+    }
+
+    @Test("Pre-mutation failure restores the prior activation barrier")
+    func uncommittedPreparationRestoresPriorState() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let currentTarget = UUID()
+        let requestedTarget = UUID()
+        let requestedGeneration = UUID()
+        let coordinator = AccountActivationCoordinator(url: url)
+
+        _ = try await coordinator.beginPreparing(
+            targetAccountId: currentTarget,
+            kind: .automatic
+        )
+        let degraded = try await coordinator.markCommittedDegraded(
+            targetAccountId: currentTarget,
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0,
+            detail: .runtimeAcknowledgementIncomplete
+        )
+        let decision = try await coordinator.beginAuthorizedCredentialMutation(
+            targetAccountId: requestedTarget,
+            kind: .manual,
+            requestedActivationGeneration: requestedGeneration
+        )
+        guard case .prepared(_, let previousState?) = decision else {
+            Issue.record("Expected an operator preparation with restorable prior state")
+            return
+        }
+
+        let restored = try await coordinator.restoreUncommittedPreparation(
+            targetAccountId: requestedTarget,
+            expectedActivationGeneration: requestedGeneration,
+            previousState: previousState
+        )
+
+        #expect(restored == degraded)
+        #expect(try await coordinator.load() == degraded)
+    }
+
+    @Test("File-commit review recovers only to configured-only state")
+    func fileCommitFailureRecoversAsDegraded() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let failedTarget = UUID()
+        let durableTarget = UUID()
+        let coordinator = AccountActivationCoordinator(url: url)
+
+        _ = try await coordinator.beginPreparing(
+            targetAccountId: failedTarget,
+            kind: .automatic
+        )
+        _ = try await coordinator.markManualReview(
+            targetAccountId: failedTarget,
+            detail: .fileCommitFailed
+        )
+
+        let recovered = try await coordinator.recoverFileCommitFailure(
+            targetAccountId: durableTarget
+        )
+
+        #expect(recovered.phase == .committedDegraded)
+        #expect(recovered.configuredAccountId == durableTarget)
+        #expect(recovered.runtimeCurrentAccountId == nil)
+        #expect(recovered.detail == .restartRecoveredCommittedFiles)
+        #expect(recovered.retryAttempt == 0)
+        #expect(try await coordinator.load() == recovered)
     }
 
     @Test("Full ACK durably confirms runtime and clears the barrier")
@@ -322,10 +391,13 @@ struct AccountActivationStateTests {
             kind: .manual,
             requestedActivationGeneration: generation
         )
-        guard case .prepared(let preparing) = decision else {
+        guard case .prepared(let preparing, let previousState) = decision else {
             Issue.record("Retry-exhausted state must permit explicit operator recovery")
             return
         }
+        #expect(previousState?.phase == .manualReview)
+        #expect(previousState?.detail == .automaticRetryLimitReached)
+        #expect(previousState?.configuredAccountId == target)
         #expect(preparing.phase == .preparing)
         #expect(preparing.configuredAccountId == replacement)
         #expect(preparing.activationGeneration == generation)
@@ -525,10 +597,12 @@ struct AccountActivationStateTests {
             kind: .manual,
             at: now.addingTimeInterval(11)
         )
-        guard case .prepared(let preparing) = crossTarget else {
+        guard case .prepared(let preparing, let previousState) = crossTarget else {
             Issue.record("Manual cross-target activation must provide an operator escape")
             return
         }
+        #expect(previousState?.phase == .committedDegraded)
+        #expect(previousState?.configuredAccountId == target)
         #expect(preparing.phase == .preparing)
         #expect(preparing.configuredAccountId == other)
     }

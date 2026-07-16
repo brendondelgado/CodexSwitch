@@ -21,7 +21,10 @@ enum AccountActivationCoordinatorError: Error, Equatable, LocalizedError {
 }
 
 enum AccountActivationCredentialMutationDecision: Equatable, Sendable {
-    case prepared(AccountActivationState)
+    case prepared(
+        AccountActivationState,
+        previousState: AccountActivationState?
+    )
     case retrySameTarget(AccountActivationState)
     case blocked(AccountActivationState?, String)
 }
@@ -85,7 +88,7 @@ actor AccountActivationCoordinator {
             at: date
         )
         switch decision {
-        case .prepared(let state):
+        case .prepared(let state, previousState: _):
             return state
         case .retrySameTarget:
             throw AccountActivationCoordinatorError.invalidTransition(
@@ -154,7 +157,7 @@ actor AccountActivationCoordinator {
                     at: date
                 )
                 proposed = preparing
-                result = .prepared(preparing)
+                result = .prepared(preparing, previousState: effective)
             case .retrySameTarget:
                 proposed = effective
                 result = .retrySameTarget(effective!)
@@ -180,6 +183,50 @@ actor AccountActivationCoordinator {
                 }
             }
             return result
+        }
+    }
+
+    @discardableResult
+    func restoreUncommittedPreparation(
+        targetAccountId: UUID,
+        expectedActivationGeneration: UUID,
+        previousState: AccountActivationState,
+        authorizeEffect: @escaping StateEffectAuthorization = { _ in true }
+    ) throws -> AccountActivationState {
+        try transition(authorizeEffect: authorizeEffect) { current in
+            guard let current,
+                  current.phase == .preparing,
+                  current.configuredAccountId == targetAccountId,
+                  current.activationGeneration == expectedActivationGeneration else {
+                throw AccountActivationCoordinatorError.invalidTransition(
+                    "uncommitted recovery does not match the prepared activation"
+                )
+            }
+            return previousState
+        }
+    }
+
+    @discardableResult
+    func recoverFileCommitFailure(
+        targetAccountId: UUID,
+        at date: Date = Date()
+    ) throws -> AccountActivationState {
+        try transition { current in
+            guard let current,
+                  current.phase == .manualReview,
+                  current.detail == .fileCommitFailed else {
+                throw AccountActivationCoordinatorError.invalidTransition(
+                    "file-commit recovery requires a matching manual-review record"
+                )
+            }
+            return .committedDegraded(
+                targetAccountId: targetAccountId,
+                detail: .restartRecoveredCommittedFiles,
+                activationGeneration: UUID(),
+                retryAttempt: 0,
+                nextRetryAt: date,
+                at: date
+            )
         }
     }
 

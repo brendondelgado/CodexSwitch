@@ -82,6 +82,22 @@ enum AccountCredentialMutationRoute: String, CaseIterable, Equatable, Sendable {
     case externalAuthObservation
 }
 
+enum AccountCredentialMutationRuntimePolicy {
+    static func requiresSourceRuntimeEvidence(
+        route: AccountCredentialMutationRoute,
+        reason: SwapEvent.SwapReason
+    ) -> Bool {
+        switch route {
+        case .swap:
+            return reason != .manual
+        case .tokenRefresh, .activeReauthentication, .planUpgrade:
+            return true
+        case .firstActivation, .externalAuthObservation:
+            return false
+        }
+    }
+}
+
 @MainActor
 enum AccountCredentialMutationBoundary {
     static func perform<Result>(

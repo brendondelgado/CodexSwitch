@@ -21,6 +21,52 @@ private final class ReloadCallCounter: @unchecked Sendable {
 
 @Suite("Account activation reload transaction")
 struct AppDelegateSwapCommitTests {
+    @Test("Manual account switches do not require source runtime-current proof")
+    func manualSwapUsesDurableSourceAuthorization() {
+        #expect(!AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .swap,
+            reason: .manual
+        ))
+        #expect(AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .swap,
+            reason: .quotaExhausted
+        ))
+        #expect(AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .tokenRefresh,
+            reason: .manual
+        ))
+        #expect(AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .activeReauthentication,
+            reason: .manual
+        ))
+        #expect(AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .planUpgrade,
+            reason: .manual
+        ))
+        #expect(!AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .firstActivation,
+            reason: .manual
+        ))
+        #expect(!AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .externalAuthObservation,
+            reason: .manual
+        ))
+    }
+
+    @Test("Launch repair requires exact durable file agreement")
+    func launchRepairChecksBothConfiguredFiles() throws {
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/App/AppDelegate.swift",
+            encoding: .utf8
+        )
+
+        #expect(source.contains("stored.detail == .fileCommitFailed"))
+        #expect(source.contains("Self.accountStoreMatches("))
+        #expect(source.contains("Self.authFileMatches("))
+        #expect(source.contains(".recoverFileCommitFailure("))
+        #expect(source.contains("ACTIVATION_FILE_COMMIT_FAILURE_RECOVERED"))
+    }
+
     @Test("No live runtime remains configured-only")
     func noRuntimeIsConfiguredOnly() {
         let completion = AccountActivationConvergenceEvaluator.completion(

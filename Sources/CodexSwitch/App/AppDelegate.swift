@@ -27,6 +27,7 @@ private struct PreparedAccountActivation: Sendable {
     let swapGeneration: UInt64
     let activationGeneration: UUID
     let expectedConfiguredAccountId: UUID?
+    let previousActivationState: AccountActivationState?
     let lease: AccountMutationLease
 }
 
@@ -885,6 +886,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return
             }
             guard stored.phase != .manualReview else {
+                if stored.detail == .fileCommitFailed,
+                   let durableTarget = accountManager.configuredAccount,
+                   Self.accountStoreMatches(
+                       account: durableTarget,
+                       accounts: accountManager.accounts
+                   ),
+                   Self.authFileMatches(
+                       account: durableTarget,
+                       atPath: Self.codexAuthPath
+                   ) {
+                    let recovered = try await accountActivationCoordinator
+                        .recoverFileCommitFailure(
+                            targetAccountId: durableTarget.id
+                        )
+                    clearManualOverride()
+                    accountManager.publishActivationState(recovered)
+                    SwapLog.append(.debug(
+                        "ACTIVATION_FILE_COMMIT_FAILURE_RECOVERED target=\(durableTarget.id.uuidString) previous_target=\(stored.configuredAccountId?.uuidString ?? "none")"
+                    ))
+                    return
+                }
                 if !AccountActivationRecoveryCoordinator
                     .manualReviewSelectionIsUnambiguous(
                         accounts: accountManager.accounts,
@@ -3505,7 +3527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             let preparing: AccountActivationState
             switch decision {
-            case .prepared(let state):
+            case .prepared(let state, let previousState):
                 preparing = state
             case .retrySameTarget(let state):
                 accountManager.publishActivationState(state)
@@ -3545,6 +3567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 swapGeneration: generation,
                 activationGeneration: activationGeneration,
                 expectedConfiguredAccountId: expectedConfiguredAccountId,
+                previousActivationState: previousState,
                 lease: lease
             ))
         } catch {
@@ -3684,13 +3707,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return nil
         }
 
-        let requiresRuntimeEvidence: Bool
-        switch route {
-        case .swap, .tokenRefresh, .activeReauthentication, .planUpgrade:
-            requiresRuntimeEvidence = true
-        case .firstActivation, .externalAuthObservation:
-            requiresRuntimeEvidence = false
-        }
+        let requiresRuntimeEvidence = AccountCredentialMutationRuntimePolicy
+            .requiresSourceRuntimeEvidence(route: route, reason: reason)
         let durableConfiguredTargetMatches: Bool
         switch route {
         case .firstActivation:
@@ -3705,9 +3723,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         let runtimePermit: AccountActivationRuntimePermit?
         if requiresRuntimeEvidence {
-            guard case .confirmed(let freshEvidence) = await captureFreshLocalRuntimeEvidence(
-                for: from
-            ) else {
+            let evidenceDecision = await captureFreshLocalRuntimeEvidence(for: from)
+            guard case .confirmed(let freshEvidence) = evidenceDecision else {
+                if case .denied(
+                    let detail,
+                    let discoveredRuntimeCount,
+                    let acknowledgedRuntimeCount
+                ) = evidenceDecision {
+                    SwapLog.append(.debug(
+                        "ACTIVATION_SOURCE_RUNTIME_AUTHORIZATION_DENIED route=\(route.rawValue) source=\(from.email) detail=\(detail.rawValue) discovered=\(discoveredRuntimeCount) acknowledged=\(acknowledgedRuntimeCount)"
+                    ))
+                }
                 return nil
             }
             runtimePermit = AccountActivationRuntimePermit(
@@ -3755,6 +3781,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                   at: now
               ) else {
             return nil
+        }
+        if route == .swap, reason == .manual {
+            SwapLog.append(.debug(
+                "ACTIVATION_MANUAL_SWAP_DURABLE_SOURCE_AUTHORIZED source=\(from.email) target=\(to.email)"
+            ))
         }
         return permit
     }
@@ -3937,6 +3968,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             await failConfiguredCredentialMutation(
                 target: to,
                 prepared: prepared,
+                stage: stage,
                 detail: stage == .journalPersistence
                     ? .committedJournalUpdateFailed
                     : .fileCommitFailed,
@@ -3950,9 +3982,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func failConfiguredCredentialMutation(
         target: CodexAccount,
         prepared: PreparedAccountActivation,
+        stage: AccountActivationCommitFailureStage,
         detail: AccountActivationDetail,
         failure: String
     ) async {
+        if stage == .mutationAuthorization,
+           await restoreUncommittedPreparation(
+               target: target,
+               prepared: prepared
+           ) {
+            if prepared.swapGeneration == swapGeneration,
+               pendingSwapTargetAccountId == target.id {
+                pendingSwapTargetAccountId = nil
+                swapConvergenceTask = nil
+            }
+            clearManualOverride()
+            SwapLog.append(.debug(
+                "ACTIVATION_UNCOMMITTED_PREPARATION_RESTORED generation=\(prepared.swapGeneration) target=\(target.email)"
+            ))
+            SwapLog.append(.swapFailed(error: failure))
+            logger.error("Configured credential mutation failed before file mutation: \(failure)")
+            return
+        }
+
         if prepared.swapGeneration == swapGeneration,
            pendingSwapTargetAccountId == target.id {
             pendingSwapTargetAccountId = nil
@@ -3971,6 +4023,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ))
         SwapLog.append(.swapFailed(error: failure))
         logger.error("Configured credential mutation failed: \(failure)")
+    }
+
+    private func restoreUncommittedPreparation(
+        target: CodexAccount,
+        prepared: PreparedAccountActivation
+    ) async -> Bool {
+        guard let previousState = prepared.previousActivationState,
+              let previousTargetAccountId = previousState.configuredAccountId,
+              let previousTarget = accountManager.accounts.first(where: {
+                  $0.id == previousTargetAccountId
+              }),
+              accountManager.configuredAccount?.id == prepared.expectedConfiguredAccountId,
+              await durableConfiguredFilesMatch(previousTarget),
+              await accountMutationTransaction.owns(prepared.lease) else {
+            return false
+        }
+
+        do {
+            let restored = try await accountActivationCoordinator
+                .restoreUncommittedPreparation(
+                    targetAccountId: target.id,
+                    expectedActivationGeneration: prepared.activationGeneration,
+                    previousState: previousState,
+                    authorizeEffect: { [accountMutationTransaction] state in
+                        accountMutationTransaction.ownerAuthorizes(
+                            prepared.lease,
+                            state: state,
+                            targetAccountId: target.id,
+                            activationGeneration: prepared.activationGeneration,
+                            allowedPhases: [.preparing]
+                        )
+                    }
+                )
+            accountManager.publishActivationState(restored)
+            let leaseOwned = await accountMutationTransaction.owns(prepared.lease)
+            let durableSourceMatches = await durableConfiguredFilesMatch(previousTarget)
+            let restorationIsCurrent = leaseOwned
+                && prepared.swapGeneration == swapGeneration
+                && pendingSwapTargetAccountId == target.id
+                && accountManager.configuredAccount?.id == previousTarget.id
+                && durableSourceMatches
+            if !restorationIsCurrent {
+                await enterActivationManualReview(
+                    targetAccountId: previousTarget.id,
+                    detail: .durableConfigurationChanged
+                )
+            }
+            statusBarController.updateIcon()
+            updatePopoverContent()
+            return true
+        } catch {
+            SwapLog.append(.debug(
+                "ACTIVATION_UNCOMMITTED_PREPARATION_RESTORE_FAILED generation=\(prepared.swapGeneration) target=\(target.email) error=\(error.localizedDescription)"
+            ))
+            return false
+        }
     }
 
     private func beginRuntimeConvergence(

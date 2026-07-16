@@ -66,7 +66,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-13
+  last_updated: 2026-07-16
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -553,6 +553,11 @@ The control must remain available while an automatic-retry-limit
 journal evidence; a visual highlight change without a new activation generation
 is not proof that the request ran.
 
+The manual switch revalidates exact durable source credentials but does not
+require the old runtime to be current. It must then converge the newly selected
+target normally. If authorization stops before credential mutation, verify that
+the prior activation journal was restored and neither configured file changed.
+
 ## Menu App Process Boundaries
 
 The Mac menu app must have exactly one live poller process. A duplicate CodexSwitch process can double-poll quota, double-sync VPS state, and produce contradictory menu updates even when each process is individually running the correct code.
@@ -640,6 +645,9 @@ Before claiming hot-swap is fixed or ready:
 - [ ] A forced rotation changes the configured account and signals the expected process count.
 - [ ] From `CommittedDegraded`, an explicit cross-target operator selection starts a fresh activation while automatic rotation remains blocked.
 - [ ] From retry-exhausted `ManualReview`, an explicit cross-target operator selection can recover; every other manual-review reason remains blocked.
+- [ ] A manual cross-account switch can leave an unconfirmed source runtime when the account store and `auth.json` still agree exactly.
+- [ ] A pre-mutation authorization failure restores the prior activation journal instead of pinning manual review to an uncommitted target.
+- [ ] Launch recovery repairs `activation_file_commit_failed` only when the account store and `auth.json` agree on one known account, and publishes configured-only state.
 - [ ] Each account card exposes a default accessibility press action, and pressing it produces the same activation request as a normal click.
 - [ ] The account-card hover overlay is non-hit-testable and cannot swallow a click.
 - [ ] The menu lists the configured account first and does not style it as runtime-current until fresh confirmation exists.
@@ -665,6 +673,12 @@ Every future hot-swap change must include tests for:
 - An in-flight `auth.json` read cannot revert a local account swap that completes before the read returns.
 - Account cards keep one shared primary action for normal clicks and the default
   accessibility press action, while hover helpers remain non-hit-testable.
+- Manual swap authorization requires exact durable source credentials but not
+  source runtime-current evidence; automatic swaps and active credential
+  maintenance retain their fresh runtime-proof requirement.
+- Pre-credential authorization failures restore the operation's prior journal
+  under the same lease, and launch repair of file-commit failures requires exact
+  store/auth agreement before publishing configured-only recovery.
 - App-server patching targets the `AuthManager` captured by `MessageProcessor`, not an earlier preload/auth probe.
 - Expired or quota-exhausted active accounts rotate to usable candidates and rewrite `auth.json`.
 - Runtime `UsageLimitReached` inside Codex rotates once, reloads the active `AuthManager`, and retries the turn before surfacing an error.
