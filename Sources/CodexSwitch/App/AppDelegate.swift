@@ -3518,6 +3518,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     accountManager.publishActivationState(state)
                 }
                 accountManager.publishActivationNotice(message)
+                SwapLog.append(.debug(
+                    "ACTIVATION_CREDENTIAL_MUTATION_BLOCKED target=\(targetAccountId.uuidString) source=\(source) reason=policy message=\(message)"
+                ))
                 return .blocked
             }
 
@@ -3526,7 +3529,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                   preparing.phase == .preparing,
                   preparing.activationGeneration == activationGeneration,
                   leaseOwned,
-                  accountManager.activationState?.phase != .manualReview,
                   accountManager.configuredAccount?.id == expectedConfiguredAccountId else {
                 throw AccountActivationCoordinatorError.invalidTransition(
                     "account mutation lease or activation generation changed"

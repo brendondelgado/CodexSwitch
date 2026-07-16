@@ -49,7 +49,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-15
+  last_updated: 2026-07-16
 ---
 
 # Runtime And Host Ownership
@@ -141,25 +141,34 @@ inspection and blocks mutation rather than being replaced with a guessed state.
 
 `Preparing`, `CommittedDegraded`, and `ManualReview` are activation barriers.
 While a barrier exists, automatic account swaps, reset redemption, and plan
-upgrade activation are blocked. A committed degraded barrier permits only a
-reload retry for its same configured target, with bounded backoff and a small
-fixed automatic-attempt ceiling. Automatic entry through token refresh,
+upgrade activation are blocked. A committed degraded barrier permits a reload
+retry for its same configured target, with bounded backoff and a small fixed
+automatic-attempt ceiling. Automatic entry through token refresh,
 reauthentication, external-auth reconciliation, or ordinary convergence retry
 preserves the same target's monotonically increasing attempt count; it cannot
 reset the count by returning to `Preparing`. Exhausting the ceiling enters
-`ManualReview`. A manual force-swap to another target is rejected; an explicit
-operator retry for the same target may start one new bounded retry sequence.
-`Confirmed` durably completes the barrier only for the lifetime of its evidence.
-Do not oscillate accounts automatically.
+`ManualReview`.
+
+An explicit operator request may escape a valid `CommittedDegraded` barrier by
+selecting another account. It may also escape `ManualReview` only when that
+state was produced by the bounded automatic-retry ceiling. The request starts a
+fresh `Preparing` generation for the selected target and must still commit and
+read back the complete account store and `auth.json` before runtime convergence
+begins. Automatic requests remain blocked, same-target clicks remain
+reconciliation retries, and corrupt, unreadable, ambiguous, or inconsistent
+manual-review states remain hard barriers. This escape exists so a runtime that
+cannot acknowledge one configured account cannot pin the operator to that
+account indefinitely. `Confirmed` durably completes the barrier only for the
+lifetime of its evidence. Do not oscillate accounts automatically.
 
 Every request decision first evaluates confirmation freshness at the request
 time. An expired `Confirmed` record is durably demoted to
 `CommittedDegraded` before either automatic or operator policy is evaluated.
-Automatic activation and manual cross-target activation are rejected while any
-barrier exists; the only permitted activation request is explicit same-target
-reconciliation. A generic observation or validation failure preserves the
-same target's monotonically increasing `retryAttempt`, including when the
-failure enters `ManualReview`.
+Automatic activation remains rejected while any barrier exists. Explicit
+same-target reconciliation and the narrowly authorized operator cross-target
+escape above are the only permitted requests. A generic observation or
+validation failure preserves the same target's monotonically increasing
+`retryAttempt`, including when the failure enters `ManualReview`.
 
 Before publishing `Confirmed`, the coordinator immediately re-reads the durable
 account store and `auth.json`, proves that both still contain the same selected
@@ -543,6 +552,12 @@ Observational commands may read files, APIs, process metadata, health endpoints,
 - rewrite thread catalogs.
 
 Repairs are named commands with prerequisites, dry-run evidence where practical, and postcondition checks. This separation makes diagnostics safe during active work.
+
+The configured Mac account is listed first in the menu. Candidate ranking is
+shown separately as "Next up"; it must not move an inactive candidate above the
+configured account and imply that list order is activation state.
+Configured-only state uses warning styling. Runtime-current emphasis is
+reserved for a fresh `Confirmed` activation record.
 
 ## Update And Patch Contract
 

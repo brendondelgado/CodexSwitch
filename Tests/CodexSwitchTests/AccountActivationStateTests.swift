@@ -99,8 +99,8 @@ struct AccountActivationStateTests {
         #expect(try await AccountActivationCoordinator(url: url).load() == bootstrapped)
     }
 
-    @Test("Barrier blocks automatic and cross-target requests but permits explicit same-target retry")
-    func barrierPolicyAllowsOnlySameTargetRetry() async throws {
+    @Test("Barrier blocks automatic requests but permits explicit operator recovery")
+    func barrierPolicyPermitsOperatorRecovery() async throws {
         let url = temporaryJournalURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let target = UUID()
@@ -122,13 +122,10 @@ struct AccountActivationStateTests {
             Issue.record("Automatic swaps must remain blocked")
             return
         }
-        guard case .blocked = degraded.decision(
+        #expect(degraded.decision(
             forRequestedTarget: other,
             kind: .manual
-        ) else {
-            Issue.record("Manual cross-target swaps must remain blocked")
-            return
-        }
+        ) == .beginActivation)
         #expect(degraded.decision(
             forRequestedTarget: target,
             kind: .manual
@@ -144,13 +141,18 @@ struct AccountActivationStateTests {
         }
         let crossTarget = try await coordinator.beginAuthorizedCredentialMutation(
             targetAccountId: other,
-            kind: .manual
+            kind: .manual,
+            requestedActivationGeneration: other
         )
-        guard case .blocked = crossTarget else {
-            Issue.record("Manual cross-target mutation must remain blocked")
+        guard case .prepared(let preparing) = crossTarget else {
+            Issue.record("Manual cross-target mutation must begin a fresh activation")
             return
         }
-        #expect(try await coordinator.load() == degraded)
+        #expect(preparing.phase == .preparing)
+        #expect(preparing.configuredAccountId == other)
+        #expect(preparing.activationGeneration == other)
+        #expect(preparing.retryAttempt == 0)
+        #expect(try await coordinator.load() == preparing)
     }
 
     @Test("Full ACK durably confirms runtime and clears the barrier")
@@ -277,13 +279,10 @@ struct AccountActivationStateTests {
             forRequestedTarget: target,
             kind: .manual
         ) == .retrySameTarget)
-        guard case .blocked = state.decision(
+        #expect(state.decision(
             forRequestedTarget: other,
             kind: .manual
-        ) else {
-            Issue.record("Retry exhaustion must not authorize another target")
-            return
-        }
+        ) == .beginActivation)
 
         let reset = try await coordinator.resetForManualSameTargetRetry(
             targetAccountId: target
@@ -291,6 +290,71 @@ struct AccountActivationStateTests {
         #expect(reset.phase == .committedDegraded)
         #expect(reset.retryAttempt == 0)
         #expect(reset.automaticRetryTarget(at: reset.updatedAt) == target)
+    }
+
+    @Test("Retry-exhausted manual review permits a fresh operator target")
+    func retryExhaustionPermitsCrossTargetRecovery() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let target = UUID()
+        let replacement = UUID()
+        let generation = UUID()
+        let coordinator = AccountActivationCoordinator(url: url)
+
+        _ = try await coordinator.beginPreparing(targetAccountId: target, kind: .automatic)
+        _ = try await coordinator.markCommittedDegraded(
+            targetAccountId: target,
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0,
+            detail: .runtimeAcknowledgementIncomplete
+        )
+        for _ in 0..<AccountActivationCoordinator.maximumAutomaticRetryAttempts {
+            _ = try await coordinator.recordConvergenceFailure(
+                targetAccountId: target,
+                discoveredRuntimeCount: 1,
+                acknowledgedRuntimeCount: 0,
+                detail: .runtimeAcknowledgementIncomplete
+            )
+        }
+
+        let decision = try await coordinator.beginAuthorizedCredentialMutation(
+            targetAccountId: replacement,
+            kind: .manual,
+            requestedActivationGeneration: generation
+        )
+        guard case .prepared(let preparing) = decision else {
+            Issue.record("Retry-exhausted state must permit explicit operator recovery")
+            return
+        }
+        #expect(preparing.phase == .preparing)
+        #expect(preparing.configuredAccountId == replacement)
+        #expect(preparing.activationGeneration == generation)
+        #expect(try await coordinator.load() == preparing)
+    }
+
+    @Test("Unsafe manual-review reasons still block cross-target changes")
+    func unsafeManualReviewBlocksCrossTargetRecovery() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let target = UUID()
+        let replacement = UUID()
+        let coordinator = AccountActivationCoordinator(url: url)
+
+        _ = try await coordinator.beginPreparing(targetAccountId: target, kind: .automatic)
+        let review = try await coordinator.markManualReview(
+            targetAccountId: target,
+            detail: .configuredFilesInconsistent
+        )
+        let decision = try await coordinator.beginAuthorizedCredentialMutation(
+            targetAccountId: replacement,
+            kind: .manual
+        )
+
+        guard case .blocked = decision else {
+            Issue.record("Inconsistent durable files must remain a hard barrier")
+            return
+        }
+        #expect(try await coordinator.load() == review)
     }
 
     @Test("Corrupt journal fails closed without replacing evidence")
@@ -445,25 +509,28 @@ struct AccountActivationStateTests {
         #expect(degraded.runtimeCurrentAccountId == nil)
         #expect(try await AccountActivationCoordinator(url: url).load() == degraded)
 
+        #expect(degraded.decision(
+            forRequestedTarget: other,
+            kind: .manual,
+            at: now.addingTimeInterval(11)
+        ) == .beginActivation)
+        #expect(degraded.decision(
+            forRequestedTarget: target,
+            kind: .manual,
+            at: now.addingTimeInterval(11)
+        ) == .retrySameTarget)
+
         let crossTarget = try await coordinator.beginAuthorizedCredentialMutation(
             targetAccountId: other,
             kind: .manual,
             at: now.addingTimeInterval(11)
         )
-        guard case .blocked = crossTarget else {
-            Issue.record("Manual cross-target activation must remain blocked")
+        guard case .prepared(let preparing) = crossTarget else {
+            Issue.record("Manual cross-target activation must provide an operator escape")
             return
         }
-        let sameTarget = try await coordinator.beginAuthorizedCredentialMutation(
-            targetAccountId: target,
-            kind: .manual,
-            at: now.addingTimeInterval(11)
-        )
-        guard case .retrySameTarget(let retryState) = sameTarget else {
-            Issue.record("Only same-target reconciliation should remain available")
-            return
-        }
-        #expect(retryState.activationGeneration == confirmed.activationGeneration)
+        #expect(preparing.phase == .preparing)
+        #expect(preparing.configuredAccountId == other)
     }
 
     @Test("Desktop runtime exit immediately demotes confirmed Mac ownership")

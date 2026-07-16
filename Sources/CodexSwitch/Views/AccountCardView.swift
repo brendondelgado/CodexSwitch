@@ -465,7 +465,7 @@ struct AccountCardView: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(
                     isRuntimeCurrent ? Self.activeGreen : (isConfigured ? .orange : .clear),
-                    lineWidth: 2.5
+                    lineWidth: isRuntimeCurrent ? 2.5 : 1.5
                 )
         )
         .overlay(alignment: .topLeading) {
@@ -475,9 +475,7 @@ struct AccountCardView: View {
             AccountCardHoverTrackingView(email: account.email, isHovering: $isHovering)
         }
         .shadow(
-            color: isRuntimeCurrent
-                ? Self.activeGreen.opacity(0.4)
-                : (isConfigured ? Color.orange.opacity(0.2) : .clear),
+            color: isRuntimeCurrent ? Self.activeGreen.opacity(0.4) : .clear,
             radius: 5
         )
         .contentShape(RoundedRectangle(cornerRadius: 8))

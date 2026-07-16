@@ -621,7 +621,10 @@ Before claiming hot-swap is fixed or ready:
 - [ ] The installed desktop version matches the latest official appcast release, or a newer signed release is staged for the next safe quit.
 - [ ] The installed ASAR contains exactly one Fast compatibility marker declaration, and the patched renderer still honors an explicit `featureRequirements.fast_mode == false` prohibition.
 - [ ] The bundled `patch-asar.py` hash matches the source used for the CodexSwitch build, the desktop-patch log records Fast fallback application without a structure warning, and the ASAR integrity hash plus strict code-sign verification pass before relaunch.
-- [ ] A forced rotation changes the active account and signals the expected process count.
+- [ ] A forced rotation changes the configured account and signals the expected process count.
+- [ ] From `CommittedDegraded`, an explicit cross-target operator selection starts a fresh activation while automatic rotation remains blocked.
+- [ ] From retry-exhausted `ManualReview`, an explicit cross-target operator selection can recover; every other manual-review reason remains blocked.
+- [ ] The menu lists the configured account first and does not style it as runtime-current until fresh confirmation exists.
 - [ ] The app-server journal or ack file proves the signal handler ran after the rotation.
 - [ ] With a disposable live desktop session, `CODEXSWITCH_RUN_LIVE_DESKTOP_RELOAD=1 swift test --filter SwapEngineTests/liveDesktopAppServerReloadWhenRequested` exercises discovery, capability gating, `SIGHUP`, and acknowledgement as one path.
 - [ ] The next real Codex request or remote compact uses the new account and does not repeat the old usage-limit error.

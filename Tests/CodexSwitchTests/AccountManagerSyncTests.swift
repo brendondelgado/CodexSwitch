@@ -623,8 +623,8 @@ struct AccountManagerSyncTests {
         #expect(manager.accounts.first?.quotaSnapshot?.fiveHour == nil)
     }
 
-    @Test("Sorted accounts put immediately usable accounts before exhausted active/pro accounts")
-    @MainActor func sortedAccountsPreferImmediateUsabilityBeforePlanAndActive() {
+    @Test("Sorted accounts keep the configured account first")
+    @MainActor func sortedAccountsKeepConfiguredAccountFirst() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
         let exhaustedPro = CodexAccount(
@@ -651,7 +651,8 @@ struct AccountManagerSyncTests {
         manager.addAccount(usablePlus)
         manager.setConfiguredAccount(exhaustedPro.id)
 
-        #expect(manager.sortedAccounts.first?.id == usablePlus.id)
+        #expect(manager.sortedAccounts.first?.id == exhaustedPro.id)
+        #expect(manager.sortedAccounts.dropFirst().first?.id == usablePlus.id)
     }
 
     @Test("Inactive imported credentials refresh an existing account")

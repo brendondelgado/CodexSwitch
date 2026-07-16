@@ -109,8 +109,10 @@ struct AccountActivationState: Codable, Equatable, Sendable {
             }
             return .beginActivation
         case .committedDegraded:
-            if kind == .manual, configuredAccountId == accountId {
-                return .retrySameTarget
+            if kind == .manual {
+                return configuredAccountId == accountId
+                    ? .retrySameTarget
+                    : .beginActivation
             }
             return .blocked(
                 "Mac runtime is not confirmed; restart or retry the configured account"
@@ -119,9 +121,10 @@ struct AccountActivationState: Codable, Equatable, Sendable {
             return .blocked("Mac account activation is incomplete; account changes are paused")
         case .manualReview:
             if kind == .manual,
-               configuredAccountId == accountId,
                detail == .automaticRetryLimitReached {
-                return .retrySameTarget
+                return configuredAccountId == accountId
+                    ? .retrySameTarget
+                    : .beginActivation
             }
             return .blocked("Mac activation state needs manual review; account changes are paused")
         }

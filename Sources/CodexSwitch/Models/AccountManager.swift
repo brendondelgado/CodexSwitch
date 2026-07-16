@@ -139,12 +139,12 @@ final class AccountManager {
     var sortedAccounts: [CodexAccount] {
         let now = Date()
         return accounts.sorted { a, b in
+            if a.isActive != b.isActive { return a.isActive }
             let aImmediatelyUsable = SwapEngine.isImmediatelyUsable(a, now: now)
             let bImmediatelyUsable = SwapEngine.isImmediatelyUsable(b, now: now)
             if aImmediatelyUsable != bImmediatelyUsable {
                 return aImmediatelyUsable
             }
-            if a.isActive != b.isActive { return a.isActive }
             let aScore = SwapEngine.score(a, now: now)
             let bScore = SwapEngine.score(b, now: now)
             if aScore != bScore { return aScore > bScore }
