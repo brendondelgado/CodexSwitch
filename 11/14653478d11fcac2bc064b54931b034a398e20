@@ -1,0 +1,28 @@
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_dfac346601b235 148-155
+  s_70c8e194852bb5::t_871c97383d883c 156
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_611180dc6e699e 1623-1642,1649-1650,1835-1847
+  s_70c8e194852bb5::t_ef2a986085a750 819-824,1552,1643-1648,2482,2570,2606
+  s_70c8e194852bb5::t_2ffe85e18fbe36 2480-2481,2483-2569,2571-2605,2607-2640
+  s_70c8e194852bb5::t_96c1e45f1a2e5b 762-818,825-937
+  s_70c8e194852bb5::t_b5ac922f035b5a 22,37-40,141-146,244
+  s_70c8e194852bb5::t_b26a79dc0dc5fa 760-761
+  s_70c8e194852bb5::t_23f4529573ded1 1848
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "1114653478d11fcac2bc064b54931b034a398e20",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
