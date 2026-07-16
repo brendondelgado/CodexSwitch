@@ -589,7 +589,7 @@ struct DesktopRuntimeReloadClient: Sendable {
                         ($0.target.process.identity.pid, $0.port)
                     }
                 )
-                SwapEngine.signalDesktopAppServerReloadSummary(
+                return SwapEngine.signalDesktopAppServerReloadSummary(
                     admittedDiscoverySnapshot: discovery,
                     admission: admission,
                     requiredOwnerUID: requiredOwnerUID,
