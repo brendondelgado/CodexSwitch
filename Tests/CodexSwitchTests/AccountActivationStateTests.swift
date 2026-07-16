@@ -335,14 +335,16 @@ struct AccountActivationStateTests {
         for _ in 0..<AccountActivationCoordinator.maximumAutomaticRetryAttempts {
             state = try await coordinator.recordConvergenceFailure(
                 targetAccountId: target,
-                discoveredRuntimeCount: 1,
-                acknowledgedRuntimeCount: 0,
+                discoveredRuntimeCount: 2,
+                acknowledgedRuntimeCount: 1,
                 detail: .runtimeAcknowledgementIncomplete
             )
         }
 
         #expect(state.phase == .manualReview)
         #expect(state.detail == .automaticRetryLimitReached)
+        #expect(state.discoveredRuntimeCount == 2)
+        #expect(state.acknowledgedRuntimeCount == 1)
         #expect(state.automaticRetryTarget(at: .distantFuture) == nil)
         #expect(state.decision(
             forRequestedTarget: target,
@@ -358,6 +360,8 @@ struct AccountActivationStateTests {
         )
         #expect(reset.phase == .committedDegraded)
         #expect(reset.retryAttempt == 0)
+        #expect(reset.discoveredRuntimeCount == 0)
+        #expect(reset.acknowledgedRuntimeCount == 0)
         #expect(reset.automaticRetryTarget(at: reset.updatedAt) == target)
     }
 

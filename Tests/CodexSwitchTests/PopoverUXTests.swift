@@ -4,6 +4,24 @@ import Testing
 
 @Suite("Popover UX")
 struct PopoverUXTests {
+    @Test("Retry exhaustion shows retained partial runtime convergence")
+    @MainActor
+    func retryExhaustionShowsPartialRuntimeProgress() {
+        let state = AccountActivationState.manualReview(
+            targetAccountId: UUID(),
+            detail: .automaticRetryLimitReached,
+            retryAttempt: AccountActivationCoordinator.maximumAutomaticRetryAttempts,
+            discoveredRuntimeCount: 3,
+            acknowledgedRuntimeCount: 2,
+            at: Date()
+        )
+
+        #expect(
+            PopoverContentView.activationStatusLabel(for: state)
+                == "Mac local: 2 of 3 runtimes switched; 1 runtime needs restart"
+        )
+    }
+
     @Test("Host ownership presentation keeps all three fields visible")
     @MainActor
     func hostOwnershipFieldsRemainSimultaneous() {

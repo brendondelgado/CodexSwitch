@@ -368,6 +368,8 @@ actor AccountActivationCoordinator {
                     detail: .automaticRetryLimitReached,
                     activationGeneration: current.activationGeneration,
                     retryAttempt: nextAttempt,
+                    discoveredRuntimeCount: discoveredRuntimeCount,
+                    acknowledgedRuntimeCount: acknowledgedRuntimeCount,
                     at: date
                 )
             }
@@ -697,8 +699,6 @@ actor AccountActivationCoordinator {
         case .manualReview:
             guard state.runtimeCurrentAccountId == nil,
                   state.nextRetryAt == nil,
-                  state.discoveredRuntimeCount == 0,
-                  state.acknowledgedRuntimeCount == 0,
                   state.detail != nil,
                   state.runtimeEvidenceGeneration == nil,
                   state.runtimeEvidenceObservedAt == nil,
@@ -710,6 +710,13 @@ actor AccountActivationCoordinator {
                     || state.retryAttempt < maximumAutomaticRetryAttempts) {
                 throw AccountActivationCoordinatorError.corruptJournal(
                     "retry-limit review is missing its target"
+                )
+            }
+            if state.detail != .automaticRetryLimitReached,
+               (state.discoveredRuntimeCount != 0
+                    || state.acknowledgedRuntimeCount != 0) {
+                throw AccountActivationCoordinatorError.corruptJournal(
+                    "manual-review runtime counts are not authorized"
                 )
             }
         }

@@ -159,6 +159,8 @@ struct AccountActivationState: Codable, Equatable, Sendable {
         detail: AccountActivationDetail,
         activationGeneration: UUID = UUID(),
         retryAttempt: Int = 0,
+        discoveredRuntimeCount: Int = 0,
+        acknowledgedRuntimeCount: Int = 0,
         at date: Date
     ) -> Self {
         Self(
@@ -170,8 +172,8 @@ struct AccountActivationState: Codable, Equatable, Sendable {
             updatedAt: date,
             retryAttempt: retryAttempt,
             nextRetryAt: nil,
-            discoveredRuntimeCount: 0,
-            acknowledgedRuntimeCount: 0,
+            discoveredRuntimeCount: discoveredRuntimeCount,
+            acknowledgedRuntimeCount: acknowledgedRuntimeCount,
             detail: detail,
             runtimeEvidenceGeneration: nil,
             runtimeEvidenceObservedAt: nil,

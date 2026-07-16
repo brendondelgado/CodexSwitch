@@ -40,6 +40,17 @@ struct PopoverContentView: View {
     }
 
     static func activationStatusLabel(for state: AccountActivationState) -> String? {
+        if state.phase != .confirmed,
+           state.discoveredRuntimeCount > 0,
+           state.acknowledgedRuntimeCount > 0,
+           state.acknowledgedRuntimeCount < state.discoveredRuntimeCount {
+            let remaining = state.discoveredRuntimeCount - state.acknowledgedRuntimeCount
+            let runtimeWord = remaining == 1 ? "runtime" : "runtimes"
+            return "Mac local: \(state.acknowledgedRuntimeCount) of "
+                + "\(state.discoveredRuntimeCount) runtimes switched; "
+                + "\(remaining) \(runtimeWord) needs restart"
+        }
+
         switch state.phase {
         case .preparing:
             return "Mac local: activation commit pending; account changes paused"

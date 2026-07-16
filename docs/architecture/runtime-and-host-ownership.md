@@ -149,7 +149,9 @@ automatic-attempt ceiling. Automatic entry through token refresh,
 reauthentication, external-auth reconciliation, or ordinary convergence retry
 preserves the same target's monotonically increasing attempt count; it cannot
 reset the count by returning to `Preparing`. Exhausting the ceiling enters
-`ManualReview`.
+`ManualReview` while retaining the final discovered and acknowledged runtime
+counts. The UI must present that partial convergence explicitly; it must not
+collapse verified progress into a generic zero-runtime or "no swaps" state.
 
 An explicit operator request may escape a valid `CommittedDegraded` barrier by
 selecting another account. It may also escape `ManualReview` only when that
@@ -392,7 +394,9 @@ The current managed local CLI may establish its first ACK under the same
 artifact and running-vnode proof, using the CLI-specific v3 acknowledgement
 shape. Exact-name preliminary discovery prevents unrelated command lines from
 making the CLI batch incomplete. A historical process lacking the v3 CLI
-contract remains a restart-required runtime and is never reported current.
+contract remains a restart-required runtime and is never reported current. Its
+presence does not erase successful desktop or current-CLI acknowledgements from
+the activation journal or status presentation.
 After that process exits, a throttled topology-change check may re-arm the
 exhausted same-target convergence once without relaunching CodexSwitch. The
 check is observational; the subsequent mutation path still performs full route,
