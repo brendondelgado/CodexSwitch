@@ -152,20 +152,28 @@ enum CodexDesktopBridgeKeepAlive {
         socketPort: UInt16
     ) -> Bool {
         let paths = supportPaths()
-        guard let route = CodexVersionChecker.installedManagedRuntimeRoute(),
-              bridgeFilesAreCurrent(paths),
-              let launchAgentPID = managedLaunchAgentPID(),
-              let runtimeFile = verifiedReadOnlyFile(
-                  at: route.runtimePath,
-                  expectedSHA256: route.runtimeSHA256,
-                  maximumBytes: maximumRuntimeBytes
-              ),
-              let helperFile = verifiedReadOnlyFile(
-                  at: route.helperPath,
-                  expectedSHA256: route.helperSHA256,
-                  maximumBytes: maximumHelperBytes
-              ) else {
-            return false
+        guard let route = CodexVersionChecker.installedManagedRuntimeRoute() else {
+            return denyBootstrap(binding, reason: "managed_route_unverified")
+        }
+        guard bridgeFilesAreCurrent(paths) else {
+            return denyBootstrap(binding, reason: "bridge_files_changed")
+        }
+        guard let launchAgentPID = managedLaunchAgentPID() else {
+            return denyBootstrap(binding, reason: "launchd_pid_unavailable")
+        }
+        guard let runtimeFile = verifiedReadOnlyFile(
+            at: route.runtimePath,
+            expectedSHA256: route.runtimeSHA256,
+            maximumBytes: maximumRuntimeBytes
+        ) else {
+            return denyBootstrap(binding, reason: "runtime_hash_unverified")
+        }
+        guard let helperFile = verifiedReadOnlyFile(
+            at: route.helperPath,
+            expectedSHA256: route.helperSHA256,
+            maximumBytes: maximumHelperBytes
+        ) else {
+            return denyBootstrap(binding, reason: "helper_hash_unverified")
         }
 
         let authorized = firstAcknowledgementBootstrapIsAuthorized(
@@ -182,8 +190,10 @@ enum CodexDesktopBridgeKeepAlive {
             SwapLog.append(.debug(
                 "DESKTOP_BRIDGE_BOOTSTRAP_AUTHORIZED pid=\(binding.processIdentity.pid)"
             ))
+        } else {
+            return denyBootstrap(binding, reason: "runtime_identity_mismatch")
         }
-        return authorized
+        return true
     }
 
     static func firstAcknowledgementBootstrapIsAuthorized(
@@ -373,6 +383,16 @@ enum CodexDesktopBridgeKeepAlive {
             return nil
         }
         return metadata
+    }
+
+    private static func denyBootstrap(
+        _ binding: CodexReloadBinding,
+        reason: String
+    ) -> Bool {
+        SwapLog.append(.debug(
+            "DESKTOP_BRIDGE_BOOTSTRAP_DENIED pid=\(binding.processIdentity.pid) reason=\(reason)"
+        ))
+        return false
     }
 
     @discardableResult
