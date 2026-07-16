@@ -3451,10 +3451,11 @@ struct CodexDesktopAppUpdaterTests {
             "codexswitch-temp-root-regression-\(UUID().uuidString).lock"
         )
         defer { try? FileManager.default.removeItem(at: leaseURL) }
-        let lease = try #require(DesktopUpdateCrossProcessLease.acquire(
+        let acquiredLease = try DesktopUpdateCrossProcessLease.acquire(
             at: leaseURL,
             isCancelled: { false }
-        ))
+        )
+        let lease = try #require(acquiredLease)
         lease.release()
 
         let downloader = DesktopUpdateDownloader(
