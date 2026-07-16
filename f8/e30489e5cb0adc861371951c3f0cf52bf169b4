@@ -1,0 +1,24 @@
+docs/architecture/desktop-update-storage.md
+  s_70c8e194852bb5::t_40069bf7ab0d5f 35,272-277
+  s_70c8e194852bb5::t_a405480f89a11d 278
+Sources/CodexSwitch/Services/DesktopUpdateOperationOwnership.swift
+  s_70c8e194852bb5::t_40069bf7ab0d5f 54-56
+Tests/CodexSwitchTests/CodexDesktopAppUpdaterTests.swift
+  s_70c8e194852bb5::t_354efeb851ab36 68-80,2783-2815
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "f8e30489e5cb0adc861371951c3f0cf52bf169b4",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
