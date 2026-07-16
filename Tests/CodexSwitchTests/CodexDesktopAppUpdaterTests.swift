@@ -3444,8 +3444,24 @@ struct CodexDesktopAppUpdaterTests {
         let canonical = try #require(CodexDesktopPathSecurity.canonicalExistingPath(alias))
         #expect(canonical.path == target.path)
         #expect(CodexDesktopPathSecurity.containsNoSymbolicLinkComponents(canonical))
+        let systemTemporary = CodexDesktopPathSecurity.canonicalSystemTemporaryDirectory()
+        #expect(CodexDesktopPathSecurity.containsNoSymbolicLinkComponents(systemTemporary))
+
+        let leaseURL = systemTemporary.appendingPathComponent(
+            "codexswitch-temp-root-regression-\(UUID().uuidString).lock"
+        )
+        defer { try? FileManager.default.removeItem(at: leaseURL) }
+        let lease = try #require(DesktopUpdateCrossProcessLease.acquire(
+            at: leaseURL,
+            isCancelled: { false }
+        ))
+        lease.release()
+
+        let downloader = DesktopUpdateDownloader(
+            updateRoot: root.appendingPathComponent("updates", isDirectory: true)
+        )
         #expect(CodexDesktopPathSecurity.containsNoSymbolicLinkComponents(
-            CodexDesktopPathSecurity.canonicalSystemTemporaryDirectory()
+            downloader.temporaryRoot
         ))
     }
 

@@ -215,7 +215,10 @@ the actual non-symlink namespace (for example `/private/tmp`) before a retained
 descriptor chain can be established. The trusted, already-existing system
 temporary root is canonicalized with `realpath` once before updater lease and
 workspace children are appended; every child and later mutation still uses the
-same no-follow traversal and retained-descriptor checks. Trust validation retains
+same no-follow traversal and retained-descriptor checks. The canonical result is
+preserved with lexical normalization because Foundation's `standardizedFileURL`
+can map `/private/var` back onto the rejected `/var` compatibility symlink.
+Trust validation retains
 no-follow descriptors for the bundle and its ancestors, observes rename/write
 events during the trust interval, and compares complete streamed seals before
 and after trust. This detects ancestor replacement, whole-bundle replace-and-

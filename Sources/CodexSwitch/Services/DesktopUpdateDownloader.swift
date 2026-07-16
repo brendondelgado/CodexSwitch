@@ -151,9 +151,9 @@ struct DesktopUpdateDownloader: @unchecked Sendable {
     ) {
         let updateRoot = updateRoot.standardizedFileURL
         self.updateRoot = updateRoot
-        self.temporaryRoot = (temporaryRoot
-            ?? CodexDesktopPathSecurity.canonicalSystemTemporaryDirectory())
-            .standardizedFileURL
+        self.temporaryRoot = CodexDesktopPathSecurity.lexicallyStandardized(
+            temporaryRoot ?? CodexDesktopPathSecurity.canonicalSystemTemporaryDirectory()
+        )
         self.fileManager = fileManager
         self.processRunner = processRunner
         self.transport = transport

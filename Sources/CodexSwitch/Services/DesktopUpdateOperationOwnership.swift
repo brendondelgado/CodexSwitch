@@ -119,7 +119,7 @@ final class DesktopUpdateCrossProcessLease: @unchecked Sendable {
         isCancelled: () -> Bool = { Task.isCancelled }
     ) throws -> DesktopUpdateCrossProcessLease? {
         guard !isCancelled() else { throw DesktopUpdateOwnershipError.cancelled }
-        let standardized = url.standardizedFileURL
+        let standardized = CodexDesktopPathSecurity.lexicallyStandardized(url)
         let parent = standardized.deletingLastPathComponent()
         if !fileManager.fileExists(atPath: parent.path) {
             try CodexDesktopPathSecurity.ensureDirectoryExists(parent, isCancelled: isCancelled)
@@ -304,8 +304,8 @@ actor DesktopUpdateOperationOwner {
         allowedDestinations: [URL]
     ) {
         self.stateMachine = stateMachine
-        self.leaseURL = leaseURL.standardizedFileURL
-        self.updateRoot = updateRoot.standardizedFileURL
+        self.leaseURL = CodexDesktopPathSecurity.lexicallyStandardized(leaseURL)
+        self.updateRoot = CodexDesktopPathSecurity.lexicallyStandardized(updateRoot)
         self.allowedDestinations = Set(allowedDestinations.map { $0.standardizedFileURL.path })
     }
 
