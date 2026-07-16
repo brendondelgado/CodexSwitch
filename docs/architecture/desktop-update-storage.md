@@ -32,7 +32,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: implemented_focused_verification
-  last_updated: 2026-07-15
+  last_updated: 2026-07-16
 ---
 
 # Desktop Update Storage
@@ -268,6 +268,13 @@ ledger, journal, cleanup-pointer, and final-status publication boundary.
 clears a slot only when both values still match. Stale work performs bounded
 non-cancellable cleanup of its own unreferenced artifact and cannot publish or
 erase replacement work.
+
+Epoch publication serialization permits same-thread reentrant current-state
+validation. Cancellation probes may validate the operation lifetime while a
+mutation boundary already owns the epoch lock; that nested validation must not
+deadlock the background updater or block the MainActor coordinator. Invalidation
+from another thread remains serialized behind the complete publication
+boundary.
 
 ## Safe Activation And Recovery
 

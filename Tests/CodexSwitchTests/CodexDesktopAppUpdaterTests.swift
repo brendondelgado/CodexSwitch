@@ -65,6 +65,19 @@ private actor ArchiveTransportFake: DesktopArchiveHTTPTransport {
     func downloads() -> Int { requestCount }
 }
 
+private final class DesktopUpdateCompletionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+
+    func markCompleted() {
+        lock.withLock { completed = true }
+    }
+
+    func isCompleted() -> Bool {
+        lock.withLock { completed }
+    }
+}
+
 private final class ConcurrentBundlePathProbe: @unchecked Sendable {
     private var process: Process?
     private var observationsURL: URL?
@@ -2765,6 +2778,39 @@ struct CodexDesktopAppUpdaterTests {
             await Task.yield()
         }
         #expect(await executor.counts().completedCleanups == 1)
+    }
+
+    @Test("Run epoch permits reentrant validation from cancellation probes")
+    func runEpochPermitsReentrantValidationFromCancellationProbes() async {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let owner = DesktopUpdateOperationOwner(
+            stateMachine: CodexDesktopUpdateStateMachine(),
+            leaseURL: root.appendingPathComponent("operation.lock"),
+            updateRoot: root.appendingPathComponent("updates", isDirectory: true),
+            allowedDestinations: []
+        )
+        let epoch = DesktopUpdateRunEpoch()
+        let acquisition = await owner.acquire(.staging, epoch: epoch)
+        guard case .acquired(let lifetime) = acquisition else {
+            Issue.record("Expected the updater operation lifetime")
+            return
+        }
+
+        let completed = DesktopUpdateCompletionFlag()
+        Thread.detachNewThread {
+            if (try? lifetime.mutationAuthority.requireCurrent(isCancelled: {
+                (try? lifetime.mutationAuthority.requireCurrent(isCancelled: { false })) == nil
+            })) != nil {
+                completed.markCompleted()
+            }
+        }
+
+        for _ in 0..<300 where !completed.isCompleted() {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(completed.isCompleted())
+        _ = await owner.finish(lifetime)
     }
 
     @Test("Sparkle ownership restore preserves a newer external value")

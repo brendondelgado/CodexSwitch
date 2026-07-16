@@ -51,7 +51,9 @@ enum DesktopUpdateOwnershipError: Error, Equatable, LocalizedError, Sendable {
 final class DesktopUpdateRunEpoch: @unchecked Sendable {
     let identifier: UUID
 
-    private let lock = NSLock()
+    // Cancellation probes can validate the same epoch while a publication
+    // boundary is already holding this lock on the current thread.
+    private let lock = NSRecursiveLock()
     private var valid: Bool
 
     init(identifier: UUID = UUID(), valid: Bool = true) {
