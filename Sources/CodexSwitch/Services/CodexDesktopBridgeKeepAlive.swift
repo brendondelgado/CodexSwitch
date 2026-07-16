@@ -5,8 +5,6 @@ enum CodexDesktopBridgeKeepAlive {
     static let label = "com.codexswitch.desktop-app-server-9223"
     static let port: UInt16 = 9223
     static let websocketURL = "ws://127.0.0.1:9223"
-    private static let maximumRuntimeBytes: Int64 = 512 * 1024 * 1024
-    private static let maximumHelperBytes: Int64 = 128 * 1024 * 1024
     private static let maximumBridgeFileBytes: Int64 = 64 * 1024
 
     static func installIfNeeded() {
@@ -152,10 +150,14 @@ enum CodexDesktopBridgeKeepAlive {
         socketPort: UInt16
     ) -> Bool {
         let paths = supportPaths()
-        guard let route = CodexVersionChecker.managedRuntimeRoute(
+        let verifiedRoute: CodexManagedRuntimeTrust.VerifiedRoute
+        switch CodexManagedRuntimeTrust.verifyRoute(
             managedLauncherPath: paths.launcherURL.path
-        ) else {
-            return denyBootstrap(binding, reason: "managed_route_unverified")
+        ) {
+        case .failure(let failure):
+            return denyBootstrap(binding, reason: failure.rawValue)
+        case .success(let verified):
+            verifiedRoute = verified
         }
         guard bridgeFilesAreCurrent(paths) else {
             return denyBootstrap(binding, reason: "bridge_files_changed")
@@ -163,30 +165,14 @@ enum CodexDesktopBridgeKeepAlive {
         guard let launchAgentPID = managedLaunchAgentPID() else {
             return denyBootstrap(binding, reason: "launchd_pid_unavailable")
         }
-        guard let runtimeFile = verifiedReadOnlyFile(
-            at: route.runtimePath,
-            expectedSHA256: route.runtimeSHA256,
-            maximumBytes: maximumRuntimeBytes
-        ) else {
-            return denyBootstrap(binding, reason: "runtime_hash_unverified")
-        }
-        guard let helperFile = verifiedReadOnlyFile(
-            at: route.helperPath,
-            expectedSHA256: route.helperSHA256,
-            maximumBytes: maximumHelperBytes
-        ) else {
-            return denyBootstrap(binding, reason: "helper_hash_unverified")
-        }
+        let route = verifiedRoute.route
 
         let authorized = firstAcknowledgementBootstrapIsAuthorized(
             binding: binding,
             socketPort: socketPort,
             launchAgentPID: launchAgentPID,
             bridgeFilesCurrent: true,
-            route: route,
-            runtimeFileIdentity: runtimeFile.identity,
-            runtimeDigest: runtimeFile.digest,
-            helperDigest: helperFile.digest
+            verifiedRoute: verifiedRoute
         )
         if authorized {
             SwapLog.append(.debug(
@@ -203,28 +189,24 @@ enum CodexDesktopBridgeKeepAlive {
         socketPort: UInt16,
         launchAgentPID: Int32?,
         bridgeFilesCurrent: Bool,
-        route: CodexVersionChecker.ManagedRuntimeRoute?,
-        runtimeFileIdentity: DesktopInstallPathIdentity?,
-        runtimeDigest: String?,
-        helperDigest: String?
+        verifiedRoute: CodexManagedRuntimeTrust.VerifiedRoute?
     ) -> Bool {
         guard binding.runtimeKind == .externalAppServer,
               socketPort == port,
               binding.processIdentity.ownerUID == UInt32(getuid()),
               launchAgentPID == binding.processIdentity.pid,
               bridgeFilesCurrent,
-              let route,
-              let runtimeFileIdentity,
-              route.managedLauncherPath == supportPaths().launcherURL.path,
-              route.runtimePath == binding.processIdentity.executablePath,
-              route.runtimePath == binding.kernelExecutableIdentity.canonicalPath,
-              runtimeFileIdentity.device == binding.kernelExecutableIdentity.device,
-              runtimeFileIdentity.inode == binding.kernelExecutableIdentity.inode,
-              runtimeDigest == route.runtimeSHA256,
-              helperDigest == route.helperSHA256 else {
+              let verifiedRoute else {
             return false
         }
-        return true
+        let route = verifiedRoute.route
+        return route.managedLauncherPath == supportPaths().launcherURL.path
+            && route.runtimePath == binding.processIdentity.executablePath
+            && route.runtimePath == binding.kernelExecutableIdentity.canonicalPath
+            && verifiedRoute.runtimeIdentity.device
+                == binding.kernelExecutableIdentity.device
+            && verifiedRoute.runtimeIdentity.inode
+                == binding.kernelExecutableIdentity.inode
     }
 
     static func launchAgentPID(from output: String) -> Int32? {
@@ -343,39 +325,6 @@ enum CodexDesktopBridgeKeepAlive {
             && (metadata.st_mode & S_IFMT) == S_IFREG
             && metadata.st_uid == getuid()
             && metadata.st_mode & 0o777 == expectedPermissions
-    }
-
-    private struct VerifiedFile {
-        let identity: DesktopInstallPathIdentity
-        let digest: String
-    }
-
-    private static func verifiedReadOnlyFile(
-        at path: String,
-        expectedSHA256: String,
-        maximumBytes: Int64
-    ) -> VerifiedFile? {
-        guard var metadata = fileMetadata(at: path),
-              metadata.st_uid == getuid(),
-              metadata.st_mode & 0o222 == 0,
-              let file = try? DesktopPinnedRegularFile(
-                  url: URL(fileURLWithPath: path),
-                  maximumBytes: maximumBytes
-              ),
-              file.byteCount > 0,
-              let digest = try? file.sha256(isCancelled: { false }),
-              digest == expectedSHA256,
-              file.verifyPathIdentity() else {
-            return nil
-        }
-        metadata = stat()
-        guard lstat(path, &metadata) == 0,
-              (metadata.st_mode & S_IFMT) == S_IFREG,
-              metadata.st_uid == getuid(),
-              metadata.st_mode & 0o222 == 0 else {
-            return nil
-        }
-        return VerifiedFile(identity: file.identity, digest: digest)
     }
 
     private static func fileMetadata(at path: String) -> stat? {

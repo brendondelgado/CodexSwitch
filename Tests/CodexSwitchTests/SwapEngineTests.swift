@@ -1240,6 +1240,46 @@ struct SwapEngineTests {
         ))
     }
 
+    @Test("CLI first ACK bootstrap is limited to an interactive CLI")
+    func cliFirstAcknowledgementBootstrapIsNarrow() {
+        let cliBinding = reloadBinding(
+            target: runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI)
+        )
+        let desktopBinding = reloadBinding(
+            target: runtimeTarget(pid: 42, runtimeKind: .externalAppServer)
+        )
+
+        #expect(SwapEngine.cliReloadCapabilityIsAuthorized(
+            binding: cliBinding,
+            hasStartupAcknowledgement: true,
+            managedRuntimeBootstrapAuthorized: false
+        ))
+        #expect(SwapEngine.cliReloadCapabilityIsAuthorized(
+            binding: cliBinding,
+            hasStartupAcknowledgement: false,
+            managedRuntimeBootstrapAuthorized: true
+        ))
+        #expect(!SwapEngine.cliReloadCapabilityIsAuthorized(
+            binding: cliBinding,
+            hasStartupAcknowledgement: false,
+            managedRuntimeBootstrapAuthorized: false
+        ))
+        #expect(!SwapEngine.cliReloadCapabilityIsAuthorized(
+            binding: desktopBinding,
+            hasStartupAcknowledgement: false,
+            managedRuntimeBootstrapAuthorized: true
+        ))
+    }
+
+    @Test("Local CLI preliminary discovery uses the exact process name")
+    func localCLIPreliminaryDiscoveryIsExact() {
+        #expect(
+            SwapEngine.localCodexProcessDiscoveryArguments
+                == ["-l", "-x", "codex"]
+        )
+        #expect(!SwapEngine.localCodexProcessDiscoveryArguments.contains("-f"))
+    }
+
     @Test("Incomplete CLI and desktop discovery sends zero signals")
     func incompleteDiscoverySendsNoSignals() {
         let parsed = SwapEngine.pgrepDiscoveryResult(

@@ -32,6 +32,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
   - ../../Sources/CodexSwitch/Services/CodexVersionChecker.swift
+  - ../../Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
   - ../../Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
@@ -387,6 +388,11 @@ forwarding wrappers remain part of CLI route verification, not desktop bridge
 authorization. This narrow bootstrap is not status evidence: activation remains
 degraded until the runtime returns the normal identity-bound ACK and proves at
 least one completed desktop frontend write.
+The current managed local CLI may establish its first ACK under the same
+artifact and running-vnode proof, using the CLI-specific v3 acknowledgement
+shape. Exact-name preliminary discovery prevents unrelated command lines from
+making the CLI batch incomplete. A historical process lacking the v3 CLI
+contract remains a restart-required runtime and is never reported current.
 After the bridge installation task completes, app launch may reset only a
 same-target `automatic_retry_limit_reached` journal and make one bounded
 convergence attempt. This recovery does not change the configured account or

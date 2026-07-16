@@ -653,6 +653,12 @@ enum SwapEngine {
 
     /// Send SIGHUP to running Codex CLI processes so they reload auth.json.
     /// Only sends if a SIGHUP-capable binary wrote a verification marker.
+    nonisolated static let localCodexProcessDiscoveryArguments = [
+        "-l",
+        "-x",
+        "codex",
+    ]
+
     @discardableResult
     static func signalCodexReload() -> CodexReloadSummary {
         let hasVerifiedSighupMarker = Self.hasVerifiedSighupMarker()
@@ -666,7 +672,7 @@ enum SwapEngine {
 
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-lf", "codex"],
+            arguments: localCodexProcessDiscoveryArguments,
             timeout: 3
         )
         let discoveryResult = pgrepDiscoveryResult(
@@ -678,6 +684,8 @@ enum SwapEngine {
             logger.error("Local Codex pgrep discovery failed: \(reason)")
             SwapLog.append(.sighupSkipped(reason: "pgrep failed: \(reason)"))
         }
+        var managedRouteVerification:
+            Result<CodexManagedRuntimeTrust.VerifiedRoute, CodexManagedRuntimeTrust.Failure>?
         let execution = executeReloadBatch(
             preliminaryPIDs: preliminaryReloadPIDs(from: discoveryResult),
             discoveryProvider: {
@@ -698,11 +706,51 @@ enum SwapEngine {
                 makeReloadBinding(for: target)
             },
             hotSwapSupport: { binding in
-                let supported = startupAcknowledgement(
+                let hasStartupAcknowledgement = startupAcknowledgement(
                     matching: binding,
                     homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
                     now: Date()
                 ) != nil
+                var managedRuntimeBootstrapAuthorized = false
+                if !hasStartupAcknowledgement {
+                    let verification: Result<
+                        CodexManagedRuntimeTrust.VerifiedRoute,
+                        CodexManagedRuntimeTrust.Failure
+                    >
+                    if let cached = managedRouteVerification {
+                        verification = cached
+                    } else {
+                        let verified = CodexManagedRuntimeTrust.verifyRoute(
+                            managedLauncherPath:
+                                CodexManagedRuntimeTrust.defaultManagedLauncherPath()
+                        )
+                        managedRouteVerification = verified
+                        verification = verified
+                    }
+
+                    switch verification {
+                    case .failure(let failure):
+                        SwapLog.append(.debug(
+                            "CLI_FIRST_ACK_BOOTSTRAP_DENIED pid=\(binding.processIdentity.pid) reason=\(failure.rawValue)"
+                        ))
+                    case .success(let verifiedRoute):
+                        managedRuntimeBootstrapAuthorized =
+                            CodexManagedRuntimeTrust.verifiedRouteAuthorizes(
+                                binding,
+                                verifiedRoute: verifiedRoute
+                            )
+                        SwapLog.append(.debug(
+                            managedRuntimeBootstrapAuthorized
+                                ? "CLI_FIRST_ACK_BOOTSTRAP_AUTHORIZED pid=\(binding.processIdentity.pid)"
+                                : "CLI_FIRST_ACK_BOOTSTRAP_DENIED pid=\(binding.processIdentity.pid) reason=runtime_identity_mismatch"
+                        ))
+                    }
+                }
+                let supported = cliReloadCapabilityIsAuthorized(
+                    binding: binding,
+                    hasStartupAcknowledgement: hasStartupAcknowledgement,
+                    managedRuntimeBootstrapAuthorized: managedRuntimeBootstrapAuthorized
+                )
                 if !supported {
                     SwapLog.append(.sighupSkipped(
                         reason: "pid \(binding.processIdentity.pid) lacks complete identity-bound startup evidence"
@@ -730,6 +778,15 @@ enum SwapEngine {
             acknowledgedPIDs: execution.acknowledgedPIDs,
             operationFailed: execution.operationFailed
         )
+    }
+
+    nonisolated static func cliReloadCapabilityIsAuthorized(
+        binding: CodexReloadBinding,
+        hasStartupAcknowledgement: Bool,
+        managedRuntimeBootstrapAuthorized: Bool
+    ) -> Bool {
+        binding.runtimeKind == .localInteractiveCLI
+            && (hasStartupAcknowledgement || managedRuntimeBootstrapAuthorized)
     }
 
     nonisolated static func codexReloadSummary(
@@ -1411,7 +1468,7 @@ enum SwapEngine {
     ) -> CodexLocalRuntimeEvidenceSnapshot {
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-lf", "codex"],
+            arguments: localCodexProcessDiscoveryArguments,
             timeout: 3
         )
         let discovery = runtimeDiscoverySnapshot(

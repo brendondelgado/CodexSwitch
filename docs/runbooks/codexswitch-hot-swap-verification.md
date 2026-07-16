@@ -29,6 +29,8 @@ cross_dependencies:
   - docs/architecture/runtime-and-host-ownership.md
   - crates/codexswitch-cli/src/readiness.rs
   - crates/codexswitch-cli/src/reload.rs
+  - Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
+  - Sources/CodexSwitch/Services/SwapEngine.swift
   - crates/codexswitch-cli/src/codex_update.rs
   - crates/codexswitch-cli/src/daemon.rs
   - crates/codexswitch-cli/src/quota.rs
@@ -258,6 +260,8 @@ CodexSwitch must evaluate these independently:
 
 - **Mac desktop:** official OpenAI signing and plugin health are separate from desktop hot-swap. The desktop status must not show green unless the live desktop runtime acknowledges reload.
 - **Mac local CLI:** only native interactive Codex CLI binaries with the CLI-specific capability marker are signal targets. Wrapper shells, code-mode hosts, `exec` subprocesses, SSH clients, and `--remote` clients are not the account-bearing local runtime. Both `~/.local/bin/codex` and `/opt/homebrew/bin/codex` must resolve their managed launcher target to the native binary before validation. A local launch must fail with a repair instruction when no complete hot-swap runtime is available; it must never silently fall back to the stock npm or desktop-bundled CLI, because that creates a process that can observe exhausted credentials but cannot adopt the next account in-turn.
+- **Mac CLI discovery:** preliminary `pgrep` candidates use exact process-name matching for `codex`. Full-command-line matching is prohibited because unrelated CodexSwitch paths and short-lived tools can make an otherwise valid batch incomplete.
+- **Mac CLI first ACK:** a current attested managed CLI may receive its first request only when its route, hashes, read-only files, owner, and running executable vnode all match. A historical runtime without the v3 CLI contract requires one exit and resume.
 - **Desktop code-mode helper:** `codex-code-mode-host` is a worker owned by the desktop app-server, not an independent interactive CLI. It must not appear as a Mac CLI readiness blocker or receive a standalone auth-reload signal; readiness follows its parent app-server.
 - **Mac remote client:** a `codex --remote` process on the Mac is a transport client, not the account-bearing app-server. It must not be treated as the VPS hot-swap target.
 - **Linux VPS app-server:** the app-server process is the primary account-bearing runtime for KittyLitter/remote sessions and must acknowledge reload.
@@ -684,6 +688,7 @@ Before claiming hot-swap is fixed or ready:
 - [ ] Each live target has a fresh `.codexswitch/hotswap-ack/<pid>.json` acknowledgement.
 - [ ] The desktop runtime contains the account-update marker, and the ACK proves matching disk/active auth fingerprints, the current signal nonce, and at least one completed frontend write.
 - [ ] A local interactive CLI ACK identifies `local-interactive-cli`, proves matching disk/active auth fingerprints and the current signal nonce, reports auth-generation/reconnect readiness, and reports zero desktop frontend writes.
+- [ ] A first-ACK CLI canary succeeds for the current managed runtime, while a historical or non-route runtime is skipped and remains restart-required.
 - [ ] The installed desktop version matches the latest official appcast release, or a newer signed release is staged for the next safe quit.
 - [ ] The installed ASAR contains exactly one Fast compatibility marker declaration, and the patched renderer still honors an explicit `featureRequirements.fast_mode == false` prohibition.
 - [ ] The bundled `patch-asar.py` hash matches the source used for the CodexSwitch build, the desktop-patch log records Fast fallback application without a structure warning, and the ASAR integrity hash plus strict code-sign verification pass before relaunch.

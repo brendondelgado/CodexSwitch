@@ -91,46 +91,60 @@ struct CodexDesktopBridgeKeepAliveTests {
             helperSHA256: String(repeating: "b", count: 64)
         )
         let fileIdentity = DesktopInstallPathIdentity(device: 7, inode: 9)
+        let verifiedRoute = CodexManagedRuntimeTrust.VerifiedRoute(
+            route: route,
+            runtimeIdentity: fileIdentity
+        )
 
         #expect(CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
             binding: binding,
             socketPort: 9223,
             launchAgentPID: 42,
             bridgeFilesCurrent: true,
-            route: route,
-            runtimeFileIdentity: fileIdentity,
-            runtimeDigest: String(repeating: "a", count: 64),
-            helperDigest: String(repeating: "b", count: 64)
+            verifiedRoute: verifiedRoute
+        ))
+        #expect(CodexManagedRuntimeTrust.verifiedRouteAuthorizes(
+            binding,
+            verifiedRoute: verifiedRoute
         ))
         #expect(!CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
             binding: binding,
             socketPort: 8390,
             launchAgentPID: 42,
             bridgeFilesCurrent: true,
-            route: route,
-            runtimeFileIdentity: fileIdentity,
-            runtimeDigest: String(repeating: "a", count: 64),
-            helperDigest: String(repeating: "b", count: 64)
+            verifiedRoute: verifiedRoute
         ))
         #expect(!CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
             binding: binding,
             socketPort: 9223,
             launchAgentPID: 43,
             bridgeFilesCurrent: true,
-            route: route,
-            runtimeFileIdentity: fileIdentity,
-            runtimeDigest: String(repeating: "a", count: 64),
-            helperDigest: String(repeating: "b", count: 64)
+            verifiedRoute: verifiedRoute
         ))
         #expect(!CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
             binding: binding,
             socketPort: 9223,
             launchAgentPID: 42,
             bridgeFilesCurrent: true,
-            route: route,
-            runtimeFileIdentity: fileIdentity,
-            runtimeDigest: String(repeating: "d", count: 64),
-            helperDigest: String(repeating: "b", count: 64)
+            verifiedRoute: CodexManagedRuntimeTrust.VerifiedRoute(
+                route: route,
+                runtimeIdentity: DesktopInstallPathIdentity(device: 7, inode: 10)
+            )
+        ))
+        #expect(!CodexManagedRuntimeTrust.verifiedRouteAuthorizes(
+            CodexReloadBinding(
+                processIdentity: identity,
+                kernelExecutableIdentity: CodexKernelExecutableIdentity(
+                    canonicalPath: runtime,
+                    device: 7,
+                    inode: 10
+                ),
+                runtimeKind: .localInteractiveCLI,
+                authFileIdentity: binding.authFileIdentity,
+                requestNonce: "other-nonce",
+                issuedAtUnixMilliseconds: 1_000_200
+            ),
+            verifiedRoute: verifiedRoute
         ))
     }
 

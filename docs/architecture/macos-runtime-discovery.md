@@ -16,6 +16,7 @@ cross_dependencies:
   - runtime-and-host-ownership.md
   - ../../Sources/CodexSwitch/Services/SwapEngine.swift
   - ../../Sources/CodexSwitch/Services/CLIStatusChecker.swift
+  - ../../Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeDiagnostics.swift
@@ -214,6 +215,20 @@ Indentation uses real tab bytes; a Swift raw-string sequence such as `\t` is a
 literal backslash plus `t` and must never be used as the expected grammar.
 Regression coverage must assert both successful route parsing and the absence
 of literal `\t` prefixes in the generated fixture.
+
+Local CLI preliminary discovery uses the exact process name `codex`; it must not
+use a broad full-command-line match that admits CodexSwitch, ChatGPT,
+`codex-code-mode-host`, build tools, or short-lived commands whose paths merely
+contain the word `codex`. Kernel identity and argv still perform final runtime
+classification.
+
+A current managed interactive CLI may also establish its first ACK during an
+explicit activation. This bootstrap requires the exact managed-launcher route,
+expected runtime and helper hashes, current-user ownership, read-only artifact
+files, and equality between the verified runtime file vnode and the running
+executable vnode. The normal v3 request, SIGHUP, and CLI-shaped ACK remain
+mandatory. Historical or unverified runtimes are not eligible; they require one
+exit and resume into the current managed runtime.
 
 Desktop JSON-RPC mutation participates in that same admitted operation. PID
 admission is acquired before typed runtime or listening-port discovery. Each
