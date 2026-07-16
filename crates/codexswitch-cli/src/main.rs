@@ -19,7 +19,7 @@ mod token_refresh;
 use account_store::save_accounts;
 use account_store::{
     active_account, commit_accounts, default_store_path, load_accounts, lock_account_store,
-    mark_runtime_unusable, quota_availability_at, resolve_account_selector,
+    mark_runtime_unusable, quota_availability_at, real_quota_snapshot, resolve_account_selector,
     select_auto_swap_candidate_from_observations, usage_limit_runtime_block_until,
     CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
 };
@@ -34,9 +34,10 @@ use clap::{Parser, Subcommand};
 use import::prepare_import_bundle;
 use quota::{apply_fetch_result, fetch_quota, FetchResult};
 use rate_limit_resets::{
-    consume_rate_limit_reset, fetch_rate_limit_reset_bank, orchestrate_reset, ConsumeResult,
-    RateLimitResetBank, ResetOrchestrationContext, ResetOrchestrationDependencies,
-    ResetQuotaRefreshStrategy, SmartResetReason,
+    consume_rate_limit_reset, fetch_rate_limit_reset_bank, orchestrate_reset,
+    reconcile_or_attempt_reset, ConsumeResult, RateLimitResetBank, ResetOrchestrationContext,
+    ResetOrchestrationDependencies, ResetQuotaRefreshStrategy, ResetReconciliationContext,
+    ResetReconciliationDependencies, SmartResetReason,
 };
 use reload::{reload_codex_hot_swap_processes, restart_codex_processes, ReloadSummary};
 use ring::digest::{digest, SHA256};
@@ -137,6 +138,12 @@ enum Command {
     Swap {
         account: String,
     },
+    /// Redeem one banked reset for one blocked Pro account without activating it.
+    RedeemReset {
+        account: String,
+        #[arg(long)]
+        json: bool,
+    },
     RotateNow {
         #[arg(long, default_value = "external_runtime_failure")]
         reason: String,
@@ -234,6 +241,7 @@ fn main() -> Result<()> {
         Command::InstallPreparedCodex { json } => install_prepared_codex(json),
         Command::AutoInstallCodexUpdate { json } => auto_install_codex_update(json),
         Command::Swap { account } => swap(&store_path, &auth_path, &account),
+        Command::RedeemReset { account, json } => redeem_reset(&store_path, &account, json),
         Command::RotateNow {
             reason,
             cooldown_seconds,
@@ -747,6 +755,184 @@ fn ensure_reload_converged(skipped: &[(i32, String)]) -> Result<()> {
         "auth was written, but {} discovered Codex runtime(s) did not acknowledge the reload; restart is required",
         skipped.len()
     )
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RedeemResetReport {
+    account: String,
+    account_id: String,
+    was_active: bool,
+    submitted_reset: bool,
+    previous_banked_resets: u32,
+    banked_resets_remaining: u32,
+    remaining_percent: Option<f64>,
+}
+
+pub(crate) fn redeem_reset(store_path: &Path, selector: &str, json_output: bool) -> Result<()> {
+    let report = redeem_reset_with(
+        store_path,
+        selector,
+        fetch_quota,
+        fetch_rate_limit_reset_bank,
+        consume_rate_limit_reset,
+    )?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        let action = if report.submitted_reset {
+            "Redeemed"
+        } else {
+            "Reconciled"
+        };
+        println!(
+            "{action} one banked reset for {}; {} reset(s) remain and the active account was unchanged",
+            report.account, report.banked_resets_remaining
+        );
+    }
+    Ok(())
+}
+
+fn redeem_reset_with<F, B, C>(
+    store_path: &Path,
+    selector: &str,
+    fetch_quota_fn: F,
+    fetch_reset_bank_fn: B,
+    consume_reset_fn: C,
+) -> Result<RedeemResetReport>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+{
+    let store_lock = lock_account_store(store_path)?;
+    let snapshot = store_lock.load()?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let target_id = resolve_account_selector(&accounts, selector)?;
+    let target_index = accounts
+        .iter()
+        .position(|account| account.id == target_id)
+        .context("resolved reset target disappeared from the account store")?;
+
+    let quota_result = fetch_quota_fn(&accounts[target_index]).with_context(|| {
+        format!(
+            "failed to refresh quota for {}",
+            accounts[target_index].email
+        )
+    })?;
+    apply_fetch_result(&mut accounts[target_index], quota_result);
+
+    if accounts[target_index].plan_priority() != 4 {
+        let email = accounts[target_index].email.clone();
+        commit_accounts(&store_lock, &mut generation, &accounts)?;
+        bail!("banked reset redemption requires a Pro account; {email} is not Pro");
+    }
+
+    let quota_now = Utc::now();
+    let quota_availability = real_quota_snapshot(&accounts[target_index])
+        .map(|snapshot| snapshot.availability_at(quota_now))
+        .unwrap_or(QuotaAvailability::Unknown);
+    if quota_availability != QuotaAvailability::Blocked {
+        let email = accounts[target_index].email.clone();
+        commit_accounts(&store_lock, &mut generation, &accounts)?;
+        bail!(
+            "banked reset redemption requires a fresh blocked quota for {email}; observed {quota_availability:?}"
+        );
+    }
+
+    let previous_bank = accounts[target_index].rate_limit_reset_bank.clone();
+    let observed_bank = match fetch_reset_bank_fn(&accounts[target_index]) {
+        Ok(bank) => bank,
+        Err(error) => {
+            let email = accounts[target_index].email.clone();
+            commit_accounts(&store_lock, &mut generation, &accounts)?;
+            return Err(error).with_context(|| format!("failed to refresh reset bank for {email}"));
+        }
+    };
+    let decision_now = std::cmp::max(Utc::now(), observed_bank.fetched_at);
+    let quota_availability = real_quota_snapshot(&accounts[target_index])
+        .map(|snapshot| snapshot.availability_at(decision_now))
+        .unwrap_or(QuotaAvailability::Unknown);
+    if quota_availability != QuotaAvailability::Blocked {
+        let email = accounts[target_index].email.clone();
+        accounts[target_index].rate_limit_reset_bank = Some(observed_bank);
+        commit_accounts(&store_lock, &mut generation, &accounts)?;
+        bail!(
+            "banked reset redemption requires a fresh blocked quota for {email}; observed {quota_availability:?}"
+        );
+    }
+
+    let email = accounts[target_index].email.clone();
+    let account_id = accounts[target_index].account_id.clone();
+    let was_active = accounts[target_index].is_active;
+    let previous_banked_resets = observed_bank.available_count;
+    let previous_runtime_unusable_until = accounts[target_index].runtime_unusable_until;
+    let previous_runtime_unusable_reason = accounts[target_index].runtime_unusable_reason.clone();
+    accounts[target_index].runtime_unusable_until = None;
+    accounts[target_index].runtime_unusable_reason = None;
+
+    let mut submitted_reset = false;
+    let flow_result = reconcile_or_attempt_reset(
+        ResetReconciliationContext {
+            store_lock: &store_lock,
+            account: &mut accounts[target_index],
+            previous_bank: previous_bank.as_ref(),
+            observed_bank,
+            attempt_reset: true,
+            now: decision_now,
+        },
+        ResetReconciliationDependencies::new(
+            |account| fetch_reset_bank_fn(account),
+            |account| {
+                let result = fetch_quota_fn(&*account)?;
+                apply_fetch_result(account, result);
+                Ok(())
+            },
+            |account, bank, request_id| {
+                submitted_reset = true;
+                consume_reset_fn(account, bank, request_id)
+            },
+        ),
+    );
+
+    let usable_success = flow_result
+        .as_ref()
+        .map(|flow| flow.is_usable_success())
+        .unwrap_or(false);
+    if !usable_success {
+        accounts[target_index].runtime_unusable_until = previous_runtime_unusable_until;
+        accounts[target_index].runtime_unusable_reason = previous_runtime_unusable_reason;
+    }
+    let banked_resets_remaining = accounts[target_index]
+        .rate_limit_reset_bank
+        .as_ref()
+        .map(|bank| bank.available_count)
+        .unwrap_or(previous_banked_resets);
+    let remaining_percent = real_quota_snapshot(&accounts[target_index])
+        .and_then(QuotaSnapshot::minimum_remaining_percent);
+    commit_accounts(&store_lock, &mut generation, &accounts)?;
+
+    let flow = flow_result.with_context(|| format!("reset reconciliation failed for {email}"))?;
+    if !flow.is_usable_success() {
+        bail!(
+            "banked reset was not reconciled as usable for {email}: {}",
+            flow.detail
+                .as_deref()
+                .unwrap_or("no available reset or no confirmed inventory decrease")
+        );
+    }
+
+    Ok(RedeemResetReport {
+        account: email,
+        account_id,
+        was_active,
+        submitted_reset,
+        previous_banked_resets,
+        banked_resets_remaining,
+        remaining_percent,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1363,6 +1549,7 @@ mod tests {
         CodexAccount, QuotaWindow, QuotaWindowRateLimitSource, QuotaWindowSlot,
         QuotaWindowSourceMetadata,
     };
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1431,6 +1618,34 @@ mod tests {
             signaled: vec![42],
             ..ReloadSummary::default()
         }
+    }
+
+    fn reset_bank(credit_ids: &[&str]) -> RateLimitResetBank {
+        RateLimitResetBank {
+            available_count: credit_ids.len() as u32,
+            total_earned_count: credit_ids.len() as u32,
+            credits: credit_ids
+                .iter()
+                .map(|credit_id| rate_limit_resets::RateLimitResetCredit {
+                    id: (*credit_id).to_string(),
+                    reset_type: Some("full".to_string()),
+                    status: "available".to_string(),
+                    granted_at: Some(Utc::now() - ChronoDuration::days(1)),
+                    expires_at: Some(Utc::now() + ChronoDuration::days(10)),
+                    redeem_started_at: None,
+                    redeemed_at: None,
+                    title: Some("Full reset".to_string()),
+                    description: None,
+                })
+                .collect(),
+            fetched_at: Utc::now(),
+        }
+    }
+
+    fn secure_temp_dir() -> Result<TempDir> {
+        let temp = TempDir::new()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+        Ok(temp)
     }
 
     #[test]
@@ -1616,6 +1831,20 @@ mod tests {
                 allow_banked_reset: true,
                 ..
             }
+        ));
+
+        let targeted = Args::try_parse_from([
+            "codexswitch-cli",
+            "redeem-reset",
+            "pro@example.com",
+            "--json",
+        ])?;
+        assert!(matches!(
+            targeted.command,
+            Command::RedeemReset {
+                account,
+                json: true,
+            } if account == "pro@example.com"
         ));
         Ok(())
     }
@@ -2245,6 +2474,167 @@ mod tests {
             quota_availability_at(active, Utc::now()),
             QuotaAvailability::Usable
         );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_redeems_only_requested_pro_and_preserves_active_auth() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 0.0, 10.0);
+        let mut exhausted = account("exhausted@example.com", false, 0.0, 100.0);
+        exhausted.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(7));
+        exhausted.runtime_unusable_reason = Some("usage_limit".to_string());
+        save_accounts(&store_path, &[active.clone(), exhausted.clone()])?;
+        auth::write_auth_file(&auth_path, &active)?;
+        let auth_before = fs::read(&auth_path)?;
+
+        let quota_fetches = Arc::new(Mutex::new(0usize));
+        let bank_fetches = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let report = redeem_reset_with(
+            &store_path,
+            &exhausted.email,
+            {
+                let quota_fetches = Arc::clone(&quota_fetches);
+                move |account| {
+                    let mut result = fetch_from_account(account)?;
+                    let mut calls = quota_fetches.lock().unwrap();
+                    *calls += 1;
+                    if *calls > 1 {
+                        for window in &mut result.snapshot.windows {
+                            window.used_percent = 0.0;
+                            window.hard_limit_reached = false;
+                        }
+                        result.snapshot.allowed = Some(true);
+                        result.snapshot.limit_reached = Some(false);
+                    }
+                    Ok(result)
+                }
+            },
+            {
+                let bank_fetches = Arc::clone(&bank_fetches);
+                move |_account| {
+                    let mut calls = bank_fetches.lock().unwrap();
+                    *calls += 1;
+                    Ok(if *calls == 1 {
+                        reset_bank(&["credit-a", "credit-b"])
+                    } else {
+                        reset_bank(&["credit-b"])
+                    })
+                }
+            },
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    Ok(ConsumeResult {
+                        code: rate_limit_resets::ConsumeCode::Reset,
+                        credit_id: Some("credit-a".to_string()),
+                    })
+                }
+            },
+        )?;
+
+        assert_eq!(report.account, exhausted.email);
+        assert!(!report.was_active);
+        assert!(report.submitted_reset);
+        assert_eq!(report.previous_banked_resets, 2);
+        assert_eq!(report.banked_resets_remaining, 1);
+        assert_eq!(*quota_fetches.lock().unwrap(), 2);
+        assert_eq!(*bank_fetches.lock().unwrap(), 2);
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+        assert_eq!(fs::read(&auth_path)?, auth_before);
+
+        let stored = load_accounts(&store_path)?;
+        assert_eq!(
+            active_account(&stored).map(|account| account.email.as_str()),
+            Some("active@example.com")
+        );
+        let redeemed = stored
+            .iter()
+            .find(|account| account.email == exhausted.email)
+            .unwrap();
+        assert_eq!(redeemed.runtime_unusable_until, None);
+        assert_eq!(redeemed.runtime_unusable_reason, None);
+        assert_eq!(
+            quota_availability_at(redeemed, Utc::now()),
+            QuotaAvailability::Usable
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_rejects_usable_pro_without_fetching_or_consuming_credit() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let usable = account("usable@example.com", true, 0.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&usable))?;
+
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let error = redeem_reset_with(
+            &store_path,
+            &usable.email,
+            fetch_from_account,
+            {
+                let bank_calls = Arc::clone(&bank_calls);
+                move |_account| {
+                    *bank_calls.lock().unwrap() += 1;
+                    Ok(reset_bank(&["credit-a"]))
+                }
+            },
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    bail!("usable account must not consume a reset")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("requires a fresh blocked quota"));
+        assert_eq!(*bank_calls.lock().unwrap(), 0);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_rejects_non_pro_without_fetching_or_consuming_credit() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let mut plus = account("plus@example.com", true, 0.0, 100.0);
+        plus.plan_type = Some("plus".to_string());
+        save_accounts(&store_path, std::slice::from_ref(&plus))?;
+
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let error = redeem_reset_with(
+            &store_path,
+            &plus.email,
+            fetch_from_account,
+            {
+                let bank_calls = Arc::clone(&bank_calls);
+                move |_account| {
+                    *bank_calls.lock().unwrap() += 1;
+                    Ok(reset_bank(&["credit-a"]))
+                }
+            },
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    bail!("non-Pro account must not consume a reset")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("requires a Pro account"));
+        assert_eq!(*bank_calls.lock().unwrap(), 0);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
         Ok(())
     }
 

@@ -145,6 +145,15 @@ The Mac menu app is the sole automatic redemption owner. The VPS daemon has no
 automatic-reset option. An explicit operator command may request one manual
 redemption, but it does not create a second background owner.
 
+`codexswitch-cli redeem-reset <account>` is that manual entrypoint. It accepts
+one exact account selector, requires a Pro account with a fresh blocked quota
+observation and a fresh available credit, and never changes the active account
+or auth file. Each invocation uses the canonical account-store reset journal,
+submits at most one credit, reconciles a newer inventory and quota observation,
+and commits the refreshed target account before reporting success. A usable
+account, a non-Pro account, an unknown or stale quota, or an unresolved prior
+attempt fails closed without sending a consume request.
+
 Reset redemption is a journaled state machine:
 
 ```text
