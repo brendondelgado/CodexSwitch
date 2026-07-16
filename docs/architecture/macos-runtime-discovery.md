@@ -169,9 +169,13 @@ not from `pgrep` text. A signal path must:
    reads to match before classifying argv.
 5. Read the canonical no-follow auth file once, bind its descriptor-derived
    device/inode and complete token fingerprint, then form the immutable binding.
-6. Establish capability only from complete startup request and ACK evidence
-   matching the current observation. Executable markers and path modification
-   time are not running-image proof.
+6. Establish capability from complete startup request and ACK evidence matching
+   the current observation. The one exception is first-ACK bootstrap for the
+   repository-owned desktop bridge on port `9223`: its launchd PID, generated
+   bridge files, exact managed-launcher grammar, expected runtime/helper hashes,
+   and the running executable vnode must all match before CodexSwitch may write
+   one request and send one signal. Executable markers or path modification time
+   alone are never running-image proof.
 7. Persist the complete structured request binding, then sandwich two equal
    argv reads between exact process-identity reads and reclassify the runtime
    kind while revalidating the executable vnode, auth path/device/inode,
@@ -187,6 +191,14 @@ Capability evidence collected before a PID identity change never authorizes the
 replacement process. A stock process whose executable path is replaced by a
 patched file remains unsupported because on-disk path state is not running-image
 evidence.
+
+The managed `9223` bootstrap closes the otherwise circular first-start
+dependency: a newly launched app-server cannot have an identity-bound ACK until
+it has received its first identity-bound request. Bootstrap is mutation-path
+only, applies to the exact launchd-owned bridge PID and socket, and still
+requires the normal post-signal ACK with matching auth fingerprints and a
+completed frontend write. It never makes readiness green by itself and does not
+authorize arbitrary app-servers or local interactive CLI processes.
 
 Desktop JSON-RPC mutation participates in that same admitted operation. PID
 admission is acquired before typed runtime or listening-port discovery. Each

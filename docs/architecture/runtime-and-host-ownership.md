@@ -378,6 +378,13 @@ not as v3 rotation evidence, and are never eligible for automatic repair.
 When a daemon tick rejects an activation barrier, the outer daemon loop must
 also skip auxiliary missing-ack bootstrap reloads for that tick; barrier failure
 is side-effect free across the complete production wrapper.
+On macOS, a newly started repository-owned desktop bridge may establish its
+first ACK during an explicit desktop activation only after CodexSwitch verifies
+the canonical `9223` listener, launchd PID, generated bridge files, exact
+managed-launcher route, expected runtime and helper hashes, and the running
+executable vnode. This narrow bootstrap is not status evidence: activation
+remains degraded until the runtime returns the normal identity-bound ACK and
+proves at least one completed desktop frontend write.
 The VPS daemon may hold the account-store lock only for a bounded read,
 generation revalidation, journal transition, or atomic commit. Provider quota
 requests, reset-inventory requests, token refresh, process discovery, signals,

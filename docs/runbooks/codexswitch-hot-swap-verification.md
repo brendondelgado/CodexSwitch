@@ -671,6 +671,10 @@ Before claiming hot-swap is fixed or ready:
 - [ ] `codexswitch-cli auth-diagnostics` shows active account hash equals `auth.json` hash.
 - [ ] `codexswitch-cli doctor` reports live runtimes as verified, not merely patched.
 - [ ] A fresh app-server restart is auto-acknowledged by the daemon bootstrap reload without waiting for a real quota swap.
+- [ ] A fresh Mac `9223` bridge restart can bootstrap its first ACK during an
+  explicit desktop activation, but only when the launchd PID, generated bridge
+  files, exact managed route, expected runtime/helper hashes, listener owner,
+  and running executable vnode all agree.
 - [ ] Each live target has a fresh `.codexswitch/hotswap-ack/<pid>.json` acknowledgement.
 - [ ] The desktop runtime contains the account-update marker, and the ACK proves matching disk/active auth fingerprints, the current signal nonce, and at least one completed frontend write.
 - [ ] A local interactive CLI ACK identifies `local-interactive-cli`, proves matching disk/active auth fingerprints and the current signal nonce, reports auth-generation/reconnect readiness, and reports zero desktop frontend writes.

@@ -231,7 +231,7 @@ struct DesktopRuntimeReloadClientTests {
         let strictCalls = LockedTestState(0)
         let (client, sender) = makeClient(
             responses: [],
-            strictReload: { _, _, _ in
+            strictReload: { _, _, _, _ in
                 strictCalls.update { $0 += 1 }
                 return Self.successfulStrictSummary
             }
@@ -416,7 +416,7 @@ struct DesktopRuntimeReloadClientTests {
                     runtimeTargetIsCurrent: { _, _ in true }
                 )
             },
-            strictReload: { _, _, _ in
+            strictReload: { _, _, _, _ in
                 strictCalls.update { $0 += 1 }
                 return Self.successfulStrictSummary
             }
@@ -445,7 +445,7 @@ struct DesktopRuntimeReloadClientTests {
         let (firstClient, _) = makeClient(
             responses: responses,
             gate: gate,
-            strictReload: { _, _, _ in
+            strictReload: { _, _, _, _ in
                 firstEnteredACKWait.signal()
                 releaseFirstACKWait.wait()
                 return Self.successfulStrictSummary
@@ -595,9 +595,10 @@ struct DesktopRuntimeReloadClientTests {
         ) -> Bool = { _, _ in true },
         strictReload: @escaping @Sendable (
             CodexRuntimeDiscoverySnapshot,
+            [CodexDesktopRuntimeSocketBinding],
             CodexReloadAdmission,
             UInt32
-        ) -> CodexReloadSummary = { _, _, _ in
+        ) -> CodexReloadSummary = { _, _, _, _ in
             DesktopRuntimeReloadClientTests.successfulStrictSummary
         }
     ) -> (DesktopRuntimeReloadClient, StubDesktopRuntimeRequestSender) {

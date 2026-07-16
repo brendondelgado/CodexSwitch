@@ -786,11 +786,16 @@ enum SwapEngine {
                 makeReloadBinding(for: target)
             },
             hotSwapSupport: { binding in
-                let supported = startupAcknowledgement(
+                let hasStartupAcknowledgement = startupAcknowledgement(
                     matching: binding,
                     homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
                     now: Date()
                 ) != nil
+                let supported = desktopReloadCapabilityIsAuthorized(
+                    binding: binding,
+                    hasStartupAcknowledgement: hasStartupAcknowledgement,
+                    firstAcknowledgementBootstrapAuthorized: false
+                )
                 if !supported {
                     SwapLog.append(.desktopExternalReloadSkipped(
                         reason: "pid \(binding.processIdentity.pid) lacks complete identity-bound startup evidence"
@@ -818,7 +823,8 @@ enum SwapEngine {
     static func signalDesktopAppServerReloadSummary(
         admittedDiscoverySnapshot discoverySnapshot: CodexRuntimeDiscoverySnapshot,
         admission: CodexReloadAdmission,
-        requiredOwnerUID: UInt32
+        requiredOwnerUID: UInt32,
+        firstAcknowledgementBootstrap: @Sendable (CodexReloadBinding) -> Bool = { _ in false }
     ) -> CodexReloadSummary {
         let targetPIDs = Set(discoverySnapshot.targets.map { $0.process.identity.pid })
         guard admission.admits(targetPIDs, on: reloadAttemptGate) else {
@@ -840,11 +846,17 @@ enum SwapEngine {
             candidateIsEligible: { _ in hasVerifiedSighupMarker },
             makeBinding: { target in makeReloadBinding(for: target) },
             hotSwapSupport: { binding in
-                let supported = startupAcknowledgement(
+                let hasStartupAcknowledgement = startupAcknowledgement(
                     matching: binding,
                     homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
                     now: Date()
                 ) != nil
+                let supported = desktopReloadCapabilityIsAuthorized(
+                    binding: binding,
+                    hasStartupAcknowledgement: hasStartupAcknowledgement,
+                    firstAcknowledgementBootstrapAuthorized: !hasStartupAcknowledgement
+                        && firstAcknowledgementBootstrap(binding)
+                )
                 if !supported {
                     SwapLog.append(.desktopExternalReloadSkipped(
                         reason: "pid \(binding.processIdentity.pid) lacks complete identity-bound startup evidence"
@@ -866,6 +878,18 @@ enum SwapEngine {
             acknowledgedPIDs: execution.acknowledgedPIDs,
             operationFailed: execution.operationFailed
         )
+    }
+
+    nonisolated static func desktopReloadCapabilityIsAuthorized(
+        binding: CodexReloadBinding,
+        hasStartupAcknowledgement: Bool,
+        firstAcknowledgementBootstrapAuthorized: Bool
+    ) -> Bool {
+        hasStartupAcknowledgement
+            || (
+                binding.runtimeKind == .externalAppServer
+                    && firstAcknowledgementBootstrapAuthorized
+            )
     }
 
     nonisolated static func desktopReloadSummary(

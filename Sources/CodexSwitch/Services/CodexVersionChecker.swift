@@ -41,6 +41,21 @@ final class CodexVersionChecker {
         let terminationStatus: Int32
     }
 
+    struct ManagedRuntimeRoute: Sendable, Equatable {
+        let managedLauncherPath: String
+        let runtimePath: String
+        let helperPath: String
+        let runtimeSHA256: String
+        let helperSHA256: String
+    }
+
+    struct ManagedRuntimeTarget: Sendable, Equatable {
+        let runtimePath: String
+        let helperPath: String
+        let runtimeSHA256: String
+        let helperSHA256: String
+    }
+
     enum CodexUpdateStatus: String, Decodable, Sendable, Equatable {
         case idle
         case checking
@@ -916,6 +931,23 @@ final class CodexVersionChecker {
         localLauncherPath: String,
         homebrewBridgePath: String
     ) -> String? {
+        managedRuntimeRoute(
+            localLauncherPath: localLauncherPath,
+            homebrewBridgePath: homebrewBridgePath
+        )?.runtimePath
+    }
+
+    nonisolated static func installedManagedRuntimeRoute() -> ManagedRuntimeRoute? {
+        managedRuntimeRoute(
+            localLauncherPath: localLauncherPath,
+            homebrewBridgePath: homebrewCodexPath
+        )
+    }
+
+    nonisolated static func managedRuntimeRoute(
+        localLauncherPath: String,
+        homebrewBridgePath: String
+    ) -> ManagedRuntimeRoute? {
         guard let localScript = try? String(contentsOfFile: localLauncherPath, encoding: .utf8),
               let bridgeScript = try? String(contentsOfFile: homebrewBridgePath, encoding: .utf8),
               let localManaged = launcherManagedCodexTarget(from: localScript),
@@ -930,10 +962,16 @@ final class CodexVersionChecker {
                 contentsOfFile: normalizedLocalManaged,
                 encoding: .utf8
               ),
-              let runtimeTarget = launcherPatchedCodexTarget(from: managedScript) else {
+              let target = launcherPatchedCodexDescriptor(from: managedScript) else {
             return nil
         }
-        return (runtimeTarget as NSString).standardizingPath
+        return ManagedRuntimeRoute(
+            managedLauncherPath: normalizedLocalManaged,
+            runtimePath: target.runtimePath,
+            helperPath: target.helperPath,
+            runtimeSHA256: target.runtimeSHA256,
+            helperSHA256: target.helperSHA256
+        )
     }
 
     nonisolated static func launcherManagedCodexTarget(from script: String) -> String? {
@@ -950,6 +988,12 @@ final class CodexVersionChecker {
     }
 
     nonisolated static func launcherPatchedCodexTarget(from script: String) -> String? {
+        launcherPatchedCodexDescriptor(from: script)?.runtimePath
+    }
+
+    nonisolated static func launcherPatchedCodexDescriptor(
+        from script: String
+    ) -> ManagedRuntimeTarget? {
         let lines = script.components(separatedBy: "\n")
         guard lines.count == 25,
               let patched = launcherSingleQuotedValue(
@@ -982,7 +1026,12 @@ final class CodexVersionChecker {
               ) else {
             return nil
         }
-        return normalizedPatched
+        return ManagedRuntimeTarget(
+            runtimePath: normalizedPatched,
+            helperPath: normalizedHelper,
+            runtimeSHA256: runtimeSHA256,
+            helperSHA256: helperSHA256
+        )
     }
 
     private nonisolated static func launcherSingleQuotedValue(

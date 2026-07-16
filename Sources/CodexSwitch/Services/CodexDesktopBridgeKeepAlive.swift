@@ -1,9 +1,13 @@
+import Darwin
 import Foundation
 
 enum CodexDesktopBridgeKeepAlive {
     static let label = "com.codexswitch.desktop-app-server-9223"
     static let port: UInt16 = 9223
     static let websocketURL = "ws://127.0.0.1:9223"
+    private static let maximumRuntimeBytes: Int64 = 512 * 1024 * 1024
+    private static let maximumHelperBytes: Int64 = 128 * 1024 * 1024
+    private static let maximumBridgeFileBytes: Int64 = 64 * 1024
 
     static func installIfNeeded() {
         do {
@@ -143,6 +147,86 @@ enum CodexDesktopBridgeKeepAlive {
         """
     }
 
+    static func authorizesFirstAcknowledgementBootstrap(
+        binding: CodexReloadBinding,
+        socketPort: UInt16
+    ) -> Bool {
+        let paths = supportPaths()
+        guard let route = CodexVersionChecker.installedManagedRuntimeRoute(),
+              bridgeFilesAreCurrent(paths),
+              let launchAgentPID = managedLaunchAgentPID(),
+              let runtimeFile = verifiedReadOnlyFile(
+                  at: route.runtimePath,
+                  expectedSHA256: route.runtimeSHA256,
+                  maximumBytes: maximumRuntimeBytes
+              ),
+              let helperFile = verifiedReadOnlyFile(
+                  at: route.helperPath,
+                  expectedSHA256: route.helperSHA256,
+                  maximumBytes: maximumHelperBytes
+              ) else {
+            return false
+        }
+
+        let authorized = firstAcknowledgementBootstrapIsAuthorized(
+            binding: binding,
+            socketPort: socketPort,
+            launchAgentPID: launchAgentPID,
+            bridgeFilesCurrent: true,
+            route: route,
+            runtimeFileIdentity: runtimeFile.identity,
+            runtimeDigest: runtimeFile.digest,
+            helperDigest: helperFile.digest
+        )
+        if authorized {
+            SwapLog.append(.debug(
+                "DESKTOP_BRIDGE_BOOTSTRAP_AUTHORIZED pid=\(binding.processIdentity.pid)"
+            ))
+        }
+        return authorized
+    }
+
+    static func firstAcknowledgementBootstrapIsAuthorized(
+        binding: CodexReloadBinding,
+        socketPort: UInt16,
+        launchAgentPID: Int32?,
+        bridgeFilesCurrent: Bool,
+        route: CodexVersionChecker.ManagedRuntimeRoute?,
+        runtimeFileIdentity: DesktopInstallPathIdentity?,
+        runtimeDigest: String?,
+        helperDigest: String?
+    ) -> Bool {
+        guard binding.runtimeKind == .externalAppServer,
+              socketPort == port,
+              binding.processIdentity.ownerUID == UInt32(getuid()),
+              launchAgentPID == binding.processIdentity.pid,
+              bridgeFilesCurrent,
+              let route,
+              let runtimeFileIdentity,
+              route.managedLauncherPath == supportPaths().launcherURL.path,
+              route.runtimePath == binding.processIdentity.executablePath,
+              route.runtimePath == binding.kernelExecutableIdentity.canonicalPath,
+              runtimeFileIdentity.device == binding.kernelExecutableIdentity.device,
+              runtimeFileIdentity.inode == binding.kernelExecutableIdentity.inode,
+              runtimeDigest == route.runtimeSHA256,
+              helperDigest == route.helperSHA256 else {
+            return false
+        }
+        return true
+    }
+
+    static func launchAgentPID(from output: String) -> Int32? {
+        let pids = output
+            .components(separatedBy: .newlines)
+            .compactMap { line -> Int32? in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard trimmed.hasPrefix("pid = ") else { return nil }
+                return Int32(trimmed.dropFirst("pid = ".count))
+            }
+            .filter { $0 > 0 }
+        return Set(pids).count == 1 ? pids[0] : nil
+    }
+
     private struct Paths {
         let binDirectory: URL
         let logDirectory: URL
@@ -195,6 +279,100 @@ enum CodexDesktopBridgeKeepAlive {
             timeout: 3
         )
         return !result.timedOut && result.terminationStatus == 0
+    }
+
+    private static func managedLaunchAgentPID() -> Int32? {
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/bin/launchctl"),
+            arguments: ["print", "\(launchDomain())/\(label)"],
+            timeout: 3
+        )
+        guard !result.timedOut, result.terminationStatus == 0 else { return nil }
+        return launchAgentPID(from: result.stdoutString)
+    }
+
+    private static func bridgeFilesAreCurrent(_ paths: Paths) -> Bool {
+        regularFileMatches(
+            paths.scriptURL,
+            expectedData: Data(bridgeScript(launcherPath: paths.launcherURL.path).utf8),
+            expectedPermissions: 0o755
+        ) && regularFileMatches(
+            paths.launchAgentURL,
+            expectedData: Data(launchAgentPlist(
+                scriptPath: paths.scriptURL.path,
+                standardOutputPath: paths.standardOutputURL.path,
+                standardErrorPath: paths.standardErrorURL.path
+            ).utf8),
+            expectedPermissions: 0o644
+        )
+    }
+
+    private static func regularFileMatches(
+        _ url: URL,
+        expectedData: Data,
+        expectedPermissions: mode_t
+    ) -> Bool {
+        guard Int64(expectedData.count) <= maximumBridgeFileBytes,
+              var metadata = fileMetadata(at: url.path),
+              metadata.st_uid == getuid(),
+              metadata.st_mode & 0o777 == expectedPermissions,
+              let file = try? DesktopPinnedRegularFile(
+                  url: url,
+                  maximumBytes: maximumBridgeFileBytes
+              ),
+              file.byteCount == Int64(expectedData.count),
+              let data = try? file.read(offset: 0, count: expectedData.count),
+              data == expectedData,
+              file.verifyPathIdentity() else {
+            return false
+        }
+        metadata = stat()
+        return lstat(url.path, &metadata) == 0
+            && (metadata.st_mode & S_IFMT) == S_IFREG
+            && metadata.st_uid == getuid()
+            && metadata.st_mode & 0o777 == expectedPermissions
+    }
+
+    private struct VerifiedFile {
+        let identity: DesktopInstallPathIdentity
+        let digest: String
+    }
+
+    private static func verifiedReadOnlyFile(
+        at path: String,
+        expectedSHA256: String,
+        maximumBytes: Int64
+    ) -> VerifiedFile? {
+        guard var metadata = fileMetadata(at: path),
+              metadata.st_uid == getuid(),
+              metadata.st_mode & 0o222 == 0,
+              let file = try? DesktopPinnedRegularFile(
+                  url: URL(fileURLWithPath: path),
+                  maximumBytes: maximumBytes
+              ),
+              file.byteCount > 0,
+              let digest = try? file.sha256(isCancelled: { false }),
+              digest == expectedSHA256,
+              file.verifyPathIdentity() else {
+            return nil
+        }
+        metadata = stat()
+        guard lstat(path, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_uid == getuid(),
+              metadata.st_mode & 0o222 == 0 else {
+            return nil
+        }
+        return VerifiedFile(identity: file.identity, digest: digest)
+    }
+
+    private static func fileMetadata(at path: String) -> stat? {
+        var metadata = stat()
+        guard lstat(path, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG else {
+            return nil
+        }
+        return metadata
     }
 
     @discardableResult

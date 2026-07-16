@@ -39,6 +39,7 @@ struct DesktopRuntimeReloadDependencies: Sendable {
     ) -> Bool
     let strictReload: @Sendable (
         CodexRuntimeDiscoverySnapshot,
+        [CodexDesktopRuntimeSocketBinding],
         CodexReloadAdmission,
         UInt32
     ) -> CodexReloadSummary
@@ -198,6 +199,7 @@ struct DesktopRuntimeReloadClient: Sendable {
 
         let strictSummary = dependencies.strictReload(
             context.discovery,
+            context.socketBindings,
             context.admission,
             context.requiredOwnerUID
         )
@@ -581,11 +583,26 @@ struct DesktopRuntimeReloadClient: Sendable {
                     requiredOwnerUID: requiredOwnerUID
                 )
             },
-            strictReload: { discovery, admission, requiredOwnerUID in
+            strictReload: { discovery, socketBindings, admission, requiredOwnerUID in
+                let portsByPID = Dictionary(
+                    uniqueKeysWithValues: socketBindings.map {
+                        ($0.target.process.identity.pid, $0.port)
+                    }
+                )
                 SwapEngine.signalDesktopAppServerReloadSummary(
                     admittedDiscoverySnapshot: discovery,
                     admission: admission,
-                    requiredOwnerUID: requiredOwnerUID
+                    requiredOwnerUID: requiredOwnerUID,
+                    firstAcknowledgementBootstrap: { binding in
+                        guard let port = portsByPID[binding.processIdentity.pid] else {
+                            return false
+                        }
+                        return CodexDesktopBridgeKeepAlive
+                            .authorizesFirstAcknowledgementBootstrap(
+                                binding: binding,
+                                socketPort: port
+                            )
+                    }
                 )
             }
         )

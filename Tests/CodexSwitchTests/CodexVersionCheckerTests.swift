@@ -764,6 +764,18 @@ struct CodexVersionCheckerTests {
                 homebrewBridgePath: bridge.path
             ) == (target as NSString).standardizingPath
         )
+        #expect(
+            CodexVersionChecker.managedRuntimeRoute(
+                localLauncherPath: local.path,
+                homebrewBridgePath: bridge.path
+            ) == CodexVersionChecker.ManagedRuntimeRoute(
+                managedLauncherPath: managed.path,
+                runtimePath: (target as NSString).standardizingPath,
+                helperPath: root.appending(path: "prepared/codex-code-mode-host").path,
+                runtimeSHA256: String(repeating: "a", count: 64),
+                helperSHA256: String(repeating: "b", count: 64)
+            )
+        )
     }
 
     @Test("Launcher target parsing accepts only the exact generated grammar")

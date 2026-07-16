@@ -1209,6 +1209,37 @@ struct SwapEngineTests {
         #expect(failed.outcome == .restartRequiredOrFailed)
     }
 
+    @Test("Desktop first ACK bootstrap never authorizes CLI or an untrusted bridge")
+    func desktopFirstAcknowledgementBootstrapIsNarrow() {
+        let desktopBinding = reloadBinding(
+            target: runtimeTarget(pid: 41, runtimeKind: .externalAppServer)
+        )
+        let cliBinding = reloadBinding(
+            target: runtimeTarget(pid: 42, runtimeKind: .localInteractiveCLI)
+        )
+
+        #expect(SwapEngine.desktopReloadCapabilityIsAuthorized(
+            binding: desktopBinding,
+            hasStartupAcknowledgement: true,
+            firstAcknowledgementBootstrapAuthorized: false
+        ))
+        #expect(SwapEngine.desktopReloadCapabilityIsAuthorized(
+            binding: desktopBinding,
+            hasStartupAcknowledgement: false,
+            firstAcknowledgementBootstrapAuthorized: true
+        ))
+        #expect(!SwapEngine.desktopReloadCapabilityIsAuthorized(
+            binding: desktopBinding,
+            hasStartupAcknowledgement: false,
+            firstAcknowledgementBootstrapAuthorized: false
+        ))
+        #expect(!SwapEngine.desktopReloadCapabilityIsAuthorized(
+            binding: cliBinding,
+            hasStartupAcknowledgement: false,
+            firstAcknowledgementBootstrapAuthorized: true
+        ))
+    }
+
     @Test("Incomplete CLI and desktop discovery sends zero signals")
     func incompleteDiscoverySendsNoSignals() {
         let parsed = SwapEngine.pgrepDiscoveryResult(

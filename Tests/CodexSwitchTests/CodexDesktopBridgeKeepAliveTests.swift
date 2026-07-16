@@ -33,6 +33,107 @@ struct CodexDesktopBridgeKeepAliveTests {
         #expect(plist.contains("<integer>5</integer>"))
     }
 
+    @Test("Launch agent PID parsing requires one positive PID")
+    func launchAgentPIDParsingIsUnambiguous() {
+        #expect(CodexDesktopBridgeKeepAlive.launchAgentPID(from: "state = running\npid = 42\n") == 42)
+        #expect(CodexDesktopBridgeKeepAlive.launchAgentPID(from: "state = waiting\n") == nil)
+        #expect(
+            CodexDesktopBridgeKeepAlive.launchAgentPID(
+                from: "pid = 42\npid = 43\n"
+            ) == nil
+        )
+    }
+
+    @Test("First ACK bootstrap is limited to the exact managed bridge")
+    func firstAcknowledgementBootstrapRequiresExactManagedIdentity() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let managedLauncher = home.appendingPathComponent(
+            ".local/share/codexswitch/patched-codex/codex"
+        ).path
+        let runtime = home.appendingPathComponent(
+            ".local/share/codexswitch/prepared-codex/0.144.4/runtime/codex"
+        ).path
+        let helper = URL(fileURLWithPath: runtime)
+            .deletingLastPathComponent()
+            .appendingPathComponent("codex-code-mode-host")
+            .path
+        let identity = CodexSignalProcessIdentity(
+            pid: 42,
+            ownerUID: UInt32(getuid()),
+            executablePath: runtime,
+            startSeconds: 1_000,
+            startMicroseconds: 12
+        )
+        let kernelIdentity = CodexKernelExecutableIdentity(
+            canonicalPath: runtime,
+            device: 7,
+            inode: 9
+        )
+        let binding = CodexReloadBinding(
+            processIdentity: identity,
+            kernelExecutableIdentity: kernelIdentity,
+            runtimeKind: .externalAppServer,
+            authFileIdentity: CodexAuthFileIdentity(
+                canonicalPath: home.appendingPathComponent(".codex/auth.json").path,
+                device: 8,
+                inode: 10,
+                accountID: "account-1",
+                completeTokenFingerprint: String(repeating: "c", count: 64)
+            ),
+            requestNonce: "nonce",
+            issuedAtUnixMilliseconds: 1_000_100
+        )
+        let route = CodexVersionChecker.ManagedRuntimeRoute(
+            managedLauncherPath: managedLauncher,
+            runtimePath: runtime,
+            helperPath: helper,
+            runtimeSHA256: String(repeating: "a", count: 64),
+            helperSHA256: String(repeating: "b", count: 64)
+        )
+        let fileIdentity = DesktopInstallPathIdentity(device: 7, inode: 9)
+
+        #expect(CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
+            binding: binding,
+            socketPort: 9223,
+            launchAgentPID: 42,
+            bridgeFilesCurrent: true,
+            route: route,
+            runtimeFileIdentity: fileIdentity,
+            runtimeDigest: String(repeating: "a", count: 64),
+            helperDigest: String(repeating: "b", count: 64)
+        ))
+        #expect(!CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
+            binding: binding,
+            socketPort: 8390,
+            launchAgentPID: 42,
+            bridgeFilesCurrent: true,
+            route: route,
+            runtimeFileIdentity: fileIdentity,
+            runtimeDigest: String(repeating: "a", count: 64),
+            helperDigest: String(repeating: "b", count: 64)
+        ))
+        #expect(!CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
+            binding: binding,
+            socketPort: 9223,
+            launchAgentPID: 43,
+            bridgeFilesCurrent: true,
+            route: route,
+            runtimeFileIdentity: fileIdentity,
+            runtimeDigest: String(repeating: "a", count: 64),
+            helperDigest: String(repeating: "b", count: 64)
+        ))
+        #expect(!CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
+            binding: binding,
+            socketPort: 9223,
+            launchAgentPID: 42,
+            bridgeFilesCurrent: true,
+            route: route,
+            runtimeFileIdentity: fileIdentity,
+            runtimeDigest: String(repeating: "d", count: 64),
+            helperDigest: String(repeating: "b", count: 64)
+        ))
+    }
+
     @Test("Bridge installation is scheduled off the main actor")
     func bridgeInstallationRunsOffMain() async {
         let observation = AsyncStream.makeStream(of: Bool.self)
