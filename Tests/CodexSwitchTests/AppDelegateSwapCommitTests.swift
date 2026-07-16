@@ -102,6 +102,36 @@ struct AppDelegateSwapCommitTests {
         ) == nil)
     }
 
+    @Test("Runtime topology recovery is one-shot and fully managed")
+    func topologyRecoveryRequiresManagedChangedTopology() {
+        let target = UUID()
+        let exhausted = AccountActivationState.manualReview(
+            targetAccountId: target,
+            detail: .automaticRetryLimitReached,
+            retryAttempt: 4,
+            at: Date()
+        )
+
+        #expect(AppDelegate.retryExhaustedTopologyRecoveryTarget(
+            state: exhausted,
+            configuredAccountId: target,
+            topologyIsFullyManaged: true,
+            topologyChanged: true
+        ) == target)
+        #expect(AppDelegate.retryExhaustedTopologyRecoveryTarget(
+            state: exhausted,
+            configuredAccountId: target,
+            topologyIsFullyManaged: false,
+            topologyChanged: true
+        ) == nil)
+        #expect(AppDelegate.retryExhaustedTopologyRecoveryTarget(
+            state: exhausted,
+            configuredAccountId: target,
+            topologyIsFullyManaged: true,
+            topologyChanged: false
+        ) == nil)
+    }
+
     @Test("Launch waits for bridge installation before retry recovery")
     func launchRecoveryRunsAfterBridgeInstallation() throws {
         let source = try String(

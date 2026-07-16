@@ -230,6 +230,12 @@ executable vnode. The normal v3 request, SIGHUP, and CLI-shaped ACK remain
 mandatory. Historical or unverified runtimes are not eligible; they require one
 exit and resume into the current managed runtime.
 
+When retry exhaustion is caused by a historical CLI, CodexSwitch observes the
+exact local CLI topology off the main actor at a throttled cadence. It may reset
+the same-target retry budget once for each newly observed topology only after
+every discovered CLI resolves to the current managed runtime. A stable failing
+topology never creates an unbounded retry loop.
+
 Desktop JSON-RPC mutation participates in that same admitted operation. PID
 admission is acquired before typed runtime or listening-port discovery. Each
 WebSocket endpoint is bound to one exact PID/start/owner/executable-vnode/argv

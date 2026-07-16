@@ -393,6 +393,10 @@ artifact and running-vnode proof, using the CLI-specific v3 acknowledgement
 shape. Exact-name preliminary discovery prevents unrelated command lines from
 making the CLI batch incomplete. A historical process lacking the v3 CLI
 contract remains a restart-required runtime and is never reported current.
+After that process exits, a throttled topology-change check may re-arm the
+exhausted same-target convergence once without relaunching CodexSwitch. The
+check is observational; the subsequent mutation path still performs full route,
+hash, vnode, request, signal, and ACK verification.
 After the bridge installation task completes, app launch may reset only a
 same-target `automatic_retry_limit_reached` journal and make one bounded
 convergence attempt. This recovery does not change the configured account or

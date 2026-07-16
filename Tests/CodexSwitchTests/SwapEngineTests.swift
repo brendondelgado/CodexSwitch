@@ -1280,6 +1280,37 @@ struct SwapEngineTests {
         #expect(!SwapEngine.localCodexProcessDiscoveryArguments.contains("-f"))
     }
 
+    @Test("Local CLI topology is complete, sorted, and route-aware")
+    func localCLITopologyIsRouteAware() throws {
+        let targets = [
+            runtimeTarget(pid: 42, runtimeKind: .localInteractiveCLI),
+            runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI),
+        ]
+        let discovery = CodexRuntimeDiscoverySnapshot(
+            targets: targets,
+            isComplete: true
+        )
+        let managedPath = targets[0].process.identity.executablePath
+        let topology = try #require(SwapEngine.localCLIRuntimeTopology(
+            discoverySnapshot: discovery,
+            managedRuntimePath: managedPath
+        ))
+
+        #expect(topology.runtimes.map(\.processIdentity.pid) == [41, 42])
+        #expect(topology.allRuntimesUseManagedRoute)
+        #expect(SwapEngine.localCLIRuntimeTopology(
+            discoverySnapshot: discovery,
+            managedRuntimePath: "/other/codex"
+        )?.allRuntimesUseManagedRoute == false)
+        #expect(SwapEngine.localCLIRuntimeTopology(
+            discoverySnapshot: CodexRuntimeDiscoverySnapshot(
+                targets: targets,
+                isComplete: false
+            ),
+            managedRuntimePath: managedPath
+        ) == nil)
+    }
+
     @Test("Incomplete CLI and desktop discovery sends zero signals")
     func incompleteDiscoverySendsNoSignals() {
         let parsed = SwapEngine.pgrepDiscoveryResult(

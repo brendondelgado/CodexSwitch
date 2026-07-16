@@ -188,6 +188,16 @@ struct CodexRuntimeDiscoverySnapshot: Equatable, Sendable {
     let isComplete: Bool
 }
 
+struct CodexLocalCLIRuntimeIdentity: Equatable, Sendable {
+    let processIdentity: CodexSignalProcessIdentity
+    let kernelExecutableIdentity: CodexKernelExecutableIdentity
+}
+
+struct CodexLocalCLIRuntimeTopology: Equatable, Sendable {
+    let runtimes: [CodexLocalCLIRuntimeIdentity]
+    let allRuntimesUseManagedRoute: Bool
+}
+
 struct CodexRuntimeObservation: Equatable, Sendable {
     let target: CodexRuntimeTarget
     let authFileIdentity: CodexAuthFileIdentity
@@ -1461,6 +1471,62 @@ enum SwapEngine {
     }
 
     /// Read-only, identity-bound evidence for local policy decisions.
+    nonisolated static func localCLIRuntimeTopology()
+        -> CodexLocalCLIRuntimeTopology? {
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
+            arguments: localCodexProcessDiscoveryArguments,
+            timeout: 3
+        )
+        let discovery = runtimeDiscoverySnapshot(
+            from: pgrepDiscoveryResult(
+                stdout: result.stdout,
+                terminationStatus: result.terminationStatus,
+                timedOut: result.timedOut
+            ),
+            runtimeKind: .localInteractiveCLI,
+            requiredOwnerUID: UInt32(getuid()),
+            identityProvider: signalProcessIdentity,
+            argumentProvider: processArguments,
+            kernelExecutableIdentityProvider: kernelExecutableIdentity
+        )
+        let managedRuntimePath = CodexVersionChecker.managedRuntimeRoute(
+            managedLauncherPath:
+                CodexManagedRuntimeTrust.defaultManagedLauncherPath()
+        )?.runtimePath
+        return localCLIRuntimeTopology(
+            discoverySnapshot: discovery,
+            managedRuntimePath: managedRuntimePath
+        )
+    }
+
+    nonisolated static func localCLIRuntimeTopology(
+        discoverySnapshot: CodexRuntimeDiscoverySnapshot,
+        managedRuntimePath: String?
+    ) -> CodexLocalCLIRuntimeTopology? {
+        guard discoverySnapshot.isComplete else { return nil }
+        let runtimes = discoverySnapshot.targets
+            .map {
+                CodexLocalCLIRuntimeIdentity(
+                    processIdentity: $0.process.identity,
+                    kernelExecutableIdentity: $0.process.kernelExecutableIdentity
+                )
+            }
+            .sorted {
+                $0.processIdentity.pid < $1.processIdentity.pid
+            }
+        let allRuntimesUseManagedRoute = managedRuntimePath.map { path in
+            runtimes.allSatisfy {
+                $0.processIdentity.executablePath == path
+                    && $0.kernelExecutableIdentity.canonicalPath == path
+            }
+        } ?? false
+        return CodexLocalCLIRuntimeTopology(
+            runtimes: runtimes,
+            allRuntimesUseManagedRoute: allRuntimesUseManagedRoute
+        )
+    }
+
     nonisolated static func localRuntimeEvidenceSnapshot(
         runtimeKind: HotSwapRuntimeKind,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,

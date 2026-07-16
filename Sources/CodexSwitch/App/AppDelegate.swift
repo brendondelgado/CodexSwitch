@@ -91,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     nonisolated static let rateLimitResetDecisionFreshnessInterval: TimeInterval = 60
     nonisolated static let configMaintenanceInterval: TimeInterval = 15 * 60
     nonisolated static let linuxDevboxCredentialSyncRetryDelay: TimeInterval = 5
+    nonisolated static let retryExhaustedTopologyCheckInterval: TimeInterval = 15
 
     // Set in applicationDidFinishLaunching before any other access
     private var statusItem: NSStatusItem!
@@ -191,6 +192,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var pendingSwapTargetAccountId: UUID?
     private var swapConvergenceTask: Task<Void, Never>?
     private var automaticPolicyGateTask: Task<Void, Never>?
+    private var retryExhaustedTopologyCheckTask: Task<Void, Never>?
+    private var lastRetryExhaustedTopologyCheckAt: Date?
+    private var lastAttemptedRetryExhaustedTopology: CodexLocalCLIRuntimeTopology?
     private var isExiting = false
     private var terminationFlushTask: Task<Void, Never>?
     private var terminationFlushCompleted = false
@@ -350,6 +354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.scheduleGlobalCLIRepairIfNeeded()
                     self?.scheduleAutomaticCodexUpdateIfNeeded()
                     self?.scheduleCodexBrowserSessionRepairIfNeeded()
+                    self?.scheduleRetryExhaustedTopologyRecoveryIfNeeded()
                     CLIStatusChecker.refresh(activeAccountId: self?.accountManager.configuredAccount?.accountId) { [weak self] in
                         self?.updatePopoverContent()
                     }
@@ -4229,6 +4234,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         await startSameTargetRuntimeRetry(to: target, source: "launch_recovery")
     }
 
+    private func scheduleRetryExhaustedTopologyRecoveryIfNeeded(
+        at date: Date = Date()
+    ) {
+        guard !isExiting,
+              retryExhaustedTopologyCheckTask == nil,
+              pendingSwapTargetAccountId == nil,
+              swapConvergenceTask == nil,
+              accountManager.activationState?.phase == .manualReview,
+              accountManager.activationState?.detail == .automaticRetryLimitReached,
+              lastRetryExhaustedTopologyCheckAt.map({
+                  date.timeIntervalSince($0) >= Self.retryExhaustedTopologyCheckInterval
+              }) ?? true else {
+            return
+        }
+        lastRetryExhaustedTopologyCheckAt = date
+        retryExhaustedTopologyCheckTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.retryExhaustedTopologyCheckTask = nil }
+            let topology = await Task.detached(priority: .utility) {
+                SwapEngine.localCLIRuntimeTopology()
+            }.value
+            guard !Task.isCancelled,
+                  !self.isExiting,
+                  self.pendingSwapTargetAccountId == nil,
+                  self.swapConvergenceTask == nil,
+                  let topology,
+                  let targetAccountId = Self.retryExhaustedTopologyRecoveryTarget(
+                      state: self.accountManager.activationState,
+                      configuredAccountId: self.accountManager.configuredAccount?.id,
+                      topologyIsFullyManaged: topology.allRuntimesUseManagedRoute,
+                      topologyChanged:
+                          topology != self.lastAttemptedRetryExhaustedTopology
+                  ),
+                  let target = self.accountManager.accounts.first(where: {
+                      $0.id == targetAccountId
+                  }) else {
+                return
+            }
+            self.lastAttemptedRetryExhaustedTopology = topology
+            SwapLog.append(.debug(
+                "ACTIVATION_TOPOLOGY_RECOVERY_STARTED target=\(target.email) runtimes=\(topology.runtimes.count)"
+            ))
+            await self.startSameTargetRuntimeRetry(
+                to: target,
+                source: "runtime_topology_recovery"
+            )
+        }
+    }
+
     nonisolated static func retryExhaustedLaunchRecoveryTarget(
         state: AccountActivationState?,
         configuredAccountId: UUID?
@@ -4241,6 +4295,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return nil
         }
         return targetAccountId
+    }
+
+    nonisolated static func retryExhaustedTopologyRecoveryTarget(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        topologyIsFullyManaged: Bool,
+        topologyChanged: Bool
+    ) -> UUID? {
+        guard topologyIsFullyManaged,
+              topologyChanged else {
+            return nil
+        }
+        return retryExhaustedLaunchRecoveryTarget(
+            state: state,
+            configuredAccountId: configuredAccountId
+        )
     }
 
     private func beginSameTargetRuntimeRetry(to target: CodexAccount, source: String) {
@@ -4259,7 +4329,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
-        let resetsRetryBudget = source == "manual" || source == "launch_recovery"
+        let resetsRetryBudget = source == "manual"
+            || source == "launch_recovery"
+            || source == "runtime_topology_recovery"
         let activationGeneration = resetsRetryBudget
             ? UUID()
             : accountManager.activationState?.activationGeneration ?? UUID()
@@ -5054,6 +5126,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Self.requestOwnedMutationTaskCancellation(swapConvergenceTask)
         automaticPolicyGateTask?.cancel()
         automaticPolicyGateTask = nil
+        retryExhaustedTopologyCheckTask?.cancel()
+        retryExhaustedTopologyCheckTask = nil
         automaticCodexUpdateTask?.cancel()
         automaticCodexUpdateTask = nil
         globalCLIRepairInFlight = false
