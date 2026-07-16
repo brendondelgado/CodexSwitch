@@ -1,0 +1,42 @@
+Sources/CodexSwitch/Services/AccountActivationRuntimeEvidence.swift
+  s_70c8e194852bb5::t_a38c311bc1e083 85-100
+Tests/CodexSwitchTests/AccountActivationStateTests.swift
+  s_70c8e194852bb5::t_08939382f28f9c 147,151,394,398-400,600,604-605
+  s_70c8e194852bb5::t_284d0fa84df8ee 159-226
+Tests/CodexSwitchTests/AccountActivationTransactionTests.swift
+  s_70c8e194852bb5::t_08939382f28f9c 107
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_62788fea62226f 69
+  s_70c8e194852bb5::t_f6814ce6958310 556-560,648-650,676-681
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_f6814ce6958310 164-178
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_4ab693557f1a00 3785-3788,4063-4065,4067-4072
+  s_70c8e194852bb5::t_f40a81c1a8a219 889-909
+  s_70c8e194852bb5::t_e941eee47ec8f5 4060-4062,4066
+  s_70c8e194852bb5::t_2cf0b8fae974ce 3710-3711,3726-3736
+  s_70c8e194852bb5::t_278411fda035f9 30,3530,3570
+  s_70c8e194852bb5::t_551cecb853bf95 3789,3971,3985,3989-4007,4028-4059,4073-4081
+  s_70c8e194852bb5::t_eeeb7537083453 4082-4083
+Tests/CodexSwitchTests/AppDelegateSwapCommitTests.swift
+  s_70c8e194852bb5::t_e4b104932ee12a 24-69
+Sources/CodexSwitch/Services/AccountActivationCoordinator.swift
+  s_70c8e194852bb5::t_1cc02f9d0756af 24-27,91,160,189-231
+  s_70c8e194852bb5::t_122f65460a0f5f 232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "0919726efce0cf4b6a2310663ebfedfb9c15e818",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
