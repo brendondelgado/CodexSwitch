@@ -32,6 +32,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
   - ../../Sources/CodexSwitch/Services/CodexVersionChecker.swift
+  - ../../Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
   - ../../Sources/CodexSwitch/Views/AccountCardView.swift
@@ -471,6 +472,15 @@ therefore remains off the UI actor while the state mutation has one explicit
 actor boundary on every supported Swift 6 toolchain.
 
 - The menu app presents local account state and read-only VPS state separately.
+- The ChatGPT desktop and CodexSwitch share one patched local app-server on
+  `ws://127.0.0.1:9223`. CodexSwitch keeps that bridge alive and publishes
+  `CODEX_APP_SERVER_WS_URL` before ChatGPT starts. Private stdio app-server
+  children are not part of the supported steady state because they cannot
+  accept CodexSwitch's externally verified reload request.
+- Every fresh desktop bridge connection completes the app-server `initialize`
+  handshake before account mutation or verification. Current app-server
+  responses may omit the optional `jsonrpc` member; identity verification and
+  the strict SIGHUP acknowledgement remain mandatory.
 - Provider quota is shared, but runtime ownership is host-specific. Every account
   card presents simultaneous `Mac Configured`, `Mac Runtime`, and `VPS Runtime`
   fields, including when the configured and runtime-current Mac identities are

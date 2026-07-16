@@ -7,6 +7,7 @@ toc:
   - Discovery Contract
   - Race Handling
   - Reload Binding
+  - Desktop Transport Bridge
   - Artifact Validation
   - Signal Authorization
   - Status Observation
@@ -24,7 +25,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical
-  last_updated: 2026-07-13
+  last_updated: 2026-07-16
 ---
 
 # macOS Runtime Discovery
@@ -102,6 +103,32 @@ the binding is not recomputed or partially updated during the operation.
 Version `3` is the structured request/ACK wire version. Static binary patch
 markers are installation hints only and never substitute for a version-`3`
 artifact or identity check.
+
+## Desktop Transport Bridge
+
+Current ChatGPT desktop builds launch their private local app-server over stdio.
+That child has no independently connectable endpoint, so CodexSwitch cannot
+perform an externally verified account reload against it.
+
+CodexSwitch owns one local desktop bridge at
+`ws://127.0.0.1:9223`. A launch agent keeps one patched Codex app-server
+listening there and publishes `CODEX_APP_SERVER_WS_URL` so ChatGPT uses the same
+runtime. The bridge uses the normal OpenAI app-server transport; it is not a
+Headroom or provider proxy.
+
+The bridge contract is:
+
+1. Exactly one current-user app-server owns port `9223`.
+2. ChatGPT connects to that listener instead of spawning a private stdio child.
+3. Stale private app-server children are conflicting runtimes, not fallback
+   endpoints. Runtime discovery fails closed until the conflict exits.
+4. Each new WebSocket connection sends `initialize` before any account RPC.
+5. App-server responses may use either the legacy JSON-RPC envelope with
+   `jsonrpc: "2.0"` or the current envelope containing only `id` plus
+   `result`/`error`. An explicit non-2.0 `jsonrpc` value remains invalid.
+6. A successful account RPC is still followed by the strict version-3 SIGHUP
+   request/ACK proof. The bridge does not weaken process, socket-owner, auth
+   file, or token-fingerprint validation.
 
 ## Artifact Validation
 

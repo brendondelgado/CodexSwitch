@@ -265,6 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             RateLimitResetSettings.automaticRedemptionDefaultsKey: true,
         ])
         _ = Self.installKeepAliveOffMainActor()
+        _ = Self.installDesktopBridgeOffMainActor()
         scheduleConfigMaintenanceIfNeeded(removeStaleCopies: true)
         configMaintenanceTimer = Timer.scheduledTimer(
             withTimeInterval: Self.configMaintenanceInterval,
@@ -1148,6 +1149,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     nonisolated static func installKeepAliveOffMainActor(
         operation: @escaping @Sendable () -> Void = {
             CodexSwitchKeepAlive.installIfNeeded()
+        }
+    ) -> Task<Void, Never> {
+        Task.detached(priority: .utility) {
+            operation()
+        }
+    }
+
+    @discardableResult
+    nonisolated static func installDesktopBridgeOffMainActor(
+        operation: @escaping @Sendable () -> Void = {
+            CodexDesktopBridgeKeepAlive.installIfNeeded()
         }
     ) -> Task<Void, Never> {
         Task.detached(priority: .utility) {

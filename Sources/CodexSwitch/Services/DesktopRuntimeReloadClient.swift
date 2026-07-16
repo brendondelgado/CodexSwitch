@@ -59,6 +59,8 @@ private enum AdmittedDesktopRuntimeResult: Sendable {
 
 private enum DesktopRuntimeSocketError: Error {
     case bindingDrift
+    case initializationFailed(String)
+    case responseLimitExceeded
 }
 
 struct DesktopRuntimeReloadClient: Sendable {
@@ -77,6 +79,7 @@ struct DesktopRuntimeReloadClient: Sendable {
 
     nonisolated static let reloadMethods = ["account/login/start"]
     nonisolated static let verificationMethod = "account/read"
+    nonisolated static let initializationID = 0
 
     init(
         timeoutSeconds: TimeInterval = 5,
@@ -229,6 +232,32 @@ struct DesktopRuntimeReloadClient: Sendable {
         }
 
         return request
+    }
+
+    nonisolated static func initializationRequest(id: Int = initializationID) -> [String: Any] {
+        [
+            "method": "initialize",
+            "id": id,
+            "params": [
+                "clientInfo": [
+                    "name": "codexswitch",
+                    "title": "CodexSwitch",
+                    "version": Bundle.main.object(
+                        forInfoDictionaryKey: "CFBundleShortVersionString"
+                    ) as? String ?? "unknown"
+                ],
+                "capabilities": [
+                    "experimentalApi": true
+                ]
+            ]
+        ]
+    }
+
+    nonisolated static func classifyInitializationResponse(
+        _ event: DesktopRuntimeWebSocketEvent,
+        expectedID: Int = initializationID
+    ) -> DesktopRuntimeRPCClassification {
+        classifyRPCEvent(event, expectedID: expectedID)
     }
 
     nonisolated static func reloadRequest(account: CodexAccount, method: String, id: Int) -> [String: Any] {
@@ -414,8 +443,13 @@ struct DesktopRuntimeReloadClient: Sendable {
             return .failed("invalid json-rpc response")
         }
 
-        guard object["jsonrpc"] as? String == "2.0",
-              let responseID = object["id"] as? Int else {
+        if let version = object["jsonrpc"] {
+            guard version as? String == "2.0" else {
+                return .failed("invalid json-rpc response")
+            }
+        }
+
+        guard let responseID = object["id"] as? Int else {
             return .failed("invalid json-rpc response")
         }
         if let expectedID, responseID != expectedID {
@@ -691,6 +725,7 @@ struct DesktopRuntimeReloadClient: Sendable {
               let jsonString = String(data: jsonData, encoding: .utf8) else {
             return .failure("failed to serialize json-rpc request")
         }
+        let requestID = request["id"] as? Int
 
         if let requestSender {
             guard dependencies.socketBindingIsCurrent(
@@ -720,29 +755,128 @@ struct DesktopRuntimeReloadClient: Sendable {
                     ) else {
                         throw DesktopRuntimeSocketError.bindingDrift
                     }
+
+                    guard let initializationData = try? JSONSerialization.data(
+                        withJSONObject: Self.initializationRequest()
+                    ), let initializationString = String(
+                        data: initializationData,
+                        encoding: .utf8
+                    ) else {
+                        throw DesktopRuntimeSocketError.initializationFailed(
+                            "failed to serialize initialize request"
+                        )
+                    }
+                    try await wsTask.send(.string(initializationString))
+                    let initializationResponse = try await Self.receiveResponse(
+                        from: wsTask,
+                        expectedID: Self.initializationID
+                    )
+                    let initializationEvent = Self.webSocketEvent(
+                        from: initializationResponse
+                    )
+                    let initialization = Self.classifyInitializationResponse(
+                        initializationEvent
+                    )
+                    guard case .success = initialization else {
+                        throw DesktopRuntimeSocketError.initializationFailed(
+                            Self.rpcFailureDescription(initialization)
+                        )
+                    }
+
+                    guard dependencies.socketBindingIsCurrent(
+                        socketBinding,
+                        requiredOwnerUID
+                    ) else {
+                        throw DesktopRuntimeSocketError.bindingDrift
+                    }
                     try await wsTask.send(.string(jsonString))
-                    return try await wsTask.receive()
+                    return try await Self.receiveResponse(
+                        from: wsTask,
+                        expectedID: requestID
+                    )
                 }
             )
             wsTask.cancel(with: .normalClosure, reason: nil)
-
-            switch response {
-            case .string(let text):
-                return .string(text)
-            case .data(let data):
-                return .data(data)
-            @unknown default:
-                return .failure("unknown websocket response")
-            }
+            return Self.webSocketEvent(from: response)
         } catch DesktopRuntimeSocketError.bindingDrift {
             wsTask.cancel(with: .goingAway, reason: nil)
             return .failure("desktop runtime binding drift")
+        } catch DesktopRuntimeSocketError.initializationFailed(let reason) {
+            wsTask.cancel(with: .goingAway, reason: nil)
+            return .failure("desktop initialize failed: \(reason)")
+        } catch DesktopRuntimeSocketError.responseLimitExceeded {
+            wsTask.cancel(with: .goingAway, reason: nil)
+            return .failure("desktop response limit exceeded")
         } catch is CancellationError {
             wsTask.cancel(with: .goingAway, reason: nil)
             return .timeout
         } catch {
             wsTask.cancel(with: .goingAway, reason: nil)
             return .failure(error.localizedDescription)
+        }
+    }
+
+    private nonisolated static func receiveResponse(
+        from task: URLSessionWebSocketTask,
+        expectedID: Int?
+    ) async throws -> URLSessionWebSocketTask.Message {
+        for _ in 0..<128 {
+            let response = try await task.receive()
+            guard let expectedID else { return response }
+            if responseID(in: response) == expectedID {
+                return response
+            }
+        }
+        throw DesktopRuntimeSocketError.responseLimitExceeded
+    }
+
+    private nonisolated static func responseID(
+        in message: URLSessionWebSocketTask.Message
+    ) -> Int? {
+        let data: Data
+        switch message {
+        case .string(let text):
+            data = Data(text.utf8)
+        case .data(let bytes):
+            data = bytes
+        @unknown default:
+            return nil
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object["id"] as? Int
+    }
+
+    private nonisolated static func webSocketEvent(
+        from message: URLSessionWebSocketTask.Message
+    ) -> DesktopRuntimeWebSocketEvent {
+        switch message {
+        case .string(let text):
+            return .string(text)
+        case .data(let data):
+            return .data(data)
+        @unknown default:
+            return .failure("unknown websocket response")
+        }
+    }
+
+    private nonisolated static func rpcFailureDescription(
+        _ classification: DesktopRuntimeRPCClassification
+    ) -> String {
+        switch classification {
+        case .success:
+            return "unknown initialization failure"
+        case .methodNotFound:
+            return "initialize method not found"
+        case .transportClosed:
+            return "transport closed"
+        case .timeout:
+            return "timeout"
+        case .cancelled:
+            return "cancelled"
+        case .failed(let reason):
+            return reason
         }
     }
 

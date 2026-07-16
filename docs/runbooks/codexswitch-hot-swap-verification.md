@@ -8,6 +8,7 @@ toc:
   - Rust Activation Barrier Recovery
   - Platform Gates
   - Unified ChatGPT Desktop Bundle
+  - Desktop Bridge Verification
   - CLI Update Storage Safety
   - Desktop Update Ownership
   - Account State Boundaries
@@ -40,6 +41,7 @@ cross_dependencies:
   - Sources/CodexSwitch/Services/CodexVersionChecker.swift
   - Sources/CodexSwitch/Services/CLIStatusChecker.swift
   - Sources/CodexSwitch/Services/DesktopAppConnector.swift
+  - Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
   - Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - Sources/CodexSwitch/App/AppDelegate.swift
   - Sources/CodexSwitch/Models/AccountManager.swift
@@ -324,6 +326,39 @@ versions. CodexSwitch's fallback updater must accept both `ChatGPT.app` and
 legacy `Codex.app` archive layouts, install to the current product name, verify
 the stock OpenAI signature, and let the normal patch monitor reapply desktop
 compatibility only after the app has quit.
+
+## Desktop Bridge Verification
+
+Current ChatGPT builds use stdio for a private local app-server unless
+`CODEX_APP_SERVER_WS_URL` is present. CodexSwitch's supported desktop topology
+is one patched listener on `127.0.0.1:9223` with ChatGPT connected to it.
+
+Verify:
+
+```sh
+lsof -nP -iTCP:9223
+```
+
+Expected:
+
+- one patched `codex` process owns the `LISTEN` socket;
+- ChatGPT has one established connection to that listener;
+- no stale private `codex ... app-server` process remains.
+
+The ChatGPT desktop log must report:
+
+```text
+Starting app-server connection hostId=local transport=websocket
+```
+
+Every CodexSwitch connection sends `initialize` before `account/login/start`
+or `account/read`. Current app-server replies may omit `jsonrpc: "2.0"`, so the
+response is valid when it has the expected `id` and exactly one
+`result`/`error` outcome. An explicit different JSON-RPC version is invalid.
+
+Do not report success from the bridge connection alone. The activation journal
+must become `confirmed`, and the matching `hotswap-ack/<pid>.json` must prove
+the strict runtime reload.
 
 ## CLI Update Storage Safety
 

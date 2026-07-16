@@ -35,6 +35,30 @@ struct DesktopRuntimeReloadClientTests {
         #expect(accountReadParams?["refreshToken"] == false)
     }
 
+    @Test("desktop connections initialize before account RPCs")
+    func initializationRequestUsesCurrentAppServerContract() {
+        let request = DesktopRuntimeReloadClient.initializationRequest(id: 0)
+        let params = request["params"] as? [String: Any]
+        let clientInfo = params?["clientInfo"] as? [String: String]
+        let capabilities = params?["capabilities"] as? [String: Bool]
+
+        #expect(request["method"] as? String == "initialize")
+        #expect(request["id"] as? Int == 0)
+        #expect(clientInfo?["name"] == "codexswitch")
+        #expect(clientInfo?["title"] == "CodexSwitch")
+        #expect(clientInfo?["version"]?.isEmpty == false)
+        #expect(capabilities?["experimentalApi"] == true)
+    }
+
+    @Test("initialize accepts current response envelope without jsonrpc member")
+    func initializationAcceptsCurrentEnvelope() {
+        let result = DesktopRuntimeReloadClient.classifyInitializationResponse(
+            .string(#"{"id":0,"result":{"userAgent":"codex-cli"}}"#)
+        )
+
+        #expect(result == .success)
+    }
+
     @Test("reload request sends full account login token set")
     func reloadRequestSendsFullAccountLoginTokenSet() {
         let account = CodexAccount(
@@ -73,8 +97,12 @@ struct DesktopRuntimeReloadClientTests {
             .string(#"{"jsonrpc":"2.0","id":1}"#),
             method: "account/login/start"
         )
-        let missingVersion = DesktopRuntimeReloadClient.classifyReloadResponse(
+        let currentEnvelope = DesktopRuntimeReloadClient.classifyReloadResponse(
             .string(#"{"id":1,"result":{"ok":true}}"#),
+            method: "account/login/start"
+        )
+        let wrongVersion = DesktopRuntimeReloadClient.classifyReloadResponse(
+            .string(#"{"jsonrpc":"1.0","id":1,"result":{"ok":true}}"#),
             method: "account/login/start"
         )
         let missingID = DesktopRuntimeReloadClient.classifyReloadResponse(
@@ -89,7 +117,8 @@ struct DesktopRuntimeReloadClientTests {
 
         #expect(plainText == .failed("invalid json-rpc response"))
         #expect(missingResult == .failed("invalid json-rpc response"))
-        #expect(missingVersion == .failed("invalid json-rpc response"))
+        #expect(currentEnvelope == .failed("desktop account identity not verified"))
+        #expect(wrongVersion == .failed("invalid json-rpc response"))
         #expect(missingID == .failed("invalid json-rpc response"))
         #expect(mismatchedID == .failed("json-rpc response id mismatch"))
     }
@@ -122,6 +151,18 @@ struct DesktopRuntimeReloadClientTests {
 
         let verificationParams = requestParams(in: requests[1].payload) as? [String: Bool]
         #expect(verificationParams?["refreshToken"] == false)
+    }
+
+    @Test("reload accepts current app-server responses without jsonrpc member")
+    func reloadAcceptsCurrentAppServerEnvelope() async {
+        let (client, _) = makeClient(responses: [
+            .string(#"{"id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro"},"requiresOpenaiAuth":true}}"#)
+        ])
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .reloaded(method: "account/login/start"))
     }
 
     @Test("matching account ID verifies when target email is unavailable")
