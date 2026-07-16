@@ -1,0 +1,25 @@
+Sources/CodexSwitch/Services/CodexVersionChecker.swift
+  s_70c8e194852bb5::t_5eb3c9219d482b 1110,1112,1114-1115,1118,1121-1123
+Tests/CodexSwitchTests/CodexVersionCheckerTests.swift
+  s_70c8e194852bb5::t_5eb3c9219d482b 794-795,997,999,1001-1002,1005,1008-1010
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_72fe63b1a92a3e 212-217
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_72fe63b1a92a3e 679-680
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "61e7598e9f04e8bf6e15a1caa3ad1c8a92fd6d24",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
