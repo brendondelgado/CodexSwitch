@@ -152,7 +152,9 @@ or auth file. Each invocation uses the canonical account-store reset journal,
 submits at most one credit, reconciles a newer inventory and quota observation,
 and commits the refreshed target account before reporting success. A usable
 account, a non-Pro account, an unknown or stale quota, or an unresolved prior
-attempt fails closed without sending a consume request.
+attempt fails closed without sending a consume request. The command may still
+reconcile an existing journaled attempt after quota becomes usable; that replay
+is observation-only and cannot submit another credit.
 
 Reset redemption is a journaled state machine:
 

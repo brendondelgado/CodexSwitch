@@ -830,18 +830,6 @@ where
         bail!("banked reset redemption requires a Pro account; {email} is not Pro");
     }
 
-    let quota_now = Utc::now();
-    let quota_availability = real_quota_snapshot(&accounts[target_index])
-        .map(|snapshot| snapshot.availability_at(quota_now))
-        .unwrap_or(QuotaAvailability::Unknown);
-    if quota_availability != QuotaAvailability::Blocked {
-        let email = accounts[target_index].email.clone();
-        commit_accounts(&store_lock, &mut generation, &accounts)?;
-        bail!(
-            "banked reset redemption requires a fresh blocked quota for {email}; observed {quota_availability:?}"
-        );
-    }
-
     let previous_bank = accounts[target_index].rate_limit_reset_bank.clone();
     let observed_bank = match fetch_reset_bank_fn(&accounts[target_index]) {
         Ok(bank) => bank,
@@ -855,14 +843,7 @@ where
     let quota_availability = real_quota_snapshot(&accounts[target_index])
         .map(|snapshot| snapshot.availability_at(decision_now))
         .unwrap_or(QuotaAvailability::Unknown);
-    if quota_availability != QuotaAvailability::Blocked {
-        let email = accounts[target_index].email.clone();
-        accounts[target_index].rate_limit_reset_bank = Some(observed_bank);
-        commit_accounts(&store_lock, &mut generation, &accounts)?;
-        bail!(
-            "banked reset redemption requires a fresh blocked quota for {email}; observed {quota_availability:?}"
-        );
-    }
+    let attempt_reset = quota_availability == QuotaAvailability::Blocked;
 
     let email = accounts[target_index].email.clone();
     let account_id = accounts[target_index].account_id.clone();
@@ -880,7 +861,7 @@ where
             account: &mut accounts[target_index],
             previous_bank: previous_bank.as_ref(),
             observed_bank,
-            attempt_reset: true,
+            attempt_reset,
             now: decision_now,
         },
         ResetReconciliationDependencies::new(
@@ -916,6 +897,11 @@ where
 
     let flow = flow_result.with_context(|| format!("reset reconciliation failed for {email}"))?;
     if !flow.is_usable_success() {
+        if !attempt_reset {
+            bail!(
+                "banked reset redemption requires a fresh blocked quota for {email}; observed {quota_availability:?}"
+            );
+        }
         bail!(
             "banked reset was not reconciled as usable for {email}: {}",
             flow.detail
@@ -2566,7 +2552,7 @@ mod tests {
     }
 
     #[test]
-    fn targeted_reset_rejects_usable_pro_without_fetching_or_consuming_credit() -> Result<()> {
+    fn targeted_reset_rejects_usable_pro_without_consuming_credit() -> Result<()> {
         let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let usable = account("usable@example.com", true, 0.0, 10.0);
@@ -2596,8 +2582,83 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("requires a fresh blocked quota"));
-        assert_eq!(*bank_calls.lock().unwrap(), 0);
+        assert_eq!(*bank_calls.lock().unwrap(), 1);
         assert_eq!(*consume_calls.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_reconciles_async_quota_recovery_without_second_post() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let exhausted = account("exhausted@example.com", true, 0.0, 100.0);
+        save_accounts(&store_path, std::slice::from_ref(&exhausted))?;
+
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let bank_fetches = Arc::new(Mutex::new(0usize));
+        let first_error = redeem_reset_with(
+            &store_path,
+            &exhausted.email,
+            fetch_from_account,
+            {
+                let bank_fetches = Arc::clone(&bank_fetches);
+                move |_account| {
+                    let mut calls = bank_fetches.lock().unwrap();
+                    *calls += 1;
+                    Ok(if *calls == 1 {
+                        reset_bank(&["credit-a"])
+                    } else {
+                        reset_bank(&[])
+                    })
+                }
+            },
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    Ok(ConsumeResult {
+                        code: rate_limit_resets::ConsumeCode::Reset,
+                        credit_id: Some("credit-a".to_string()),
+                    })
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{first_error:#}").contains("not reconciled as usable"));
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+
+        let report = redeem_reset_with(
+            &store_path,
+            &exhausted.email,
+            |account| {
+                let mut result = fetch_from_account(account)?;
+                for window in &mut result.snapshot.windows {
+                    window.used_percent = 0.0;
+                    window.hard_limit_reached = false;
+                }
+                result.snapshot.allowed = Some(true);
+                result.snapshot.limit_reached = Some(false);
+                Ok(result)
+            },
+            |_account| Ok(reset_bank(&[])),
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    bail!("journal replay must not submit a second reset")
+                }
+            },
+        )?;
+
+        assert!(!report.submitted_reset);
+        assert_eq!(report.previous_banked_resets, 0);
+        assert_eq!(report.banked_resets_remaining, 0);
+        assert_eq!(report.remaining_percent, Some(100.0));
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+        let journal: Value = serde_json::from_slice(&fs::read(
+            rate_limit_resets::reset_attempt_journal_path(&store_path),
+        )?)?;
+        assert_eq!(journal["attempts"][0]["state"], "reconciled_usable");
         Ok(())
     }
 
