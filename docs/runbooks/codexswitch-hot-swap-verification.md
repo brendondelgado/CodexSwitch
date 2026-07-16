@@ -676,6 +676,8 @@ Before claiming hot-swap is fixed or ready:
   files, their embedded exact managed route, expected runtime/helper hashes,
   listener owner, and running executable vnode all agree. A stale independent
   CLI forwarding wrapper must not block this desktop-only bootstrap.
+- [ ] The Swift managed-launcher fixture uses real tab bytes and contains no
+  literal `\t` indentation sequences, matching the Rust-generated launcher.
 - [ ] Relaunching CodexSwitch recovers a same-target
   `automatic_retry_limit_reached` journal once, after bridge installation,
   without changing the configured account or credential files.

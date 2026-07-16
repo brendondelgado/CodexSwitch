@@ -209,6 +209,12 @@ forwarding wrappers would let a stale or unreadable interactive shell route
 block an otherwise valid desktop reload, even though launchd never executes
 those wrappers.
 
+The Swift verifier must reproduce the Rust-generated launcher bytes exactly.
+Indentation uses real tab bytes; a Swift raw-string sequence such as `\t` is a
+literal backslash plus `t` and must never be used as the expected grammar.
+Regression coverage must assert both successful route parsing and the absence
+of literal `\t` prefixes in the generated fixture.
+
 Desktop JSON-RPC mutation participates in that same admitted operation. PID
 admission is acquired before typed runtime or listening-port discovery. Each
 WebSocket endpoint is bound to one exact PID/start/owner/executable-vnode/argv

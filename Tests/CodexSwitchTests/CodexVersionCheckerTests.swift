@@ -791,6 +791,8 @@ struct CodexVersionCheckerTests {
         let validManaged = Self.rustManagedLauncherScript(patchedBinary: runtime)
         let validBridge = Self.rustBridgeLauncherScript(managedLauncher: managed)
 
+        #expect(validManaged.contains("\tCODEX_VPS="))
+        #expect(!validManaged.contains(#"\tCODEX_VPS="#))
         #expect(
             CodexVersionChecker.launcherPatchedCodexTarget(
                 from: "#!/bin/bash\nexec '/tmp/prepared-codex/0.144.1/codex' \"$@\"\n"
@@ -992,20 +994,20 @@ struct CodexVersionCheckerTests {
             "\tPATCHED_HELPER='\(helper)'",
             "\tEXPECTED_CODEX_SHA256='\(String(repeating: "a", count: 64))'",
             "\tEXPECTED_HELPER_SHA256='\(String(repeating: "b", count: 64))'",
-            #"\tCODEX_VPS="${CODEXSWITCH_CODEX_VPS:-$HOME/.local/bin/codex-vps}""#,
+            "\tCODEX_VPS=\"${CODEXSWITCH_CODEX_VPS:-$HOME/.local/bin/codex-vps}\"",
             "",
-            #"\tif [[ "${1:-}" == "--remote" ]]; then"#,
+            "\tif [[ \"${1:-}\" == \"--remote\" ]]; then",
             "\t  shift",
-            #"\t  if [[ ! -x "$CODEX_VPS" ]]; then"#,
-            #"\t    echo "codex: --remote requires the provenance-checked codex-vps synced client: $CODEX_VPS" >&2"#,
+            "\t  if [[ ! -x \"$CODEX_VPS\" ]]; then",
+            "\t    echo \"codex: --remote requires the provenance-checked codex-vps synced client: $CODEX_VPS\" >&2",
             "\t    exit 1",
             "\t  fi",
-            #"\t  exec "$CODEX_VPS" --remote-client "$@""#,
+            "\t  exec \"$CODEX_VPS\" --remote-client \"$@\"",
             "\tfi",
             "",
-            #"\tif [[ -x "$PATCHED_CODEX" && -x "$PATCHED_HELPER" ]] \"#,
-            #"\t  && [[ ! -L "$PATCHED_CODEX" && ! -L "$PATCHED_HELPER" ]]; then"#,
-            #"\t  exec "$PATCHED_CODEX" "$@""#,
+            "\tif [[ -x \"$PATCHED_CODEX\" && -x \"$PATCHED_HELPER\" ]] \\",
+            "\t  && [[ ! -L \"$PATCHED_CODEX\" && ! -L \"$PATCHED_HELPER\" ]]; then",
+            "\t  exec \"$PATCHED_CODEX\" \"$@\"",
             "\tfi",
             "",
             #"echo "codex: local runtime failed complete provenance/hot-swap validation at $PATCHED_CODEX; run 'codexswitch-cli codex-update-status' and explicitly prepare/install a verified runtime" >&2"#,
