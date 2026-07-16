@@ -957,16 +957,25 @@ final class CodexVersionChecker {
 
         let normalizedLocalManaged = (localManaged as NSString).standardizingPath
         let normalizedBridgeManaged = (bridgeManaged as NSString).standardizingPath
-        guard normalizedLocalManaged == normalizedBridgeManaged,
+        guard normalizedLocalManaged == normalizedBridgeManaged else {
+            return nil
+        }
+        return managedRuntimeRoute(managedLauncherPath: normalizedLocalManaged)
+    }
+
+    nonisolated static func managedRuntimeRoute(
+        managedLauncherPath: String
+    ) -> ManagedRuntimeRoute? {
+        guard let normalizedManaged = normalizedAbsoluteLauncherPath(managedLauncherPath),
               let managedScript = try? String(
-                contentsOfFile: normalizedLocalManaged,
+                contentsOfFile: normalizedManaged,
                 encoding: .utf8
               ),
               let target = launcherPatchedCodexDescriptor(from: managedScript) else {
             return nil
         }
         return ManagedRuntimeRoute(
-            managedLauncherPath: normalizedLocalManaged,
+            managedLauncherPath: normalizedManaged,
             runtimePath: target.runtimePath,
             helperPath: target.helperPath,
             runtimeSHA256: target.runtimeSHA256,

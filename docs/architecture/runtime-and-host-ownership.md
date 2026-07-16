@@ -381,10 +381,12 @@ is side-effect free across the complete production wrapper.
 On macOS, a newly started repository-owned desktop bridge may establish its
 first ACK during an explicit desktop activation only after CodexSwitch verifies
 the canonical `9223` listener, launchd PID, generated bridge files, exact
-managed-launcher route, expected runtime and helper hashes, and the running
-executable vnode. This narrow bootstrap is not status evidence: activation
-remains degraded until the runtime returns the normal identity-bound ACK and
-proves at least one completed desktop frontend write.
+managed-launcher route embedded in the bridge script, expected runtime and
+helper hashes, and the running executable vnode. The local and Homebrew CLI
+forwarding wrappers remain part of CLI route verification, not desktop bridge
+authorization. This narrow bootstrap is not status evidence: activation remains
+degraded until the runtime returns the normal identity-bound ACK and proves at
+least one completed desktop frontend write.
 After the bridge installation task completes, app launch may reset only a
 same-target `automatic_retry_limit_reached` journal and make one bounded
 convergence attempt. This recovery does not change the configured account or

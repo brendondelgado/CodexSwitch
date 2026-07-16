@@ -152,7 +152,9 @@ enum CodexDesktopBridgeKeepAlive {
         socketPort: UInt16
     ) -> Bool {
         let paths = supportPaths()
-        guard let route = CodexVersionChecker.installedManagedRuntimeRoute() else {
+        guard let route = CodexVersionChecker.managedRuntimeRoute(
+            managedLauncherPath: paths.launcherURL.path
+        ) else {
             return denyBootstrap(binding, reason: "managed_route_unverified")
         }
         guard bridgeFilesAreCurrent(paths) else {

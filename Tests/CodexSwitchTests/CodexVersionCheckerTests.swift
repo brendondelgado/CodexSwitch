@@ -735,6 +735,13 @@ struct CodexVersionCheckerTests {
             atomically: true,
             encoding: .utf8
         )
+        let expectedRoute = CodexVersionChecker.ManagedRuntimeRoute(
+            managedLauncherPath: managed.path,
+            runtimePath: (target as NSString).standardizingPath,
+            helperPath: root.appending(path: "prepared/codex-code-mode-host").path,
+            runtimeSHA256: String(repeating: "a", count: 64),
+            helperSHA256: String(repeating: "b", count: 64)
+        )
 
         try Self.rustBridgeLauncherScript(managedLauncher: managed.path).write(
             to: local,
@@ -752,6 +759,11 @@ struct CodexVersionCheckerTests {
                 homebrewBridgePath: bridge.path
             ) == nil
         )
+        #expect(
+            CodexVersionChecker.managedRuntimeRoute(
+                managedLauncherPath: managed.path
+            ) == expectedRoute
+        )
 
         try Self.rustBridgeLauncherScript(managedLauncher: managed.path).write(
             to: bridge,
@@ -768,13 +780,7 @@ struct CodexVersionCheckerTests {
             CodexVersionChecker.managedRuntimeRoute(
                 localLauncherPath: local.path,
                 homebrewBridgePath: bridge.path
-            ) == CodexVersionChecker.ManagedRuntimeRoute(
-                managedLauncherPath: managed.path,
-                runtimePath: (target as NSString).standardizingPath,
-                helperPath: root.appending(path: "prepared/codex-code-mode-host").path,
-                runtimeSHA256: String(repeating: "a", count: 64),
-                helperSHA256: String(repeating: "b", count: 64)
-            )
+            ) == expectedRoute
         )
     }
 

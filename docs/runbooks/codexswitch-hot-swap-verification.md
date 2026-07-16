@@ -673,8 +673,9 @@ Before claiming hot-swap is fixed or ready:
 - [ ] A fresh app-server restart is auto-acknowledged by the daemon bootstrap reload without waiting for a real quota swap.
 - [ ] A fresh Mac `9223` bridge restart can bootstrap its first ACK during an
   explicit desktop activation, but only when the launchd PID, generated bridge
-  files, exact managed route, expected runtime/helper hashes, listener owner,
-  and running executable vnode all agree.
+  files, their embedded exact managed route, expected runtime/helper hashes,
+  listener owner, and running executable vnode all agree. A stale independent
+  CLI forwarding wrapper must not block this desktop-only bootstrap.
 - [ ] Relaunching CodexSwitch recovers a same-target
   `automatic_retry_limit_reached` journal once, after bridge installation,
   without changing the configured account or credential files.
