@@ -53,10 +53,14 @@ struct PopoverUXTests {
         #expect(source.contains("private var emailHoverOverlay: some View"))
         #expect(source.contains("Text(account.email)"))
         #expect(source.contains("AccountCardHoverTrackingView(email: account.email, isHovering: $isHovering)"))
+        #expect(source.contains(".allowsHitTesting(false)"))
         #expect(source.contains("NSTrackingArea("))
         #expect(source.contains("toolTip = email"))
         #expect(source.contains(".onHover { hovering in"))
         #expect(source.contains(".help(account.email)"))
+        #expect(source.contains(".accessibilityAddTraits(.isButton)"))
+        #expect(source.contains(".accessibilityAction {"))
+        #expect(source.contains("_ = handlePrimaryClick()"))
     }
 
     @Test("Status bar menu captures click type before async restart menu handling")

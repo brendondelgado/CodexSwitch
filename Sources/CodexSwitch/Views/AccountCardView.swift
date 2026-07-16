@@ -243,6 +243,19 @@ struct AccountCardView: View {
         requiresReauthentication
     }
 
+    var primaryActionAccessibilityHint: String {
+        if needsReauthentication {
+            return "Reauthenticate this account"
+        }
+        if isRuntimeCurrent {
+            return "Mac runtime is already using this account"
+        }
+        if isConfigured {
+            return "Retry Mac runtime activation"
+        }
+        return "Switch Mac to this account"
+    }
+
     static func needsReauthentication(for pollingError: String?) -> Bool {
         guard let pollingError else { return false }
         let lower = pollingError
@@ -473,6 +486,7 @@ struct AccountCardView: View {
         }
         .overlay {
             AccountCardHoverTrackingView(email: account.email, isHovering: $isHovering)
+                .allowsHitTesting(false)
         }
         .shadow(
             color: isRuntimeCurrent ? Self.activeGreen.opacity(0.4) : .clear,
@@ -485,6 +499,13 @@ struct AccountCardView: View {
             isHovering = hovering
         }
         .onTapGesture {
+            _ = handlePrimaryClick()
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(account.email)
+        .accessibilityHint(primaryActionAccessibilityHint)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
             _ = handlePrimaryClick()
         }
         .contextMenu {

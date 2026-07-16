@@ -11,6 +11,7 @@ toc:
   - CLI Update Storage Safety
   - Desktop Update Ownership
   - Account State Boundaries
+  - Manual Account Controls
   - Menu App Process Boundaries
   - Quota Snapshot Validity
   - Runtime Blockers and Reauth
@@ -51,6 +52,8 @@ cross_dependencies:
   - Tests/CodexSwitchTests/CodexVersionCheckerTests.swift
   - Tests/CodexSwitchTests/DesktopRuntimeReloadClientTests.swift
   - Tests/CodexSwitchTests/DesktopStatusTests.swift
+  - Tests/CodexSwitchTests/AccountCardViewTests.swift
+  - Tests/CodexSwitchTests/PopoverUXTests.swift
   - Sources/CodexSwitch/Services/DesktopPatchManager.swift
   - Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
   - Sources/CodexSwitch/Services/CodexDesktopAppUpdater.swift
@@ -537,6 +540,19 @@ When the Mac menu app and VPS CLI disagree, compare safe evidence in this order:
 3. `auth-diagnostics` active account and `auth.json` hash on the host that sent the request.
 4. The active Codex session's own `/status`, treating any "limits may be stale" warning as non-authoritative until rechecked.
 
+## Manual Account Controls
+
+Each account card is one manual activation control. Its visible click target and
+default macOS accessibility press action must call the same primary action:
+reauthenticate an unusable account, retry a configured-but-unconfirmed account,
+or switch the Mac to another account. Hover and tooltip helpers must be declared
+non-hit-testable so they cannot intercept that control.
+
+The control must remain available while an automatic-retry-limit
+`ManualReview` barrier is visible. A successful press must produce activation
+journal evidence; a visual highlight change without a new activation generation
+is not proof that the request ran.
+
 ## Menu App Process Boundaries
 
 The Mac menu app must have exactly one live poller process. A duplicate CodexSwitch process can double-poll quota, double-sync VPS state, and produce contradictory menu updates even when each process is individually running the correct code.
@@ -624,6 +640,8 @@ Before claiming hot-swap is fixed or ready:
 - [ ] A forced rotation changes the configured account and signals the expected process count.
 - [ ] From `CommittedDegraded`, an explicit cross-target operator selection starts a fresh activation while automatic rotation remains blocked.
 - [ ] From retry-exhausted `ManualReview`, an explicit cross-target operator selection can recover; every other manual-review reason remains blocked.
+- [ ] Each account card exposes a default accessibility press action, and pressing it produces the same activation request as a normal click.
+- [ ] The account-card hover overlay is non-hit-testable and cannot swallow a click.
 - [ ] The menu lists the configured account first and does not style it as runtime-current until fresh confirmation exists.
 - [ ] The app-server journal or ack file proves the signal handler ran after the rotation.
 - [ ] With a disposable live desktop session, `CODEXSWITCH_RUN_LIVE_DESKTOP_RELOAD=1 swift test --filter SwapEngineTests/liveDesktopAppServerReloadWhenRequested` exercises discovery, capability gating, `SIGHUP`, and acknowledgement as one path.
@@ -645,6 +663,8 @@ Every future hot-swap change must include tests for:
 - A stale `desktop-auth-watcher-ready` file cannot make a current desktop process report ready.
 - Desktop updates are downloaded and signature-verified while the app is live, but replacement and compatibility patching wait for app termination.
 - An in-flight `auth.json` read cannot revert a local account swap that completes before the read returns.
+- Account cards keep one shared primary action for normal clicks and the default
+  accessibility press action, while hover helpers remain non-hit-testable.
 - App-server patching targets the `AuthManager` captured by `MessageProcessor`, not an earlier preload/auth probe.
 - Expired or quota-exhausted active accounts rotate to usable candidates and rewrite `auth.json`.
 - Runtime `UsageLimitReached` inside Codex rotates once, reloads the active `AuthManager`, and retries the turn before surfacing an error.

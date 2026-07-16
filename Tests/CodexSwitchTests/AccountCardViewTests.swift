@@ -106,4 +106,42 @@ struct AccountCardViewTests {
         #expect(!didSwap)
         #expect(didReauthenticate)
     }
+
+    @Test("Accessibility hint describes the same primary action")
+    @MainActor
+    func accessibilityHintMatchesPrimaryAction() {
+        let account = makeAccount(isActive: false)
+
+        #expect(AccountCardView(
+            account: account,
+            pollingError: nil,
+            onReauthenticate: nil,
+            onForceSwap: {}
+        ).primaryActionAccessibilityHint == "Switch Mac to this account")
+
+        #expect(AccountCardView(
+            account: account,
+            isConfigured: true,
+            isRuntimeCurrent: false,
+            pollingError: nil,
+            onReauthenticate: nil,
+            onForceSwap: {}
+        ).primaryActionAccessibilityHint == "Retry Mac runtime activation")
+
+        #expect(AccountCardView(
+            account: account,
+            isConfigured: true,
+            isRuntimeCurrent: true,
+            pollingError: nil,
+            onReauthenticate: nil,
+            onForceSwap: {}
+        ).primaryActionAccessibilityHint == "Mac runtime is already using this account")
+
+        #expect(AccountCardView(
+            account: account,
+            pollingError: "Token refresh failed (HTTP 401)",
+            onReauthenticate: {},
+            onForceSwap: {}
+        ).primaryActionAccessibilityHint == "Reauthenticate this account")
+    }
 }
