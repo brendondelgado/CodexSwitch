@@ -3429,6 +3429,26 @@ struct CodexDesktopAppUpdaterTests {
         ))
     }
 
+    @Test("System temporary roots are canonicalized before no-follow traversal")
+    func systemTemporaryRootCanonicalizationResolvesCompatibilitySymlinks() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("private-target", isDirectory: true)
+        let alias = root.appendingPathComponent("compatibility-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            atPath: alias.path,
+            withDestinationPath: target.path
+        )
+
+        let canonical = try #require(CodexDesktopPathSecurity.canonicalExistingPath(alias))
+        #expect(canonical.path == target.path)
+        #expect(CodexDesktopPathSecurity.containsNoSymbolicLinkComponents(canonical))
+        #expect(CodexDesktopPathSecurity.containsNoSymbolicLinkComponents(
+            CodexDesktopPathSecurity.canonicalSystemTemporaryDirectory()
+        ))
+    }
+
     @Test("Bound rollback identity rejects same-inode mutate-and-restore ABA")
     func rollbackIdentityBindsChildLiveStateAcrossABA() throws {
         let root = temporaryDirectory()

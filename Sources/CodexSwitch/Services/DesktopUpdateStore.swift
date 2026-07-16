@@ -36,6 +36,28 @@ enum CodexDesktopPathSecurity {
         return true
     }
 
+    static func canonicalExistingPath(_ url: URL) -> URL? {
+        let standardized = lexicallyStandardized(url)
+        guard standardized.isFileURL,
+              standardized.path.hasPrefix("/"),
+              let resolved = Darwin.realpath(standardized.path, nil) else {
+            return nil
+        }
+        defer { Darwin.free(resolved) }
+        return URL(
+            fileURLWithPath: String(cString: resolved),
+            isDirectory: url.hasDirectoryPath
+        )
+    }
+
+    static func canonicalSystemTemporaryDirectory(
+        fileManager: FileManager = .default
+    ) -> URL {
+        let temporaryDirectory = fileManager.temporaryDirectory
+        return canonicalExistingPath(temporaryDirectory)
+            ?? lexicallyStandardized(temporaryDirectory)
+    }
+
     static func isStrictDescendant(_ candidate: URL, of root: URL) -> Bool {
         let rootComponents = lexicallyStandardized(root).pathComponents
         let candidateComponents = lexicallyStandardized(candidate).pathComponents

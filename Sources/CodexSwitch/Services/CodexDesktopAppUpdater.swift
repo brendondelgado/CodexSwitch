@@ -37,8 +37,8 @@ enum CodexDesktopAppUpdater {
         URL(fileURLWithPath: "/Applications/ChatGPT.app"),
         URL(fileURLWithPath: "/Applications/Codex.app"),
     ]
-    private static let operationLeaseURL = FileManager.default.temporaryDirectory
-        .resolvingSymlinksInPath()
+    private static let operationLeaseURL = CodexDesktopPathSecurity
+        .canonicalSystemTemporaryDirectory()
         .appendingPathComponent("com.codexswitch.desktop-update-\(getuid()).lock")
     private static let operationOwner = DesktopUpdateOperationOwner(
         stateMachine: stateMachine,

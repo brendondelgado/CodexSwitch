@@ -347,7 +347,7 @@ final class CodexDesktopUpdateCoordinator {
         }
     ) {
         self.temporaryRoot = temporaryRoot
-            ?? FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            ?? CodexDesktopPathSecurity.canonicalSystemTemporaryDirectory()
         self.currentDate = currentDate
         self.executor = executor
         self.nativeUpdateOwnershipProvider = nativeUpdateOwnershipProvider

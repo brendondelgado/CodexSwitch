@@ -32,7 +32,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: implemented_focused_verification
-  last_updated: 2026-07-14
+  last_updated: 2026-07-15
 ---
 
 # Desktop Update Storage
@@ -212,7 +212,10 @@ before a descendant can be created through a symlink. Security-sensitive path
 normalization is lexical only: it removes `.` and `..` syntax without resolving
 an ancestor such as `/tmp` or `/var` through a symbolic link. Callers must use
 the actual non-symlink namespace (for example `/private/tmp`) before a retained
-descriptor chain can be established. Trust validation retains
+descriptor chain can be established. The trusted, already-existing system
+temporary root is canonicalized with `realpath` once before updater lease and
+workspace children are appended; every child and later mutation still uses the
+same no-follow traversal and retained-descriptor checks. Trust validation retains
 no-follow descriptors for the bundle and its ancestors, observes rename/write
 events during the trust interval, and compares complete streamed seals before
 and after trust. This detects ancestor replacement, whole-bundle replace-and-
