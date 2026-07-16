@@ -2220,6 +2220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         await self.failConfiguredCredentialMutation(
                             target: account,
                             prepared: prepared,
+                            stage: .mutationAuthorization,
                             detail: .runtimeEvidenceExpired,
                             failure: "active token refresh authorization changed before submission"
                         )
@@ -2241,6 +2242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     await self.failConfiguredCredentialMutation(
                         target: account,
                         prepared: prepared,
+                        stage: .credentialMutation,
                         detail: .fileCommitFailed,
                         failure: "active token refresh failed or was cancelled before commit"
                     )
@@ -3526,9 +3528,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             )
             let preparing: AccountActivationState
+            let previousActivationState: AccountActivationState?
             switch decision {
             case .prepared(let state, let previousState):
                 preparing = state
+                previousActivationState = previousState
             case .retrySameTarget(let state):
                 accountManager.publishActivationState(state)
                 accountManager.publishActivationNotice(
@@ -3567,7 +3571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 swapGeneration: generation,
                 activationGeneration: activationGeneration,
                 expectedConfiguredAccountId: expectedConfiguredAccountId,
-                previousActivationState: previousState,
+                previousActivationState: previousActivationState,
                 lease: lease
             ))
         } catch {
@@ -4293,6 +4297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 swapGeneration: generation,
                 activationGeneration: activationGeneration,
                 expectedConfiguredAccountId: target.id,
+                previousActivationState: nil,
                 lease: lease
             )
             self.accountManager.publishActivationNotice(nil)
