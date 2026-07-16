@@ -1,0 +1,40 @@
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_f6d69361e1975e 263-264,691
+  s_70c8e194852bb5::t_c9cc71bbfce6fe 32-33
+Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
+  s_70c8e194852bb5::t_bceeb55d549c8d 153-154,156-160,168
+  s_70c8e194852bb5::t_bdbb27e242b04e 199,202-209
+  s_70c8e194852bb5::t_9ab3f5fe05460f 175,192
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_61c269bc661457 656-661,675,687-688,709,714-753,783-791,1471
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_f6d69361e1975e 219-232
+  s_70c8e194852bb5::t_c9cc71bbfce6fe 19
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_c9cc71bbfce6fe 35
+  s_70c8e194852bb5::t_f6d69361e1975e 391-395
+Tests/CodexSwitchTests/CodexDesktopBridgeKeepAliveTests.swift
+  s_70c8e194852bb5::t_398f29f818b755 94-97,105-108,133-147
+  s_70c8e194852bb5::t_9ab3f5fe05460f 104,115,122,129-132
+Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
+  s_70c8e194852bb5::t_9ab3f5fe05460f 8,14
+  s_70c8e194852bb5::t_0bf1dbda503c46 1-7,9-13,15-105
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_398f29f818b755 1243-1282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "761a6c800184e4164434ee08f5ab90a30d9483ec",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
