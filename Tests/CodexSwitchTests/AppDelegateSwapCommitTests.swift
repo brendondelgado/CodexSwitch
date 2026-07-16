@@ -67,6 +67,55 @@ struct AppDelegateSwapCommitTests {
         #expect(source.contains("ACTIVATION_FILE_COMMIT_FAILURE_RECOVERED"))
     }
 
+    @Test("Launch recovery is limited to the configured retry-exhausted target")
+    func launchRecoveryRequiresExactRetryExhaustedTarget() {
+        let target = UUID()
+        let other = UUID()
+        let exhausted = AccountActivationState.manualReview(
+            targetAccountId: target,
+            detail: .automaticRetryLimitReached,
+            retryAttempt: 4,
+            at: Date()
+        )
+        let unrelatedReview = AccountActivationState.manualReview(
+            targetAccountId: target,
+            detail: .configuredFilesInconsistent,
+            retryAttempt: 4,
+            at: Date()
+        )
+
+        #expect(AppDelegate.retryExhaustedLaunchRecoveryTarget(
+            state: exhausted,
+            configuredAccountId: target
+        ) == target)
+        #expect(AppDelegate.retryExhaustedLaunchRecoveryTarget(
+            state: exhausted,
+            configuredAccountId: other
+        ) == nil)
+        #expect(AppDelegate.retryExhaustedLaunchRecoveryTarget(
+            state: unrelatedReview,
+            configuredAccountId: target
+        ) == nil)
+        #expect(AppDelegate.retryExhaustedLaunchRecoveryTarget(
+            state: nil,
+            configuredAccountId: target
+        ) == nil)
+    }
+
+    @Test("Launch waits for bridge installation before retry recovery")
+    func launchRecoveryRunsAfterBridgeInstallation() throws {
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/App/AppDelegate.swift",
+            encoding: .utf8
+        )
+        let bridgeWait = try #require(source.range(of: "await desktopBridgeInstallation.value"))
+        let recovery = try #require(
+            source.range(of: "await recoverRetryExhaustedActivationOnLaunch()")
+        )
+
+        #expect(bridgeWait.lowerBound < recovery.lowerBound)
+    }
+
     @Test("No live runtime remains configured-only")
     func noRuntimeIsConfiguredOnly() {
         let completion = AccountActivationConvergenceEvaluator.completion(

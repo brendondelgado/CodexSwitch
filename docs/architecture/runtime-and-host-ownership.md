@@ -385,6 +385,10 @@ managed-launcher route, expected runtime and helper hashes, and the running
 executable vnode. This narrow bootstrap is not status evidence: activation
 remains degraded until the runtime returns the normal identity-bound ACK and
 proves at least one completed desktop frontend write.
+After the bridge installation task completes, app launch may reset only a
+same-target `automatic_retry_limit_reached` journal and make one bounded
+convergence attempt. This recovery does not change the configured account or
+credentials, and all later automatic retry limits remain in force.
 The VPS daemon may hold the account-store lock only for a bounded read,
 generation revalidation, journal transition, or atomic commit. Provider quota
 requests, reset-inventory requests, token refresh, process discovery, signals,

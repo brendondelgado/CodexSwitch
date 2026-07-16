@@ -265,7 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             RateLimitResetSettings.automaticRedemptionDefaultsKey: true,
         ])
         _ = Self.installKeepAliveOffMainActor()
-        _ = Self.installDesktopBridgeOffMainActor()
+        let desktopBridgeInstallation = Self.installDesktopBridgeOffMainActor()
         scheduleConfigMaintenanceIfNeeded(removeStaleCopies: true)
         configMaintenanceTimer = Timer.scheduledTimer(
             withTimeInterval: Self.configMaintenanceInterval,
@@ -315,6 +315,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Load accounts from Keychain (async for file I/O), then start services
         Task { @MainActor [self] in
             await loadAccounts()
+            await desktopBridgeInstallation.value
+            await recoverRetryExhaustedActivationOnLaunch()
             restoreExternalRateLimitResetHolds()
 
             // Prune old diagnostic logs (>7 days)
@@ -4217,6 +4219,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         beginSameTargetRuntimeRetry(to: target, source: "automatic")
     }
 
+    private func recoverRetryExhaustedActivationOnLaunch() async {
+        guard let targetAccountId = Self.retryExhaustedLaunchRecoveryTarget(
+            state: accountManager.activationState,
+            configuredAccountId: accountManager.configuredAccount?.id
+        ), let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) else {
+            return
+        }
+        await startSameTargetRuntimeRetry(to: target, source: "launch_recovery")
+    }
+
+    nonisolated static func retryExhaustedLaunchRecoveryTarget(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?
+    ) -> UUID? {
+        guard let state,
+              state.phase == .manualReview,
+              state.detail == .automaticRetryLimitReached,
+              let targetAccountId = state.configuredAccountId,
+              targetAccountId == configuredAccountId else {
+            return nil
+        }
+        return targetAccountId
+    }
+
     private func beginSameTargetRuntimeRetry(to target: CodexAccount, source: String) {
         guard !isExiting else { return }
         Task { @MainActor [weak self] in
@@ -4233,8 +4259,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
-        let isManualRetry = source == "manual"
-        let activationGeneration = isManualRetry
+        let resetsRetryBudget = source == "manual" || source == "launch_recovery"
+        let activationGeneration = resetsRetryBudget
             ? UUID()
             : accountManager.activationState?.activationGeneration ?? UUID()
         let scoped = await accountMutationTransaction.withActivationLease(
@@ -4243,7 +4269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ) { [weak self] lease in
             guard let self, !self.isExiting else { return false }
             do {
-                if isManualRetry {
+                if resetsRetryBudget {
                     let reset = try await self.accountActivationCoordinator
                         .resetForManualSameTargetRetry(
                             targetAccountId: target.id,

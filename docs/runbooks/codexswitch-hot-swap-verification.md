@@ -675,6 +675,9 @@ Before claiming hot-swap is fixed or ready:
   explicit desktop activation, but only when the launchd PID, generated bridge
   files, exact managed route, expected runtime/helper hashes, listener owner,
   and running executable vnode all agree.
+- [ ] Relaunching CodexSwitch recovers a same-target
+  `automatic_retry_limit_reached` journal once, after bridge installation,
+  without changing the configured account or credential files.
 - [ ] Each live target has a fresh `.codexswitch/hotswap-ack/<pid>.json` acknowledgement.
 - [ ] The desktop runtime contains the account-update marker, and the ACK proves matching disk/active auth fingerprints, the current signal nonce, and at least one completed frontend write.
 - [ ] A local interactive CLI ACK identifies `local-interactive-cli`, proves matching disk/active auth fingerprints and the current signal nonce, reports auth-generation/reconnect readiness, and reports zero desktop frontend writes.
