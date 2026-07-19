@@ -16,6 +16,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
+  last_updated: 2026-07-19
 ---
 
 # Codex VPS Thread Tools MCP
@@ -134,9 +135,10 @@ from app-server conversation callbacks and refreshes on startup.
 If new VPS agent threads are usable through tools but do not appear in the Mac
 sidebar until Codex.app restarts, thread creation is working and the bug is the
 desktop renderer's live recent-conversations refresh. `scripts/patch-asar.py`
-must keep the `CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH` installed alongside
-the auth hot-swap patch so enabled remote hosts get a lightweight periodic
-recent-thread refresh while the sidebar is mounted.
+must keep `CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2` installed alongside the
+auth hot-swap patch. Native callbacks and the native startup refresh remain the
+primary path; one cleanup-bound 60-second timer is only a missed-notification
+fallback while the sidebar is mounted.
 
 ## Verification
 

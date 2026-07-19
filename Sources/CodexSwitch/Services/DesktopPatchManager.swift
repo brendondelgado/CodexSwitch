@@ -308,8 +308,8 @@ enum DesktopPatchManager {
     private nonisolated static let patchLeasePath =
         NSString("~/.codexswitch/desktop-patch.lock").expandingTildeInPath
 
-    private nonisolated static let authPatchMarker = "_invalidateAccountQueries"
-    private nonisolated static let remoteRecentsPatchMarker = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH"
+    private nonisolated static let authPatchMarker = "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2"
+    private nonisolated static let remoteRecentsPatchMarker = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2"
     private nonisolated static let modelLabelFallbackMarker = "CODEXSWITCH_MODEL_LABEL_FALLBACK"
     private nonisolated static let modelAvailabilityFallbackMarker = "CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK"
     private nonisolated static let selectedModelLabelFallbackMarker = "CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK"

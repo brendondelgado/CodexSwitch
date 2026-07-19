@@ -70,7 +70,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-16
+  last_updated: 2026-07-19
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -108,6 +108,12 @@ delivery. This proof is ACK contract version 3 and is advertised by the
 without notifying the renderer leaves the visible account and React Query caches
 stale. Desktop readiness therefore requires the runtime marker for this full
 contract; a historical `desktop-auth-watcher-ready` file is not live evidence.
+The ASAR auth callback must also contain the current versioned cache-invalidation
+marker. A bare `_invalidateAccountQueries` function name is not sufficient: the
+July 19, 2026 renderer incident placed that helper inside a lazy initializer while
+calling it from module scope, producing an unhandled `ReferenceError`, provider
+unmount, renderer remount, and lost composer text. Reject and migrate that unsafe
+generation before launching the desktop app.
 An auth-only reload while no initialized frontend is connected does not satisfy
 this strict proof. Run a same-account canary with an initialized client attached
 and require a version 3 ACK whose nested binding matches the request, whose
@@ -693,6 +699,8 @@ Before claiming hot-swap is fixed or ready:
 - [ ] Exiting the final historical CLI and resuming through the managed launcher re-arms an exhausted same-target journal without relaunching CodexSwitch.
 - [ ] The installed desktop version matches the latest official appcast release, or a newer signed release is staged for the next safe quit.
 - [ ] The installed ASAR contains exactly one Fast compatibility marker declaration, and the patched renderer still honors an explicit `featureRequirements.fast_mode == false` prohibition.
+- [ ] The installed ASAR contains `CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2` exactly once, contains no nested legacy WeakMap helper, and a same-account auth notification produces no `_invalidateAccountQueries is not defined`, provider unmount, route remount, or window reload.
+- [ ] The installed ASAR contains `CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2`; its fallback adds no immediate mount refresh, polls at 60 seconds, retains native callback and startup updates, and clears its single timer on unmount.
 - [ ] The bundled `patch-asar.py` hash matches the source used for the CodexSwitch build, the desktop-patch log records Fast fallback application without a structure warning, and the ASAR integrity hash plus strict code-sign verification pass before relaunch.
 - [ ] A forced rotation changes the configured account and signals the expected process count.
 - [ ] From `CommittedDegraded`, an explicit cross-target operator selection starts a fresh activation while automatic rotation remains blocked.

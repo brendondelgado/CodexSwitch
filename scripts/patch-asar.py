@@ -85,6 +85,7 @@ ASAR_BACKUP = BACKUP_ROOT / "app.asar.bak"
 
 # Marker to detect if already patched
 PATCH_MARKER = "_invalidateAccountQueries"
+AUTH_CACHE_PATCH_MARKER = "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2"
 FAST_FALLBACK_MARKER = "_bundledFastModels"
 HEADROOM_ENV_MARKER = "CODEXSWITCH_HEADROOM_BASE_URL"
 HEADROOM_TRANSPORT_PATCH_MARKER = "CODEXSWITCH_HEADROOM_TRANSPORT_PATCH"
@@ -92,7 +93,9 @@ HEADROOM_GLOBAL_ENV_MARKER = "CODEXSWITCH_HEADROOM_GLOBAL_ENV_PATCH"
 DESKTOP_CLI_PATH_GUARD_MARKER = "CODEXSWITCH_DESKTOP_CLI_PATH_GUARD"
 BUNDLED_PLUGIN_SYNC_COMPAT_MARKER = "CODEXSWITCH_BUNDLED_PLUGIN_SYNC_COMPAT"
 BUNDLED_PLUGIN_LIST_ROOT_MARKER = "CODEXSWITCH_BUNDLED_PLUGIN_LIST_ROOT_PATCH"
-REMOTE_RECENTS_REFRESH_MARKER = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH"
+LEGACY_REMOTE_RECENTS_REFRESH_MARKER = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH"
+REMOTE_RECENTS_REFRESH_MARKER = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2"
+REMOTE_RECENTS_REFRESH_INTERVAL_MS = 60_000
 MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_MODEL_LABEL_FALLBACK"
 MODEL_AVAILABILITY_FALLBACK_MARKER = "CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK"
 SELECTED_MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK"
@@ -1269,6 +1272,60 @@ def identify_aliases(content: str) -> tuple[str, str] | None:
     return uqc_alias, qk_alias
 
 
+def current_auth_patch_present(content: str) -> bool:
+    """Return whether the renderer has the scope-safe auth patch generation."""
+    return PATCH_MARKER in content and AUTH_CACHE_PATCH_MARKER in content
+
+
+def module_patch_insert_position(content: str) -> int:
+    """Return a module-scope insertion point after imports and strict directives."""
+    last_import_match = None
+    for match in re.finditer(r'from"\./[^"]+\.js";', content):
+        last_import_match = match
+    if last_import_match:
+        return last_import_match.end()
+
+    strict_directive = re.match(r'(?:(?:"use strict"|\'use strict\');)+', content)
+    return strict_directive.end() if strict_directive else 0
+
+
+def query_client_auth_module_patch(query_key_builder: str, *, include_ref: bool) -> str:
+    """Build a no-throw module-scope React Query cache invalidator."""
+    ref_declaration = "var _qcRef=null;" if include_ref else ""
+    return (
+        ref_declaration
+        + f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";try{{'
+        + 'if(_qcRef)void Promise.allSettled(['
+        + '_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]}),'
+        + f'_qcRef.invalidateQueries({{queryKey:{query_key_builder}(`account-info`)}})'
+        + '])}catch{}}}'
+    )
+
+
+def upgrade_query_client_auth_patch(file_path: Path, content: str) -> bool:
+    """Upgrade the recognized module-scope V1 query-client helper in place."""
+    helper_re = re.compile(
+        rf'function {PATCH_MARKER}\(\)\{{if\(_qcRef\)\{{'
+        r'_qcRef\.invalidateQueries\(\{queryKey:\[`accounts`,`check`\]\}\);'
+        r'_qcRef\.invalidateQueries\(\{queryKey:'
+        r'(?P<builder>_csQueryKey|_qkBuild)\(`account-info`\)\}\)\}\}'
+    )
+    match = helper_re.search(content)
+    if not match:
+        return False
+
+    patched = (
+        content[:match.start()]
+        + query_client_auth_module_patch(match.group("builder"), include_ref=False)
+        + content[match.end():]
+    )
+    if not current_auth_patch_present(patched):
+        return False
+    file_path.write_text(patched)
+    print(f"  Upgraded module-scope auth patch: {file_path.name}")
+    return True
+
+
 def apply_modern_use_auth_patch(file_path: Path) -> bool:
     """Patch newer `use-auth` chunks that no longer import React Query directly."""
     content = file_path.read_text()
@@ -1296,13 +1353,7 @@ def apply_modern_use_auth_patch(file_path: Path) -> bool:
         print("ERROR: Cannot find end of import statements")
         return False
 
-    module_patch = (
-        f'var _qcRef=null;function {PATCH_MARKER}()'
-        '{if(_qcRef){'
-        '_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]});'
-        '_qcRef.invalidateQueries({queryKey:_csQueryKey(`account-info`)})'
-        '}}'
-    )
+    module_patch = query_client_auth_module_patch("_csQueryKey", include_ref=True)
     patched = (
         patched[:last_import_match.end()]
         + module_patch
@@ -1340,7 +1391,7 @@ def apply_modern_use_auth_patch(file_path: Path) -> bool:
             print(f"  Context: ...{patched[context_start:context_end]}...")
         return False
 
-    if PATCH_MARKER not in patched:
+    if not current_auth_patch_present(patched):
         print("ERROR: Patch marker not found after patching -- something went wrong")
         return False
     if "_csUseQueryClient" not in patched or "_csQueryKey" not in patched:
@@ -1373,40 +1424,51 @@ def apply_weakmap_use_auth_patch(file_path: Path, content: str | None = None) ->
         return False
 
     patched = content
-    cache_patch = (
+    legacy_helper = (
         f'{weakmap_var}=new WeakMap;'
         f'function {PATCH_MARKER}(){{{weakmap_var}=new WeakMap}}'
     )
-    patched, cache_count = re.subn(
-        rf'{re.escape(weakmap_var)}=new WeakMap(?=[,;}}])',
-        cache_patch,
-        patched,
-        count=1,
+    if PATCH_MARKER in patched:
+        if patched.count(legacy_helper) != 1:
+            print("ERROR: Cannot safely upgrade unrecognized WeakMap auth patch")
+            return False
+        patched = patched.replace(legacy_helper, f'{weakmap_var}=new WeakMap', 1)
+
+    insert_pos = module_patch_insert_position(patched)
+    cache_patch = (
+        f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";'
+        f'try{{typeof {weakmap_var}!="undefined"&&({weakmap_var}=new WeakMap)}}catch{{}}}}'
     )
-    if cache_count != 1:
-        print("ERROR: Could not insert WeakMap cache invalidation helper")
-        return False
+    patched = patched[:insert_pos] + cache_patch + patched[insert_pos:]
 
     callback_tail_re = re.compile(
         r'\}\),([A-Za-z_$][\w$]*)\(\)\};return\s*'
         r'([A-Za-z_$][\w$]*)\.addAuthStatusCallback\('
     )
-    patched, callback_count = callback_tail_re.subn(
-        rf'}}),{PATCH_MARKER}(),\1()}};return \2.addAuthStatusCallback(',
-        patched,
-        count=1,
+    patched_callback_re = re.compile(
+        rf'\}}\),{PATCH_MARKER}\(\),([A-Za-z_$][\w$]*)\(\)\}};return\s*'
+        r'([A-Za-z_$][\w$]*)\.addAuthStatusCallback\('
     )
-    if callback_count != 1:
-        print("ERROR: Cannot find WeakMap auth status callback refresh tail")
-        idx = patched.find("addAuthStatusCallback")
-        if idx >= 0:
-            context_start = max(0, idx - 200)
-            context_end = min(len(patched), idx + 200)
-            print(f"  Context: ...{patched[context_start:context_end]}...")
-        return False
+    if len(patched_callback_re.findall(patched)) != 1:
+        patched, callback_count = callback_tail_re.subn(
+            rf'}}),{PATCH_MARKER}(),\1()}};return \2.addAuthStatusCallback(',
+            patched,
+            count=1,
+        )
+        if callback_count != 1:
+            print("ERROR: Cannot find WeakMap auth status callback refresh tail")
+            idx = patched.find("addAuthStatusCallback")
+            if idx >= 0:
+                context_start = max(0, idx - 200)
+                context_end = min(len(patched), idx + 200)
+                print(f"  Context: ...{patched[context_start:context_end]}...")
+            return False
 
-    if PATCH_MARKER not in patched:
+    if not current_auth_patch_present(patched):
         print("ERROR: Patch marker not found after WeakMap patching")
+        return False
+    if legacy_helper in patched:
+        print("ERROR: Legacy nested WeakMap helper survived migration")
         return False
     if "addAuthStatusCallback" not in patched or "getAccount" not in patched:
         print("ERROR: WeakMap auth structure disappeared after patching")
@@ -1437,9 +1499,24 @@ def apply_patch(file_path: Path) -> bool:
     """
     content = file_path.read_text()
 
-    if PATCH_MARKER in content:
+    if current_auth_patch_present(content):
         print(f"  Already patched: {file_path.name}")
         return True
+
+    if PATCH_MARKER in content:
+        weakmap_var = find_weakmap_account_cache_var(content)
+        legacy_weakmap_helper = (
+            f'{weakmap_var}=new WeakMap;function {PATCH_MARKER}()'
+            f'{{{weakmap_var}=new WeakMap}}'
+            if weakmap_var
+            else None
+        )
+        if legacy_weakmap_helper and legacy_weakmap_helper in content:
+            return apply_weakmap_use_auth_patch(file_path, content)
+        if upgrade_query_client_auth_patch(file_path, content):
+            return True
+        print("ERROR: Existing auth patch has an unknown scope; refusing to layer another patch")
+        return False
 
     if (
         "addAuthStatusCallback" in content
@@ -1506,12 +1583,8 @@ def apply_patch(file_path: Path) -> bool:
     insert_pos = last_import_match.end()
 
     module_patch = (
-        f'var _qcHook={uqc_alias},_qkBuild={qk_alias},_qcRef=null;'
-        f'function {PATCH_MARKER}()'
-        '{if(_qcRef){'
-        '_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]});'
-        '_qcRef.invalidateQueries({queryKey:_qkBuild(`account-info`)})'
-        '}}'
+        f'var _qcHook={uqc_alias},_qkBuild={qk_alias};'
+        + query_client_auth_module_patch("_qkBuild", include_ref=True)
     )
     patched = patched[:insert_pos] + module_patch + patched[insert_pos:]
 
@@ -1576,7 +1649,7 @@ def apply_patch(file_path: Path) -> bool:
     patched = patched.replace(old_callback_tail, new_callback_tail, 1)
 
     # --- Verify the patch looks right ---
-    if PATCH_MARKER not in patched:
+    if not current_auth_patch_present(patched):
         print("ERROR: Patch marker not found after patching -- something went wrong")
         return False
 
@@ -2036,6 +2109,49 @@ def apply_bundled_plugin_list_root_patch(file_path: Path) -> bool:
     return True
 
 
+def upgrade_remote_recents_refresh_v1(file_path: Path, content: str) -> bool:
+    """Migrate the recognized 15-second remote-recents fallback to V2."""
+    legacy_literal = f'"{LEGACY_REMOTE_RECENTS_REFRESH_MARKER}";'
+    current_literal = f'"{REMOTE_RECENTS_REFRESH_MARKER}";'
+    if legacy_literal not in content or current_literal in content:
+        return False
+
+    interval_re = re.compile(
+        r'window\.setInterval\((?P<refresh>[A-Za-z_$][\w$]*),15000\)'
+    )
+    matches = list(interval_re.finditer(content))
+    if len(matches) != 1:
+        print("ERROR: Cannot identify the legacy remote-recents fallback timer")
+        return False
+
+    refresh = matches[0].group("refresh")
+    patched = content.replace(legacy_literal, current_literal, 1)
+    patched = interval_re.sub(
+        lambda match: (
+            f'window.setInterval({match.group("refresh")},'
+            f'{REMOTE_RECENTS_REFRESH_INTERVAL_MS})'
+        ),
+        patched,
+        count=1,
+    )
+    if refresh == "_csRemoteRecentRefresh":
+        injected_mount_refresh = f',{refresh}());'
+        if patched.count(injected_mount_refresh) != 1:
+            print("ERROR: Cannot remove the legacy remote-recents mount refresh")
+            return False
+        patched = patched.replace(injected_mount_refresh, ");", 1)
+
+    if not has_remote_recents_refresh_patch(patched):
+        return False
+    if legacy_literal in patched or interval_re.search(patched):
+        print("ERROR: Legacy remote-recents fallback survived migration")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Upgraded remote recent conversation refresh: {file_path.name}")
+    return True
+
+
 def apply_remote_recents_refresh_patch(file_path: Path) -> bool:
     """Refresh remote sidebar recents even when the desktop misses a notification.
 
@@ -2049,6 +2165,8 @@ def apply_remote_recents_refresh_patch(file_path: Path) -> bool:
     if has_remote_recents_refresh_patch(content):
         print(f"  Already patched remote recent conversation refresh: {file_path.name}")
         return True
+    if f'"{LEGACY_REMOTE_RECENTS_REFRESH_MARKER}";' in content:
+        return upgrade_remote_recents_refresh_v1(file_path, content)
 
     old = (
         "let t=()=>{let t=z(u);"
@@ -2063,7 +2181,7 @@ def apply_remote_recents_refresh_patch(file_path: Path) -> bool:
         "m.setQueryData([e,p,u],I({appServerRegistry:s,enabledRemoteHostIds:t,sortKey:p})),"
         "R({scope:n,appServerRegistry:s,sortKey:p,refreshesInFlightHostIds:g.current})};"
         f'"{REMOTE_RECENTS_REFRESH_MARKER}";'
-        "let _csRemoteRecentRefreshTimer=u!==`[]`?window.setInterval(t,15000):null;"
+        f"let _csRemoteRecentRefreshTimer=u!==`[]`?window.setInterval(t,{REMOTE_RECENTS_REFRESH_INTERVAL_MS}):null;"
         "return t(),N([P({appServerRegistry:s,onStoreChange:t,subscribeToManager:(t,n)=>{"
         "switch(e){case`recent-conversations`:return t.addAnyConversationCallback(n);"
         "case`recent-conversations-meta`:return t.addAnyConversationMetaCallback(n)}}}),"
@@ -2112,8 +2230,7 @@ def apply_remote_recents_refresh_patch(file_path: Path) -> bool:
                 'Promise.resolve(e.refreshRecentConversations({})).catch(()=>{})},'
                 f'{watch_call};"{REMOTE_RECENTS_REFRESH_MARKER}";'
                 f'{key}!==`local`&&(_csRemoteRecentRefreshTimer='
-                'window.setInterval(_csRemoteRecentRefresh,15000),'
-                '_csRemoteRecentRefresh());'
+                f'window.setInterval(_csRemoteRecentRefresh,{REMOTE_RECENTS_REFRESH_INTERVAL_MS}));'
                 f'return()=>{{{watch}(),_csRemoteRecentRefreshTimer!=null&&'
                 'window.clearInterval(_csRemoteRecentRefreshTimer),'
                 f'{cleanup}(t,{key},{ids},[])}}'
@@ -2158,7 +2275,7 @@ def apply_remote_recents_refresh_patch(file_path: Path) -> bool:
                     match.group("prefix")
                     + f'"{REMOTE_RECENTS_REFRESH_MARKER}";'
                     + f'let _csRemoteRecentRefreshTimer={enabled_var}!==`[]`?'
-                    + f'window.setInterval({refresh_fn},15000):null;'
+                    + f'window.setInterval({refresh_fn},{REMOTE_RECENTS_REFRESH_INTERVAL_MS}):null;'
                     + f'return {refresh_fn}(),{cleanup_fn}([{subscribe_call},'
                     + '()=>{_csRemoteRecentRefreshTimer!=null&&'
                     + 'window.clearInterval(_csRemoteRecentRefreshTimer)}])'
@@ -2176,9 +2293,9 @@ def apply_remote_recents_refresh_patch(file_path: Path) -> bool:
     if not has_remote_recents_refresh_patch(patched):
         print("ERROR: Remote recent conversation refresh marker missing after patch")
         return False
-    if (
-        "window.setInterval(t,15000)" not in patched
-        and "window.setInterval(_csRemoteRecentRefresh,15000)" not in patched
+    if not re.search(
+        rf'window\.setInterval\([A-Za-z_$][\w$]*,{REMOTE_RECENTS_REFRESH_INTERVAL_MS}\)',
+        patched,
     ):
         print("ERROR: Remote recent conversation refresh timer missing after patch")
         return False
@@ -3298,7 +3415,7 @@ def main():
     print(f"Found remote model refresh file: {remote_model_refresh_file.name}")
     print("Desktop patch scope: auth hot-swap, Fast Mode metadata, remote sidebar/model refresh, and known-model availability/labels/efforts; bundled CLI and plugin files are preserved.")
 
-    auth_already_patched = PATCH_MARKER in auth_file.read_text()
+    auth_already_patched = current_auth_patch_present(auth_file.read_text())
     fast_already_patched = FAST_FALLBACK_MARKER in fast_mode_file.read_text()
     remote_recents_already_patched = bool(
         remote_recents_file

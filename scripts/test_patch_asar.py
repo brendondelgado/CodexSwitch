@@ -730,6 +730,7 @@ class PatchAsarTests(unittest.TestCase):
             self.assertTrue(ok)
             patched = target.read_text()
             self.assertIn(patch_asar.PATCH_MARKER, patched)
+            self.assertIn(patch_asar.AUTH_CACHE_PATCH_MARKER, patched)
             self.assertIn("A as _csUseQueryClient", patched)
             self.assertIn("r as _csQueryKey", patched)
             self.assertIn("_qcRef=_csUseQueryClient();let n=(0,u.c)(14),", patched)
@@ -749,10 +750,13 @@ class PatchAsarTests(unittest.TestCase):
             self.assertTrue(ok)
             patched = target.read_text()
             self.assertIn(patch_asar.PATCH_MARKER, patched)
+            self.assertIn(patch_asar.AUTH_CACHE_PATCH_MARKER, patched)
             self.assertIn(
-                "f=new WeakMap;function _invalidateAccountQueries(){f=new WeakMap}",
+                'function _invalidateAccountQueries(){"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2";'
+                'try{typeof f!="undefined"&&(f=new WeakMap)}catch{}}',
                 patched,
             )
+            self.assertIn("f=new WeakMap;", patched)
             self.assertIn(
                 "}),_invalidateAccountQueries(),c()};return e.addAuthStatusCallback",
                 patched,
@@ -768,10 +772,17 @@ class PatchAsarTests(unittest.TestCase):
 
             self.assertTrue(ok)
             patched = target.read_text()
+            self.assertEqual(patched.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
             self.assertIn(
-                "_9=new WeakMap;function _invalidateAccountQueries(){_9=new WeakMap}",
+                'function _invalidateAccountQueries(){"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2";'
+                'try{typeof _9!="undefined"&&(_9=new WeakMap)}catch{}}',
                 patched,
             )
+            self.assertLess(
+                patched.index("function _invalidateAccountQueries"),
+                patched.index("var m9,h9,g9,_9,v9="),
+            )
+            self.assertIn("_9=new WeakMap}));", patched)
             self.assertIn("hd=new WeakMap", patched)
             self.assertNotIn("hd=new WeakMap;function _invalidateAccountQueries", patched)
             self.assertIn(
@@ -779,6 +790,62 @@ class PatchAsarTests(unittest.TestCase):
                 patched,
             )
             self.assertIn("export{f9 as i};", patched)
+
+    def test_apply_patch_repairs_nested_weakmap_v1_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            broken = CODEX_4753_WEAKMAP_AUTH_CONTENT.replace(
+                "_9=new WeakMap}));",
+                "_9=new WeakMap;function _invalidateAccountQueries(){_9=new WeakMap}}));",
+                1,
+            ).replace(
+                "}),l()};return e.addAuthStatusCallback",
+                "}),_invalidateAccountQueries(),l()};return e.addAuthStatusCallback",
+                1,
+            )
+            target.write_text(broken)
+
+            self.assertTrue(patch_asar.apply_patch(target))
+
+            repaired = target.read_text()
+            self.assertNotIn(
+                "_9=new WeakMap;function _invalidateAccountQueries(){_9=new WeakMap}",
+                repaired,
+            )
+            self.assertEqual(repaired.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
+            self.assertEqual(repaired.count("function _invalidateAccountQueries"), 1)
+            self.assertEqual(repaired.count("_invalidateAccountQueries(),l()"), 1)
+            self.assertLess(
+                repaired.index("function _invalidateAccountQueries"),
+                repaired.index("var m9,h9,g9,_9,v9="),
+            )
+
+            self.assertTrue(patch_asar.apply_patch(target))
+            self.assertEqual(target.read_text(), repaired)
+
+    def test_apply_patch_upgrades_module_scope_query_client_v1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "use-auth-HASH.js"
+            target.write_text(
+                "var _qcRef=null;"
+                "function _invalidateAccountQueries(){if(_qcRef){"
+                "_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]});"
+                "_qcRef.invalidateQueries({queryKey:_csQueryKey(`account-info`)})}}"
+                "function hook(){_invalidateAccountQueries()}export{hook as h};"
+            )
+
+            self.assertTrue(patch_asar.apply_patch(target))
+
+            upgraded = target.read_text()
+            self.assertEqual(upgraded.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
+            self.assertIn("Promise.allSettled", upgraded)
+            self.assertNotIn(
+                "function _invalidateAccountQueries(){if(_qcRef)",
+                upgraded,
+            )
+
+            self.assertTrue(patch_asar.apply_patch(target))
+            self.assertEqual(target.read_text(), upgraded)
 
     def test_find_fast_mode_file_matches_bundle_by_content(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -864,7 +931,8 @@ class PatchAsarTests(unittest.TestCase):
             self.assertTrue(ok)
             patched = target.read_text()
             self.assertIn(patch_asar.REMOTE_RECENTS_REFRESH_MARKER, patched)
-            self.assertIn("window.setInterval(t,15000)", patched)
+            self.assertIn("window.setInterval(t,60000)", patched)
+            self.assertEqual(patched.count("window.setInterval(t,60000)"), 1)
             self.assertIn("window.clearInterval(_csRemoteRecentRefreshTimer)", patched)
             self.assertIn("return t(),N([P({appServerRegistry:s", patched)
 
@@ -878,7 +946,7 @@ class PatchAsarTests(unittest.TestCase):
             self.assertTrue(ok)
             patched = target.read_text()
             self.assertIn(patch_asar.REMOTE_RECENTS_REFRESH_MARKER, patched)
-            self.assertIn("window.setInterval(t,15000)", patched)
+            self.assertIn("window.setInterval(t,60000)", patched)
             self.assertIn("window.clearInterval(_csRemoteRecentRefreshTimer)", patched)
             self.assertIn("return t(),W7([G7({appServerRegistry:r", patched)
 
@@ -892,7 +960,12 @@ class PatchAsarTests(unittest.TestCase):
             self.assertTrue(ok)
             patched = target.read_text()
             self.assertIn(patch_asar.REMOTE_RECENTS_REFRESH_MARKER, patched)
-            self.assertIn("window.setInterval(_csRemoteRecentRefresh,15000)", patched)
+            self.assertIn("window.setInterval(_csRemoteRecentRefresh,60000)", patched)
+            self.assertNotIn(
+                "window.setInterval(_csRemoteRecentRefresh,60000),"
+                "_csRemoteRecentRefresh()",
+                patched,
+            )
             self.assertIn("window.clearInterval(_csRemoteRecentRefreshTimer)", patched)
             self.assertIn("let e=t.get(O5,n)", patched)
             self.assertIn("e.refreshRecentConversations({})", patched)
@@ -908,6 +981,54 @@ class PatchAsarTests(unittest.TestCase):
             second = target.read_text()
 
             self.assertEqual(first, second)
+
+    def test_apply_remote_recents_refresh_patch_upgrades_v1_timer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-server-manager-hooks-HASH.js"
+            target.write_text(REMOTE_RECENTS_CONTENT)
+            self.assertTrue(patch_asar.apply_remote_recents_refresh_patch(target))
+            legacy = target.read_text().replace(
+                patch_asar.REMOTE_RECENTS_REFRESH_MARKER,
+                patch_asar.LEGACY_REMOTE_RECENTS_REFRESH_MARKER,
+                1,
+            ).replace("window.setInterval(t,60000)", "window.setInterval(t,15000)", 1)
+            target.write_text(legacy)
+
+            self.assertTrue(patch_asar.apply_remote_recents_refresh_patch(target))
+
+            upgraded = target.read_text()
+            self.assertIn('"CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2";', upgraded)
+            self.assertNotIn('"CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH";', upgraded)
+            self.assertIn("window.setInterval(t,60000)", upgraded)
+            self.assertIn("return t(),N([P({appServerRegistry:s", upgraded)
+
+    def test_apply_remote_recents_refresh_patch_removes_v1_signal_mount_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CODEX_5018_REMOTE_RECENTS_SIGNAL_CONTENT)
+            self.assertTrue(patch_asar.apply_remote_recents_refresh_patch(target))
+            legacy = target.read_text().replace(
+                patch_asar.REMOTE_RECENTS_REFRESH_MARKER,
+                patch_asar.LEGACY_REMOTE_RECENTS_REFRESH_MARKER,
+                1,
+            ).replace(
+                "window.setInterval(_csRemoteRecentRefresh,60000));",
+                "window.setInterval(_csRemoteRecentRefresh,15000),"
+                "_csRemoteRecentRefresh());",
+                1,
+            )
+            target.write_text(legacy)
+
+            self.assertTrue(patch_asar.apply_remote_recents_refresh_patch(target))
+
+            upgraded = target.read_text()
+            self.assertIn("window.setInterval(_csRemoteRecentRefresh,60000)", upgraded)
+            self.assertNotIn(
+                "window.setInterval(_csRemoteRecentRefresh,60000),"
+                "_csRemoteRecentRefresh()",
+                upgraded,
+            )
+            self.assertEqual(upgraded.count(patch_asar.REMOTE_RECENTS_REFRESH_MARKER), 1)
 
     def test_apply_model_label_fallback_patch_labels_gpt56_sol(self):
         with tempfile.TemporaryDirectory() as tmp:

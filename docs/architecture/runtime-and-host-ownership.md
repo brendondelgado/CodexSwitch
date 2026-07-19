@@ -36,6 +36,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
+  - ../../Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
   - ../../Sources/CodexSwitch/Views/AccountCardView.swift
   - ../../Sources/CodexSwitch/Views/PopoverContentView.swift
   - ../../Sources/CodexSwitch/Views/StatusBarController.swift
@@ -45,13 +46,15 @@ cross_dependencies:
   - ../../crates/codexswitch-cli/src/reload.rs
   - ../../crates/codexswitch-cli/src/codex_update.rs
   - ../../scripts/codex-vps
+  - ../../scripts/patch-asar.py
+  - ../../scripts/test_patch_asar.py
   - macos-runtime-artifact.md
   - ../runbooks/codexswitch-hot-swap-verification.md
   - ../runbooks/linux-repository-deployment.md
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-16
+  last_updated: 2026-07-19
 ---
 
 # Runtime And Host Ownership
@@ -329,6 +332,15 @@ admission. AppDelegate never follows that result with an independent desktop
 signal. Failed, unsupported, unverified, zero-listener, or partial JSON-RPC ends
 that desktop attempt as degraded; a later signal cannot override it or turn it
 into runtime-current evidence.
+
+The desktop renderer compatibility callback is part of that transaction. Its
+auth-cache invalidator must be declared in the same module scope as the callback,
+must not throw or leave a rejected promise unhandled, and must update auth state
+without unmounting the provider or replacing the renderer. An auth notification
+must not reload the window or discard an in-progress composer draft. Desktop
+patch readiness therefore requires a versioned auth-cache marker that proves this
+scope contract; the historical unversioned `_invalidateAccountQueries` marker is
+not sufficient evidence and must be upgraded before activation.
 
 Broad `pkill`, name-only matching, and signalling a newly initialized process are prohibited.
 
@@ -630,6 +642,17 @@ or report an installation outcome. Automatic installation occurs only after a
 proven desktop app-termination boundary and is re-gated immediately before
 mutation. An explicit manual install is also allowed through the same gate.
 Status checks cannot trigger repair or installation.
+
+Renderer patch markers identify behavior generations, not merely function names.
+The patcher must migrate a recognized unsafe generation in the staged artifact,
+and both the patch manager and installed-app locator must reject that generation
+until the current versioned marker is present. Re-running the current patch is
+idempotent and must not add duplicate callbacks, timers, or helper declarations.
+Remote-recents compatibility uses native conversation callbacks for immediate
+updates. Its recovery timer is a missed-notification fallback only: it performs
+no extra injected refresh at mount, preserves the native startup refresh, runs
+no more often than once per 60 seconds, and is cancelled when the owning effect
+unmounts.
 
 Rollback trust is not inherited from an earlier installed-app observation. The
 transaction validates the previous bundle through the official trust pipeline,
