@@ -2901,6 +2901,14 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         let mut state = automatic_update_test_state(UpdateStatus::Failed, now);
         state.failed_prepare_version = Some("0.145.0".to_string());
         state.prepare_retry_not_before = Some(now + ChronoDuration::hours(6));
+        state.error = Some("0.145.0 source preparation failed".to_string());
+        record_unresolved_failure(
+            &mut state,
+            UpdateFailureKind::Preparation,
+            now,
+            Some("0.145.0".to_string()),
+            None,
+        );
 
         apply_successful_metadata_check(
             &mut state,
@@ -2915,6 +2923,9 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
 
         assert_eq!(state.failed_prepare_version, None);
         assert_eq!(state.prepare_retry_not_before, None);
+        assert_eq!(state.unresolved_failure, None);
+        assert_eq!(state.status, UpdateStatus::Idle);
+        assert_eq!(state.error, None);
         assert_eq!(
             automatic_update_decision(
                 &state,

@@ -24,8 +24,9 @@ use account_store::{
     validate_accounts, CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
 };
 use activation::{
-    activate_with, reconcile_activation_barrier, replace_accounts_with, ActivationBarrierContext,
-    ActivationContext, ActivationOutcome, ActivationState,
+    activate_with, reconcile_activation_barrier, replace_accounts_with,
+    resolve_manual_review_activation, ActivationBarrierContext, ActivationContext,
+    ActivationOutcome, ActivationState,
 };
 use anyhow::{bail, Context, Result};
 use auth::default_auth_path;
@@ -161,6 +162,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Confirm a reviewed activation barrier without changing account credentials.
+    ResolveActivation {
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Daemon {
         #[arg(long, default_value_t = 5)]
         interval_seconds: u64,
@@ -263,6 +271,9 @@ fn main() -> Result<()> {
             !offline_file_only,
             json,
         ),
+        Command::ResolveActivation { yes, json } => {
+            resolve_activation(&store_path, &auth_path, yes, json)
+        }
         Command::Daemon { interval_seconds } => daemon::run_loop(
             &store_path,
             &auth_path,
@@ -754,6 +765,51 @@ where
     )?;
     let summary = require_confirmed_activation(outcome)?;
     Ok((target_email, summary))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveActivationReport {
+    state: ActivationState,
+    verified_runtime_acks: usize,
+    skipped_runtime_targets: usize,
+    detail: Option<String>,
+}
+
+fn resolve_activation(store_path: &Path, auth_path: &Path, yes: bool, json: bool) -> Result<()> {
+    if !yes {
+        bail!("resolve-activation requires --yes after reviewing the activation record");
+    }
+
+    let store_lock = lock_account_store(store_path)?;
+    let snapshot = store_lock.load()?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let outcome = resolve_manual_review_activation(
+        ActivationBarrierContext {
+            store_lock: &store_lock,
+            generation: &mut generation,
+            accounts: &mut accounts,
+            auth_path,
+            reload_enabled: true,
+        },
+        reload_codex_hot_swap_processes,
+    )?;
+    let report = ResolveActivationReport {
+        state: outcome.state,
+        verified_runtime_acks: outcome.reload.signaled.len(),
+        skipped_runtime_targets: outcome.reload.skipped.len(),
+        detail: outcome.detail,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Resolved activation barrier with {} verified runtime ACK(s)",
+            report.verified_runtime_acks
+        );
+    }
+    Ok(())
 }
 
 fn require_confirmed_activation(outcome: ActivationOutcome) -> Result<ReloadSummary> {
@@ -1869,6 +1925,29 @@ mod tests {
                 account,
                 json: true,
             } if account == "pro@example.com"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn activation_resolution_requires_explicit_operator_confirmation() -> Result<()> {
+        let confirmed =
+            Args::try_parse_from(["codexswitch-cli", "resolve-activation", "--yes", "--json"])?;
+        assert!(matches!(
+            confirmed.command,
+            Command::ResolveActivation {
+                yes: true,
+                json: true
+            }
+        ));
+
+        let unconfirmed = Args::try_parse_from(["codexswitch-cli", "resolve-activation"])?;
+        assert!(matches!(
+            unconfirmed.command,
+            Command::ResolveActivation {
+                yes: false,
+                json: false
+            }
         ));
         Ok(())
     }

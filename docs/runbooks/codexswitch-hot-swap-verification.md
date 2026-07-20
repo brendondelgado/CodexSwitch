@@ -287,6 +287,15 @@ never authorize repair. The coordinator repeats store-generation and complete
 auth readback after the ACK, and import is blocked behind the same convergence
 barrier before replacement bytes can be written.
 
+After inspecting a generic version-3 manual-review record, an operator may run
+`codexswitch-cli resolve-activation --yes --json`. This command never selects an
+account or writes credentials. It requires a known activation kind, exactly one
+active account, matching complete store/auth tokens, unchanged generation
+readback, and at least one verified live runtime ACK with no skipped targets.
+It repeats the store/auth proof after the ACK and only then replaces the journal
+with `Confirmed`. Any mismatch, missing target, reload error, zero ACK result,
+or concurrent change leaves the original manual-review journal untouched.
+
 The regression proof requires two reload acknowledgements for a cross-target
 request behind a repaired barrier: one for the durable current target and one
 for the selected replacement. The final activation record must be `Confirmed`
@@ -427,11 +436,15 @@ is installed, after which the version-scoped failure policy still applies.
 A failed source preparation records both the failed version and a durable retry
 deadline. Stable-channel metadata checks may discover a newer version and may
 clear an obsolete failure record, but only when the discovered version is
-strictly newer. A registry rollback or the return of the same failed version
-must not erase its cooldown. Automatic preparation resumes only after that
-deadline or when a newer stable version is available. The update-state file is
-committed by same-directory temporary-file rename so a crash or disk-full write
-cannot truncate the only copy of the cooldown.
+strictly newer. Clearing that obsolete preparation failure includes its matching
+typed `unresolvedFailure` snapshot; otherwise the snapshot would immediately
+restore the superseded error and block the newer preparation. Installation and
+activation failures remain durable across a newer preparation. A registry
+rollback or the return of the same failed version must not erase its cooldown.
+Automatic preparation resumes only after that deadline or when a newer stable
+version is available. The update-state file is committed by same-directory
+temporary-file rename so a crash or disk-full write cannot truncate the only
+copy of the cooldown.
 
 Manual preparation is idempotent too. If the requested version already has a
 fully validated immutable generation, the command returns that generation

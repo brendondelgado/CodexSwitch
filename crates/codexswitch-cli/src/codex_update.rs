@@ -1340,12 +1340,22 @@ fn resolve_prepare_failure_for_version(state: &mut CodexUpdateState, version: &s
 }
 
 fn clear_obsolete_prepare_failure(state: &mut CodexUpdateState, latest: &str) {
-    if state
+    let Some(failed_version) = state
         .failed_prepare_version
-        .as_deref()
-        .is_some_and(|failed| version_is_strictly_newer(latest, failed))
-    {
-        clear_prepare_failure(state);
+        .clone()
+        .filter(|failed| version_is_strictly_newer(latest, failed))
+    else {
+        return;
+    };
+    let clears_snapshot = state.unresolved_failure.as_ref().is_some_and(|failure| {
+        failure.kind == UpdateFailureKind::Preparation
+            && failure.version.as_deref() == Some(failed_version.as_str())
+            && failure.failed_prepare_version.as_deref() == Some(failed_version.as_str())
+            && failure.failed_install_version.is_none()
+    });
+    clear_prepare_failure(state);
+    if clears_snapshot {
+        clear_unresolved_failure(state);
     }
 }
 

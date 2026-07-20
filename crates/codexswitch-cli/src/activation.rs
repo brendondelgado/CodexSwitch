@@ -120,6 +120,84 @@ where
         .map(|resolution| resolution.map(|(_, outcome)| outcome))
 }
 
+pub fn resolve_manual_review_activation<R>(
+    context: ActivationBarrierContext<'_>,
+    mut reload: R,
+) -> Result<ActivationOutcome>
+where
+    R: FnMut(&Path) -> Result<ReloadSummary>,
+{
+    let ActivationBarrierContext {
+        store_lock,
+        generation,
+        accounts,
+        auth_path,
+        reload_enabled,
+    } = context;
+    if !reload_enabled {
+        bail!("manual-review resolution requires live runtime convergence");
+    }
+
+    let record = read_activation_record(store_lock)?
+        .context("manual-review resolution requires an activation record")?;
+    if record.state != ActivationState::ManualReview {
+        bail!("activation record is {:?}, not manual_review", record.state);
+    }
+    if record.version != ACTIVATION_RECORD_VERSION {
+        bail!(
+            "manual-review resolution requires activation record version {}",
+            ACTIVATION_RECORD_VERSION
+        );
+    }
+    if record.kind == ActivationKind::Unknown {
+        bail!("manual-review resolution requires an explicit activation kind");
+    }
+
+    let mut active_accounts = accounts.iter().filter(|account| account.is_active);
+    let active = active_accounts
+        .next()
+        .context("manual-review resolution requires exactly one active account")?;
+    if active_accounts.next().is_some() {
+        bail!("manual-review resolution requires exactly one active account");
+    }
+    let active_fingerprint = account_token_fingerprint(active)
+        .context("manual-review resolution requires a complete active token set")?;
+
+    verify_committed_activation(store_lock, generation, auth_path, active.id, active)
+        .context("manual-review resolution refused divergent store/auth state")?;
+    let summary = reload(auth_path).context("manual-review runtime reload failed")?;
+    if !runtime_convergence_proven(&summary) {
+        bail!(
+            "manual-review runtime convergence was not proven: {} verified ACK(s), {} target(s) skipped",
+            summary.signaled.len(),
+            summary.skipped.len()
+        );
+    }
+    verify_committed_activation(store_lock, generation, auth_path, active.id, active)
+        .context("manual-review final store/auth proof changed after runtime acknowledgement")?;
+
+    let detail = format!(
+        "operator resolved manual review after {} verified runtime ACK(s)",
+        summary.signaled.len()
+    );
+    let mut confirmed = activation_record_ids(
+        ActivationState::Confirmed,
+        &record.previous_account_id,
+        &active.account_id,
+        generation,
+        Some(active_fingerprint),
+        Some(detail.clone()),
+    );
+    confirmed.kind = record.kind;
+    write_activation_record(store_lock, &confirmed)?;
+
+    Ok(ActivationOutcome {
+        state: ActivationState::Confirmed,
+        reload: summary,
+        detail: Some(detail),
+    })
+}
+
 pub fn activate_with<R>(context: ActivationContext<'_>, reload: R) -> Result<ActivationOutcome>
 where
     R: FnMut(&Path) -> Result<ReloadSummary>,
@@ -1481,6 +1559,20 @@ mod tests {
         }
     }
 
+    fn manual_review_record(
+        generation: &AccountStoreGeneration,
+        active: &CodexAccount,
+    ) -> ActivationRecord {
+        activation_record_ids(
+            ActivationState::ManualReview,
+            &active.account_id,
+            &active.account_id,
+            generation,
+            account_token_fingerprint(active),
+            Some("operator review required".to_string()),
+        )
+    }
+
     #[test]
     fn activation_is_confirmed_only_after_store_auth_and_reload_proof() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2107,6 +2199,145 @@ mod tests {
             Some(initial[0].id)
         );
         assert!(auth_file_matches_account(&auth_path, &initial[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_manual_review_resolution_requires_final_runtime_proof() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let initial = vec![
+            account("first@example.com", true),
+            account("second@example.com", false),
+        ];
+        save_accounts(&store_path, &initial)?;
+        commit_auth_file(&auth_path, &initial[0])?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let mut record = manual_review_record(&generation, &accounts[0]);
+        record.kind = ActivationKind::Import;
+        record.base_store_generation = Some("prior-store-generation".to_string());
+        record.owned_store_generation = Some("owned-store-generation".to_string());
+        record.rollback = Some(ActivationRollbackImage {
+            store_bytes: None,
+            auth: capture_auth_file(&auth_path)?,
+        });
+        write_activation_record(&store_lock, &record)?;
+
+        let outcome = resolve_manual_review_activation(
+            ActivationBarrierContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path: &auth_path,
+                reload_enabled: true,
+            },
+            |_| {
+                Ok(ReloadSummary {
+                    sighup_sent: vec![42],
+                    signaled: vec![42],
+                    ..ReloadSummary::default()
+                })
+            },
+        )?;
+
+        assert!(outcome.is_confirmed());
+        let confirmed = read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(confirmed.state, ActivationState::Confirmed);
+        assert_eq!(confirmed.kind, ActivationKind::Import);
+        assert_eq!(confirmed.target_account_id, initial[0].account_id);
+        assert_eq!(
+            confirmed.auth_fingerprint,
+            account_token_fingerprint(&initial[0])
+        );
+        assert_eq!(confirmed.base_store_generation, None);
+        assert_eq!(confirmed.owned_store_generation, None);
+        assert!(confirmed.rollback.is_none());
+        assert!(auth_file_matches_account(&auth_path, &initial[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_ack_manual_review_resolution_preserves_journal_bytes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let initial = vec![account("first@example.com", true)];
+        save_accounts(&store_path, &initial)?;
+        commit_auth_file(&auth_path, &initial[0])?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        write_activation_record(
+            &store_lock,
+            &manual_review_record(&generation, &accounts[0]),
+        )?;
+        let journal_path = activation_record_path(&store_path);
+        let original = fs::read(&journal_path)?;
+
+        let error = resolve_manual_review_activation(
+            ActivationBarrierContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path: &auth_path,
+                reload_enabled: true,
+            },
+            |_| Ok(ReloadSummary::default()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("0 verified ACK"));
+        assert_eq!(fs::read(&journal_path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn divergent_auth_manual_review_resolution_never_signals_or_writes_journal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let initial = vec![
+            account("first@example.com", true),
+            account("second@example.com", false),
+        ];
+        save_accounts(&store_path, &initial)?;
+        commit_auth_file(&auth_path, &initial[0])?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        write_activation_record(
+            &store_lock,
+            &manual_review_record(&generation, &accounts[0]),
+        )?;
+        commit_auth_file(&auth_path, &accounts[1])?;
+        let journal_path = activation_record_path(&store_path);
+        let original = fs::read(&journal_path)?;
+        let reload_calls = std::cell::Cell::new(0usize);
+
+        let error = resolve_manual_review_activation(
+            ActivationBarrierContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path: &auth_path,
+                reload_enabled: true,
+            },
+            |_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default())
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("divergent store/auth"));
+        assert_eq!(reload_calls.get(), 0);
+        assert_eq!(fs::read(&journal_path)?, original);
         Ok(())
     }
 
