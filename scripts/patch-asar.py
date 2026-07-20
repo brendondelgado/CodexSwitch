@@ -97,6 +97,7 @@ LEGACY_REMOTE_RECENTS_REFRESH_MARKER = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH
 REMOTE_RECENTS_REFRESH_MARKER = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2"
 REMOTE_RECENTS_REFRESH_INTERVAL_MS = 60_000
 RECENT_THREADS_STATE_DB_MARKER = "CODEXSWITCH_RECENT_THREADS_STATE_DB_V1"
+STATSIG_FAIL_OPEN_MARKER = "CODEXSWITCH_STATSIG_FAIL_OPEN_V1"
 MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_MODEL_LABEL_FALLBACK"
 MODEL_AVAILABILITY_FALLBACK_MARKER = "CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK"
 SELECTED_MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK"
@@ -1138,6 +1139,22 @@ def find_recent_threads_state_db_file(assets_dir: Path) -> Path | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
+def find_statsig_bootstrap_file(assets_dir: Path) -> Path | None:
+    """Find the authenticated renderer's post-login Statsig provider."""
+    if not assets_dir.exists():
+        return None
+    candidates = []
+    for path in sorted(assets_dir.glob("*.js")):
+        content = path.read_text()
+        if (
+            "Timed out while fetching post-login Statsig bootstrap" in content
+            and "Statsig: error while bootstrapping post-login client" in content
+            and "CodexStatsigProvider.async.identity" in content
+        ):
+            candidates.append(path)
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def find_model_label_file(assets_dir: Path) -> Path | None:
     """Find the unified desktop model picker that renders missing names as Custom."""
     if not assets_dir.exists():
@@ -1230,6 +1247,18 @@ def has_recent_threads_state_db_patch(content: str) -> bool:
     return (
         RECENT_THREADS_STATE_DB_MARKER in body
         and "useStateDbOnly:!0" in body
+    )
+
+
+def has_statsig_fail_open_patch(content: str) -> bool:
+    return (
+        content.count(STATSIG_FAIL_OPEN_MARKER) == 1
+        and content.count("function _codexSwitchStatsigFailOpen(e)") == 1
+        and re.search(
+            r"\.jsxs\)\(_codexSwitchStatsigFailOpen,\{appSessionId:",
+            content,
+        )
+        is not None
     )
 
 
@@ -1955,6 +1984,7 @@ def required_desktop_patches_present(
     auth: bool,
     remote_recents: bool,
     recent_threads_state_db: bool,
+    statsig_fail_open: bool,
     fast: bool,
     model_label: bool,
     model_availability: bool,
@@ -1968,6 +1998,7 @@ def required_desktop_patches_present(
             auth,
             remote_recents,
             recent_threads_state_db,
+            statsig_fail_open,
             fast,
             model_label,
             model_availability,
@@ -2525,6 +2556,110 @@ def apply_recent_threads_state_db_patch(file_path: Path) -> bool:
 
     file_path.write_text(patched)
     print(f"  Patched indexed recent-thread loading: {file_path.name}")
+    return True
+
+
+def apply_statsig_fail_open_patch(file_path: Path) -> bool:
+    """Mount the authenticated app after the bounded Statsig bootstrap fails."""
+    content = file_path.read_text()
+    if has_statsig_fail_open_patch(content):
+        print(f"  Already patched Statsig startup fail-open: {file_path.name}")
+        return True
+
+    client_matches = list(
+        re.finditer(
+            r"new\s+(?P<sdk>[A-Za-z_$][\w$]*)\.StatsigClient\("
+            r"(?P<key>[A-Za-z_$][\w$]*),[A-Za-z_$][\w$]*\.user,"
+            r"(?P<config>[A-Za-z_$][\w$]*)\)",
+            content,
+        )
+    )
+    provider_matches = list(
+        re.finditer(
+            r"function\s+(?P<provider>[A-Za-z_$][\w$]*)\(\{"
+            r"appVersion:[^,{}]+,authMethod:[^,{}]+,client:[^,{}]+,"
+            r"deviceId:[^,{}]+,hostBuildFlavor:[^,{}]+,children:[^,{}]+"
+            r"\}\)",
+            content,
+        )
+    )
+    stable_id_namespaces = set(
+        re.findall(r"([A-Za-z_$][\w$]*)\.StableID\.get\(", content)
+    )
+    fallback_re = re.compile(
+        r"(?P<prefix>\(0,(?P<jsx>[A-Za-z_$][\w$]*)\.jsxs\)\()"
+        r"(?P<fallback>[A-Za-z_$][\w$]*)"
+        r"(?P<suffix>,\{appSessionId:[A-Za-z_$][\w$]*,"
+        r"appVersion:[A-Za-z_$][\w$]*,auth:[A-Za-z_$][\w$]*,"
+        r"browserLocale:[A-Za-z_$][\w$]*,hostBuildFlavor:[A-Za-z_$][\w$]*,"
+        r"statsigClientKey:[A-Za-z_$][\w$]*,systemName:[A-Za-z_$][\w$]*,"
+        r"systemVersion:[A-Za-z_$][\w$]*,children:\["
+        r"[A-Za-z_$][\w$]*,[A-Za-z_$][\w$]*\]\}\))"
+    )
+    fallback_matches = list(fallback_re.finditer(content))
+    if not (
+        len(client_matches) == 1
+        and len(provider_matches) == 1
+        and len(fallback_matches) == 1
+        and len(stable_id_namespaces) == 1
+    ):
+        print(f"ERROR: Could not isolate Statsig fail-open shape in {file_path.name}")
+        return False
+
+    fallback_match = fallback_matches[0]
+    fallback_component = fallback_match.group("fallback")
+    component_start = content.rfind("function ", 0, fallback_match.start())
+    if component_start < 0:
+        print(f"ERROR: Could not isolate post-login provider in {file_path.name}")
+        return False
+    component_prefix = content[component_start:fallback_match.start()]
+    if (
+        "mutationFn:async" not in component_prefix
+        or "status:" not in component_prefix
+        or f"function {fallback_component}(" not in content
+    ):
+        print(f"ERROR: Statsig failed-bootstrap branch is ambiguous in {file_path.name}")
+        return False
+
+    client_match = client_matches[0]
+    provider_match = provider_matches[0]
+    sdk = client_match.group("sdk")
+    config = client_match.group("config")
+    jsx = fallback_match.group("jsx")
+    provider = provider_match.group("provider")
+    stable_ids = next(iter(stable_id_namespaces))
+    helper = (
+        "let _codexSwitchStatsigFailOpenClients=new Map;"
+        f'function _codexSwitchStatsigFailOpen(e){{"{STATSIG_FAIL_OPEN_MARKER}";'
+        f"let r={stable_ids}.StableID.get(e.statsigClientKey),"
+        "t=`${e.statsigClientKey}:${r}`,"
+        "n=_codexSwitchStatsigFailOpenClients.get(t);"
+        "if(n==null)try{"
+        f"n=new {sdk}.StatsigClient(e.statsigClientKey,{{userID:r}},{config}),"
+        "n.initializeSync(),_codexSwitchStatsigFailOpenClients.set(t,n)"
+        "}catch(t){return e.children}"
+        f"return (0,{jsx}.jsx)({provider},{{appVersion:e.appVersion,"
+        "authMethod:e.auth?.authMethod??`chatgpt`,client:n,deviceId:r,"
+        "hostBuildFlavor:e.hostBuildFlavor,children:e.children})}"
+    )
+    replacement = (
+        fallback_match.group("prefix")
+        + "_codexSwitchStatsigFailOpen"
+        + fallback_match.group("suffix")
+    )
+    patched = (
+        content[:component_start]
+        + helper
+        + content[component_start:fallback_match.start()]
+        + replacement
+        + content[fallback_match.end():]
+    )
+    if not has_statsig_fail_open_patch(patched):
+        print(f"ERROR: Statsig fail-open patch verification failed in {file_path.name}")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched Statsig startup fail-open: {file_path.name}")
     return True
 
 
@@ -3615,6 +3750,10 @@ def main():
     if not recent_threads_state_db_file:
         print("WARNING: Could not find indexed recent-thread JS file -- app structure may have changed")
         sys.exit(2)
+    statsig_bootstrap_file = find_statsig_bootstrap_file(assets_dir)
+    if not statsig_bootstrap_file:
+        print("WARNING: Could not find post-login Statsig JS file -- app structure may have changed")
+        sys.exit(2)
     model_label_file = find_model_label_file(assets_dir)
     if not model_label_file:
         print("WARNING: Could not find model picker JS file -- app structure may have changed")
@@ -3636,11 +3775,12 @@ def main():
     if remote_recents_file:
         print(f"Found remote recents file: {remote_recents_file.name}")
     print(f"Found indexed recent-thread file: {recent_threads_state_db_file.name}")
+    print(f"Found post-login Statsig file: {statsig_bootstrap_file.name}")
     print(f"Found model picker file: {model_label_file.name}")
     print(f"Found model filter file: {model_filter_file.name}")
     print(f"Found remote model refresh file: {remote_model_refresh_file.name}")
     print(f"Found native updater files: {', '.join(path.name for path in native_updater_files)}")
-    print("Desktop patch scope: auth hot-swap, indexed recent-thread loading, Fast Mode metadata, remote sidebar/model refresh, known-model availability/labels/efforts, and native updater ownership; bundled CLI and plugin files are preserved.")
+    print("Desktop patch scope: auth hot-swap, indexed recent-thread loading, bounded Statsig startup, Fast Mode metadata, remote sidebar/model refresh, known-model availability/labels/efforts, and native updater ownership; bundled CLI and plugin files are preserved.")
 
     auth_already_patched = current_auth_patch_present(auth_file.read_text())
     fast_already_patched = FAST_FALLBACK_MARKER in fast_mode_file.read_text()
@@ -3650,6 +3790,9 @@ def main():
     )
     recent_threads_state_db_already_patched = has_recent_threads_state_db_patch(
         recent_threads_state_db_file.read_text()
+    )
+    statsig_fail_open_already_patched = has_statsig_fail_open_patch(
+        statsig_bootstrap_file.read_text()
     )
     model_file_content = model_label_file.read_text()
     model_filter_content = model_filter_file.read_text()
@@ -3672,6 +3815,7 @@ def main():
         auth=auth_already_patched,
         remote_recents=remote_recents_file is None or remote_recents_already_patched,
         recent_threads_state_db=recent_threads_state_db_already_patched,
+        statsig_fail_open=statsig_fail_open_already_patched,
         fast=fast_already_patched,
         model_label=model_label_already_patched,
         model_availability=model_availability_already_patched,
@@ -3732,6 +3876,10 @@ def main():
     if not recent_threads_state_db_already_patched:
         if not apply_recent_threads_state_db_patch(recent_threads_state_db_file):
             print("ERROR: Indexed recent-thread patch failed")
+            sys.exit(1)
+    if not statsig_fail_open_already_patched:
+        if not apply_statsig_fail_open_patch(statsig_bootstrap_file):
+            print("ERROR: Statsig startup fail-open patch failed")
             sys.exit(1)
     if not model_label_already_patched:
         if not apply_model_label_fallback_patch(model_label_file):

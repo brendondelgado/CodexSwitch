@@ -756,6 +756,15 @@ search, hydration, and repair paths keep their upstream behavior. The indexed
 loading marker is required readiness evidence, and the patch must fail closed
 when the current method shape is missing or ambiguous.
 
+The authenticated desktop must never remain on its startup logo after the
+bounded post-login Statsig bootstrap fails. That failure path uses one
+synchronously initialized cached/default client and mounts the application
+immediately; normal refresh may continue after mount. It must not enter the
+upstream asynchronous identity/client fallback, whose network completion is
+not bounded. The versioned fail-open marker and the actual failed-bootstrap
+branch replacement are both required readiness evidence. A missing or
+ambiguous bootstrap shape fails the compatibility patch closed.
+
 Rollback trust is not inherited from an earlier installed-app observation. The
 transaction validates the previous bundle through the official trust pipeline,
 captures a format-3 seal over its complete descriptor-rooted tree, revalidates

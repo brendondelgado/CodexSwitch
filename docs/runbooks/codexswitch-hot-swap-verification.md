@@ -515,6 +515,11 @@ main process. Verify the versioned marker in the extracted ASAR; defaults alone
 are not proof because ChatGPT can rewrite them while launching. A successful
 CodexSwitch-managed installation relaunches ChatGPT in the background (`open
 -g`) and must not foreground the app or discard text being composed elsewhere.
+If the post-login Statsig bootstrap times out, the renderer must mount through
+the versioned synchronous fail-open provider instead of entering the unbounded
+asynchronous identity/client fallback. Confirm the fail-open marker appears
+exactly once and the failed-bootstrap branch references that provider; an
+injected helper that is not reached by the branch is not valid evidence.
 Once the patched bundle and signature are verified with ChatGPT stopped, the
 patcher removes only the exact `com.openai.codex` Sparkle
 `PersistentDownloads` contents. Confirm the directory is empty or absent and
@@ -768,6 +773,7 @@ Before claiming hot-swap is fixed or ready:
 - [ ] The installed ASAR contains `CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2` exactly once, contains no nested legacy WeakMap helper, and a same-account auth notification produces no `_invalidateAccountQueries is not defined`, provider unmount, route remount, or window reload.
 - [ ] The installed ASAR contains `CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2`; its fallback adds no immediate mount refresh, polls at 60 seconds, retains native callback and startup updates, and clears its single timer on unmount.
 - [ ] The installed ASAR contains `CODEXSWITCH_RECENT_THREADS_STATE_DB_V1`, ordinary sidebar `thread/list` requests use `useStateDbOnly: true`, and archive/search/hydration behavior is unchanged.
+- [ ] The installed ASAR contains `CODEXSWITCH_STATSIG_FAIL_OPEN_V1` exactly once, and the failed post-login bootstrap branch mounts the synchronous fail-open provider rather than the unbounded async identity/client fallback.
 - [ ] The bundled `patch-asar.py` hash matches the source used for the CodexSwitch build, the desktop-patch log records Fast fallback application without a structure warning, and the ASAR integrity hash plus strict code-sign verification pass before relaunch.
 - [ ] A forced rotation changes the configured account and signals the expected process count.
 - [ ] From `CommittedDegraded`, an explicit cross-target operator selection starts a fresh activation while automatic rotation remains blocked.

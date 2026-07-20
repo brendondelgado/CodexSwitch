@@ -257,6 +257,29 @@ CHATGPT_5440_RECENT_THREADS_CONTENT = (
     "}"
 )
 
+CHATGPT_5440_STATSIG_CONTENT = (
+    "async function Bootstrap(e){throw Error(`Timed out while fetching post-login "
+    "Statsig bootstrap`)}"
+    "function AsyncFallback(e){StableIDs.StableID.get(e.statsigClientKey);"
+    "return `CodexStatsigProvider.async.identity`}"
+    "function ReadyProvider({appVersion:e,authMethod:t,client:n,deviceId:r,"
+    "hostBuildFlavor:i,children:a}){return a}"
+    "function PostLogin(e){let{appSessionId:n,appVersion:r,auth:i,browserLocale:a,"
+    "hostBuildFlavor:o,stableId:s,statsigClientKey:c,systemName:l,systemVersion:u,"
+    "children:d}=e,f={mutationFn:async e=>{let t=await Bootstrap(e);try{let e=new "
+    "StatsigSDK.StatsigClient(c,t.user,networkConfig);return e.initializeSync(),e}"
+    "catch(e){throw e}},retry:retryBootstrap,onError:reportBootstrapError};"
+    "let{data:p,error:m,mutate:h,status:g}=useMutation(f);"
+    "if(g===`error`){let e=diagnostic,s;return s=(0,jsxRuntime.jsxs)(AsyncFallback,"
+    "{appSessionId:n,appVersion:r,auth:i,browserLocale:a,hostBuildFlavor:o,"
+    "statsigClientKey:c,systemName:l,systemVersion:u,children:[e,d]})}"
+    "if(p==null)return loading;return (0,jsxRuntime.jsx)(ReadyProvider,"
+    "{appVersion:r,authMethod:i.authMethod,client:p,deviceId:s,hostBuildFlavor:o,"
+    "children:d})}"
+    "function visible(){return `Statsig: error while bootstrapping post-login client "
+    "CodexStatsigProvider.async`}"
+)
+
 CODEX_5042_MODEL_PICKER_CONTENT = (
     "function DM(e){if(!e.trimStart().toLowerCase().startsWith(`gpt`))return e;"
     "return e}"
@@ -1121,6 +1144,51 @@ class PatchAsarTests(unittest.TestCase):
                 target.read_text(),
             )
 
+    def test_find_statsig_bootstrap_file_matches_unique_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            expected = assets / "app-main-current.js"
+            expected.write_text(CHATGPT_5440_STATSIG_CONTENT)
+            (assets / "unrelated.js").write_text("const statsig = null;")
+
+            self.assertEqual(patch_asar.find_statsig_bootstrap_file(assets), expected)
+
+    def test_apply_statsig_fail_open_patch_replaces_unbounded_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-current.js"
+            target.write_text(CHATGPT_5440_STATSIG_CONTENT)
+
+            self.assertTrue(patch_asar.apply_statsig_fail_open_patch(target))
+            patched = target.read_text()
+
+            self.assertTrue(patch_asar.has_statsig_fail_open_patch(patched))
+            self.assertEqual(patched.count(patch_asar.STATSIG_FAIL_OPEN_MARKER), 1)
+            self.assertIn("new StatsigSDK.StatsigClient", patched)
+            self.assertIn("r=StableIDs.StableID.get(e.statsigClientKey)", patched)
+            self.assertIn("{userID:r}", patched)
+            self.assertIn("deviceId:r", patched)
+            self.assertIn("n.initializeSync()", patched)
+            self.assertIn("catch(t){return e.children}", patched)
+            self.assertIn(
+                "(0,jsxRuntime.jsxs)(_codexSwitchStatsigFailOpen,{appSessionId:",
+                patched,
+            )
+            self.assertNotIn(
+                "(0,jsxRuntime.jsxs)(AsyncFallback,{appSessionId:",
+                patched,
+            )
+
+    def test_apply_statsig_fail_open_patch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-current.js"
+            target.write_text(CHATGPT_5440_STATSIG_CONTENT)
+
+            self.assertTrue(patch_asar.apply_statsig_fail_open_patch(target))
+            once = target.read_text()
+            self.assertTrue(patch_asar.apply_statsig_fail_open_patch(target))
+
+            self.assertEqual(target.read_text(), once)
+
     def test_apply_model_label_fallback_patch_labels_gpt56_sol(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "app-initial-HASH.js"
@@ -1461,6 +1529,7 @@ class PatchAsarTests(unittest.TestCase):
             "auth": True,
             "remote_recents": True,
             "recent_threads_state_db": True,
+            "statsig_fail_open": True,
             "fast": True,
             "model_label": True,
             "model_availability": True,
@@ -1476,6 +1545,11 @@ class PatchAsarTests(unittest.TestCase):
         self.assertFalse(patch_asar.required_desktop_patches_present(**states))
 
         states["fast"] = True
+        states["statsig_fail_open"] = False
+
+        self.assertFalse(patch_asar.required_desktop_patches_present(**states))
+
+        states["statsig_fail_open"] = True
         states["native_updater"] = False
 
         self.assertFalse(patch_asar.required_desktop_patches_present(**states))
