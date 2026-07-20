@@ -74,6 +74,14 @@ The Mac and VPS are separate activation domains:
 
 A connected remote session does not suppress Mac CLI protection, change the Mac active account, or cause a VPS observation to be written into Mac auth state.
 
+Automatic Mac-to-VPS credential replication does not transfer activation
+ownership. Before exporting, the Mac re-marks the replicated snapshot with the
+freshly observed VPS active provider identity; if that identity is absent from
+the Mac pool, sync fails closed. The VPS imports automatic bundles with
+`update-bundle --preserve-active`, which independently retains its current
+active provider identity. Bundle metadata may describe an active account for a
+manual import, but it is never authoritative during background replication.
+
 ## Account Store Protocol
 
 Every writer follows one protocol:
@@ -195,13 +203,22 @@ store and `auth.json` agree exactly on one known account; recovery produces
 `CommittedDegraded`, never `Confirmed`.
 
 Every request decision first evaluates confirmation freshness at the request
-time. An expired `Confirmed` record is durably demoted to
-`CommittedDegraded` before either automatic or operator policy is evaluated.
-Automatic activation remains rejected while any barrier exists. Explicit
-same-target reconciliation and the narrowly authorized operator cross-target
-escape above are the only permitted requests. A generic observation or
-validation failure preserves the same target's monotonically increasing
-`retryAttempt`, including when the failure enters `ManualReview`.
+time. Expiry revokes authorization, but expiry alone is not evidence that the
+runtime changed and must not persist `CommittedDegraded`, schedule convergence,
+signal a runtime, or reload the desktop. Background policy first performs a
+read-only runtime-evidence refresh. Successful proof renews `Confirmed` under
+the same activation generation. Missing, incomplete, or transiently unavailable
+proof leaves the expired `Confirmed` record fail closed and retries only the
+read-only observation. It does not create an automatic reload loop.
+
+An explicit operator request may convert an expired confirmation into the
+existing same-target reconciliation or narrowly authorized cross-target escape.
+A committed credential mutation or recovered interrupted commit establishes a
+real `CommittedDegraded` barrier. Desktop termination and topology changes
+invalidate the old observation but do not mutate credentials, so they trigger
+only passive revalidation. A generic observation or validation failure
+preserves the same target's monotonically increasing `retryAttempt`, including
+when the failure enters `ManualReview`.
 
 Before publishing `Confirmed`, the coordinator immediately re-reads the durable
 account store and `auth.json`, proves that both still contain the same selected
@@ -219,10 +236,12 @@ issued for `Confirmed` cannot authorize a `Preparing` effect, and a permit issue
 for `CommittedDegraded` cannot authorize confirmation after a same-generation
 demotion to `ManualReview`. The snapshot must be complete, unexpired, and show
 at least one expected live local runtime on the configured target. Failure
-durably demotes `Confirmed` to
-`CommittedDegraded` and returns without the automatic mutation. Desktop
-termination demotes immediately. CLI disappearance is caught by this fresh gate,
-even if no launch lifecycle event occurred.
+returns without the automatic mutation and without signalling or changing the
+journal solely because observation was unavailable. Desktop termination and CLI
+disappearance are handled by the same passive fresh gate. A verified durable
+identity contradiction enters review, while a committed credential change
+enters the normal degraded convergence contract; a transient discovery miss does
+neither.
 
 Every automatic entry point uses this one fresh gate before it selects a target
 or writes `Preparing`, including quota exhaustion, plan upgrade, invalid-token,
@@ -244,17 +263,19 @@ the stable provider account identifier; email equality is presentation metadata
 and never permits replacement of the configured credentials by a different
 provider account.
 
-Every process launch invalidates prior runtime observations. A persisted
-`Confirmed` record is demoted durably to `CommittedDegraded` before automatic
-policy starts, then the same target is reconciled using fresh local CLI and
-desktop discovery/acknowledgement evidence. Existing configured account and auth
-files with no journal likewise bootstrap a durable degraded barrier before
-same-target reconciliation. Missing journal state never means unblocked when a
-configured account exists. Startup may identify that configured account only by
-an exact observed-auth provider-identity match or by exactly one durable selected
-record. A stale defaults key, array order, duplicate provider identity, multiple
-selected records, or no selected record is ambiguous: clear in-memory configured
-intent, publish no target, and remain fail closed for operator review.
+Every coordinator launch invalidates in-memory runtime permits. A persisted
+`Confirmed` record remains historical durable evidence; startup performs
+read-only local CLI and desktop discovery before any automatic effect and
+refreshes the same generation when the proof succeeds. Startup does not turn an
+unchanged account into `CommittedDegraded` or reload ChatGPT merely because the
+coordinator restarted. Existing configured account and auth files with no
+journal still bootstrap a durable degraded barrier before same-target
+reconciliation. Missing journal state never means unblocked when a configured
+account exists. Startup may identify that configured account only by an exact
+observed-auth provider-identity match or by exactly one durable selected record.
+A stale defaults key, array order, duplicate provider identity, multiple selected
+records, or no selected record is ambiguous: clear in-memory configured intent,
+publish no target, and remain fail closed for operator review.
 
 An externally changed `auth.json` is an observation, not permission for an
 unjournaled promotion. A known external target enters the same configured-only
@@ -336,6 +357,27 @@ on `unix://`. A `codex app-server proxy` process only transports a client to an
 app-server and is never a credential owner or signal target. Runtime convergence
 requires acknowledgements from every discovered account-bearing listener, so a
 successful port-8390 reload cannot conceal a stale ChatGPT SSH daemon.
+
+The repository-owned `--remote-control --listen ws://...` mode uses the distinct
+`headless-remote-control-app-server` runtime kind and
+`codexswitch-hotswap-headless-idle-v1` capability marker. When one or more
+initialized frontends are present, it must report internally consistent total
+initialized, eligible delivery, and completed-write counts, with at least one
+completed `account/updated` transport write. When no initialized frontend
+exists, it may instead report an explicit idle-listener acknowledgement with all
+three counts equal to zero. That idle proof is runtime convergence, not
+notification of a live client: it is valid only after the same bound auth reload
+and cache fingerprint checks, and the next client initializes against that
+reloaded auth manager. Desktop and other `external-app-server` runtimes remain
+strict and cannot use idle proof. A timeout, closed writer, positive initialized
+count with zero completed writes, contradictory counts, missing capability
+marker, or runtime-kind mismatch remains degraded.
+
+Successful signal delivery is recorded separately from verified acknowledgement.
+The runtime reloads backend auth before it attempts frontend delivery, so an
+unacknowledged target may already have changed. Import rollback must perform and
+verify compensating convergence after any delivered signal; failure to prove the
+restored runtime enters `ManualReview` instead of claiming a safe rollback.
 
 The desktop reload client owns one admitted transaction: JSON-RPC submission,
 identity readback, and its strict acknowledgement all use the same discovery and
@@ -481,6 +523,12 @@ repository deployment that has positively proved the runtime idle must pass
 `--offline-file-only`; this flag changes only the new import's handoff and never
 waives convergence of a pre-existing activation barrier.
 
+Background cross-host replication must pass `update-bundle --preserve-active`.
+The command merges credential changes into the VPS pool while retaining the
+VPS coordinator's active provider identity, then converges that same identity
+through the normal activation barrier. An incoming bundle cannot select the VPS
+active account merely because another host marked it active.
+
 The Rust account-store implementation anchors traversal at a trusted root and
 opens every component with `openat` plus `O_NOFOLLOW`. Lock, store, and temporary
 descriptors must be regular files owned by the current uid with mode `0600`;
@@ -586,7 +634,10 @@ actor boundary on every supported Swift 6 toolchain.
 - The CLI and daemon share domain functions; they do not implement independent rotation policies.
 - The port-8390 WebSocket service and the built-in SSH `unix://` app-server are
   separate account-bearing runtimes. Both participate in discovery and verified
-  reload whenever they are running; `app-server proxy` helpers never do.
+  reload whenever they are running; `app-server proxy` helpers never do. The
+  port-8390 remote-control service may use the explicit headless idle proof. The
+  SSH daemon remains a strict external app-server and must prove frontend
+  delivery whenever it is retained as a live account-bearing runtime.
 - Service status is readable without starting the service.
 - Remote usage aggregation preserves the model identity supplied by runtime
   evidence. Missing model evidence is reported as `unknown`; it is never
@@ -653,6 +704,20 @@ or report an installation outcome. Automatic installation occurs only after a
 proven desktop app-termination boundary and is re-gated immediately before
 mutation. An explicit manual install is also allowed through the same gate.
 Status checks cannot trigger repair or installation.
+
+When CodexSwitch locally re-signs the desktop bundle, the patched main process
+must disable the bundle's native updater before it initializes. User-defaults
+ownership remains defense in depth, but it is not sufficient because the desktop
+app may rewrite those defaults during startup. After CodexSwitch installs and
+patches an update, its automatic relaunch must use background activation and must
+not take keyboard focus from the user's current app.
+
+After that patch and signature verification succeed while the desktop is
+stopped, the patcher may remove only the exact
+`~/Library/Caches/com.openai.codex/org.sparkle-project.Sparkle/PersistentDownloads`
+contents. It must reject a linked or foreign-owned cache root and must not scan
+or remove unrelated application caches. This cleanup prevents failed native
+updater downloads from accumulating after CodexSwitch assumes update ownership.
 
 Renderer patch markers identify behavior generations, not merely function names.
 The patcher must migrate a recognized unsafe generation in the staged artifact,

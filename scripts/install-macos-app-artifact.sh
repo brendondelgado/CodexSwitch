@@ -17,6 +17,7 @@ repo_root="${0:A:h:h}"
 trusted_repository="brendondelgado/CodexSwitch"
 trusted_workflow="brendondelgado/CodexSwitch/.github/workflows/build-macos-app.yml"
 install_path="/Applications/CodexSwitch.app"
+codexswitch_process_pattern='/CodexSwitch\.app/Contents/MacOS/CodexSwitch([[:space:]]|$)'
 
 [[ -d "$download_dir" && ! -L "$download_dir" ]] || {
   print -u2 "artifact must be a regular directory, not a symlink: $download_dir"
@@ -65,6 +66,10 @@ if renameatx_np(AT_FDCWD, left, AT_FDCWD, right, RENAME_SWAP) != 0:
     error = ctypes.get_errno()
     raise OSError(error, os.strerror(error), f"{sys.argv[1]} <-> {sys.argv[2]}")
 PY
+}
+
+codexswitch_app_is_running() {
+  /usr/bin/pgrep -f "$codexswitch_process_pattern" >/dev/null 2>&1
 }
 
 rollback_activation() {
@@ -580,19 +585,19 @@ failed_path="$install_workdir/CodexSwitch.failed.app"
 verify_bundle "$staged_path"
 verify_frozen_snapshot
 
-if /usr/bin/pgrep -f "$install_path/Contents/MacOS/CodexSwitch" >/dev/null 2>&1; then
+if codexswitch_app_is_running; then
   was_running=1
 fi
 /bin/launchctl bootout "gui/$(/usr/bin/id -u)/com.codexswitch.watchdog" >/dev/null 2>&1 || true
-/usr/bin/osascript -e 'tell application "CodexSwitch" to quit' >/dev/null 2>&1 || true
+/usr/bin/osascript -e 'tell application id "com.codexswitch" to quit' >/dev/null 2>&1 || true
 for _ in {1..20}; do
-  if ! /usr/bin/pgrep -f "$install_path/Contents/MacOS/CodexSwitch" >/dev/null 2>&1; then
+  if ! codexswitch_app_is_running; then
     break
   fi
   /bin/sleep 0.25
 done
-if /usr/bin/pgrep -f "$install_path/Contents/MacOS/CodexSwitch" >/dev/null 2>&1; then
-  print -u2 "CodexSwitch is still running; refusing to replace its installed bundle"
+if codexswitch_app_is_running; then
+  print -u2 "A CodexSwitch app process is still running; refusing to activate a second bundle copy"
   exit 1
 fi
 quit_completed=1

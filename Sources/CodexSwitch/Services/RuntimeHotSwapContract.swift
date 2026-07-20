@@ -15,9 +15,16 @@ enum RuntimeHotSwapContract {
         "codexswitch-hotswap-contract-v3",
     ]
 
+    static let headlessRemoteControlMarkers = [
+        "codexswitch-hotswap-headless-idle-v1",
+    ]
+
     static let localInteractiveMarkers = [
         "codexswitch-hotswap-cli-contract-v3",
     ]
 
-    static let fullMarkers = commonMarkers + externalAppServerMarkers + localInteractiveMarkers
+    static let fullMarkers = commonMarkers
+        + externalAppServerMarkers
+        + headlessRemoteControlMarkers
+        + localInteractiveMarkers
 }

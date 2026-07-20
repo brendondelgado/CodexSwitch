@@ -149,6 +149,35 @@ struct CodexReloadAcknowledgement: Codable, Equatable, Sendable {
     let frontendWriteCount: Int
     let authGeneration: UInt64?
     let reconnectReady: Bool?
+    let initializedFrontendCount: Int?
+    let eligibleFrontendCount: Int?
+    let idleListenerReady: Bool?
+
+    init(
+        binding: CodexReloadBinding,
+        acknowledgedAtUnixMilliseconds: Int64,
+        loadedTokenFingerprint: String,
+        activeTokenFingerprint: String,
+        frontendNotified: Bool,
+        frontendWriteCount: Int,
+        authGeneration: UInt64?,
+        reconnectReady: Bool?,
+        initializedFrontendCount: Int? = nil,
+        eligibleFrontendCount: Int? = nil,
+        idleListenerReady: Bool? = nil
+    ) {
+        self.binding = binding
+        self.acknowledgedAtUnixMilliseconds = acknowledgedAtUnixMilliseconds
+        self.loadedTokenFingerprint = loadedTokenFingerprint
+        self.activeTokenFingerprint = activeTokenFingerprint
+        self.frontendNotified = frontendNotified
+        self.frontendWriteCount = frontendWriteCount
+        self.authGeneration = authGeneration
+        self.reconnectReady = reconnectReady
+        self.initializedFrontendCount = initializedFrontendCount
+        self.eligibleFrontendCount = eligibleFrontendCount
+        self.idleListenerReady = idleListenerReady
+    }
 }
 
 enum CodexPGrepDiscoveryResult: Equatable, Sendable {
@@ -1116,6 +1145,8 @@ enum SwapEngine {
         case .externalAppServer:
             return runtimeArguments.contains("app-server")
                 && DesktopRuntimeDiagnostics.classifyAppServerPath(executablePath) == .desktopAppServer
+        case .headlessRemoteControlAppServer:
+            return false
         }
     }
 
@@ -1937,13 +1968,67 @@ enum SwapEngine {
     ) -> Bool {
         switch acknowledgement.binding.runtimeKind {
         case .externalAppServer:
-            return acknowledgement.frontendNotified
-                && acknowledgement.frontendWriteCount > 0
+            return externalAppServerAcknowledgementIsValid(
+                acknowledgement,
+                allowIdleListener: false,
+                allowLegacyMissingFrontendCounts: true
+            )
+        case .headlessRemoteControlAppServer:
+            return externalAppServerAcknowledgementIsValid(
+                acknowledgement,
+                allowIdleListener: true,
+                allowLegacyMissingFrontendCounts: false
+            )
         case .localInteractiveCLI:
             return !acknowledgement.frontendNotified
                 && acknowledgement.frontendWriteCount == 0
                 && acknowledgement.authGeneration != nil
                 && acknowledgement.reconnectReady == true
+                && acknowledgement.initializedFrontendCount == nil
+                && acknowledgement.eligibleFrontendCount == nil
+                && acknowledgement.idleListenerReady != true
+        }
+    }
+
+    private nonisolated static func externalAppServerAcknowledgementIsValid(
+        _ acknowledgement: CodexReloadAcknowledgement,
+        allowIdleListener: Bool,
+        allowLegacyMissingFrontendCounts: Bool
+    ) -> Bool {
+        let deliveredToFrontend = acknowledgement.idleListenerReady != true
+            && acknowledgement.frontendNotified
+            && acknowledgement.frontendWriteCount > 0
+            && frontendDeliveryCountsAreValid(
+                acknowledgement,
+                allowLegacyMissingCounts: allowLegacyMissingFrontendCounts
+            )
+        let idleListener = allowIdleListener
+            && acknowledgement.idleListenerReady == true
+            && !acknowledgement.frontendNotified
+            && acknowledgement.frontendWriteCount == 0
+            && acknowledgement.initializedFrontendCount == 0
+            && acknowledgement.eligibleFrontendCount == 0
+        return acknowledgement.reconnectReady != true
+            && (deliveredToFrontend || idleListener)
+    }
+
+    private nonisolated static func frontendDeliveryCountsAreValid(
+        _ acknowledgement: CodexReloadAcknowledgement,
+        allowLegacyMissingCounts: Bool
+    ) -> Bool {
+        switch (
+            acknowledgement.initializedFrontendCount,
+            acknowledgement.eligibleFrontendCount
+        ) {
+        case (nil, nil):
+            return allowLegacyMissingCounts
+        case let (.some(initialized), .some(eligible)):
+            return initialized > 0
+                && eligible > 0
+                && eligible <= initialized
+                && acknowledgement.frontendWriteCount <= eligible
+        default:
+            return false
         }
     }
 

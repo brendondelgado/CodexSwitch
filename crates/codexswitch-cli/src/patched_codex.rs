@@ -137,6 +137,11 @@ pub fn binary_has_local_cli_hot_swap_markers(path: &Path) -> bool {
     binary_has_marker_contract(path, RequiredMarkerContract::LocalCli)
 }
 
+#[cfg(test)]
+pub fn binary_has_headless_remote_control_hot_swap_markers(path: &Path) -> bool {
+    binary_has_marker_contract(path, RequiredMarkerContract::HeadlessRemoteControl)
+}
+
 const BINARY_MARKER_SCAN_CHUNK_BYTES: usize = 128 * 1024;
 const COMMON_HOT_SWAP_MARKERS: [&[u8]; 8] = [
     b"sighup-verified",
@@ -152,6 +157,8 @@ const EXTERNAL_APP_SERVER_HOT_SWAP_MARKERS: [&[u8]; 2] = [
     b"CodexSwitch account/updated frontend write acknowledged after auth reload",
     b"codexswitch-hotswap-contract-v3",
 ];
+const HEADLESS_REMOTE_CONTROL_HOT_SWAP_MARKERS: [&[u8]; 1] =
+    [b"codexswitch-hotswap-headless-idle-v1"];
 const LOCAL_CLI_HOT_SWAP_MARKERS: [&[u8]; 1] = [b"codexswitch-hotswap-cli-contract-v3"];
 const GOAL_USAGE_MARKER: &[u8] = b"Usage: /goal <objective>";
 const GOAL_PURSUING_MARKER: &[u8] = b"Pursuing goal";
@@ -161,6 +168,7 @@ const GOAL_SET_MARKER: &[u8] = b"thread/goal/set";
 struct BinaryMarkerState {
     common: [bool; COMMON_HOT_SWAP_MARKERS.len()],
     external: [bool; EXTERNAL_APP_SERVER_HOT_SWAP_MARKERS.len()],
+    headless_remote_control: [bool; HEADLESS_REMOTE_CONTROL_HOT_SWAP_MARKERS.len()],
     local: [bool; LOCAL_CLI_HOT_SWAP_MARKERS.len()],
     goal_usage: bool,
     goal_pursuing: bool,
@@ -173,6 +181,8 @@ enum RequiredMarkerContract {
     #[cfg(test)]
     ExternalAppServer,
     #[cfg(test)]
+    HeadlessRemoteControl,
+    #[cfg(test)]
     LocalCli,
 }
 
@@ -182,6 +192,11 @@ impl BinaryMarkerState {
         update_marker_flags(
             &mut self.external,
             &EXTERNAL_APP_SERVER_HOT_SWAP_MARKERS,
+            data,
+        );
+        update_marker_flags(
+            &mut self.headless_remote_control,
+            &HEADLESS_REMOTE_CONTROL_HOT_SWAP_MARKERS,
             data,
         );
         update_marker_flags(&mut self.local, &LOCAL_CLI_HOT_SWAP_MARKERS, data);
@@ -203,15 +218,26 @@ impl BinaryMarkerState {
         self.local.iter().all(|present| *present)
     }
 
+    fn has_headless_remote_control_contract(&self) -> bool {
+        self.headless_remote_control.iter().all(|present| *present)
+    }
+
     fn satisfies(&self, required: RequiredMarkerContract) -> bool {
         self.has_common_contract()
             && match required {
                 RequiredMarkerContract::Full => {
-                    self.has_external_app_server_contract() && self.has_local_cli_contract()
+                    self.has_external_app_server_contract()
+                        && self.has_headless_remote_control_contract()
+                        && self.has_local_cli_contract()
                 }
                 #[cfg(test)]
                 RequiredMarkerContract::ExternalAppServer => {
                     self.has_external_app_server_contract()
+                }
+                #[cfg(test)]
+                RequiredMarkerContract::HeadlessRemoteControl => {
+                    self.has_external_app_server_contract()
+                        && self.has_headless_remote_control_contract()
                 }
                 #[cfg(test)]
                 RequiredMarkerContract::LocalCli => self.has_local_cli_contract(),
@@ -264,6 +290,7 @@ fn maximum_marker_length() -> usize {
     COMMON_HOT_SWAP_MARKERS
         .iter()
         .chain(EXTERNAL_APP_SERVER_HOT_SWAP_MARKERS.iter())
+        .chain(HEADLESS_REMOTE_CONTROL_HOT_SWAP_MARKERS.iter())
         .chain(LOCAL_CLI_HOT_SWAP_MARKERS.iter())
         .copied()
         .chain([GOAL_USAGE_MARKER, GOAL_PURSUING_MARKER, GOAL_SET_MARKER])
@@ -641,16 +668,29 @@ mod tests {
         let strict = temp.path().join("strict-codex");
         let cli = temp.path().join("cli-codex");
         let full = temp.path().join("full-codex");
+        let headless = temp.path().join("headless-codex");
         let common = "sighup-verified\nSIGHUP: auth reloaded\nhotswap-ack\nCodexSwitch rotated accounts after a usage limit\nCodexSwitch rotated accounts after an auth failure\nAuth changed, opening new WebSocket with fresh credentials\ncodexswitch-runtime-convergence-v3\ncodexswitch-runtime-rotation-handoff-v1\nUsage: /goal <objective>\n";
         let strict_markers = "CodexSwitch account/updated frontend write acknowledged after auth reload\ncodexswitch-hotswap-contract-v3\n";
+        let headless_markers = "codexswitch-hotswap-headless-idle-v1\n";
         let cli_markers = "codexswitch-hotswap-cli-contract-v3\n";
         fs::write(&strict, format!("{common}{strict_markers}"))?;
+        fs::write(
+            &headless,
+            format!("{common}{strict_markers}{headless_markers}"),
+        )?;
         fs::write(&cli, format!("{common}{cli_markers}"))?;
-        fs::write(&full, format!("{common}{strict_markers}{cli_markers}"))?;
+        fs::write(
+            &full,
+            format!("{common}{strict_markers}{headless_markers}{cli_markers}"),
+        )?;
 
         assert!(binary_has_external_app_server_hot_swap_markers(&strict));
         assert!(!binary_has_local_cli_hot_swap_markers(&strict));
         assert!(!binary_has_hot_swap_markers(&strict));
+        assert!(binary_has_headless_remote_control_hot_swap_markers(
+            &headless
+        ));
+        assert!(!binary_has_hot_swap_markers(&headless));
         assert!(binary_has_local_cli_hot_swap_markers(&cli));
         assert!(!binary_has_external_app_server_hot_swap_markers(&cli));
         assert!(!binary_has_hot_swap_markers(&cli));
@@ -662,7 +702,7 @@ mod tests {
     fn marker_scan_handles_large_sparse_binaries_without_whole_file_reads() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let binary = temp.path().join("large-codex");
-        let markers = b"sighup-verified\nSIGHUP: auth reloaded\nhotswap-ack\nCodexSwitch rotated accounts after a usage limit\nCodexSwitch rotated accounts after an auth failure\nAuth changed, opening new WebSocket with fresh credentials\ncodexswitch-runtime-convergence-v3\ncodexswitch-runtime-rotation-handoff-v1\nUsage: /goal <objective>\nCodexSwitch account/updated frontend write acknowledged after auth reload\ncodexswitch-hotswap-contract-v3\ncodexswitch-hotswap-cli-contract-v3\n";
+        let markers = b"sighup-verified\nSIGHUP: auth reloaded\nhotswap-ack\nCodexSwitch rotated accounts after a usage limit\nCodexSwitch rotated accounts after an auth failure\nAuth changed, opening new WebSocket with fresh credentials\ncodexswitch-runtime-convergence-v3\ncodexswitch-runtime-rotation-handoff-v1\nUsage: /goal <objective>\nCodexSwitch account/updated frontend write acknowledged after auth reload\ncodexswitch-hotswap-contract-v3\ncodexswitch-hotswap-headless-idle-v1\ncodexswitch-hotswap-cli-contract-v3\n";
         let mut file = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -728,7 +768,7 @@ mod tests {
         fs::create_dir_all(launcher.parent().unwrap())?;
         fs::write(
             &runtime,
-            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\nif [ \"${1:-}\" = --version ]; then echo 'codex-cli 0.144.1'; exit 0; fi\nprintf 'local:%s\\n' \"$*\" >> \"$TRACE\"\n",
+            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-headless-idle-v1 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\nif [ \"${1:-}\" = --version ]; then echo 'codex-cli 0.144.1'; exit 0; fi\nprintf 'local:%s\\n' \"$*\" >> \"$TRACE\"\n",
         )?;
         fs::write(&helper, "#!/bin/sh\nexit 0\n")?;
         set_executable(&runtime)?;

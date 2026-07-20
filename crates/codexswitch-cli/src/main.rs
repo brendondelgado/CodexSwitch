@@ -21,7 +21,7 @@ use account_store::{
     active_account, commit_accounts, default_store_path, load_accounts, lock_account_store,
     mark_runtime_unusable, quota_availability_at, real_quota_snapshot, resolve_account_selector,
     select_auto_swap_candidate_from_observations, usage_limit_runtime_block_until,
-    CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
+    validate_accounts, CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
 };
 use activation::{
     activate_with, reconcile_activation_barrier, replace_accounts_with, ActivationBarrierContext,
@@ -79,6 +79,9 @@ enum Command {
         bundle: PathBuf,
         #[arg(long)]
         ignore_expiry: bool,
+        /// Keep this host's current active provider account authoritative.
+        #[arg(long)]
+        preserve_active: bool,
         /// Commit and verify store/auth while an operator-proven runtime is idle.
         #[arg(long)]
         offline_file_only: bool,
@@ -207,11 +210,13 @@ fn main() -> Result<()> {
             &auth_path,
             ignore_expiry,
             offline_file_only,
+            false,
             "Imported",
         ),
         Command::UpdateBundle {
             bundle,
             ignore_expiry,
+            preserve_active,
             offline_file_only,
         } => import_accounts(
             &bundle,
@@ -219,6 +224,7 @@ fn main() -> Result<()> {
             &auth_path,
             ignore_expiry,
             offline_file_only,
+            preserve_active,
             "Updated",
         ),
         Command::Status => status(&store_path),
@@ -283,12 +289,18 @@ fn import_accounts(
     auth_path: &Path,
     ignore_expiry: bool,
     offline_file_only: bool,
+    preserve_active: bool,
     verb: &str,
 ) -> Result<()> {
-    let accounts = prepare_import_bundle(bundle, ignore_expiry)?;
-    let account_count = accounts.len();
+    let imported_accounts = prepare_import_bundle(bundle, ignore_expiry)?;
     let store_lock = lock_account_store(store_path)?;
     let snapshot = store_lock.load()?;
+    let accounts = if preserve_active {
+        preserve_host_active_account(imported_accounts, &snapshot.accounts)?
+    } else {
+        imported_accounts
+    };
+    let account_count = accounts.len();
     let mut generation = snapshot.generation;
     let mut stored_accounts = snapshot.accounts;
     let outcome = replace_accounts_with(
@@ -316,6 +328,31 @@ fn import_accounts(
         );
     }
     Ok(())
+}
+
+fn preserve_host_active_account(
+    mut incoming: Vec<account_store::CodexAccount>,
+    current: &[account_store::CodexAccount],
+) -> Result<Vec<account_store::CodexAccount>> {
+    validate_accounts(&incoming).context("incoming credential bundle is invalid")?;
+    if current.is_empty() {
+        return Ok(incoming);
+    }
+    validate_accounts(current).context("current host account store is invalid")?;
+    let current_active = active_account(current)
+        .context("current host account store has no active provider account")?;
+
+    for account in &mut incoming {
+        account.is_active = account.account_id == current_active.account_id;
+    }
+    if !incoming
+        .iter()
+        .any(|account| account.account_id == current_active.account_id)
+    {
+        incoming.push(current_active.clone());
+    }
+    validate_accounts(&incoming).context("host-preserving credential merge is invalid")?;
+    Ok(incoming)
 }
 
 pub(crate) fn doctor(store_path: &Path, auth_path: &Path, json: bool) -> Result<()> {
@@ -1601,6 +1638,7 @@ mod tests {
 
     fn verified_reload_summary() -> ReloadSummary {
         ReloadSummary {
+            sighup_sent: vec![42],
             signaled: vec![42],
             ..ReloadSummary::default()
         }
@@ -1859,6 +1897,59 @@ mod tests {
                 ..
             }
         ));
+
+        let host_preserving = Args::try_parse_from([
+            "codexswitch-cli",
+            "update-bundle",
+            "--preserve-active",
+            "bundle.json",
+        ])?;
+        assert!(matches!(
+            host_preserving.command,
+            Command::UpdateBundle {
+                preserve_active: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn credential_bundle_merge_preserves_host_active_provider_identity() -> Result<()> {
+        let current_active = account("vps-active@example.com", true, 10.0, 10.0);
+        let current_inactive = account("mac-active@example.com", false, 10.0, 10.0);
+        let mut incoming_vps = current_active.clone();
+        incoming_vps.is_active = false;
+        incoming_vps.refresh_token = "refreshed-on-mac".to_string();
+        let mut incoming_mac = current_inactive.clone();
+        incoming_mac.is_active = true;
+
+        let merged = preserve_host_active_account(
+            vec![incoming_mac, incoming_vps],
+            &[current_active.clone(), current_inactive],
+        )?;
+
+        let active = active_account(&merged).context("merged host lost its active account")?;
+        assert_eq!(active.account_id, current_active.account_id);
+        assert_eq!(active.refresh_token, "refreshed-on-mac");
+        Ok(())
+    }
+
+    #[test]
+    fn credential_bundle_merge_retains_remote_only_active_account() -> Result<()> {
+        let current_active = account("vps-only@example.com", true, 10.0, 10.0);
+        let incoming_active = account("mac-only@example.com", true, 10.0, 10.0);
+
+        let merged = preserve_host_active_account(
+            vec![incoming_active],
+            std::slice::from_ref(&current_active),
+        )?;
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            active_account(&merged).map(|account| account.account_id.as_str()),
+            Some(current_active.account_id.as_str())
+        );
         Ok(())
     }
 

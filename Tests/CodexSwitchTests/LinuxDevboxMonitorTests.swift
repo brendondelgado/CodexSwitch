@@ -243,6 +243,58 @@ struct LinuxDevboxMonitorTests {
         #expect(LinuxDevboxMonitor.credentialSyncFingerprint(accounts: [account]) != runtimeFingerprint)
     }
 
+    @Test("credential sync preserves the VPS active provider identity")
+    func credentialSyncPreservesVPSActiveProviderIdentity() throws {
+        let macActive = CodexAccount(
+            email: "mac@example.com",
+            accessToken: "mac-access",
+            refreshToken: "mac-refresh",
+            idToken: "mac-id",
+            accountId: "mac-account",
+            isActive: true
+        )
+        let vpsActive = CodexAccount(
+            email: "vps@example.com",
+            accessToken: "vps-access",
+            refreshToken: "vps-refresh",
+            idToken: "vps-id",
+            accountId: "vps-account",
+            isActive: false
+        )
+
+        let result = LinuxDevboxMonitor.credentialSyncAccountsPreservingRemoteActive(
+            accounts: [macActive, vpsActive],
+            remoteActiveProviderAccountId: "vps-account"
+        )
+        let synchronized = try result.get()
+
+        #expect(synchronized.first(where: \.isActive)?.accountId == "vps-account")
+        #expect(synchronized.first(where: { $0.accountId == "mac-account" })?.isActive == false)
+    }
+
+    @Test("credential sync refuses to guess when the VPS active account is absent")
+    func credentialSyncRejectsMissingVPSActiveProviderIdentity() {
+        let macActive = CodexAccount(
+            email: "mac@example.com",
+            accessToken: "mac-access",
+            refreshToken: "mac-refresh",
+            idToken: "mac-id",
+            accountId: "mac-account",
+            isActive: true
+        )
+
+        let result = LinuxDevboxMonitor.credentialSyncAccountsPreservingRemoteActive(
+            accounts: [macActive],
+            remoteActiveProviderAccountId: "vps-only-account"
+        )
+
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected missing VPS identity to reject background sync")
+            return
+        }
+        #expect(failure.credentialSyncDisposition == .rejected)
+    }
+
     @Test("credential evidence fingerprint covers inactive account tokens")
     func credentialSetFingerprintCoversInactiveTokens() throws {
         let active = CodexAccount(
@@ -384,7 +436,7 @@ struct LinuxDevboxMonitorTests {
 
         #expect(command.contains("stage='/tmp/codexswitch-auto-sync-fixture'"))
         #expect(command.contains("CODEXSWITCH_IMPORT_PASSPHRASE_FILE='/tmp/codexswitch-auto-sync-fixture/sync.passphrase'"))
-        #expect(command.contains("codexswitch-cli update-bundle '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
+        #expect(command.contains("codexswitch-cli update-bundle --preserve-active '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
         #expect(command.contains("chmod 600 '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
         #expect(!command.contains("chmod 600 --"))
         #expect(!command.contains("--ignore-expiry"))

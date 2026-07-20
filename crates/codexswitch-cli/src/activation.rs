@@ -686,7 +686,7 @@ where
             &mut reload,
         ),
         Ok(summary) => {
-            let runtime_may_have_changed = !summary.signaled.is_empty();
+            let runtime_may_have_changed = !summary.sighup_sent.is_empty();
             rollback_replacement_activation(
                 ReplacementRollbackContext {
                     store_lock,
@@ -2256,6 +2256,95 @@ mod tests {
         assert!(!outcome.is_confirmed());
         assert_eq!(fs::read(&store_path)?, original_store);
         assert_eq!(fs::read(&auth_path)?, original_auth);
+        Ok(())
+    }
+
+    #[test]
+    fn import_failure_after_sighup_requires_verified_compensating_reload() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let initial = vec![account("first@example.com", true)];
+        save_accounts(&store_path, &initial)?;
+        commit_auth_file(&auth_path, &initial[0])?;
+        let original_store = fs::read(&store_path)?;
+        let original_auth = fs::read(&auth_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut current_accounts = snapshot.accounts;
+        let reload_calls = std::cell::Cell::new(0usize);
+
+        let outcome = replace_accounts_with(
+            &store_lock,
+            &mut generation,
+            &mut current_accounts,
+            vec![account("imported@example.com", true)],
+            &auth_path,
+            true,
+            |_| {
+                let call = reload_calls.get();
+                reload_calls.set(call + 1);
+                if call == 0 {
+                    Ok(ReloadSummary {
+                        sighup_sent: vec![42],
+                        skipped: vec![(42, "frontend delivery failed".to_string())],
+                        ..ReloadSummary::default()
+                    })
+                } else {
+                    Ok(ReloadSummary {
+                        sighup_sent: vec![42],
+                        signaled: vec![42],
+                        ..ReloadSummary::default()
+                    })
+                }
+            },
+        )?;
+
+        assert_eq!(outcome.state, ActivationState::RolledBack);
+        assert_eq!(reload_calls.get(), 2);
+        assert_eq!(fs::read(&store_path)?, original_store);
+        assert_eq!(fs::read(&auth_path)?, original_auth);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_compensating_reload_after_sighup_requires_manual_review() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let initial = vec![account("first@example.com", true)];
+        save_accounts(&store_path, &initial)?;
+        commit_auth_file(&auth_path, &initial[0])?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut current_accounts = snapshot.accounts;
+        let reload_calls = std::cell::Cell::new(0usize);
+
+        let outcome = replace_accounts_with(
+            &store_lock,
+            &mut generation,
+            &mut current_accounts,
+            vec![account("imported@example.com", true)],
+            &auth_path,
+            true,
+            |_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary {
+                    sighup_sent: vec![42],
+                    skipped: vec![(42, "frontend delivery failed".to_string())],
+                    ..ReloadSummary::default()
+                })
+            },
+        )?;
+
+        assert_eq!(outcome.state, ActivationState::ManualReview);
+        assert_eq!(reload_calls.get(), 2);
+        assert_eq!(
+            read_activation_record(&store_lock)?.unwrap().state,
+            ActivationState::ManualReview
+        );
         Ok(())
     }
 

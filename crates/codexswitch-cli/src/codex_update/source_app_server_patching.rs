@@ -83,10 +83,10 @@ fn patch_app_server_frontend_write_ack_source(
     },"#,
         r#"
     /// Broadcasts a notification and reports how many initialized frontend
-    /// writers completed the underlying transport write.
+    /// writers were eligible and completed the underlying transport write.
     BroadcastWithWriteAck {
         message: OutgoingMessage,
-        write_complete_tx: oneshot::Sender<usize>,
+        write_complete_tx: oneshot::Sender<(usize, usize, usize)>,
     },"#,
         "BroadcastWithWriteAck",
     )?;
@@ -98,6 +98,12 @@ fn patch_app_server_frontend_write_ack_source(
             message,
             write_complete_tx,
         } => {
+            let initialized_frontend_count = connections
+                .iter()
+                .filter(|(_, connection_state)| {
+                    connection_state.initialized.load(Ordering::Acquire)
+                })
+                .count();
             let target_connections: Vec<ConnectionId> = connections
                 .iter()
                 .filter_map(|(connection_id, connection_state)| {
@@ -110,6 +116,7 @@ fn patch_app_server_frontend_write_ack_source(
                     }
                 })
                 .collect();
+            let eligible_frontend_count = target_connections.len();
             let mut write_receivers = Vec::with_capacity(target_connections.len());
 
             for connection_id in target_connections {
@@ -133,7 +140,11 @@ fn patch_app_server_frontend_write_ack_source(
                     .into_iter()
                     .filter(|result| matches!(result, Ok(Ok(()))))
                     .count();
-                let _ = write_complete_tx.send(completed_writes);
+                let _ = write_complete_tx.send((
+                    initialized_frontend_count,
+                    eligible_frontend_count,
+                    completed_writes,
+                ));
             });
         }
 "#,

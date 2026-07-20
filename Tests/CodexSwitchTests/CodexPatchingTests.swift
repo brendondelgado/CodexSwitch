@@ -137,7 +137,7 @@ struct CodexPatchingTests {
         #expect(adHoc == .adHoc)
     }
 
-    @Test("Desktop app locator requires auth, recents, model, Fast, and reconnect markers")
+    @Test("Desktop app locator requires auth, recents, model, Fast, reconnect, and updater markers")
     func desktopAppLocatorRequiresCurrentDesktopPatchMarkers() throws {
         let temp = temporaryDirectory()
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
@@ -197,6 +197,7 @@ struct CodexPatchingTests {
                 .appending("CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK ")
                 .appending("CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK ")
                 .appending("CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH ")
+                .appending("CODEXSWITCH_NATIVE_UPDATER_DISABLED_V1 ")
                 .appending("_bundledFastModels")
                 .utf8
         ).write(to: asar)
@@ -210,6 +211,7 @@ struct CodexPatchingTests {
                 .appending("CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK ")
                 .appending("CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK ")
                 .appending("CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH ")
+                .appending("CODEXSWITCH_NATIVE_UPDATER_DISABLED_V1 ")
                 .appending("_bundledFastModels")
                 .utf8
         ).write(to: asar)

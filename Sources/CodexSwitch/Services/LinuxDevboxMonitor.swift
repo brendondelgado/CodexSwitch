@@ -545,6 +545,26 @@ enum LinuxDevboxMonitor {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
+    static func credentialSyncAccountsPreservingRemoteActive(
+        accounts: [CodexAccount],
+        remoteActiveProviderAccountId: String
+    ) -> Result<[CodexAccount], LinuxDevboxMonitorFailure> {
+        guard !remoteActiveProviderAccountId.isEmpty,
+              accounts.contains(where: { $0.accountId == remoteActiveProviderAccountId }) else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "VPS active account is absent from the Mac credential pool; sync refused to preserve host ownership",
+                credentialSyncDisposition: .rejected
+            ))
+        }
+
+        var synchronized = accounts
+        for index in synchronized.indices {
+            synchronized[index].isActive =
+                synchronized[index].accountId == remoteActiveProviderAccountId
+        }
+        return .success(synchronized)
+    }
+
     static func credentialAccountIdentityFingerprint(accounts: [CodexAccount]) -> String {
         var hasher = SHA256()
         for account in accounts.sorted(by: { $0.accountId < $1.accountId }) {
@@ -1645,7 +1665,7 @@ enum LinuxDevboxMonitor {
         umask 077
         chmod 600 \(bundle) \(passphrase)
         export PATH="$HOME/.local/bin:$PATH"
-        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) codexswitch-cli update-bundle \(bundle)
+        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) codexswitch-cli update-bundle --preserve-active \(bundle)
         """
     }
 

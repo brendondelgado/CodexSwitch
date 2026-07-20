@@ -33,6 +33,7 @@ pub struct CodexProcess {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReloadSummary {
+    pub sighup_sent: Vec<i32>,
     pub signaled: Vec<i32>,
     pub restarted: Vec<i32>,
     pub skipped: Vec<(i32, String)>,
@@ -77,6 +78,8 @@ const EXTERNAL_APP_SERVER_MARKERS: [&[u8]; 2] = [
     b"CodexSwitch account/updated frontend write acknowledged after auth reload",
     b"codexswitch-hotswap-contract-v3",
 ];
+const HEADLESS_REMOTE_CONTROL_APP_SERVER_MARKERS: [&[u8]; 1] =
+    [b"codexswitch-hotswap-headless-idle-v1"];
 const LOCAL_INTERACTIVE_CLI_MARKERS: [&[u8]; 1] = [b"codexswitch-hotswap-cli-contract-v3"];
 const GOAL_USAGE_MARKER: &[u8] = b"Usage: /goal <objective>";
 const GOAL_PURSUING_MARKER: &[u8] = b"Pursuing goal";
@@ -120,10 +123,11 @@ const HOT_SWAP_ARTIFACT_RETENTION: HotSwapArtifactRetention = HotSwapArtifactRet
 const PS_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 static HOT_SWAP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum HotSwapRuntimeKind {
     ExternalAppServer,
+    HeadlessRemoteControlAppServer,
     LocalInteractiveCli,
 }
 
@@ -691,6 +695,7 @@ fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<
         }
         let signal_result = send_signal(process.pid, libc::SIGHUP);
         if signal_result.is_ok() {
+            summary.sighup_sent.push(process.pid);
             if wait_for_hot_swap_ack(&process, &request, runtime_kind, Duration::from_secs(5)) {
                 summary.signaled.push(process.pid);
             } else {
@@ -712,8 +717,13 @@ fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<
     Ok(summary)
 }
 
-pub fn binary_has_sighup_support(path: &Path) -> bool {
+#[cfg(test)]
+fn binary_has_sighup_support(path: &Path) -> bool {
     binary_has_sighup_support_for_runtime(path, HotSwapRuntimeKind::ExternalAppServer)
+        && binary_has_sighup_support_for_runtime(
+            path,
+            HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+        )
         && binary_has_sighup_support_for_runtime(path, HotSwapRuntimeKind::LocalInteractiveCli)
 }
 
@@ -745,6 +755,7 @@ pub fn binary_has_sighup_support_for_runtime(
 struct BinaryMarkerState {
     common: [bool; COMMON_SIGHUP_MARKERS.len()],
     external_app_server: [bool; EXTERNAL_APP_SERVER_MARKERS.len()],
+    headless_remote_control_app_server: [bool; HEADLESS_REMOTE_CONTROL_APP_SERVER_MARKERS.len()],
     local_interactive_cli: [bool; LOCAL_INTERACTIVE_CLI_MARKERS.len()],
     goal_usage: bool,
     goal_pursuing: bool,
@@ -761,6 +772,14 @@ impl BinaryMarkerState {
         for (index, marker) in EXTERNAL_APP_SERVER_MARKERS.iter().enumerate() {
             if !self.external_app_server[index] && contains_bytes(data, marker) {
                 self.external_app_server[index] = true;
+            }
+        }
+        for (index, marker) in HEADLESS_REMOTE_CONTROL_APP_SERVER_MARKERS
+            .iter()
+            .enumerate()
+        {
+            if !self.headless_remote_control_app_server[index] && contains_bytes(data, marker) {
+                self.headless_remote_control_app_server[index] = true;
             }
         }
         for (index, marker) in LOCAL_INTERACTIVE_CLI_MARKERS.iter().enumerate() {
@@ -785,6 +804,13 @@ impl BinaryMarkerState {
         let has_runtime_markers = match runtime_kind {
             HotSwapRuntimeKind::ExternalAppServer => {
                 self.external_app_server.iter().all(|found| *found)
+            }
+            HotSwapRuntimeKind::HeadlessRemoteControlAppServer => {
+                self.external_app_server.iter().all(|found| *found)
+                    && self
+                        .headless_remote_control_app_server
+                        .iter()
+                        .all(|found| *found)
             }
             HotSwapRuntimeKind::LocalInteractiveCli => {
                 self.local_interactive_cli.iter().all(|found| *found)
@@ -851,6 +877,7 @@ fn max_marker_len() -> usize {
         .iter()
         .copied()
         .chain(EXTERNAL_APP_SERVER_MARKERS.iter().copied())
+        .chain(HEADLESS_REMOTE_CONTROL_APP_SERVER_MARKERS.iter().copied())
         .chain(LOCAL_INTERACTIVE_CLI_MARKERS.iter().copied())
         .chain([GOAL_USAGE_MARKER, GOAL_PURSUING_MARKER, GOAL_SET_MARKER])
         .map(|marker| marker.len())
@@ -930,6 +957,12 @@ pub(crate) struct HotSwapAck {
     pub(crate) auth_generation: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) reconnect_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) initialized_frontend_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) eligible_frontend_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) idle_listener_ready: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1025,12 +1058,48 @@ fn hot_swap_ack_matches_request(
         && ack.active_token_fingerprint == expected_fingerprint
         && match runtime_kind {
             HotSwapRuntimeKind::ExternalAppServer => {
-                ack.frontend_notified && ack.frontend_write_count > 0 && !ack.reconnect_ready
+                external_app_server_ack_is_verified(ack, false, true)
+            }
+            HotSwapRuntimeKind::HeadlessRemoteControlAppServer => {
+                external_app_server_ack_is_verified(ack, true, false)
             }
             HotSwapRuntimeKind::LocalInteractiveCli => {
-                !ack.frontend_notified && ack.frontend_write_count == 0 && ack.reconnect_ready
+                !ack.frontend_notified
+                    && ack.frontend_write_count == 0
+                    && ack.reconnect_ready
+                    && ack.initialized_frontend_count.is_none()
+                    && ack.eligible_frontend_count.is_none()
+                    && !ack.idle_listener_ready
             }
         }
+}
+
+fn external_app_server_ack_is_verified(
+    ack: &HotSwapAck,
+    allow_idle_listener: bool,
+    allow_legacy_missing_frontend_counts: bool,
+) -> bool {
+    let delivered_to_frontend = !ack.idle_listener_ready
+        && ack.frontend_notified
+        && ack.frontend_write_count > 0
+        && match (ack.initialized_frontend_count, ack.eligible_frontend_count) {
+            (None, None) => allow_legacy_missing_frontend_counts,
+            (Some(initialized), Some(eligible)) => {
+                initialized > 0
+                    && eligible > 0
+                    && eligible <= initialized
+                    && ack.frontend_write_count <= eligible
+            }
+            _ => false,
+        };
+    let idle_listener = allow_idle_listener
+        && ack.idle_listener_ready
+        && !ack.frontend_notified
+        && ack.frontend_write_count == 0
+        && ack.initialized_frontend_count == Some(0)
+        && ack.eligible_frontend_count == Some(0);
+
+    !ack.reconnect_ready && (delivered_to_frontend || idle_listener)
 }
 
 fn hot_swap_ack_path(pid: i32) -> Option<PathBuf> {
@@ -1571,6 +1640,9 @@ pub fn hot_swap_runtime_kind(process: &CodexProcess) -> Option<HotSwapRuntimeKin
     if is_native_codex_runtime(&process.executable)
         && is_codex_app_server_command_line(&process.command_line)
     {
+        if is_headless_remote_control_app_server_command_line(&process.command_line) {
+            return Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer);
+        }
         return Some(HotSwapRuntimeKind::ExternalAppServer);
     }
     if is_codex_cli_runtime(&process.command_line, &process.executable) {
@@ -1648,6 +1720,33 @@ pub fn is_codex_app_server_command_line(command_line: &str) -> bool {
         return false;
     }
     true
+}
+
+fn is_headless_remote_control_app_server_command_line(command_line: &str) -> bool {
+    if !is_codex_app_server_command_line(command_line) {
+        return false;
+    }
+    let parts = command_line
+        .split_whitespace()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let Some(app_server_index) = parts.iter().position(|part| part == "app-server") else {
+        return false;
+    };
+    let arguments = &parts[app_server_index + 1..];
+    let has_remote_control = arguments
+        .iter()
+        .any(|argument| argument == "--remote-control");
+    let has_websocket_listener = arguments.iter().enumerate().any(|(index, argument)| {
+        argument
+            .strip_prefix("--listen=")
+            .is_some_and(|value| value.starts_with("ws://"))
+            || (argument == "--listen"
+                && arguments
+                    .get(index + 1)
+                    .is_some_and(|value| value.starts_with("ws://")))
+    });
+    has_remote_control && has_websocket_listener
 }
 
 fn first_command_token_is_native_codex(command_line: &str) -> bool {
@@ -1960,6 +2059,33 @@ mod tests {
         ));
         assert!(!is_codex_app_server_command_line(
             "/home/signul/.local/share/codexswitch/patched-codex/codex app-server proxy --sock /tmp/control.sock"
+        ));
+    }
+
+    #[test]
+    fn remote_control_websocket_listener_uses_headless_runtime_contract() {
+        let command_line = "/home/signul/.local/share/codexswitch/patched-codex/codex -c features.code_mode_host=true app-server --remote-control --listen ws://127.0.0.1:8390";
+        let process = CodexProcess {
+            pid: 42,
+            owner_uid: 1001,
+            start_identity: "linux:123".to_string(),
+            started_at_unix: 1,
+            command_line: command_line.to_string(),
+            executable: PathBuf::from("/home/signul/.local/share/codexswitch/patched-codex/codex"),
+        };
+
+        assert!(is_headless_remote_control_app_server_command_line(
+            command_line
+        ));
+        assert_eq!(
+            hot_swap_runtime_kind(&process),
+            Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer)
+        );
+        assert!(!is_headless_remote_control_app_server_command_line(
+            "/home/signul/codex app-server --listen ws://127.0.0.1:8390"
+        ));
+        assert!(!is_headless_remote_control_app_server_command_line(
+            "/home/signul/codex app-server --remote-control --listen unix://"
         ));
     }
 
@@ -2291,6 +2417,7 @@ mod tests {
             "\"binding\": binding",
             "codexswitch-runtime-convergence-v3",
             "codexswitch-hotswap-contract-v3",
+            "codexswitch-hotswap-headless-idle-v1",
             "codexswitch-hotswap-cli-contract-v3",
         ] {
             assert!(generated_runtime.contains(required), "missing {required}");
@@ -2332,6 +2459,96 @@ mod tests {
         let mut stale = ack;
         stale.acknowledged_at_unix_milliseconds = now.saturating_sub(301_000);
         assert!(!matches(&stale));
+        Ok(())
+    }
+
+    #[test]
+    fn external_v3_ack_distinguishes_idle_listener_from_failed_delivery() -> Result<()> {
+        let (mut request, mut idle) = shared_v3_fixture()?;
+        request.binding.runtime_kind = HotSwapRuntimeKind::HeadlessRemoteControlAppServer;
+        idle.binding = request.binding.clone();
+        let now = idle.acknowledged_at_unix_milliseconds;
+        let matches = |candidate: &HotSwapAck| {
+            hot_swap_ack_matches_request(
+                candidate,
+                &request,
+                HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+                now,
+                Duration::from_secs(300),
+            )
+        };
+
+        let mut delivered = idle.clone();
+        assert!(!matches(&delivered));
+        delivered.initialized_frontend_count = Some(2);
+        delivered.eligible_frontend_count = Some(2);
+        assert!(matches(&delivered));
+
+        let mut missing_initialized_count = delivered.clone();
+        missing_initialized_count.initialized_frontend_count = None;
+        assert!(!matches(&missing_initialized_count));
+
+        let mut missing_eligible_count = delivered.clone();
+        missing_eligible_count.eligible_frontend_count = None;
+        assert!(!matches(&missing_eligible_count));
+
+        let mut inconsistent_delivery_counts = delivered.clone();
+        inconsistent_delivery_counts.initialized_frontend_count = Some(1);
+        inconsistent_delivery_counts.eligible_frontend_count = Some(2);
+        assert!(!matches(&inconsistent_delivery_counts));
+
+        let mut writes_exceed_eligible_count = delivered;
+        writes_exceed_eligible_count.frontend_write_count = 3;
+        assert!(!matches(&writes_exceed_eligible_count));
+
+        idle.frontend_notified = false;
+        idle.frontend_write_count = 0;
+        idle.initialized_frontend_count = Some(0);
+        idle.eligible_frontend_count = Some(0);
+        idle.idle_listener_ready = true;
+        assert!(matches(&idle));
+
+        let mut missing_idle_counts = idle.clone();
+        missing_idle_counts.initialized_frontend_count = None;
+        missing_idle_counts.eligible_frontend_count = None;
+        assert!(!matches(&missing_idle_counts));
+
+        let mut initialized_without_delivery = idle.clone();
+        initialized_without_delivery.initialized_frontend_count = Some(1);
+        assert!(!matches(&initialized_without_delivery));
+
+        let mut contradictory_counts = idle.clone();
+        contradictory_counts.eligible_frontend_count = Some(1);
+        assert!(!matches(&contradictory_counts));
+
+        let mut missing_idle_marker = idle.clone();
+        missing_idle_marker.idle_listener_ready = false;
+        assert!(!matches(&missing_idle_marker));
+
+        let mut false_notification = idle;
+        false_notification.frontend_notified = true;
+        assert!(!matches(&false_notification));
+
+        let (strict_request, mut strict_idle) = shared_v3_fixture()?;
+        assert!(hot_swap_ack_matches_request(
+            &strict_idle,
+            &strict_request,
+            HotSwapRuntimeKind::ExternalAppServer,
+            strict_idle.acknowledged_at_unix_milliseconds,
+            Duration::from_secs(300),
+        ));
+        strict_idle.frontend_notified = false;
+        strict_idle.frontend_write_count = 0;
+        strict_idle.initialized_frontend_count = Some(0);
+        strict_idle.eligible_frontend_count = Some(0);
+        strict_idle.idle_listener_ready = true;
+        assert!(!hot_swap_ack_matches_request(
+            &strict_idle,
+            &strict_request,
+            HotSwapRuntimeKind::ExternalAppServer,
+            strict_idle.acknowledged_at_unix_milliseconds,
+            Duration::from_secs(300),
+        ));
         Ok(())
     }
 
@@ -2571,15 +2788,23 @@ mod tests {
         ));
         assert!(!binary_has_sighup_support_for_runtime(
             &binary,
+            HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+        ));
+        assert!(!binary_has_sighup_support_for_runtime(
+            &binary,
             HotSwapRuntimeKind::LocalInteractiveCli,
         ));
         assert!(!binary_has_sighup_support(&binary));
 
         fs::write(
             &binary,
-            b"sighup-verified\nSIGHUP: auth reloaded\nhotswap-ack\nCodexSwitch rotated accounts after a usage limit\nCodexSwitch rotated accounts after an auth failure\nAuth changed, opening new WebSocket with fresh credentials\ncodexswitch-runtime-convergence-v3\ncodexswitch-runtime-rotation-handoff-v1\nCodexSwitch account/updated frontend write acknowledged after auth reload\ncodexswitch-hotswap-contract-v3\ncodexswitch-hotswap-cli-contract-v3\nPursuing goal\nthread/goal/set\n",
+            b"sighup-verified\nSIGHUP: auth reloaded\nhotswap-ack\nCodexSwitch rotated accounts after a usage limit\nCodexSwitch rotated accounts after an auth failure\nAuth changed, opening new WebSocket with fresh credentials\ncodexswitch-runtime-convergence-v3\ncodexswitch-runtime-rotation-handoff-v1\nCodexSwitch account/updated frontend write acknowledged after auth reload\ncodexswitch-hotswap-contract-v3\ncodexswitch-hotswap-headless-idle-v1\ncodexswitch-hotswap-cli-contract-v3\nPursuing goal\nthread/goal/set\n",
         )
         .unwrap();
+        assert!(binary_has_sighup_support_for_runtime(
+            &binary,
+            HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+        ));
         assert!(binary_has_sighup_support(&binary));
     }
 

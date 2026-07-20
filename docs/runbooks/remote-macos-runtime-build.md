@@ -28,7 +28,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-14
+  last_updated: 2026-07-20
 ---
 
 # Remote macOS Runtime Build
@@ -379,9 +379,12 @@ scripts/install-macos-app-artifact.sh <empty-directory>
 The installer snapshots and attests both members, validates the strict manifest
 and archive bounds, safely extracts the ZIP, and repeats the complete bundle
 contract before it creates an `/Applications` staging directory or asks the
-running app to quit. It never recompiles or re-signs the bundle. Replacement is
-transactional: validation or launch failure restores and relaunches the prior
-app, while a preactivation failure leaves the installed app unchanged.
+running app to quit. The liveness gate covers every process launched from a
+bundle named `CodexSwitch.app`, including stale development-build watchdog
+targets, rather than checking only `/Applications`. It never recompiles or
+re-signs the bundle. Replacement is transactional: validation or launch failure
+restores and relaunches the prior app, while a preactivation failure leaves the
+installed app unchanged.
 
 ## Failure Handling
 

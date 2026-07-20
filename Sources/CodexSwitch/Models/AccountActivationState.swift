@@ -14,6 +14,7 @@ enum AccountActivationDetail: String, Codable, Equatable, Sendable {
     case restartRecoveredCommittedFiles = "restart_recovered_committed_files"
     case launchRuntimeEvidenceExpired = "launch_runtime_evidence_expired"
     case runtimeEvidenceExpired = "runtime_evidence_expired"
+    // Retained for existing journals; desktop exit now triggers passive revalidation.
     case desktopRuntimeExited = "desktop_runtime_exited"
     case activeCredentialMutation = "active_credential_mutation"
     case externalAuthObserved = "external_auth_observed"

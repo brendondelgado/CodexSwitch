@@ -14,6 +14,9 @@
     "CodexSwitch account/updated frontend write acknowledged after auth reload",
     "codexswitch-hotswap-contract-v3"
   ],
+  "headlessRemoteControlAppServer": [
+    "codexswitch-hotswap-headless-idle-v1"
+  ],
   "localInteractiveCLI": [
     "codexswitch-hotswap-cli-contract-v3"
   ]

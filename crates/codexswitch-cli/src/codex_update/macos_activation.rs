@@ -1526,7 +1526,7 @@ mod macos_activation_tests {
         fs::write(
             &runtime,
             format!(
-                "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\nif [ \"${{1:-}}\" = --version ]; then echo 'codex-cli {TEST_VERSION}'; exit 0; fi\nprintf 'runtime:%s\\n' \"$*\"\n"
+                "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-headless-idle-v1 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\nif [ \"${{1:-}}\" = --version ]; then echo 'codex-cli {TEST_VERSION}'; exit 0; fi\nprintf 'runtime:%s\\n' \"$*\"\n"
             ),
         )?;
         fs::write(&helper, "#!/bin/sh\nexit 0\n")?;

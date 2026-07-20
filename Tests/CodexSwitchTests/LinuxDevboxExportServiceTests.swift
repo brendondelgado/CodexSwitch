@@ -100,6 +100,40 @@ struct LinuxDevboxExportServiceTests {
         #expect(payload.accounts.map(\.accessToken) == expectedPayload.accounts.map(\.accessToken))
     }
 
+    @Test("Bundle creation preserves the caller-selected active account")
+    func bundleCreationDoesNotRerankTheActiveAccount() throws {
+        var plus = CodexAccount(
+            email: "plus@example.com",
+            accessToken: "plus-access",
+            refreshToken: "plus-refresh",
+            idToken: "plus-id",
+            accountId: "plus-account",
+            isActive: true
+        )
+        plus.planType = "plus"
+        var pro = CodexAccount(
+            email: "pro@example.com",
+            accessToken: "pro-access",
+            refreshToken: "pro-refresh",
+            idToken: "pro-id",
+            accountId: "pro-account",
+            isActive: false
+        )
+        pro.planType = "pro"
+        let service = LinuxDevboxExportService(
+            randomBytes: { Data(repeating: 0x42, count: $0) }
+        )
+
+        let bundle = try service.makeEncryptedBundle(
+            accounts: [plus, pro],
+            passphrase: "host-ownership-test",
+            confirmation: "host-ownership-test"
+        )
+
+        #expect(bundle.metadata.activeAccountId == "plus-account")
+        #expect(bundle.metadata.activeEmail == "plus@example.com")
+    }
+
     @Test("Export writes a mode 0600 csbundle with import commands")
     func exportWritesBundleWithImportCommands() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())

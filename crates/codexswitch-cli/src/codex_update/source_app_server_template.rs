@@ -82,6 +82,38 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
                 None
             }
 
+            fn codexswitch_external_runtime_kind() -> &'static str {
+                let arguments = std::env::args()
+                    .map(|argument| argument.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                let Some(app_server_index) =
+                    arguments.iter().position(|argument| argument == "app-server")
+                else {
+                    return "external-app-server";
+                };
+                let app_server_arguments = &arguments[app_server_index + 1..];
+                let has_remote_control = app_server_arguments
+                    .iter()
+                    .any(|argument| argument == "--remote-control");
+                let has_websocket_listener = app_server_arguments
+                    .iter()
+                    .enumerate()
+                    .any(|(index, argument)| {
+                        argument
+                            .strip_prefix("--listen=")
+                            .is_some_and(|value| value.starts_with("ws://"))
+                            || (argument == "--listen"
+                                && app_server_arguments
+                                    .get(index + 1)
+                                    .is_some_and(|value| value.starts_with("ws://")))
+                    });
+                if has_remote_control && has_websocket_listener {
+                    "headless-remote-control-app-server"
+                } else {
+                    "external-app-server"
+                }
+            }
+
             fn codexswitch_validate_v3_binding(
                 request: &serde_json::Value,
                 expected_runtime_kind: &str,
@@ -173,7 +205,7 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
                 let _ = std::fs::create_dir_all(marker_dir.join("hotswap-request"));
                 let _ = std::fs::write(
                     marker_dir.join("sighup-verified"),
-                    "app-server codexswitch-hotswap-contract-v3 codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1\n",
+                    "app-server codexswitch-hotswap-contract-v3 codexswitch-hotswap-headless-idle-v1 codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1\n",
                 );
                 marker_dir
             });
@@ -206,8 +238,9 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
                         tracing::error!("CodexSwitch SIGHUP request is missing or invalid");
                         continue;
                     };
+                    let expected_runtime_kind = codexswitch_external_runtime_kind();
                     let Some((binding, auth_path, expected_account_id, expected_auth_hash)) =
-                        codexswitch_validate_v3_binding(&request, "external-app-server")
+                        codexswitch_validate_v3_binding(&request, expected_runtime_kind)
                     else {
                         tracing::error!(
                             "CodexSwitch SIGHUP request does not match the canonical v3 runtime binding"
@@ -287,24 +320,49 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
                         tracing::error!("CodexSwitch failed to queue account/updated after auth reload");
                         continue;
                     }
-                    let frontend_write_count = match tokio::time::timeout(
+                    let frontend_delivery = match tokio::time::timeout(
                         std::time::Duration::from_secs(3),
                         frontend_write_rx,
                     )
                     .await
                     {
-                        Ok(Ok(count)) => count,
-                        _ => 0,
+                        Ok(Ok(proof)) => proof,
+                        _ => {
+                            tracing::error!(
+                                "CodexSwitch account/updated frontend delivery proof failed"
+                            );
+                            continue;
+                        }
                     };
-                    if frontend_write_count == 0 {
+                    let (
+                        initialized_frontend_count,
+                        eligible_frontend_count,
+                        frontend_write_count,
+                    ) = frontend_delivery;
+                    if eligible_frontend_count > initialized_frontend_count
+                        || frontend_write_count > eligible_frontend_count
+                    {
                         tracing::error!(
-                            "CodexSwitch account/updated reached no initialized frontend writer"
+                            "CodexSwitch account/updated returned contradictory frontend delivery counts"
                         );
                         continue;
                     }
-                    tracing::info!(
-                        "CodexSwitch account/updated frontend write acknowledged after auth reload"
-                    );
+                    let idle_listener_ready = initialized_frontend_count == 0
+                        && expected_runtime_kind == "headless-remote-control-app-server";
+                    if idle_listener_ready {
+                        tracing::info!(
+                            "CodexSwitch idle app-server auth reload acknowledged without an initialized frontend"
+                        );
+                    } else if frontend_write_count == 0 {
+                        tracing::error!(
+                            "CodexSwitch account/updated reached initialized frontends without a completed writer"
+                        );
+                        continue;
+                    } else {
+                        tracing::info!(
+                            "CodexSwitch account/updated frontend write acknowledged after auth reload"
+                        );
+                    }
                     let acknowledged_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|duration| duration.as_millis() as u64)
@@ -318,8 +376,11 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
                         "acknowledgedAtUnixMilliseconds": acknowledged_at,
                         "loadedTokenFingerprint": loaded_auth_hash,
                         "activeTokenFingerprint": active_auth_hash,
-                        "frontendNotified": true,
+                        "frontendNotified": frontend_write_count > 0,
                         "frontendWriteCount": frontend_write_count,
+                        "initializedFrontendCount": initialized_frontend_count,
+                        "eligibleFrontendCount": eligible_frontend_count,
+                        "idleListenerReady": idle_listener_ready,
                         "authGeneration": auth_generation,
                     });
                     let ack_path = marker_dir.join("hotswap-ack").join(format!("{pid}.json"));

@@ -5,9 +5,9 @@ use crate::auth::{account_token_fingerprint, auth_file_fingerprint};
 #[cfg(not(target_os = "linux"))]
 use crate::bounded_command;
 use crate::reload::{
-    binary_has_sighup_support, discover_codex_app_server_processes, discover_codex_cli_processes,
-    process_has_current_hot_swap_ack, process_identity_is_current, process_is_sighup_safe_target,
-    CodexProcess,
+    binary_has_sighup_support_for_runtime, discover_codex_app_server_processes,
+    discover_codex_cli_processes, hot_swap_runtime_kind, process_has_current_hot_swap_ack,
+    process_identity_is_current, process_is_sighup_safe_target, CodexProcess, HotSwapRuntimeKind,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -123,8 +123,13 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
     let processes = discover_codex_cli_processes()?
         .into_iter()
         .map(|process| {
-            let binary_has_markers =
-                cached_binary_has_sighup_support(&mut binary_marker_cache, &process.executable);
+            let binary_has_markers = hot_swap_runtime_kind(&process).is_some_and(|runtime_kind| {
+                cached_binary_has_sighup_support(
+                    &mut binary_marker_cache,
+                    &process.executable,
+                    runtime_kind,
+                )
+            });
             let ack_ready = process_has_current_hot_swap_ack(&process, auth_path);
             classify_process_readiness(&process, binary_has_markers, ack_ready, false, false)
         })
@@ -140,8 +145,13 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
     let app_servers = discover_codex_app_server_processes()?
         .into_iter()
         .map(|process| {
-            let binary_has_markers =
-                cached_binary_has_sighup_support(&mut binary_marker_cache, &process.executable);
+            let binary_has_markers = hot_swap_runtime_kind(&process).is_some_and(|runtime_kind| {
+                cached_binary_has_sighup_support(
+                    &mut binary_marker_cache,
+                    &process.executable,
+                    runtime_kind,
+                )
+            });
             let ack_ready = process_has_current_hot_swap_ack(&process, auth_path);
             let fresh_start_ready = app_server_started_after_auth_file(&process, auth_path);
             classify_process_readiness(
@@ -207,12 +217,17 @@ fn token_fingerprints_match(active: Option<&str>, auth: Option<&str>) -> bool {
         .is_some_and(|(active, auth)| active == auth)
 }
 
-fn cached_binary_has_sighup_support(cache: &mut HashMap<PathBuf, bool>, path: &Path) -> bool {
-    if let Some(has_support) = cache.get(path) {
+fn cached_binary_has_sighup_support(
+    cache: &mut HashMap<(PathBuf, HotSwapRuntimeKind), bool>,
+    path: &Path,
+    runtime_kind: HotSwapRuntimeKind,
+) -> bool {
+    let key = (path.to_path_buf(), runtime_kind);
+    if let Some(has_support) = cache.get(&key) {
         return *has_support;
     }
-    let has_support = binary_has_sighup_support(path);
-    cache.insert(path.to_path_buf(), has_support);
+    let has_support = binary_has_sighup_support_for_runtime(path, runtime_kind);
+    cache.insert(key, has_support);
     has_support
 }
 

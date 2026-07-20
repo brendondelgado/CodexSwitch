@@ -429,6 +429,14 @@ struct DesktopStatusTests {
         #expect(DesktopPatchAttemptOutcome.completed.shouldStopPostQuitRetry)
     }
 
+    @Test("Managed desktop update relaunch stays in the background")
+    func managedDesktopUpdateRelaunchStaysInBackground() {
+        #expect(
+            AppDelegate.desktopUpdateRelaunchArguments(appPath: "/Applications/ChatGPT.app")
+                == ["-g", "/Applications/ChatGPT.app"]
+        )
+    }
+
     @Test("Desktop patch lease serializes local and cross-process attempts")
     func desktopPatchLeaseSerializesAttempts() throws {
         let directory = FileManager.default.temporaryDirectory

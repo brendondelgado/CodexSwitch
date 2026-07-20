@@ -78,6 +78,17 @@ APP_SERVER_LAUNCHER_CONTENT = (
     "return t}"
 )
 
+NATIVE_UPDATER_BOOTSTRAP_CONTENT = (
+    "sparkleManager:new aH({enableUpdater:r.a.shouldIncludeUpdater("
+    "o,process.platform,process.env),buildFlavor:o,isPackaged:a.app.isPackaged})"
+)
+
+NATIVE_UPDATER_MAIN_CONTENT = (
+    "m=i.a.shouldIncludeSparkle(o,process.platform,process.env),"
+    "h=i.a.shouldIncludeUpdater(o,process.platform,process.env),"
+    "g=i.a.allowDevtools(o)"
+)
+
 APP_SERVER_LAUNCHER_LEGACY_HEADROOM_CONTENT = (
     "var ae=new Set([`BREAKPAD_DUMP_LOCATION`,`CHROME_CRASHPAD_PIPE_NAME`,"
     "`CRASHPAD_HANDLER_PID`,`ELECTRON_CRASH_REPORTER_PROCESS_TYPE`]);"
@@ -447,6 +458,7 @@ class PatchAsarTests(unittest.TestCase):
             b"codexswitch-runtime-rotation-handoff-v1",
             b"CodexSwitch account/updated frontend write acknowledged after auth reload",
             b"codexswitch-hotswap-contract-v3",
+            b"codexswitch-hotswap-headless-idle-v1",
             b"codexswitch-hotswap-cli-contract-v3",
             b"Usage: /goal <objective>",
         )
@@ -1365,7 +1377,7 @@ class PatchAsarTests(unittest.TestCase):
 
             self.assertIn(patch_asar.FAST_FALLBACK_MARKER, target.read_text())
 
-    def test_required_renderer_patch_contract_includes_fast(self):
+    def test_required_desktop_patch_contract_includes_fast_and_native_updater(self):
         states = {
             "auth": True,
             "remote_recents": True,
@@ -1375,12 +1387,78 @@ class PatchAsarTests(unittest.TestCase):
             "selected_model_label": True,
             "gpt56_max_effort": True,
             "remote_model_refresh": True,
+            "native_updater": True,
         }
-        self.assertTrue(patch_asar.required_renderer_patches_present(**states))
+        self.assertTrue(patch_asar.required_desktop_patches_present(**states))
 
         states["fast"] = False
 
-        self.assertFalse(patch_asar.required_renderer_patches_present(**states))
+        self.assertFalse(patch_asar.required_desktop_patches_present(**states))
+
+        states["fast"] = True
+        states["native_updater"] = False
+
+        self.assertFalse(patch_asar.required_desktop_patches_present(**states))
+
+    def test_native_updater_patch_covers_bootstrap_and_main_bundles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build = root / ".vite" / "build"
+            build.mkdir(parents=True)
+            bootstrap = build / "bootstrap-current.js"
+            main = build / "main-current.js"
+            unrelated = build / "preload.js"
+            bootstrap.write_text(NATIVE_UPDATER_BOOTSTRAP_CONTENT)
+            main.write_text(NATIVE_UPDATER_MAIN_CONTENT)
+            unrelated.write_text("const updater = null;")
+
+            files = patch_asar.find_native_updater_files(root)
+
+            self.assertEqual(files, [bootstrap, main])
+            self.assertFalse(patch_asar.native_updater_patch_present(files))
+            self.assertTrue(patch_asar.apply_native_updater_disable_patch(files))
+            self.assertTrue(patch_asar.native_updater_patch_present(files))
+            for target in files:
+                patched = target.read_text()
+                self.assertIn(patch_asar.NATIVE_UPDATER_DISABLED_MARKER, patched)
+                self.assertIn("&&", patched)
+                self.assertIn(",!1)", patched)
+
+            first = [path.read_text() for path in files]
+            self.assertTrue(patch_asar.apply_native_updater_disable_patch(files))
+            self.assertEqual(first, [path.read_text() for path in files])
+
+    def test_native_updater_cache_cleanup_is_exact_and_symlink_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            root = patch_asar.native_updater_persistent_downloads_path(home)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir(parents=True)
+            second.mkdir()
+            (first / "update.zip").write_bytes(b"a" * 32)
+            (second / "update.zip").write_bytes(b"b" * 64)
+            unrelated = home / "Library" / "Caches" / "unrelated"
+            unrelated.mkdir(parents=True)
+            sentinel = unrelated / "keep"
+            sentinel.write_text("keep")
+
+            removed_entries, removed_bytes = (
+                patch_asar.cleanup_native_updater_persistent_downloads(root)
+            )
+
+            self.assertEqual(removed_entries, 2)
+            self.assertEqual(removed_bytes, 96)
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(sentinel.read_text(), "keep")
+
+            linked_root = Path(tmp) / "linked-root"
+            linked_root.symlink_to(unrelated, target_is_directory=True)
+            self.assertEqual(
+                patch_asar.cleanup_native_updater_persistent_downloads(linked_root),
+                (0, 0),
+            )
+            self.assertEqual(sentinel.read_text(), "keep")
 
     def test_main_requires_and_applies_fast_patch(self):
         source = inspect.getsource(patch_asar.main)
@@ -1388,6 +1466,12 @@ class PatchAsarTests(unittest.TestCase):
         self.assertIn("fast=fast_already_patched", source)
         self.assertIn("apply_required_fast_mode_patch(fast_mode_file)", source)
         self.assertNotIn("Skipping optional fast-mode fallback", source)
+
+    def test_main_requires_and_applies_native_updater_patch(self):
+        source = inspect.getsource(patch_asar.main)
+
+        self.assertIn("native_updater=native_updater_already_patched", source)
+        self.assertIn("apply_native_updater_disable_patch(native_updater_files)", source)
 
     def test_remove_headroom_env_patch_leaves_stock_launcher_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:

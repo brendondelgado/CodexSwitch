@@ -23,6 +23,18 @@ enum AppDelegateAccountsPersistenceOutcome: Equatable, Sendable {
     }
 }
 
+enum AppDelegateDesktopPatchRetryDisposition: Equatable, Sendable {
+    case retry
+    case stop
+    case relaunch
+}
+
+enum AppDelegateDurableConfigurationStatus: Equatable, Sendable {
+    case matches
+    case mismatch
+    case unavailable
+}
+
 private struct PreparedAccountActivation: Sendable {
     let swapGeneration: UInt64
     let activationGeneration: UUID
@@ -674,7 +686,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     ) {
         desktopPatchRetryTask?.cancel()
         desktopPatchRetryTask = Task.detached {
-            for delaySeconds in DesktopPatchManager.postQuitPatchRetryDelaysSeconds {
+            let retryDelays = DesktopPatchManager.postQuitPatchRetryDelaysSeconds
+            for (index, delaySeconds) in retryDelays.enumerated() {
                 let nanoseconds = UInt64(delaySeconds * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: nanoseconds)
                 guard !Task.isCancelled else { return }
@@ -688,24 +701,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         "DESKTOP_PATCH_RETRY reason=\(reason) delay_seconds=\(Int(delaySeconds)) outcome=\(outcome.logValue)"
                     )
                 )
-                if outcome.shouldStopPostQuitRetry {
-                    if relaunchAfterCompletion {
-                        Self.relaunchDesktopAppAfterUpdate()
-                    }
+                switch Self.desktopPatchRetryDisposition(
+                    after: outcome,
+                    hasRemainingAttempts: index + 1 < retryDelays.count,
+                    relaunchAfterCompletion: relaunchAfterCompletion
+                ) {
+                case .retry:
+                    continue
+                case .stop:
+                    return
+                case .relaunch:
+                    Self.relaunchDesktopAppAfterUpdate()
                     return
                 }
             }
-            if relaunchAfterCompletion {
-                Self.relaunchDesktopAppAfterUpdate()
-            }
         }
+    }
+
+    nonisolated static func desktopPatchRetryDisposition(
+        after outcome: DesktopPatchAttemptOutcome,
+        hasRemainingAttempts: Bool,
+        relaunchAfterCompletion: Bool
+    ) -> AppDelegateDesktopPatchRetryDisposition {
+        switch outcome {
+        case .completed, .notNeeded:
+            return relaunchAfterCompletion ? .relaunch : .stop
+        default:
+            guard !outcome.shouldStopPostQuitRetry, hasRemainingAttempts else {
+                return .stop
+            }
+            return .retry
+        }
+    }
+
+    nonisolated static func desktopUpdateRelaunchArguments(appPath: String) -> [String] {
+        ["-g", appPath]
     }
 
     nonisolated private static func relaunchDesktopAppAfterUpdate() {
         guard let appPath = CodexDesktopAppLocator.locate()?.appPath else { return }
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/open"),
-            arguments: ["-a", appPath],
+            arguments: desktopUpdateRelaunchArguments(appPath: appPath),
             timeout: 15
         )
         SwapLog.append(
@@ -810,26 +847,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 if self.codexAppTerminationTaskIdentifier == taskIdentifier {
                     self.codexAppTerminationTask = nil
                     self.codexAppTerminationTaskIdentifier = nil
-                }
-            }
-            if let state = self.accountManager.activationState,
-               state.phase == .confirmed,
-               let targetId = state.configuredAccountId {
-                do {
-                    let degraded = try await self.accountActivationCoordinator
-                        .demoteForRuntimeEvidenceLoss(
-                            targetAccountId: targetId,
-                            expectedActivationGeneration: state.activationGeneration,
-                            detail: .desktopRuntimeExited
-                        )
-                    self.accountManager.publishActivationState(degraded)
-                    self.statusBarController.updateIcon()
-                    self.updatePopoverContent()
-                } catch {
-                    await self.enterActivationManualReview(
-                        targetAccountId: targetId,
-                        detail: .runtimeEvidencePersistFailed
-                    )
                 }
             }
             do {
@@ -980,10 +997,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     discoveredRuntimeCount: 0,
                     acknowledgedRuntimeCount: 0,
                     detail: .restartRecoveredCommittedFiles
-                )
-            } else if stored.phase == .confirmed {
-                recovered = try await accountActivationCoordinator.demoteConfirmedForLaunch(
-                    targetAccountId: target.id
                 )
             } else {
                 recovered = stored
@@ -1184,6 +1197,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return credentialsMatch(account, observed)
     }
 
+    nonisolated static func durableConfiguredFilesStatus(
+        account: CodexAccount,
+        accounts: [CodexAccount],
+        authObservation: AccountAuthObservation
+    ) -> AppDelegateDurableConfigurationStatus {
+        guard accountStoreMatches(account: account, accounts: accounts) else {
+            return .mismatch
+        }
+
+        switch authObservation {
+        case .valid(let observed):
+            return credentialsMatch(account, observed) ? .matches : .mismatch
+        case .unreadable:
+            return .unavailable
+        case .invalid(.ancestorChanged), .invalid(.changedDuringRead):
+            return .unavailable
+        case .absent, .invalid:
+            return .mismatch
+        }
+    }
+
     nonisolated static func accountStoreMatches(
         account: CodexAccount,
         accounts: [CodexAccount]
@@ -1228,16 +1262,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         existing ?? imported
     }
 
-    private func durableConfiguredFilesMatch(_ account: CodexAccount) async -> Bool {
+    private func durableConfiguredFilesStatus(
+        _ account: CodexAccount
+    ) async -> AppDelegateDurableConfigurationStatus {
         do {
             let accounts = try await accountPersistence.loadAll()
-            return Self.accountStoreMatches(account: account, accounts: accounts)
-                && Self.authFileMatches(account: account, atPath: Self.codexAuthPath)
+            let status = Self.durableConfiguredFilesStatus(
+                account: account,
+                accounts: accounts,
+                authObservation: AccountImporter.observeCurrentAccount(
+                    from: Self.codexAuthPath
+                )
+            )
+            if status == .unavailable {
+                SwapLog.append(.debug(
+                    "ACTIVATION_DURABLE_READ_UNAVAILABLE target=\(account.id.uuidString) source=auth"
+                ))
+            }
+            return status
         } catch {
             SwapLog.append(.debug(
                 "ACTIVATION_DURABLE_READ_FAILED target=\(account.id.uuidString) error=\(error.localizedDescription)"
             ))
+            return .unavailable
+        }
+    }
+
+    private func durableConfiguredFilesMatch(_ account: CodexAccount) async -> Bool {
+        await durableConfiguredFilesStatus(account) == .matches
+    }
+
+    static func runtimePermitAllowsDurableConfiguration(
+        _ status: AppDelegateDurableConfigurationStatus,
+        requiredPhase: AccountActivationPhase,
+        enterManualReview: () async -> Void
+    ) async -> Bool {
+        switch status {
+        case .matches:
+            return true
+        case .unavailable where requiredPhase == .confirmed:
             return false
+        case .mismatch, .unavailable:
+            await enterManualReview()
+            return false
+        }
+    }
+
+    private func durableConfigurationAllowsRuntimePermit(
+        for account: CodexAccount,
+        activationGeneration: UUID,
+        requiredPhase: AccountActivationPhase
+    ) async -> Bool {
+        let status = await durableConfiguredFilesStatus(account)
+        if status == .unavailable, requiredPhase == .confirmed {
+            SwapLog.append(.debug(
+                "ACTIVATION_CONFIRMED_EVIDENCE_REFRESH_DEFERRED target=\(account.id.uuidString) reason=durable_read_unavailable"
+            ))
+        }
+        return await Self.runtimePermitAllowsDurableConfiguration(
+            status,
+            requiredPhase: requiredPhase
+        ) {
+            guard self.accountManager.activationState?.phase == requiredPhase,
+                  self.accountManager.activationState?.configuredAccountId == account.id,
+                  self.accountManager.activationState?.activationGeneration
+                    == activationGeneration else {
+                return
+            }
+            await self.enterActivationManualReview(
+                targetAccountId: account.id,
+                detail: .durableConfigurationChanged
+            )
         }
     }
 
@@ -1272,7 +1367,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         for account: CodexAccount
     ) async -> AccountActivationRuntimeEvidenceDecision {
         await Task.detached(priority: .userInitiated) {
-            let observedAt = Date()
             let authURL = URL(fileURLWithPath: Self.codexAuthPath)
             guard Self.authFileMatches(account: account, atPath: Self.codexAuthPath),
                   let expectedAuthIdentity = SwapEngine.authFileIdentity(
@@ -1291,6 +1385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let desktop = SwapEngine.localRuntimeEvidenceSnapshot(
                 runtimeKind: .externalAppServer
             )
+            let observedAt = Date()
             return AccountActivationRuntimeEvidenceEvaluator.evaluate(
                 cli: cli,
                 desktop: desktop,
@@ -1301,10 +1396,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }.value
     }
 
-    private func activationStateForRequest(at date: Date = Date()) async -> AccountActivationState? {
+    private func activationStateForRequest(at _: Date = Date()) async -> AccountActivationState? {
         do {
-            let durable = try await accountActivationCoordinator
-                .demoteExpiredConfirmationIfNeeded(at: date)
+            let durable = try await accountActivationCoordinator.load()
             if durable != accountManager.activationState {
                 accountManager.publishActivationState(durable)
                 statusBarController?.updateIcon()
@@ -1328,12 +1422,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard accountManager.activationState?.phase == requiredPhase,
               accountManager.activationState?.configuredAccountId == account.id,
               accountManager.activationState?.activationGeneration == activationGeneration,
-              accountManager.configuredAccount?.id == account.id,
-              await durableConfiguredFilesMatch(account) else {
+              accountManager.configuredAccount?.id == account.id else {
             await enterActivationManualReview(
                 targetAccountId: account.id,
                 detail: .durableConfigurationChanged
             )
+            return nil
+        }
+        guard await durableConfigurationAllowsRuntimePermit(
+            for: account,
+            activationGeneration: activationGeneration,
+            requiredPhase: requiredPhase
+        ) else {
             return nil
         }
 
@@ -1341,12 +1441,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard accountManager.activationState?.phase == requiredPhase,
               accountManager.activationState?.configuredAccountId == account.id,
               accountManager.activationState?.activationGeneration == activationGeneration,
-              accountManager.configuredAccount?.id == account.id,
-              await durableConfiguredFilesMatch(account) else {
+              accountManager.configuredAccount?.id == account.id else {
             await enterActivationManualReview(
                 targetAccountId: account.id,
                 detail: .durableConfigurationChanged
             )
+            return nil
+        }
+        guard await durableConfigurationAllowsRuntimePermit(
+            for: account,
+            activationGeneration: activationGeneration,
+            requiredPhase: requiredPhase
+        ) else {
             return nil
         }
 
@@ -1388,6 +1494,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             return permit
         case .denied(let detail, let discovered, let acknowledged):
+            guard requiredPhase != .confirmed else {
+                return nil
+            }
             do {
                 let degraded = try await accountActivationCoordinator.demoteForRuntimeEvidenceLoss(
                     targetAccountId: account.id,
@@ -1644,11 +1753,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return
             }
 
+            let synchronizedAccounts: [CodexAccount]
+            switch LinuxDevboxMonitor.credentialSyncAccountsPreservingRemoteActive(
+                accounts: accounts,
+                remoteActiveProviderAccountId: baseline.activeProviderAccountId
+            ) {
+            case .success(let value):
+                synchronizedAccounts = value
+            case .failure(let failure):
+                await finishSync(.failure(failure))
+                return
+            }
+            let synchronizedFingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(
+                accounts: synchronizedAccounts
+            )
+
             let operation: LinuxDevboxCredentialSyncOperation
             switch LinuxDevboxMonitor.makeCredentialSyncOperation(
                 settings: settings,
-                accounts: accounts,
-                credentialFingerprint: fingerprint,
+                accounts: synchronizedAccounts,
+                credentialFingerprint: synchronizedFingerprint,
                 baseline: baseline
             ) {
             case .success(let value):
@@ -1670,7 +1794,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
             var result = LinuxDevboxMonitor.syncCredentials(
                 settings: settings,
-                accounts: accounts,
+                accounts: synchronizedAccounts,
                 operation: operation
             )
             do {

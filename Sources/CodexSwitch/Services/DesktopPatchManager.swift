@@ -13,6 +13,7 @@ enum DesktopRuntimeHotSwapState: Sendable, Equatable {
 
 enum HotSwapRuntimeKind: String, Decodable, Sendable, Equatable {
     case externalAppServer = "external-app-server"
+    case headlessRemoteControlAppServer = "headless-remote-control-app-server"
     case localInteractiveCLI = "local-interactive-cli"
 }
 
@@ -315,6 +316,7 @@ enum DesktopPatchManager {
     private nonisolated static let selectedModelLabelFallbackMarker = "CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK"
     private nonisolated static let gpt56MaxEffortFallbackMarker = "CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK"
     private nonisolated static let remoteModelRefreshMarker = "CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH"
+    private nonisolated static let nativeUpdaterDisabledMarker = "CODEXSWITCH_NATIVE_UPDATER_DISABLED_V1"
     private nonisolated static let fastPatchMarker = "_bundledFastModels"
     private nonisolated static let bundledPluginListRootPatchMarker = "CODEXSWITCH_BUNDLED_PLUGIN_LIST_ROOT_PATCH"
     private nonisolated static let goalUsageMarker = "Usage: /goal <objective>"
@@ -743,6 +745,7 @@ enum DesktopPatchManager {
             && fileContainsMarker(selectedModelLabelFallbackMarker, at: asarPath)
             && fileContainsMarker(gpt56MaxEffortFallbackMarker, at: asarPath)
             && fileContainsMarker(remoteModelRefreshMarker, at: asarPath)
+            && fileContainsMarker(nativeUpdaterDisabledMarker, at: asarPath)
         let remoteRecents = fileContainsMarker(remoteRecentsPatchMarker, at: asarPath)
         let fast = fileContainsMarker(fastPatchMarker, at: asarPath)
         let bundledPluginListRoot = fileContainsMarker(bundledPluginListRootPatchMarker, at: asarPath)
@@ -794,7 +797,11 @@ enum DesktopPatchManager {
     }
 
     nonisolated static func bundledCLIHasHotSwapPatch() -> Bool {
-        (RuntimeHotSwapContract.commonMarkers + RuntimeHotSwapContract.externalAppServerMarkers)
+        (
+            RuntimeHotSwapContract.commonMarkers
+                + RuntimeHotSwapContract.externalAppServerMarkers
+                + RuntimeHotSwapContract.headlessRemoteControlMarkers
+        )
             .allSatisfy { fileContainsMarker($0, at: bundledCLIPath) }
             && fileHasGoalSupport(at: bundledCLIPath)
     }

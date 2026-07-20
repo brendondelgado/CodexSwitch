@@ -125,7 +125,8 @@ actor AccountActivationCoordinator {
             let snapshot = try lockedFile.read()
             let current = try Self.decode(snapshot.bytes)
             let effective: AccountActivationState?
-            if let current,
+            if kind == .manual,
+               let current,
                current.phase == .confirmed,
                !current.authorizesAutomaticMutations(at: date) {
                 effective = .committedDegraded(
@@ -246,63 +247,6 @@ actor AccountActivationCoordinator {
                 targetAccountId: targetAccountId,
                 detail: detail,
                 activationGeneration: UUID(),
-                retryAttempt: 0,
-                nextRetryAt: date,
-                at: date
-            )
-        }
-    }
-
-    @discardableResult
-    func demoteExpiredConfirmationIfNeeded(
-        at date: Date = Date()
-    ) throws -> AccountActivationState? {
-        try transaction.withExclusiveLock { lockedFile in
-            let snapshot = try lockedFile.read()
-            guard let current = try Self.decode(snapshot.bytes) else { return nil }
-            guard current.phase == .confirmed,
-                  !current.authorizesAutomaticMutations(at: date) else {
-                return current
-            }
-            let degraded = AccountActivationState.committedDegraded(
-                targetAccountId: current.configuredAccountId!,
-                detail: .runtimeEvidenceExpired,
-                activationGeneration: current.activationGeneration,
-                retryAttempt: current.retryAttempt,
-                nextRetryAt: date,
-                discoveredRuntimeCount: current.discoveredRuntimeCount,
-                acknowledgedRuntimeCount: current.acknowledgedRuntimeCount,
-                at: date
-            )
-            try Self.validate(degraded)
-            let readback = try lockedFile.replace(
-                try Self.encode(degraded),
-                expectedGeneration: snapshot.generation
-            )
-            guard try Self.decode(readback.bytes) == degraded else {
-                throw AccountActivationCoordinatorError.readbackMismatch
-            }
-            return degraded
-        }
-    }
-
-    @discardableResult
-    func demoteConfirmedForLaunch(
-        targetAccountId: UUID,
-        at date: Date = Date()
-    ) throws -> AccountActivationState {
-        try transition { current in
-            guard let current,
-                  current.phase == .confirmed,
-                  current.configuredAccountId == targetAccountId else {
-                throw AccountActivationCoordinatorError.invalidTransition(
-                    "launch revalidation does not match confirmed activation"
-                )
-            }
-            return .committedDegraded(
-                targetAccountId: targetAccountId,
-                detail: .launchRuntimeEvidenceExpired,
-                activationGeneration: current.activationGeneration,
                 retryAttempt: 0,
                 nextRetryAt: date,
                 at: date

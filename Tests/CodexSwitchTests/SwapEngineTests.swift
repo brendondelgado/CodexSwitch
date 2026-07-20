@@ -375,9 +375,18 @@ struct SwapEngineTests {
         ownerUID: UInt32 = 501,
         arguments: [String]? = nil
     ) -> CodexRuntimeTarget {
-        let defaultArguments = runtimeKind == .externalAppServer
-            ? ["codex", "app-server", "--analytics-default-enabled"]
-            : ["codex", "resume", "thread-\(pid)"]
+        let defaultArguments: [String]
+        switch runtimeKind {
+        case .externalAppServer:
+            defaultArguments = ["codex", "app-server", "--analytics-default-enabled"]
+        case .headlessRemoteControlAppServer:
+            defaultArguments = [
+                "codex", "app-server", "--remote-control", "--listen",
+                "ws://127.0.0.1:8390",
+            ]
+        case .localInteractiveCLI:
+            defaultArguments = ["codex", "resume", "thread-\(pid)"]
+        }
         let identity = signalIdentity(pid: pid, ownerUID: ownerUID)
         return CodexRuntimeTarget(
             process: CodexIdentityBoundProcess(
@@ -1663,6 +1672,97 @@ struct SwapEngineTests {
                 nowUnixMilliseconds: now
             ) == nil)
         }
+    }
+
+    @Test("External ACK distinguishes an idle listener from failed frontend delivery")
+    func externalAcknowledgementDistinguishesIdleListenerFromFailedDelivery() {
+        let target = runtimeTarget(pid: 41, runtimeKind: .headlessRemoteControlAppServer)
+        let binding = reloadBinding(target: target)
+        let now: Int64 = 1_500_200
+        let candidate = {
+            (
+                initialized: Int?,
+                eligible: Int?,
+                notified: Bool,
+                completed: Int,
+                idle: Bool
+            ) in
+            CodexReloadAcknowledgement(
+                binding: binding,
+                acknowledgedAtUnixMilliseconds: 1_500_100,
+                loadedTokenFingerprint: binding.authFileIdentity.completeTokenFingerprint,
+                activeTokenFingerprint: binding.authFileIdentity.completeTokenFingerprint,
+                frontendNotified: notified,
+                frontendWriteCount: completed,
+                authGeneration: 7,
+                reconnectReady: nil,
+                initializedFrontendCount: initialized,
+                eligibleFrontendCount: eligible,
+                idleListenerReady: idle
+            )
+        }
+        let isValid = { (acknowledgement: CodexReloadAcknowledgement) in
+            let artifacts = artifactSnapshots(
+                binding: binding,
+                acknowledgement: acknowledgement
+            )
+            return SwapEngine.validatedReloadAcknowledgement(
+                request: artifacts.0,
+                acknowledgement: artifacts.1,
+                currentBinding: binding,
+                expectedBinding: binding,
+                nowUnixMilliseconds: now
+            ) != nil
+        }
+
+        #expect(isValid(candidate(0, 0, false, 0, true)))
+        #expect(isValid(candidate(2, 2, true, 1, false)))
+        #expect(!isValid(candidate(nil, nil, true, 1, false)))
+        #expect(!isValid(candidate(nil, 2, true, 1, false)))
+        #expect(!isValid(candidate(2, nil, true, 1, false)))
+        #expect(!isValid(candidate(1, 2, true, 1, false)))
+        #expect(!isValid(candidate(nil, nil, false, 0, true)))
+        #expect(!isValid(candidate(1, 1, false, 0, true)))
+        #expect(!isValid(candidate(0, 1, false, 0, true)))
+        #expect(!isValid(candidate(0, 0, false, 0, false)))
+        #expect(!isValid(candidate(1, 1, false, 0, false)))
+        #expect(!isValid(candidate(1, 1, true, 2, false)))
+
+        let strictTarget = runtimeTarget(pid: 42, runtimeKind: .externalAppServer)
+        let strictBinding = reloadBinding(target: strictTarget)
+        let strictLegacyArtifacts = artifactSnapshots(binding: strictBinding)
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: strictLegacyArtifacts.0,
+            acknowledgement: strictLegacyArtifacts.1,
+            currentBinding: strictBinding,
+            expectedBinding: strictBinding,
+            nowUnixMilliseconds: now
+        ) != nil)
+
+        let strictIdle = CodexReloadAcknowledgement(
+            binding: strictBinding,
+            acknowledgedAtUnixMilliseconds: 1_500_100,
+            loadedTokenFingerprint: strictBinding.authFileIdentity.completeTokenFingerprint,
+            activeTokenFingerprint: strictBinding.authFileIdentity.completeTokenFingerprint,
+            frontendNotified: false,
+            frontendWriteCount: 0,
+            authGeneration: 7,
+            reconnectReady: nil,
+            initializedFrontendCount: 0,
+            eligibleFrontendCount: 0,
+            idleListenerReady: true
+        )
+        let strictArtifacts = artifactSnapshots(
+            binding: strictBinding,
+            acknowledgement: strictIdle
+        )
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: strictArtifacts.0,
+            acknowledgement: strictArtifacts.1,
+            currentBinding: strictBinding,
+            expectedBinding: strictBinding,
+            nowUnixMilliseconds: now
+        ) == nil)
     }
 
     @Test("Reload artifacts reject stale and future authority")

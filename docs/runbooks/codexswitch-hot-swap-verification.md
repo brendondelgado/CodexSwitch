@@ -97,12 +97,12 @@ contract expected for the discovered process rather than accepting whichever
 contract the acknowledgement claims. Both contracts require the exact request
 nonce and matching independently loaded and active auth fingerprints.
 
-An external ChatGPT desktop app-server uses the strict `external-app-server`
-contract. It must successfully parse the current auth source, prove that the
-newly cached auth fingerprint matches the independently parsed `auth.json`
-fingerprint, and deliver `account/updated` to at least one initialized frontend
-writer. Merely accepting a broadcast into the app-server's internal queue is not
-delivery. This proof is ACK contract version 3 and is advertised by the
+An external ChatGPT desktop or SSH app-server uses the strict
+`external-app-server` contract. It must successfully parse the current auth
+source, prove that the newly cached auth fingerprint matches the independently
+parsed `auth.json` fingerprint, and deliver `account/updated` to at least one
+initialized frontend writer. Merely accepting a broadcast into the app-server's
+internal queue is not delivery. This proof is ACK contract version 3 and is advertised by the
 `codexswitch-hotswap-contract-v3` capability marker together with
 `codexswitch-runtime-convergence-v3` and
 `codexswitch-runtime-rotation-handoff-v1`. Reloading the Rust backend
@@ -115,11 +115,18 @@ July 19, 2026 renderer incident placed that helper inside a lazy initializer whi
 calling it from module scope, producing an unhandled `ReferenceError`, provider
 unmount, renderer remount, and lost composer text. Reject and migrate that unsafe
 generation before launching the desktop app.
-An auth-only reload while no initialized frontend is connected does not satisfy
-this strict proof. Run a same-account canary with an initialized client attached
-and require a version 3 ACK whose nested binding matches the request, whose
-frontend delivery evidence is positive, and receipt of the `account/updated`
-notification before declaring the external runtime ready.
+
+The repository-owned `--remote-control --listen ws://...` service instead binds
+the request and ACK to `headless-remote-control-app-server` and advertises
+`codexswitch-hotswap-headless-idle-v1`. When its transport reports exactly zero
+initialized and eligible frontends, it may acknowledge an idle listener after
+the same auth reload and cache checks. That ACK explicitly marks idle-listener
+readiness, reports zero completed writes, and reports no frontend notification.
+It proves that a future client will initialize against the new auth manager; it
+does not claim a currently connected client was notified. A timeout or failed
+proof channel is not zero-frontends evidence. If any initialized frontend
+exists, at least one completed write remains mandatory. The strict
+`external-app-server` kind never accepts this idle shape.
 
 A local interactive CLI embeds an in-process app-server but has no desktop
 renderer writer. Its `local-interactive-cli` acknowledgement may complete after
@@ -228,6 +235,18 @@ After startup, reconcile the same target to `Confirmed` before declaring the
 deployment active. Interactive imports retain live convergence by default.
 
 ## Mac Activation Barrier Recovery
+
+A short runtime-evidence lease expiring is not itself an activation failure.
+Observe at least two lease-expiry intervals after a successful desktop swap and
+verify that CodexSwitch performs read-only evidence refreshes without another
+`DESKTOP_EXTERNAL_RELOAD_ATTEMPT`, `SIGHUP_SENT`, window activation, or
+`ACTIVATION_RETRY_STARTED`. If passive evidence is temporarily unavailable, the
+expired confirmation must block automatic mutation while remaining free of an
+automatic retry target. Only an explicit operator request, a committed
+credential change, or recovery of an interrupted commit may establish a new
+degraded convergence barrier. Restarting CodexSwitch or intentionally closing
+ChatGPT must not schedule a same-target reload; the next automatic effect first
+performs passive topology and identity proof.
 
 A Mac `durable_configuration_changed` manual-review record can be recovered
 only for its same configured account. CodexSwitch may attempt that recovery once
@@ -483,6 +502,16 @@ While CodexSwitch owns this path, it must disable Sparkle's automatic checks for
 the locally signed bundle so Sparkle does not repeatedly download an archive its
 privileged installer cannot accept.
 
+The compatibility patch must also disable updater initialization in the desktop
+main process. Verify the versioned marker in the extracted ASAR; defaults alone
+are not proof because ChatGPT can rewrite them while launching. A successful
+CodexSwitch-managed installation relaunches ChatGPT in the background (`open
+-g`) and must not foreground the app or discard text being composed elsewhere.
+Once the patched bundle and signature are verified with ChatGPT stopped, the
+patcher removes only the exact `com.openai.codex` Sparkle
+`PersistentDownloads` contents. Confirm the directory is empty or absent and
+that unrelated cache roots were not touched.
+
 Desktop status and readiness probes must inspect the currently available
 code-signing identity without importing certificates or private keys. Keychain
 repair is a mutation reserved for an explicit patch, build, or repair operation;
@@ -669,6 +698,10 @@ When a Mac-side Codex client is attached to the VPS app-server, the menubar may 
 - The detector must include both `codex-vps` terminal clients and Codex.app-launched `codex --remote ws://100.95.84.123:8390 ...` clients.
 - SSH/Tailscale tunnel helper processes are transport plumbing and must not be mistaken for an active Codex remote client.
 - The Mac menu app must not push local active-account swaps to the VPS. The VPS rotates itself through its own coordinator and hot-swap path even when the Mac is offline. The Mac may display VPS state in a clearly remote view and sync non-authoritative observations, but background sync preserves each host's active account unless that host's coordinator rotates it.
+- Automatic credential sync must invoke `update-bundle --preserve-active`, and
+  the generated bundle must identify the freshly observed VPS active provider
+  account. Reject the sync if that provider identity is missing from the Mac
+  pool; do not guess a replacement or promote the Mac active account.
 
 ## Pool Capacity Math
 
@@ -740,7 +773,8 @@ Every future hot-swap change must include tests for:
 - A fresh ACK from the running PID remains authoritative when the executable at that path was replaced after process start or the executable path cannot be resolved.
 - Desktop readiness rejects binaries that reload backend auth without broadcasting `account/updated` to the shell.
 - Missing or malformed auth produces no successful ACK and does not replace valid cached auth with `None`.
-- Zero initialized frontends, a closed frontend writer, and a same-second stale ACK cannot satisfy hot-swap verification.
+- Only the capability-bound `headless-remote-control-app-server` kind may use an explicit zero-count idle-listener ACK after verified auth reload. Strict external app-servers, a timeout, contradictory count, closed frontend writer, initialized frontend with zero completed writes, or same-second stale ACK cannot.
+- A successfully delivered SIGHUP marks runtime auth as potentially changed even when no ACK follows; import rollback requires verified compensating convergence or a durable `ManualReview` result.
 - The SIGHUP request nonce is unique per signal and must be echoed by the matching PID ACK.
 - An external app-server rejects a CLI-kind ACK, and a local interactive CLI accepts only its CLI-kind ACK with exact nonce/fingerprints plus auth-generation/reconnect readiness.
 - A stale in-process app-server handler exits on a closed outgoing channel before it can read the request; the request remains available for the live handler and injected-turn binding, while `account/updated` delivery to the TUI remains best-effort.

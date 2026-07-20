@@ -84,7 +84,7 @@ struct LinuxDevboxExportService: Sendable {
         guard exportedByHost.utf8.count <= Self.maximumInnerStringByteCount else {
             throw LinuxDevboxExportError.accountFieldTooLarge
         }
-        let exportAccounts = accounts.preferHighestUsablePlanActive()
+        let exportAccounts = accounts
         let active = exportAccounts.first(where: \.isActive)
         let metadata = LinuxDevboxBundleMetadata(
             schemaVersion: Self.schemaVersion,
@@ -270,23 +270,5 @@ struct LinuxDevboxExportService: Sendable {
                 }
             }
         }
-    }
-}
-
-private extension Array where Element == CodexAccount {
-    func preferHighestUsablePlanActive() -> [CodexAccount] {
-        var accounts = self
-        let active = accounts.first(where: \.isActive)
-        let target: CodexAccount?
-        if let active {
-            target = SwapEngine.selectPlanUpgradeCandidate(active: active, from: accounts) ?? active
-        } else {
-            target = SwapEngine.selectOptimalAccount(from: accounts) ?? accounts.first
-        }
-        guard let target else { return accounts }
-        for index in accounts.indices {
-            accounts[index].isActive = accounts[index].id == target.id
-        }
-        return accounts
     }
 }

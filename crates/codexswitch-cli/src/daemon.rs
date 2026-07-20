@@ -1360,6 +1360,7 @@ mod tests {
 
     fn verified_reload_summary() -> ReloadSummary {
         ReloadSummary {
+            sighup_sent: vec![42],
             signaled: vec![42],
             ..ReloadSummary::default()
         }
@@ -1754,9 +1755,9 @@ mod tests {
             move |_| {
                 *reloads_for_closure.lock().unwrap() += 1;
                 Ok(ReloadSummary {
+                    sighup_sent: vec![42],
                     signaled: vec![42],
-                    restarted: Vec::new(),
-                    skipped: Vec::new(),
+                    ..ReloadSummary::default()
                 })
             },
         )?;

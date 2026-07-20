@@ -155,7 +155,7 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
             'mktemp -d /Applications/.codexswitch-app-install.'
         )
         staged_validation = installer.index('verify_bundle "$staged_path"')
-        quit_app = installer.index("tell application \"CodexSwitch\" to quit")
+        quit_app = installer.index('tell application id "com.codexswitch" to quit')
         self.assertLess(snapshot, manifest)
         self.assertLess(manifest, attestation)
         self.assertLess(attestation, preflight)
@@ -167,6 +167,15 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
         self.assertGreaterEqual(
             installer[:quit_app].count("verify_frozen_snapshot"), 3
         )
+
+    def test_installer_retires_every_codexswitch_bundle_copy_before_activation(self) -> None:
+        installer = self.installer
+        self.assertIn("codexswitch_process_pattern=", installer)
+        self.assertIn("/CodexSwitch\\.app/Contents/MacOS/CodexSwitch", installer)
+        self.assertIn("codexswitch_app_is_running()", installer)
+        self.assertIn('tell application id "com.codexswitch" to quit', installer)
+        self.assertGreaterEqual(installer.count("codexswitch_app_is_running"), 4)
+        self.assertIn("refusing to activate a second bundle copy", installer)
 
     def test_installer_enforces_snapshot_attestation_and_no_build_or_resign(self) -> None:
         installer = self.installer
@@ -222,7 +231,7 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
             self.assertIn("toc:", document)
             self.assertIn("cross_dependencies:", document)
             self.assertIn("version_control:", document)
-            self.assertIn("last_updated: 2026-07-14", document)
+            self.assertIn("last_updated: 2026-07-20", document)
         self.assertIn("## App Artifact Boundary", architecture)
         self.assertIn("codexswitch-macos-app-artifact-v1", architecture)
         self.assertIn("## App Installation", architecture)

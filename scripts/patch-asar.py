@@ -101,6 +101,7 @@ MODEL_AVAILABILITY_FALLBACK_MARKER = "CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK"
 SELECTED_MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK"
 REMOTE_MODEL_REFRESH_MARKER = "CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH"
 GPT56_MAX_EFFORT_FALLBACK_MARKER = "CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK"
+NATIVE_UPDATER_DISABLED_MARKER = "CODEXSWITCH_NATIVE_UPDATER_DISABLED_V1"
 BUNDLED_PLUGIN_MARKETPLACE_ROOT = str(
     APP_PATH / "Contents/Resources/plugins/openai-bundled"
 )
@@ -130,6 +131,7 @@ SIGHUP_REQUIRED_MARKERS = (
     b"codexswitch-runtime-rotation-handoff-v1",
     b"CodexSwitch account/updated frontend write acknowledged after auth reload",
     b"codexswitch-hotswap-contract-v3",
+    b"codexswitch-hotswap-headless-idle-v1",
     b"codexswitch-hotswap-cli-contract-v3",
 )
 GOAL_USAGE_MARKER = b"Usage: /goal <objective>"
@@ -1770,7 +1772,129 @@ def apply_required_fast_mode_patch(file_path: Path) -> bool:
     )
 
 
-def required_renderer_patches_present(
+def find_native_updater_files(extract_dir: Path) -> list[Path]:
+    """Find desktop main-process bundles that decide whether to start an updater."""
+    build_dir = extract_dir / ".vite" / "build"
+    if not build_dir.is_dir():
+        return []
+    return sorted(
+        path
+        for path in build_dir.glob("*.js")
+        if ".shouldIncludeUpdater(" in path.read_text()
+    )
+
+
+def native_updater_patch_present(files: list[Path]) -> bool:
+    return bool(files) and all(
+        NATIVE_UPDATER_DISABLED_MARKER in path.read_text() for path in files
+    )
+
+
+def apply_native_updater_disable_patch(files: list[Path]) -> bool:
+    """Disable native updater startup in every desktop main-process bundle."""
+    if not files:
+        print("ERROR: Cannot find desktop native updater initialization")
+        return False
+
+    updater_call = re.compile(r"\.shouldIncludeUpdater\(([^()\n]*)\)")
+    for path in files:
+        content = path.read_text()
+        if NATIVE_UPDATER_DISABLED_MARKER in content:
+            continue
+        patched, count = updater_call.subn(
+            lambda match: (
+                f'{match.group(0)}&&(\"{NATIVE_UPDATER_DISABLED_MARKER}\",!1)'
+            ),
+            content,
+        )
+        if count == 0:
+            print(f"ERROR: Cannot patch native updater initialization in {path.name}")
+            return False
+        path.write_text(patched)
+
+    if not native_updater_patch_present(files):
+        print("ERROR: Native updater disable marker missing after patch")
+        return False
+    print(f"  Disabled native updater initialization in {len(files)} main-process bundle(s)")
+    return True
+
+
+def native_updater_persistent_downloads_path(home: Path | None = None) -> Path:
+    base = home or Path.home()
+    return (
+        base
+        / "Library"
+        / "Caches"
+        / "com.openai.codex"
+        / "org.sparkle-project.Sparkle"
+        / "PersistentDownloads"
+    )
+
+
+def cleanup_native_updater_persistent_downloads(
+    cache_root: Path | None = None,
+) -> tuple[int, int]:
+    """Remove only the disabled native updater's bounded persistent downloads."""
+    root = cache_root or native_updater_persistent_downloads_path()
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        return (0, 0)
+    except OSError as exc:
+        print(f"WARNING: Cannot inspect native updater cache: {exc}")
+        return (0, 0)
+
+    if (
+        stat.S_ISLNK(root_stat.st_mode)
+        or not stat.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != os.getuid()
+    ):
+        print("WARNING: Refusing linked, non-directory, or foreign-owned native updater cache")
+        return (0, 0)
+
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        print(f"WARNING: Cannot enumerate native updater cache: {exc}")
+        return (0, 0)
+    if len(entries) > 4096:
+        print("WARNING: Refusing native updater cache with more than 4096 entries")
+        return (0, 0)
+
+    removed_entries = 0
+    removed_bytes = 0
+    for entry in entries:
+        try:
+            metadata = entry.lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                removed_bytes += metadata.st_size
+            elif stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                for directory, _, names in os.walk(entry, followlinks=False):
+                    for name in names:
+                        try:
+                            child = Path(directory) / name
+                            child_metadata = child.lstat()
+                            if stat.S_ISREG(child_metadata.st_mode):
+                                removed_bytes += child_metadata.st_size
+                        except OSError:
+                            pass
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed_entries += 1
+        except OSError as exc:
+            print(f"WARNING: Native updater cache cleanup stopped at {entry.name}: {exc}")
+            break
+
+    if removed_entries:
+        print(
+            "  Removed native updater persistent downloads: "
+            f"entries={removed_entries} bytes={removed_bytes}"
+        )
+    return (removed_entries, removed_bytes)
+
+
+def required_desktop_patches_present(
     *,
     auth: bool,
     remote_recents: bool,
@@ -1780,6 +1904,7 @@ def required_renderer_patches_present(
     selected_model_label: bool,
     gpt56_max_effort: bool,
     remote_model_refresh: bool,
+    native_updater: bool,
 ) -> bool:
     return all(
         (
@@ -1791,6 +1916,7 @@ def required_renderer_patches_present(
             selected_model_label,
             gpt56_max_effort,
             remote_model_refresh,
+            native_updater,
         )
     )
 
@@ -3406,6 +3532,10 @@ def main():
     if not remote_model_refresh_file:
         print("WARNING: Could not find remote model refresh JS file -- app structure may have changed")
         sys.exit(2)
+    native_updater_files = find_native_updater_files(extract_dir)
+    if not native_updater_files:
+        print("WARNING: Could not find native updater initialization -- app structure may have changed")
+        sys.exit(2)
     print(f"Found auth file: {auth_file.name}")
     print(f"Found fast-mode file: {fast_mode_file.name}")
     if remote_recents_file:
@@ -3413,7 +3543,8 @@ def main():
     print(f"Found model picker file: {model_label_file.name}")
     print(f"Found model filter file: {model_filter_file.name}")
     print(f"Found remote model refresh file: {remote_model_refresh_file.name}")
-    print("Desktop patch scope: auth hot-swap, Fast Mode metadata, remote sidebar/model refresh, and known-model availability/labels/efforts; bundled CLI and plugin files are preserved.")
+    print(f"Found native updater files: {', '.join(path.name for path in native_updater_files)}")
+    print("Desktop patch scope: auth hot-swap, Fast Mode metadata, remote sidebar/model refresh, known-model availability/labels/efforts, and native updater ownership; bundled CLI and plugin files are preserved.")
 
     auth_already_patched = current_auth_patch_present(auth_file.read_text())
     fast_already_patched = FAST_FALLBACK_MARKER in fast_mode_file.read_text()
@@ -3437,7 +3568,8 @@ def main():
     remote_model_refresh_already_patched = (
         REMOTE_MODEL_REFRESH_MARKER in remote_model_refresh_file.read_text()
     )
-    all_required_patches_present = required_renderer_patches_present(
+    native_updater_already_patched = native_updater_patch_present(native_updater_files)
+    all_required_patches_present = required_desktop_patches_present(
         auth=auth_already_patched,
         remote_recents=remote_recents_file is None or remote_recents_already_patched,
         fast=fast_already_patched,
@@ -3446,6 +3578,7 @@ def main():
         selected_model_label=selected_model_label_already_patched,
         gpt56_max_effort=gpt56_max_effort_already_patched,
         remote_model_refresh=remote_model_refresh_already_patched,
+        native_updater=native_updater_already_patched,
     )
     if all_required_patches_present:
         print("Already patched; verifying ASAR integrity metadata...")
@@ -3479,6 +3612,7 @@ def main():
                     rollback_bundled_cli,
                 )
                 sys.exit(1)
+        cleanup_native_updater_persistent_downloads()
         print("Already patched, nothing else to do.")
         sys.exit(0)
 
@@ -3517,6 +3651,10 @@ def main():
     if not remote_model_refresh_already_patched:
         if not apply_remote_model_refresh_patch(remote_model_refresh_file):
             print("ERROR: Remote model refresh patch failed")
+            sys.exit(1)
+    if not native_updater_already_patched:
+        if not apply_native_updater_disable_patch(native_updater_files):
+            print("ERROR: Native updater ownership patch failed")
             sys.exit(1)
     # ---- Repack ----
     print("Repacking app.asar (with --unpack for native modules)...")
@@ -3623,6 +3761,7 @@ def main():
         print("Cleaning up leftover app.asar.extracted directory...")
         shutil.rmtree(old_extracted, ignore_errors=True)
 
+    cleanup_native_updater_persistent_downloads()
     print("Done! Codex desktop app will use the patch on next restart.")
     sys.exit(0)
 

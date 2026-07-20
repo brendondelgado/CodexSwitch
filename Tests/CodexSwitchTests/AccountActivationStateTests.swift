@@ -251,8 +251,8 @@ struct AccountActivationStateTests {
         #expect(try await AccountActivationCoordinator(url: url).load() == confirmed)
     }
 
-    @Test("Confirmed runtime evidence becomes provisional on every launch")
-    func confirmedStateDemotesOnLaunch() async throws {
+    @Test("Coordinator launch preserves confirmation without arming reload")
+    func confirmedStatePersistsAcrossCoordinatorLaunch() async throws {
         let url = temporaryJournalURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let target = UUID()
@@ -267,21 +267,18 @@ struct AccountActivationStateTests {
             detail: .runtimeConfirmationPending,
             at: now
         )
-        _ = try await confirm(
+        let confirmed = try await confirm(
             coordinator,
             targetAccountId: target,
             runtimeCount: 2,
             at: now
         )
-        let provisional = try await coordinator.demoteConfirmedForLaunch(
-            targetAccountId: target,
-            at: now.addingTimeInterval(1)
-        )
+        let relaunched = AccountActivationCoordinator(url: url)
+        let restored = try #require(try await relaunched.load())
 
-        #expect(provisional.phase == .committedDegraded)
-        #expect(provisional.detail == .launchRuntimeEvidenceExpired)
-        #expect(provisional.runtimeCurrentAccountId == nil)
-        #expect(provisional.automaticRetryTarget(at: now.addingTimeInterval(1)) == target)
+        #expect(restored == confirmed)
+        #expect(restored.phase == .confirmed)
+        #expect(restored.automaticRetryTarget(at: .distantFuture) == nil)
     }
 
     @Test("Active credential mutation invalidates confirmed runtime evidence")
@@ -581,8 +578,8 @@ struct AccountActivationStateTests {
         #expect(try await coordinator.load() == review)
     }
 
-    @Test("Request evaluation durably demotes expired evidence before policy")
-    func expiredEvidenceDemotesBeforeRequestDecision() async throws {
+    @Test("Automatic requests preserve expired confirmation without arming reload")
+    func expiredEvidenceFailsClosedWithoutAutomaticDemotion() async throws {
         let url = temporaryJournalURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let target = UUID()
@@ -613,34 +610,44 @@ struct AccountActivationStateTests {
         #expect(!confirmed.runtimeIsCurrent(for: target, at: now.addingTimeInterval(10)))
 
         let other = UUID()
-        let decision = try await coordinator.beginAuthorizedCredentialMutation(
-            targetAccountId: other,
-            kind: .automatic,
-            at: now.addingTimeInterval(10)
+        for offset in stride(from: 10.0, through: 70.0, by: 10.0) {
+            let decision = try await coordinator.beginAuthorizedCredentialMutation(
+                targetAccountId: other,
+                kind: .automatic,
+                at: now.addingTimeInterval(offset)
+            )
+            guard case .blocked(let unchanged?, _) = decision else {
+                Issue.record("Expected expired confirmation to block automatic mutation")
+                return
+            }
+            #expect(unchanged == confirmed)
+            #expect(unchanged.phase == .confirmed)
+            #expect(unchanged.automaticRetryTarget(at: .distantFuture) == nil)
+            #expect(try await coordinator.load() == confirmed)
+        }
+
+        let sameTarget = try await coordinator.beginAuthorizedCredentialMutation(
+            targetAccountId: target,
+            kind: .manual,
+            at: now.addingTimeInterval(71)
         )
-        guard case .blocked(let degraded?, _) = decision else {
-            Issue.record("Expected expired confirmation to block and demote")
+        guard case .retrySameTarget(let degraded) = sameTarget else {
+            Issue.record("Explicit same-target recovery must establish a degraded barrier")
             return
         }
         #expect(degraded.phase == .committedDegraded)
-        #expect(degraded.runtimeCurrentAccountId == nil)
-        #expect(try await AccountActivationCoordinator(url: url).load() == degraded)
+        #expect(degraded.detail == .runtimeEvidenceExpired)
+        #expect(degraded.automaticRetryTarget(at: now.addingTimeInterval(71)) == target)
 
-        #expect(degraded.decision(
-            forRequestedTarget: other,
-            kind: .manual,
-            at: now.addingTimeInterval(11)
-        ) == .beginActivation)
-        #expect(degraded.decision(
-            forRequestedTarget: target,
-            kind: .manual,
-            at: now.addingTimeInterval(11)
-        ) == .retrySameTarget)
-
+        let reset = try await coordinator.resetForManualSameTargetRetry(
+            targetAccountId: target,
+            at: now.addingTimeInterval(71)
+        )
+        #expect(reset.phase == .committedDegraded)
         let crossTarget = try await coordinator.beginAuthorizedCredentialMutation(
             targetAccountId: other,
             kind: .manual,
-            at: now.addingTimeInterval(11)
+            at: now.addingTimeInterval(72)
         )
         guard case .prepared(let preparing, let previousState) = crossTarget else {
             Issue.record("Manual cross-target activation must provide an operator escape")
@@ -650,45 +657,6 @@ struct AccountActivationStateTests {
         #expect(previousState?.configuredAccountId == target)
         #expect(preparing.phase == .preparing)
         #expect(preparing.configuredAccountId == other)
-    }
-
-    @Test("Desktop runtime exit immediately demotes confirmed Mac ownership")
-    func desktopExitDemotesConfirmedState() async throws {
-        let url = temporaryJournalURL()
-        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let target = UUID()
-        let now = Date(timeIntervalSince1970: 1_800_003_000)
-        let coordinator = AccountActivationCoordinator(url: url)
-
-        _ = try await coordinator.beginPreparing(
-            targetAccountId: target,
-            kind: .automatic,
-            at: now
-        )
-        _ = try await coordinator.markCommittedDegraded(
-            targetAccountId: target,
-            discoveredRuntimeCount: 1,
-            acknowledgedRuntimeCount: 1,
-            detail: .runtimeConfirmationPending,
-            at: now
-        )
-        let confirmed = try await confirm(
-            coordinator,
-            targetAccountId: target,
-            runtimeCount: 1,
-            at: now
-        )
-        let degraded = try await coordinator.demoteForRuntimeEvidenceLoss(
-            targetAccountId: target,
-            expectedActivationGeneration: confirmed.activationGeneration,
-            detail: .desktopRuntimeExited,
-            at: now.addingTimeInterval(1)
-        )
-
-        #expect(degraded.phase == .committedDegraded)
-        #expect(degraded.detail == .desktopRuntimeExited)
-        #expect(degraded.runtimeCurrentAccountId == nil)
-        #expect(degraded.blocksAutomaticMutations)
     }
 
     private func confirm(

@@ -28,7 +28,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-14
+  last_updated: 2026-07-20
 ---
 
 # macOS Runtime Artifact
@@ -276,9 +276,12 @@ running process untouched.
 
 Activation copies the already validated bundle into a same-filesystem staging
 directory under `/Applications`, validates that copy, asks the old app to quit,
-and refuses replacement while its executable remains live. An existing app is
-replaced with `renameatx_np(..., RENAME_SWAP)` so the previous bundle remains
-the rollback object. A first installation uses one same-filesystem rename.
+and refuses replacement while any process launched from a bundle named
+`CodexSwitch.app` remains live. Process admission is bundle-path independent so
+a stale watchdog launch from a development build cannot coexist with or block
+verification of the canonical `/Applications` copy. An existing app is replaced
+with `renameatx_np(..., RENAME_SWAP)` so the previous bundle remains the
+rollback object. A first installation uses one same-filesystem rename.
 Installed validation or relaunch failure restores the previous bundle, or
 removes the failed first installation, before returning an error. A rollback
 failure preserves the recovery directory and reports its exact path.

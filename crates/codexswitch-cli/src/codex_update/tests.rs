@@ -103,7 +103,7 @@ mod tests {
         fs::create_dir_all(directory)?;
         let codex = directory.join("codex");
         let current_markers = if current_contract {
-            "codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3"
+            "codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-headless-idle-v1"
         } else {
             "legacy-desktop-auth-reload-contract"
         };
@@ -2012,8 +2012,10 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         let outgoing = fs::read_to_string(outgoing)?;
         let transport = fs::read_to_string(transport)?;
         assert!(outgoing.contains("BroadcastWithWriteAck"));
-        assert!(outgoing.contains("write_complete_tx: oneshot::Sender<usize>"));
+        assert!(outgoing.contains("write_complete_tx: oneshot::Sender<(usize, usize, usize)>"));
         assert!(transport.contains("connection_state.initialized.load"));
+        assert!(transport.contains("initialized_frontend_count"));
+        assert!(transport.contains("eligible_frontend_count"));
         assert!(transport.contains("Some(connection_write_tx)"));
         assert!(transport.contains("completed_writes"));
         assert!(transport.contains("matches!(result, Ok(Ok(())))"));
@@ -3444,7 +3446,7 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         let binary = temp_dir.path().join("codex");
         fs::write(
             &binary,
-            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\necho 'codex-cli 0.130.0'\n",
+            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-headless-idle-v1 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\necho 'codex-cli 0.130.0'\n",
         )
         .unwrap();
         set_executable(&binary).unwrap();
@@ -3459,7 +3461,7 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         fs::create_dir_all(prepared.parent().unwrap()).unwrap();
         fs::write(
             &prepared,
-            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\necho 'codex-cli 0.130.0'\n",
+            "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-headless-idle-v1 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\necho 'codex-cli 0.130.0'\n",
         )
         .unwrap();
         set_executable(&prepared).unwrap();
@@ -3916,12 +3918,20 @@ async fn run_turn() {
         assert!(patched.contains("codexswitch_auth_file_identity(&auth_path)"));
         assert!(patched.contains("codexswitch-runtime-convergence-v3"));
         assert!(patched.contains("codexswitch-hotswap-contract-v3"));
-        assert!(
-            patched.contains("codexswitch_validate_v3_binding(&request, \"external-app-server\")")
-        );
+        assert!(patched.contains("codexswitch-hotswap-headless-idle-v1"));
+        assert!(patched.contains("codexswitch_external_runtime_kind()"));
+        assert!(patched.contains("headless-remote-control-app-server"));
+        assert!(patched.contains(
+            "codexswitch_validate_v3_binding(&request, expected_runtime_kind)"
+        ));
         assert!(patched.contains("BroadcastWithWriteAck"));
         assert!(patched.contains("codexswitch_reload_auth_json_verified"));
         assert!(patched.contains("frontendWriteCount"));
+        assert!(patched.contains("initializedFrontendCount"));
+        assert!(patched.contains("eligibleFrontendCount"));
+        assert!(patched.contains("idleListenerReady"));
+        assert!(patched.contains("frontend delivery proof failed"));
+        assert!(patched.contains("initialized frontends without a completed writer"));
         assert!(patched.contains("requestNonce"));
         assert!(patched.contains("processIdentity"));
         assert!(patched.contains("kernelExecutableIdentity"));
