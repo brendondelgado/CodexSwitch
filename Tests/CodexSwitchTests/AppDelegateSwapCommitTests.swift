@@ -67,14 +67,19 @@ struct AppDelegateSwapCommitTests {
         #expect(source.contains("ACTIVATION_FILE_COMMIT_FAILURE_RECOVERED"))
     }
 
-    @Test("Launch recovery is limited to the configured retry-exhausted target")
-    func launchRecoveryRequiresExactRetryExhaustedTarget() {
+    @Test("Launch recovery is limited to a configured recoverable target")
+    func launchRecoveryRequiresExactRecoverableTarget() {
         let target = UUID()
         let other = UUID()
         let exhausted = AccountActivationState.manualReview(
             targetAccountId: target,
             detail: .automaticRetryLimitReached,
             retryAttempt: 4,
+            at: Date()
+        )
+        let durableReadback = AccountActivationState.manualReview(
+            targetAccountId: target,
+            detail: .durableConfigurationChanged,
             at: Date()
         )
         let unrelatedReview = AccountActivationState.manualReview(
@@ -84,19 +89,23 @@ struct AppDelegateSwapCommitTests {
             at: Date()
         )
 
-        #expect(AppDelegate.retryExhaustedLaunchRecoveryTarget(
+        #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
             state: exhausted,
             configuredAccountId: target
         ) == target)
-        #expect(AppDelegate.retryExhaustedLaunchRecoveryTarget(
+        #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
+            state: durableReadback,
+            configuredAccountId: target
+        ) == target)
+        #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
             state: exhausted,
             configuredAccountId: other
         ) == nil)
-        #expect(AppDelegate.retryExhaustedLaunchRecoveryTarget(
+        #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
             state: unrelatedReview,
             configuredAccountId: target
         ) == nil)
-        #expect(AppDelegate.retryExhaustedLaunchRecoveryTarget(
+        #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
             state: nil,
             configuredAccountId: target
         ) == nil)
@@ -140,7 +149,7 @@ struct AppDelegateSwapCommitTests {
         )
         let bridgeWait = try #require(source.range(of: "await desktopBridgeInstallation.value"))
         let recovery = try #require(
-            source.range(of: "await recoverRetryExhaustedActivationOnLaunch()")
+            source.range(of: "await recoverManualReviewActivationOnLaunch()")
         )
 
         #expect(bridgeWait.lowerBound < recovery.lowerBound)

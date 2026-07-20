@@ -320,7 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Task { @MainActor [self] in
             await loadAccounts()
             await desktopBridgeInstallation.value
-            await recoverRetryExhaustedActivationOnLaunch()
+            await recoverManualReviewActivationOnLaunch()
             restoreExternalRateLimitResetHolds()
 
             // Prune old diagnostic logs (>7 days)
@@ -4224,8 +4224,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         beginSameTargetRuntimeRetry(to: target, source: "automatic")
     }
 
-    private func recoverRetryExhaustedActivationOnLaunch() async {
-        guard let targetAccountId = Self.retryExhaustedLaunchRecoveryTarget(
+    private func recoverManualReviewActivationOnLaunch() async {
+        guard let targetAccountId = Self.manualReviewLaunchRecoveryTarget(
             state: accountManager.activationState,
             configuredAccountId: accountManager.configuredAccount?.id
         ), let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) else {
@@ -4283,13 +4283,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    nonisolated static func retryExhaustedLaunchRecoveryTarget(
+    nonisolated static func manualReviewLaunchRecoveryTarget(
         state: AccountActivationState?,
         configuredAccountId: UUID?
     ) -> UUID? {
         guard let state,
               state.phase == .manualReview,
-              state.detail == .automaticRetryLimitReached,
+              state.detail?.allowsManualSameTargetRetry == true,
               let targetAccountId = state.configuredAccountId,
               targetAccountId == configuredAccountId else {
             return nil
@@ -4304,10 +4304,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         topologyChanged: Bool
     ) -> UUID? {
         guard topologyIsFullyManaged,
-              topologyChanged else {
+              topologyChanged,
+              state?.detail == .automaticRetryLimitReached else {
             return nil
         }
-        return retryExhaustedLaunchRecoveryTarget(
+        return manualReviewLaunchRecoveryTarget(
             state: state,
             configuredAccountId: configuredAccountId
         )
@@ -4342,6 +4343,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self, !self.isExiting else { return false }
             do {
                 if resetsRetryBudget {
+                    if self.accountManager.activationState?.phase == .manualReview,
+                       self.accountManager.activationState?.detail
+                        == .durableConfigurationChanged {
+                        guard await self.durableConfiguredFilesMatch(target) else {
+                            self.accountManager.publishActivationNotice(
+                                "Stored account and auth file still disagree; activation remains paused"
+                            )
+                            return false
+                        }
+                    }
                     let reset = try await self.accountActivationCoordinator
                         .resetForManualSameTargetRetry(
                             targetAccountId: target.id,

@@ -31,6 +31,19 @@ enum AccountActivationDetail: String, Codable, Equatable, Sendable {
     case committedJournalUpdateFailed = "committed_journal_update_failed"
     case runtimeEvidencePersistFailed = "runtime_evidence_persist_failed"
     case fileCommitFailed = "activation_file_commit_failed"
+
+    var allowsManualSameTargetRetry: Bool {
+        switch self {
+        case .automaticRetryLimitReached, .durableConfigurationChanged:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var allowsManualCrossTargetEscape: Bool {
+        self == .automaticRetryLimitReached
+    }
 }
 
 enum AccountActivationRequestKind: Equatable, Sendable {
@@ -120,11 +133,14 @@ struct AccountActivationState: Codable, Equatable, Sendable {
         case .preparing:
             return .blocked("Mac account activation is incomplete; account changes are paused")
         case .manualReview:
-            if kind == .manual,
-               detail == .automaticRetryLimitReached {
-                return configuredAccountId == accountId
-                    ? .retrySameTarget
-                    : .beginActivation
+            if kind == .manual, let detail {
+                if configuredAccountId == accountId,
+                   detail.allowsManualSameTargetRetry {
+                    return .retrySameTarget
+                }
+                if detail.allowsManualCrossTargetEscape {
+                    return .beginActivation
+                }
             }
             return .blocked("Mac activation state needs manual review; account changes are paused")
         }

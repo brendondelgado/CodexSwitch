@@ -433,6 +433,47 @@ struct AccountActivationStateTests {
         #expect(try await coordinator.load() == review)
     }
 
+    @Test("Durable readback review permits only same-target reconciliation")
+    func durableReadbackReviewPermitsOnlySameTargetRetry() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let target = UUID()
+        let replacement = UUID()
+        let coordinator = AccountActivationCoordinator(url: url)
+
+        _ = try await coordinator.beginPreparing(targetAccountId: target, kind: .automatic)
+        let review = try await coordinator.markManualReview(
+            targetAccountId: target,
+            detail: .durableConfigurationChanged
+        )
+
+        #expect(review.decision(
+            forRequestedTarget: target,
+            kind: .manual
+        ) == .retrySameTarget)
+        guard case .blocked = review.decision(
+            forRequestedTarget: replacement,
+            kind: .manual
+        ) else {
+            Issue.record("Durable readback review must not authorize another account")
+            return
+        }
+        guard case .blocked = review.decision(
+            forRequestedTarget: target,
+            kind: .automatic
+        ) else {
+            Issue.record("Durable readback review must not authorize automatic recovery")
+            return
+        }
+
+        let reset = try await coordinator.resetForManualSameTargetRetry(
+            targetAccountId: target
+        )
+        #expect(reset.phase == .committedDegraded)
+        #expect(reset.configuredAccountId == target)
+        #expect(reset.retryAttempt == 0)
+    }
+
     @Test("Corrupt journal fails closed without replacing evidence")
     func corruptJournalFailsClosed() async throws {
         let url = temporaryJournalURL()

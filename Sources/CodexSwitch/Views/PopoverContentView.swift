@@ -60,11 +60,20 @@ struct PopoverContentView: View {
             return "Mac local: runtime reload incomplete; restart Codex required"
         case .manualReview where state.detail == .automaticRetryLimitReached:
             return "Mac local: retry limit reached; manual retry or restart required"
+        case .manualReview where state.detail == .durableConfigurationChanged:
+            return "Mac local: stored account changed; verify and retry current account"
         case .manualReview:
             return "Mac local: activation needs manual review; account changes paused"
         case .confirmed:
             return nil
         }
+    }
+
+    static func canRetryActivation(_ state: AccountActivationState?) -> Bool {
+        guard let state else { return false }
+        if state.phase == .committedDegraded { return true }
+        return state.phase == .manualReview
+            && state.detail?.allowsManualSameTargetRetry == true
     }
 
     /// Find the non-active account whose weekly resets soonest (for "Next Available" fallback)
@@ -292,9 +301,9 @@ struct PopoverContentView: View {
                             ?? "Mac local: configured only; runtime confirmation pending"
                         if !runtimeCurrent {
                             let activationPhase = manager.activationState?.phase
-                            let canRetryActivation = activationPhase == .committedDegraded
-                                || (activationPhase == .manualReview
-                                    && manager.activationState?.detail == .automaticRetryLimitReached)
+                            let canRetryActivation = Self.canRetryActivation(
+                                manager.activationState
+                            )
                             HStack(spacing: 4) {
                                 Image(systemName: activationPhase == .manualReview
                                     ? "exclamationmark.octagon.fill"

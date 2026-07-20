@@ -54,7 +54,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-19
+  last_updated: 2026-07-20
 ---
 
 # Runtime And Host Ownership
@@ -165,8 +165,19 @@ begins. Automatic requests remain blocked, same-target clicks remain
 reconciliation retries, and corrupt, unreadable, ambiguous, or inconsistent
 manual-review states remain hard barriers. This escape exists so a runtime that
 cannot acknowledge one configured account cannot pin the operator to that
-account indefinitely. `Confirmed` durably completes the barrier only for the
-lifetime of its evidence. Do not oscillate accounts automatically.
+account indefinitely.
+
+A `durable_configuration_changed` review is a narrower recoverable case. It may
+start only an explicit or one-shot launch reconciliation for the same configured
+account. Before the journal leaves `ManualReview`, CodexSwitch must re-read the
+account store and `auth.json` and prove the stable provider identity and complete
+access, refresh, and identity token set match exactly. A mismatch preserves the
+hard barrier, and this reason never permits a cross-account escape. Successful
+revalidation still requires fresh identity-bound acknowledgements from every
+discovered local runtime before publishing `Confirmed`.
+
+`Confirmed` durably completes the barrier only for the lifetime of its evidence.
+Do not oscillate accounts automatically.
 
 An explicit manual cross-account switch is authorized by the operator request
 plus exact durable agreement between the current account store and `auth.json`;

@@ -22,6 +22,22 @@ struct PopoverUXTests {
         )
     }
 
+    @Test("Durable readback review offers same-target verification")
+    @MainActor
+    func durableReadbackReviewOffersRetry() {
+        let state = AccountActivationState.manualReview(
+            targetAccountId: UUID(),
+            detail: .durableConfigurationChanged,
+            at: Date()
+        )
+
+        #expect(PopoverContentView.canRetryActivation(state))
+        #expect(
+            PopoverContentView.activationStatusLabel(for: state)
+                == "Mac local: stored account changed; verify and retry current account"
+        )
+    }
+
     @Test("Host ownership presentation keeps all three fields visible")
     @MainActor
     func hostOwnershipFieldsRemainSimultaneous() {

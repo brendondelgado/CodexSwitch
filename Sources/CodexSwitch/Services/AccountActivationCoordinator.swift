@@ -403,7 +403,7 @@ actor AccountActivationCoordinator {
                   current.configuredAccountId == targetAccountId,
                   current.phase == .committedDegraded
                     || (current.phase == .manualReview
-                        && current.detail == .automaticRetryLimitReached) else {
+                        && current.detail?.allowsManualSameTargetRetry == true) else {
                 throw AccountActivationCoordinatorError.invalidTransition(
                     "manual retry is not authorized for this target"
                 )

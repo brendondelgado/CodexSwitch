@@ -5,6 +5,7 @@ toc:
   - Readiness Contract
   - Swap Commit Contract
   - Rust Runtime Handoff Evidence
+  - Mac Activation Barrier Recovery
   - Rust Activation Barrier Recovery
   - Platform Gates
   - Unified ChatGPT Desktop Bundle
@@ -70,7 +71,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-19
+  last_updated: 2026-07-20
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -225,6 +226,21 @@ after repository deployment has positively proved the managed runtime idle.
 That command must publish an `Import/FileOnly` barrier without calling reload.
 After startup, reconcile the same target to `Confirmed` before declaring the
 deployment active. Interactive imports retain live convergence by default.
+
+## Mac Activation Barrier Recovery
+
+A Mac `durable_configuration_changed` manual-review record can be recovered
+only for its same configured account. CodexSwitch may attempt that recovery once
+after launch, after the desktop bridge is installed, or after an explicit retry.
+Before changing the journal or signalling a runtime, verify that exactly one
+account is configured and that its stable provider identity and complete access,
+refresh, and identity token set exactly match `~/.codex/auth.json`.
+
+If those durable files disagree, leave the review barrier intact. Do not select
+another account, rewrite either credential file, or delete the journal. If they
+agree, start a fresh same-target reconciliation generation and require current
+PID, start-time, executable, auth-file identity, and token-fingerprint evidence
+from every discovered local runtime before publishing `Confirmed`.
 
 ## Rust Activation Barrier Recovery
 
