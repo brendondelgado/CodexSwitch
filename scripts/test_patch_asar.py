@@ -239,6 +239,24 @@ CODEX_5018_REMOTE_RECENTS_SIGNAL_CONTENT = (
     "addAnyConversationCallback`}"
 )
 
+CHATGPT_5440_RECENT_THREADS_CONTENT = (
+    "class RequestClient{"
+    "async listRecentThreads({limit:e}){return(await this.sendRequest(`thread/list`,"
+    "{archived:!1,cursor:null,limit:e,modelProviders:null,sortKey:`updated_at`},"
+    "{priority:`background`,source:`thread_list`})).data}"
+    "async searchThreads({limit:e,query:t}){return[]}"
+    "}"
+    "class RecentThreadManager{"
+    "async listRecentThreads({cursor:e,limit:t,useStateDbOnly:n=!1,background:r=!1}){"
+    "let i={limit:t,cursor:e,sortKey:this.params.requestClient."
+    "getCompatibleThreadSortKey(this.recentConversationSortKey),modelProviders:null,"
+    "archived:!1,sourceKinds:wb,useStateDbOnly:n},a=await this.params.requestClient."
+    "sendRequest(`thread/list`,i,r?{priority:`background`,source:`recent_threads`}:"
+    "{source:`recent_threads`});return{...a,data:a.data.filter(e=>e.ephemeral!==!0)}}"
+    "async hydrateThreads(e,{includeTurns:t=!1}){return e}"
+    "}"
+)
+
 CODEX_5042_MODEL_PICKER_CONTENT = (
     "function DM(e){if(!e.trimStart().toLowerCase().startsWith(`gpt`))return e;"
     "return e}"
@@ -1042,6 +1060,67 @@ class PatchAsarTests(unittest.TestCase):
             )
             self.assertEqual(upgraded.count(patch_asar.REMOTE_RECENTS_REFRESH_MARKER), 1)
 
+    def test_find_recent_threads_state_db_file_matches_unique_manager(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            (assets / "unrelated.js").write_text("async listRecentThreads({limit:e}){}")
+            expected = assets / "app-main-current.js"
+            expected.write_text(CHATGPT_5440_RECENT_THREADS_CONTENT)
+
+            self.assertEqual(
+                patch_asar.find_recent_threads_state_db_file(assets),
+                expected,
+            )
+
+    def test_apply_recent_threads_state_db_patch_forces_only_sidebar_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-current.js"
+            target.write_text(CHATGPT_5440_RECENT_THREADS_CONTENT)
+
+            self.assertTrue(patch_asar.apply_recent_threads_state_db_patch(target))
+            patched = target.read_text()
+
+            self.assertTrue(patch_asar.has_recent_threads_state_db_patch(patched))
+            self.assertEqual(
+                patched.count(patch_asar.RECENT_THREADS_STATE_DB_MARKER),
+                1,
+            )
+            self.assertIn("sourceKinds:wb,useStateDbOnly:!0", patched)
+            self.assertIn(
+                "{archived:!1,cursor:null,limit:e,modelProviders:null,sortKey:`updated_at`}",
+                patched,
+            )
+
+    def test_apply_recent_threads_state_db_patch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-current.js"
+            target.write_text(CHATGPT_5440_RECENT_THREADS_CONTENT)
+
+            self.assertTrue(patch_asar.apply_recent_threads_state_db_patch(target))
+            once = target.read_text()
+            self.assertTrue(patch_asar.apply_recent_threads_state_db_patch(target))
+
+            self.assertEqual(target.read_text(), once)
+
+    def test_recent_threads_state_db_patch_rejects_ambiguous_manager(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "ambiguous.js"
+            manager = CHATGPT_5440_RECENT_THREADS_CONTENT.split(
+                "class RecentThreadManager{",
+                1,
+            )[1]
+            target.write_text(
+                CHATGPT_5440_RECENT_THREADS_CONTENT
+                + "class DuplicateRecentThreadManager{"
+                + manager
+            )
+
+            self.assertFalse(patch_asar.apply_recent_threads_state_db_patch(target))
+            self.assertNotIn(
+                patch_asar.RECENT_THREADS_STATE_DB_MARKER,
+                target.read_text(),
+            )
+
     def test_apply_model_label_fallback_patch_labels_gpt56_sol(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "app-initial-HASH.js"
@@ -1381,6 +1460,7 @@ class PatchAsarTests(unittest.TestCase):
         states = {
             "auth": True,
             "remote_recents": True,
+            "recent_threads_state_db": True,
             "fast": True,
             "model_label": True,
             "model_availability": True,

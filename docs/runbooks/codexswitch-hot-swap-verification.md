@@ -572,6 +572,13 @@ normal five-minute stale window, because the selected model and the picker
 options would then disagree even though the replacement app-server already
 advertises the new catalog.
 
+The ordinary recent-thread sidebar request must set `useStateDbOnly: true`.
+Without that compatibility patch, activating ChatGPT can synchronously scan a
+large `~/.codex/sessions` tree and leave the window unresponsive while the
+request runs. Verify the state-database path independently before patching, then
+verify the renderer request after relaunch. Do not change archive, search,
+hydration, or explicit repair requests as part of this optimization.
+
 Fast Mode compatibility is a model-metadata repair, not an account-entitlement
 bypass. Older desktop bundles gate Fast from `additionalSpeedTiers`; unified
 ChatGPT build `26.707.51957` and later service-tier layouts derive the picker
@@ -750,6 +757,7 @@ Before claiming hot-swap is fixed or ready:
 - [ ] The installed ASAR contains exactly one Fast compatibility marker declaration, and the patched renderer still honors an explicit `featureRequirements.fast_mode == false` prohibition.
 - [ ] The installed ASAR contains `CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2` exactly once, contains no nested legacy WeakMap helper, and a same-account auth notification produces no `_invalidateAccountQueries is not defined`, provider unmount, route remount, or window reload.
 - [ ] The installed ASAR contains `CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2`; its fallback adds no immediate mount refresh, polls at 60 seconds, retains native callback and startup updates, and clears its single timer on unmount.
+- [ ] The installed ASAR contains `CODEXSWITCH_RECENT_THREADS_STATE_DB_V1`, ordinary sidebar `thread/list` requests use `useStateDbOnly: true`, and archive/search/hydration behavior is unchanged.
 - [ ] The bundled `patch-asar.py` hash matches the source used for the CodexSwitch build, the desktop-patch log records Fast fallback application without a structure warning, and the ASAR integrity hash plus strict code-sign verification pass before relaunch.
 - [ ] A forced rotation changes the configured account and signals the expected process count.
 - [ ] From `CommittedDegraded`, an explicit cross-target operator selection starts a fresh activation while automatic rotation remains blocked.

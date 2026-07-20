@@ -730,6 +730,13 @@ no extra injected refresh at mount, preserves the native startup refresh, runs
 no more often than once per 60 seconds, and is cancelled when the owning effect
 unmounts.
 
+Ordinary recent-thread listing must use the app-server state database rather
+than scanning rollout JSONL files. The desktop compatibility patch forces
+`useStateDbOnly` only in the sidebar's `listRecentThreads` request; archive,
+search, hydration, and repair paths keep their upstream behavior. The indexed
+loading marker is required readiness evidence, and the patch must fail closed
+when the current method shape is missing or ambiguous.
+
 Rollback trust is not inherited from an earlier installed-app observation. The
 transaction validates the previous bundle through the official trust pipeline,
 captures a format-3 seal over its complete descriptor-rooted tree, revalidates

@@ -96,6 +96,7 @@ BUNDLED_PLUGIN_LIST_ROOT_MARKER = "CODEXSWITCH_BUNDLED_PLUGIN_LIST_ROOT_PATCH"
 LEGACY_REMOTE_RECENTS_REFRESH_MARKER = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH"
 REMOTE_RECENTS_REFRESH_MARKER = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2"
 REMOTE_RECENTS_REFRESH_INTERVAL_MS = 60_000
+RECENT_THREADS_STATE_DB_MARKER = "CODEXSWITCH_RECENT_THREADS_STATE_DB_V1"
 MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_MODEL_LABEL_FALLBACK"
 MODEL_AVAILABILITY_FALLBACK_MARKER = "CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK"
 SELECTED_MODEL_LABEL_FALLBACK_MARKER = "CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK"
@@ -1094,6 +1095,49 @@ def find_remote_recents_file(assets_dir: Path) -> Path | None:
     return None
 
 
+def _recent_threads_state_db_method(
+    content: str,
+) -> tuple[re.Match[str], int] | None:
+    """Locate the one recent-thread method that exposes useStateDbOnly."""
+    signature_re = re.compile(
+        r"async\s+listRecentThreads\(\{"
+        r"(?=[^{}]*\bcursor:)"
+        r"(?=[^{}]*\blimit:)"
+        r"(?=[^{}]*\bbackground:)"
+        r"[^{}]*\buseStateDbOnly:"
+        r"(?P<state>[A-Za-z_$][\w$]*)=![01]"
+        r"[^{}]*\}\)\{"
+    )
+    matches = list(signature_re.finditer(content))
+    if len(matches) != 1:
+        return None
+
+    match = matches[0]
+    next_method = content.find("}async ", match.end())
+    if next_method == -1:
+        return None
+    body_end = next_method + 1
+    body = content[match.end():body_end]
+    if (
+        "sendRequest(`thread/list`" not in body
+        or "source:`recent_threads`" not in body
+    ):
+        return None
+    return (match, body_end)
+
+
+def find_recent_threads_state_db_file(assets_dir: Path) -> Path | None:
+    """Find the renderer manager that loads the ordinary recent-thread list."""
+    if not assets_dir.exists():
+        return None
+    candidates = [
+        path
+        for path in sorted(assets_dir.glob("*.js"))
+        if _recent_threads_state_db_method(path.read_text()) is not None
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def find_model_label_file(assets_dir: Path) -> Path | None:
     """Find the unified desktop model picker that renders missing names as Custom."""
     if not assets_dir.exists():
@@ -1175,6 +1219,18 @@ def has_bundled_plugin_list_root_patch(content: str) -> bool:
 
 def has_remote_recents_refresh_patch(content: str) -> bool:
     return REMOTE_RECENTS_REFRESH_MARKER in content
+
+
+def has_recent_threads_state_db_patch(content: str) -> bool:
+    located = _recent_threads_state_db_method(content)
+    if located is None:
+        return False
+    match, body_end = located
+    body = content[match.end():body_end]
+    return (
+        RECENT_THREADS_STATE_DB_MARKER in body
+        and "useStateDbOnly:!0" in body
+    )
 
 
 def find_array_cleanup_function(content: str) -> str | None:
@@ -1898,6 +1954,7 @@ def required_desktop_patches_present(
     *,
     auth: bool,
     remote_recents: bool,
+    recent_threads_state_db: bool,
     fast: bool,
     model_label: bool,
     model_availability: bool,
@@ -1910,6 +1967,7 @@ def required_desktop_patches_present(
         (
             auth,
             remote_recents,
+            recent_threads_state_db,
             fast,
             model_label,
             model_availability,
@@ -2434,6 +2492,39 @@ def apply_remote_recents_refresh_patch(file_path: Path) -> bool:
 
     file_path.write_text(patched)
     print(f"  Patched remote recent conversation refresh: {file_path.name}")
+    return True
+
+
+def apply_recent_threads_state_db_patch(file_path: Path) -> bool:
+    """Keep ordinary sidebar recents on the indexed state-database path."""
+    content = file_path.read_text()
+    if has_recent_threads_state_db_patch(content):
+        print(f"  Already patched indexed recent-thread loading: {file_path.name}")
+        return True
+
+    located = _recent_threads_state_db_method(content)
+    if located is None:
+        print(f"ERROR: Could not isolate indexed recent-thread method in {file_path.name}")
+        return False
+    match, body_end = located
+    body = content[match.end():body_end]
+    state_var = match.group("state")
+    state_field_re = re.compile(
+        rf"\buseStateDbOnly:{re.escape(state_var)}(?=[,}}])"
+    )
+    if len(state_field_re.findall(body)) != 1:
+        print(f"ERROR: Could not isolate recent-thread state-db request in {file_path.name}")
+        return False
+
+    patched_body = state_field_re.sub("useStateDbOnly:!0", body, count=1)
+    patched_body = f'"{RECENT_THREADS_STATE_DB_MARKER}";' + patched_body
+    patched = content[:match.end()] + patched_body + content[body_end:]
+    if not has_recent_threads_state_db_patch(patched):
+        print(f"ERROR: Indexed recent-thread patch verification failed in {file_path.name}")
+        return False
+
+    file_path.write_text(patched)
+    print(f"  Patched indexed recent-thread loading: {file_path.name}")
     return True
 
 
@@ -3520,6 +3611,10 @@ def main():
     remote_recents_file = find_remote_recents_file(assets_dir)
     if not remote_recents_file:
         print("WARNING: Could not find remote recents JS file -- skipping optional remote sidebar refresh patch")
+    recent_threads_state_db_file = find_recent_threads_state_db_file(assets_dir)
+    if not recent_threads_state_db_file:
+        print("WARNING: Could not find indexed recent-thread JS file -- app structure may have changed")
+        sys.exit(2)
     model_label_file = find_model_label_file(assets_dir)
     if not model_label_file:
         print("WARNING: Could not find model picker JS file -- app structure may have changed")
@@ -3540,17 +3635,21 @@ def main():
     print(f"Found fast-mode file: {fast_mode_file.name}")
     if remote_recents_file:
         print(f"Found remote recents file: {remote_recents_file.name}")
+    print(f"Found indexed recent-thread file: {recent_threads_state_db_file.name}")
     print(f"Found model picker file: {model_label_file.name}")
     print(f"Found model filter file: {model_filter_file.name}")
     print(f"Found remote model refresh file: {remote_model_refresh_file.name}")
     print(f"Found native updater files: {', '.join(path.name for path in native_updater_files)}")
-    print("Desktop patch scope: auth hot-swap, Fast Mode metadata, remote sidebar/model refresh, known-model availability/labels/efforts, and native updater ownership; bundled CLI and plugin files are preserved.")
+    print("Desktop patch scope: auth hot-swap, indexed recent-thread loading, Fast Mode metadata, remote sidebar/model refresh, known-model availability/labels/efforts, and native updater ownership; bundled CLI and plugin files are preserved.")
 
     auth_already_patched = current_auth_patch_present(auth_file.read_text())
     fast_already_patched = FAST_FALLBACK_MARKER in fast_mode_file.read_text()
     remote_recents_already_patched = bool(
         remote_recents_file
         and has_remote_recents_refresh_patch(remote_recents_file.read_text())
+    )
+    recent_threads_state_db_already_patched = has_recent_threads_state_db_patch(
+        recent_threads_state_db_file.read_text()
     )
     model_file_content = model_label_file.read_text()
     model_filter_content = model_filter_file.read_text()
@@ -3572,6 +3671,7 @@ def main():
     all_required_patches_present = required_desktop_patches_present(
         auth=auth_already_patched,
         remote_recents=remote_recents_file is None or remote_recents_already_patched,
+        recent_threads_state_db=recent_threads_state_db_already_patched,
         fast=fast_already_patched,
         model_label=model_label_already_patched,
         model_availability=model_availability_already_patched,
@@ -3628,6 +3728,10 @@ def main():
     if remote_recents_file and not remote_recents_already_patched:
         if not apply_remote_recents_refresh_patch(remote_recents_file):
             print("ERROR: Remote sidebar refresh patch failed")
+            sys.exit(1)
+    if not recent_threads_state_db_already_patched:
+        if not apply_recent_threads_state_db_patch(recent_threads_state_db_file):
+            print("ERROR: Indexed recent-thread patch failed")
             sys.exit(1)
     if not model_label_already_patched:
         if not apply_model_label_fallback_patch(model_label_file):

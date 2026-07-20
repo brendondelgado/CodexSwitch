@@ -215,6 +215,21 @@ struct CodexPatchingTests {
                 .appending("_bundledFastModels")
                 .utf8
         ).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
+
+        try Data(
+            "_invalidateAccountQueries CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2 "
+                .appending("CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2 ")
+                .appending("CODEXSWITCH_RECENT_THREADS_STATE_DB_V1 ")
+                .appending("CODEXSWITCH_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK ")
+                .appending("CODEXSWITCH_SELECTED_MODEL_LABEL_FALLBACK ")
+                .appending("CODEXSWITCH_GPT56_MAX_EFFORT_FALLBACK ")
+                .appending("CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH ")
+                .appending("CODEXSWITCH_NATIVE_UPDATER_DISABLED_V1 ")
+                .appending("_bundledFastModels")
+                .utf8
+        ).write(to: asar)
         #expect(CodexDesktopAppLocator.patchMarkerPresent(install: install))
 
         try Data(
