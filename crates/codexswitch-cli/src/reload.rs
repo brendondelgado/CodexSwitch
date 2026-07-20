@@ -1452,9 +1452,7 @@ fn hot_swap_binding_matches_current(
 ) -> bool {
     if binding.contract_version != HOT_SWAP_REQUEST_CONTRACT_VERSION
         || binding.runtime_kind != runtime_kind
-        || binding.request_nonce.is_empty()
-        || binding.request_nonce.len() > HOT_SWAP_NONCE_MAX_BYTES
-        || !hot_swap_request_nonce_belongs_to_process(&binding.request_nonce, process)
+        || !hot_swap_request_nonce_is_valid(&binding.request_nonce)
         || binding.issued_at_unix_milliseconds
             > current_unix_timestamp_milliseconds().saturating_add(60_000)
     {
@@ -1477,6 +1475,12 @@ fn hot_swap_binding_matches_current(
     binding.process_identity == process_identity
         && binding.kernel_executable_identity == kernel_executable_identity
         && binding.auth_file_identity == auth_file_identity
+}
+
+fn hot_swap_request_nonce_is_valid(nonce: &str) -> bool {
+    !nonce.is_empty()
+        && nonce.len() <= HOT_SWAP_NONCE_MAX_BYTES
+        && nonce.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
 fn next_hot_swap_request_nonce(process: &CodexProcess) -> String {
@@ -1693,7 +1697,15 @@ pub fn is_codex_cli_command_line(command_line: &str) -> bool {
 }
 
 fn is_codex_cli_runtime(command_line: &str, executable: &Path) -> bool {
-    is_codex_cli_command_line(command_line) && !is_shell_wrapper_runtime(executable)
+    is_codex_cli_command_line(command_line)
+        && !is_shell_wrapper_runtime(executable)
+        && !is_desktop_framework_helper(executable)
+}
+
+fn is_desktop_framework_helper(executable: &Path) -> bool {
+    let path = executable.to_string_lossy().to_ascii_lowercase();
+    path.contains("/applications/chatgpt.app/contents/frameworks/")
+        || path.contains("/applications/codex.app/contents/frameworks/")
 }
 
 pub fn is_codex_app_server_command_line(command_line: &str) -> bool {
@@ -1993,6 +2005,18 @@ mod tests {
         assert!(!is_codex_cli_command_line(
             "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
         ));
+        assert!(!is_codex_cli_runtime(
+            "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150/Helpers/browser_crashpad_handler --database=/Library/Application Support/Codex",
+            Path::new(
+                "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150/Helpers/browser_crashpad_handler"
+            )
+        ));
+        assert!(!is_codex_cli_runtime(
+            "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            Path::new(
+                "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+            )
+        ));
         assert!(is_codex_app_server_command_line(
             "/usr/bin/codex app-server --listen ws://127.0.0.1:8390"
         ));
@@ -2289,6 +2313,8 @@ mod tests {
 90299   501 Mon Jul  1 12:00:01 2024 /Users/me/.local/share/codexswitch/prepared-codex/0.143.0/codex app-server --analytics-default-enabled
 90300   502 Mon Jul  1 12:00:02 2024 /Users/other/.local/share/codexswitch/prepared-codex/0.143.0/codex app-server --analytics-default-enabled
 90301   501 Mon Jul  1 12:00:03 2024 /bin/zsh -c rg prepared-codex
+90302   501 Mon Jul  1 12:00:04 2024 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150/Helpers/browser_crashpad_handler --database=/Library/Application Support/Codex
+90303   501 Mon Jul  1 12:00:05 2024 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)
 ";
 
         let processes = parse_ps_processes(ps_output, true, 501, 1);
@@ -2624,6 +2650,22 @@ mod tests {
             next_hot_swap_request_nonce(&process),
             next_hot_swap_request_nonce(&process)
         );
+    }
+
+    #[test]
+    fn request_nonce_validation_accepts_swift_and_rust_writers() {
+        assert!(hot_swap_request_nonce_is_valid(
+            "3FCC58C4-D0C8-4AC9-BD5B-47BE404BBC33"
+        ));
+        assert!(hot_swap_request_nonce_is_valid(
+            "123-42-macos_1000_000001-1784581742553000000-7"
+        ));
+        assert!(!hot_swap_request_nonce_is_valid(""));
+        assert!(!hot_swap_request_nonce_is_valid("contains whitespace"));
+        assert!(!hot_swap_request_nonce_is_valid("contains\ncontrol"));
+        assert!(!hot_swap_request_nonce_is_valid(
+            &"x".repeat(HOT_SWAP_NONCE_MAX_BYTES + 1)
+        ));
     }
 
     #[test]

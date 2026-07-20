@@ -982,9 +982,7 @@ fn reconcile_legacy_token_refresh_manual_review(
     let Some(active) = active_account(accounts) else {
         return Ok(record);
     };
-    if active.account_id != record.target_account_id
-        || !auth_file_matches_account(auth_path, active)
-    {
+    if !auth_file_matches_account(auth_path, active) {
         return Ok(record);
     }
     let Some(current_fingerprint) = account_token_fingerprint(active) else {
@@ -992,10 +990,14 @@ fn reconcile_legacy_token_refresh_manual_review(
     };
 
     record.state = ActivationState::CommittedDegraded;
+    if active.account_id != record.target_account_id {
+        record.previous_account_id = record.target_account_id;
+        record.target_account_id = active.account_id.clone();
+    }
     record.store_generation = generation.as_str().to_string();
     record.auth_fingerprint = Some(current_fingerprint);
     record.detail = Some(
-        "legacy token-refresh mismatch reconciled from exact store/auth convergence; runtime acknowledgement remains required"
+        "legacy degraded-token mismatch reconciled from exact store/auth convergence; runtime acknowledgement remains required"
             .to_string(),
     );
     record.updated_at = Utc::now();
@@ -1802,6 +1804,72 @@ mod tests {
             read_activation_record(&store_lock)?.unwrap().state,
             ActivationState::Confirmed
         );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_mismatch_adopts_exact_externally_converged_active_account() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let initial = vec![
+            account("current@example.com", true),
+            account("stale-target@example.com", false),
+        ];
+        save_accounts(&store_path, &initial)?;
+        commit_auth_file(&auth_path, &initial[0])?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        write_activation_record(
+            &store_lock,
+            &ActivationRecord {
+                version: ACTIVATION_RECORD_VERSION,
+                state: ActivationState::ManualReview,
+                kind: ActivationKind::Rotation,
+                previous_account_id: accounts[0].account_id.clone(),
+                target_account_id: accounts[1].account_id.clone(),
+                store_generation: generation.as_str().to_string(),
+                auth_fingerprint: Some("superseded-token-generation".to_string()),
+                base_store_generation: None,
+                owned_store_generation: None,
+                base_auth_generation: None,
+                owned_auth_generation: None,
+                rollback: None,
+                detail: Some(LEGACY_DEGRADED_TOKEN_MISMATCH.to_string()),
+                updated_at: Utc::now(),
+            },
+        )?;
+        let reload_calls = std::cell::Cell::new(0usize);
+
+        let outcome = activate_with(
+            ActivationContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path: &auth_path,
+                target_id: initial[0].id,
+                reload_enabled: true,
+            },
+            |_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary {
+                    signaled: vec![42],
+                    ..ReloadSummary::default()
+                })
+            },
+        )?;
+
+        assert!(outcome.is_confirmed());
+        assert_eq!(reload_calls.get(), 1);
+        assert_eq!(
+            active_account(&store_lock.load()?.accounts).map(|account| account.id),
+            Some(initial[0].id)
+        );
+        let record = read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(record.state, ActivationState::Confirmed);
+        assert_eq!(record.target_account_id, initial[0].account_id);
         Ok(())
     }
 

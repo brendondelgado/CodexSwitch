@@ -92,6 +92,12 @@ A Codex runtime is hot-swap ready only when all three facts are true:
 
 Marker strings such as `sighup-verified` and `SIGHUP: auth reloaded` are necessary but not sufficient. They prove the binary was patched; they do not prove the running process loaded the new token.
 
+Treat request nonces as opaque correlation values. A Swift UUID and a
+Rust-generated process-bound nonce are both valid when they are bounded
+printable ASCII and every other version-3 binding field matches exactly.
+Rejecting the other writer's nonce shape makes a real acknowledgement appear
+missing after a successful reload.
+
 Every acknowledgement identifies its `runtimeKind`; the signaler validates the
 contract expected for the discovered process rather than accepting whichever
 contract the acknowledgement claims. Both contracts require the exact request
@@ -318,6 +324,8 @@ CodexSwitch must evaluate these independently:
   identity captured at discovery. A changed or unavailable kernel path fails
   closed; a prepared update must converge process identity before reload.
 - **SIGHUP ownership:** current upstream app-server builds may register `SIGHUP` as a graceful shutdown signal. The patched runtime must remove that shutdown branch so the CodexSwitch auth-reload task is the only SIGHUP subscriber. A valid ack followed by process exit is a failed hot-swap, not readiness.
+- **macOS process discovery:** exclude ChatGPT framework services, renderers, and crash reporters by executable identity. A helper command containing a bundle path that ends in `Codex` is not an interactive CLI and must never be reported or signaled as one.
+- **Cross-owner stale rotation record:** a recognized version-3 legacy degraded-token mismatch may adopt the one exact store/auth active account, but it must reload and acknowledge that account before continuing to a requested replacement. Unrecognized manual-review records remain hard barriers.
 - **VPS SSH transport:** CodexSwitch-managed readiness probes, swap commands, tunnels, and direct remote TTY fallbacks must pass `ControlMaster=no`, `ControlPath=none`, and `ControlPersist=no`. User shell aliases may multiplex, but app-managed Codex transports must not inherit a shared OpenSSH master where unrelated channels can add latency or close the session.
 
 ## Unified ChatGPT Desktop Bundle
@@ -751,6 +759,8 @@ Before claiming hot-swap is fixed or ready:
 - [ ] Each live target has a fresh `.codexswitch/hotswap-ack/<pid>.json` acknowledgement.
 - [ ] The desktop runtime contains the account-update marker, and the ACK proves matching disk/active auth fingerprints, the current signal nonce, and at least one completed frontend write.
 - [ ] A local interactive CLI ACK identifies `local-interactive-cli`, proves matching disk/active auth fingerprints and the current signal nonce, reports auth-generation/reconnect readiness, and reports zero desktop frontend writes.
+- [ ] The Rust readiness path accepts a Swift UUID request nonce when the full version-3 binding matches, and rejects empty, oversized, whitespace, or control-character nonces.
+- [ ] ChatGPT framework helpers and crash reporters do not appear in CLI readiness or restart target lists.
 - [ ] A first-ACK CLI canary succeeds for the current managed runtime, while a historical or non-route runtime is skipped and remains restart-required.
 - [ ] Exiting the final historical CLI and resuming through the managed launcher re-arms an exhausted same-target journal without relaunching CodexSwitch.
 - [ ] The installed desktop version matches the latest official appcast release, or a newer signed release is staged for the next safe quit.

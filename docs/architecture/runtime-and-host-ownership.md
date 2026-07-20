@@ -395,6 +395,13 @@ patch readiness therefore requires a versioned auth-cache marker that proves thi
 scope contract; the historical unversioned `_invalidateAccountQueries` marker is
 not sufficient evidence and must be upgraded before activation.
 
+The version-3 reload nonce is an opaque cross-language correlation identifier.
+Swift and Rust writers may encode it differently, so readers validate that it
+is bounded printable ASCII and rely on the complete process, executable, auth
+file, runtime-kind, and acknowledgement binding for identity. A reader must not
+reject an otherwise exact binding because the nonce does not use its own local
+generator's serialization.
+
 Broad `pkill`, name-only matching, and signalling a newly initialized process are prohibited.
 
 `auth.json` readback proves file configuration, not runtime-current identity.
@@ -678,6 +685,18 @@ Observational commands may read files, APIs, process metadata, health endpoints,
 - rewrite thread catalogs.
 
 Repairs are named commands with prerequisites, dry-run evidence where practical, and postcondition checks. This separation makes diagnostics safe during active work.
+
+Runtime discovery classifies the kernel executable as well as the command line.
+ChatGPT framework helpers, renderers, services, and crash reporters are never
+interactive Codex CLI sessions even when an argument or bundle path happens to
+end in `Codex`. They cannot make readiness fail or become signal targets.
+
+A version-3 rotation record carrying the recognized legacy degraded-token
+mismatch may be superseded when the account store has exactly one active known
+account and `auth.json` matches that account's complete token set. Recovery
+rebinds the record to that exact account, performs and verifies a runtime reload,
+then handles any newly requested cross-account activation. Other manual-review
+reasons remain blocked.
 
 The configured Mac account is listed first in the menu. Candidate ranking is
 shown separately as "Next up"; it must not move an inactive candidate above the
