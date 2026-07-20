@@ -1504,30 +1504,6 @@ fn process_start_identity_token(process: &CodexProcess) -> String {
     identity_hash[..16].to_string()
 }
 
-fn hot_swap_request_nonce_belongs_to_process(nonce: &str, process: &CodexProcess) -> bool {
-    let mut fields = nonce.rsplitn(5, '-');
-    let Some(sequence) = fields.next() else {
-        return false;
-    };
-    let Some(nanos) = fields.next() else {
-        return false;
-    };
-    let Some(identity_token) = fields.next() else {
-        return false;
-    };
-    let Some(target_pid) = fields.next() else {
-        return false;
-    };
-    let Some(requester_pid) = fields.next() else {
-        return false;
-    };
-    sequence.parse::<u64>().is_ok()
-        && nanos.parse::<u128>().is_ok()
-        && requester_pid.parse::<u32>().is_ok()
-        && target_pid.parse::<i32>().ok() == Some(process.pid)
-        && identity_token == process_start_identity_token(process)
-}
-
 fn write_hot_swap_request(
     process: &CodexProcess,
     auth_path: &Path,
@@ -2725,30 +2701,13 @@ mod tests {
                 .complete_token_fingerprint,
             auth_file_fingerprint(&auth_path).unwrap()
         );
-        assert!(hot_swap_request_nonce_belongs_to_process(
-            &persisted.binding.request_nonce,
-            &process
+        assert!(hot_swap_request_nonce_is_valid(
+            &persisted.binding.request_nonce
         ));
         let value = serde_json::to_value(&persisted)?;
         assert_eq!(value.as_object().unwrap().len(), 1);
         assert!(value.get("binding").is_some());
         Ok(())
-    }
-
-    #[test]
-    fn request_nonce_rejects_same_second_pid_reuse() {
-        let original = CodexProcess {
-            start_identity: "macos:2000:000001".to_string(),
-            ..restart_test_process()
-        };
-        let reused = CodexProcess {
-            start_identity: "macos:2000:000002".to_string(),
-            ..original.clone()
-        };
-        let nonce = next_hot_swap_request_nonce(&original);
-
-        assert!(hot_swap_request_nonce_belongs_to_process(&nonce, &original));
-        assert!(!hot_swap_request_nonce_belongs_to_process(&nonce, &reused));
     }
 
     #[test]

@@ -791,6 +791,11 @@ Before claiming hot-swap is fixed or ready:
 
 ## Regression Requirements
 
+Run the security-sensitive Rust suite on Linux under `umask 0077`. The account
+store and journal tests deliberately validate every temporary parent component;
+a permissive login umask such as `0002` creates group-writable fixture roots and
+correctly exercises rejection paths instead of the intended test scenario.
+
 Every future hot-swap change must include tests for:
 
 - Marker-only binaries are **not** ready without live acknowledgement.
