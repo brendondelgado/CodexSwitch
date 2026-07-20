@@ -1,0 +1,37 @@
+Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
+  s_70c8e194852bb5::t_5376cfed0fe848 34
+Tests/CodexSwitchTests/CodexPatchingTests.swift
+  s_70c8e194852bb5::t_c1df4341341428 140,233-239
+  s_70c8e194852bb5::t_d989c0ad6ec67c 240-242
+  s_70c8e194852bb5::t_86aa5ba17acc84 243-248
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_7f8b1c884518b0 518-522,776
+scripts/patch-asar.py
+  s_70c8e194852bb5::t_c81cdd2f16cb6e 2562-2585,2589-2603,2605-2629,2631-2633,2636-2637,2639-2641,2643-2665
+  s_70c8e194852bb5::t_12bed4cf5cc575 2586-2588,2604,2630,2634-2635,2638,2642
+  s_70c8e194852bb5::t_442782c6adde3f 100,1142-1157,1253-1264,1987,2001
+  s_70c8e194852bb5::t_fec9cec5842d37 3753-3756,3778,3783,3794-3796,3818,3880-3882
+  s_70c8e194852bb5::t_243f9ab3b4d988 3883
+scripts/test_patch_asar.py
+  s_70c8e194852bb5::t_ca2a2fa5b5d62b 260-262,265-279,281-282,1147-1166,1170-1191,1532,1548-1552
+  s_70c8e194852bb5::t_12bed4cf5cc575 263-264,1167-1169
+  s_70c8e194852bb5::t_dd99bc6bc02260 280
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_7f8b1c884518b0 759-767
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "2c2093c988c7451a9afe7b27b1360fd20d52f6fe",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
