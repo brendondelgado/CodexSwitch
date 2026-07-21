@@ -83,6 +83,20 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Compile the standalone source patch driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch_driver="$RUNNER_TEMP/patch-codex-source"
+          CODEXSWITCH_REPOSITORY_ROOT="$GITHUB_WORKSPACE" \
+            rustc \
+              --edition=2021 \
+              -D warnings \
+              -C opt-level=1 \
+              Tests/Fixtures/BuildFork/patch_codex_source.rs \
+              -o "$patch_driver"
+          test -x "$patch_driver"
+
       - name: Run full codexswitch-cli contract suite
         shell: bash
         run: |

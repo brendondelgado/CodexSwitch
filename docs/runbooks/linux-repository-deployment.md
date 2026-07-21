@@ -241,6 +241,13 @@ not accepted. The release manifest persists the artifact manifest digest,
 upstream peeled commit, and `sourcePatchSha256`, then rechecks them before
 activation or any separately requested post-commit start.
 
+The ordinary hot-swap contract and each release workflow compile the source
+patch driver directly with `rustc -D warnings` before upstream checkout or
+mutation. Its standalone compatibility shim must expose every error-context
+operation used by the included production patch modules. This fail-closed
+check prevents a Cargo-only build from masking an unusable exact-commit patch
+driver.
+
 Runtime-storage hardening remains frozen, unimplemented in the reviewed patch
 driver, and disabled. `codex-runtime-storage-leases-v1` is not part of the
 active runtime marker contract, and the checked-in app-server unit does not set

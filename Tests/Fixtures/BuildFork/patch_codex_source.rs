@@ -16,6 +16,10 @@ macro_rules! bail {
 }
 
 trait Context<T> {
+    fn context<C>(self, context: C) -> Result<T>
+    where
+        C: std::fmt::Display;
+
     fn with_context<C, F>(self, context: F) -> Result<T>
     where
         C: std::fmt::Display,
@@ -26,6 +30,13 @@ impl<T, E> Context<T> for std::result::Result<T, E>
 where
     E: std::fmt::Display,
 {
+    fn context<C>(self, context: C) -> Result<T>
+    where
+        C: std::fmt::Display,
+    {
+        self.map_err(|error| format!("{context}: {error}").into())
+    }
+
     fn with_context<C, F>(self, context: F) -> Result<T>
     where
         C: std::fmt::Display,
@@ -36,6 +47,13 @@ where
 }
 
 impl<T> Context<T> for Option<T> {
+    fn context<C>(self, context: C) -> Result<T>
+    where
+        C: std::fmt::Display,
+    {
+        self.ok_or_else(|| context.to_string().into())
+    }
+
     fn with_context<C, F>(self, context: F) -> Result<T>
     where
         C: std::fmt::Display,
