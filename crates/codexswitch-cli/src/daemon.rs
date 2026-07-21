@@ -1673,7 +1673,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("stale or malformed confirmation"));
+        assert!(format!("{error:#}").contains("stale or does not match current store/auth state"));
         assert_eq!(*quota_calls.lock().unwrap(), 0);
         assert_eq!(*reloads.lock().unwrap(), 0);
         assert!(std::fs::read_to_string(auth_path)?.contains("stale-token"));
@@ -1781,6 +1781,7 @@ mod tests {
         fallback.quota_snapshot.as_mut().unwrap().fetched_at = stale_at;
         save_accounts(&store_path, &[active, fallback])?;
         confirm_daemon_activation(&store_path, &auth_path)?;
+        set_test_activation_state(&store_path, ActivationState::CommittedDegraded)?;
         let first_tick = run_once_report_with(
             &store_path,
             &auth_path,
@@ -1887,6 +1888,7 @@ mod tests {
             ],
         )?;
         confirm_daemon_activation(&store_path, &auth_path)?;
+        set_test_activation_state(&store_path, ActivationState::CommittedDegraded)?;
 
         let first_tick = run_once_report_with(
             &store_path,

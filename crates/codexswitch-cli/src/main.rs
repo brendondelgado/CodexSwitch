@@ -2668,7 +2668,7 @@ mod tests {
         let active = account("active@example.com", true, 100.0, 100.0);
         let candidate = account("candidate@example.com", false, 10.0, 10.0);
         save_accounts(&store_path, &[active.clone(), candidate.clone()])?;
-        auth::write_auth_file(&auth_path, &active)?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_for_reload = Arc::clone(&observed);
         let receipt_nonce = Uuid::parse_str("37f84870-9b39-45ae-aee9-3e0a63e1f989").unwrap();
@@ -2953,6 +2953,7 @@ mod tests {
         active.runtime_unusable_until = Some(Utc::now() + ChronoDuration::hours(6));
         let replacement = account("replacement@example.com", false, 10.0, 10.0);
         save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let report = rotate_now_with(
             &store_path,
@@ -2998,6 +2999,7 @@ mod tests {
         let replacement = account("replacement@example.com", false, 10.0, 10.0);
         let five_hour_reset = Utc::now() + ChronoDuration::minutes(45);
         save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let report = rotate_now_with(
             &store_path,
@@ -3068,6 +3070,7 @@ mod tests {
         let active = account("active@example.com", true, 100.0, 10.0);
         let stale_replacement = account("replacement@example.com", false, 100.0, 10.0);
         save_accounts(&store_path, &[active, stale_replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let report = rotate_now_with(
             &store_path,
@@ -3104,6 +3107,7 @@ mod tests {
         let mut replacement = account("replacement@example.com", false, 10.0, 10.0);
         replacement.plan_type = Some("free".to_string());
         save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let consume_calls = Arc::new(Mutex::new(0usize));
         let consume_calls_for_closure = Arc::clone(&consume_calls);
@@ -3557,7 +3561,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("current Confirmed activation record"));
+        assert!(format!("{error:#}").contains("durable Confirmed activation record"));
         let snapshot = load_account_store_snapshot(&store_path)?;
         assert_eq!(snapshot.generation, generation_before);
         assert_eq!(
@@ -3576,6 +3580,7 @@ mod tests {
         let active = account("active@example.com", true, 100.0, 100.0);
         let replacement = account("replacement@example.com", false, 10.0, 10.0);
         save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let report = rotate_now_with(
             &store_path,
@@ -3613,6 +3618,7 @@ mod tests {
         let mut replacement = account("replacement@example.com", false, 10.0, 10.0);
         replacement.plan_type = Some("free".to_string());
         save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let active_fetches = Arc::new(Mutex::new(0usize));
         let active_fetches_for_closure = Arc::clone(&active_fetches);
@@ -3727,7 +3733,7 @@ mod tests {
         let mut replacement = account("replacement@example.com", false, 10.0, 10.0);
         replacement.plan_type = Some("free".to_string());
         save_accounts(&store_path, &[active.clone(), replacement])?;
-        auth::write_auth_file(&auth_path, &active)?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let active_fetches = Arc::new(Mutex::new(0usize));
         let bank_fetches = Arc::new(Mutex::new(0usize));
@@ -4417,6 +4423,7 @@ mod tests {
         let active = account("active@example.com", true, 100.0, 20.0);
         let replacement = account("replacement@example.com", false, 10.0, 10.0);
         save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let consume_calls = Arc::new(Mutex::new(0usize));
         let consume_calls_for_closure = Arc::clone(&consume_calls);

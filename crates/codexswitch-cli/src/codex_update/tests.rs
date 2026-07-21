@@ -4497,6 +4497,7 @@ async fn run_turn() {
             let release_id = format!("0.1.0-{}", "a".repeat(40));
             let release_dir = releases.join(&release_id);
             fs::create_dir_all(&release_dir).unwrap();
+            fs::create_dir_all(&bin).unwrap();
             for directory in [&home, &local, &bin, &share, &install_root, &releases] {
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
             }

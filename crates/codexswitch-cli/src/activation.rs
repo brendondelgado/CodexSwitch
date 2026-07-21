@@ -927,7 +927,7 @@ where
                     ActivationState::CommittedDegraded,
                     summary,
                     Some(format!(
-                        "runtime acknowledgement did not survive final activation proof: {error:#}"
+                        "runtime acknowledgement did not survive because final store/auth proof changed: {error:#}"
                     )),
                 ),
             },
@@ -1205,13 +1205,51 @@ where
     }
 
     let expected = activation_reload_binding(generation, auth_path, &target_fingerprint)?;
-    match capture_activation_reload(&mut reload, auth_path, &expected) {
-        Ok(summary)
-            if verify_runtime_confirmation(
-                &summary, &expected, store_lock, generation, auth_path, target.id, &target,
-            )
-            .is_ok() =>
-        {
+    let mut summary = match reload(auth_path) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return rollback_replacement_activation(
+                ReplacementRollbackContext {
+                    store_lock,
+                    generation,
+                    current_accounts,
+                    auth_path,
+                    rollback: &rollback,
+                    owned_generation: &owned_generation,
+                    owned_auth_generation: Some(&auth_commit.generation),
+                    previous_account_id: &previous_account_id,
+                    target: &target,
+                },
+                error.context("import runtime reload failed"),
+                false,
+                &mut reload,
+            );
+        }
+    };
+    let runtime_may_have_changed = !summary.sighup_sent.is_empty();
+    if let Err(error) = bind_activation_reload(&mut summary, &expected) {
+        return rollback_replacement_activation(
+            ReplacementRollbackContext {
+                store_lock,
+                generation,
+                current_accounts,
+                auth_path,
+                rollback: &rollback,
+                owned_generation: &owned_generation,
+                owned_auth_generation: Some(&auth_commit.generation),
+                previous_account_id: &previous_account_id,
+                target: &target,
+            },
+            error.context("import runtime convergence failed"),
+            runtime_may_have_changed,
+            &mut reload,
+        );
+    }
+
+    match verify_runtime_confirmation(
+        &summary, &expected, store_lock, generation, auth_path, target.id, &target,
+    ) {
+        Ok(()) => {
             *current_accounts = replacement_accounts;
             write_activation_record(
                 store_lock,
@@ -1230,47 +1268,6 @@ where
                 detail: None,
             })
         }
-        Ok(summary) if summary.verified_hot_swap() => rollback_replacement_activation(
-            ReplacementRollbackContext {
-                store_lock,
-                generation,
-                current_accounts,
-                auth_path,
-                rollback: &rollback,
-                owned_generation: &owned_generation,
-                owned_auth_generation: Some(&auth_commit.generation),
-                previous_account_id: &previous_account_id,
-                target: &target,
-            },
-            anyhow::anyhow!(
-                "import runtime acknowledged reload but final store/auth proof changed"
-            ),
-            true,
-            &mut reload,
-        ),
-        Ok(summary) => {
-            let runtime_may_have_changed = !summary.sighup_sent.is_empty();
-            rollback_replacement_activation(
-                ReplacementRollbackContext {
-                    store_lock,
-                    generation,
-                    current_accounts,
-                    auth_path,
-                    rollback: &rollback,
-                    owned_generation: &owned_generation,
-                    owned_auth_generation: Some(&auth_commit.generation),
-                    previous_account_id: &previous_account_id,
-                    target: &target,
-                },
-                anyhow::anyhow!(
-                    "import runtime convergence failed with {} verified ACK(s) and {} skipped target(s)",
-                    summary.signaled.len(),
-                    summary.skipped.len()
-                ),
-                runtime_may_have_changed,
-                &mut reload,
-            )
-        }
         Err(error) => rollback_replacement_activation(
             ReplacementRollbackContext {
                 store_lock,
@@ -1283,8 +1280,8 @@ where
                 previous_account_id: &previous_account_id,
                 target: &target,
             },
-            error.context("import runtime reload failed"),
-            false,
+            error.context("import runtime acknowledged reload but final store/auth proof changed"),
+            true,
             &mut reload,
         ),
     }
@@ -1367,11 +1364,28 @@ where
     *current_accounts = restored.accounts;
 
     if runtime_may_have_changed {
-        let rollback_reload = reload(auth_path);
-        if !rollback_reload
-            .as_ref()
-            .is_ok_and(ReloadSummary::verified_hot_swap)
-        {
+        let rollback_reload = (|| -> Result<ReloadSummary> {
+            let restored_active = active_account(current_accounts)
+                .cloned()
+                .context("import rollback restored no active account")?;
+            let restored_fingerprint = complete_account_token_fingerprint(&restored_active)
+                .context("import rollback restored incomplete active token material")?;
+            let expected = activation_reload_binding(generation, auth_path, &restored_fingerprint)?;
+            let summary = capture_activation_reload(reload, auth_path, &expected)
+                .context("import rollback runtime reload failed")?;
+            verify_runtime_confirmation(
+                &summary,
+                &expected,
+                store_lock,
+                generation,
+                auth_path,
+                restored_active.id,
+                &restored_active,
+            )
+            .context("import rollback runtime convergence was not proven")?;
+            Ok(summary)
+        })();
+        if rollback_reload.is_err() {
             let detail = format!(
                 "import store/auth rolled back after {failure:#}, but prior runtime convergence could not be proven: {}",
                 rollback_reload
@@ -1486,7 +1500,11 @@ where
     if record.state == ActivationState::Confirmed {
         record =
             reconcile_confirmed_generation_transition(store_lock, generation, auth_path, record)?;
-        let active = active_account(accounts)
+        let durable = store_lock.load()?;
+        if &durable.generation != generation {
+            bail!("Confirmed activation reconciliation received a stale store generation");
+        }
+        let active = active_account(&durable.accounts)
             .context("Confirmed activation reconciliation requires one active account")?;
         let auth_fingerprint = auth_file_fingerprint(auth_path);
         if !activation_record_confirms_current(
@@ -1745,8 +1763,22 @@ where
     R: FnMut(&Path) -> Result<ReloadSummary>,
 {
     let mut summary = reload(auth_path)?;
-    summary.bind_activation(expected)?;
+    bind_activation_reload(&mut summary, expected)?;
     Ok(summary)
+}
+
+fn bind_activation_reload(
+    summary: &mut ReloadSummary,
+    expected: &ActivationReloadBinding,
+) -> Result<()> {
+    let acknowledgement_count = summary.signaled.len();
+    let sighup_count = summary.sighup_sent.len();
+    let skipped_count = summary.skipped.len();
+    summary.bind_activation(expected).with_context(|| {
+        format!(
+            "runtime convergence failed with {acknowledgement_count} verified ACK(s), {sighup_count} SIGHUP target(s), and {skipped_count} skipped target(s)"
+        )
+    })
 }
 
 fn verify_runtime_confirmation(
@@ -2907,6 +2939,67 @@ mod tests {
             read_activation_record(&store_lock)?.unwrap().state,
             ActivationState::Confirmed
         );
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_same_account_token_refresh_commits_and_reloads_new_credentials() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        commit_auth_file(&auth_path, &active)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let target_id = accounts[0].id;
+
+        let initial = activate_with(
+            ActivationContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path: &auth_path,
+                target_id,
+                reload_enabled: true,
+            },
+            |_| {
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
+            },
+        )?;
+        assert!(initial.is_confirmed());
+
+        accounts[0].access_token = "fresh-access".to_string();
+        accounts[0].refresh_token = "fresh-refresh".to_string();
+        accounts[0].id_token = "fresh-id".to_string();
+        let reload_calls = Cell::new(0usize);
+        let refreshed = activate_with(
+            ActivationContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path: &auth_path,
+                target_id,
+                reload_enabled: true,
+            },
+            |_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
+            },
+        )?;
+
+        assert!(refreshed.is_confirmed());
+        assert_eq!(reload_calls.get(), 1);
+        let durable = store_lock.load()?;
+        assert_eq!(durable.accounts[0].access_token, "fresh-access");
+        assert_eq!(durable.accounts[0].refresh_token, "fresh-refresh");
+        assert!(auth_file_matches_account(&auth_path, &durable.accounts[0]));
         Ok(())
     }
 
