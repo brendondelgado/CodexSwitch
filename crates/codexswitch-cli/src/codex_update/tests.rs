@@ -3771,7 +3771,25 @@ name = "codex-core"
 version = "0.0.0"
 dependencies = [
  "serde",
+ "sha2",
 ]
+
+[[package]]
+name = "codex-utils"
+version = "0.0.0"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 "#,
         )
         .unwrap();
@@ -3782,7 +3800,10 @@ dependencies = [
         let manifest = fs::read_to_string(core.join("Cargo.toml")).unwrap();
         assert_eq!(manifest.matches("sha2 = { workspace = true }").count(), 1);
         let lockfile = fs::read_to_string(workspace.join("Cargo.lock")).unwrap();
-        assert_eq!(lockfile.matches(" \"sha2\",\n").count(), 1);
+        assert!(!lockfile.contains(" \"sha2\",\n"));
+        assert!(lockfile.contains(
+            "name = \"codex-core\"\nversion = \"0.0.0\"\ndependencies = [\n \"serde\",\n \"sha2 0.10.9\",\n]"
+        ));
     }
 
     #[test]
@@ -3856,6 +3877,11 @@ dependencies = [
 [[package]]
 name = "codex-mcp"
 version = "0.0.0"
+
+[[package]]
+name = "libc"
+version = "0.2.182"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 "#,
         )
         .unwrap();
@@ -3872,6 +3898,58 @@ version = "0.0.0"
         ));
         assert!(patched.contains(
             "name = \"codex-login\"\nversion = \"0.0.0\"\ndependencies = [\n \"keyring\",\n \"libc\",\n \"once_cell\",\n]"
+        ));
+    }
+
+    #[test]
+    fn source_patch_rejects_conflicting_workspace_lock_references() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile = temp_dir.path().join("Cargo.lock");
+        fs::write(
+            &lockfile,
+            r#"version = 4
+
+[[package]]
+name = "codex-core"
+version = "0.0.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "codex-old"
+version = "0.0.0"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "codex-new"
+version = "0.0.0"
+dependencies = [
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#,
+        )
+        .unwrap();
+
+        let error =
+            patch_lockfile_dependency_if_present(&lockfile, "codex-core", "sha2").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting workspace lock references"));
+        assert!(!fs::read_to_string(lockfile).unwrap().contains(
+            "name = \"codex-core\"\nversion = \"0.0.0\"\ndependencies = [\n \"serde\",\n \"sha2"
         ));
     }
 

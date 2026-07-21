@@ -103,6 +103,8 @@ fn patch_lockfile_dependency_if_present(
     }
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let dependency_reference =
+        canonical_lockfile_dependency_reference(&content, package, dependency, path)?;
     let package_marker = format!("[[package]]\nname = \"{package}\"\n");
     let package_start = content.find(&package_marker).with_context(|| {
         format!(
@@ -148,16 +150,17 @@ fn patch_lockfile_dependency_if_present(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    if dependencies.iter().any(|value| value == dependency) {
-        return Ok(());
-    }
-    dependencies.push(dependency.to_owned());
+    dependencies.retain(|value| lockfile_dependency_name(value) != dependency);
+    dependencies.push(dependency_reference);
     dependencies.sort();
     dependencies.dedup();
     let rendered = dependencies
         .iter()
         .map(|value| format!(" \"{value}\",\n"))
         .collect::<String>();
+    if rendered == content[dependencies_start..dependencies_end] {
+        return Ok(());
+    }
     let updated = format!(
         "{}{}{}",
         &content[..dependencies_start],
@@ -166,4 +169,121 @@ fn patch_lockfile_dependency_if_present(
     );
     fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn canonical_lockfile_dependency_reference(
+    content: &str,
+    target_package: &str,
+    dependency: &str,
+    path: &Path,
+) -> Result<String> {
+    let mut dependency_versions = Vec::new();
+    let mut workspace_references = Vec::new();
+
+    for package_block in content.split("[[package]]\n").skip(1) {
+        let package_name = lockfile_string_field(package_block, "name")
+            .with_context(|| format!("lockfile package has no name in {}", path.display()))?;
+        if package_name == dependency {
+            let version = lockfile_string_field(package_block, "version").with_context(|| {
+                format!(
+                    "dependency {dependency} has no version in lockfile {}",
+                    path.display()
+                )
+            })?;
+            dependency_versions.push(version.to_owned());
+        }
+
+        let is_workspace_package = !package_block
+            .lines()
+            .any(|line| line.starts_with("source = "));
+        if !is_workspace_package || package_name == target_package {
+            continue;
+        }
+        for reference in lockfile_dependency_references(package_block, package_name, path)? {
+            if lockfile_dependency_name(&reference) == dependency {
+                workspace_references.push(reference);
+            }
+        }
+    }
+
+    dependency_versions.sort();
+    match dependency_versions.len() {
+        0 => bail!(
+            "dependency {dependency} is missing from lockfile {}",
+            path.display()
+        ),
+        1 => return Ok(dependency.to_owned()),
+        _ => {}
+    }
+
+    workspace_references.retain(|reference| {
+        let mut components = reference.split_whitespace();
+        components.next() == Some(dependency)
+            && components
+                .next()
+                .is_some_and(|version| dependency_versions.iter().any(|item| item == version))
+    });
+    workspace_references.sort();
+    workspace_references.dedup();
+    match workspace_references.as_slice() {
+        [reference] => Ok(reference.clone()),
+        [] => bail!(
+            "dependency {dependency} has multiple locked versions but no canonical workspace reference in {}",
+            path.display()
+        ),
+        references => bail!(
+            "dependency {dependency} has conflicting workspace lock references in {}: {}",
+            path.display(),
+            references.join(", ")
+        ),
+    }
+}
+
+fn lockfile_string_field<'a>(package_block: &'a str, field: &str) -> Option<&'a str> {
+    let prefix = format!("{field} = \"");
+    package_block
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.strip_suffix('"'))
+}
+
+fn lockfile_dependency_references(
+    package_block: &str,
+    package: &str,
+    path: &Path,
+) -> Result<Vec<String>> {
+    let marker = "dependencies = [\n";
+    let Some(start) = package_block
+        .find(marker)
+        .map(|offset| offset + marker.len())
+    else {
+        return Ok(Vec::new());
+    };
+    let end = package_block[start..]
+        .find("]\n")
+        .map(|offset| start + offset)
+        .with_context(|| {
+            format!(
+                "package {package} has an unterminated dependency list in lockfile {}",
+                path.display()
+            )
+        })?;
+    package_block[start..end]
+        .lines()
+        .map(|line| {
+            line.trim()
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix("\","))
+                .map(str::to_owned)
+                .with_context(|| {
+                    format!(
+                        "package {package} has a malformed dependency in lockfile {}",
+                        path.display()
+                    )
+                })
+        })
+        .collect()
+}
+
+fn lockfile_dependency_name(reference: &str) -> &str {
+    reference.split_whitespace().next().unwrap_or(reference)
 }

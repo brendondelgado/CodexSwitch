@@ -67,8 +67,7 @@ cross_dependencies:
   - ../architecture/runtime-and-host-ownership.md
 version_control:
   branch: main
-  base_commit: 664edf6201fcd7dcdc299084392e3dad510ec9d7
-  status: local_uncommitted
+  status: operational
   last_updated: 2026-07-21
 ---
 
@@ -247,6 +246,12 @@ mutation. Its standalone compatibility shim must expose every error-context
 operation used by the included production patch modules. This fail-closed
 check prevents a Cargo-only build from masking an unusable exact-commit patch
 driver.
+
+Injected workspace dependencies must also preserve Cargo's canonical lockfile
+reference. When the lock contains more than one version of a crate, the patch
+driver derives the version-qualified reference from existing source-less
+workspace packages and rejects missing or conflicting evidence. It never
+regenerates the upstream lockfile or resolves newer transitive dependencies.
 
 Runtime-storage hardening remains frozen, unimplemented in the reviewed patch
 driver, and disabled. `codex-runtime-storage-leases-v1` is not part of the
