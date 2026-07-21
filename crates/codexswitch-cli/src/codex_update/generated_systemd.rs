@@ -3,53 +3,105 @@ fn observe_managed_systemd_unit_activity() -> RuntimeActivityObservation {
         Ok(expectation) => expectation,
         Err(error) => return RuntimeActivityObservation::Unknown(format!("{error:#}")),
     };
+    if let Err(error) = verify_managed_systemd_fragment(&expectation) {
+        return RuntimeActivityObservation::Unknown(format!("{error:#}"));
+    }
+    observe_managed_systemd_unit_activity_with(&expectation, || probe_managed_systemd_unit())
+}
+
+fn verify_managed_systemd_fragment(expectation: &SystemdOwnerExpectation) -> Result<()> {
     let fragment_metadata = match fs::symlink_metadata(&expectation.fragment_path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
-        Ok(_) => {
-            return RuntimeActivityObservation::Unknown(format!(
-                "managed systemd fragment {} is not a regular non-symlink file",
-                expectation.fragment_path.display()
-            ));
-        }
-        Err(error) => {
-            return RuntimeActivityObservation::Unknown(format!(
-                "failed to inspect managed systemd fragment {}: {error}",
-                expectation.fragment_path.display()
-            ));
-        }
+        Ok(_) => bail!(
+            "managed systemd fragment {} is not a regular non-symlink file",
+            expectation.fragment_path.display()
+        ),
+        Err(error) => bail!(
+            "failed to inspect managed systemd fragment {}: {error}",
+            expectation.fragment_path.display()
+        ),
     };
     if fs::canonicalize(&expectation.fragment_path).ok().as_deref()
         != Some(expectation.fragment_path.as_path())
         || fragment_metadata.len() == 0
     {
-        return RuntimeActivityObservation::Unknown(format!(
+        bail!(
             "managed systemd fragment {} has drifted provenance",
             expectation.fragment_path.display()
-        ));
+        );
     }
-    observe_managed_systemd_unit_activity_with(&expectation, || {
-        let output = bounded_command::output(
-            Command::new("systemctl")
-                .arg("--user")
-                .arg("show")
-                .arg(MANAGED_APP_SERVER_UNIT)
-                .args([
-                    "--property=LoadState",
-                    "--property=ActiveState",
-                    "--property=FragmentPath",
-                    "--property=ExecStart",
-                    "--property=MainPID",
-                ]),
-            PROBE_COMMAND_TIMEOUT,
-            bounded_command::SMALL_OUTPUT_LIMIT,
-        )?;
-        Ok(CommandProbeOutput {
-            success: output.status.success(),
-            exit_code: output.status.code(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+    Ok(())
+}
+
+fn probe_managed_systemd_unit() -> Result<CommandProbeOutput> {
+    let output = bounded_command::output(
+        Command::new("systemctl")
+            .arg("--user")
+            .arg("show")
+            .arg(MANAGED_APP_SERVER_UNIT)
+            .args([
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=FragmentPath",
+                "--property=ExecStart",
+                "--property=MainPID",
+            ]),
+        PROBE_COMMAND_TIMEOUT,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )?;
+    Ok(CommandProbeOutput {
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn managed_headless_app_server_identity(
+) -> Result<Option<ManagedHeadlessAppServerIdentity>> {
+    let expectation = managed_systemd_owner_expectation()?;
+    verify_managed_systemd_fragment(&expectation)?;
+    let output = probe_managed_systemd_unit()?;
+    match systemd_activity_from_probe(
+        output.success,
+        output.exit_code,
+        &output.stdout,
+        &output.stderr,
+        &expectation,
+    ) {
+        RuntimeActivityObservation::Inactive => return Ok(None),
+        RuntimeActivityObservation::Unknown(error) => bail!(error),
+        RuntimeActivityObservation::Active => {}
+    }
+    let output = std::str::from_utf8(&output.stdout).context("systemctl output was not UTF-8")?;
+    let pid = output
+        .lines()
+        .find_map(|line| line.strip_prefix("MainPID="))
+        .context("verified systemd observation omitted MainPID")?
+        .parse::<i32>()
+        .context("verified systemd MainPID was invalid")?;
+    if pid <= 0 {
+        bail!("verified active systemd unit reported a non-positive MainPID");
+    }
+    let executable = expectation
+        .exec_argv
+        .windows(2)
+        .find_map(|pair| (pair[1] == "app-server").then(|| PathBuf::from(&pair[0])))
+        .context("managed systemd ExecStart omitted the Codex runtime executable")?;
+    let executable = fs::canonicalize(&executable).with_context(|| {
+        format!(
+            "failed to resolve managed systemd runtime {}",
+            executable.display()
+        )
+    })?;
+    bind_managed_headless_app_server_identity(pid, unsafe { libc::geteuid() }, executable).map(Some)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn managed_headless_app_server_identity(
+) -> Result<Option<ManagedHeadlessAppServerIdentity>> {
+    Ok(None)
 }
 
 fn observe_managed_systemd_unit_activity_with<Probe>(
@@ -201,8 +253,6 @@ fn managed_systemd_owner_expectation() -> Result<SystemdOwnerExpectation> {
                 .join("current/patched-codex/codex")
                 .display()
                 .to_string(),
-            "-c".to_string(),
-            "features.local_thread_store_compression=true".to_string(),
             "app-server".to_string(),
             "--remote-control".to_string(),
             "--listen".to_string(),

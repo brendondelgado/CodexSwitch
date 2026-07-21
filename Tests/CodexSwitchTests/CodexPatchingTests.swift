@@ -137,7 +137,7 @@ struct CodexPatchingTests {
         #expect(adHoc == .adHoc)
     }
 
-    @Test("Desktop app locator requires auth, recents, startup, model, Fast, reconnect, and updater markers")
+    @Test("Desktop app locator requires complete auth, recents, startup, model, Fast, reconnect, and updater markers")
     func desktopAppLocatorRequiresCurrentDesktopPatchMarkers() throws {
         let temp = temporaryDirectory()
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
@@ -248,8 +248,10 @@ struct CodexPatchingTests {
         ).write(to: asar)
         #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
 
-        try Data(
+        let completeMarkerSet =
             "_invalidateAccountQueries CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3 "
+                .appending("CODEXSWITCH_AUTH_EVENT_DEDUPE_V1 ")
+                .appending("CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1 ")
                 .appending("CODEXSWITCH_AUTH_TRANSITION_V2 ")
                 .appending("CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2 ")
                 .appending("CODEXSWITCH_RECENT_THREADS_STATE_DB_V1 ")
@@ -261,8 +263,24 @@ struct CodexPatchingTests {
                 .appending("CODEXSWITCH_REMOTE_MODEL_REFRESH_PATCH ")
                 .appending("CODEXSWITCH_NATIVE_UPDATER_DISABLED_V1 ")
                 .appending("_bundledFastModels")
-                .utf8
+
+        try Data(
+            completeMarkerSet.replacingOccurrences(
+                of: "CODEXSWITCH_AUTH_EVENT_DEDUPE_V1 ",
+                with: ""
+            ).utf8
         ).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
+
+        try Data(
+            completeMarkerSet.replacingOccurrences(
+                of: "CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1 ",
+                with: ""
+            ).utf8
+        ).write(to: asar)
+        #expect(!CodexDesktopAppLocator.patchMarkerPresent(install: install))
+
+        try Data(completeMarkerSet.utf8).write(to: asar)
         #expect(CodexDesktopAppLocator.patchMarkerPresent(install: install))
 
         try Data(

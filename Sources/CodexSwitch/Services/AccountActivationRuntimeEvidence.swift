@@ -7,6 +7,155 @@ struct AccountActivationRuntimeEvidence: Equatable, Sendable {
     let expiresAt: Date
     let discoveredRuntimeCount: Int
     let acknowledgedRuntimeCount: Int
+    let runtimeBindings: [CodexReloadBinding]
+
+    init(
+        generation: UUID,
+        runtimeCurrentAccountId: UUID,
+        observedAt: Date,
+        expiresAt: Date,
+        discoveredRuntimeCount: Int,
+        acknowledgedRuntimeCount: Int,
+        runtimeBindings: [CodexReloadBinding] = []
+    ) {
+        self.generation = generation
+        self.runtimeCurrentAccountId = runtimeCurrentAccountId
+        self.observedAt = observedAt
+        self.expiresAt = expiresAt
+        self.discoveredRuntimeCount = discoveredRuntimeCount
+        self.acknowledgedRuntimeCount = acknowledgedRuntimeCount
+        self.runtimeBindings = runtimeBindings
+    }
+
+    var hasConcreteRuntimeBindings: Bool {
+        discoveredRuntimeCount > 0
+            && acknowledgedRuntimeCount == discoveredRuntimeCount
+            && runtimeBindings.count == discoveredRuntimeCount
+            && Set(runtimeBindings.map(\.processIdentity.pid)).count == runtimeBindings.count
+    }
+
+    func hasSameRuntimeTopology(as current: AccountActivationRuntimeEvidence) -> Bool {
+        guard hasConcreteRuntimeBindings,
+              current.hasConcreteRuntimeBindings,
+              runtimeCurrentAccountId == current.runtimeCurrentAccountId,
+              runtimeBindings.count == current.runtimeBindings.count else {
+            return false
+        }
+        let expected = sortedRuntimeBindings
+        let observed = current.sortedRuntimeBindings
+        return zip(expected, observed).allSatisfy { pair in
+            SwapEngine.bindingHasSameRuntimeAuthority(pair.0, pair.1)
+        }
+    }
+
+    func matchesRediscoveredRuntimeTopology(
+        cli: CodexLocalRuntimeEvidenceSnapshot,
+        desktop: CodexLocalRuntimeEvidenceSnapshot
+    ) -> Bool {
+        let snapshots = [cli, desktop]
+        guard snapshots.allSatisfy(\.isComplete) else { return false }
+        let bindings = snapshots
+            .flatMap(\.runtimes)
+            .map(\.startupAcknowledgement.binding)
+        let rediscovered = AccountActivationRuntimeEvidence(
+            generation: generation,
+            runtimeCurrentAccountId: runtimeCurrentAccountId,
+            observedAt: observedAt,
+            expiresAt: expiresAt,
+            discoveredRuntimeCount: bindings.count,
+            acknowledgedRuntimeCount: bindings.count,
+            runtimeBindings: bindings
+        )
+        return hasSameRuntimeTopology(as: rediscovered)
+    }
+
+    private var sortedRuntimeBindings: [CodexReloadBinding] {
+        runtimeBindings.sorted { lhs, rhs in
+            if lhs.processIdentity.pid != rhs.processIdentity.pid {
+                return lhs.processIdentity.pid < rhs.processIdentity.pid
+            }
+            if lhs.runtimeKind.rawValue != rhs.runtimeKind.rawValue {
+                return lhs.runtimeKind.rawValue < rhs.runtimeKind.rawValue
+            }
+            return lhs.requestNonce < rhs.requestNonce
+        }
+    }
+}
+
+struct AccountActivationRuntimeRenewal: Equatable, Sendable {
+    let cliReload: CodexReloadSummary
+    let desktopReload: DesktopReloadResult
+}
+
+struct AccountActivationRuntimeSnapshotSet: Sendable {
+    let cli: CodexLocalRuntimeEvidenceSnapshot
+    let desktop: CodexLocalRuntimeEvidenceSnapshot
+    let observedAt: Date
+}
+
+enum AccountActivationRuntimeEvidencePreflight {
+    static func performRenewal(
+        desktopReload: () async -> DesktopReloadResult,
+        cliReload: () async -> CodexReloadSummary
+    ) async -> AccountActivationRuntimeRenewal {
+        let desktop = await desktopReload()
+        let cli: CodexReloadSummary
+        switch desktop {
+        case .reloaded, .noDesktopRuntime:
+            cli = await cliReload()
+        case .failed, .unsupported:
+            cli = CodexReloadSummary(
+                discoveredRuntimeCount: 0,
+                acknowledgedRuntimeCount: 0
+            )
+        }
+        return AccountActivationRuntimeRenewal(
+            cliReload: cli,
+            desktopReload: desktop
+        )
+    }
+
+    static func renewAndEvaluate(
+        expectedAccountId: UUID,
+        expectedAuthIdentity: CodexAuthFileIdentity,
+        lifetime: TimeInterval = AccountActivationCoordinator.runtimeEvidenceLifetime,
+        generation: UUID = UUID(),
+        renew: () async -> AccountActivationRuntimeRenewal,
+        capture: () async -> AccountActivationRuntimeSnapshotSet?,
+        runtimeBindingIsCurrent: (CodexReloadBinding) -> Bool
+    ) async -> AccountActivationRuntimeEvidenceDecision {
+        let renewal = await renew()
+        let completion = AccountActivationConvergenceEvaluator.completion(
+            cliReload: renewal.cliReload,
+            desktopReload: renewal.desktopReload
+        )
+        guard completion.outcome == .runtimeCurrent else {
+            return .denied(
+                detail: completion.outcome == .configuredOnly
+                    ? .noLocalRuntime
+                    : .runtimeAcknowledgementIncomplete,
+                discoveredRuntimeCount: completion.discoveredRuntimeCount,
+                acknowledgedRuntimeCount: completion.acknowledgedRuntimeCount
+            )
+        }
+        guard let snapshots = await capture() else {
+            return .denied(
+                detail: .durableConfigurationChanged,
+                discoveredRuntimeCount: completion.discoveredRuntimeCount,
+                acknowledgedRuntimeCount: completion.acknowledgedRuntimeCount
+            )
+        }
+        return AccountActivationRuntimeEvidenceEvaluator.evaluate(
+            cli: snapshots.cli,
+            desktop: snapshots.desktop,
+            expectedAccountId: expectedAccountId,
+            expectedAuthIdentity: expectedAuthIdentity,
+            observedAt: snapshots.observedAt,
+            lifetime: lifetime,
+            generation: generation,
+            runtimeBindingIsCurrent: runtimeBindingIsCurrent
+        )
+    }
 }
 
 struct AccountActivationRuntimePermit: Equatable, Sendable {
@@ -124,6 +273,8 @@ enum AccountCredentialMutationBoundary {
 }
 
 enum AccountActivationRuntimeEvidenceEvaluator {
+    static let maximumAcknowledgementAge = SwapEngine.maximumReloadAcknowledgementAge
+
     static func evaluate(
         cli: CodexLocalRuntimeEvidenceSnapshot,
         desktop: CodexLocalRuntimeEvidenceSnapshot,
@@ -131,7 +282,8 @@ enum AccountActivationRuntimeEvidenceEvaluator {
         expectedAuthIdentity: CodexAuthFileIdentity,
         observedAt: Date,
         lifetime: TimeInterval = AccountActivationCoordinator.runtimeEvidenceLifetime,
-        generation: UUID = UUID()
+        generation: UUID = UUID(),
+        runtimeBindingIsCurrent: (CodexReloadBinding) -> Bool
     ) -> AccountActivationRuntimeEvidenceDecision {
         let snapshots = [cli, desktop]
         let discovered = snapshots.reduce(0) { $0 + $1.runtimes.count }
@@ -153,11 +305,11 @@ enum AccountActivationRuntimeEvidenceEvaluator {
         guard runtimes.allSatisfy({ evidence in
             let acknowledgement = evidence.startupAcknowledgement
             return evidence.observation.authFileIdentity == expectedAuthIdentity
-                && acknowledgement.binding.authFileIdentity == expectedAuthIdentity
-                && acknowledgement.loadedTokenFingerprint
-                    == expectedAuthIdentity.completeTokenFingerprint
-                && acknowledgement.activeTokenFingerprint
-                    == expectedAuthIdentity.completeTokenFingerprint
+                && SwapEngine.acknowledgementSupportsPassiveRuntimeEvidence(
+                    acknowledgement,
+                    observation: evidence.observation
+                )
+                && runtimeBindingIsCurrent(acknowledgement.binding)
         }) else {
             return .denied(
                 detail: .runtimeAcknowledgementIncomplete,
@@ -165,14 +317,40 @@ enum AccountActivationRuntimeEvidenceEvaluator {
                 acknowledgedRuntimeCount: 0
             )
         }
+        let acknowledgementDates = runtimes.map {
+            Date(
+                timeIntervalSince1970: TimeInterval(
+                    $0.startupAcknowledgement.acknowledgedAtUnixMilliseconds
+                ) / 1_000
+            )
+        }
+        guard acknowledgementDates.allSatisfy({ acknowledgementDate in
+            let age = observedAt.timeIntervalSince(acknowledgementDate)
+            return age >= 0 && age <= maximumAcknowledgementAge
+        }), let evidenceObservedAt = acknowledgementDates.min() else {
+            return .denied(
+                detail: .runtimeAcknowledgementIncomplete,
+                discoveredRuntimeCount: discovered,
+                acknowledgedRuntimeCount: 0
+            )
+        }
         let boundedLifetime = max(1, min(lifetime, 30))
+        let expiresAt = evidenceObservedAt.addingTimeInterval(boundedLifetime)
+        guard expiresAt > observedAt else {
+            return .denied(
+                detail: .runtimeAcknowledgementIncomplete,
+                discoveredRuntimeCount: discovered,
+                acknowledgedRuntimeCount: 0
+            )
+        }
         return .confirmed(AccountActivationRuntimeEvidence(
             generation: generation,
             runtimeCurrentAccountId: expectedAccountId,
-            observedAt: observedAt,
-            expiresAt: observedAt.addingTimeInterval(boundedLifetime),
+            observedAt: evidenceObservedAt,
+            expiresAt: expiresAt,
             discoveredRuntimeCount: discovered,
-            acknowledgedRuntimeCount: discovered
+            acknowledgedRuntimeCount: discovered,
+            runtimeBindings: runtimes.map(\.startupAcknowledgement.binding)
         ))
     }
 }

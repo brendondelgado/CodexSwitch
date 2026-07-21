@@ -255,7 +255,7 @@ struct ExternalRateLimitResetHoldStoreTests {
         let bank = resetBank(
             availableCount: 1,
             totalEarnedCount: 1,
-            credits: [],
+            credits: [resetCredit(id: "background-credit", status: "available", now: now)],
             fetchedAt: now.addingTimeInterval(-61)
         )
 
@@ -273,7 +273,7 @@ struct ExternalRateLimitResetHoldStoreTests {
         let decisionFreshBank = resetBank(
             availableCount: 1,
             totalEarnedCount: 1,
-            credits: [],
+            credits: [resetCredit(id: "decision-credit", status: "available", now: now)],
             fetchedAt: now.addingTimeInterval(-59)
         )
         #expect(AppDelegate.rateLimitResetBankIsFresh(
@@ -285,11 +285,45 @@ struct ExternalRateLimitResetHoldStoreTests {
         let backgroundExpiredBank = resetBank(
             availableCount: 1,
             totalEarnedCount: 1,
-            credits: [],
+            credits: [resetCredit(id: "stale-credit", status: "available", now: now)],
             fetchedAt: now.addingTimeInterval(-300)
         )
         #expect(!AppDelegate.rateLimitResetBankIsFresh(
             backgroundExpiredBank,
+            at: now,
+            requiresDecisionEvidence: false
+        ))
+
+        let malformedFreshBank = resetBank(
+            availableCount: 1,
+            totalEarnedCount: 1,
+            credits: [],
+            fetchedAt: now.addingTimeInterval(-1)
+        )
+        #expect(!AppDelegate.rateLimitResetBankIsFresh(
+            malformedFreshBank,
+            at: now,
+            requiresDecisionEvidence: false
+        ))
+
+        let expiredCredit = RateLimitResetCredit(
+            id: "expired-credit",
+            resetType: "weekly",
+            status: "available",
+            grantedAt: now.addingTimeInterval(-3_600),
+            expiresAt: now.addingTimeInterval(-1),
+            redeemedAt: nil,
+            title: nil,
+            description: nil
+        )
+        let expiredFreshBank = resetBank(
+            availableCount: 1,
+            totalEarnedCount: 1,
+            credits: [expiredCredit],
+            fetchedAt: now.addingTimeInterval(-1)
+        )
+        #expect(!AppDelegate.rateLimitResetBankIsFresh(
+            expiredFreshBank,
             at: now,
             requiresDecisionEvidence: false
         ))

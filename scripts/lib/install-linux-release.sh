@@ -1,4 +1,286 @@
 # shellcheck shell=bash
+# Keep installer ownership observation aligned with the reviewed checked-in unit.
+observe_managed_systemd_owner() {
+  python3 "$RUNTIME_OBSERVER_HELPER_ROOT/observe-managed-systemd.py" \
+    "$MANAGED_APP_SERVER_UNIT" \
+    "$SERVICE_DIR/$MANAGED_APP_SERVER_UNIT" \
+    "$RUNTIME_OBSERVATION_TIMEOUT_SECONDS" \
+    "$STATE_FILE_MAX_BYTES" \
+    /usr/bin/flock --shared --no-fork \
+    "$RUNTIME_START_INSTALL_GUARD" \
+    /usr/bin/flock --exclusive --nonblock --no-fork \
+    "$DAEMON_RESERVATION_GUARD" \
+    "$CURRENT_LINK/patched-codex/codex" \
+    app-server --remote-control --listen ws://127.0.0.1:8390
+}
+
+reconcile_stale_systemd_start_barriers() {
+  local barrier_root=""
+  local units=""
+  local result=""
+
+  [[ "$ACTIVATE" == "1" ]] || return 0
+  [[ -e "$ACTIVATION_LOCK_FILE" || -L "$ACTIVATION_LOCK_FILE" ]] || return 0
+  barrier_root="$(systemd_start_barrier_root)" || fail "failed to resolve the systemd start barrier root"
+  units="$(activation_blocking_systemd_units)" || fail "failed to load the systemd start barrier contract"
+  result="$(python3 - \
+    "$INSTALL_ROOT" "$ACTIVATION_LOCK_FILE" "$barrier_root" "$PROC_ROOT" \
+    "$STATE_FILE_MAX_BYTES" "$units" <<'PY'
+import fcntl
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+install_root = Path(sys.argv[1])
+lock_path = Path(sys.argv[2])
+barrier_root = Path(sys.argv[3])
+proc_root = Path(sys.argv[4])
+read_limit = int(sys.argv[5])
+units = [value for value in sys.argv[6].splitlines() if value]
+
+
+def read_regular(path: Path):
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        return None
+    if before.st_size <= 0 or before.st_size > read_limit:
+        return None
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_size)
+        expected_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+        )
+        if identity != expected_identity:
+            raise SystemExit(f"stale activation owner changed identity: {path}")
+        data = os.read(descriptor, read_limit + 1)
+        if len(data) > read_limit or os.read(descriptor, 1):
+            raise SystemExit(f"stale activation owner exceeds read bound: {path}")
+    finally:
+        os.close(descriptor)
+    return identity, data
+
+
+def parse_owner(record):
+    if record is None:
+        return None
+    _identity, data = record
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return None
+    fields = {}
+    for line in lines:
+        parts = line.split("\t", 1)
+        if len(parts) != 2 or parts[0] in fields:
+            return None
+        fields[parts[0]] = parts[1]
+    if set(fields) != {"format", "pid", "start", "token"}:
+        return None
+    if fields["format"] != "codexswitch-activation-lock-v1":
+        return None
+    if re.fullmatch(r"[1-9][0-9]*", fields["pid"]) is None:
+        return None
+    if re.fullmatch(r"(?:UNKNOWN|[0-9]+)", fields["start"]) is None:
+        return None
+    if re.fullmatch(r"[0-9a-f]{32}", fields["token"]) is None:
+        return None
+    return fields
+
+
+def owner_is_live(owner) -> bool:
+    pid = int(owner["pid"])
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if owner["start"] == "UNKNOWN":
+        return True
+    try:
+        value = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+    fields = value[value.rfind(")") + 2 :].split()
+    observed = fields[19] if len(fields) > 19 else "UNKNOWN"
+    return observed == owner["start"]
+
+
+if not install_root.is_absolute() or Path(os.path.realpath(install_root)) != install_root:
+    raise SystemExit("activation mutex root is not canonical")
+if not barrier_root.is_absolute() or Path(os.path.realpath(barrier_root)) != barrier_root:
+    raise SystemExit("systemd start barrier root is not canonical")
+if not units or len(units) != len(set(units)):
+    raise SystemExit("systemd start barrier unit contract is invalid")
+
+mutex = os.open(
+    install_root,
+    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+)
+try:
+    fcntl.flock(mutex, fcntl.LOCK_EX)
+    lock_record = read_regular(lock_path)
+    owner = parse_owner(lock_record)
+    if owner is None:
+        print("unverified")
+        raise SystemExit(0)
+    if owner_is_live(owner):
+        print("live")
+        raise SystemExit(0)
+
+    barriers = [
+        barrier_root / f"{unit}.d" / "00-codexswitch-activation-guard.conf"
+        for unit in units
+    ]
+    present = [os.path.lexists(path) for path in barriers]
+    if not any(present):
+        print("absent")
+        raise SystemExit(0)
+    if not all(present):
+        raise SystemExit("stale systemd start barrier set is incomplete")
+
+    expected = (
+        "# codexswitch-activation-start-barrier-v1\n"
+        f"# owner_pid={owner['pid']}\n"
+        f"# owner_start={owner['start']}\n"
+        f"# owner_token={owner['token']}\n"
+        "[Unit]\n"
+        f"ConditionPathExists=!{lock_path}\n"
+    ).encode("utf-8")
+    identities = {}
+    for path in barriers:
+        parent = path.parent
+        metadata = parent.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise SystemExit(f"stale systemd start barrier parent is unsafe: {parent}")
+        if Path(os.path.realpath(parent)) != parent:
+            raise SystemExit(f"stale systemd start barrier parent is not canonical: {parent}")
+        record = read_regular(path)
+        if record is None or record[1] != expected:
+            raise SystemExit(f"stale systemd start barrier ownership changed: {path}")
+        identities[path] = record[0]
+
+    if read_regular(lock_path) != lock_record:
+        raise SystemExit("stale activation owner changed before barrier removal")
+    for path in barriers:
+        metadata = path.lstat()
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size)
+        if identity != identities[path]:
+            raise SystemExit(f"stale systemd start barrier changed identity: {path}")
+    for path in barriers:
+        path.unlink()
+        directory = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
+    root_descriptor = os.open(
+        barrier_root,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        os.fsync(root_descriptor)
+    finally:
+        os.close(root_descriptor)
+    print("removed")
+finally:
+    os.close(mutex)
+PY
+)" || fail "stale systemd start barrier reconciliation failed"
+
+  case "$result" in
+    absent|live|unverified) return 0 ;;
+    removed)
+      systemctl --user daemon-reload || fail "failed to reload systemd after stale start barrier removal"
+      verify_systemd_start_barriers_absent
+      ;;
+    *) fail "stale systemd start barrier reconciliation returned invalid state: ${result:-<empty>}" ;;
+  esac
+}
+
+load_linux_artifact_provenance() {
+  local report=""
+  local -a values=()
+
+  [[ "$TARGET_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "CODEXSWITCH_GIT_SHA must be a full lowercase 40- or 64-character Git SHA"
+  [[ -n "$LINUX_ARTIFACT_DIR" ]] || fail "CODEXSWITCH_LINUX_ARTIFACT_DIR is required"
+  [[ -d "$LINUX_ARTIFACT_DIR" && ! -L "$LINUX_ARTIFACT_DIR" ]] || fail "Linux artifact must be a regular directory: $LINUX_ARTIFACT_DIR"
+  [[ -f "$LINUX_ARTIFACT_VERIFIER" && ! -L "$LINUX_ARTIFACT_VERIFIER" ]] || fail "Linux artifact verifier is missing or unsafe: $LINUX_ARTIFACT_VERIFIER"
+  if [[ -n "${CODEXSWITCH_LINUX_ARTIFACT_DIR:-}" && -n "${CODEXSWITCH_CODEX_RUNTIME_DIR:-}" ]]; then
+    [[ "$(canonicalize_path "$CODEXSWITCH_LINUX_ARTIFACT_DIR")" == "$(canonicalize_path "$CODEXSWITCH_CODEX_RUNTIME_DIR")" ]] || fail "CODEXSWITCH_CODEX_RUNTIME_DIR may not substitute a different artifact directory"
+  fi
+
+  report="$(python3 "$LINUX_ARTIFACT_VERIFIER" verify --directory "$(canonicalize_path "$LINUX_ARTIFACT_DIR")" --mode staged)" || fail "Linux artifact verification failed"
+  while IFS= read -r value; do
+    values+=("$value")
+  done < <(python3 -c '
+import json
+import sys
+
+report = json.load(sys.stdin)
+expected = {
+    "artifactBytes",
+    "buildEpoch",
+    "buildVersion",
+    "manifestSha256",
+    "sourcePatchSha256",
+    "sourceSha",
+    "upstreamSha",
+    "upstreamVersion",
+}
+if set(report) != expected:
+    raise SystemExit("Linux artifact verifier returned an unexpected report")
+for key in (
+    "sourceSha",
+    "upstreamSha",
+    "sourcePatchSha256",
+    "upstreamVersion",
+    "buildVersion",
+    "buildEpoch",
+    "manifestSha256",
+    "artifactBytes",
+):
+    print(report[key])
+' <<< "$report")
+  [[ "${#values[@]}" -eq 8 ]] || fail "Linux artifact verifier returned incomplete provenance"
+
+  [[ "${values[0]}" == "$TARGET_SHA" ]] || fail "artifact CodexSwitch commit does not match CODEXSWITCH_GIT_SHA"
+  CODEX_SOURCE_SHA="${values[1]}"
+  SOURCE_PATCH_SHA256="${values[2]}"
+  CODEX_VERSION="${values[3]}"
+  ARTIFACT_BUILD_VERSION="${values[4]}"
+  ARTIFACT_BUILD_EPOCH="${values[5]}"
+  ARTIFACT_MANIFEST_SHA256="${values[6]}"
+  ARTIFACT_TOTAL_BYTES="${values[7]}"
+
+  if [[ -n "$REQUESTED_CODEX_VERSION" ]]; then
+    [[ "$REQUESTED_CODEX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "CODEXSWITCH_CODEX_VERSION must be a stable three-component version when supplied as an expectation"
+    [[ "$REQUESTED_CODEX_VERSION" == "$CODEX_VERSION" ]] || fail "CODEXSWITCH_CODEX_VERSION does not match the verified artifact manifest"
+  fi
+  if [[ -n "$REQUESTED_CODEX_SOURCE_SHA" ]]; then
+    [[ "$REQUESTED_CODEX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "CODEXSWITCH_CODEX_SOURCE_SHA must be a full lowercase 40-character Git SHA when supplied as an expectation"
+    [[ "$REQUESTED_CODEX_SOURCE_SHA" == "$CODEX_SOURCE_SHA" ]] || fail "CODEXSWITCH_CODEX_SOURCE_SHA does not match the verified artifact manifest"
+  fi
+  [[ "$("$LINUX_ARTIFACT_DIR/codexswitch-cli" --version)" == "$ARTIFACT_BUILD_VERSION" ]] || fail "artifact control-plane version does not match its manifest"
+}
+
 prepare_source_worktree() {
   local metadata=""
   local origin_url=""
@@ -37,7 +319,9 @@ prepare_source_worktree() {
   RELEASE_ID="$PACKAGE_VERSION-$TARGET_SHA"
   RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
   validate_derived_path RELEASE_DIR "$RELEASES_DIR" "$RELEASE_DIR"
-  EXPECTED_CLI_VERSION="codexswitch-cli $PACKAGE_VERSION (git ${TARGET_SHA:0:12}, built $BUILD_EPOCH)"
+  EXPECTED_CLI_VERSION="codexswitch-cli $PACKAGE_VERSION (git $TARGET_SHA, built $BUILD_EPOCH)"
+  [[ "$ARTIFACT_BUILD_EPOCH" == "$BUILD_EPOCH" ]] || fail "artifact build epoch does not match the exact CodexSwitch commit"
+  [[ "$ARTIFACT_BUILD_VERSION" == "$EXPECTED_CLI_VERSION" ]] || fail "artifact control-plane provenance does not match the exact CodexSwitch source"
 }
 
 binary_contains_marker() {
@@ -59,7 +343,6 @@ validate_hot_swap_markers() {
     "CodexSwitch account/updated frontend write acknowledged after auth reload"
     "codexswitch-hotswap-contract-v3"
     "codexswitch-hotswap-cli-contract-v3"
-    "codex-runtime-storage-leases-v1"
   )
 
   for marker in "${required_markers[@]}"; do
@@ -164,6 +447,11 @@ validate_release() {
   local expected_cli=""
   local codex_version=""
   local codex_source_sha=""
+  local upstream_codex_git_sha=""
+  local source_patch_sha256=""
+  local source_patch_manifest_value=""
+  local artifact_manifest_sha256=""
+  local artifact_total_bytes=""
 
   validate_derived_path RELEASE_DIR "$RELEASES_DIR" "$release_dir"
   validate_derived_path RELEASE_RUNTIME_DIR "$release_dir" "$runtime_dir"
@@ -182,16 +470,26 @@ validate_release() {
   expected_cli="$(manifest_value "$manifest" cli_version)"
   codex_version="$(manifest_value "$manifest" codex_version)"
   codex_source_sha="$(manifest_value "$manifest" codex_source_sha)"
+  upstream_codex_git_sha="$(manifest_value "$manifest" upstream_codex_git_sha)"
+  source_patch_sha256="$(manifest_value "$manifest" source_patch_sha256)"
+  source_patch_manifest_value="$(manifest_value "$manifest" sourcePatchSha256)"
+  artifact_manifest_sha256="$(manifest_value "$manifest" artifact_manifest_sha256)"
+  artifact_total_bytes="$(manifest_value "$manifest" artifact_total_bytes)"
 
   [[ "$git_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "release manifest has an invalid Git SHA: $manifest"
   [[ "$codex_source_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || fail "release manifest has an invalid Codex source SHA: $manifest"
+  [[ "$upstream_codex_git_sha" =~ ^[0-9a-f]{40}$ && "$upstream_codex_git_sha" == "$codex_source_sha" ]] || fail "release manifest has an invalid upstream peeled SHA: $manifest"
+  [[ "$source_patch_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "release manifest has an invalid source patch SHA-256: $manifest"
+  [[ "$source_patch_manifest_value" == "$source_patch_sha256" ]] || fail "release manifest sourcePatchSha256 provenance drifted: $manifest"
+  [[ "$artifact_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "release manifest has an invalid artifact manifest SHA-256: $manifest"
+  [[ "$artifact_total_bytes" =~ ^[1-9][0-9]*$ && "$artifact_total_bytes" -le "$RELEASE_MAX_BYTES" ]] || fail "release manifest has an invalid artifact byte total: $manifest"
   [[ "$package_version" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]] || fail "release manifest has an invalid package version: $manifest"
   [[ "$codex_version" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]] || fail "release manifest has an invalid Codex version: $manifest"
   [[ "$build_epoch" =~ ^[0-9]+$ ]] || fail "release manifest has an invalid build epoch: $manifest"
   [[ "$release_id" == "$package_version-$git_sha" ]] || fail "release ID does not match version plus SHA: $manifest"
   [[ "$(basename "$release_dir")" == "$release_id" ]] || fail "release directory name does not match manifest: $release_dir"
 
-  expected_cli="codexswitch-cli $package_version (git ${git_sha:0:12}, built $build_epoch)"
+  expected_cli="codexswitch-cli $package_version (git $git_sha, built $build_epoch)"
   [[ "$(manifest_value "$manifest" cli_version)" == "$expected_cli" ]] || fail "release CLI provenance string is incompatible: $manifest"
   [[ -f "$cli" && ! -L "$cli" && -x "$cli" ]] || fail "release CLI is missing or linked: $cli"
   [[ "$(sha256_file "$cli")" == "$(manifest_value "$manifest" cli_sha256)" ]] || fail "release CLI SHA-256 mismatch: $release_dir"
@@ -219,8 +517,13 @@ validate_candidate_release() {
   [[ "$(manifest_value "$manifest" package_version)" == "$PACKAGE_VERSION" ]] || fail "candidate release package version mismatch"
   [[ "$(manifest_value "$manifest" build_epoch)" == "$BUILD_EPOCH" ]] || fail "candidate release build epoch mismatch"
   [[ "$(manifest_value "$manifest" cli_version)" == "$EXPECTED_CLI_VERSION" ]] || fail "candidate release CLI version mismatch"
-  [[ "$(manifest_value "$manifest" codex_version)" == "$CODEX_VERSION" ]] || fail "candidate release Codex version does not match requested runtime provenance"
-  [[ "$(manifest_value "$manifest" codex_source_sha)" == "$CODEX_SOURCE_SHA" ]] || fail "candidate release Codex source SHA does not match requested runtime provenance"
+  [[ "$(manifest_value "$manifest" codex_version)" == "$CODEX_VERSION" ]] || fail "candidate release Codex version does not match the verified artifact"
+  [[ "$(manifest_value "$manifest" codex_source_sha)" == "$CODEX_SOURCE_SHA" ]] || fail "candidate release Codex source SHA does not match the verified artifact"
+  [[ "$(manifest_value "$manifest" upstream_codex_git_sha)" == "$CODEX_SOURCE_SHA" ]] || fail "candidate release upstream peeled SHA does not match the verified artifact"
+  [[ "$(manifest_value "$manifest" source_patch_sha256)" == "$SOURCE_PATCH_SHA256" ]] || fail "candidate release source patch SHA-256 does not match the verified artifact"
+  [[ "$(manifest_value "$manifest" sourcePatchSha256)" == "$SOURCE_PATCH_SHA256" ]] || fail "candidate release sourcePatchSha256 does not match the verified artifact"
+  [[ "$(manifest_value "$manifest" artifact_manifest_sha256)" == "$ARTIFACT_MANIFEST_SHA256" ]] || fail "candidate release artifact manifest SHA-256 does not match the verified artifact"
+  [[ "$(manifest_value "$manifest" artifact_total_bytes)" == "$ARTIFACT_TOTAL_BYTES" ]] || fail "candidate release artifact byte total does not match the verified artifact"
 }
 
 run_repository_cargo_build() {
@@ -460,9 +763,10 @@ publish_release() {
   codex_sha="$(sha256_file "$runtime_target/codex")"
   helper_sha="$(sha256_file "$runtime_target/codex-code-mode-host")"
   validate_systemd_payload "$systemd_target"
-  printf 'format\tcodexswitch-release-v3\nrelease_id\t%s\ngit_sha\t%s\npackage_version\t%s\nbuild_epoch\t%s\ncli_version\t%s\ncli_sha256\t%s\ncodex_source_sha\t%s\ncodex_version\t%s\ncodex_sha256\t%s\ncodex_code_mode_host_sha256\t%s\ncodex_marker_contract\tcodexswitch-hotswap-full-v3\nsystemd_payload\t%s\ncodexswitch_unit_sha256\t%s\ncodexswitch_dropin_sha256\t%s\napp_server_unit_sha256\t%s\napp_server_dropin_sha256\t%s\n' \
+  printf 'format\tcodexswitch-release-v3\nrelease_id\t%s\ngit_sha\t%s\npackage_version\t%s\nbuild_epoch\t%s\ncli_version\t%s\ncli_sha256\t%s\ncodex_source_sha\t%s\nupstream_codex_git_sha\t%s\nsource_patch_sha256\t%s\nsourcePatchSha256\t%s\nartifact_manifest_sha256\t%s\nartifact_total_bytes\t%s\ncodex_version\t%s\ncodex_sha256\t%s\ncodex_code_mode_host_sha256\t%s\ncodex_marker_contract\tcodexswitch-hotswap-full-v3\nsystemd_payload\t%s\ncodexswitch_unit_sha256\t%s\ncodexswitch_dropin_sha256\t%s\napp_server_unit_sha256\t%s\napp_server_dropin_sha256\t%s\n' \
     "$RELEASE_ID" "$TARGET_SHA" "$PACKAGE_VERSION" "$BUILD_EPOCH" "$EXPECTED_CLI_VERSION" "$cli_sha" \
-    "$CODEX_SOURCE_SHA" "$CODEX_VERSION" "$codex_sha" "$helper_sha" "$(systemd_payload_manifest_value)" \
+    "$CODEX_SOURCE_SHA" "$CODEX_SOURCE_SHA" "$SOURCE_PATCH_SHA256" "$SOURCE_PATCH_SHA256" "$ARTIFACT_MANIFEST_SHA256" "$ARTIFACT_TOTAL_BYTES" \
+    "$CODEX_VERSION" "$codex_sha" "$helper_sha" "$(systemd_payload_manifest_value)" \
     "$(sha256_file "$systemd_target/codexswitch.service")" \
     "$(sha256_file "$systemd_target/codexswitch.service.d/10-maintenance-resources.conf")" \
     "$(sha256_file "$systemd_target/signul-codex-app-server.service")" \

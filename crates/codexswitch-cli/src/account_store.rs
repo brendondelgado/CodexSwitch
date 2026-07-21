@@ -782,6 +782,34 @@ impl AccountStoreLock {
         load_account_store_snapshot_at(&self.directory, &self.store_name, &self.store_path, true)
     }
 
+    pub(crate) fn with_lock_released<T, F>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        flock(self.file.as_raw_fd(), LOCK_UN)
+            .context("failed to release account-store lock for external I/O")?;
+        struct Relock<'a> {
+            lock: &'a AccountStoreLock,
+            active: bool,
+        }
+        impl Drop for Relock<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    let _ = flock(self.lock.file.as_raw_fd(), LOCK_EX);
+                }
+            }
+        }
+        let mut relock = Relock {
+            lock: self,
+            active: true,
+        };
+        let result = operation();
+        flock(self.file.as_raw_fd(), LOCK_EX)
+            .context("failed to reacquire account-store lock after external I/O")?;
+        relock.active = false;
+        result
+    }
+
     pub fn commit(
         &self,
         expected_generation: &AccountStoreGeneration,
@@ -1223,6 +1251,35 @@ fn descriptor_identity(file: &fs::File, path: &Path) -> Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableAccountStoreIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+fn stable_account_store_identity(
+    file: &fs::File,
+    path: &Path,
+) -> Result<StableAccountStoreIdentity> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to fstat {}", path.display()))?;
+    Ok(StableAccountStoreIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
 fn verify_reopened_store_inode(
     directory: &AccountStoreDirectory,
     store_name: &OsStr,
@@ -1397,12 +1454,28 @@ fn load_account_store_snapshot_at(
     ) {
         Ok(mut file) => {
             validate_owned_regular_file(&file, path, current_uid())?;
-            let length = usize::try_from(file.metadata()?.len())
+            let before = stable_account_store_identity(&file, path)?;
+            let length = usize::try_from(before.length)
                 .context("account store length does not fit in memory")?;
             validate_account_store_byte_length(length)?;
-            let mut data = Vec::new();
+            let mut data = Vec::with_capacity(length);
             file.read_to_end(&mut data)
                 .with_context(|| format!("failed to read {}", path.display()))?;
+            validate_account_store_byte_length(data.len())?;
+            if stable_account_store_identity(&file, path)? != before {
+                bail!("account store changed during observation");
+            }
+            let reopened = open_file_at(
+                &directory.file,
+                store_name,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                0,
+            )
+            .with_context(|| format!("failed to reopen {} after observation", path.display()))?;
+            validate_owned_regular_file(&reopened, path, current_uid())?;
+            if stable_account_store_identity(&reopened, path)? != before {
+                bail!("account store was replaced during observation");
+            }
             data
         }
         Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
@@ -1427,11 +1500,15 @@ fn load_account_store_snapshot_at(
     })
 }
 
-pub fn load_accounts(path: &Path) -> Result<Vec<CodexAccount>> {
+pub(crate) fn load_account_store_snapshot(path: &Path) -> Result<AccountStoreSnapshot> {
     let store_path = normalize_account_store_path(path)?;
     let directory = open_account_store_directory(&store_path, false)?;
     let store_name = account_store_file_name(&store_path)?;
-    Ok(load_account_store_snapshot_at(&directory, store_name, &store_path, false)?.accounts)
+    load_account_store_snapshot_at(&directory, store_name, &store_path, false)
+}
+
+pub fn load_accounts(path: &Path) -> Result<Vec<CodexAccount>> {
+    Ok(load_account_store_snapshot(path)?.accounts)
 }
 
 pub fn commit_accounts(
@@ -1526,7 +1603,10 @@ pub fn resolve_account_selector(accounts: &[CodexAccount], selector: &str) -> Re
         .collect::<HashSet<_>>();
     match matches.len() {
         0 => bail!("no account matched {selector}"),
-        1 => Ok(*matches.iter().next().expect("one match")),
+        1 => matches
+            .into_iter()
+            .next()
+            .context("resolved account selector lost its only match"),
         _ => bail!("account selector {selector} is ambiguous"),
     }
 }
@@ -1567,7 +1647,7 @@ impl CodexAccount {
             self.account_id.as_str(),
         ]
         .iter()
-        .all(|value| !value.is_empty())
+        .all(|value| !value.trim().is_empty())
     }
 }
 
@@ -2298,6 +2378,29 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert_eq!(fs::read(&outside)?, b"[]");
+        Ok(())
+    }
+
+    #[test]
+    fn account_store_observation_does_not_create_a_lock_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(
+            dir.path(),
+            fs::Permissions::from_mode(ACCOUNT_STORE_DIRECTORY_MODE),
+        )?;
+        let store_path = dir.path().join("accounts.json");
+        let accounts = vec![
+            account("first@example.com", 10.0, 10.0, true),
+            account("second@example.com", 20.0, 20.0, false),
+        ];
+        fs::write(&store_path, serde_json::to_vec(&accounts)?)?;
+        fs::set_permissions(
+            &store_path,
+            fs::Permissions::from_mode(ACCOUNT_STORE_FILE_MODE),
+        )?;
+
+        assert_eq!(load_accounts(&store_path)?.len(), 2);
+        assert!(!store_path.with_extension("json.lock").exists());
         Ok(())
     }
 

@@ -82,11 +82,11 @@ fn patch_app_server_frontend_write_ack_source(
         message: OutgoingMessage,
     },"#,
         r#"
-    /// Broadcasts a notification and reports how many initialized frontend
-    /// writers were eligible and completed the underlying transport write.
+    /// Broadcasts a notification and reports initialized, skipped,
+    /// successfully enqueued, rejected, and completed frontend writer counts.
     BroadcastWithWriteAck {
         message: OutgoingMessage,
-        write_complete_tx: oneshot::Sender<(usize, usize, usize)>,
+        write_complete_tx: oneshot::Sender<(usize, usize, usize, usize, usize)>,
     },"#,
         "BroadcastWithWriteAck",
     )?;
@@ -116,19 +116,27 @@ fn patch_app_server_frontend_write_ack_source(
                     }
                 })
                 .collect();
-            let eligible_frontend_count = target_connections.len();
             let mut write_receivers = Vec::with_capacity(target_connections.len());
+            let mut eligible_frontend_count = 0usize;
+            let skipped_frontend_count =
+                initialized_frontend_count.saturating_sub(target_connections.len());
+            let mut rejected_frontend_count = 0usize;
 
             for connection_id in target_connections {
                 let (connection_write_tx, connection_write_rx) = tokio::sync::oneshot::channel();
-                let _ = send_message_to_connection(
+                if !send_message_to_connection(
                     connections,
                     connection_id,
                     message.clone(),
                     Some(connection_write_tx),
                 )
-                .await;
-                write_receivers.push(connection_write_rx);
+                .await
+                {
+                    eligible_frontend_count += 1;
+                    write_receivers.push(connection_write_rx);
+                } else {
+                    rejected_frontend_count += 1;
+                }
             }
 
             tokio::spawn(async move {
@@ -142,7 +150,9 @@ fn patch_app_server_frontend_write_ack_source(
                     .count();
                 let _ = write_complete_tx.send((
                     initialized_frontend_count,
+                    skipped_frontend_count,
                     eligible_frontend_count,
+                    rejected_frontend_count,
                     completed_writes,
                 ));
             });

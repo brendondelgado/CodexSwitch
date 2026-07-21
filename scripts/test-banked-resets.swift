@@ -1,6 +1,97 @@
 import Darwin
 import Foundation
 
+// The standalone replay compiles only the reset boundary, not the complete app
+// runtime graph. These evidence types retain the authorization invariants that
+// RateLimitResetSubmissionPermit validates before its injected transport runs.
+enum AccountActivationPhase: Sendable, Equatable {
+    case confirmed
+}
+
+struct AccountActivationRuntimeEvidence: Sendable, Equatable {
+    let generation: UUID
+    let runtimeCurrentAccountId: UUID
+    let observedAt: Date
+    let expiresAt: Date
+    let discoveredRuntimeCount: Int
+    let acknowledgedRuntimeCount: Int
+}
+
+struct AccountActivationRuntimePermit: Sendable, Equatable {
+    let targetAccountId: UUID
+    let activationGeneration: UUID
+    let requiredPhase: AccountActivationPhase
+    let evidence: AccountActivationRuntimeEvidence
+}
+
+private struct HarnessActivationState: Sendable {
+    let phase: AccountActivationPhase
+    let configuredAccountId: UUID
+    let activationGeneration: UUID
+    let runtimeEvidenceGeneration: UUID
+    let runtimeEvidenceObservedAt: Date
+    let runtimeEvidenceExpiresAt: Date
+}
+
+struct AccountActivationEffectPermit: Sendable, Equatable {
+    let targetAccountId: UUID
+    let activationGeneration: UUID
+    let requiredPhase: AccountActivationPhase
+    let leaseGeneration: UInt64
+    let runtimePermit: AccountActivationRuntimePermit?
+
+    private let nonce: UUID
+    private let leaseAuthorization: @Sendable () -> Bool
+    private let durableStateProvider: @Sendable () -> HarnessActivationState?
+
+    fileprivate init(
+        targetAccountId: UUID,
+        activationGeneration: UUID,
+        requiredPhase: AccountActivationPhase,
+        leaseGeneration: UInt64,
+        runtimePermit: AccountActivationRuntimePermit?,
+        leaseAuthorization: @escaping @Sendable () -> Bool,
+        durableStateProvider: @escaping @Sendable () -> HarnessActivationState?
+    ) {
+        self.targetAccountId = targetAccountId
+        self.activationGeneration = activationGeneration
+        self.requiredPhase = requiredPhase
+        self.leaseGeneration = leaseGeneration
+        self.runtimePermit = runtimePermit
+        self.nonce = UUID()
+        self.leaseAuthorization = leaseAuthorization
+        self.durableStateProvider = durableStateProvider
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.nonce == rhs.nonce
+    }
+
+    func isCurrentlyAuthorized(at date: Date = Date()) -> Bool {
+        guard leaseAuthorization(),
+              let state = durableStateProvider(),
+              state.phase == requiredPhase,
+              state.configuredAccountId == targetAccountId,
+              state.activationGeneration == activationGeneration,
+              state.runtimeEvidenceObservedAt <= date,
+              state.runtimeEvidenceExpiresAt > date,
+              let runtimePermit,
+              runtimePermit.targetAccountId == targetAccountId,
+              runtimePermit.activationGeneration == activationGeneration,
+              runtimePermit.requiredPhase == requiredPhase,
+              runtimePermit.evidence.generation == state.runtimeEvidenceGeneration,
+              runtimePermit.evidence.runtimeCurrentAccountId == targetAccountId,
+              runtimePermit.evidence.observedAt <= date,
+              runtimePermit.evidence.expiresAt > date,
+              runtimePermit.evidence.discoveredRuntimeCount > 0,
+              runtimePermit.evidence.acknowledgedRuntimeCount
+                == runtimePermit.evidence.discoveredRuntimeCount else {
+            return false
+        }
+        return true
+    }
+}
+
 private enum HarnessError: Error, CustomStringConvertible {
     case failed(String)
 
@@ -47,6 +138,8 @@ private final class TransportHarness: @unchecked Sendable {
 private enum BankedResetHarness {
     static func main() async throws {
         try await inventoryReplay()
+        try inventoryTransitionReplay()
+        try await orchestrationReplay()
         try policyReplay()
         try weeklyOnlyResponseReplay()
         try quotaWindowMigrationReplay()
@@ -154,11 +247,306 @@ private enum BankedResetHarness {
             RateLimitResetHTTPResponse(statusCode: 200, data: fixture)
         }
         let now = try date("2026-07-12T12:00:00Z")
-        let bank = try await service.fetchBank(for: account(), force: true, now: now)
+        let bank = try await service.fetchBank(
+            for: account(),
+            force: true,
+            now: now,
+            observationCompletedAt: now
+        )
         try require(bank.availableCount == 2, "inventory count did not parse")
         try require(
             bank.oldestExpiringCredit(at: now)?.id == "earlier",
             "oldest-expiring credit was not selected"
+        )
+
+        let contradictory = RateLimitResetService { _ in
+            RateLimitResetHTTPResponse(
+                statusCode: 200,
+                data: Data(
+                    """
+                    {
+                      "available_count": 0,
+                      "total_earned_count": 1,
+                      "credits": [{"id":"hidden","status":"available"}]
+                    }
+                    """.utf8
+                )
+            )
+        }
+        do {
+            _ = try await contradictory.fetchBank(
+                for: account(),
+                force: true,
+                now: now,
+                observationCompletedAt: now
+            )
+            throw HarnessError.failed("zero-count available credit was accepted")
+        } catch RateLimitResetServiceError.malformedInventory {
+            // Expected: contradictory inventory cannot hide an available credit.
+        }
+
+        let expiryUnknown = RateLimitResetService { _ in
+            RateLimitResetHTTPResponse(
+                statusCode: 200,
+                data: Data(
+                    """
+                    {
+                      "available_count": 1,
+                      "total_earned_count": 1,
+                      "credits": [{"id":"expiry-unknown","status":"available"}]
+                    }
+                    """.utf8
+                )
+            )
+        }
+        do {
+            _ = try await expiryUnknown.fetchBank(
+                for: account(),
+                force: true,
+                now: now,
+                observationCompletedAt: now
+            )
+            throw HarnessError.failed("expiry-less available credit was accepted")
+        } catch RateLimitResetServiceError.malformedInventory {
+            // Expected: redemption requires a present future expiration.
+        }
+
+        let expiresDuringRequest = RateLimitResetService { _ in
+            RateLimitResetHTTPResponse(
+                statusCode: 200,
+                data: Data(
+                    """
+                    {
+                      "available_count": 1,
+                      "total_earned_count": 1,
+                      "credits": [
+                        {
+                          "id":"mid-request-expiry",
+                          "status":"available",
+                          "expires_at":"2026-07-12T12:00:10Z"
+                        }
+                      ]
+                    }
+                    """.utf8
+                )
+            )
+        }
+        do {
+            _ = try await expiresDuringRequest.fetchBank(
+                for: account(),
+                force: true,
+                now: now,
+                observationCompletedAt: now.addingTimeInterval(20)
+            )
+            throw HarnessError.failed("mid-request credit expiry was accepted")
+        } catch RateLimitResetServiceError.malformedInventory {
+            // Expected: inventory is authoritative only at response completion.
+        }
+    }
+
+    private static func inventoryTransitionReplay() throws {
+        let now = try date("2026-07-12T12:00:00Z")
+        let credits = ["credit-1", "credit-2", "credit-3"].enumerated().map {
+            offset, id in
+            RateLimitResetCredit(
+                id: id,
+                resetType: "full",
+                status: "available",
+                grantedAt: now,
+                expiresAt: now.addingTimeInterval(3_600 + Double(offset)),
+                redeemedAt: nil,
+                title: nil,
+                description: nil
+            )
+        }
+        let initial = RateLimitResetBank(
+            availableCount: 3,
+            totalEarnedCount: 3,
+            credits: credits,
+            fetchedAt: now
+        )
+        let attempt = RateLimitResetAttempt(
+            id: UUID(),
+            providerAccountId: "account-id-active@example.com",
+            creditId: "credit-1",
+            startingAvailableCount: 3,
+            startingBankFetchedAt: now,
+            startingQuotaFetchedAt: now,
+            creditExpiresAt: credits[0].expiresAt,
+            createdAt: now,
+            submittedAt: now,
+            state: .submitted,
+            consumeResponseCode: nil,
+            updatedAt: now
+        )
+        let afterLocal = RateLimitResetBank(
+            availableCount: 2,
+            totalEarnedCount: 3,
+            credits: Array(credits.dropFirst()),
+            fetchedAt: now.addingTimeInterval(1)
+        )
+        let unchangedBank = RateLimitResetBank(
+            availableCount: initial.availableCount,
+            totalEarnedCount: initial.totalEarnedCount,
+            credits: initial.credits,
+            fetchedAt: now.addingTimeInterval(1)
+        )
+        var unresolvedAttempt = attempt
+        unresolvedAttempt.state = .reconciling
+        unresolvedAttempt.updatedAt = now.addingTimeInterval(1)
+        let unchanged = RateLimitResetInventoryTransition.classify(
+            previousBank: initial,
+            refreshedBank: unchangedBank,
+            localExpectation: RateLimitResetSubmissionExpectation(attempt: unresolvedAttempt),
+            observedProviderAccountId: "  ACCOUNT-ID-ACTIVE@EXAMPLE.COM\n",
+            now: now
+        )
+        let retainedExpectation = unchanged.updatedExpectation?.retained(
+            while: unresolvedAttempt
+        )
+        try require(unchanged.disposition == .unchanged, "unchanged inventory lost attribution")
+        try require(retainedExpectation != nil, "unresolved attempt did not retain attribution")
+        let local = RateLimitResetInventoryTransition.classify(
+            previousBank: unchangedBank,
+            refreshedBank: afterLocal,
+            localExpectation: retainedExpectation,
+            observedProviderAccountId: attempt.providerAccountId,
+            now: now
+        )
+        try require(
+            local.disposition == .expectedLocalDecrement,
+            "exact local decrement was not attributed to its attempt"
+        )
+        let afterAdditionalDrop = RateLimitResetBank(
+            availableCount: 1,
+            totalEarnedCount: 3,
+            credits: Array(credits.dropFirst(2)),
+            fetchedAt: now.addingTimeInterval(2)
+        )
+        let additional = RateLimitResetInventoryTransition.classify(
+            previousBank: afterLocal,
+            refreshedBank: afterAdditionalDrop,
+            localExpectation: local.updatedExpectation,
+            observedProviderAccountId: attempt.providerAccountId,
+            now: now
+        )
+        try require(
+            additional.disposition == .externalRedemption,
+            "an additional decrement was hidden by the local expectation"
+        )
+        let oversized = RateLimitResetInventoryTransition.classify(
+            previousBank: initial,
+            refreshedBank: afterAdditionalDrop,
+            localExpectation: RateLimitResetSubmissionExpectation(attempt: attempt),
+            observedProviderAccountId: attempt.providerAccountId,
+            now: now
+        )
+        try require(
+            oversized.disposition == .externalRedemption,
+            "a three-to-one transition was attributed to one local reset"
+        )
+        let naturallyExpiringCredit = RateLimitResetCredit(
+            id: "credit-expiring",
+            resetType: "full",
+            status: "available",
+            grantedAt: now,
+            expiresAt: now.addingTimeInterval(10),
+            redeemedAt: nil,
+            title: nil,
+            description: nil
+        )
+        let retainedCredit = RateLimitResetCredit(
+            id: "credit-retained",
+            resetType: "full",
+            status: "available",
+            grantedAt: now,
+            expiresAt: now.addingTimeInterval(3_600),
+            redeemedAt: nil,
+            title: nil,
+            description: nil
+        )
+        let beforeNaturalExpiry = RateLimitResetBank(
+            availableCount: 2,
+            totalEarnedCount: 2,
+            credits: [naturallyExpiringCredit, retainedCredit],
+            fetchedAt: now
+        )
+        let observedAfterExpiry = now.addingTimeInterval(20)
+        let afterNaturalExpiry = RateLimitResetBank(
+            availableCount: 1,
+            totalEarnedCount: 2,
+            credits: [retainedCredit],
+            fetchedAt: observedAfterExpiry
+        )
+        let naturalExpiry = RateLimitResetInventoryTransition.classify(
+            previousBank: beforeNaturalExpiry,
+            refreshedBank: afterNaturalExpiry,
+            localExpectation: nil,
+            observedProviderAccountId: attempt.providerAccountId,
+            now: observedAfterExpiry
+        )
+        try require(
+            naturalExpiry.disposition == .changedWithoutRedemption,
+            "a naturally expired credit was classified as an external redemption"
+        )
+        let expiringAttempt = RateLimitResetAttempt(
+            id: UUID(),
+            providerAccountId: attempt.providerAccountId,
+            creditId: naturallyExpiringCredit.id,
+            startingAvailableCount: beforeNaturalExpiry.availableCount,
+            startingBankFetchedAt: beforeNaturalExpiry.fetchedAt,
+            startingQuotaFetchedAt: now,
+            creditExpiresAt: naturallyExpiringCredit.expiresAt,
+            createdAt: now,
+            submittedAt: now,
+            state: .submitted,
+            consumeResponseCode: nil,
+            updatedAt: now
+        )
+        let expectedButExpired = RateLimitResetInventoryTransition.classify(
+            previousBank: beforeNaturalExpiry,
+            refreshedBank: afterNaturalExpiry,
+            localExpectation: RateLimitResetSubmissionExpectation(attempt: expiringAttempt),
+            observedProviderAccountId: expiringAttempt.providerAccountId,
+            now: observedAfterExpiry
+        )
+        try require(
+            expectedButExpired.disposition == .changedWithoutRedemption,
+            "an expired selected credit was falsely attributed as local redemption"
+        )
+        unresolvedAttempt.state = .succeeded
+        try require(
+            retainedExpectation?.retained(while: unresolvedAttempt) == nil,
+            "terminal attempt retained local attribution"
+        )
+    }
+
+    @MainActor
+    private static func orchestrationReplay() async throws {
+        var runtimeAuthorizationRequests = 0
+        let manual = RateLimitResetOrchestrationPlan(reason: .manual)
+        let automatic = RateLimitResetOrchestrationPlan(reason: .weeklyPressure)
+
+        _ = await manual.requestRuntimeAuthorization {
+            runtimeAuthorizationRequests += 1
+            return nil
+        }
+        try require(
+            runtimeAuthorizationRequests == 0,
+            "manual redemption requested runtime authorization"
+        )
+        _ = await automatic.requestRuntimeAuthorization {
+            runtimeAuthorizationRequests += 1
+            return nil
+        }
+        try require(
+            runtimeAuthorizationRequests == 1,
+            "automatic redemption did not request runtime authorization exactly once"
+        )
+        try require(manual.requestedCapabilities.isEmpty, "manual redemption requested effects")
+        try require(
+            automatic.requestedCapabilities == [.runtimeAuthorization],
+            "automatic redemption requested account mutation effects"
         )
     }
 
@@ -180,6 +568,46 @@ private enum BankedResetHarness {
                 now: now
             ) == nil,
             "same-tier capacity did not preserve the reset"
+        )
+
+        var free = weekly
+        free.planType = "free"
+        free.rateLimitResetBank = normalBank
+        var incomplete = weekly
+        incomplete.refreshToken = "  "
+        incomplete.rateLimitResetBank = normalBank
+        try require(
+            RateLimitResetPolicy.redemptionReason(
+                for: free,
+                allAccounts: [free],
+                bank: normalBank,
+                now: now
+            ) == nil,
+            "free account became an automatic reset candidate"
+        )
+        try require(
+            RateLimitResetPolicy.redemptionReason(
+                for: incomplete,
+                allAccounts: [incomplete],
+                bank: normalBank,
+                now: now
+            ) == nil,
+            "credential-incomplete account became an automatic reset candidate"
+        )
+        try require(
+            RateLimitResetPolicy.selectRedemptionCandidate(
+                from: [free, incomplete],
+                now: now
+            ) == nil,
+            "ineligible accounts entered the automatic reset pool"
+        )
+        try require(
+            !RateLimitResetPolicy.canManuallyRedeem(
+                for: incomplete,
+                bank: normalBank,
+                now: now
+            ),
+            "credential-incomplete account became manually redeemable"
         )
 
         var activePlus = account(
@@ -240,6 +668,24 @@ private enum BankedResetHarness {
                 now: now
             ) == nil,
             "pool selector spent an inactive Plus reset while active Pro was usable"
+        )
+
+        var laterExpiringPro = account(
+            email: "alpha@example.com",
+            snapshot: snapshot(fiveHourUsed: 20, weeklyUsed: 100, now: now)
+        )
+        laterExpiringPro.rateLimitResetBank = bank(now: now, expiresIn: 7 * 86_400)
+        var soonerExpiringPro = account(
+            email: "zulu@example.com",
+            snapshot: snapshot(fiveHourUsed: 20, weeklyUsed: 100, now: now)
+        )
+        soonerExpiringPro.rateLimitResetBank = bank(now: now, expiresIn: 2 * 86_400)
+        try require(
+            RateLimitResetPolicy.selectRedemptionCandidate(
+                from: [laterExpiringPro, soonerExpiringPro],
+                now: now
+            )?.accountId == soonerExpiringPro.id,
+            "same-tier pool selector did not prioritize the earliest-expiring reset"
         )
 
         let plus = account(
@@ -331,15 +777,41 @@ private enum BankedResetHarness {
         )
         let now = try date("2026-07-12T12:00:00Z")
         let blocked = account(
+            id: UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!,
             snapshot: snapshot(fiveHourUsed: 20, weeklyUsed: 100, now: now.addingTimeInterval(-60))
         )
+        let resetBank = bank(now: now, expiresIn: 86_400)
         let requestId = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        var incomplete = blocked
+        incomplete.refreshToken = " "
+        do {
+            _ = try await service.consume(
+                for: incomplete,
+                bank: resetBank,
+                now: now,
+                authorizeSubmission: { _ in nil }
+            )
+            throw HarnessError.failed("credential-incomplete consume reached the journal")
+        } catch RateLimitResetServiceError.submissionUnauthorized {
+            // Expected: no journal transition or transport is allowed.
+        }
+        try require(
+            harness.requestBodies().isEmpty,
+            "credential-incomplete consume reached transport"
+        )
         do {
             _ = try await service.consume(
                 for: blocked,
-                bank: bank(now: now, expiresIn: 86_400),
+                bank: resetBank,
                 now: now,
-                redeemRequestId: requestId
+                redeemRequestId: requestId,
+                authorizeSubmission: { attempt in
+                    submissionPermit(
+                        for: attempt,
+                        account: blocked,
+                        bank: resetBank
+                    )
+                }
             )
             throw HarnessError.failed("uncertain POST unexpectedly completed")
         } catch is TransportFailure {
@@ -356,6 +828,27 @@ private enum BankedResetHarness {
             "journaled request identifier was not sent"
         )
 
+        let journalTransaction = SecureAtomicFileTransaction(
+            path: journalURL.path,
+            subject: "reset harness legacy journal"
+        )
+        try journalTransaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read(allowMissing: false)
+            guard let bytes = current.bytes,
+                  var envelope = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+                  var attempts = envelope["attempts"] as? [[String: Any]],
+                  !attempts.isEmpty else {
+                throw HarnessError.failed("could not seed legacy reset journal identity")
+            }
+            attempts[0]["providerAccountId"] = "  ACCOUNT-ID-ACTIVE@EXAMPLE.COM\n"
+            envelope["attempts"] = attempts
+            let legacyBytes = try JSONSerialization.data(withJSONObject: envelope)
+            _ = try lockedFile.replace(
+                legacyBytes,
+                expectedGeneration: current.generation
+            )
+        }
+
         let restartedHarness = TransportHarness([
             .response(RateLimitResetHTTPResponse(
                 statusCode: 200,
@@ -366,11 +859,28 @@ private enum BankedResetHarness {
             transport: { request in try restartedHarness.send(request) },
             journalURL: journalURL
         )
+        let normalizedLegacyAttempt = try await restarted.unresolvedAttempt(
+            for: "account-id-active@example.com"
+        )
+        try require(
+            normalizedLegacyAttempt?.providerAccountId == "account-id-active@example.com",
+            "legacy journal identity was not normalized on read"
+        )
+        let restartedBank = bank(now: now.addingTimeInterval(60), expiresIn: 86_400)
+        var blockedVariant = blocked
+        blockedVariant.accountId = "\tAccount-ID-Active@Example.com  "
         do {
             _ = try await restarted.consume(
-                for: blocked,
-                bank: bank(now: now.addingTimeInterval(60), expiresIn: 86_400),
-                now: now.addingTimeInterval(60)
+                for: blockedVariant,
+                bank: restartedBank,
+                now: now.addingTimeInterval(60),
+                authorizeSubmission: { attempt in
+                    submissionPermit(
+                        for: attempt,
+                        account: blocked,
+                        bank: restartedBank
+                    )
+                }
             )
             throw HarnessError.failed("restart allowed a second unresolved POST")
         } catch let error as RateLimitResetServiceError {
@@ -416,6 +926,68 @@ private enum BankedResetHarness {
         )
     }
 
+    private static func submissionPermit(
+        for attempt: RateLimitResetAttempt,
+        account: CodexAccount,
+        bank: RateLimitResetBank
+    ) -> RateLimitResetSubmissionPermit? {
+        guard attempt.providerAccountId == account.accountId,
+              attempt.creditId == bank.oldestExpiringCredit(at: attempt.createdAt)?.id else {
+            return nil
+        }
+
+        let issuedAt = Date()
+        let activationGeneration = UUID(
+            uuidString: "22222222-3333-4444-5555-666666666666"
+        )!
+        let evidenceGeneration = UUID(
+            uuidString: "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+        )!
+        let evidence = AccountActivationRuntimeEvidence(
+            generation: evidenceGeneration,
+            runtimeCurrentAccountId: account.id,
+            observedAt: issuedAt.addingTimeInterval(-1),
+            expiresAt: issuedAt.addingTimeInterval(60),
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        )
+        let state = HarnessActivationState(
+            phase: .confirmed,
+            configuredAccountId: account.id,
+            activationGeneration: activationGeneration,
+            runtimeEvidenceGeneration: evidenceGeneration,
+            runtimeEvidenceObservedAt: evidence.observedAt,
+            runtimeEvidenceExpiresAt: evidence.expiresAt
+        )
+        let runtimePermit = AccountActivationRuntimePermit(
+            targetAccountId: account.id,
+            activationGeneration: activationGeneration,
+            requiredPhase: .confirmed,
+            evidence: evidence
+        )
+        let effectPermit = AccountActivationEffectPermit(
+            targetAccountId: account.id,
+            activationGeneration: activationGeneration,
+            requiredPhase: .confirmed,
+            leaseGeneration: 1,
+            runtimePermit: runtimePermit,
+            leaseAuthorization: { true },
+            durableStateProvider: { state }
+        )
+        let permit = RateLimitResetSubmissionPermit(
+            attemptId: attempt.id,
+            providerAccountId: account.accountId,
+            creditId: attempt.creditId,
+            targetAccountId: account.id,
+            activationGeneration: activationGeneration,
+            leaseGeneration: 1,
+            runtimePermit: runtimePermit,
+            activationEffectPermit: effectPermit,
+            issuedAt: issuedAt
+        )
+        return permit.matches(attempt, at: issuedAt) ? permit : nil
+    }
+
     private static func canonicalTemporaryDirectory() throws -> URL {
         let temporaryPath = FileManager.default.temporaryDirectory.path
         guard let resolvedPath = realpath(temporaryPath, nil) else {
@@ -449,11 +1021,13 @@ private enum BankedResetHarness {
     }
 
     private static func account(
+        id: UUID = UUID(),
         email: String = "active@example.com",
         snapshot: QuotaSnapshot? = nil,
         planType: String = "pro"
     ) -> CodexAccount {
         CodexAccount(
+            id: id,
             email: email,
             accessToken: "access-token",
             refreshToken: "refresh-token",

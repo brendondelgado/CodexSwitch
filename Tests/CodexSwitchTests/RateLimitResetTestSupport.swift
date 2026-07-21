@@ -6,13 +6,15 @@ extension RateLimitResetService {
         for account: CodexAccount,
         bank: RateLimitResetBank,
         now: Date = Date(),
-        redeemRequestId: UUID = UUID()
+        redeemRequestId: UUID = UUID(),
+        redemptionReason: RateLimitResetRedemptionReason? = nil
     ) async throws -> RateLimitResetConsumeResult {
         try await consume(
             for: account,
             bank: bank,
             now: now,
             redeemRequestId: redeemRequestId,
+            redemptionReason: redemptionReason,
             authorizeSubmission: { attempt in
                 authorizedResetSubmissionPermit(for: attempt)
             }
@@ -21,9 +23,12 @@ extension RateLimitResetService {
 }
 
 func authorizedResetSubmissionPermit(
-    for attempt: RateLimitResetAttempt
+    for attempt: RateLimitResetAttempt,
+    requiredPhase: AccountActivationPhase = .confirmed,
+    includesRuntimePermit: Bool = true,
+    runtimeAuthorizationRequired: Bool = true,
+    issuedAt: Date = Date()
 ) -> RateLimitResetSubmissionPermit {
-    let issuedAt = Date()
     let targetAccountId = UUID()
     let activationGeneration = UUID()
     let evidence = AccountActivationRuntimeEvidence(
@@ -36,7 +41,7 @@ func authorizedResetSubmissionPermit(
     )
     let state = AccountActivationState(
         version: AccountActivationState.currentVersion,
-        phase: .confirmed,
+        phase: requiredPhase,
         activationGeneration: activationGeneration,
         configuredAccountId: targetAccountId,
         runtimeCurrentAccountId: targetAccountId,
@@ -50,16 +55,18 @@ func authorizedResetSubmissionPermit(
         runtimeEvidenceObservedAt: evidence.observedAt,
         runtimeEvidenceExpiresAt: evidence.expiresAt
     )
-    let runtimePermit = AccountActivationRuntimePermit(
-        targetAccountId: targetAccountId,
-        activationGeneration: activationGeneration,
-        requiredPhase: .confirmed,
-        evidence: evidence
-    )
+    let runtimePermit: AccountActivationRuntimePermit? = includesRuntimePermit
+        ? AccountActivationRuntimePermit(
+            targetAccountId: targetAccountId,
+            activationGeneration: activationGeneration,
+            requiredPhase: requiredPhase,
+            evidence: evidence
+        )
+        : nil
     let effectPermit = AccountActivationEffectPermit(
         targetAccountId: targetAccountId,
         activationGeneration: activationGeneration,
-        requiredPhase: .confirmed,
+        requiredPhase: requiredPhase,
         leaseGeneration: 1,
         runtimePermit: runtimePermit,
         leaseAuthorization: { true },
@@ -72,6 +79,7 @@ func authorizedResetSubmissionPermit(
         targetAccountId: targetAccountId,
         activationGeneration: activationGeneration,
         leaseGeneration: 1,
+        runtimeAuthorizationRequired: runtimeAuthorizationRequired,
         runtimePermit: runtimePermit,
         activationEffectPermit: effectPermit,
         issuedAt: issuedAt

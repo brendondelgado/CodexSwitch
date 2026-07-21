@@ -248,11 +248,13 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          echo "## Manual Build Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Version | \`${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Tag | \`fork-v${VERSION}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Skip Rebase | \`${{ inputs.skip_rebase }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Runner | \`$(uname -m)\` |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Manual Build Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Tag | \`fork-v${VERSION}\` |"
+            echo "| Skip Rebase | \`${{ inputs.skip_rebase }}\` |"
+            echo "| Runner | \`$(uname -m)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

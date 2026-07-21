@@ -35,6 +35,91 @@ enum AppDelegateDurableConfigurationStatus: Equatable, Sendable {
     case unavailable
 }
 
+struct ExternalAuthObservationContext: Equatable, Sendable {
+    let configuredAccountId: UUID?
+    let swapGeneration: UInt64
+    let activationGeneration: UUID?
+}
+
+struct RateLimitResetInventoryObservation: Equatable, Sendable {
+    let transition: RateLimitResetInventoryTransition
+    let externalHoldUntil: Date?
+}
+
+enum ManualRateLimitResetSwapSuppression: Equatable, Sendable {
+    case pending
+    case durable
+}
+
+private final class RateLimitResetSubmissionTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var expectations: [String: RateLimitResetSubmissionExpectation] = [:]
+
+    func begin(attempt: RateLimitResetAttempt) {
+        guard let providerAccountId = attempt.normalizedProviderAccountId else { return }
+        lock.lock()
+        expectations[providerAccountId] = RateLimitResetSubmissionExpectation(attempt: attempt)
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        expectations.removeAll()
+        lock.unlock()
+    }
+
+    func clear(providerAccountId: String) {
+        guard let providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+            providerAccountId
+        ) else {
+            return
+        }
+        lock.lock()
+        expectations[providerAccountId] = nil
+        lock.unlock()
+    }
+
+    func reconcile(
+        providerAccountId: String,
+        unresolvedAttempt: RateLimitResetAttempt?
+    ) {
+        guard let providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+            providerAccountId
+        ) else {
+            return
+        }
+        lock.lock()
+        if let expectation = expectations[providerAccountId] {
+            expectations[providerAccountId] = expectation.retained(while: unresolvedAttempt)
+        }
+        lock.unlock()
+    }
+
+    func classify(
+        previousBank: RateLimitResetBank?,
+        refreshedBank: RateLimitResetBank,
+        observedProviderAccountId: String,
+        now: Date
+    ) -> RateLimitResetInventoryTransition {
+        lock.lock()
+        defer { lock.unlock() }
+        let providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+            observedProviderAccountId
+        )
+        let transition = RateLimitResetInventoryTransition.classify(
+            previousBank: previousBank,
+            refreshedBank: refreshedBank,
+            localExpectation: providerAccountId.flatMap { expectations[$0] },
+            observedProviderAccountId: observedProviderAccountId,
+            now: now
+        )
+        if let providerAccountId {
+            expectations[providerAccountId] = transition.updatedExpectation
+        }
+        return transition
+    }
+}
+
 private struct PreparedAccountActivation: Sendable {
     let swapGeneration: UInt64
     let activationGeneration: UUID
@@ -123,6 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let accountPersistence = AccountPersistenceCoordinator(store: KeychainStore())
     private let quotaPoller = QuotaPoller()
     private let rateLimitResetService = RateLimitResetService()
+    private let rateLimitResetSubmissionTracker = RateLimitResetSubmissionTracker()
     private let externalRateLimitResetHoldStore = ExternalRateLimitResetHoldStore()
     private let tokenSavingsStore = CodexTokenSavingsStore()
     private let weeklyPrimer = WeeklyPrimer()
@@ -141,10 +227,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
     private var rateLimitResetDecisionPending: Set<UUID> = []
     private var rateLimitResetRedemptionTask: Task<Void, Never>?
-    private var rateLimitResetRedemptionAccountId: String? {
+    private var rateLimitResetOperationProviderAccountId: String? {
         didSet { publishRateLimitResetPresentations() }
     }
     private var rateLimitResetRedemptionBlockedUntil: [UUID: Date] = [:]
+    private var manualRateLimitResetSwapSuppressions: [
+        String: ManualRateLimitResetSwapSuppression
+    ] = [:]
+    private var manualRateLimitResetSwapSuppressionRevisions: [String: UInt64] = [:]
+    private var manualRateLimitResetReleaseProviderAccountIds: Set<String> = []
+    private var rateLimitResetJournalStateIsReadable = false {
+        didSet { publishRateLimitResetPresentations() }
+    }
+    private var rateLimitResetJournalFailureLogged = false
     private var externalRateLimitResetRedemptionBlockedUntil: [UUID: Date] = [:] {
         didSet { publishRateLimitResetPresentations() }
     }
@@ -152,6 +247,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var externalRateLimitResetHoldFailureLogged = false
     private var rateLimitResetRecoveryUntil: [UUID: Date] = [:]
     private var rateLimitResetInventoryRetryAfter: [UUID: Date] = [:]
+    private var rateLimitResetManualErrors: [UUID: String] = [:] {
+        didSet { publishRateLimitResetPresentations() }
+    }
     private var rateLimitResetUnresolvedProviderAccountIds: Set<String> = [] {
         didSet { publishRateLimitResetPresentations() }
     }
@@ -172,6 +270,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastLinuxDevboxFullCheckAt: Date?
     private var lastLinuxDevboxAccountMirrorSucceededAt: Date?
     private var linuxDevboxReadinessCheckInFlight = false
+    private var linuxDevboxReadinessGeneration: UInt64 = 0
+    private var linuxDevboxReadinessTaskContext: LinuxDevboxReadinessTaskContext?
     private var linuxDevboxConsecutiveIssueChecks = 0
     private var lastSubscriptionRefresh: Date?
     private var lastCLIRepairCheck: Date?
@@ -212,6 +312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var terminationFlushCompleted = false
     private var accountPersistenceRevision: UInt64 = 0
     private var externalAuthReconciliationInFlight = false
+    private var externalAuthReconciliationPending = false
 
     private func installStatusItem() {
         if let existingStatusItem = statusItem {
@@ -377,14 +478,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func reconcileExternalAuthIfNeeded() async {
-        guard !isExiting, !externalAuthReconciliationInFlight else { return }
+        guard !isExiting else { return }
+        guard !externalAuthReconciliationInFlight else {
+            externalAuthReconciliationPending = true
+            return
+        }
         externalAuthReconciliationInFlight = true
         defer { externalAuthReconciliationInFlight = false }
+
+        repeat {
+            externalAuthReconciliationPending = false
+            await reconcileExternalAuthObservation()
+        } while externalAuthReconciliationPending && !isExiting
+    }
+
+    private func reconcileExternalAuthObservation() async {
+        let capturedContext = externalAuthObservationContext()
 
         let observation = await Task.detached(priority: .utility) {
             AccountImporter.observeCurrentAccount()
         }.value
         guard !isExiting else { return }
+        let currentContext = externalAuthObservationContext()
+        guard Self.externalAuthObservationIsCurrent(
+            captured: capturedContext,
+            current: currentContext
+        ) else {
+            externalAuthReconciliationPending = true
+            SwapLog.append(.debug(
+                "EXTERNAL_AUTH_OBSERVATION_DISCARDED reason=activation_context_changed captured_swap_generation=\(capturedContext.swapGeneration) current_swap_generation=\(currentContext.swapGeneration)"
+            ))
+            return
+        }
         let imported: CodexAccount
         switch observation {
         case .absent:
@@ -524,6 +649,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 committedDetail: .externalAuthObserved
             )
         }
+    }
+
+    private func externalAuthObservationContext() -> ExternalAuthObservationContext {
+        ExternalAuthObservationContext(
+            configuredAccountId: accountManager.configuredAccount?.id,
+            swapGeneration: swapGeneration,
+            activationGeneration: accountManager.activationState?.activationGeneration
+        )
+    }
+
+    nonisolated static func externalAuthObservationIsCurrent(
+        captured: ExternalAuthObservationContext,
+        current: ExternalAuthObservationContext
+    ) -> Bool {
+        captured == current
     }
 
     private func scheduleGlobalCLIRepairIfNeeded(force: Bool = false) {
@@ -904,8 +1044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 )
             }
             await restoreAccountActivationState()
-            rateLimitResetUnresolvedProviderAccountIds = try await rateLimitResetService
-                .unresolvedProviderAccountIds()
+            _ = await restoreRateLimitResetJournalState()
             let primedDates = await weeklyPrimer.persistedFiveHourPrimedAt()
             for (id, date) in primedDates {
                 if accountManager.accounts.first(where: { $0.id == id })?.realQuotaSnapshot?.fiveHour != nil {
@@ -914,6 +1053,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         } catch {
             logger.error("Failed to load accounts: \(error.localizedDescription)")
+        }
+    }
+
+    private func restoreRateLimitResetJournalState() async -> Bool {
+        let capturedSuppressionRevisions = manualRateLimitResetSwapSuppressionRevisions
+        do {
+            let attempts = try await rateLimitResetService.allAttempts()
+            rateLimitResetUnresolvedProviderAccountIds = Set(attempts.compactMap { attempt in
+                attempt.state.isTerminal ? nil : attempt.normalizedProviderAccountId
+            })
+            applyRestoredManualRateLimitResetSwapSuppressions(
+                Self.manualRateLimitResetSwapSuppressions(attempts: attempts),
+                capturedRevisions: capturedSuppressionRevisions
+            )
+            rateLimitResetJournalStateIsReadable = true
+            rateLimitResetJournalFailureLogged = false
+            return true
+        } catch {
+            rateLimitResetJournalStateIsReadable = false
+            if !rateLimitResetJournalFailureLogged {
+                rateLimitResetJournalFailureLogged = true
+                SwapLog.append(.debug(
+                    "RESET_JOURNAL_UNAVAILABLE automatic_routing=suppressed error=\(error.localizedDescription)"
+                ))
+            }
+            return false
+        }
+    }
+
+    private func ensureRateLimitResetJournalStateIsReadable() async -> Bool {
+        if rateLimitResetJournalStateIsReadable { return true }
+        return await restoreRateLimitResetJournalState()
+    }
+
+    private func recordRateLimitResetJournalFailureIfNeeded(
+        _ error: Error,
+        context: String
+    ) {
+        guard let serviceError = error as? RateLimitResetServiceError,
+              case .journalUnavailable = serviceError else {
+            return
+        }
+        rateLimitResetJournalStateIsReadable = false
+        if !rateLimitResetJournalFailureLogged {
+            rateLimitResetJournalFailureLogged = true
+            SwapLog.append(.debug(
+                "RESET_JOURNAL_UNAVAILABLE context=\(context) automatic_routing=suppressed error=\(error.localizedDescription)"
+            ))
         }
     }
 
@@ -1380,34 +1567,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func captureFreshLocalRuntimeEvidence(
         for account: CodexAccount
     ) async -> AccountActivationRuntimeEvidenceDecision {
-        await Task.detached(priority: .userInitiated) {
+        let expectedAuthIdentity: CodexAuthFileIdentity? = await Task.detached(priority: .userInitiated) {
             let authURL = URL(fileURLWithPath: Self.codexAuthPath)
             guard Self.authFileMatches(account: account, atPath: Self.codexAuthPath),
                   let expectedAuthIdentity = SwapEngine.authFileIdentity(
                       at: authURL,
                       requiredOwnerUID: UInt32(getuid())
                   ) else {
-                return .denied(
-                    detail: .durableConfigurationChanged,
-                    discoveredRuntimeCount: 0,
-                    acknowledgedRuntimeCount: 0
-                )
+                return nil
             }
-            let cli = SwapEngine.localRuntimeEvidenceSnapshot(
-                runtimeKind: .localInteractiveCLI
-            )
-            let desktop = SwapEngine.localRuntimeEvidenceSnapshot(
-                runtimeKind: .externalAppServer
-            )
-            let observedAt = Date()
-            return AccountActivationRuntimeEvidenceEvaluator.evaluate(
-                cli: cli,
-                desktop: desktop,
-                expectedAccountId: account.id,
-                expectedAuthIdentity: expectedAuthIdentity,
-                observedAt: observedAt
-            )
+            return expectedAuthIdentity
         }.value
+        guard let expectedAuthIdentity else {
+            return .denied(
+                detail: .durableConfigurationChanged,
+                discoveredRuntimeCount: 0,
+                acknowledgedRuntimeCount: 0
+            )
+        }
+
+        return await AccountActivationRuntimeEvidencePreflight.renewAndEvaluate(
+            expectedAccountId: account.id,
+            expectedAuthIdentity: expectedAuthIdentity,
+            renew: {
+                await AccountActivationRuntimeEvidencePreflight.performRenewal(
+                    desktopReload: {
+                        await DesktopRuntimeReloadClient().reloadAuth(
+                            account: account
+                        )
+                    },
+                    cliReload: {
+                        await Task.detached(priority: .userInitiated) {
+                            SwapEngine.signalCodexReload()
+                        }.value
+                    }
+                )
+            },
+            capture: {
+                await Task.detached(priority: .userInitiated) { () -> AccountActivationRuntimeSnapshotSet? in
+                    let authURL = URL(fileURLWithPath: Self.codexAuthPath)
+                    guard Self.authFileMatches(
+                        account: account,
+                        atPath: Self.codexAuthPath
+                    ), SwapEngine.authFileIdentity(
+                        at: authURL,
+                        requiredOwnerUID: UInt32(getuid())
+                    ) == expectedAuthIdentity else {
+                        return nil
+                    }
+                    return AccountActivationRuntimeSnapshotSet(
+                        cli: SwapEngine.localRuntimeEvidenceSnapshot(
+                            runtimeKind: .localInteractiveCLI
+                        ),
+                        desktop: SwapEngine.localRuntimeEvidenceSnapshot(
+                            runtimeKind: .externalAppServer
+                        ),
+                        observedAt: Date()
+                    )
+                }.value
+            },
+            runtimeBindingIsCurrent: { binding in
+                SwapEngine.reloadBindingIsCurrent(binding)
+            }
+        )
+    }
+
+    private func revalidatedRuntimeEvidence(
+        _ expected: AccountActivationRuntimeEvidence,
+        for account: CodexAccount
+    ) async -> AccountActivationRuntimeEvidence? {
+        guard case .confirmed(let current) = await captureFreshLocalRuntimeEvidence(
+            for: account
+        ), expected.hasSameRuntimeTopology(as: current) else {
+            return nil
+        }
+        return current
     }
 
     private func activationStateForRequest(at _: Date = Date()) async -> AccountActivationState? {
@@ -2028,16 +2262,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         context: String
     ) {
         let summary = Self.linuxDevboxCredentialSyncHoldSummary(reason: reason)
-        let current = accountManager.linuxDevboxStatus
-        accountManager.linuxDevboxStatus = LinuxDevboxStatus(
-            state: .notReady,
-            summary: summary,
-            activeEmail: current.activeEmail,
-            activeProviderAccountId: current.activeProviderAccountId
+        publishLinuxDevboxInvalidation(
+            .barrierBlocked,
+            summary: summary
         )
         SwapLog.append(.debug(
             "LINUX_DEVBOX_CREDENTIAL_SYNC_HELD context=\(context) unresolved_fingerprint=\(fingerprint) reason=\(reason)"
         ))
+    }
+
+    private func publishLinuxDevboxInvalidation(
+        _ invalidation: LinuxDevboxStatus.Invalidation,
+        summary: String
+    ) {
+        invalidateLinuxDevboxReadinessTask()
+        switch invalidation {
+        case .activeSessionUnverified, .deferred, .expired:
+            lastLinuxDevboxReady = nil
+        case .negative, .failed, .decodedInvalid, .barrierBlocked:
+            lastLinuxDevboxReady = false
+        }
+        lastLinuxDevboxAccountMirrorSucceededAt = nil
+        accountManager.invalidateLinuxDevboxRuntimeEvidence()
+        accountManager.linuxDevboxStatus = .invalidated(
+            by: invalidation,
+            summary: summary
+        )
+    }
+
+    private func beginLinuxDevboxReadinessTask(
+        settings: LinuxDevboxMonitorSettings
+    ) -> LinuxDevboxReadinessTaskContext {
+        linuxDevboxReadinessGeneration &+= 1
+        let context = LinuxDevboxReadinessTaskContext(
+            generation: linuxDevboxReadinessGeneration,
+            settings: settings
+        )
+        linuxDevboxReadinessTaskContext = context
+        linuxDevboxReadinessCheckInFlight = true
+        return context
+    }
+
+    private func linuxDevboxReadinessTaskIsCurrent(
+        _ context: LinuxDevboxReadinessTaskContext
+    ) -> Bool {
+        linuxDevboxReadinessTaskContext == context
+            && context.authorizesPublication(
+                currentGeneration: linuxDevboxReadinessGeneration,
+                currentSettings: LinuxDevboxMonitor.settings()
+            )
+    }
+
+    private func finishLinuxDevboxReadinessTask(
+        _ context: LinuxDevboxReadinessTaskContext
+    ) {
+        guard linuxDevboxReadinessTaskContext == context else { return }
+        linuxDevboxReadinessTaskContext = nil
+        linuxDevboxReadinessCheckInFlight = false
+    }
+
+    private func invalidateLinuxDevboxReadinessTask() {
+        linuxDevboxReadinessGeneration &+= 1
+        linuxDevboxReadinessTaskContext = nil
+        linuxDevboxReadinessCheckInFlight = false
     }
 
     private func clearLegacyLinuxDevboxCredentialSyncHold() {
@@ -2594,6 +2881,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func publishRateLimitResetPresentations(at now: Date = Date()) {
         let presentations = Dictionary(uniqueKeysWithValues: accountManager.accounts.map { account in
             let bank = account.rateLimitResetBank
+            let providerAccountId = account.normalizedProviderAccountId
             let presentation = RateLimitResetInventoryPresentation.resolve(
                 availableCount: bank?.availableCount ?? 0,
                 nextExpiration: bank?.nextExpiration(at: now),
@@ -2602,8 +2890,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     at: now,
                     requiresDecisionEvidence: false
                 ),
-                isRedeeming: rateLimitResetRedemptionAccountId == account.accountId,
-                isReconciling: rateLimitResetUnresolvedProviderAccountIds.contains(account.accountId),
+                isRedeeming: providerAccountId.map {
+                    rateLimitResetOperationProviderAccountId == $0
+                } ?? false,
+                isReconciling: providerAccountId.map {
+                    rateLimitResetUnresolvedProviderAccountIds.contains($0)
+                } ?? false,
+                error: rateLimitResetManualErrors[account.id],
                 externalHoldUntil: externalRateLimitResetRedemptionBlockedUntil[account.id],
                 isRefreshing: rateLimitResetRefreshTasks[account.id] != nil,
                 now: now
@@ -2611,6 +2904,231 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return (account.id, presentation)
         })
         accountManager.publishRateLimitResetPresentations(presentations)
+    }
+
+    private func rateLimitResetCoordinatorAuthorization(
+        for accountId: UUID,
+        at now: Date = Date()
+    ) -> RateLimitResetCoordinatorAuthorization {
+        guard !isExiting else {
+            return .blocked("CodexSwitch is shutting down")
+        }
+        guard Self.rateLimitResetJournalAllowsAutomaticRouting(
+            isReadable: rateLimitResetJournalStateIsReadable
+        ) else {
+            return .blocked("Reset journal is unavailable; redemption is paused")
+        }
+        guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else {
+            return .blocked("This account is no longer available")
+        }
+        let configuredAccount = accountManager.configuredAccount
+        let activationState = accountManager.activationState
+        return .resolve(
+            state: RateLimitResetCoordinatorState(
+                externalHoldStateIsReadable: externalRateLimitResetHoldStateIsReadable,
+                redemptionIsInProgress: rateLimitResetRedemptionTask != nil
+                    || rateLimitResetOperationProviderAccountId != nil,
+                configuredAccountIsAvailable: configuredAccount != nil,
+                activationAllowsManualRedemption: configuredAccount.map { configured in
+                    activationState?.configuredAccountId == configured.id
+                        && activationState.map {
+                            Self.rateLimitResetActivationStateAllows($0, reason: .manual)
+                        } == true
+                } ?? false,
+                accountHasUnresolvedAttempt: rateLimitResetUnresolvedProviderAccountIds
+                    .contains(account.normalizedProviderAccountId ?? ""),
+                externalHoldUntil: externalRateLimitResetRedemptionBlockedUntil[accountId],
+                localHoldUntil: rateLimitResetRedemptionBlockedUntil[accountId]
+            ),
+            now: now
+        )
+    }
+
+    private func redeemRateLimitResetManually(for accountId: UUID) {
+        guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else {
+            SwapLog.append(.debug(
+                "RESET_MANUAL_REDEMPTION_REJECTED account_id=\(accountId.uuidString) reason=account_missing"
+            ))
+            return
+        }
+        let now = Date()
+        let coordinatorAuthorization = rateLimitResetCoordinatorAuthorization(
+            for: accountId,
+            at: now
+        )
+        guard coordinatorAuthorization.isAuthorized else {
+            recordManualRateLimitResetError(
+                coordinatorAuthorization.unavailableReason
+                    ?? "Manual reset redemption is unavailable",
+                for: accountId,
+                reason: .manual
+            )
+            return
+        }
+        guard let bank = account.rateLimitResetBank else {
+            recordManualRateLimitResetError(
+                "Reset inventory is unavailable; refresh and try again",
+                for: accountId,
+                reason: .manual
+            )
+            scheduleRateLimitResetRefresh(for: accountId, force: true)
+            return
+        }
+        if let reason = RateLimitResetPolicy.manualRedemptionUnavailableReason(
+            for: account,
+            bank: bank,
+            now: now
+        ) {
+            recordManualRateLimitResetError(reason, for: accountId, reason: .manual)
+            if !Self.rateLimitResetBankIsFresh(
+                bank,
+                at: now,
+                requiresDecisionEvidence: true
+            ) {
+                scheduleRateLimitResetRefresh(for: accountId, force: true)
+            }
+            return
+        }
+
+        recordManualRateLimitResetError(nil, for: accountId, reason: .manual)
+        startRateLimitResetRedemption(
+            account: account,
+            bank: bank,
+            reason: .manual
+        )
+    }
+
+    private func clearPendingManualRateLimitResetSwapHold(
+        forProviderAccountId providerAccountId: String,
+        reason: RateLimitResetRedemptionReason
+    ) {
+        guard reason == .manual else { return }
+        setManualRateLimitResetSwapSuppression(
+            Self.manualRateLimitResetSwapSuppressionAfterClearingPending(
+                manualRateLimitResetSwapSuppressions[providerAccountId]
+            ),
+            forProviderAccountId: providerAccountId
+        )
+    }
+
+    private func recordSuccessfulManualRateLimitResetSwapHold(
+        attempt: RateLimitResetAttempt,
+        at _: Date
+    ) {
+        guard attempt.redemptionReason == .manual,
+              let providerAccountId = attempt.normalizedProviderAccountId else {
+            return
+        }
+        setManualRateLimitResetSwapSuppression(
+            Self.manualRateLimitResetSwapSuppressionAfterSuccess(
+                manualRateLimitResetSwapSuppressions[providerAccountId],
+                attempt: attempt
+            ),
+            forProviderAccountId: providerAccountId
+        )
+    }
+
+    private func activeManualRateLimitResetSwapExclusions(at _: Date) -> Set<UUID> {
+        Set(accountManager.accounts.compactMap { account in
+            guard let providerAccountId = account.normalizedProviderAccountId,
+                  manualRateLimitResetSwapSuppressions[providerAccountId] != nil else {
+                return nil
+            }
+            return account.id
+        })
+    }
+
+    private func releaseManualRateLimitResetSwapSuppressionIfNeeded(
+        for account: CodexAccount
+    ) async {
+        guard let providerAccountId = account.normalizedProviderAccountId else {
+            return
+        }
+        manualRateLimitResetReleaseProviderAccountIds.insert(providerAccountId)
+        manualRateLimitResetSwapSuppressionRevisions[providerAccountId, default: 0] &+= 1
+        let observedSuppressionRevision = manualRateLimitResetSwapSuppressionRevisions[
+            providerAccountId,
+            default: 0
+        ]
+        defer {
+            manualRateLimitResetReleaseProviderAccountIds.remove(providerAccountId)
+        }
+        do {
+            let released = try await rateLimitResetService.releaseManualSwapSuppression(
+                for: providerAccountId
+            )
+            guard released else {
+                SwapLog.append(.debug(
+                    "RESET_MANUAL_ROUTE_SUPPRESSION_RELEASE_SKIPPED account=\(account.email) reason=no_matching_attempt"
+                ))
+                return
+            }
+            let currentSuppressionRevision = manualRateLimitResetSwapSuppressionRevisions[
+                providerAccountId,
+                default: 0
+            ]
+            guard Self.manualRateLimitResetReleaseMayClearLiveSuppression(
+                observedRevision: observedSuppressionRevision,
+                currentRevision: currentSuppressionRevision
+            ) else {
+                SwapLog.append(.debug(
+                    "RESET_MANUAL_ROUTE_SUPPRESSION_RELEASE_PRESERVED account=\(account.email) reason=newer_local_state"
+                ))
+                return
+            }
+            setManualRateLimitResetSwapSuppression(
+                nil,
+                forProviderAccountId: providerAccountId
+            )
+            SwapLog.append(.debug(
+                "RESET_MANUAL_ROUTE_SUPPRESSION_RELEASED account=\(account.email)"
+            ))
+        } catch {
+            rateLimitResetJournalStateIsReadable = false
+            SwapLog.append(.debug(
+                "RESET_MANUAL_ROUTE_SUPPRESSION_RELEASE_FAILED account=\(account.email) error=\(error.localizedDescription) automatic_routing=suppressed"
+            ))
+        }
+    }
+
+    private func recordManualRateLimitResetError(
+        _ message: String?,
+        for accountId: UUID,
+        reason: RateLimitResetRedemptionReason
+    ) {
+        guard reason == .manual else { return }
+        rateLimitResetManualErrors[accountId] = message
+        guard let message else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            guard let self,
+                  self.rateLimitResetManualErrors[accountId] == message else {
+                return
+            }
+            if let providerAccountId = self.accountManager.accounts.first(where: {
+                $0.id == accountId
+            })?.normalizedProviderAccountId,
+               self.rateLimitResetUnresolvedProviderAccountIds.contains(providerAccountId) {
+                return
+            }
+            self.rateLimitResetManualErrors[accountId] = nil
+        }
+    }
+
+    private func notifyRateLimitResetExpirationIfNeeded(
+        for accountId: UUID,
+        bank: RateLimitResetBank,
+        now: Date
+    ) {
+        guard let expiration = bank.nextExpiration(at: now),
+              let account = accountManager.accounts.first(where: { $0.id == accountId }) else {
+            return
+        }
+        NotificationManager.notifyResetExpiration(
+            account: account,
+            expiration: expiration,
+            now: now
+        )
     }
 
     private var automaticRateLimitResetRedemptionEnabled: Bool {
@@ -2701,6 +3219,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func markExternalRateLimitResetHoldStateReadable() {
         externalRateLimitResetHoldStateIsReadable = true
+        publishRateLimitResetPresentations()
+        accountManager.requestUIRefresh()
         guard externalRateLimitResetHoldFailureLogged else { return }
         externalRateLimitResetHoldFailureLogged = false
         SwapLog.append(.debug(
@@ -2713,6 +3233,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         context: String
     ) {
         externalRateLimitResetHoldStateIsReadable = false
+        publishRateLimitResetPresentations()
+        accountManager.requestUIRefresh()
         guard !externalRateLimitResetHoldFailureLogged else { return }
         externalRateLimitResetHoldFailureLogged = true
         logger.warning(
@@ -2721,6 +3243,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         SwapLog.append(.debug(
             "RESET_EXTERNAL_HOLD_STATE_UNAVAILABLE context=\(context) error=\(error.localizedDescription) automatic_redemption=disabled"
         ))
+    }
+
+    private func observeRateLimitResetBank(
+        for account: CodexAccount,
+        previousBank: RateLimitResetBank?,
+        refreshedBank: RateLimitResetBank,
+        source: String,
+        at now: Date
+    ) -> RateLimitResetInventoryObservation {
+        let transition = rateLimitResetSubmissionTracker.classify(
+            previousBank: previousBank,
+            refreshedBank: refreshedBank,
+            observedProviderAccountId: account.accountId,
+            now: now
+        )
+        var externalHoldUntil: Date?
+        if transition.observedExternalRedemption {
+            let proposedHoldUntil = now.addingTimeInterval(
+                Self.externalRateLimitResetRedemptionCooldown
+            )
+            do {
+                let persistedHold = try externalRateLimitResetHoldStore.record(
+                    providerAccountId: account.accountId,
+                    observedAt: now,
+                    blockedUntil: proposedHoldUntil
+                )
+                externalHoldUntil = persistedHold?.blockedUntil ?? proposedHoldUntil
+            } catch {
+                markExternalRateLimitResetHoldStateUnavailable(
+                    error,
+                    context: "record-\(source)"
+                )
+                externalHoldUntil = proposedHoldUntil
+            }
+            externalRateLimitResetRedemptionBlockedUntil[account.id] = externalHoldUntil
+            restoreExternalRateLimitResetHolds(at: now)
+            SwapLog.append(.debug(
+                "RESET_EXTERNAL_REDEMPTION_OBSERVED account=\(account.email) previous_available=\(previousBank?.availableCount ?? 0) available=\(refreshedBank.availableCount) source=\(source) automatic_redemption=suppressed cooldown_seconds=\(Int(Self.externalRateLimitResetRedemptionCooldown)) blocked_until=\(Int((externalHoldUntil ?? proposedHoldUntil).timeIntervalSince1970)) quota_refresh=required"
+            ))
+        }
+
+        let inventoryChanged = Self.rateLimitResetInventorySemanticallyChanged(
+            previous: previousBank,
+            refreshed: refreshedBank
+        )
+        accountManager.updateRateLimitResetBank(for: account.id, bank: refreshedBank)
+        notifyRateLimitResetExpirationIfNeeded(
+            for: account.id,
+            bank: refreshedBank,
+            now: now
+        )
+        if inventoryChanged {
+            queueTelemetryPersistence(context: "reset-bank-\(source)")
+            statusBarController.updateIcon()
+            updatePopoverContent()
+        }
+        return RateLimitResetInventoryObservation(
+            transition: transition,
+            externalHoldUntil: externalHoldUntil
+        )
     }
 
     private func scheduleRateLimitResetRefresh(
@@ -2741,7 +3323,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                at: now,
                requiresDecisionEvidence: checkSwapAfter
            ),
-           !rateLimitResetUnresolvedProviderAccountIds.contains(storedAccount.accountId) {
+           !(storedAccount.normalizedProviderAccountId.map {
+               rateLimitResetUnresolvedProviderAccountIds.contains($0)
+           } ?? false) {
             if checkSwapAfter {
                 checkAndSwapIfNeeded()
             }
@@ -2765,8 +3349,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             var refreshSucceeded = false
             var externalRedemptionObserved = false
             do {
-                let isReconciling = self.rateLimitResetUnresolvedProviderAccountIds
-                    .contains(account.accountId)
+                let isReconciling = account.normalizedProviderAccountId.map {
+                    self.rateLimitResetUnresolvedProviderAccountIds.contains($0)
+                } ?? false
                 let bank = try await service.fetchBank(
                     for: account,
                     force: force || isReconciling
@@ -2776,88 +3361,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let previous = self.accountManager.accounts
                     .first(where: { $0.id == accountId })?
                     .rateLimitResetBank
-                let observedAt = Date()
-                if let blockedUntil = Self.externalRateLimitResetRedemptionBlockUntil(
-                    previousAvailableCount: previous?.availableCount,
-                    refreshedAvailableCount: bank.availableCount,
-                    localRedemptionProviderAccountId: self.rateLimitResetRedemptionAccountId,
-                    observedProviderAccountId: account.accountId,
-                    now: observedAt
-                ) {
-                    externalRedemptionObserved = true
-                    let effectiveBlockedUntil: Date
-                    do {
-                        let persistedHold = try self.externalRateLimitResetHoldStore.record(
-                            providerAccountId: account.accountId,
-                            observedAt: observedAt,
-                            blockedUntil: blockedUntil
-                        )
-                        effectiveBlockedUntil = persistedHold?.blockedUntil ?? blockedUntil
-                    } catch {
-                        self.markExternalRateLimitResetHoldStateUnavailable(
-                            error,
-                            context: "record"
-                        )
-                        effectiveBlockedUntil = blockedUntil
-                    }
-                    self.externalRateLimitResetRedemptionBlockedUntil[accountId] = effectiveBlockedUntil
-                    self.restoreExternalRateLimitResetHolds(at: observedAt)
-                    SwapLog.append(.debug(
-                        "RESET_EXTERNAL_REDEMPTION_OBSERVED account=\(account.email) previous_available=\(previous?.availableCount ?? 0) available=\(bank.availableCount) automatic_redemption=suppressed cooldown_seconds=\(Int(Self.externalRateLimitResetRedemptionCooldown)) blocked_until=\(Int(effectiveBlockedUntil.timeIntervalSince1970)) quota_refresh=forced"
-                    ))
-                }
-                let inventoryChanged = Self.rateLimitResetInventorySemanticallyChanged(
-                    previous: previous,
-                    refreshed: bank
+                let unresolvedAttempt = try await service.unresolvedAttempt(
+                    for: account.accountId
                 )
-                self.accountManager.updateRateLimitResetBank(for: accountId, bank: bank)
-                if inventoryChanged {
-                    self.queueTelemetryPersistence(context: "reset-bank-refresh")
-                    self.statusBarController.updateIcon()
-                    self.updatePopoverContent()
-                }
+                self.rateLimitResetSubmissionTracker.reconcile(
+                    providerAccountId: account.accountId,
+                    unresolvedAttempt: unresolvedAttempt
+                )
+                let observedAt = Date()
+                let observation = self.observeRateLimitResetBank(
+                    for: account,
+                    previousBank: previous,
+                    refreshedBank: bank,
+                    source: "inventory-refresh",
+                    at: observedAt
+                )
+                externalRedemptionObserved = observation.transition
+                    .observedExternalRedemption
                 SwapLog.append(.debug(
                     "RESET_BANK_REFRESHED account=\(account.email) available=\(bank.availableCount)"
                 ))
 
-                if try await service.unresolvedAttempt(for: account.accountId) != nil {
-                    self.rateLimitResetUnresolvedProviderAccountIds.insert(account.accountId)
+                if unresolvedAttempt != nil {
+                    if let providerAccountId = account.normalizedProviderAccountId {
+                        self.rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
+                    }
                     let reconciled = await self.reconcileRateLimitResetAttempt(
                         account: account,
                         bank: bank,
+                        observation: observation,
                         source: "inventory-refresh"
                     )
                     if !reconciled {
                         self.rateLimitResetInventoryRetryAfter[accountId] = Date().addingTimeInterval(60)
                     }
-                } else if externalRedemptionObserved {
-                    let quotaAccount = self.accountManager.accounts
-                        .first(where: { $0.id == accountId }) ?? account
-                    do {
-                        let quota = try await poller.fetchQuota(for: quotaAccount)
-                        self.accountManager.updateQuota(
-                            for: accountId,
-                            snapshot: quota.snapshot,
-                            planType: quota.planType
-                        )
-                        self.clearExternalRateLimitResetHoldIfQuotaRecovered(
-                            for: accountId,
-                            snapshot: quota.snapshot,
-                            at: Date()
-                        )
-                        self.queueTelemetryPersistence(context: "quota-update")
-                        self.statusBarController.updateIcon()
-                        self.updatePopoverContent()
-                        SwapLog.append(.debug(
-                            "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESHED account=\(account.email) fetched=\(Int(quota.snapshot.fetchedAt.timeIntervalSince1970))"
-                        ))
-                    } catch {
-                        SwapLog.append(.debug(
-                            "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_FAILED account=\(account.email) error=\(error.localizedDescription)"
-                        ))
+                } else {
+                    if let providerAccountId = account.normalizedProviderAccountId {
+                        self.rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+                    }
+                    self.rateLimitResetManualErrors[accountId] = nil
+                    if externalRedemptionObserved {
+                        let quotaAccount = self.accountManager.accounts
+                            .first(where: { $0.id == accountId }) ?? account
+                        do {
+                            let quota = try await poller.fetchQuota(for: quotaAccount)
+                            self.accountManager.updateQuota(
+                                for: accountId,
+                                snapshot: quota.snapshot,
+                                planType: quota.planType
+                            )
+                            self.clearExternalRateLimitResetHoldIfQuotaRecovered(
+                                for: accountId,
+                                snapshot: quota.snapshot,
+                                at: Date()
+                            )
+                            self.queueTelemetryPersistence(context: "quota-update")
+                            self.statusBarController.updateIcon()
+                            self.updatePopoverContent()
+                            SwapLog.append(.debug(
+                                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESHED account=\(account.email) fetched=\(Int(quota.snapshot.fetchedAt.timeIntervalSince1970))"
+                            ))
+                        } catch {
+                            SwapLog.append(.debug(
+                                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_FAILED account=\(account.email) error=\(error.localizedDescription)"
+                            ))
+                        }
                     }
                 }
             } catch {
+                self.recordRateLimitResetJournalFailureIfNeeded(
+                    error,
+                    context: "inventory-refresh"
+                )
                 self.rateLimitResetInventoryRetryAfter[accountId] = Date().addingTimeInterval(60)
                 SwapLog.append(.debug(
                     "RESET_BANK_REFRESH_FAILED account=\(account.email) error=\(error.localizedDescription)"
@@ -2878,23 +3453,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func reconcileRateLimitResetAttempt(
         account: CodexAccount,
         bank: RateLimitResetBank,
+        observation suppliedObservation: RateLimitResetInventoryObservation? = nil,
         source: String
     ) async -> Bool {
         let accountId = account.id
+        guard let providerAccountId = account.normalizedProviderAccountId else { return false }
         let quotaAccount = accountManager.accounts.first(where: { $0.id == accountId }) ?? account
+        let observation = suppliedObservation ?? observeRateLimitResetBank(
+            for: account,
+            previousBank: accountManager.accounts.first(where: { $0.id == accountId })?
+                .rateLimitResetBank,
+            refreshedBank: bank,
+            source: source,
+            at: Date()
+        )
         do {
             let quota = try await quotaPoller.fetchQuota(for: quotaAccount)
-            accountManager.updateRateLimitResetBank(for: accountId, bank: bank)
             accountManager.updateQuota(
                 for: accountId,
                 snapshot: quota.snapshot,
                 planType: quota.planType
             )
-            clearExternalRateLimitResetHoldIfQuotaRecovered(
-                for: accountId,
-                snapshot: quota.snapshot,
-                at: Date()
-            )
+            if !observation.transition.observedExternalRedemption {
+                clearExternalRateLimitResetHoldIfQuotaRecovered(
+                    for: accountId,
+                    snapshot: quota.snapshot,
+                    at: Date()
+                )
+            }
             let outcome = try await rateLimitResetService.reconcile(
                 for: account,
                 bank: bank,
@@ -2911,10 +3497,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 let succeeded = try await rateLimitResetService
                     .finalizeReconciliationAfterPersistence(attemptId: attempt.id)
-                rateLimitResetUnresolvedProviderAccountIds.remove(account.accountId)
+                rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+                rateLimitResetSubmissionTracker.reconcile(
+                    providerAccountId: providerAccountId,
+                    unresolvedAttempt: nil
+                )
                 rateLimitResetRecoveryUntil[accountId] = Date().addingTimeInterval(60)
                 rateLimitResetRedemptionBlockedUntil[accountId] = nil
                 rateLimitResetInventoryRetryAfter[accountId] = nil
+                rateLimitResetManualErrors[accountId] = nil
+                recordSuccessfulManualRateLimitResetSwapHold(
+                    attempt: succeeded,
+                    at: Date()
+                )
                 startPollingForAccount(accountId)
                 statusBarController.updateIcon()
                 updatePopoverContent()
@@ -2923,7 +3518,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ))
                 return true
             case .unresolved(let attempt):
-                rateLimitResetUnresolvedProviderAccountIds.insert(account.accountId)
+                rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
+                rateLimitResetSubmissionTracker.reconcile(
+                    providerAccountId: providerAccountId,
+                    unresolvedAttempt: attempt
+                )
                 queueTelemetryPersistence(context: "reset-reconciling")
                 statusBarController.updateIcon()
                 updatePopoverContent()
@@ -2932,11 +3531,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ))
                 return false
             case .noAttempt:
-                rateLimitResetUnresolvedProviderAccountIds.remove(account.accountId)
+                rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+                rateLimitResetSubmissionTracker.reconcile(
+                    providerAccountId: providerAccountId,
+                    unresolvedAttempt: nil
+                )
+                clearPendingManualRateLimitResetSwapHold(
+                    forProviderAccountId: providerAccountId,
+                    reason: .manual
+                )
                 return false
             }
         } catch {
-            rateLimitResetUnresolvedProviderAccountIds.insert(account.accountId)
+            recordRateLimitResetJournalFailureIfNeeded(
+                error,
+                context: "reconciliation"
+            )
+            rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
             SwapLog.append(.debug(
                 "RESET_RECONCILIATION_FAILED account=\(account.email) source=\(source) error=\(error.localizedDescription)"
             ))
@@ -2949,19 +3560,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         bank: RateLimitResetBank,
         reason: RateLimitResetRedemptionReason
     ) {
-        guard !isExiting,
-              rateLimitResetRedemptionTask == nil,
-              !rateLimitResetUnresolvedProviderAccountIds.contains(account.accountId) else {
+        guard !isExiting else {
+            recordManualRateLimitResetError(
+                "CodexSwitch is shutting down",
+                for: account.id,
+                reason: reason
+            )
             return
         }
-
+        guard account.hasCompleteRuntimeCredentials,
+              let providerAccountId = account.normalizedProviderAccountId else {
+            recordManualRateLimitResetError(
+                "Complete runtime credentials are required to redeem a reset",
+                for: account.id,
+                reason: reason
+            )
+            return
+        }
+        guard rateLimitResetRedemptionTask == nil else {
+            recordManualRateLimitResetError(
+                "Another reset redemption is already in progress",
+                for: account.id,
+                reason: reason
+            )
+            return
+        }
+        guard !rateLimitResetUnresolvedProviderAccountIds.contains(providerAccountId) else {
+            recordManualRateLimitResetError(
+                "This account already has a reset awaiting reconciliation",
+                for: account.id,
+                reason: reason
+            )
+            return
+        }
         guard let configured = accountManager.configuredAccount,
               accountManager.activationState != nil else {
+            recordManualRateLimitResetError(
+                "The active runtime is not ready; wait for account activation to finish",
+                for: account.id,
+                reason: reason
+            )
             return
         }
         let service = rateLimitResetService
-        rateLimitResetRedemptionAccountId = account.accountId
-        rateLimitResetUnresolvedProviderAccountIds.insert(account.accountId)
+        let submissionTracker = rateLimitResetSubmissionTracker
+        recordManualRateLimitResetError(nil, for: account.id, reason: reason)
+        rateLimitResetOperationProviderAccountId = providerAccountId
+        rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
+        if reason == .manual {
+            setManualRateLimitResetSwapSuppression(
+                Self.manualRateLimitResetSwapSuppressionAfterStarting(
+                    manualRateLimitResetSwapSuppressions[providerAccountId]
+                ),
+                forProviderAccountId: providerAccountId
+            )
+        }
         SwapLog.append(.debug(
             "RESET_REDEMPTION_STARTED account=\(account.email) reason=\(reason.rawValue) available=\(bank.availableCount)"
         ))
@@ -2969,11 +3622,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         rateLimitResetRedemptionTask = Task { @MainActor [weak self] in
             guard let self, !self.isExiting else { return }
             guard let activationState = await self.activationStateForRequest(),
-                  activationState.phase == .confirmed,
+                  Self.rateLimitResetActivationStateAllows(
+                      activationState,
+                      reason: reason
+                  ),
                   !self.isExiting,
                   self.accountManager.configuredAccount?.id == configured.id else {
-                self.rateLimitResetUnresolvedProviderAccountIds.remove(account.accountId)
-                self.rateLimitResetRedemptionAccountId = nil
+                do {
+                    let unresolvedAttempt = try await service.unresolvedAttempt(
+                        for: providerAccountId
+                    )
+                    submissionTracker.reconcile(
+                        providerAccountId: providerAccountId,
+                        unresolvedAttempt: unresolvedAttempt
+                    )
+                    if unresolvedAttempt == nil {
+                        self.rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+                        self.clearPendingManualRateLimitResetSwapHold(
+                            forProviderAccountId: providerAccountId,
+                            reason: reason
+                        )
+                    } else {
+                        self.rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
+                    }
+                } catch {
+                    self.recordRateLimitResetJournalFailureIfNeeded(
+                        error,
+                        context: "redemption-preflight"
+                    )
+                    self.rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
+                }
+                self.recordManualRateLimitResetError(
+                    "The active runtime changed before redemption could begin",
+                    for: account.id,
+                    reason: reason
+                )
+                self.rateLimitResetOperationProviderAccountId = nil
                 self.rateLimitResetRedemptionTask = nil
                 return
             }
@@ -2987,16 +3671,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     configured: configured,
                     bank: bank,
                     reason: reason,
+                    requiredActivationPhase: activationState.phase,
                     service: service,
+                    submissionTracker: submissionTracker,
                     lease: lease
                 )
             }
             if shouldResumeSwap == nil {
-                self.rateLimitResetUnresolvedProviderAccountIds.remove(account.accountId)
+                self.rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+                self.clearPendingManualRateLimitResetSwapHold(
+                    forProviderAccountId: providerAccountId,
+                    reason: reason
+                )
+                self.recordManualRateLimitResetError(
+                    "Account state changed before redemption could begin",
+                    for: account.id,
+                    reason: reason
+                )
             }
-            self.rateLimitResetRedemptionAccountId = nil
+            self.rateLimitResetOperationProviderAccountId = nil
+            do {
+                let unresolvedAttempt = try await service.unresolvedAttempt(
+                    for: providerAccountId
+                )
+                submissionTracker.reconcile(
+                    providerAccountId: providerAccountId,
+                    unresolvedAttempt: unresolvedAttempt
+                )
+                if unresolvedAttempt == nil {
+                    self.rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+                    self.clearPendingManualRateLimitResetSwapHold(
+                        forProviderAccountId: providerAccountId,
+                        reason: reason
+                    )
+                } else {
+                    self.rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
+                }
+            } catch {
+                self.recordRateLimitResetJournalFailureIfNeeded(
+                    error,
+                    context: "redemption-cleanup"
+                )
+                SwapLog.append(.debug(
+                    "RESET_SUBMISSION_EXPECTATION_RETAINED account=\(account.email) reason=journal_unavailable"
+                ))
+            }
             self.rateLimitResetRedemptionTask = nil
-            if shouldResumeSwap == true, !self.isExiting {
+            if reason == .manual,
+               self.rateLimitResetManualErrors[account.id] != nil,
+               !self.isExiting {
+                self.scheduleRateLimitResetRefresh(
+                    for: account.id,
+                    force: true
+                )
+            }
+            if Self.automaticSwapMayResume(
+                after: reason,
+                operationRequestedResume: shouldResumeSwap == true
+            ), !self.isExiting {
                 self.checkAndSwapIfNeeded()
             }
         }
@@ -3007,23 +3739,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         configured: CodexAccount,
         bank: RateLimitResetBank,
         reason: RateLimitResetRedemptionReason,
+        requiredActivationPhase: AccountActivationPhase,
         service: RateLimitResetService,
+        submissionTracker: RateLimitResetSubmissionTracker,
         lease: AccountMutationLease
     ) async -> Bool {
         let accountId = account.id
+        guard account.hasCompleteRuntimeCredentials,
+              let providerAccountId = account.normalizedProviderAccountId else {
+            recordManualRateLimitResetError(
+                "Complete runtime credentials are required to redeem a reset",
+                for: accountId,
+                reason: reason
+            )
+            return true
+        }
         do {
             guard let authorized = await revalidateRateLimitResetRedemption(
                 account: account,
                 configuredAccount: configured,
+                authorizedBank: bank,
                 reason: reason,
+                requiredActivationPhase: requiredActivationPhase,
                 lease: lease
             ) else {
-                rateLimitResetUnresolvedProviderAccountIds.remove(account.accountId)
+                recordManualRateLimitResetError(
+                    "Account eligibility changed before the reset was submitted",
+                    for: accountId,
+                    reason: reason
+                )
                 return false
             }
             let result = try await service.consume(
                 for: authorized.account,
                 bank: authorized.bank,
+                redemptionReason: reason,
                 authorizeSubmission: { [weak self] attempt in
                     guard let self else { return nil }
                     return await self.resetSubmissionStillAuthorized(
@@ -3031,9 +3781,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         configuredAccount: configured,
                         bank: authorized.bank,
                         reason: reason,
+                        requiredActivationPhase: requiredActivationPhase,
                         lease: lease,
                         attempt: attempt
                     )
+                },
+                submissionWillStart: { attempt in
+                    submissionTracker.begin(attempt: attempt)
                 }
             )
             switch result {
@@ -3055,12 +3809,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     ))
                 }
             case .noCredit, .nothingToReset:
-                rateLimitResetUnresolvedProviderAccountIds.remove(account.accountId)
+                rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+                submissionTracker.clear(providerAccountId: providerAccountId)
+                clearPendingManualRateLimitResetSwapHold(
+                    forProviderAccountId: providerAccountId,
+                    reason: reason
+                )
                 rateLimitResetRedemptionBlockedUntil[accountId] = Date().addingTimeInterval(60)
                 scheduleRateLimitResetRefresh(
                     for: accountId,
                     force: true,
-                    checkSwapAfter: true
+                    checkSwapAfter: Self.automaticSwapMayResume(
+                        after: reason,
+                        operationRequestedResume: true
+                    )
+                )
+                recordManualRateLimitResetError(
+                    "No redeemable reset remained when the request was submitted",
+                    for: accountId,
+                    reason: reason
                 )
                 SwapLog.append(.debug(
                     "RESET_REDEMPTION_INAPPLICABLE account=\(account.email) result=\(String(describing: result))"
@@ -3083,7 +3850,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 journalReportsUnresolved = true
             }
             if journalReportsUnresolved || journalUnavailable {
-                rateLimitResetUnresolvedProviderAccountIds.insert(account.accountId)
+                if journalUnavailable {
+                    recordRateLimitResetJournalFailureIfNeeded(
+                        error,
+                        context: "redemption"
+                    )
+                }
+                rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
                 rateLimitResetInventoryRetryAfter[accountId] = Date().addingTimeInterval(60)
                 if journalUnavailable {
                     accountManager.updatePollingError(
@@ -3096,8 +3869,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ))
                 return false
             }
-            rateLimitResetUnresolvedProviderAccountIds.remove(account.accountId)
+            rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+            submissionTracker.clear(providerAccountId: providerAccountId)
+            clearPendingManualRateLimitResetSwapHold(
+                forProviderAccountId: providerAccountId,
+                reason: reason
+            )
             rateLimitResetRedemptionBlockedUntil[accountId] = Date().addingTimeInterval(60)
+            recordManualRateLimitResetError(
+                error.localizedDescription,
+                for: accountId,
+                reason: reason
+            )
             SwapLog.append(.debug(
                 "RESET_REDEMPTION_FAILED_BEFORE_SUBMISSION account=\(account.email) error=\(error.localizedDescription)"
             ))
@@ -3108,21 +3891,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func revalidateRateLimitResetRedemption(
         account: CodexAccount,
         configuredAccount: CodexAccount,
+        authorizedBank initialAuthorizedBank: RateLimitResetBank,
         reason: RateLimitResetRedemptionReason,
+        requiredActivationPhase: AccountActivationPhase,
         lease: AccountMutationLease
     ) async -> (account: CodexAccount, bank: RateLimitResetBank)? {
         let activationGeneration = lease.purpose.activationGeneration
         guard await accountMutationTransaction.owns(lease),
-              accountManager.activationState?.phase == .confirmed,
+              accountManager.activationState?.phase == requiredActivationPhase,
+              accountManager.activationState.map({
+                  Self.rateLimitResetActivationStateAllows($0, reason: reason)
+              }) == true,
               accountManager.activationState?.configuredAccountId == configuredAccount.id,
               accountManager.activationState?.activationGeneration == activationGeneration else {
             return nil
         }
 
         do {
-            guard try await rateLimitResetService.unresolvedAttempt(
+            let unresolvedAttempt = try await rateLimitResetService.unresolvedAttempt(
                 for: account.accountId
-            ) == nil else {
+            )
+            rateLimitResetSubmissionTracker.reconcile(
+                providerAccountId: account.accountId,
+                unresolvedAttempt: unresolvedAttempt
+            )
+            guard unresolvedAttempt == nil else {
+                if let providerAccountId = account.normalizedProviderAccountId {
+                    rateLimitResetUnresolvedProviderAccountIds.insert(providerAccountId)
+                }
                 return nil
             }
             let quota = try await quotaPoller.fetchQuota(for: account)
@@ -3135,35 +3931,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 for: account,
                 force: true
             )
-            accountManager.updateRateLimitResetBank(for: account.id, bank: refreshedBank)
+            let now = Date()
+            let observation = observeRateLimitResetBank(
+                for: account,
+                previousBank: initialAuthorizedBank,
+                refreshedBank: refreshedBank,
+                source: "redemption-preflight",
+                at: now
+            )
+            guard !observation.transition.observedExternalRedemption,
+                  Self.rateLimitResetAvailableInventoryMatches(
+                      initialAuthorizedBank,
+                      refreshedBank,
+                      at: now
+                  ) else {
+                return nil
+            }
             guard let refreshedAccount = accountManager.accounts.first(where: {
                 $0.id == account.id
-            }),
-            let selection = RateLimitResetPolicy.selectRedemptionCandidate(
-                from: accountManager.accounts,
-                excluding: [],
-                now: Date()
-            ),
-            selection.accountId == account.id,
-            selection.reason == reason,
-            selection.bank.isFresh(
-                at: Date(),
+            }) else {
+                return nil
+            }
+
+            if reason == .manual {
+                guard RateLimitResetPolicy.canManuallyRedeem(
+                    for: refreshedAccount,
+                    bank: initialAuthorizedBank,
+                    now: now
+                ) else {
+                    return nil
+                }
+            } else {
+                guard let selection = RateLimitResetPolicy.selectRedemptionCandidate(
+                    from: accountManager.accounts,
+                    excluding: [],
+                    now: now
+                ),
+                selection.accountId == account.id,
+                selection.reason == reason,
+                Self.rateLimitResetAvailableInventoryMatches(
+                    selection.bank,
+                    initialAuthorizedBank,
+                    at: now
+                ) else {
+                    return nil
+                }
+            }
+
+            let orchestrationPlan = RateLimitResetOrchestrationPlan(reason: reason)
+            let runtimePermit = await orchestrationPlan.requestRuntimeAuthorization {
+                await requireFreshLocalRuntimePermit(
+                    for: configuredAccount,
+                    activationGeneration: activationGeneration,
+                    requiredPhase: requiredActivationPhase
+                )
+            }
+            guard initialAuthorizedBank.isFresh(
+                at: now,
                 maxAge: Self.rateLimitResetDecisionFreshnessInterval
             ),
-            await requireFreshLocalRuntimePermit(
-                for: configuredAccount,
-                activationGeneration: activationGeneration,
-                requiredPhase: .confirmed
-            ) != nil,
+            !orchestrationPlan.requiresRuntimeAuthorization || runtimePermit != nil,
             await durableConfiguredFilesMatch(configuredAccount),
             try await rateLimitResetService.unresolvedAttempt(for: account.accountId) == nil,
             await accountMutationTransaction.owns(lease),
-            accountManager.activationState?.phase == .confirmed,
+            accountManager.activationState?.phase == requiredActivationPhase,
+            accountManager.activationState.map({
+                Self.rateLimitResetActivationStateAllows($0, reason: reason)
+            }) == true,
             accountManager.activationState?.configuredAccountId == configuredAccount.id,
             accountManager.activationState?.activationGeneration == activationGeneration else {
                 return nil
             }
-            return (refreshedAccount, selection.bank)
+            return (refreshedAccount, initialAuthorizedBank)
         } catch {
             SwapLog.append(.debug(
                 "RESET_REDEMPTION_REVALIDATION_FAILED account=\(account.email) error=\(error.localizedDescription)"
@@ -3175,8 +4014,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func resetSubmissionStillAuthorized(
         account: CodexAccount,
         configuredAccount: CodexAccount,
-        bank _: RateLimitResetBank,
+        bank authorizedBank: RateLimitResetBank,
         reason: RateLimitResetRedemptionReason,
+        requiredActivationPhase: AccountActivationPhase,
         lease: AccountMutationLease,
         attempt: RateLimitResetAttempt
     ) async -> RateLimitResetSubmissionPermit? {
@@ -3194,15 +4034,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 for: account,
                 force: true
             )
-            accountManager.updateRateLimitResetBank(for: account.id, bank: refreshedBank)
         } catch {
             return nil
         }
-        guard let runtimePermit = await requireFreshLocalRuntimePermit(
-            for: configuredAccount,
-            activationGeneration: activationGeneration,
-            requiredPhase: .confirmed
-        ) else {
+        let now = Date()
+        let observation = observeRateLimitResetBank(
+            for: account,
+            previousBank: authorizedBank,
+            refreshedBank: refreshedBank,
+            source: "submission-authorization",
+            at: now
+        )
+        guard !observation.transition.observedExternalRedemption else { return nil }
+
+        let orchestrationPlan = RateLimitResetOrchestrationPlan(reason: reason)
+        let runtimePermit = await orchestrationPlan.requestRuntimeAuthorization {
+            await requireFreshLocalRuntimePermit(
+                for: configuredAccount,
+                activationGeneration: activationGeneration,
+                requiredPhase: requiredActivationPhase
+            )
+        }
+        guard !orchestrationPlan.requiresRuntimeAuthorization || runtimePermit != nil else {
             return nil
         }
         let durableConfiguredTargetMatches = await durableConfiguredFilesMatch(
@@ -3216,41 +4069,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } catch {
             return nil
         }
-        let now = Date()
         let currentAccount = accountManager.accounts.first(where: { $0.id == account.id })
-        let selection = RateLimitResetPolicy.selectRedemptionCandidate(
-            from: accountManager.accounts,
-            excluding: [],
-            now: now
-        )
         let quotaIsFresh = currentAccount?.realQuotaSnapshot?.isFresh(at: now) == true
             && refreshedBank.isFresh(
                 at: now,
                 maxAge: Self.rateLimitResetDecisionFreshnessInterval
             )
-        let candidateStillMatches = selection?.accountId == account.id
-            && selection?.reason == reason
-            && selection?.bank == refreshedBank
-            && refreshedBank.oldestExpiringCredit(at: now)?.id == attempt.creditId
-        let resetJournalMatches = journalAttempt?.id == attempt.id
-            && journalAttempt?.state == .submitted
-            && journalAttempt?.providerAccountId == account.accountId
-            && journalAttempt?.creditId == attempt.creditId
+        let inventoryStillMatches = Self.rateLimitResetInventoryStillAuthorizesSubmission(
+            attempt: attempt,
+            authorizedBank: authorizedBank,
+            refreshedBank: refreshedBank,
+            now: now
+        )
+        let candidateStillMatches: Bool
+        if reason == .manual {
+            candidateStillMatches = currentAccount.map {
+                RateLimitResetPolicy.canManuallyRedeem(
+                    for: $0,
+                    bank: refreshedBank,
+                    now: now
+                )
+            } == true
+        } else {
+            let selection = RateLimitResetPolicy.selectRedemptionCandidate(
+                from: accountManager.accounts,
+                excluding: [],
+                now: now
+            )
+            candidateStillMatches = selection?.accountId == account.id
+                && selection?.reason == reason
+                && selection?.bank == refreshedBank
+        }
+        let resetJournalMatches = journalAttempt == attempt && attempt.state == .submitted
+        let runtimeAuthorizationStillValid = runtimePermit.map {
+            $0.authorizes(state: accountManager.activationState, at: now)
+        } ?? true
 
         guard !isExiting,
+              externalRateLimitResetHoldStateIsReadable,
+              !Self.rateLimitResetRedemptionIsBlocked(
+                  until: externalRateLimitResetRedemptionBlockedUntil[account.id],
+                  at: now
+              ),
+              !Self.rateLimitResetRedemptionIsBlocked(
+                  until: rateLimitResetRedemptionBlockedUntil[account.id],
+                  at: now
+              ),
               durableConfiguredTargetMatches,
               quotaIsFresh,
+              inventoryStillMatches,
               candidateStillMatches,
               resetJournalMatches,
               accountManager.configuredAccount?.id == configuredAccount.id,
-              runtimePermit.authorizes(state: accountManager.activationState, at: now),
+              accountManager.activationState?.phase == requiredActivationPhase,
+              accountManager.activationState.map({
+                  Self.rateLimitResetActivationStateAllows($0, reason: reason)
+              }) == true,
+              runtimeAuthorizationStillValid,
               lease.purpose.accountId == account.id,
               lease.purpose.activationGeneration == activationGeneration,
               let activationEffectPermit = accountMutationTransaction.makeEffectPermit(
                   lease: lease,
                   targetAccountId: configuredAccount.id,
                   activationGeneration: activationGeneration,
-                  requiredPhase: .confirmed,
+                  requiredPhase: requiredActivationPhase,
                   runtimePermit: runtimePermit,
                   journal: accountActivationCoordinator,
                   at: now
@@ -3264,10 +4146,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             targetAccountId: configuredAccount.id,
             activationGeneration: activationGeneration,
             leaseGeneration: lease.generation,
+            runtimeAuthorizationRequired: orchestrationPlan.requiresRuntimeAuthorization,
             runtimePermit: runtimePermit,
             activationEffectPermit: activationEffectPermit,
             issuedAt: now
         )
+    }
+
+    nonisolated static func rateLimitResetActivationStateAllows(
+        _ state: AccountActivationState,
+        reason: RateLimitResetRedemptionReason
+    ) -> Bool {
+        switch reason {
+        case .manual:
+            state.phase == .confirmed || state.phase == .committedDegraded
+        default:
+            state.phase == .confirmed
+        }
+    }
+
+    nonisolated static func rateLimitResetInventoryStillAuthorizesSubmission(
+        attempt: RateLimitResetAttempt,
+        authorizedBank: RateLimitResetBank,
+        refreshedBank: RateLimitResetBank,
+        now: Date
+    ) -> Bool {
+        return authorizedBank.availableCount == attempt.startingAvailableCount
+            && authorizedBank.fetchedAt == attempt.startingBankFetchedAt
+            && attempt.creditExpiresAt.map { $0 > now } == true
+            && authorizedBank.credits.first(where: {
+                $0.normalizedRedemptionIdentifier == attempt.creditId
+            })?.expiresAt == attempt.creditExpiresAt
+            && refreshedBank.availableCount == attempt.startingAvailableCount
+            && Self.rateLimitResetAvailableInventoryMatches(
+                authorizedBank,
+                refreshedBank,
+                at: now
+            )
+            && refreshedBank.oldestExpiringCredit(at: now)?.id == attempt.creditId
+    }
+
+    nonisolated static func rateLimitResetAvailableInventoryMatches(
+        _ lhs: RateLimitResetBank,
+        _ rhs: RateLimitResetBank,
+        at now: Date
+    ) -> Bool {
+        guard let lhsCredits = lhs.structurallyValidAvailableCredits(at: now),
+              let rhsCredits = rhs.structurallyValidAvailableCredits(at: now) else {
+            return false
+        }
+        return lhs.availableCount == rhs.availableCount && lhsCredits == rhsCredits
     }
 
     nonisolated static func rateLimitResetInventorySemanticallyChanged(
@@ -3280,6 +4208,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             || previous.credits != refreshed.credits
     }
 
+    nonisolated static func automaticSwapMayResume(
+        after reason: RateLimitResetRedemptionReason,
+        operationRequestedResume: Bool
+    ) -> Bool {
+        reason != .manual && operationRequestedResume
+    }
+
+    nonisolated static func rateLimitResetJournalAllowsAutomaticRouting(
+        isReadable: Bool
+    ) -> Bool {
+        isReadable
+    }
+
+    nonisolated static func manualRateLimitResetSwapSuppressionAfterStarting(
+        _ existing: ManualRateLimitResetSwapSuppression?
+    ) -> ManualRateLimitResetSwapSuppression {
+        existing == .durable ? .durable : .pending
+    }
+
+    nonisolated static func manualRateLimitResetSwapSuppressionAfterClearingPending(
+        _ existing: ManualRateLimitResetSwapSuppression?
+    ) -> ManualRateLimitResetSwapSuppression? {
+        existing == .pending ? nil : existing
+    }
+
+    nonisolated static func manualRateLimitResetSwapSuppressionAfterSuccess(
+        _ existing: ManualRateLimitResetSwapSuppression?,
+        attempt: RateLimitResetAttempt
+    ) -> ManualRateLimitResetSwapSuppression? {
+        guard attempt.redemptionReason == .manual else { return existing }
+        return attempt.routineSwapSuppressionReleasedAt == nil ? .durable : nil
+    }
+
+    nonisolated static func manualRateLimitResetReleaseMayClearLiveSuppression(
+        observedRevision: UInt64,
+        currentRevision: UInt64
+    ) -> Bool {
+        observedRevision == currentRevision
+    }
+
+    nonisolated static func manualRateLimitResetRestoreMayApply(
+        capturedRevision: UInt64,
+        currentRevision: UInt64,
+        releaseInFlight: Bool,
+        currentSuppression: ManualRateLimitResetSwapSuppression?,
+        restoredSuppression: ManualRateLimitResetSwapSuppression?
+    ) -> Bool {
+        guard capturedRevision == currentRevision, !releaseInFlight else { return false }
+        return currentSuppression != .pending || restoredSuppression != nil
+    }
+
+    private func setManualRateLimitResetSwapSuppression(
+        _ suppression: ManualRateLimitResetSwapSuppression?,
+        forProviderAccountId providerAccountId: String
+    ) {
+        manualRateLimitResetSwapSuppressions[providerAccountId] = suppression
+        manualRateLimitResetSwapSuppressionRevisions[providerAccountId, default: 0] &+= 1
+    }
+
+    private func applyRestoredManualRateLimitResetSwapSuppressions(
+        _ suppressions: [String: ManualRateLimitResetSwapSuppression],
+        capturedRevisions: [String: UInt64]
+    ) {
+        let providerAccountIds = Set(manualRateLimitResetSwapSuppressions.keys)
+            .union(suppressions.keys)
+            .union(capturedRevisions.keys)
+        for providerAccountId in providerAccountIds {
+            let capturedRevision = capturedRevisions[providerAccountId, default: 0]
+            let currentRevision = manualRateLimitResetSwapSuppressionRevisions[
+                providerAccountId,
+                default: 0
+            ]
+            let currentSuppression = manualRateLimitResetSwapSuppressions[providerAccountId]
+            let restoredSuppression = suppressions[providerAccountId]
+            guard Self.manualRateLimitResetRestoreMayApply(
+                capturedRevision: capturedRevision,
+                currentRevision: currentRevision,
+                releaseInFlight: manualRateLimitResetReleaseProviderAccountIds.contains(
+                    providerAccountId
+                ),
+                currentSuppression: currentSuppression,
+                restoredSuppression: restoredSuppression
+            ) else {
+                continue
+            }
+            setManualRateLimitResetSwapSuppression(
+                restoredSuppression,
+                forProviderAccountId: providerAccountId
+            )
+        }
+    }
+
+    nonisolated static func manualRateLimitResetSwapSuppressions(
+        attempts: [RateLimitResetAttempt]
+    ) -> [String: ManualRateLimitResetSwapSuppression] {
+        var suppressions: [String: ManualRateLimitResetSwapSuppression] = [:]
+        for attempt in attempts where
+            attempt.redemptionReason == .manual
+                && attempt.routineSwapSuppressionReleasedAt == nil {
+            guard let providerAccountId = attempt.normalizedProviderAccountId else {
+                continue
+            }
+
+            let suppression: ManualRateLimitResetSwapSuppression
+            switch attempt.state {
+            case .prepared, .submitted, .reconciling, .pendingPersistence:
+                suppression = .pending
+            case .succeeded:
+                suppression = .durable
+            case .notApplied:
+                continue
+            }
+            if suppressions[providerAccountId] != .durable {
+                suppressions[providerAccountId] = suppression
+            }
+        }
+        return suppressions
+    }
+
     nonisolated static func rateLimitResetBankIsFresh(
         _ bank: RateLimitResetBank?,
         at now: Date,
@@ -3288,7 +4335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let maximumAge = requiresDecisionEvidence
             ? rateLimitResetDecisionFreshnessInterval
             : rateLimitResetBackgroundFreshnessInterval
-        return bank?.isFresh(at: now, maxAge: maximumAge) == true
+        guard let bank,
+              bank.isFresh(at: now, maxAge: maximumAge) else {
+            return false
+        }
+        return bank.structurallyValidAvailableCredits(at: now) != nil
     }
 
     nonisolated static func rateLimitResetQuotaRequiresDecisionEvidence(
@@ -3299,21 +4350,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return snapshot.isDenied
             || snapshot.needsSwap
             || snapshot.blockingWindows.contains(where: \.isExhausted)
-    }
-
-    nonisolated static func externalRateLimitResetRedemptionBlockUntil(
-        previousAvailableCount: Int?,
-        refreshedAvailableCount: Int,
-        localRedemptionProviderAccountId: String?,
-        observedProviderAccountId: String,
-        now: Date
-    ) -> Date? {
-        guard localRedemptionProviderAccountId != observedProviderAccountId,
-              let previousAvailableCount,
-              refreshedAvailableCount < previousAvailableCount else {
-            return nil
-        }
-        return now.addingTimeInterval(externalRateLimitResetRedemptionCooldown)
     }
 
     nonisolated static func rateLimitResetRedemptionIsBlocked(
@@ -3350,6 +4386,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         automaticPolicyGateTask = Task { @MainActor [weak self] in
             guard let self, !self.isExiting else { return }
             defer { self.automaticPolicyGateTask = nil }
+            let resetJournalIsReadable = await self.ensureRateLimitResetJournalStateIsReadable()
+            guard Self.rateLimitResetJournalAllowsAutomaticRouting(
+                isReadable: resetJournalIsReadable
+            ) else {
+                return
+            }
             guard let activationState = await self.activationStateForRequest(at: now),
                   activationState.phase == .confirmed else {
                 if !self.isExiting {
@@ -3454,7 +4496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 rateLimitResetRecoveryUntil[active.id] = nil
             }
         }
-        guard rateLimitResetRedemptionAccountId == nil,
+        guard rateLimitResetOperationProviderAccountId == nil,
               rateLimitResetDecisionPending.isEmpty else {
             return
         }
@@ -3491,7 +4533,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     || inventoryBlocked
                     || recovering
                     || rateLimitResetDecisionPending.contains(account.id)
-                    || rateLimitResetUnresolvedProviderAccountIds.contains(account.accountId)
+                    || (account.normalizedProviderAccountId.map {
+                        rateLimitResetUnresolvedProviderAccountIds.contains($0)
+                    } ?? true)
                     ? account.id
                     : nil
             })
@@ -3534,10 +4578,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
 
+        let manualResetSwapExclusions = activeManualRateLimitResetSwapExclusions(at: now)
         if !manualOverrideActive,
            let upgrade = SwapEngine.selectPlanUpgradeCandidate(
                active: active,
                from: accountManager.accounts,
+               excluding: manualResetSwapExclusions,
                now: now
            ) {
             exhaustedPoolAlertGate.markRecovered()
@@ -4303,7 +5349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
 
             switch desktopReload {
-            case .reloaded(let method):
+            case .reloaded(let method, _, _):
                 SwapLog.append(.desktopExternalReloadSuccess(method: "json-rpc:\(method)"))
             case .noDesktopRuntime:
                 SwapLog.append(.debug(
@@ -4313,7 +5359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 SwapLog.append(.debug(
                     "DESKTOP_JSON_RPC_DIAGNOSTIC result=unsupported"
                 ))
-            case .failed(let failure):
+            case .failed(let failure, _, _):
                 SwapLog.append(.debug(
                     "DESKTOP_JSON_RPC_DIAGNOSTIC result=failed reason=\(failure)"
                 ))
@@ -4739,18 +5785,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                 runtimePermit: freshRuntimePermit
                             )
                         },
+                        reauthorizeConfirmation: { [weak self] confirmationPermit in
+                            guard let self,
+                                  confirmationPermit.isCurrentlyAuthorized(),
+                                  let revalidatedEvidence = await self
+                                    .revalidatedRuntimeEvidence(freshEvidence, for: to) else {
+                                return nil
+                            }
+                            let revalidatedRuntimePermit = AccountActivationRuntimePermit(
+                                targetAccountId: to.id,
+                                activationGeneration: prepared.activationGeneration,
+                                requiredPhase: .committedDegraded,
+                                evidence: revalidatedEvidence
+                            )
+                            return await self.activationEffectPermit(
+                                prepared,
+                                targetAccountId: to.id,
+                                requiredPhase: .committedDegraded,
+                                configuredAccountId: to.id,
+                                runtimePermit: revalidatedRuntimePermit
+                            )
+                        },
                         persistConfirmation: { [weak self] confirmationPermit in
-                            guard let self else { return nil }
+                            guard let self,
+                                  let revalidatedEvidence = confirmationPermit.runtimePermit?.evidence,
+                                  revalidatedEvidence.hasConcreteRuntimeBindings else {
+                                return nil
+                            }
                             return try? await self.accountActivationCoordinator.markConfirmed(
                                 targetAccountId: to.id,
                                 expectedActivationGeneration: prepared.activationGeneration,
-                                discoveredRuntimeCount: freshEvidence.discoveredRuntimeCount,
-                                acknowledgedRuntimeCount: freshEvidence.acknowledgedRuntimeCount,
-                                evidenceGeneration: freshEvidence.generation,
-                                evidenceObservedAt: freshEvidence.observedAt,
-                                evidenceExpiresAt: freshEvidence.expiresAt,
+                                discoveredRuntimeCount: revalidatedEvidence.discoveredRuntimeCount,
+                                acknowledgedRuntimeCount: revalidatedEvidence.acknowledgedRuntimeCount,
+                                evidenceGeneration: revalidatedEvidence.generation,
+                                evidenceObservedAt: revalidatedEvidence.observedAt,
+                                evidenceExpiresAt: revalidatedEvidence.expiresAt,
                                 authorizeEffect: { state in
-                                    confirmationPermit.authorizes(state: state, at: Date())
+                                    guard confirmationPermit.authorizes(
+                                        state: state,
+                                        at: Date()
+                                    ), revalidatedEvidence.runtimeBindings.allSatisfy({
+                                        SwapEngine.reloadBindingIsCurrent($0)
+                                    }) else {
+                                        return false
+                                    }
+                                    return revalidatedEvidence
+                                        .matchesRediscoveredRuntimeTopology(
+                                            cli: SwapEngine.localRuntimeEvidenceSnapshot(
+                                                runtimeKind: .localInteractiveCLI
+                                            ),
+                                            desktop: SwapEngine.localRuntimeEvidenceSnapshot(
+                                                runtimeKind: .externalAppServer
+                                            )
+                                        )
                                 }
                             )
                         }
@@ -4789,6 +5876,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     pendingSwapTargetAccountId = nil
                     swapConvergenceTask = nil
+                    return
+                case .blocked(.runtimeRevalidation):
+                    pendingSwapTargetAccountId = nil
+                    swapConvergenceTask = nil
+                    SwapLog.append(.debug(
+                        "SWAP_CONFIRMATION_BLOCKED target=\(to.email) reason=runtime_topology_changed_before_publish"
+                    ))
                     return
                 case .blocked(.journalPersistence):
                     throw AccountActivationCoordinatorError.invalidTransition(
@@ -4869,6 +5963,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         pendingSwapTargetAccountId = nil
         swapConvergenceTask = nil
+
+        if case .runtimeCurrent = completion.outcome {
+            await releaseManualRateLimitResetSwapSuppressionIfNeeded(for: to)
+        }
 
         switch completion.outcome {
         case .runtimeCurrent where recordsSwap:
@@ -5106,6 +6204,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     onAddAccount: { [weak self] in self?.addAccount() },
                     onForceSwap: { [weak self] id in self?.forceSwap(to: id) },
                     onReauthenticate: { [weak self] id in self?.reauthenticateAccount(id) },
+                    onRedeemReset: { [weak self] id in
+                        self?.redeemRateLimitResetManually(for: id)
+                    },
+                    resetRedemptionAuthorization: { [weak self] id in
+                        self?.rateLimitResetCoordinatorAuthorization(for: id)
+                            ?? .blocked("Reset coordinator is unavailable")
+                    },
                     onOpenSettings: { [weak self] in self?.openSettings() }
                 )
             )
@@ -5386,7 +6491,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         rateLimitResetDecisionPending.removeAll()
         rateLimitResetRedemptionTask?.cancel()
         rateLimitResetRedemptionTask = nil
-        rateLimitResetRedemptionAccountId = nil
+        rateLimitResetOperationProviderAccountId = nil
+        rateLimitResetSubmissionTracker.clear()
         for email in emails {
             SwapLog.append(.accountRemoved(email: email))
         }
@@ -5518,7 +6624,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard settings.isConfigured else {
             lastLinuxDevboxReady = nil
             lastLinuxDevboxFullCheckAt = nil
-            linuxDevboxReadinessCheckInFlight = false
+            invalidateLinuxDevboxReadinessTask()
             lastLinuxDevboxAccountMirrorSucceededAt = nil
             accountManager.invalidateLinuxDevboxRuntimeEvidence()
             linuxDevboxConsecutiveIssueChecks = 0
@@ -5526,7 +6632,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             updatePopoverContent()
             return
         }
-        _ = applyLinuxDevboxCredentialSyncHoldIfPresent(
+        let supersededReadinessTask: Bool
+        if let activeContext = linuxDevboxReadinessTaskContext,
+           force || activeContext.settings != settings {
+            invalidateLinuxDevboxReadinessTask()
+            supersededReadinessTask = true
+        } else {
+            supersededReadinessTask = false
+        }
+        if accountManager.linuxDevboxStatus.state == .ready,
+           !linuxDevboxAccountMirrorIsFresh() {
+            publishLinuxDevboxInvalidation(
+                .expired,
+                summary: "VPS readiness evidence expired"
+            )
+            SwapLog.append(.debug("LINUX_DEVBOX_READINESS_EXPIRED"))
+            updatePopoverContent()
+        }
+        let credentialSyncHeld = applyLinuxDevboxCredentialSyncHoldIfPresent(
             context: "readiness",
             settings: settings
         )
@@ -5535,7 +6658,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard LinuxDevboxMonitor.shouldRunReadinessCheck(
             lastFullCheckAt: lastLinuxDevboxFullCheckAt,
             hasActiveRemoteSession: hasActiveRemoteSession,
-            force: force
+            force: force || supersededReadinessTask
         ) else {
             return
         }
@@ -5543,50 +6666,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             SwapLog.append(.debug("LINUX_DEVBOX_CHECK_SKIPPED reason=in_flight active_remote=\(hasActiveRemoteSession)"))
             return
         }
-        linuxDevboxReadinessCheckInFlight = true
 
-        if LinuxDevboxMonitor.remotePollingMode(hasActiveRemoteSession: hasActiveRemoteSession) == .activeSession {
-            Task { [weak self] in
-                let result = await Task.detached {
-                    LinuxDevboxMonitor.fetchAccountStates(settings: settings)
-                }.value
-                guard let self else { return }
-                self.linuxDevboxReadinessCheckInFlight = false
-                self.lastLinuxDevboxReady = true
-                self.linuxDevboxConsecutiveIssueChecks = 0
-                switch result {
-                case .success(let states):
-                    self.lastLinuxDevboxAccountMirrorSucceededAt = Date()
-                    let accountStateActiveEmail = states.first(where: \.isActive)?.email
-                    self.accountManager.linuxDevboxStatus = Self
-                        .vpsStatusPreservingReadinessIdentity(
-                            self.accountManager.linuxDevboxStatus,
-                            summary: "active Codex VPS remote session detected; remote account status mirrored"
-                    )
-                    self.applyLinuxDevboxAccountStates(
-                        states,
-                        context: "linux-devbox-interactive-sync"
-                    )
-                    SwapLog.append(.debug("LINUX_DEVBOX_REMOTE_ACCOUNT_STATUS_SYNCED remote_active=\(accountStateActiveEmail ?? "none") readiness_active=\(self.accountManager.linuxDevboxStatus.activeEmail ?? "none") local_configured=\(self.accountManager.configuredAccount?.email ?? "none") accounts=\(states.count)"))
-                case .failure(let failure):
-                    self.lastLinuxDevboxAccountMirrorSucceededAt = nil
-                    self.accountManager.invalidateLinuxDevboxRuntimeEvidence()
-                    self.accountManager.linuxDevboxStatus = LinuxDevboxStatus(
-                        state: .ready,
-                        summary: "active Codex VPS remote session detected; account mirror failed: \(failure.message)",
-                        activeEmail: self.accountManager.linuxDevboxStatus.activeEmail,
-                        activeProviderAccountId: self.accountManager.linuxDevboxStatus
-                            .activeProviderAccountId
-                    )
-                    SwapLog.append(.debug("LINUX_DEVBOX_REMOTE_ACCOUNT_SYNC_FAILED message=\(failure.message)"))
-                }
-                _ = self.applyLinuxDevboxCredentialSyncHoldIfPresent(
-                    context: "active-session-readiness",
-                    settings: settings
-                )
-                self.updatePopoverContent()
-            }
-            return
+        let activeSessionRequiresInvalidation = LinuxDevboxStatus
+            .activeSessionRequiresInvalidation(
+                hasActiveRemoteSession: hasActiveRemoteSession,
+                status: accountManager.linuxDevboxStatus,
+                mirrorObservedAt: lastLinuxDevboxAccountMirrorSucceededAt,
+                now: Date(),
+                maximumAge: LinuxDevboxMonitor.activeRemoteAccountStatePollInterval * 4
+            )
+        if !credentialSyncHeld,
+           activeSessionRequiresInvalidation {
+            publishLinuxDevboxInvalidation(
+                .activeSessionUnverified,
+                summary: "active Codex VPS remote session detected; readiness not verified"
+            )
+            updatePopoverContent()
         }
 
         lastLinuxDevboxFullCheckAt = Date()
@@ -5598,17 +6693,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             accountManager.linuxDevboxStatus = .checking
             updatePopoverContent()
         }
+        let taskContext = beginLinuxDevboxReadinessTask(settings: settings)
         Task { [weak self] in
-            if await NetworkBackoffGuard.shared.shouldDeferNonCriticalProbe(operation: "linux_devbox_readiness") {
-                self?.linuxDevboxReadinessCheckInFlight = false
+            let shouldDefer = await NetworkBackoffGuard.shared
+                .shouldDeferNonCriticalProbe(operation: "linux_devbox_readiness")
+            guard let self else { return }
+            guard self.linuxDevboxReadinessTaskIsCurrent(taskContext) else {
+                self.finishLinuxDevboxReadinessTask(taskContext)
+                SwapLog.append(.debug(
+                    "LINUX_DEVBOX_CHECK_DISCARDED reason=stale_before_probe generation=\(taskContext.generation)"
+                ))
+                return
+            }
+            if shouldDefer {
+                self.publishLinuxDevboxInvalidation(
+                    .deferred,
+                    summary: "VPS readiness check deferred by network backoff"
+                )
+                SwapLog.append(.debug("LINUX_DEVBOX_CHECK_DEFERRED reason=network_backoff"))
+                self.updatePopoverContent()
                 return
             }
             let result = await Task.detached {
-                LinuxDevboxMonitor.check(settings: settings)
+                LinuxDevboxMonitor.check(settings: taskContext.settings)
             }.value
-            guard let self else { return }
+            guard self.linuxDevboxReadinessTaskIsCurrent(taskContext) else {
+                self.finishLinuxDevboxReadinessTask(taskContext)
+                SwapLog.append(.debug(
+                    "LINUX_DEVBOX_CHECK_DISCARDED reason=stale_after_probe generation=\(taskContext.generation)"
+                ))
+                return
+            }
             defer {
-                self.linuxDevboxReadinessCheckInFlight = false
+                self.finishLinuxDevboxReadinessTask(taskContext)
             }
             switch result {
             case .success(let readiness):
@@ -5616,38 +6733,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     await NetworkBackoffGuard.shared.recordSuccess(operation: "linux_devbox_readiness")
                 }
                 let wasReady = self.lastLinuxDevboxReady
-                self.lastLinuxDevboxReady = readiness.ready
                 if readiness.ready {
-                    self.linuxDevboxConsecutiveIssueChecks = 0
-                } else {
-                    self.linuxDevboxConsecutiveIssueChecks += 1
-                    if LinuxDevboxStatus.shouldSuppressTransientIssue(
-                        wasReady: wasReady,
-                        consecutiveIssueChecks: self.linuxDevboxConsecutiveIssueChecks
-                    ) {
-                        self.accountManager.invalidateLinuxDevboxRuntimeEvidence()
-                        SwapLog.append(.debug("LINUX_DEVBOX_TRANSIENT_NOT_READY summary=\(readiness.summary)"))
-                        self.updatePopoverContent()
+                    let verifiedReadiness = LinuxDevboxStatus(
+                        state: .ready,
+                        summary: readiness.summary,
+                        activeEmail: readiness.activeEmail,
+                        activeProviderAccountId: readiness.activeProviderAccountId
+                    )
+                    let accountStateResult = await Task.detached {
+                        LinuxDevboxMonitor.fetchAccountStates(
+                            settings: taskContext.settings
+                        )
+                    }.value
+                    guard self.linuxDevboxReadinessTaskIsCurrent(taskContext) else {
+                        SwapLog.append(.debug(
+                            "LINUX_DEVBOX_CHECK_DISCARDED reason=stale_after_account_mirror generation=\(taskContext.generation)"
+                        ))
                         return
                     }
-                }
-                self.accountManager.linuxDevboxStatus = LinuxDevboxStatus(
-                    state: readiness.ready ? .ready : .notReady,
-                    summary: readiness.summary,
-                    activeEmail: readiness.activeEmail,
-                    activeProviderAccountId: readiness.activeProviderAccountId
-                )
-                if readiness.ready {
-                    let accountStateResult = await Task.detached {
-                        LinuxDevboxMonitor.fetchAccountStates(settings: settings)
-                    }.value
                     switch accountStateResult {
                     case .success(let states):
+                        self.lastLinuxDevboxReady = true
+                        self.linuxDevboxConsecutiveIssueChecks = 0
                         self.lastLinuxDevboxAccountMirrorSucceededAt = Date()
                         let accountStateActiveEmail = states.first(where: \.isActive)?.email
                         self.accountManager.linuxDevboxStatus = Self
                             .vpsStatusPreservingReadinessIdentity(
-                                self.accountManager.linuxDevboxStatus,
+                                verifiedReadiness,
                                 summary: readiness.summary
                         )
                         self.applyLinuxDevboxAccountStates(
@@ -5655,16 +6767,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             context: "linux-devbox-status-sync"
                         )
                         SwapLog.append(.debug("LINUX_DEVBOX_REMOTE_ACCOUNT_STATUS_SYNCED remote_active=\(accountStateActiveEmail ?? "none") readiness_active=\(self.accountManager.linuxDevboxStatus.activeEmail ?? "none") local_configured=\(self.accountManager.configuredAccount?.email ?? "none") accounts=\(states.count) reason=headless-readiness"))
+                        SwapLog.append(.debug("LINUX_DEVBOX_READY summary=\(readiness.summary)"))
                     case .failure(let failure):
-                        self.lastLinuxDevboxAccountMirrorSucceededAt = nil
-                        self.accountManager.invalidateLinuxDevboxRuntimeEvidence()
+                        self.publishLinuxDevboxInvalidation(
+                            failure.isDecodedInvalidObservation ? .decodedInvalid : .failed,
+                            summary: failure.message
+                        )
                         SwapLog.append(.debug("LINUX_DEVBOX_REMOTE_ACCOUNT_STATUS_SYNC_FAILED message=\(failure.message) reason=headless-readiness"))
                     }
-                    SwapLog.append(.debug("LINUX_DEVBOX_READY summary=\(readiness.summary)"))
                 } else {
-                    self.accountManager.invalidateLinuxDevboxRuntimeEvidence()
-                    if wasReady != false {
-                        SwapLog.append(.debug("LINUX_DEVBOX_NOT_READY summary=\(readiness.summary)"))
+                    self.linuxDevboxConsecutiveIssueChecks += 1
+                    let issueCount = self.linuxDevboxConsecutiveIssueChecks
+                    let suppressNotification = LinuxDevboxStatus
+                        .shouldSuppressTransientIssueNotification(
+                            wasReady: wasReady,
+                            consecutiveIssueChecks: issueCount
+                        )
+                    self.publishLinuxDevboxInvalidation(
+                        .negative,
+                        summary: readiness.summary
+                    )
+                    SwapLog.append(.debug("LINUX_DEVBOX_NOT_READY summary=\(readiness.summary)"))
+                    if !suppressNotification,
+                       wasReady != false || issueCount == 2 {
                         NotificationManager.notifyLinuxDevboxReadinessIssue(summary: readiness.summary)
                     }
                 }
@@ -5673,32 +6798,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     await NetworkBackoffGuard.shared.recordFailure(failure.message, operation: "linux_devbox_readiness")
                 }
                 let wasReady = self.lastLinuxDevboxReady
-                self.lastLinuxDevboxReady = false
                 self.linuxDevboxConsecutiveIssueChecks += 1
-                if LinuxDevboxStatus.shouldSuppressTransientIssue(
-                    wasReady: wasReady,
-                    consecutiveIssueChecks: self.linuxDevboxConsecutiveIssueChecks
-                ) {
-                    self.accountManager.invalidateLinuxDevboxRuntimeEvidence()
-                    SwapLog.append(.debug("LINUX_DEVBOX_TRANSIENT_CHECK_FAILED message=\(failure.message)"))
-                    self.updatePopoverContent()
-                    return
-                }
-                self.accountManager.linuxDevboxStatus = LinuxDevboxStatus(
-                    state: .failed,
-                    summary: failure.message,
-                    activeEmail: nil,
-                    activeProviderAccountId: nil
+                let issueCount = self.linuxDevboxConsecutiveIssueChecks
+                let suppressNotification = LinuxDevboxStatus
+                    .shouldSuppressTransientIssueNotification(
+                        wasReady: wasReady,
+                        consecutiveIssueChecks: issueCount
+                    )
+                self.publishLinuxDevboxInvalidation(
+                    failure.isDecodedInvalidObservation ? .decodedInvalid : .failed,
+                    summary: failure.message
                 )
-                self.accountManager.invalidateLinuxDevboxRuntimeEvidence()
-                if wasReady != false {
-                    SwapLog.append(.debug("LINUX_DEVBOX_CHECK_FAILED message=\(failure.message)"))
+                SwapLog.append(.debug("LINUX_DEVBOX_CHECK_FAILED message=\(failure.message)"))
+                if !suppressNotification,
+                   wasReady != false || issueCount == 2 {
                     NotificationManager.notifyLinuxDevboxReadinessIssue(summary: failure.message)
                 }
             }
             _ = self.applyLinuxDevboxCredentialSyncHoldIfPresent(
                 context: "readiness-result",
-                settings: settings
+                settings: taskContext.settings
             )
             self.updatePopoverContent()
         }
@@ -5749,9 +6868,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func linuxDevboxAccountMirrorIsFresh(now: Date = Date()) -> Bool {
-        guard let lastLinuxDevboxAccountMirrorSucceededAt else { return false }
-        return now.timeIntervalSince(lastLinuxDevboxAccountMirrorSucceededAt)
-            <= LinuxDevboxMonitor.activeRemoteAccountStatePollInterval * 4
+        LinuxDevboxStatus.accountMirrorIsFresh(
+            observedAt: lastLinuxDevboxAccountMirrorSucceededAt,
+            now: now,
+            maximumAge: LinuxDevboxMonitor.activeRemoteAccountStatePollInterval * 4
+        )
     }
 
     private func applyLinuxDevboxAccountStates(

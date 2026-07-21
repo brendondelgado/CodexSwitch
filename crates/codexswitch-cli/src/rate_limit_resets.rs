@@ -6,10 +6,11 @@
 //! continues to suppress redemption across process restarts.
 
 use crate::account_store::{
-    quota_availability_at, real_quota_snapshot, AccountStoreLock, CodexAccount,
-    CurrentQuotaObservations, QuotaAvailability, QuotaWindowKind, QuotaWindowRateLimitSource,
-    QuotaWindowSlot,
+    quota_availability_at, real_quota_snapshot, AccountStoreGeneration, AccountStoreLock,
+    CodexAccount, CurrentQuotaObservations, QuotaAvailability, QuotaWindowKind,
+    QuotaWindowRateLimitSource, QuotaWindowSlot,
 };
+use crate::activation::acquire_provider_io_lease;
 use crate::secure_file::{self, SecureFileGeneration, SecureFileLock};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -52,19 +53,51 @@ pub struct RateLimitResetBank {
 }
 
 impl RateLimitResetBank {
+    fn structurally_valid_available_credits(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Option<Vec<&RateLimitResetCredit>> {
+        if self.available_count > self.total_earned_count {
+            return None;
+        }
+
+        let mut identifiers = std::collections::HashSet::new();
+        let mut available = Vec::new();
+        for credit in &self.credits {
+            let provider_marks_available =
+                credit.status.eq_ignore_ascii_case("available") && credit.redeemed_at.is_none();
+            if !provider_marks_available {
+                continue;
+            }
+            let Some(identifier) = credit.normalized_id() else {
+                return None;
+            };
+            if !credit.is_available(now) || !identifiers.insert(identifier) {
+                return None;
+            }
+            available.push(credit);
+        }
+        if available.len() != self.available_count as usize {
+            return None;
+        }
+        available.sort_by(|left, right| match (left.expires_at, right.expires_at) {
+            (Some(left_expiration), Some(right_expiration)) => left_expiration
+                .cmp(&right_expiration)
+                .then_with(|| left.id.cmp(&right.id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.id.cmp(&right.id),
+        });
+        Some(available)
+    }
+
     pub fn oldest_expiring_available_credit(
         &self,
         now: DateTime<Utc>,
     ) -> Option<&RateLimitResetCredit> {
-        self.credits
-            .iter()
-            .filter(|credit| credit.is_available(now))
-            .min_by(|left, right| match (left.expires_at, right.expires_at) {
-                (Some(left), Some(right)) => left.cmp(&right),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => left.id.cmp(&right.id),
-            })
+        self.structurally_valid_available_credits(now)?
+            .into_iter()
+            .next()
     }
 
     pub fn has_available_reset(&self, now: DateTime<Utc>) -> bool {
@@ -115,14 +148,16 @@ pub struct RateLimitResetCredit {
 }
 
 impl RateLimitResetCredit {
+    fn normalized_id(&self) -> Option<&str> {
+        let identifier = self.id.trim();
+        (!identifier.is_empty()).then_some(identifier)
+    }
+
     fn is_available(&self, now: DateTime<Utc>) -> bool {
-        !self.id.trim().is_empty()
+        self.normalized_id().is_some()
             && self.status.eq_ignore_ascii_case("available")
             && self.redeemed_at.is_none()
-            && self
-                .expires_at
-                .map(|expires_at| expires_at > now)
-                .unwrap_or(true)
+            && self.expires_at.is_some_and(|expires_at| expires_at > now)
     }
 
     fn has_terminal_consumption_status(&self) -> bool {
@@ -195,6 +230,24 @@ pub(crate) fn select_smart_reset_candidate(
             right_account
                 .plan_priority()
                 .cmp(&left_account.plan_priority())
+                .then_with(|| {
+                    let left_expiration = left_account
+                        .rate_limit_reset_bank
+                        .as_ref()
+                        .and_then(|bank| bank.oldest_expiring_available_credit(now))
+                        .and_then(|credit| credit.expires_at);
+                    let right_expiration = right_account
+                        .rate_limit_reset_bank
+                        .as_ref()
+                        .and_then(|bank| bank.oldest_expiring_available_credit(now))
+                        .and_then(|credit| credit.expires_at);
+                    match (left_expiration, right_expiration) {
+                        (Some(left), Some(right)) => left.cmp(&right),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                })
                 .then_with(|| {
                     left_account
                         .email
@@ -387,7 +440,7 @@ impl ResetAttemptState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResetAttempt {
     account_id: String,
@@ -599,6 +652,115 @@ impl ResetJournalTransaction {
     }
 }
 
+enum ResetPreparation {
+    Suppressed(String),
+    NoAttempt,
+    Reconcile(ResetAttempt),
+    Submit {
+        attempt: ResetAttempt,
+        bank: RateLimitResetBank,
+    },
+}
+
+fn with_account_store_unlocked<T, F>(
+    store_lock: &AccountStoreLock,
+    expected_generation: &AccountStoreGeneration,
+    operation: F,
+) -> Result<T>
+where
+    F: FnOnce() -> T,
+{
+    let result = store_lock.with_lock_released(|| Ok(operation()))?;
+    let current_generation = store_lock.load()?.generation;
+    if &current_generation != expected_generation {
+        bail!(
+            "account store changed during reset provider I/O; preserving the durable reset journal for recovery (expected {}, found {})",
+            expected_generation.as_str(),
+            current_generation.as_str()
+        );
+    }
+    Ok(result)
+}
+
+fn validate_reset_provider_io<V>(
+    store_lock: &AccountStoreLock,
+    expected_generation: &AccountStoreGeneration,
+    validate_provider_io: &mut V,
+) -> Result<()>
+where
+    V: FnMut(&AccountStoreLock) -> Result<()>,
+{
+    let current_generation = store_lock.load()?.generation;
+    if &current_generation != expected_generation {
+        bail!(
+            "account store changed before reset provider I/O (expected {}, found {})",
+            expected_generation.as_str(),
+            current_generation.as_str()
+        );
+    }
+    validate_provider_io(store_lock)
+}
+
+fn open_exact_reset_attempt(
+    path: &Path,
+    expected: &ResetAttempt,
+    now: DateTime<Utc>,
+) -> Result<(ResetJournalTransaction, ResetAttemptJournal, usize)> {
+    let (mut transaction, mut journal) = ResetJournalTransaction::open(path, now)?;
+    if let Some(manual_review) = journal.manual_review.as_ref() {
+        bail!(
+            "reset journal entered manual review during provider I/O: {}",
+            manual_review.reason
+        );
+    }
+    let attempt_index = journal
+        .attempts
+        .iter()
+        .position(|attempt| attempt.request_id == expected.request_id);
+    if let Some(attempt_index) = attempt_index {
+        if journal.attempts.get(attempt_index) == Some(expected) {
+            return Ok((transaction, journal, attempt_index));
+        }
+    }
+
+    mark_reset_journal_manual_review(
+        &mut journal,
+        now,
+        0,
+        "reset attempt changed during unlocked provider I/O; concurrent state was preserved and manual review is required",
+    );
+    transaction.save(&mut journal, now)?;
+    bail!(
+        "reset attempt {} changed during unlocked provider I/O; concurrent state was preserved",
+        expected.request_id
+    )
+}
+
+fn revalidate_exact_reset_attempt(
+    path: &Path,
+    expected: &ResetAttempt,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let (_transaction, _journal, _attempt_index) = open_exact_reset_attempt(path, expected, now)?;
+    Ok(())
+}
+
+fn update_exact_reset_attempt<F>(
+    path: &Path,
+    expected: &ResetAttempt,
+    now: DateTime<Utc>,
+    update: F,
+) -> Result<ResetAttempt>
+where
+    F: FnOnce(&mut ResetAttemptJournal, usize),
+{
+    let (mut transaction, mut journal, attempt_index) =
+        open_exact_reset_attempt(path, expected, now)?;
+    update(&mut journal, attempt_index);
+    transaction.save(&mut journal, now)?;
+    Ok(journal.attempts[attempt_index].clone())
+}
+
 pub struct ResetReconciliationContext<'a> {
     pub store_lock: &'a AccountStoreLock,
     pub account: &'a mut CodexAccount,
@@ -656,29 +818,33 @@ pub struct ResetOrchestrationResult<O> {
     pub completion: Option<O>,
 }
 
-pub fn orchestrate_reset<B, Q, C, S, O>(
+pub fn orchestrate_reset_with_provider_guard<B, Q, C, S, O, V>(
     context: ResetOrchestrationContext<'_>,
     dependencies: ResetOrchestrationDependencies<B, Q, C, S>,
+    validate_provider_io: V,
 ) -> Result<ResetOrchestrationResult<O>>
 where
     B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
     Q: FnMut(&mut CodexAccount, ResetQuotaRefreshStrategy) -> Result<()>,
     C: FnMut(&CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
     S: FnMut(&mut [CodexAccount], usize) -> Result<O>,
+    V: FnMut(&AccountStoreLock) -> Result<()>,
 {
-    orchestrate_reset_with_scope(context, dependencies, false, None)
+    orchestrate_reset_with_scope(context, dependencies, false, None, validate_provider_io)
 }
 
-pub fn orchestrate_pool_reset_with_selection<B, Q, C, S, O>(
+pub fn orchestrate_pool_reset_with_selection_and_provider_guard<B, Q, C, S, O, V>(
     context: ResetOrchestrationContext<'_>,
     dependencies: ResetOrchestrationDependencies<B, Q, C, S>,
     selection_accounts: &[CodexAccount],
+    validate_provider_io: V,
 ) -> Result<ResetOrchestrationResult<O>>
 where
     B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
     Q: FnMut(&mut CodexAccount, ResetQuotaRefreshStrategy) -> Result<()>,
     C: FnMut(&CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
     S: FnMut(&mut [CodexAccount], usize) -> Result<O>,
+    V: FnMut(&AccountStoreLock) -> Result<()>,
 {
     if context.accounts.len() != selection_accounts.len()
         || context
@@ -689,20 +855,28 @@ where
     {
         bail!("reset-selection observations do not match the persisted account order");
     }
-    orchestrate_reset_with_scope(context, dependencies, true, Some(selection_accounts))
+    orchestrate_reset_with_scope(
+        context,
+        dependencies,
+        true,
+        Some(selection_accounts),
+        validate_provider_io,
+    )
 }
 
-fn orchestrate_reset_with_scope<B, Q, C, S, O>(
+fn orchestrate_reset_with_scope<B, Q, C, S, O, V>(
     context: ResetOrchestrationContext<'_>,
     dependencies: ResetOrchestrationDependencies<B, Q, C, S>,
     pool_wide: bool,
     selection_accounts: Option<&[CodexAccount]>,
+    mut validate_provider_io: V,
 ) -> Result<ResetOrchestrationResult<O>>
 where
     B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
     Q: FnMut(&mut CodexAccount, ResetQuotaRefreshStrategy) -> Result<()>,
     C: FnMut(&CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
     S: FnMut(&mut [CodexAccount], usize) -> Result<O>,
+    V: FnMut(&AccountStoreLock) -> Result<()>,
 {
     let reset_account_index = if pool_wide && context.allow_reset {
         let candidate_accounts = selection_accounts.unwrap_or(&*context.accounts);
@@ -741,11 +915,22 @@ where
         mut consume,
         mut on_reconciled_usable,
     } = dependencies;
+    let expected_store_generation = store_lock.load()?.generation;
 
     let previous_bank = accounts[reset_account_index].rate_limit_reset_bank.clone();
     let observed_bank = match prefetched_observed_bank {
         Some(bank) => bank,
-        None => fetch_bank(&accounts[reset_account_index])?,
+        None => {
+            validate_reset_provider_io(
+                store_lock,
+                &expected_store_generation,
+                &mut validate_provider_io,
+            )
+            .context("reset activation guard changed before reset-bank refresh")?;
+            with_account_store_unlocked(store_lock, &expected_store_generation, || {
+                fetch_bank(&accounts[reset_account_index])
+            })??
+        }
     };
     let decision_now = std::cmp::max(now, observed_bank.fetched_at);
     let reset_account_runtime_usage_limit = (reset_account_index == active_index
@@ -763,7 +948,7 @@ where
         )
     });
     let reason = reason.flatten();
-    let flow = reconcile_or_attempt_reset(
+    let flow = reconcile_or_attempt_reset_with_provider_guard(
         ResetReconciliationContext {
             store_lock,
             account: &mut accounts[reset_account_index],
@@ -777,9 +962,16 @@ where
             |account| refresh_quota(account, refresh_strategy),
             &mut consume,
         ),
+        &mut validate_provider_io,
     )?;
 
     let completion = if flow.is_usable_success() {
+        validate_reset_provider_io(
+            store_lock,
+            &expected_store_generation,
+            &mut validate_provider_io,
+        )
+        .context("reset activation guard changed before completion commit")?;
         accounts[reset_account_index].runtime_unusable_until = None;
         accounts[reset_account_index].runtime_unusable_reason = None;
         Some(on_reconciled_usable(accounts, reset_account_index)?)
@@ -810,6 +1002,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub fn reconcile_or_attempt_reset<B, Q, C>(
     context: ResetReconciliationContext<'_>,
     dependencies: ResetReconciliationDependencies<B, Q, C>,
@@ -819,6 +1012,20 @@ where
     Q: FnMut(&mut CodexAccount) -> Result<()>,
     C: FnMut(&CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
 {
+    reconcile_or_attempt_reset_with_provider_guard(context, dependencies, |_| Ok(()))
+}
+
+pub fn reconcile_or_attempt_reset_with_provider_guard<B, Q, C, V>(
+    context: ResetReconciliationContext<'_>,
+    dependencies: ResetReconciliationDependencies<B, Q, C>,
+    mut validate_provider_io: V,
+) -> Result<ResetFlowResult>
+where
+    B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
+    Q: FnMut(&mut CodexAccount) -> Result<()>,
+    C: FnMut(&CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    V: FnMut(&AccountStoreLock) -> Result<()>,
+{
     let ResetReconciliationContext {
         store_lock,
         account,
@@ -827,135 +1034,262 @@ where
         attempt_reset,
         now,
     } = context;
+    let expected_store_generation = store_lock.load()?.generation;
+    let previous_bank = previous_bank.cloned();
+    let mut working_account = account.clone();
+    let flow = reconcile_or_attempt_reset_inner(
+        store_lock,
+        &expected_store_generation,
+        &mut working_account,
+        previous_bank,
+        observed_bank,
+        attempt_reset,
+        now,
+        dependencies,
+        &mut validate_provider_io,
+    )?;
+    *account = working_account;
+    Ok(flow)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_or_attempt_reset_inner<B, Q, C, V>(
+    store_lock: &AccountStoreLock,
+    expected_store_generation: &AccountStoreGeneration,
+    account: &mut CodexAccount,
+    previous_bank: Option<RateLimitResetBank>,
+    observed_bank: RateLimitResetBank,
+    attempt_reset: bool,
+    now: DateTime<Utc>,
+    dependencies: ResetReconciliationDependencies<B, Q, C>,
+    validate_provider_io: &mut V,
+) -> Result<ResetFlowResult>
+where
+    B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
+    Q: FnMut(&mut CodexAccount) -> Result<()>,
+    C: FnMut(&CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    V: FnMut(&AccountStoreLock) -> Result<()>,
+{
     let ResetReconciliationDependencies {
         mut fetch_bank,
         mut refresh_quota,
         mut consume,
     } = dependencies;
     let journal_path = reset_attempt_journal_path(store_lock.store_path());
-    let (mut journal_transaction, mut journal) = ResetJournalTransaction::open(&journal_path, now)?;
-    let unpruned_len = journal.attempts.len();
-    let previous_manual_review = journal.manual_review.clone();
-    prune_reset_attempt_journal(&mut journal, now);
-    if journal.attempts.len() != unpruned_len || journal.manual_review != previous_manual_review {
-        journal_transaction.save(&mut journal, now)?;
-    }
     account.rate_limit_reset_bank = Some(observed_bank.clone());
-
-    if let Some(manual_review) = journal.manual_review.as_ref() {
-        return Ok(ResetFlowResult {
-            state: ResetFlowState::Suppressed,
-            consumption_observed: false,
-            quota_reconciled: false,
-            detail: Some(manual_review.reason.clone()),
-        });
-    }
-
-    let mut active_attempt = journal.attempts.iter().rposition(|attempt| {
-        (attempt.account_id == account.account_id || attempt.local_account_id == account.id)
-            && attempt.state.suppresses_redemption()
-    });
-
-    if active_attempt.is_none() {
-        if let Some(previous) = previous_bank {
-            if inventory_decreased(previous, &observed_bank) {
-                let selected_credit_id = externally_consumed_credit(previous, &observed_bank);
-                journal.attempts.push(new_reset_attempt(
-                    account,
-                    previous,
-                    selected_credit_id,
-                    Uuid::new_v4(),
-                    now,
-                    ResetAttemptOrigin::ExternalInventoryDecrease,
-                    ResetAttemptState::ConsumptionObserved,
-                ));
-                active_attempt = Some(journal.attempts.len() - 1);
+    let preparation = with_account_store_unlocked(
+        store_lock,
+        expected_store_generation,
+        || -> Result<ResetPreparation> {
+            let (mut journal_transaction, mut journal) =
+                ResetJournalTransaction::open(&journal_path, now)?;
+            let unpruned_len = journal.attempts.len();
+            let previous_manual_review = journal.manual_review.clone();
+            prune_reset_attempt_journal(&mut journal, now);
+            if journal.attempts.len() != unpruned_len
+                || journal.manual_review != previous_manual_review
+            {
                 journal_transaction.save(&mut journal, now)?;
             }
-        }
-    }
 
-    if let Some(index) = active_attempt {
-        return reconcile_attempt(
-            PendingResetAttempt {
-                journal_transaction: &mut journal_transaction,
-                journal: &mut journal,
-                attempt_index: index,
+            if let Some(manual_review) = journal.manual_review.as_ref() {
+                return Ok(ResetPreparation::Suppressed(manual_review.reason.clone()));
+            }
+
+            let mut active_attempt = journal.attempts.iter().rposition(|attempt| {
+                (attempt.account_id == account.account_id || attempt.local_account_id == account.id)
+                    && attempt.state.suppresses_redemption()
+            });
+
+            if active_attempt.is_none() {
+                if let Some(previous) = previous_bank.as_ref() {
+                    if inventory_decreased(previous, &observed_bank) {
+                        let selected_credit_id =
+                            externally_consumed_credit(previous, &observed_bank);
+                        journal.attempts.push(new_reset_attempt(
+                            account,
+                            previous,
+                            selected_credit_id,
+                            Uuid::new_v4(),
+                            now,
+                            ResetAttemptOrigin::ExternalInventoryDecrease,
+                            ResetAttemptState::ConsumptionObserved,
+                        ));
+                        active_attempt = Some(journal.attempts.len() - 1);
+                        journal_transaction.save(&mut journal, now)?;
+                    }
+                }
+            }
+
+            if let Some(index) = active_attempt {
+                return Ok(ResetPreparation::Reconcile(journal.attempts[index].clone()));
+            }
+
+            if !attempt_reset || !observed_bank.has_available_reset(now) {
+                return Ok(ResetPreparation::NoAttempt);
+            }
+
+            let selected_credit_id = observed_bank
+                .oldest_expiring_available_credit(now)
+                .and_then(RateLimitResetCredit::normalized_id)
+                .map(str::to_string);
+            let request_id = Uuid::new_v4();
+            journal.attempts.push(new_reset_attempt(
                 account,
-            },
-            ResetReconciliationObservation {
-                bank: observed_bank,
-                inventory_fresh: true,
-                inventory_error: None,
+                &observed_bank,
+                selected_credit_id,
+                request_id,
                 now,
-            },
-            &mut refresh_quota,
+                ResetAttemptOrigin::LocalRequest,
+                ResetAttemptState::Prepared,
+            ));
+            let attempt_index = journal.attempts.len() - 1;
+            journal.attempts[attempt_index].submitted_at = Some(now);
+
+            // A crash after this durable write is intentionally uncertain.
+            // Every replay observes this exact attempt and cannot repeat the POST.
+            journal_transaction.save(&mut journal, now)?;
+            Ok(ResetPreparation::Submit {
+                attempt: journal.attempts[attempt_index].clone(),
+                bank: observed_bank.clone(),
+            })
+        },
+    )??;
+
+    let (mut expected_attempt, submitted_bank) = match preparation {
+        ResetPreparation::Suppressed(detail) => {
+            return Ok(ResetFlowResult {
+                state: ResetFlowState::Suppressed,
+                consumption_observed: false,
+                quota_reconciled: false,
+                detail: Some(detail),
+            });
+        }
+        ResetPreparation::NoAttempt => {
+            return Ok(ResetFlowResult {
+                state: ResetFlowState::NoAttempt,
+                consumption_observed: false,
+                quota_reconciled: false,
+                detail: None,
+            });
+        }
+        ResetPreparation::Reconcile(expected_attempt) => {
+            return reconcile_attempt(
+                store_lock,
+                expected_store_generation,
+                &journal_path,
+                expected_attempt,
+                account,
+                ResetReconciliationObservation {
+                    bank: observed_bank,
+                    inventory_fresh: true,
+                    inventory_error: None,
+                    now,
+                },
+                &mut refresh_quota,
+                validate_provider_io,
+            );
+        }
+        ResetPreparation::Submit { attempt, bank } => (attempt, bank),
+    };
+
+    with_account_store_unlocked(store_lock, expected_store_generation, || {
+        revalidate_exact_reset_attempt(&journal_path, &expected_attempt, now)
+    })??;
+    let request_id = expected_attempt.request_id;
+    let selected_credit_id = expected_attempt.selected_credit_id.clone();
+    let provider_io_lease = acquire_provider_io_lease(store_lock.store_path()).and_then(|lease| {
+        validate_reset_provider_io(store_lock, expected_store_generation, validate_provider_io)?;
+        Ok(lease)
+    });
+    let provider_io_lease = match provider_io_lease {
+        Ok(lease) => lease,
+        Err(error) => {
+            let detail = format!(
+            "reset provider submission was cancelled before POST because its activation guard or provider-I/O lease changed: {error:#}"
         );
-    }
+            with_account_store_unlocked(store_lock, expected_store_generation, || {
+                update_exact_reset_attempt(
+                    &journal_path,
+                    &expected_attempt,
+                    now,
+                    |journal, attempt_index| {
+                        let attempt = &mut journal.attempts[attempt_index];
+                        attempt.state = ResetAttemptState::TerminalNotApplied;
+                        attempt.last_error = Some(detail.clone());
+                    },
+                )
+            })??;
+            return Err(error)
+                .context("reset provider submission gate changed immediately before POST");
+        }
+    };
+    let consume_result =
+        with_account_store_unlocked(store_lock, expected_store_generation, || {
+            consume(account, &submitted_bank, request_id)
+        })?;
+    drop(provider_io_lease);
 
-    if !attempt_reset || !observed_bank.has_available_reset(now) {
-        return Ok(ResetFlowResult {
-            state: ResetFlowState::NoAttempt,
-            consumption_observed: false,
-            quota_reconciled: false,
-            detail: None,
-        });
-    }
-
-    let selected_credit_id = observed_bank
-        .oldest_expiring_available_credit(now)
-        .map(|credit| credit.id.clone());
-    let request_id = Uuid::new_v4();
-    journal.attempts.push(new_reset_attempt(
-        account,
-        &observed_bank,
-        selected_credit_id.clone(),
-        request_id,
-        now,
-        ResetAttemptOrigin::LocalRequest,
-        ResetAttemptState::Prepared,
-    ));
-    let attempt_index = journal.attempts.len() - 1;
-    journal.attempts[attempt_index].submitted_at = Some(now);
-
-    // A crash after this durable write is intentionally treated as uncertain.
-    // Replaying the process reconciles observations and never repeats the POST.
-    journal_transaction.save(&mut journal, now)?;
-
-    match consume(account, &observed_bank, request_id) {
+    let (response_code, selected_credit_id, state, last_error) = match consume_result {
         Ok(result) => {
-            journal.attempts[attempt_index].response_code = Some(result.code);
-            journal.attempts[attempt_index].selected_credit_id =
-                result.credit_id.or_else(|| selected_credit_id.clone());
-            if matches!(
+            let selected_credit_id = result.credit_id.or(selected_credit_id);
+            let state = if matches!(
                 result.code,
                 ConsumeCode::NoCredit | ConsumeCode::NothingToReset
             ) {
-                journal.attempts[attempt_index].state = ResetAttemptState::TerminalNotApplied;
-                journal.attempts[attempt_index].last_error = None;
-                journal_transaction.save(&mut journal, now)?;
-                return Ok(ResetFlowResult {
-                    state: ResetFlowState::TerminalNotApplied,
-                    consumption_observed: false,
-                    quota_reconciled: false,
-                    detail: Some(format!(
-                        "reset was definitively not applied ({})",
-                        consume_code_name(result.code)
-                    )),
-                });
-            }
-            journal.attempts[attempt_index].state = ResetAttemptState::Uncertain;
-            journal.attempts[attempt_index].last_error = None;
+                ResetAttemptState::TerminalNotApplied
+            } else {
+                ResetAttemptState::Uncertain
+            };
+            (Some(result.code), selected_credit_id, state, None)
         }
-        Err(error) => {
-            journal.attempts[attempt_index].state = ResetAttemptState::Uncertain;
-            journal.attempts[attempt_index].last_error =
-                Some(format!("reset request outcome is uncertain: {error:#}"));
-        }
-    }
-    journal_transaction.save(&mut journal, now)?;
+        Err(error) => (
+            None,
+            selected_credit_id,
+            ResetAttemptState::Uncertain,
+            Some(format!("reset request outcome is uncertain: {error:#}")),
+        ),
+    };
+    expected_attempt = with_account_store_unlocked(store_lock, expected_store_generation, || {
+        update_exact_reset_attempt(
+            &journal_path,
+            &expected_attempt,
+            now,
+            |journal, attempt_index| {
+                let attempt = &mut journal.attempts[attempt_index];
+                attempt.response_code = response_code;
+                attempt.selected_credit_id = selected_credit_id;
+                attempt.state = state;
+                attempt.last_error = last_error;
+            },
+        )
+    })??;
 
-    let (reconciled_bank, inventory_fresh, inventory_error) = match fetch_bank(account) {
+    if state == ResetAttemptState::TerminalNotApplied {
+        return Ok(ResetFlowResult {
+            state: ResetFlowState::TerminalNotApplied,
+            consumption_observed: false,
+            quota_reconciled: false,
+            detail: Some(format!(
+                "reset was definitively not applied ({})",
+                consume_code_name(
+                    response_code
+                        .context("terminal reset response lost its durable response code")?
+                )
+            )),
+        });
+    }
+
+    with_account_store_unlocked(store_lock, expected_store_generation, || {
+        revalidate_exact_reset_attempt(&journal_path, &expected_attempt, now)
+    })??;
+    validate_reset_provider_io(store_lock, expected_store_generation, validate_provider_io)
+        .context("reset activation guard changed before inventory reconciliation")?;
+    let reconciled_bank_result =
+        with_account_store_unlocked(store_lock, expected_store_generation, || {
+            fetch_bank(account)
+        })?;
+    let (reconciled_bank, inventory_fresh, inventory_error) = match reconciled_bank_result {
         Ok(bank) => {
             account.rate_limit_reset_bank = Some(bank.clone());
             (bank, true, None)
@@ -968,12 +1302,11 @@ where
     };
 
     reconcile_attempt(
-        PendingResetAttempt {
-            journal_transaction: &mut journal_transaction,
-            journal: &mut journal,
-            attempt_index,
-            account,
-        },
+        store_lock,
+        expected_store_generation,
+        &journal_path,
+        expected_attempt,
+        account,
         ResetReconciliationObservation {
             bank: reconciled_bank,
             inventory_fresh,
@@ -981,6 +1314,7 @@ where
             now,
         },
         &mut refresh_quota,
+        validate_provider_io,
     )
 }
 
@@ -1018,13 +1352,6 @@ fn new_reset_attempt(
     }
 }
 
-struct PendingResetAttempt<'a> {
-    journal_transaction: &'a mut ResetJournalTransaction,
-    journal: &'a mut ResetAttemptJournal,
-    attempt_index: usize,
-    account: &'a mut CodexAccount,
-}
-
 struct ResetReconciliationObservation {
     bank: RateLimitResetBank,
     inventory_fresh: bool,
@@ -1032,40 +1359,47 @@ struct ResetReconciliationObservation {
     now: DateTime<Utc>,
 }
 
-fn reconcile_attempt<Q>(
-    attempt: PendingResetAttempt<'_>,
+fn reconcile_attempt<Q, V>(
+    store_lock: &AccountStoreLock,
+    expected_store_generation: &AccountStoreGeneration,
+    journal_path: &Path,
+    expected_attempt: ResetAttempt,
+    account: &mut CodexAccount,
     observation: ResetReconciliationObservation,
     refresh_quota: &mut Q,
+    validate_provider_io: &mut V,
 ) -> Result<ResetFlowResult>
 where
     Q: FnMut(&mut CodexAccount) -> Result<()>,
+    V: FnMut(&AccountStoreLock) -> Result<()>,
 {
-    let PendingResetAttempt {
-        journal_transaction,
-        journal,
-        attempt_index,
-        account,
-    } = attempt;
     let ResetReconciliationObservation {
         bank,
         inventory_fresh,
         inventory_error,
         now,
     } = observation;
-    let expected_owner = journal.attempts[attempt_index].stable_owner.clone();
-    let starting_quota_generation = journal.attempts[attempt_index]
-        .starting_quota_generation
-        .clone();
+    let expected_owner = expected_attempt.stable_owner.clone();
+    let starting_quota_generation = expected_attempt.starting_quota_generation.clone();
     let current_owner = reset_attempt_owner(account);
     let starting_quota_generation = starting_quota_generation
         .filter(|_| expected_owner.as_deref() == Some(current_owner.as_str()));
     let Some(starting_quota_generation) = starting_quota_generation else {
         let detail = "reset attempt lacks matching stable-owner or starting-quota evidence; manual review is required"
             .to_string();
-        journal.attempts[attempt_index].state = ResetAttemptState::ReconciliationOverdue;
-        journal.attempts[attempt_index].last_error = Some(detail.clone());
-        mark_reset_journal_manual_review(journal, now, 0, detail.clone());
-        journal_transaction.save(journal, now)?;
+        with_account_store_unlocked(store_lock, expected_store_generation, || {
+            update_exact_reset_attempt(
+                journal_path,
+                &expected_attempt,
+                now,
+                |journal, attempt_index| {
+                    journal.attempts[attempt_index].state =
+                        ResetAttemptState::ReconciliationOverdue;
+                    journal.attempts[attempt_index].last_error = Some(detail.clone());
+                    mark_reset_journal_manual_review(journal, now, 0, detail.clone());
+                },
+            )
+        })??;
         return Ok(ResetFlowResult {
             state: ResetFlowState::Suppressed,
             consumption_observed: false,
@@ -1073,11 +1407,19 @@ where
             detail: Some(detail),
         });
     };
-    let quota_result = refresh_quota(account);
-    let quota_freshness_boundary = {
-        let attempt = &journal.attempts[attempt_index];
-        attempt.submitted_at.unwrap_or(attempt.started_at)
-    };
+    with_account_store_unlocked(store_lock, expected_store_generation, || {
+        revalidate_exact_reset_attempt(journal_path, &expected_attempt, now)
+    })??;
+    validate_reset_provider_io(store_lock, expected_store_generation, validate_provider_io)
+        .context("reset activation guard changed before quota reconciliation")?;
+    let mut refreshed_account = account.clone();
+    let quota_result = with_account_store_unlocked(store_lock, expected_store_generation, || {
+        refresh_quota(&mut refreshed_account)
+    })?;
+    *account = refreshed_account;
+    let quota_freshness_boundary = expected_attempt
+        .submitted_at
+        .unwrap_or(expected_attempt.started_at);
     let observed_quota_generation = quota_evidence_generation(account);
     let fresh_snapshot = real_quota_snapshot(account)
         .filter(|snapshot| snapshot.fetched_at > quota_freshness_boundary);
@@ -1111,53 +1453,45 @@ where
         Ok(()) => None,
     };
 
-    let attempt = &mut journal.attempts[attempt_index];
+    let mut updated_attempt = expected_attempt.clone();
     if inventory_fresh {
-        attempt.last_inventory_generation = Some(inventory_generation(&bank));
-        attempt.last_inventory_count = Some(bank.available_count);
+        updated_attempt.last_inventory_generation = Some(inventory_generation(&bank));
+        updated_attempt.last_inventory_count = Some(bank.available_count);
     }
     if quota_reconciled {
-        attempt.quota_reconciled_at = fresh_snapshot_at;
-        attempt.quota_usable = Some(quota_usable);
+        updated_attempt.quota_reconciled_at = fresh_snapshot_at;
+        updated_attempt.quota_usable = Some(quota_usable);
     }
     if fresh_snapshot.is_some() {
-        attempt.last_quota_generation = Some(observed_quota_generation);
+        updated_attempt.last_quota_generation = Some(observed_quota_generation);
     }
 
     let consumption_observed = inventory_fresh
-        && inventory_is_newer_than_attempt(attempt, &bank)
-        && inventory_is_consumed(attempt, &bank);
-    let external_hold_active = attempt.origin == ResetAttemptOrigin::ExternalInventoryDecrease
-        && now < attempt.reconciliation_deadline;
-    attempt.state = if consumption_observed && quota_usable && !external_hold_active {
+        && inventory_is_newer_than_attempt(&updated_attempt, &bank)
+        && inventory_is_consumed(&updated_attempt, &bank);
+    let external_hold_active = updated_attempt.origin
+        == ResetAttemptOrigin::ExternalInventoryDecrease
+        && now < updated_attempt.reconciliation_deadline;
+    updated_attempt.state = if consumption_observed && quota_usable && !external_hold_active {
         ResetAttemptState::ReconciledUsable
     } else if consumption_observed {
         ResetAttemptState::ConsumptionObserved
-    } else if now >= attempt.reconciliation_deadline {
+    } else if now >= updated_attempt.reconciliation_deadline {
         ResetAttemptState::ReconciliationOverdue
     } else {
         ResetAttemptState::Uncertain
     };
-    attempt.last_error = join_details([
-        attempt.last_error.take(),
+    updated_attempt.last_error = join_details([
+        updated_attempt.last_error.take(),
         inventory_error.clone(),
         quota_error.clone(),
     ]);
-    let state = if attempt.state == ResetAttemptState::ReconciledUsable {
+    let state = if updated_attempt.state == ResetAttemptState::ReconciledUsable {
         ResetFlowState::ReconciledUsable
     } else {
         ResetFlowState::Suppressed
     };
-    let detail = attempt.last_error.clone();
-
-    if !owner_still_matches {
-        mark_reset_journal_manual_review(
-            journal,
-            now,
-            0,
-            "quota reconciliation changed the stable reset owner; manual review is required",
-        );
-    }
+    let detail = updated_attempt.last_error.clone();
 
     let result = ResetFlowResult {
         state,
@@ -1165,8 +1499,25 @@ where
         quota_reconciled,
         detail,
     };
+    with_account_store_unlocked(store_lock, expected_store_generation, || {
+        update_exact_reset_attempt(
+            journal_path,
+            &expected_attempt,
+            now,
+            |journal, attempt_index| {
+                journal.attempts[attempt_index] = updated_attempt;
+                if !owner_still_matches {
+                    mark_reset_journal_manual_review(
+                        journal,
+                        now,
+                        0,
+                        "quota reconciliation changed the stable reset owner; manual review is required",
+                    );
+                }
+            },
+        )
+    })??;
     account.rate_limit_reset_bank = Some(bank);
-    journal_transaction.save(journal, now)?;
     Ok(result)
 }
 
@@ -1179,7 +1530,7 @@ fn inventory_is_consumed(attempt: &ResetAttempt, bank: &RateLimitResetBank) -> b
     };
     bank.credits
         .iter()
-        .find(|credit| credit.id == selected_credit_id)
+        .find(|credit| credit.normalized_id() == Some(selected_credit_id.trim()))
         .is_some_and(RateLimitResetCredit::has_terminal_consumption_status)
 }
 
@@ -1206,11 +1557,12 @@ fn externally_consumed_credit(
             observed
                 .credits
                 .iter()
-                .find(|candidate| candidate.id == credit.id)
+                .find(|candidate| candidate.normalized_id() == credit.normalized_id())
                 .map(RateLimitResetCredit::has_terminal_consumption_status)
                 .unwrap_or(observed.available_count < previous.available_count)
         })
-        .map(|credit| credit.id.clone())
+        .filter_map(RateLimitResetCredit::normalized_id)
+        .map(str::to_string)
 }
 
 fn inventory_generation(bank: &RateLimitResetBank) -> String {
@@ -1857,7 +2209,7 @@ where
     }
     let selected_credit_id = bank
         .oldest_expiring_available_credit(now)
-        .map(|credit| credit.id.as_str())
+        .and_then(RateLimitResetCredit::normalized_id)
         .context("reset bank has no concrete available credit identifier")?;
     let request = ConsumeRequest {
         credit_id: selected_credit_id,
@@ -1889,7 +2241,10 @@ where
     };
     let credit_id = response
         .credit
-        .map(|credit| credit.id)
+        .and_then(|credit| {
+            let identifier = credit.id.trim();
+            (!identifier.is_empty()).then(|| identifier.to_string())
+        })
         .or_else(|| Some(selected_credit_id.to_string()));
     Ok(ConsumeResult { code, credit_id })
 }
@@ -1971,12 +2326,13 @@ fn decode_swift_datetime(value: &serde_json::Value) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::account_store::{
-        lock_account_store, QuotaSnapshot, QuotaWindow, QuotaWindowKind,
+        lock_account_store, save_accounts, QuotaSnapshot, QuotaWindow, QuotaWindowKind,
         QuotaWindowRateLimitSource, QuotaWindowSlot, QuotaWindowSourceMetadata,
     };
     use anyhow::anyhow;
     use serde_json::json;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -2106,6 +2462,40 @@ mod tests {
     fn make_quota_precede_attempt(account: &mut CodexAccount, attempt_at: DateTime<Utc>) {
         account.quota_snapshot.as_mut().unwrap().fetched_at =
             attempt_at - ChronoDuration::seconds(1);
+    }
+
+    fn assert_advisory_lock_available(path: &Path, label: &str) -> Result<()> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            bail!(
+                "{label} was held during provider callback: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let unlock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        if unlock_result != 0 {
+            bail!(
+                "failed to release {label} probe: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_reset_locks_available(store_path: &Path) -> Result<()> {
+        assert_advisory_lock_available(
+            &store_path.with_extension("json.lock"),
+            "account-store lock",
+        )?;
+        let journal_path = reset_attempt_journal_path(store_path);
+        let mut journal_lock = journal_path.as_os_str().to_os_string();
+        journal_lock.push(".lock");
+        assert_advisory_lock_available(Path::new(&journal_lock), "reset-journal lock")
     }
 
     #[test]
@@ -2277,6 +2667,10 @@ mod tests {
         let mut empty_identifier = bank(now, &[ChronoDuration::days(10)]);
         empty_identifier.credits[0].id = "  ".to_string();
         assert!(!empty_identifier.has_available_reset(now));
+
+        let mut missing_expiration = bank(now, &[ChronoDuration::days(10)]);
+        missing_expiration.credits[0].expires_at = None;
+        assert!(!missing_expiration.has_available_reset(now));
 
         let mut active = policy_account(
             "active@example.com",
@@ -2506,7 +2900,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_selector_ranks_plan_then_stable_identity() {
+    fn pool_selector_ranks_plan_expiration_then_stable_identity() {
         let now = fixed_policy_now();
         let active_free = policy_account(
             "free@example.com",
@@ -2526,7 +2920,7 @@ mod tests {
             true,
             now,
         );
-        let alpha_pro = policy_account(
+        let mut alpha_pro = policy_account(
             "alpha@example.com",
             false,
             "pro",
@@ -2535,7 +2929,7 @@ mod tests {
             true,
             now,
         );
-        let zulu_pro = policy_account(
+        let mut zulu_pro = policy_account(
             "zulu@example.com",
             false,
             "pro",
@@ -2544,6 +2938,8 @@ mod tests {
             true,
             now,
         );
+        alpha_pro.rate_limit_reset_bank = Some(bank(now, &[ChronoDuration::days(10)]));
+        zulu_pro.rate_limit_reset_bank = Some(bank(now, &[ChronoDuration::days(2)]));
 
         let forward = vec![
             active_free.clone(),
@@ -2556,12 +2952,12 @@ mod tests {
         assert_eq!(
             select_smart_reset_candidate(&forward, 0, false, now, None)
                 .map(|candidate| forward[candidate.account_index].email.as_str()),
-            Some("alpha@example.com")
+            Some("zulu@example.com")
         );
         assert_eq!(
             select_smart_reset_candidate(&reverse, 0, false, now, None)
                 .map(|candidate| reverse[candidate.account_index].email.as_str()),
-            Some("alpha@example.com")
+            Some("zulu@example.com")
         );
     }
 
@@ -2864,6 +3260,233 @@ mod tests {
             seen.lock().unwrap().as_slice(),
             &[(request_id, "credit-0".to_string())]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_provider_callbacks_run_without_store_or_journal_locks() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let now = Utc::now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let reconciled_bank = consumed_bank(initial_bank.clone(), now + ChronoDuration::seconds(1));
+        let mut stored_account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut stored_account, now);
+        save_accounts(&store_path, std::slice::from_ref(&stored_account))?;
+
+        let store_lock = lock_account_store(&store_path)?;
+        let mut working_account = store_lock.load()?.accounts.remove(0);
+        let callback_order = Arc::new(Mutex::new(Vec::new()));
+        let bank_path = store_path.clone();
+        let bank_callbacks = Arc::clone(&callback_order);
+        let quota_path = store_path.clone();
+        let quota_callbacks = Arc::clone(&callback_order);
+        let consume_path = store_path.clone();
+        let consume_callbacks = Arc::clone(&callback_order);
+
+        let flow = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut working_account,
+                previous_bank: None,
+                observed_bank: initial_bank,
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                move |_account| {
+                    assert_reset_locks_available(&bank_path)?;
+                    bank_callbacks.lock().unwrap().push("bank");
+                    Ok(reconciled_bank.clone())
+                },
+                move |account| {
+                    assert_reset_locks_available(&quota_path)?;
+                    quota_callbacks.lock().unwrap().push("quota");
+                    make_quota_usable(account, now + ChronoDuration::seconds(2));
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    assert_reset_locks_available(&consume_path)?;
+                    assert!(
+                        acquire_provider_io_lease(&consume_path).is_err(),
+                        "reset POST callback ran without the provider-I/O lease"
+                    );
+                    consume_callbacks.lock().unwrap().push("consume");
+                    Ok(ConsumeResult {
+                        code: ConsumeCode::Reset,
+                        credit_id: Some("credit-0".to_string()),
+                    })
+                },
+            ),
+        )?;
+
+        assert!(flow.is_usable_success());
+        assert_eq!(
+            callback_order.lock().unwrap().as_slice(),
+            &["consume", "bank", "quota"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn store_generation_race_preserves_prepared_attempt_and_never_reconsumes() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let now = Utc::now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let reconciled_bank = consumed_bank(initial_bank.clone(), now + ChronoDuration::seconds(1));
+        let mut stored_account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut stored_account, now);
+        save_accounts(&store_path, std::slice::from_ref(&stored_account))?;
+
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut working_account = snapshot.accounts[0].clone();
+        let mut concurrent_account = snapshot.accounts[0].clone();
+        concurrent_account.runtime_unusable_reason = Some("concurrent-mutation".to_string());
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_callback = Arc::clone(&consume_calls);
+        let mutation_path = store_path.clone();
+
+        let error = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut working_account,
+                previous_bank: None,
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| bail!("store race must stop before inventory reconciliation"),
+                |_account| bail!("store race must stop before quota reconciliation"),
+                move |_account, _bank, _request_id| {
+                    assert_reset_locks_available(&mutation_path)?;
+                    *consume_calls_for_callback.lock().unwrap() += 1;
+                    save_accounts(&mutation_path, std::slice::from_ref(&concurrent_account))?;
+                    Ok(ConsumeResult {
+                        code: ConsumeCode::Reset,
+                        credit_id: Some("credit-0".to_string()),
+                    })
+                },
+            ),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("account store changed during reset provider I/O"));
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+        let journal = load_reset_attempt_journal(&reset_attempt_journal_path(&store_path))?;
+        assert_eq!(journal.attempts.len(), 1);
+        assert_eq!(journal.attempts[0].state, ResetAttemptState::Prepared);
+        assert!(journal.manual_review.is_none());
+
+        drop(store_lock);
+        let replay_lock = lock_account_store(&store_path)?;
+        let mut replay_account = replay_lock.load()?.accounts.remove(0);
+        let replay_consume_calls = Arc::clone(&consume_calls);
+        let replay = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &replay_lock,
+                account: &mut replay_account,
+                previous_bank: Some(&initial_bank),
+                observed_bank: reconciled_bank.clone(),
+                attempt_reset: true,
+                now: now + ChronoDuration::seconds(2),
+            },
+            ResetReconciliationDependencies::new(
+                |_account| Ok(reconciled_bank.clone()),
+                |account| {
+                    make_quota_usable(account, now + ChronoDuration::seconds(3));
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    *replay_consume_calls.lock().unwrap() += 1;
+                    bail!("journal replay must never issue a second consume request")
+                },
+            ),
+        )?;
+
+        assert!(replay.is_usable_success());
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn journal_identity_race_fails_closed_and_suppresses_reconsume() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let journal_path = reset_attempt_journal_path(&store_path);
+        let now = Utc::now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let mut stored_account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut stored_account, now);
+        save_accounts(&store_path, std::slice::from_ref(&stored_account))?;
+
+        let store_lock = lock_account_store(&store_path)?;
+        let mut working_account = store_lock.load()?.accounts.remove(0);
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_callback = Arc::clone(&consume_calls);
+        let callback_store_path = store_path.clone();
+        let callback_journal_path = journal_path.clone();
+        let error = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut working_account,
+                previous_bank: None,
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| bail!("journal race must stop before inventory reconciliation"),
+                |_account| bail!("journal race must stop before quota reconciliation"),
+                move |_account, _bank, _request_id| {
+                    assert_reset_locks_available(&callback_store_path)?;
+                    *consume_calls_for_callback.lock().unwrap() += 1;
+                    let (mut transaction, mut journal) =
+                        ResetJournalTransaction::open(&callback_journal_path, now)?;
+                    let attempt = journal
+                        .attempts
+                        .last_mut()
+                        .context("prepared reset attempt disappeared before concurrent mutation")?;
+                    attempt.state = ResetAttemptState::Uncertain;
+                    attempt.last_error = Some("concurrent reconciler updated attempt".to_string());
+                    transaction.save(&mut journal, now)?;
+                    Ok(ConsumeResult {
+                        code: ConsumeCode::Reset,
+                        credit_id: Some("credit-0".to_string()),
+                    })
+                },
+            ),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("reset attempt"));
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+        let journal = load_reset_attempt_journal(&journal_path)?;
+        assert_eq!(journal.attempts.len(), 1);
+        assert_eq!(journal.attempts[0].state, ResetAttemptState::Uncertain);
+        assert!(journal.manual_review.is_some());
+
+        let replay = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut working_account,
+                previous_bank: None,
+                observed_bank: initial_bank,
+                attempt_reset: true,
+                now: now + ChronoDuration::seconds(1),
+            },
+            ResetReconciliationDependencies::new(
+                |_account| bail!("manual review must block inventory I/O"),
+                |_account| bail!("manual review must block quota I/O"),
+                |_account, _bank, _request_id| {
+                    bail!("manual review must block a second consume request")
+                },
+            ),
+        )?;
+        assert!(replay.suppresses_redemption());
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
         Ok(())
     }
 

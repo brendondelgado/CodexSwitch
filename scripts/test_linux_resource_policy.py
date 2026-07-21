@@ -44,7 +44,6 @@ HOT_SWAP_MARKERS = [
     "CodexSwitch account/updated frontend write acknowledged after auth reload",
     "codexswitch-hotswap-contract-v3",
     "codexswitch-hotswap-cli-contract-v3",
-    "codex-runtime-storage-leases-v1",
     "Usage: /goal <objective>",
 ]
 
@@ -89,8 +88,7 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             "/usr/bin/flock --exclusive --nonblock --no-fork "
             "%h/.codex/app-server-daemon/app-server.pid.lock "
             "%h/.local/share/codexswitch/current/patched-codex/codex "
-            "-c features.local_thread_store_compression=true app-server "
-            "--remote-control --listen ws://127.0.0.1:8390",
+            "app-server --remote-control --listen ws://127.0.0.1:8390",
             text,
         )
         for directive in (
@@ -157,6 +155,7 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         self.assertIn("codexswitch-build-reaped-v1", text)
         self.assertIn('RELEASE_ID="$PACKAGE_VERSION-$TARGET_SHA"', text)
         self.assertIn("codexswitch-release-v3", text)
+        self.assertIn("sourcePatchSha256", text)
         self.assertIn("codexswitch-activation-v4", text)
         self.assertIn('"systemd-run", "--user", "--scope", "--quiet"', text)
         self.assertIn("systemd_payload", text)
@@ -346,8 +345,8 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         self.assertIn("100,000 files / 3,650 days / 64 GiB", text)
         self.assertIn("active lease", text)
         self.assertIn("fails closed", text)
-        self.assertIn("features.local_thread_store_compression=true", unit)
-        self.assertIn("not evidence of VPS deployment", text)
+        self.assertNotIn("local_thread_store_compression", unit)
+        self.assertIn("deferred, frozen, unimplemented, and disabled", text)
 
     def test_linux_setup_uses_only_immutable_full_sha_installer_flow(self):
         text = LINUX_CLI_DOC.read_text()
@@ -355,7 +354,8 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         self.assertNotIn("cargo build --release -p codexswitch-cli", text)
         self.assertNotIn("install -Dm755 target/release", text)
         self.assertNotIn("curl -fsSL", text)
-        self.assertIn("<full-40-or-64-character-git-sha>", text)
+        self.assertIn("<full-40-character-git-sha>", text)
+        self.assertIn("stage-linux-runtime-artifact.sh", text)
         self.assertIn("CODEXSWITCH_DRY_RUN=1 scripts/install-linux.sh", text)
         self.assertIn("CODEXSWITCH_ACTIVATE=1 scripts/install-linux.sh", text)
         self.assertIn("CODEXSWITCH_IMPORT_BUNDLE=", text)
@@ -666,7 +666,9 @@ class LinuxImportTransactionFixtureTests(unittest.TestCase):
 
 class LinuxInstallerFixtureTests(unittest.TestCase):
     def setUp(self):
-        self.tempdir = tempfile.TemporaryDirectory(prefix="codexswitch-linux-install-")
+        self.tempdir = tempfile.TemporaryDirectory(
+            prefix="csi-", dir=str(pathlib.Path("/tmp").resolve())
+        )
         self.root = pathlib.Path(self.tempdir.name)
         self.home = self.root / "home"
         self.install_root = self.root / "install"
@@ -689,8 +691,8 @@ class LinuxInstallerFixtureTests(unittest.TestCase):
         self.xdg_runtime_dir.mkdir(mode=0o700)
         self.proc_root.mkdir()
         self._create_fake_tools()
-        self._create_runtime(self.runtime_dir)
         self.first_sha, self.unapproved_sha = self._create_fixture_repository()
+        self._create_runtime(self.runtime_dir)
 
     def tearDown(self):
         for path in self.root.rglob("*"):
@@ -825,11 +827,10 @@ PY
               "$CODEXSWITCH_BUILD_GIT_SHA" "$CODEXSWITCH_BUILD_PACKAGE_VERSION" \
               "$SOURCE_DATE_EPOCH" "$CARGO_TARGET_DIR" "$CARGO_BUILD_JOBS" \
               >> "$FAKE_TOOL_LOG"
-            short_sha=$(printf '%s' "$CODEXSWITCH_BUILD_GIT_SHA" | cut -c1-12)
             if [ "${{FAKE_BAD_CLI_VERSION:-0}}" = 1 ]; then
               version='codexswitch-cli 0.0.0 (git unknown-dirty, built unknown)'
             else
-              version="codexswitch-cli $CODEXSWITCH_BUILD_PACKAGE_VERSION (git $short_sha, built $SOURCE_DATE_EPOCH)"
+              version="codexswitch-cli $CODEXSWITCH_BUILD_PACKAGE_VERSION (git $CODEXSWITCH_BUILD_GIT_SHA, built $SOURCE_DATE_EPOCH)"
             fi
             mkdir -p "$CARGO_TARGET_DIR/release"
             binary="$CARGO_TARGET_DIR/release/codexswitch-cli"
@@ -990,6 +991,14 @@ CLI
 
             if [ "$*" = "--user daemon-reload" ]; then
               [ "${FAKE_DAEMON_RELOAD_FAIL:-0}" != 1 ] || exit 42
+              if [ -n "${FAKE_DAEMON_RELOAD_FAIL_AFTER:-}" ]; then
+                reload_count_file="$state_dir/daemon-reload-fail-count"
+                reload_count=0
+                [ ! -f "$reload_count_file" ] || reload_count=$(cat "$reload_count_file")
+                reload_count=$((reload_count + 1))
+                printf '%s\n' "$reload_count" > "$reload_count_file"
+                [ "$reload_count" != "$FAKE_DAEMON_RELOAD_FAIL_AFTER" ] || exit 42
+              fi
               if [ "${FAKE_CONCURRENT_MAINTENANCE_START:-0}" = 1 ] && \
                  [ ! -e "$state_dir/concurrent-maintenance-attempted" ]; then
                 : > "$state_dir/concurrent-maintenance-attempted"
@@ -1055,8 +1064,8 @@ CLI
               should_fail start "$unit" && exit 46
               if [ "$unit" = codexswitch.service ] && \
                  [ -e "$state_dir/active/signul-codex-app-server.service" ]; then
-                account_store=${{CODEXSWITCH_ACCOUNT_STORE_PATH:-$HOME/.codexswitch/accounts.json}}
-                python3 - "$account_store" "${{FAKE_IMPORT_CONVERGENCE:-confirmed}}" <<'PY'
+                account_store=${CODEXSWITCH_ACCOUNT_STORE_PATH:-$HOME/.codexswitch/accounts.json}
+                python3 - "$account_store" "${FAKE_IMPORT_CONVERGENCE:-confirmed}" <<'PY'
 import json
 import os
 import sys
@@ -1070,7 +1079,7 @@ if record_path.is_file() and mode != "pending":
         record["targetAccountId"] = record["targetAccountId"] + "-different"
     record["state"] = "confirmed"
     record["detail"] = None
-    temporary = record_path.with_name(f".{{record_path.name}}.tmp.{{os.getpid()}}")
+    temporary = record_path.with_name(f".{record_path.name}.tmp.{os.getpid()}")
     descriptor = os.open(
         temporary,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -1213,7 +1222,7 @@ PY
                   drifted-exec) active_state=inactive ;;
                   *) active_state="$observation" ;;
                 esac
-                exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $install_root/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork $runtime_storage_root/app-server-daemon/app-server.pid.lock $install_root/current/patched-codex/codex -c features.local_thread_store_compression=true app-server --remote-control --listen ws://127.0.0.1:8390 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+                exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $install_root/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork $runtime_storage_root/app-server-daemon/app-server.pid.lock $install_root/current/patched-codex/codex app-server --remote-control --listen ws://127.0.0.1:8390 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
                 if [ "$observation" = drifted-exec ]; then
                   exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $CODEXSWITCH_INSTALL_ROOT/other.lock $CODEXSWITCH_INSTALL_ROOT/current/patched-codex/codex app-server ; ignore_errors=no ; }"
                 fi
@@ -1349,6 +1358,60 @@ PY
             exit 0
             """,
         )
+        self._refresh_runtime_artifact(runtime_dir, self.first_sha)
+
+    def _refresh_runtime_artifact(self, runtime_dir: pathlib.Path, source_sha: str):
+        runtime_dir.chmod(0o700)
+        for path in runtime_dir.iterdir():
+            if not path.is_symlink():
+                path.chmod(0o600)
+        build_epoch = self._git(
+            "show", "-s", "--format=%ct", source_sha, cwd=self.fixture_repo
+        )
+        build_version = (
+            f"codexswitch-cli {PACKAGE_VERSION} "
+            f"(git {source_sha}, built {build_epoch})"
+        )
+        write_executable(
+            runtime_dir / "codexswitch-cli",
+            f"""
+            #!/bin/sh
+            if [ "${{1:-}}" = --version ]; then
+              printf '%s\n' '{build_version}'
+              exit 0
+            fi
+            exit 0
+            """,
+        )
+        files = []
+        for name in ("codex", "codex-code-mode-host", "codexswitch-cli"):
+            payload = (runtime_dir / name).read_bytes()
+            files.append(
+                {
+                    "name": name,
+                    "bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+        manifest = {
+            "format": "codexswitch-linux-runtime-artifact-v1",
+            "codexSwitchGitSha": source_sha,
+            "codexSwitchBuildVersion": build_version,
+            "upstreamCodexVersion": CODEX_VERSION,
+            "upstreamCodexGitSha": CODEX_SOURCE_SHA,
+            "sourcePatchSha256": "d" * 64,
+            "targetTriple": "x86_64-unknown-linux-gnu",
+            "architecture": "x86_64",
+            "buildEpoch": int(build_epoch),
+            "files": files,
+        }
+        (runtime_dir / "manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True), encoding="utf-8"
+        )
+        (runtime_dir / "manifest.json").chmod(0o400)
+        for name in ("codex", "codex-code-mode-host", "codexswitch-cli"):
+            (runtime_dir / name).chmod(0o500)
+        runtime_dir.chmod(0o500)
 
     def _git(self, *args, cwd=None, extra_env=None):
         env = {
@@ -1456,7 +1519,7 @@ PY
             "CODEXSWITCH_BUILD_ROOT": str(self.build_root),
             "CODEXSWITCH_BIN_DIR": str(self.bin_dir),
             "CODEXSWITCH_SYSTEMD_USER_DIR": str(self.service_dir),
-            "CODEXSWITCH_CODEX_RUNTIME_DIR": str(self.runtime_dir),
+            "CODEXSWITCH_LINUX_ARTIFACT_DIR": str(self.runtime_dir),
             "CODEXSWITCH_RUNTIME_STORAGE_ROOT": str(self.home / ".codex"),
             "CODEXSWITCH_PROC_ROOT": str(self.proc_root),
             "CODEXSWITCH_CODEX_VERSION": CODEX_VERSION,
@@ -1507,12 +1570,20 @@ PY
         return self.install_root / "releases" / f"{PACKAGE_VERSION}-{sha}"
 
     def _stage(self, sha=None, extra_env=None, check=True):
+        target_sha = sha or self.first_sha
+        artifact_override = (extra_env or {}).get("CODEXSWITCH_LINUX_ARTIFACT_DIR")
+        if artifact_override is None:
+            self._refresh_runtime_artifact(self.runtime_dir, target_sha)
         env = self._environment(sha)
         if extra_env:
             env.update(extra_env)
         return self._run_installer(env, check=check)
 
     def _activate(self, sha=None, extra_env=None, check=True):
+        target_sha = sha or self.first_sha
+        artifact_override = (extra_env or {}).get("CODEXSWITCH_LINUX_ARTIFACT_DIR")
+        if artifact_override is None:
+            self._refresh_runtime_artifact(self.runtime_dir, target_sha)
         env = self._environment(sha)
         env["CODEXSWITCH_ACTIVATE"] = "1"
         if extra_env:
@@ -1523,6 +1594,9 @@ PY
         self._stage()
         current_release = self._release(self.first_sha)
         shutil.copytree(current_release / "systemd", self.service_dir)
+        for path in (self.service_dir, *self.service_dir.rglob("*")):
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode | stat.S_IWUSR)
         (self.install_root / "current").symlink_to(
             pathlib.Path("releases") / current_release.name
         )
@@ -1702,7 +1776,7 @@ PY
         env["CODEXSWITCH_CODEX_SOURCE_SHA"] = "C" * 40
         result = self._run_installer(env, check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("full lowercase 40- or 64-character", result.stderr)
+        self.assertIn("full lowercase 40-character", result.stderr)
 
         lock = self.build_root / ".build.lock"
         lock.mkdir(parents=True)
@@ -1777,19 +1851,18 @@ PY
         runtime_link = self.root / "runtime-input-link"
         runtime_link.symlink_to(self.runtime_dir, target_is_directory=True)
         result = self._stage(
-            extra_env={"CODEXSWITCH_CODEX_RUNTIME_DIR": str(runtime_link)},
+            extra_env={"CODEXSWITCH_LINUX_ARTIFACT_DIR": str(runtime_link)},
             check=False,
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "CODEXSWITCH_CODEX_RUNTIME_DIR must not be a symlink", result.stderr
-        )
+        self.assertIn("Linux artifact must be a regular directory", result.stderr)
 
     def test_runtime_input_rejects_arbitrary_nested_symlinks_without_touching_targets(self):
         external_file = self.root / "external-runtime-data"
         external_file.write_text("preserve\n")
         external_file.chmod(0o400)
+        self.runtime_dir.chmod(0o700)
         nested = self.runtime_dir / "unused" / "nested"
         nested.mkdir(parents=True)
         file_link = nested / "metadata.json"
@@ -1797,9 +1870,12 @@ PY
 
         result = self._stage(check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("PATCHED_CODEX_RUNTIME contains a linked", result.stderr)
+        self.assertIn("artifact must contain exactly", result.stderr)
         self.assertEqual(external_file.read_text(), "preserve\n")
         self.assertEqual(stat.S_IMODE(external_file.stat().st_mode), 0o400)
+        self.runtime_dir.chmod(0o700)
+        (self.runtime_dir / "unused").chmod(0o700)
+        nested.chmod(0o700)
         file_link.unlink()
 
         external_dir = self.root / "external-runtime-dir"
@@ -1810,8 +1886,11 @@ PY
 
         result = self._stage(check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("PATCHED_CODEX_RUNTIME contains a linked", result.stderr)
+        self.assertIn("artifact must contain exactly", result.stderr)
         self.assertEqual((external_dir / "sentinel").read_text(), "untouched\n")
+        self.runtime_dir.chmod(0o700)
+        (self.runtime_dir / "unused").chmod(0o700)
+        nested.chmod(0o700)
 
     def test_runtime_and_archive_bounds_preserve_active_leased_sessions(self):
         runtime_storage = self.home / ".codex"
@@ -2109,7 +2188,7 @@ PY
         epoch = self._git("show", "-s", "--format=%ct", self.first_sha, cwd=self.fixture_repo)
         expected_version = (
             f"codexswitch-cli {PACKAGE_VERSION} "
-            f"(git {self.first_sha[:12]}, built {epoch})"
+            f"(git {self.first_sha}, built {epoch})"
         )
 
         self.assertIn("staged and validated without activation", result.stdout)
@@ -2117,6 +2196,9 @@ PY
         self.assertEqual(manifest["release_id"], f"{PACKAGE_VERSION}-{self.first_sha}")
         self.assertEqual(manifest["cli_version"], expected_version)
         self.assertEqual(manifest["codex_source_sha"], CODEX_SOURCE_SHA)
+        self.assertEqual(manifest["upstream_codex_git_sha"], CODEX_SOURCE_SHA)
+        self.assertEqual(manifest["sourcePatchSha256"], "d" * 64)
+        self.assertEqual(manifest["source_patch_sha256"], "d" * 64)
         self.assertEqual(manifest["codex_version"], CODEX_VERSION)
         self.assertEqual(
             manifest["systemd_payload"],
@@ -2269,7 +2351,7 @@ PY
         bad_runtime = self.root / "bad-runtime"
         self._create_runtime(bad_runtime, HOT_SWAP_MARKERS[:-1])
         result = self._stage(
-            extra_env={"CODEXSWITCH_CODEX_RUNTIME_DIR": str(bad_runtime)},
+            extra_env={"CODEXSWITCH_LINUX_ARTIFACT_DIR": str(bad_runtime)},
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
@@ -2284,7 +2366,7 @@ PY
             extra_env={"CODEXSWITCH_CODEX_VERSION": "0.145.0"}, check=False
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not match requested runtime provenance", result.stderr)
+        self.assertIn("does not match the verified artifact manifest", result.stderr)
 
         manifest = release / "release-manifest.tsv"
         manifest.chmod(0o644)
@@ -2299,28 +2381,28 @@ PY
         self.assertRegex(result.stderr, "release ID|directory name")
         self.assertFalse((self.install_root / "current").exists())
 
-    def test_release_reuse_and_activation_require_exact_reviewed_runtime_provenance(self):
+    def test_manifest_is_authoritative_and_optional_expectations_must_match(self):
         self._stage()
 
         for missing_name in (
             "CODEXSWITCH_CODEX_VERSION",
             "CODEXSWITCH_CODEX_SOURCE_SHA",
         ):
-            result = self._stage(extra_env={missing_name: ""}, check=False)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(f"{missing_name} is required", result.stderr)
-
-            result = self._activate(extra_env={missing_name: ""}, check=False)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(f"{missing_name} is required", result.stderr)
-            self.assertFalse((self.install_root / "current").exists())
+            result = self._stage(extra_env={missing_name: ""})
+            self.assertIn("Using verified existing release", result.stdout)
 
         result = self._activate(
             extra_env={"CODEXSWITCH_CODEX_SOURCE_SHA": "d" * 40}, check=False
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not match requested runtime provenance", result.stderr)
+        self.assertIn("does not match the verified artifact manifest", result.stderr)
         self.assertFalse((self.install_root / "current").exists())
+
+        result = self._stage(
+            extra_env={"CODEXSWITCH_LINUX_ARTIFACT_DIR": ""}, check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CODEXSWITCH_LINUX_ARTIFACT_DIR is required", result.stderr)
 
     def test_systemd_payload_is_exact_and_rejects_extra_or_missing_entries(self):
         self._stage()
@@ -2937,7 +3019,7 @@ PY
         self.assertEqual(auth_path.read_bytes(), b"old auth\n")
         self.assertEqual(stat.S_IMODE(account_store.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(auth_path.stat().st_mode), 0o640)
-        self.assertTrue(account_lock.is_file())
+        self.assertFalse(account_lock.exists())
         self.assertEqual(self._systemd_artifact_state(), original_systemd)
         self.assertFalse((self.install_root / "current").exists())
         self.assertFalse((self.install_root / "previous").exists())
@@ -3086,9 +3168,10 @@ PY
         self._stage()
 
         result = self._activate(
-            extra_env={"FAKE_DAEMON_RELOAD_FAIL": "1"}, check=False
+            extra_env={"FAKE_DAEMON_RELOAD_FAIL_AFTER": "1"}, check=False
         )
-        self.assertEqual(result.returncode, 42)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to load systemd start barriers", result.stderr)
         self.assertFalse((self.install_root / "current").exists())
 
         lock = self.install_root / ".activation.lock"
@@ -3522,7 +3605,7 @@ PY
         self.assertFalse(legacy_enablement.is_symlink())
 
         interrupted_recovery = self._activate(
-            extra_env={"FAKE_DAEMON_RELOAD_FAIL": "1"}, check=False
+            extra_env={"FAKE_DAEMON_RELOAD_FAIL_AFTER": "3"}, check=False
         )
         self.assertNotEqual(interrupted_recovery.returncode, 0)
         self.assertEqual(

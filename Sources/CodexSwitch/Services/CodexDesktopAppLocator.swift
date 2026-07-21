@@ -29,6 +29,8 @@ enum CodexDesktopAppLocator {
     private static let requiredPatchMarkers = [
         "_invalidateAccountQueries",
         "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3",
+        "CODEXSWITCH_AUTH_EVENT_DEDUPE_V1",
+        "CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1",
         "CODEXSWITCH_AUTH_TRANSITION_V2",
         "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2",
         "CODEXSWITCH_RECENT_THREADS_STATE_DB_V1",

@@ -1,5 +1,8 @@
 use crate::bounded_command;
 use crate::patched_codex;
+#[cfg(target_os = "linux")]
+use crate::reload::bind_managed_headless_app_server_identity;
+use crate::reload::ManagedHeadlessAppServerIdentity;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::blocking::Client;
@@ -100,7 +103,6 @@ impl Default for CodexUpdateState {
 pub fn status_report() -> Result<CodexUpdateReport> {
     let data_dir = codexswitch_data_dir()?;
     status_report_at(
-        &data_dir.join("codex-update.lock"),
         &data_dir.join("codex-cli-update.json"),
         installed_codex_version,
         reconcile_installed_state,
@@ -114,7 +116,6 @@ fn deferred_status_report() -> Result<CodexUpdateReport> {
 }
 
 fn status_report_at<Installed, Reconcile>(
-    lock_path: &Path,
     state_path: &Path,
     installed_version: Installed,
     reconcile: Reconcile,
@@ -123,22 +124,13 @@ where
     Installed: FnOnce() -> Option<String>,
     Reconcile: FnOnce(&mut CodexUpdateState) -> bool,
 {
-    let Some(_operation_lock) = UpdaterOperationLock::try_acquire_at(lock_path)? else {
-        let mut state = load_state_at(state_path)?;
-        restore_unresolved_failure(&mut state);
-        return Ok(report_from_state(state));
-    };
     let mut state = load_state_at(state_path)?;
     let observed_installed_version = installed_version();
-    let mut changed = state.installed_version != observed_installed_version;
     observe_installed_version(&mut state, observed_installed_version);
     if state.unresolved_failure.is_some() {
-        changed |= restore_unresolved_failure(&mut state);
+        restore_unresolved_failure(&mut state);
     } else {
-        changed |= reconcile(&mut state);
-    }
-    if changed {
-        save_state_at(state_path, &state)?;
+        reconcile(&mut state);
     }
     Ok(report_from_state(state))
 }

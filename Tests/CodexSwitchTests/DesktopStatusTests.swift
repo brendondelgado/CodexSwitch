@@ -607,6 +607,31 @@ struct DesktopStatusTests {
         )
     }
 
+    @Test("Desktop auth readiness requires event dedupe and account-read single-flight")
+    func desktopAuthReadinessRequiresCurrentCoordinationMarkers() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("auth-markers.bin")
+        let completeMarkers = [
+            "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3",
+            "CODEXSWITCH_AUTH_EVENT_DEDUPE_V1",
+            "CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1",
+            "CODEXSWITCH_AUTH_TRANSITION_V2",
+        ]
+
+        for missingMarker in completeMarkers {
+            let partialMarkers = completeMarkers.filter { $0 != missingMarker }.joined(separator: " ")
+            try Data(partialMarkers.utf8).write(to: file)
+            #expect(!DesktopPatchManager.authPatchMarkersPresent(at: file.path))
+        }
+
+        try Data(completeMarkers.joined(separator: " ").utf8).write(to: file)
+        #expect(DesktopPatchManager.authPatchMarkersPresent(at: file.path))
+    }
+
     private func writeCodexInfoPlist(shortVersion: String, bundleVersion: String, to url: URL) throws {
         let plist: [String: String] = [
             "CFBundleIdentifier": "com.openai.codex",

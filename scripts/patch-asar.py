@@ -99,8 +99,13 @@ LEGACY_AUTH_TRANSITION_PATCH_MARKER = "CODEXSWITCH_AUTH_TRANSITION_V1"
 AUTH_TRANSITION_PATCH_MARKER = "CODEXSWITCH_AUTH_TRANSITION_V2"
 AUTH_TRANSITION_HELPER = "_codexSwitchResolveAuthState"
 AUTH_TRANSITION_LOGOUT_DELAY_MS = 10_000
-AUTH_INVALIDATION_GUARD = "_csAuthInvalidationPending"
+LEGACY_AUTH_INVALIDATION_GUARD = "_csAuthInvalidationPending"
+AUTH_INVALIDATION_GUARD = "_csAuthInvalidationEvents"
+AUTH_INVALIDATION_EVENT_MARKER = "CODEXSWITCH_AUTH_EVENT_DEDUPE_V1"
 AUTH_INVALIDATION_COALESCE_MS = 100
+AUTH_SINGLE_FLIGHT_PATCH_MARKER = "CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1"
+AUTH_SINGLE_FLIGHT_CACHE = "_csAccountReadFlights"
+AUTH_SINGLE_FLIGHT_HELPER = "_codexSwitchReadAccount"
 FAST_FALLBACK_MARKER = "_bundledFastModels"
 HEADROOM_ENV_MARKER = "CODEXSWITCH_HEADROOM_BASE_URL"
 HEADROOM_TRANSPORT_PATCH_MARKER = "CODEXSWITCH_HEADROOM_TRANSPORT_PATCH"
@@ -1087,8 +1092,8 @@ def find_auth_file(assets_dir: Path) -> Path | None:
     return best_auth_hook(list(assets_dir.glob("*.js")))
 
 
-def find_weakmap_account_cache_var(content: str) -> str | None:
-    """Return the WeakMap variable that caches getAccount() promises, if present."""
+def find_weakmap_account_cache(content: str) -> dict[str, str | None] | None:
+    """Return the recognized getAccount() helper and its WeakMap cache."""
     match = re.search(
         r'let\s+[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\.get\(([A-Za-z_$][\w$]*)\);'
         r'if\([^;]+?!=null\)return\s+[A-Za-z_$][\w$]*;'
@@ -1102,7 +1107,23 @@ def find_weakmap_account_cache_var(content: str) -> str | None:
     weakmap_var = match.group(1)
     if not re.search(rf'{re.escape(weakmap_var)}=new WeakMap(?=[,;}}])', content):
         return None
-    return weakmap_var
+
+    connection = match.group(2)
+    prefix = content[max(0, match.start() - 160):match.start()]
+    helper_match = re.search(
+        rf'function\s+([A-Za-z_$][\w$]*)\({re.escape(connection)}\)\{{\s*$',
+        prefix,
+    )
+    return {
+        "helper": helper_match.group(1) if helper_match else None,
+        "cache": weakmap_var,
+    }
+
+
+def find_weakmap_account_cache_var(content: str) -> str | None:
+    """Return the WeakMap variable that caches getAccount() promises, if present."""
+    cache = find_weakmap_account_cache(content)
+    return str(cache["cache"]) if cache else None
 
 
 def find_fast_mode_file(assets_dir: Path) -> Path | None:
@@ -1226,33 +1247,40 @@ def find_remote_recents_file(assets_dir: Path) -> Path | None:
 
 def _recent_threads_state_db_method(
     content: str,
-) -> tuple[re.Match[str], int] | None:
-    """Locate the one recent-thread method that exposes useStateDbOnly."""
+) -> tuple[re.Match[str], int, str | None] | None:
+    """Locate the one sidebar recent-thread method and its optional state flag."""
     signature_re = re.compile(
         r"async\s+listRecentThreads\(\{"
         r"(?=[^{}]*\bcursor:)"
         r"(?=[^{}]*\blimit:)"
         r"(?=[^{}]*\bbackground:)"
-        r"[^{}]*\buseStateDbOnly:"
-        r"(?P<state>[A-Za-z_$][\w$]*)=![01]"
-        r"[^{}]*\}\)\{"
+        r"(?P<parameters>[^{}]*)\}\)\{"
     )
-    matches = list(signature_re.finditer(content))
-    if len(matches) != 1:
-        return None
+    candidates: list[tuple[re.Match[str], int, str | None]] = []
+    for match in signature_re.finditer(content):
+        next_method = content.find("}async ", match.end())
+        if next_method == -1:
+            continue
+        body_end = next_method + 1
+        body = content[match.end():body_end]
+        if (
+            "sendRequest(`thread/list`" not in body
+            or "source:`recent_threads`" not in body
+        ):
+            continue
 
-    match = matches[0]
-    next_method = content.find("}async ", match.end())
-    if next_method == -1:
+        state_match = re.search(
+            r"\buseStateDbOnly:(?P<state>[A-Za-z_$][\w$]*)=![01]",
+            match.group("parameters"),
+        )
+        state_var = state_match.group("state") if state_match else None
+        if state_var is None and body.count("useStateDbOnly:!0") != 1:
+            continue
+        candidates.append((match, body_end, state_var))
+
+    if len(candidates) != 1:
         return None
-    body_end = next_method + 1
-    body = content[match.end():body_end]
-    if (
-        "sendRequest(`thread/list`" not in body
-        or "source:`recent_threads`" not in body
-    ):
-        return None
-    return (match, body_end)
+    return candidates[0]
 
 
 def find_recent_threads_state_db_file(assets_dir: Path) -> Path | None:
@@ -1370,11 +1398,11 @@ def has_recent_threads_state_db_patch(content: str) -> bool:
     located = _recent_threads_state_db_method(content)
     if located is None:
         return False
-    match, body_end = located
+    match, body_end, _ = located
     body = content[match.end():body_end]
     return (
-        RECENT_THREADS_STATE_DB_MARKER in body
-        and "useStateDbOnly:!0" in body
+        body.count(RECENT_THREADS_STATE_DB_MARKER) == 1
+        and body.count("useStateDbOnly:!0") == 1
     )
 
 
@@ -1487,8 +1515,8 @@ def identify_aliases(content: str) -> tuple[str, str] | None:
     return uqc_alias, qk_alias
 
 
-def current_auth_patch_present(content: str) -> bool:
-    """Return whether the renderer has the scope-safe auth patch generation."""
+def current_auth_transition_patch_present(content: str) -> bool:
+    """Return whether account state commits use the current ordering contract."""
     return (
         PATCH_MARKER in content
         and AUTH_CACHE_PATCH_MARKER in content
@@ -1499,7 +1527,57 @@ def current_auth_patch_present(content: str) -> bool:
         and "_csLogoutTimer=null" in content
         and "_csReadEpoch===_csAuthEpoch" in content
         and "_csLogoutTimer=setTimeout" in content
-        and f"var {AUTH_INVALIDATION_GUARD}=!1" in content
+    )
+
+
+def auth_status_callback_event(content: str) -> str | None:
+    """Return the event parameter for the one registered auth callback."""
+    events: list[str] = []
+    for match in re.finditer(
+        r'let\s+(?P<callback>[A-Za-z_$][\w$]*)='
+        r'(?P<event>[A-Za-z_$][\w$]*)=>\{',
+        content,
+    ):
+        callback = match.group("callback")
+        if re.search(
+            rf'\.addAuthStatusCallback\({re.escape(callback)}\)',
+            content,
+        ):
+            events.append(match.group("event"))
+    return events[0] if len(events) == 1 else None
+
+
+def current_auth_invalidation_patch_present(content: str) -> bool:
+    """Return whether invalidation coalesces only duplicate broadcasts."""
+    event = auth_status_callback_event(content)
+    return (
+        event is not None
+        and auth_invalidation_guard_patch() in content
+        and content.count(AUTH_INVALIDATION_EVENT_MARKER) == 1
+        and f"{PATCH_MARKER}({event})" in content
+    )
+
+
+def current_auth_patch_present(content: str) -> bool:
+    """Return whether the renderer has the complete current auth patch."""
+    wrapper = renderer_account_read_wrapper(content)
+    weakmap_var = find_weakmap_account_cache_var(content)
+    helper_cache_ready = (
+        weakmap_var is None
+        or weakmap_auth_cache_reset(weakmap_var) in content
+    )
+    return (
+        current_auth_transition_patch_present(content)
+        and current_auth_invalidation_patch_present(content)
+        and content.count(AUTH_SINGLE_FLIGHT_PATCH_MARKER) == 1
+        and f"var {AUTH_SINGLE_FLIGHT_CACHE}=new WeakMap" in content
+        and wrapper is not None
+        and bool(wrapper["wrapped"])
+        and (
+            f"try{{{AUTH_SINGLE_FLIGHT_CACHE}=new WeakMap;"
+            in content
+        )
+        and helper_cache_ready
     )
 
 
@@ -1537,25 +1615,77 @@ def auth_transition_module_patch() -> str:
 
 
 def auth_invalidation_guard_patch() -> str:
-    """Build the short coalescing window shared by auth-status subscribers."""
-    return f'var {AUTH_INVALIDATION_GUARD}=!1;'
+    """Build the identity map used to coalesce one broadcast's callbacks."""
+    return f'var {AUTH_INVALIDATION_GUARD}=new WeakMap;'
+
+
+def legacy_auth_invalidation_guard_patch() -> str:
+    """Return the global 100 ms boolean used by the previous generation."""
+    return f'var {LEGACY_AUTH_INVALIDATION_GUARD}=!1;'
+
+
+def auth_single_flight_module_patch() -> str:
+    """Build the module-level account-read promise flight shared by subscribers."""
+    return (
+        f'var {AUTH_SINGLE_FLIGHT_CACHE}=new WeakMap;'
+        f'function {AUTH_SINGLE_FLIGHT_HELPER}(e,t){{'
+        f'"{AUTH_SINGLE_FLIGHT_PATCH_MARKER}";'
+        f'let n={AUTH_SINGLE_FLIGHT_CACHE}.get(e);if(n!=null)return n;'
+        f'let r={AUTH_SINGLE_FLIGHT_CACHE};'
+        'n=Promise.resolve().then(t).finally(()=>{'
+        'r.get(e)===n&&r.delete(e)'
+        '});return r.set(e,n),n}'
+    )
+
+
+def auth_invalidator_prefix() -> str:
+    """Return the broadcast-specific auth invalidator prefix."""
+    return (
+        f'function {PATCH_MARKER}(e){{"{AUTH_CACHE_PATCH_MARKER}";'
+        f'"{AUTH_INVALIDATION_EVENT_MARKER}";'
+        'let t=e!=null&&(typeof e=="object"||typeof e=="function"),'
+        f'n=t?e.authMethod:void 0,r=t?{AUTH_INVALIDATION_GUARD}.get(e):null;'
+        'if(r!=null&&r.state===n)return;'
+        f'if(t){{let r={AUTH_INVALIDATION_GUARD},i={{state:n}};'
+        f'r.set(e,i),setTimeout(()=>{{r.get(e)===i&&r.delete(e)}},'
+        f'{AUTH_INVALIDATION_COALESCE_MS})}}try{{'
+    )
+
+
+def legacy_auth_invalidator_prefix() -> str:
+    """Return the previous global-window invalidator prefix."""
+    return (
+        f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";'
+        f'if({LEGACY_AUTH_INVALIDATION_GUARD})return;'
+        f'{LEGACY_AUTH_INVALIDATION_GUARD}=!0;'
+        f'setTimeout(()=>{{{LEGACY_AUTH_INVALIDATION_GUARD}=!1}},'
+        f'{AUTH_INVALIDATION_COALESCE_MS});try{{'
+    )
 
 
 def guarded_auth_invalidator(body: str) -> str:
     """Wrap one cache invalidation so a broadcast performs one shared reset."""
     return (
-        f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";'
-        f'if({AUTH_INVALIDATION_GUARD})return;'
-        f'{AUTH_INVALIDATION_GUARD}=!0;'
-        f'setTimeout(()=>{{{AUTH_INVALIDATION_GUARD}=!1}},'
-        f'{AUTH_INVALIDATION_COALESCE_MS});try{{{body}}}catch{{}}}}'
+        auth_invalidator_prefix()
+        + f'{AUTH_SINGLE_FLIGHT_CACHE}=new WeakMap;'
+        + body
+        + '}catch{}}'
     )
 
 
-def query_client_auth_invalidator_patch(query_key_builder: str) -> str:
+def weakmap_auth_cache_reset(weakmap_var: str) -> str:
+    """Return a no-throw-compatible reset for one recognized helper cache."""
+    return f'typeof {weakmap_var}!="undefined"&&({weakmap_var}=new WeakMap)'
+
+
+def query_client_auth_invalidator_patch(
+    query_key_builder: str,
+    weakmap_var: str | None = None,
+) -> str:
     """Build the guarded React Query auth-cache invalidator."""
     body = (
-        'if(_qcRef)void Promise.allSettled(['
+        (weakmap_auth_cache_reset(weakmap_var) + ";" if weakmap_var else "")
+        + 'if(_qcRef)void Promise.allSettled(['
         '_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]}),'
         f'_qcRef.invalidateQueries({{queryKey:{query_key_builder}(`account-info`)}})'
         '])'
@@ -1565,27 +1695,63 @@ def query_client_auth_invalidator_patch(query_key_builder: str) -> str:
 
 def weakmap_auth_invalidator_patch(weakmap_var: str) -> str:
     """Build the guarded account-read promise-cache invalidator."""
-    return guarded_auth_invalidator(
-        f'typeof {weakmap_var}!="undefined"&&({weakmap_var}=new WeakMap)'
-    )
+    return guarded_auth_invalidator(weakmap_auth_cache_reset(weakmap_var))
 
 
-def query_client_auth_module_patch(query_key_builder: str, *, include_ref: bool) -> str:
+def query_client_auth_module_patch(
+    query_key_builder: str,
+    *,
+    include_ref: bool,
+    weakmap_var: str | None = None,
+) -> str:
     """Build a no-throw, coalesced module-scope React Query invalidator."""
     ref_declaration = "var _qcRef=null;" if include_ref else ""
     return (
         ref_declaration
+        + auth_single_flight_module_patch()
         + auth_invalidation_guard_patch()
-        + query_client_auth_invalidator_patch(query_key_builder)
+        + query_client_auth_invalidator_patch(query_key_builder, weakmap_var)
         + auth_transition_module_patch()
     )
+
+
+def bind_auth_invalidation_to_callback(content: str) -> str | None:
+    """Pass the registered callback's broadcast object into invalidation."""
+    event = auth_status_callback_event(content)
+    if event is None:
+        return None
+    current_call = f'{PATCH_MARKER}({event})'
+    if current_call in content:
+        return content
+    legacy_call = f'{PATCH_MARKER}()'
+    if content.count(legacy_call) != 1:
+        return None
+    return content.replace(legacy_call, current_call, 1)
+
+
+def upgrade_auth_invalidation_dedupe(content: str) -> str | None:
+    """Upgrade the global 100 ms guard and bind the callback event."""
+    patched = content
+    current_guard = auth_invalidation_guard_patch()
+    if current_guard not in patched:
+        legacy_guard = legacy_auth_invalidation_guard_patch()
+        legacy_prefix = legacy_auth_invalidator_prefix()
+        if patched.count(legacy_guard) != 1 or patched.count(legacy_prefix) != 1:
+            return None
+        patched = patched.replace(legacy_guard, current_guard, 1)
+        patched = patched.replace(legacy_prefix, auth_invalidator_prefix(), 1)
+    elif patched.count(AUTH_INVALIDATION_EVENT_MARKER) != 1:
+        return None
+    return bind_auth_invalidation_to_callback(patched)
 
 
 def coalesce_auth_invalidator(content: str) -> str | None:
     """Upgrade a recognized V3 invalidator without layering another helper."""
     guard = auth_invalidation_guard_patch()
     if guard in content:
-        return content
+        return upgrade_auth_invalidation_dedupe(content)
+    if legacy_auth_invalidation_guard_patch() in content:
+        return upgrade_auth_invalidation_dedupe(content)
 
     candidates: list[tuple[str, str]] = []
     weakmap_var = find_weakmap_account_cache_var(content)
@@ -1611,7 +1777,10 @@ def coalesce_auth_invalidator(content: str) -> str | None:
         )
         if content.count(legacy_query) == 1:
             candidates.append(
-                (legacy_query, guard + query_client_auth_invalidator_patch(builder))
+                (
+                    legacy_query,
+                    guard + query_client_auth_invalidator_patch(builder, weakmap_var),
+                )
             )
 
     if len(candidates) != 1:
@@ -1621,13 +1790,126 @@ def coalesce_auth_invalidator(content: str) -> str | None:
         )
         return None
     old, new = candidates[0]
-    return content.replace(old, new, 1)
+    return bind_auth_invalidation_to_callback(content.replace(old, new, 1))
+
+
+def renderer_account_read_wrapper(content: str) -> dict[str, object] | None:
+    """Return the one accepted local account-read wrapper and its call shape."""
+    prefix = (
+        r'(?P<prefix>(?P<wrapper>[A-Za-z_$][\w$]*)='
+        r'\((?P<parameters>[^()]*)\)=>\{)'
+    )
+    read = (
+        r'(?P<read>(?:(?P<direct_connection>[A-Za-z_$][\w$]*)\.getAccount\(\)|'
+        r'(?P<read_helper>[A-Za-z_$][\w$]*)'
+        r'\((?P<helper_connection>[A-Za-z_$][\w$]*)\)))'
+    )
+    raw_matches = list(re.finditer(prefix + read + r'(?=\.then\()', content))
+    wrapped_matches = list(
+        re.finditer(
+            prefix
+            + re.escape(AUTH_SINGLE_FLIGHT_HELPER)
+            + r'\((?P<flight_connection>[A-Za-z_$][\w$]*),\(\)=>'
+            + read
+            + r'\)(?=\.then\()',
+            content,
+        )
+    )
+    if len(raw_matches) + len(wrapped_matches) != 1:
+        return None
+
+    wrapped = bool(wrapped_matches)
+    match = wrapped_matches[0] if wrapped else raw_matches[0]
+    connection = match.group("direct_connection") or match.group("helper_connection")
+    if wrapped and match.group("flight_connection") != connection:
+        return None
+    return {
+        "match": match,
+        "wrapper": match.group("wrapper"),
+        "connection": connection,
+        "read": match.group("read"),
+        "read_helper": match.group("read_helper"),
+        "wrapped": wrapped,
+    }
+
+
+def ensure_auth_account_read_single_flight(content: str) -> str | None:
+    """Share one in-flight account read across every mounted auth subscriber."""
+    patched = upgrade_auth_invalidation_dedupe(content)
+    if patched is None:
+        print("ERROR: Cannot bind auth invalidation to one broadcast")
+        return None
+    marker_count = patched.count(AUTH_SINGLE_FLIGHT_PATCH_MARKER)
+    if marker_count == 0:
+        insert_pos = module_patch_insert_position(patched)
+        helper = auth_single_flight_module_patch()
+        patched = patched[:insert_pos] + helper + patched[insert_pos:]
+    elif marker_count != 1:
+        print(f"ERROR: Expected one auth single-flight marker, found {marker_count}")
+        return None
+
+    invalidator_prefix = auth_invalidator_prefix()
+    current_prefix = invalidator_prefix + f'{AUTH_SINGLE_FLIGHT_CACHE}=new WeakMap;'
+    if patched.count(current_prefix) != 1:
+        if patched.count(invalidator_prefix) != 1:
+            print("ERROR: Cannot bind the account-read flight to auth invalidation")
+            return None
+        patched = patched.replace(invalidator_prefix, current_prefix, 1)
+
+    weakmap_cache = find_weakmap_account_cache(patched)
+    if weakmap_cache:
+        weakmap_var = str(weakmap_cache["cache"])
+        cache_reset = weakmap_auth_cache_reset(weakmap_var)
+        if cache_reset not in patched:
+            if patched.count(current_prefix) != 1:
+                print("ERROR: Cannot bind the helper account cache to auth invalidation")
+                return None
+            patched = patched.replace(
+                current_prefix,
+                current_prefix + cache_reset + ";",
+                1,
+            )
+
+    wrapper = renderer_account_read_wrapper(patched)
+    if wrapper is None:
+        print("ERROR: Expected one accepted desktop account read wrapper")
+        return None
+    if not wrapper["wrapped"]:
+        match = wrapper["match"]
+        assert isinstance(match, re.Match)
+        read = str(wrapper["read"])
+        if (
+            weakmap_cache
+            and wrapper["read_helper"] == weakmap_cache["helper"]
+        ):
+            read = f'{wrapper["connection"]}.getAccount()'
+        replacement = (
+            f'{AUTH_SINGLE_FLIGHT_HELPER}({wrapper["connection"]},()=>'
+            f'{read})'
+        )
+        patched = patched[:match.start("read")] + replacement + patched[match.end("read"):]
+
+    wrapper = renderer_account_read_wrapper(patched)
+    if (
+        wrapper is None
+        or not wrapper["wrapped"]
+        or patched.count(AUTH_SINGLE_FLIGHT_PATCH_MARKER) != 1
+    ):
+        print("ERROR: Desktop account reads did not converge to module single-flight")
+        return None
+    return patched
 
 
 def apply_renderer_auth_transition_patch(content: str) -> str | None:
     """Make renderer auth commits ordered and require confirmed logout."""
     if current_auth_patch_present(content):
         return content
+    if current_auth_transition_patch_present(content):
+        patched = ensure_auth_account_read_single_flight(content)
+        if patched is None or not current_auth_patch_present(patched):
+            print("ERROR: Existing auth transition could not add account-read single-flight")
+            return None
+        return patched
 
     native_branch_re = re.compile(
         r'(?P<setter>[A-Za-z_$][\w$]*)\('
@@ -1686,19 +1968,12 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
 
     authoritative = native_setters[0] if native_setters else legacy_setters[0]
     logout = branch.group("logout") if native_matches else authoritative.group("logout")
-    wrapper_re = re.compile(
-        r'(?P<wrapper>[A-Za-z_$][\w$]*)=\(\)=>\{'
-        r'(?:(?P<connection>[A-Za-z_$][\w$]*)\.getAccount\(\)|'
-        r'[A-Za-z_$][\w$]*\((?P<helper_connection>[A-Za-z_$][\w$]*)\))'
-        r'\.then\('
-    )
-    wrappers = list(wrapper_re.finditer(content))
-    if len(wrappers) != 1:
-        print(f"ERROR: Expected one desktop account read wrapper, found {len(wrappers)}")
+    wrapper_info = renderer_account_read_wrapper(content)
+    if wrapper_info is None:
+        print("ERROR: Expected one desktop account read wrapper")
         return None
-    wrapper_match = wrappers[0]
-    wrapper = wrapper_match.group("wrapper")
-    connection = wrapper_match.group("connection") or wrapper_match.group("helper_connection")
+    wrapper = str(wrapper_info["wrapper"])
+    connection = str(wrapper_info["connection"])
 
     callback_head_re = re.compile(
         rf'let (?P<callback>[A-Za-z_$][\w$]*)={re.escape(event)}=>\{{'
@@ -1780,7 +2055,7 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
         f'{connection}.addAuthStatusCallback({callback})'
     )
     callback_tail_replacement = (
-        f'}}),{PATCH_MARKER}(),{event}.authMethod==null?('
+        f'}}),{PATCH_MARKER}({event}),{event}.authMethod==null?('
         '_csLogoutTimer!=null&&clearTimeout(_csLogoutTimer),'
         '_csLogoutTimer=setTimeout(()=>{_csLogoutTimer=null,'
         f'{wrapper}(_csEventEpoch,!0)}},{AUTH_TRANSITION_LOGOUT_DELAY_MS})):'
@@ -1809,7 +2084,8 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
         return None
     patched = patched.replace(cleanup, cleanup_replacement, 1)
 
-    if not current_auth_patch_present(patched):
+    patched = ensure_auth_account_read_single_flight(patched)
+    if patched is None or not current_auth_patch_present(patched):
         print("ERROR: Desktop auth transition patch did not converge")
         return None
     return patched
@@ -1865,7 +2141,11 @@ def upgrade_query_client_auth_patch(file_path: Path, content: str) -> bool:
 
     patched = (
         content[:match.start()]
-        + query_client_auth_module_patch(match.group("builder"), include_ref=False)
+        + query_client_auth_module_patch(
+            match.group("builder"),
+            include_ref=False,
+            weakmap_var=find_weakmap_account_cache_var(content),
+        )
         + content[match.end():]
     )
     patched = apply_renderer_auth_transition_patch(patched)
@@ -1905,7 +2185,11 @@ def apply_modern_use_auth_patch(file_path: Path) -> bool:
         print("ERROR: Cannot find end of import statements")
         return False
 
-    module_patch = query_client_auth_module_patch("_csQueryKey", include_ref=True)
+    module_patch = query_client_auth_module_patch(
+        "_csQueryKey",
+        include_ref=True,
+        weakmap_var=find_weakmap_account_cache_var(content),
+    )
     patched = (
         patched[:last_import_match.end()]
         + module_patch
@@ -1992,7 +2276,8 @@ def apply_weakmap_use_auth_patch(file_path: Path, content: str | None = None) ->
 
     insert_pos = module_patch_insert_position(patched)
     cache_patch = (
-        auth_invalidation_guard_patch()
+        auth_single_flight_module_patch()
+        + auth_invalidation_guard_patch()
         + weakmap_auth_invalidator_patch(weakmap_var)
         + auth_transition_module_patch()
     )
@@ -2046,19 +2331,22 @@ def apply_weakmap_use_auth_patch(file_path: Path, content: str | None = None) ->
 def apply_patch(file_path: Path) -> bool:
     """Apply the renderer auth-cache and transition patch.
 
-    Four modifications to the minified JS:
+    Five modifications to the minified JS:
 
     1. After the last import statement, insert module-level vars and the
        _invalidateAccountQueries() helper function.
 
-    2. In the function that calls useQueryClient() (function d), capture the
+    2. Route every accepted account-read wrapper through one module-level
+       in-flight promise per app-server connection.
+
+    3. In the function that calls useQueryClient() (function d), capture the
        QueryClient instance into _qcRef so our helper can use it.
 
-    3. In the auth status callback (the arrow function passed to
+    4. In the auth status callback (the arrow function passed to
        addAuthStatusCallback), insert a call to _invalidateAccountQueries()
        before the existing getAccount() call so caches are busted first.
 
-    4. Retain authenticated state across a transient null auth notification,
+    5. Retain authenticated state across a transient null auth notification,
        accept only the newest account-read generation, and require a delayed
        current-generation confirmation before committing logout.
     """
@@ -2151,7 +2439,11 @@ def apply_patch(file_path: Path) -> bool:
 
     module_patch = (
         f'var _qcHook={uqc_alias},_qkBuild={qk_alias};'
-        + query_client_auth_module_patch("_qkBuild", include_ref=True)
+        + query_client_auth_module_patch(
+            "_qkBuild",
+            include_ref=True,
+            weakmap_var=find_weakmap_account_cache_var(content),
+        )
     )
     patched = patched[:insert_pos] + module_patch + patched[insert_pos:]
 
@@ -3021,17 +3313,22 @@ def apply_recent_threads_state_db_patch(file_path: Path) -> bool:
     if located is None:
         print(f"ERROR: Could not isolate indexed recent-thread method in {file_path.name}")
         return False
-    match, body_end = located
+    match, body_end, state_var = located
     body = content[match.end():body_end]
-    state_var = match.group("state")
-    state_field_re = re.compile(
-        rf"\buseStateDbOnly:{re.escape(state_var)}(?=[,}}])"
-    )
-    if len(state_field_re.findall(body)) != 1:
-        print(f"ERROR: Could not isolate recent-thread state-db request in {file_path.name}")
-        return False
+    if state_var is None:
+        if body.count("useStateDbOnly:!0") != 1:
+            print(f"ERROR: Native recent-thread state-db request changed in {file_path.name}")
+            return False
+        patched_body = body
+    else:
+        state_field_re = re.compile(
+            rf"\buseStateDbOnly:{re.escape(state_var)}(?=[,}}])"
+        )
+        if len(state_field_re.findall(body)) != 1:
+            print(f"ERROR: Could not isolate recent-thread state-db request in {file_path.name}")
+            return False
+        patched_body = state_field_re.sub("useStateDbOnly:!0", body, count=1)
 
-    patched_body = state_field_re.sub("useStateDbOnly:!0", body, count=1)
     patched_body = f'"{RECENT_THREADS_STATE_DB_MARKER}";' + patched_body
     patched = content[:match.end()] + patched_body + content[body_end:]
     if not has_recent_threads_state_db_patch(patched):
@@ -3054,7 +3351,8 @@ def apply_statsig_fail_open_patch(file_path: Path) -> bool:
         re.finditer(
             r"new\s+(?P<sdk>[A-Za-z_$][\w$]*)\.StatsigClient\("
             r"(?P<key>[A-Za-z_$][\w$]*),[A-Za-z_$][\w$]*\.user,"
-            r"(?P<config>[A-Za-z_$][\w$]*)\)",
+            r"(?P<config>[A-Za-z_$][\w$]*"
+            r"(?:===![01]\?[A-Za-z_$][\w$]*:[A-Za-z_$][\w$]*)?)\)",
             content,
         )
     )
@@ -3119,7 +3417,7 @@ def apply_statsig_fail_open_patch(file_path: Path) -> bool:
         "t=`${e.statsigClientKey}:${r}`,"
         "n=_codexSwitchStatsigFailOpenClients.get(t);"
         "if(n==null)try{"
-        f"n=new {sdk}.StatsigClient(e.statsigClientKey,{{userID:r}},{config}),"
+        f"n=new {sdk}.StatsigClient(e.statsigClientKey,{{userID:r}},e.networkConfig),"
         "n.initializeSync(),_codexSwitchStatsigFailOpenClients.set(t,n)"
         "}catch(t){return e.children}"
         f"return (0,{jsx}.jsx)({provider},{{appVersion:e.appVersion,"
@@ -3129,7 +3427,11 @@ def apply_statsig_fail_open_patch(file_path: Path) -> bool:
     replacement = (
         fallback_match.group("prefix")
         + "_codexSwitchStatsigFailOpen"
-        + fallback_match.group("suffix")
+        + fallback_match.group("suffix").replace(
+            "children:[",
+            f"networkConfig:{config},children:[",
+            1,
+        )
     )
     patched = (
         content[:component_start]
@@ -3207,6 +3509,44 @@ def apply_selected_model_label_fallback_patch(file_path: Path) -> bool:
         if "composer.mode.local.model.custom"
         in content[match.start() : match.end() + 500]
     ]
+    if not matches and MODEL_LABEL_FALLBACK_MARKER in content:
+        native_option_re = re.compile(
+            r"\.map\((?P<effort>[A-Za-z_$][\w$]*)=>\(\{"
+            r"id:`\$\{(?P<model>[A-Za-z_$][\w$]*)\}:"
+            r"\$\{(?P=effort)\}`,model:(?P=model),"
+            r"(?P<label_field>modelLabel:(?P<label>[A-Za-z_$][\w$]*)),"
+            r"reasoningEffort:(?P=effort)\}\)\)"
+        )
+        native_matches = [
+            match
+            for match in native_option_re.finditer(content)
+            if MODEL_LABEL_FALLBACK_MARKER
+            in content[max(0, match.start() - 500) : match.end()]
+        ]
+        selected_consumers = list(re.finditer(
+            r"model:(?P<option>[A-Za-z_$][\w$]*)\.model,"
+            r"displayName:(?P=option)\.modelLabel",
+            content,
+        ))
+        if len(native_matches) == 1 and selected_consumers:
+            native_match = native_matches[0]
+            label_field_start, label_field_end = native_match.span("label_field")
+            patched = (
+                content[:label_field_start]
+                + f"/*{SELECTED_MODEL_LABEL_FALLBACK_MARKER}*/"
+                + content[label_field_start:label_field_end]
+                + content[label_field_end:]
+            )
+            if patched.count(SELECTED_MODEL_LABEL_FALLBACK_MARKER) != 1:
+                print(
+                    f"ERROR: Native selected model label verification failed in "
+                    f"{file_path.name}"
+                )
+                return False
+            file_path.write_text(patched)
+            print(f"  Marked native selected model label path: {file_path.name}")
+            return True
+
     if len(matches) != 1:
         print(
             f"ERROR: Expected one selected model label branch in {file_path.name}, "

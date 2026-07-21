@@ -31,6 +31,55 @@ struct AccountCardViewTests {
         )
     }
 
+    private func makeResetBank(now: Date) -> RateLimitResetBank {
+        RateLimitResetBank(
+            availableCount: 1,
+            totalEarnedCount: 1,
+            credits: [
+                RateLimitResetCredit(
+                    id: "credit-1",
+                    resetType: "weekly",
+                    status: "available",
+                    grantedAt: now.addingTimeInterval(-3_600),
+                    expiresAt: now.addingTimeInterval(2 * 86_400),
+                    redeemedAt: nil,
+                    title: nil,
+                    description: nil
+                ),
+            ],
+            fetchedAt: now
+        )
+    }
+
+    private func makeRedeemableAccount(now: Date) -> CodexAccount {
+        CodexAccount(
+            email: "blocked-pro@example.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "blocked-pro",
+            quotaSnapshot: QuotaSnapshot(
+                allowed: true,
+                limitReached: false,
+                fetchedAt: now,
+                windows: [
+                    QuotaWindow(
+                        kind: .weekly,
+                        durationSeconds: 604_800,
+                        usedPercent: 100,
+                        resetsAt: now.addingTimeInterval(86_400),
+                        source: QuotaWindowSourceMetadata(
+                            rateLimit: .main,
+                            slot: .primary
+                        )
+                    ),
+                ]
+            ),
+            planType: "pro",
+            rateLimitResetBank: makeResetBank(now: now)
+        )
+    }
+
     @Test("Primary click triggers a manual swap for inactive accounts")
     @MainActor
     func primaryClickTriggersSwap() {
@@ -143,5 +192,97 @@ struct AccountCardViewTests {
             onReauthenticate: {},
             onForceSwap: {}
         ).primaryActionAccessibilityHint == "Reauthenticate this account")
+    }
+
+    @Test("Confirmed redemption invokes the account callback only for current eligible inventory")
+    @MainActor
+    func confirmedRedemptionRequiresVisibleEligibility() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let account = makeRedeemableAccount(now: now)
+        var didRedeem = false
+        let eligibleView = AccountCardView(
+            account: account,
+            rateLimitResetPresentation: .current(
+                availableCount: 1,
+                nextExpiration: now.addingTimeInterval(2 * 86_400)
+            ),
+            onRedeemReset: {
+                didRedeem = true
+            },
+            onReauthenticate: nil,
+            onForceSwap: nil
+        )
+
+        #expect(eligibleView.resetRedemptionActionPresentation(at: now).isEnabled)
+        #expect(eligibleView.handleConfirmedResetRedemption(at: now))
+        #expect(didRedeem)
+
+        didRedeem = false
+        let errorView = AccountCardView(
+            account: account,
+            rateLimitResetPresentation: .error(
+                message: "Inventory request failed",
+                lastKnownCount: 1
+            ),
+            onRedeemReset: {
+                didRedeem = true
+            },
+            onReauthenticate: nil,
+            onForceSwap: nil
+        )
+
+        let errorAction = errorView.resetRedemptionActionPresentation(at: now)
+        #expect(!errorAction.isEnabled)
+        #expect(errorAction.helpText == "Reset inventory error: Inventory request failed")
+        #expect(!errorView.handleConfirmedResetRedemption(at: now))
+        #expect(!didRedeem)
+
+        let coordinatorBlockedView = AccountCardView(
+            account: account,
+            rateLimitResetPresentation: .current(
+                availableCount: 1,
+                nextExpiration: now.addingTimeInterval(2 * 86_400)
+            ),
+            rateLimitResetCoordinatorAuthorization: .blocked(
+                "Another reset redemption is already in progress"
+            ),
+            onRedeemReset: {
+                didRedeem = true
+            },
+            onReauthenticate: nil,
+            onForceSwap: nil
+        )
+        let blockedAction = coordinatorBlockedView.resetRedemptionActionPresentation(at: now)
+        #expect(!blockedAction.isEnabled)
+        #expect(blockedAction.helpText == "Another reset redemption is already in progress")
+        #expect(!coordinatorBlockedView.handleConfirmedResetRedemption(at: now))
+        #expect(!didRedeem)
+    }
+
+    @Test("Redemption tooltip uses the policy's unavailable reason")
+    @MainActor
+    func redemptionTooltipUsesPolicyReason() {
+        var usableAccount = makeAccount(isActive: false)
+        let now = Date().addingTimeInterval(1)
+        usableAccount.rateLimitResetBank = makeResetBank(now: now)
+        let view = AccountCardView(
+            account: usableAccount,
+            rateLimitResetPresentation: .current(
+                availableCount: 1,
+                nextExpiration: now.addingTimeInterval(2 * 86_400)
+            ),
+            onRedeemReset: {},
+            onReauthenticate: nil,
+            onForceSwap: nil
+        )
+
+        let action = view.resetRedemptionActionPresentation(at: now)
+        #expect(!action.isEnabled)
+        #expect(action.helpText == RateLimitResetPolicy.manualRedemptionUnavailableReason(
+            for: usableAccount,
+            bank: usableAccount.rateLimitResetBank,
+            now: now
+        ))
+        #expect(action.helpText == "This account still has usable quota")
     }
 }

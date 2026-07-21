@@ -3,12 +3,12 @@ use crate::account_store::{
     AccountStoreSnapshot, CodexAccount,
 };
 use crate::auth::{
-    account_token_fingerprint, auth_file_generation, auth_file_matches_account,
-    auth_file_matches_snapshot, capture_auth_file, commit_auth_file, restore_auth_file_if_owned,
-    AuthFileCommit, AuthFileSnapshot,
+    account_token_fingerprint, auth_file_fingerprint, auth_file_generation,
+    auth_file_matches_account, auth_file_matches_snapshot, capture_auth_file, commit_auth_file,
+    restore_auth_file_if_owned, AuthFileCommit, AuthFileSnapshot,
 };
-use crate::reload::ReloadSummary;
-use crate::secure_file::SecureFileGeneration;
+use crate::reload::{ActivationReloadBinding, ReloadSummary};
+use crate::secure_file::{self, SecureFileGeneration};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -65,8 +65,16 @@ pub struct ActivationRecord {
 }
 
 const ACTIVATION_RECORD_VERSION: u32 = 3;
+const ACTIVATION_RECORD_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const LEGACY_DEGRADED_TOKEN_MISMATCH: &str =
     "degraded activation no longer matches the intended store/auth token set; manual review is required";
+
+fn complete_account_token_fingerprint(account: &CodexAccount) -> Option<String> {
+    account
+        .has_complete_token_material()
+        .then(|| account_token_fingerprint(account))
+        .flatten()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,7 +92,9 @@ pub struct ActivationOutcome {
 
 impl ActivationOutcome {
     pub fn is_confirmed(&self) -> bool {
-        self.state == ActivationState::Confirmed && self.reload.verified_hot_swap()
+        self.state == ActivationState::Confirmed
+            && self.reload.verified_hot_swap()
+            && self.reload.has_bound_activation_proof()
     }
 
     pub fn is_file_only(&self) -> bool {
@@ -109,6 +119,83 @@ pub struct ActivationBarrierContext<'a> {
     pub reload_enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivationJournalIdentity {
+    generation: SecureFileGeneration,
+    file_identity: Option<(u64, u64)>,
+    modified_unix: Option<(i64, u32)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderIoActivationGuard {
+    store_generation: AccountStoreGeneration,
+    journal: ActivationJournalIdentity,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderIoActivationSnapshot {
+    pub accounts: Vec<CodexAccount>,
+    pub generation: AccountStoreGeneration,
+    pub guard: ProviderIoActivationGuard,
+}
+
+#[derive(Debug)]
+struct ObservedActivationRecord {
+    record: Option<ActivationRecord>,
+    identity: ActivationJournalIdentity,
+}
+
+#[derive(Debug, Clone)]
+enum ObservedReload {
+    Success(ReloadSummary),
+    Failure {
+        summary: ReloadSummary,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingActivationIdentity {
+    target_account_id: String,
+    state: ActivationState,
+    kind: ActivationKind,
+    journal_auth_fingerprint: Option<String>,
+    binding: ActivationReloadBinding,
+}
+
+impl ObservedReload {
+    fn capture_with_topology<R, T>(
+        auth_path: &Path,
+        expected: &ActivationReloadBinding,
+        reload: &R,
+        revalidate_topology: T,
+    ) -> Self
+    where
+        R: Fn(&Path) -> Result<ReloadSummary>,
+        T: Fn(&ReloadSummary, &Path) -> Result<()>,
+    {
+        let mut summary = match reload(auth_path) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return Self::Failure {
+                    summary: ReloadSummary::default(),
+                    error: format!("{error:#}"),
+                };
+            }
+        };
+        if let Err(error) = summary
+            .bind_activation(expected)
+            .and_then(|()| revalidate_topology(&summary, auth_path))
+        {
+            return Self::Failure {
+                summary,
+                error: format!("{error:#}"),
+            };
+        }
+        Self::Success(summary)
+    }
+}
+
 pub fn reconcile_activation_barrier<R>(
     context: ActivationBarrierContext<'_>,
     mut reload: R,
@@ -118,6 +205,404 @@ where
 {
     reconcile_activation_barrier_with(context, &mut reload)
         .map(|resolution| resolution.map(|(_, outcome)| outcome))
+}
+
+fn activation_reload_binding(
+    generation: &AccountStoreGeneration,
+    auth_path: &Path,
+    expected_fingerprint: &str,
+) -> Result<ActivationReloadBinding> {
+    let auth_generation = auth_file_generation(auth_path)
+        .context("activation auth secure-file generation is unavailable")?;
+    let auth_fingerprint = auth_file_fingerprint(auth_path)
+        .context("activation auth file has incomplete token material")?;
+    let stable_auth_generation = auth_file_generation(auth_path)
+        .context("activation auth secure-file generation disappeared during observation")?;
+    if stable_auth_generation != auth_generation {
+        bail!("activation auth file changed during generation/fingerprint observation");
+    }
+    if auth_fingerprint != expected_fingerprint {
+        bail!("activation auth fingerprint changed before runtime reload");
+    }
+    Ok(ActivationReloadBinding {
+        store_generation: generation.as_str().to_string(),
+        auth_generation,
+        complete_token_fingerprint: auth_fingerprint,
+    })
+}
+
+fn pending_activation_identity(
+    store_lock: &AccountStoreLock,
+    auth_path: &Path,
+    allowed_states: &[ActivationState],
+) -> Result<PendingActivationIdentity> {
+    let record = read_activation_record(store_lock)?
+        .context("activation record disappeared while preparing runtime convergence")?;
+    if !allowed_states.contains(&record.state) {
+        bail!("activation record is not in the expected convergence state");
+    }
+    if record.version != ACTIVATION_RECORD_VERSION || record.kind == ActivationKind::Unknown {
+        bail!("activation record lacks a current version and explicit activation kind");
+    }
+    let snapshot = store_lock.load()?;
+    if record.store_generation != snapshot.generation.as_str() {
+        bail!("activation journal/store generation diverged before runtime reload");
+    }
+    let active = active_account(&snapshot.accounts)
+        .context("activation convergence requires exactly one active account")?;
+    if active.account_id != record.target_account_id {
+        bail!("activation journal target is not the active store account");
+    }
+    let active_fingerprint = complete_account_token_fingerprint(active)
+        .context("active store account has incomplete token material")?;
+    if record.state != ActivationState::ManualReview
+        && record.auth_fingerprint.as_deref() != Some(active_fingerprint.as_str())
+    {
+        bail!("activation journal fingerprint does not match the active store account");
+    }
+    let binding = activation_reload_binding(&snapshot.generation, auth_path, &active_fingerprint)?;
+    Ok(PendingActivationIdentity {
+        target_account_id: record.target_account_id,
+        state: record.state,
+        kind: record.kind,
+        journal_auth_fingerprint: record.auth_fingerprint,
+        binding,
+    })
+}
+
+fn ensure_pending_activation_unchanged(
+    store_lock: &AccountStoreLock,
+    auth_path: &Path,
+    expected: &PendingActivationIdentity,
+) -> Result<()> {
+    let current = pending_activation_identity(store_lock, auth_path, &[expected.state])?;
+    if &current != expected {
+        bail!(
+            "activation generation or store/auth identity changed while runtime reload was in flight; preserving the newer state"
+        );
+    }
+    Ok(())
+}
+
+fn finalize_pending_activation(
+    store_lock: &AccountStoreLock,
+    auth_path: &Path,
+    expected: &PendingActivationIdentity,
+    observed: ObservedReload,
+    confirmed_detail: Option<String>,
+) -> Result<(ActivationOutcome, AccountStoreSnapshot)> {
+    ensure_pending_activation_unchanged(store_lock, auth_path, expected)?;
+    let snapshot = store_lock.load()?;
+    let mut record = read_activation_record(store_lock)?
+        .context("activation record disappeared before final confirmation CAS")?;
+
+    let (state, summary, detail) = match observed {
+        ObservedReload::Success(summary) => {
+            if !summary.proves_activation(&expected.binding) {
+                bail!("runtime evidence lost its exact activation binding before publication");
+            }
+            (ActivationState::Confirmed, summary, confirmed_detail)
+        }
+        ObservedReload::Failure { summary, error } => (
+            ActivationState::CommittedDegraded,
+            summary,
+            Some(format!(
+                "runtime convergence failed before final activation confirmation: {error}"
+            )),
+        ),
+    };
+
+    record.state = state;
+    record.store_generation = expected.binding.store_generation.clone();
+    record.auth_fingerprint = Some(expected.binding.complete_token_fingerprint.clone());
+    record.detail = detail.clone();
+    if state == ActivationState::Confirmed {
+        record.base_store_generation = None;
+        record.owned_store_generation = None;
+        record.base_auth_generation = None;
+        record.owned_auth_generation = None;
+        record.rollback = None;
+    }
+    record.updated_at = Utc::now();
+    write_activation_record(store_lock, &record)?;
+    Ok((
+        ActivationOutcome {
+            state,
+            reload: summary,
+            detail,
+        },
+        snapshot,
+    ))
+}
+
+fn converge_pending_activation_unlocked_with<R, T>(
+    store_path: &Path,
+    auth_path: &Path,
+    expected: PendingActivationIdentity,
+    reload: &R,
+    revalidate_topology: T,
+    confirmed_detail: Option<String>,
+) -> Result<(ActivationOutcome, AccountStoreSnapshot)>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+    T: Fn(&ReloadSummary, &Path) -> Result<()>,
+{
+    let observed = ObservedReload::capture_with_topology(
+        auth_path,
+        &expected.binding,
+        reload,
+        revalidate_topology,
+    );
+    let store_lock = crate::account_store::lock_account_store(store_path)?;
+    finalize_pending_activation(
+        &store_lock,
+        auth_path,
+        &expected,
+        observed,
+        confirmed_detail,
+    )
+}
+
+pub(crate) fn reconcile_activation_barrier_unlocked<R>(
+    store_path: &Path,
+    auth_path: &Path,
+    reload_enabled: bool,
+    reload: &R,
+) -> Result<Option<ActivationOutcome>>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    reconcile_activation_barrier_unlocked_with_topology(
+        store_path,
+        auth_path,
+        reload_enabled,
+        reload,
+        |summary, path| summary.revalidate_current_topology(path),
+    )
+}
+
+fn reconcile_activation_barrier_unlocked_with_topology<R, T>(
+    store_path: &Path,
+    auth_path: &Path,
+    reload_enabled: bool,
+    reload: &R,
+    revalidate_topology: T,
+) -> Result<Option<ActivationOutcome>>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+    T: Fn(&ReloadSummary, &Path) -> Result<()>,
+{
+    let prepared = {
+        let store_lock = crate::account_store::lock_account_store(store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let outcome = reconcile_activation_barrier(
+            ActivationBarrierContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path,
+                reload_enabled: false,
+            },
+            |_| bail!("runtime reload was requested during locked activation preparation"),
+        )?;
+        match outcome {
+            Some(outcome) => Some((
+                outcome,
+                pending_activation_identity(
+                    &store_lock,
+                    auth_path,
+                    &[
+                        ActivationState::FileOnly,
+                        ActivationState::CommittedDegraded,
+                    ],
+                )?,
+            )),
+            None => None,
+        }
+    };
+    let Some((prepared, expected_identity)) = prepared else {
+        return Ok(None);
+    };
+    if prepared.is_confirmed() || !reload_enabled {
+        return Ok(Some(prepared));
+    }
+
+    converge_pending_activation_unlocked_with(
+        store_path,
+        auth_path,
+        expected_identity,
+        reload,
+        revalidate_topology,
+        None,
+    )
+    .map(|(outcome, _)| Some(outcome))
+}
+
+pub(crate) fn activate_with_unlocked_reload<R>(
+    store_path: &Path,
+    auth_path: &Path,
+    generation: &mut AccountStoreGeneration,
+    accounts: &mut [CodexAccount],
+    target_id: Uuid,
+    reload_enabled: bool,
+    reload: &R,
+) -> Result<ActivationOutcome>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    activate_with_unlocked_reload_with_topology(
+        store_path,
+        auth_path,
+        generation,
+        accounts,
+        target_id,
+        reload_enabled,
+        reload,
+        |summary, path| summary.revalidate_current_topology(path),
+    )
+}
+
+fn activate_with_unlocked_reload_with_topology<R, T>(
+    store_path: &Path,
+    auth_path: &Path,
+    generation: &mut AccountStoreGeneration,
+    accounts: &mut [CodexAccount],
+    target_id: Uuid,
+    reload_enabled: bool,
+    reload: &R,
+    revalidate_topology: T,
+) -> Result<ActivationOutcome>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+    T: Fn(&ReloadSummary, &Path) -> Result<()>,
+{
+    let (prepared, expected_identity) = {
+        let store_lock = crate::account_store::lock_account_store(store_path)?;
+        let current = store_lock.load()?;
+        if current.generation != *generation {
+            bail!("account store changed before activation commit; retry from a fresh snapshot");
+        }
+        let outcome = activate_with(
+            ActivationContext {
+                store_lock: &store_lock,
+                generation,
+                accounts,
+                auth_path,
+                target_id,
+                reload_enabled: false,
+            },
+            |_| bail!("runtime reload was requested during locked activation preparation"),
+        )?;
+        let identity = matches!(
+            outcome.state,
+            ActivationState::FileOnly | ActivationState::CommittedDegraded
+        )
+        .then(|| {
+            pending_activation_identity(
+                &store_lock,
+                auth_path,
+                &[
+                    ActivationState::FileOnly,
+                    ActivationState::CommittedDegraded,
+                ],
+            )
+        })
+        .transpose()?;
+        (outcome, identity)
+    };
+    if !reload_enabled
+        || !matches!(
+            prepared.state,
+            ActivationState::FileOnly | ActivationState::CommittedDegraded
+        )
+    {
+        return Ok(prepared);
+    }
+    let expected_identity = expected_identity
+        .context("activation record disappeared while preparing unlocked runtime convergence")?;
+    let (outcome, snapshot) = converge_pending_activation_unlocked_with(
+        store_path,
+        auth_path,
+        expected_identity,
+        reload,
+        revalidate_topology,
+        None,
+    )?;
+    if snapshot.accounts.len() != accounts.len() {
+        bail!(
+            "account set changed while runtime reload was in flight; retry from a fresh snapshot"
+        );
+    }
+    *generation = snapshot.generation;
+    accounts.clone_from_slice(&snapshot.accounts);
+    Ok(outcome)
+}
+
+pub(crate) fn resolve_manual_review_activation_unlocked<R>(
+    store_path: &Path,
+    auth_path: &Path,
+    reload: &R,
+) -> Result<ActivationOutcome>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    resolve_manual_review_activation_unlocked_with_topology(
+        store_path,
+        auth_path,
+        reload,
+        |summary, path| summary.revalidate_current_topology(path),
+    )
+}
+
+fn resolve_manual_review_activation_unlocked_with_topology<R, T>(
+    store_path: &Path,
+    auth_path: &Path,
+    reload: &R,
+    revalidate_topology: T,
+) -> Result<ActivationOutcome>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+    T: Fn(&ReloadSummary, &Path) -> Result<()>,
+{
+    let expected = {
+        let store_lock = crate::account_store::lock_account_store(store_path)?;
+        let record = read_activation_record(&store_lock)?
+            .context("manual-review resolution requires an activation record")?;
+        if record.state != ActivationState::ManualReview {
+            bail!("activation record is {:?}, not manual_review", record.state);
+        }
+        if record.version != ACTIVATION_RECORD_VERSION {
+            bail!(
+                "manual-review resolution requires activation record version {}",
+                ACTIVATION_RECORD_VERSION
+            );
+        }
+        if record.kind == ActivationKind::Unknown {
+            bail!("manual-review resolution requires an explicit activation kind");
+        }
+        pending_activation_identity(&store_lock, auth_path, &[ActivationState::ManualReview])?
+    };
+
+    let observed = ObservedReload::capture_with_topology(
+        auth_path,
+        &expected.binding,
+        reload,
+        revalidate_topology,
+    );
+    let acknowledgement_count = match &observed {
+        ObservedReload::Success(summary) => summary.signaled.len(),
+        ObservedReload::Failure { error, .. } => {
+            bail!("manual-review runtime convergence failed: {error}")
+        }
+    };
+    let detail = format!(
+        "operator resolved manual review after {acknowledgement_count} verified runtime ACK(s)"
+    );
+    let store_lock = crate::account_store::lock_account_store(store_path)?;
+    finalize_pending_activation(&store_lock, auth_path, &expected, observed, Some(detail))
+        .map(|(outcome, _)| outcome)
 }
 
 pub fn resolve_manual_review_activation<R>(
@@ -160,21 +645,18 @@ where
     if active_accounts.next().is_some() {
         bail!("manual-review resolution requires exactly one active account");
     }
-    let active_fingerprint = account_token_fingerprint(active)
+    let active_fingerprint = complete_account_token_fingerprint(active)
         .context("manual-review resolution requires a complete active token set")?;
 
     verify_committed_activation(store_lock, generation, auth_path, active.id, active)
         .context("manual-review resolution refused divergent store/auth state")?;
-    let summary = reload(auth_path).context("manual-review runtime reload failed")?;
-    if !runtime_convergence_proven(&summary) {
-        bail!(
-            "manual-review runtime convergence was not proven: {} verified ACK(s), {} target(s) skipped",
-            summary.signaled.len(),
-            summary.skipped.len()
-        );
-    }
-    verify_committed_activation(store_lock, generation, auth_path, active.id, active)
-        .context("manual-review final store/auth proof changed after runtime acknowledgement")?;
+    let expected = activation_reload_binding(generation, auth_path, &active_fingerprint)?;
+    let summary = capture_activation_reload(&mut reload, auth_path, &expected)
+        .context("manual-review runtime reload failed")?;
+    verify_runtime_confirmation(
+        &summary, &expected, store_lock, generation, auth_path, active.id, active,
+    )
+    .context("manual-review runtime convergence was not proven")?;
 
     let detail = format!(
         "operator resolved manual review after {} verified runtime ACK(s)",
@@ -245,7 +727,7 @@ where
         .find(|account| account.id == target_id)
         .context("activation target disappeared")?
         .clone();
-    let target_fingerprint = account_token_fingerprint(&target)
+    let target_fingerprint = complete_account_token_fingerprint(&target)
         .context("activation target has incomplete token material")?;
     let previous_auth = capture_auth_file(auth_path)?;
     let base_snapshot = store_lock.load()?;
@@ -434,35 +916,29 @@ where
         });
     }
 
-    let (state, summary, detail) = match reload(auth_path) {
-        Ok(summary) if runtime_convergence_proven(&summary) => {
-            match verify_committed_activation(store_lock, generation, auth_path, target_id, &target)
-            {
+    let expected = activation_reload_binding(generation, auth_path, &target_fingerprint)?;
+    let (state, summary, detail) =
+        match capture_activation_reload(&mut reload, auth_path, &expected) {
+            Ok(summary) => match verify_runtime_confirmation(
+                &summary, &expected, store_lock, generation, auth_path, target_id, &target,
+            ) {
                 Ok(()) => (ActivationState::Confirmed, summary, None),
                 Err(error) => (
                     ActivationState::CommittedDegraded,
                     summary,
                     Some(format!(
-                        "runtime acknowledged reload but final store/auth proof changed: {error:#}"
+                        "runtime acknowledgement did not survive final activation proof: {error:#}"
                     )),
                 ),
-            }
-        }
-        Ok(summary) => {
-            let detail = format!(
-                "auth and account store committed; runtime convergence is unconfirmed ({} verified ACK(s), {} target(s) skipped)",
-                summary.signaled.len(), summary.skipped.len()
-            );
-            (ActivationState::CommittedDegraded, summary, Some(detail))
-        }
-        Err(error) => (
-            ActivationState::CommittedDegraded,
-            ReloadSummary::default(),
-            Some(format!(
-                "auth and account store committed; runtime reload failed: {error:#}"
-            )),
-        ),
-    };
+            },
+            Err(error) => (
+                ActivationState::CommittedDegraded,
+                ReloadSummary::default(),
+                Some(format!(
+                    "auth and account store committed; runtime reload failed: {error:#}"
+                )),
+            ),
+        };
     write_activation_record(
         store_lock,
         &activation_record(
@@ -545,10 +1021,19 @@ where
         *current_accounts = refreshed.accounts;
     }
 
+    if let Some(incomplete) = replacement_accounts
+        .iter()
+        .find(|account| !account.has_complete_token_material())
+    {
+        bail!(
+            "import account {} has incomplete token material after trimming",
+            incomplete.email
+        );
+    }
     let target = active_account(&replacement_accounts)
         .context("import replacement must contain exactly one active account")?
         .clone();
-    let target_fingerprint = account_token_fingerprint(&target)
+    let target_fingerprint = complete_account_token_fingerprint(&target)
         .context("import target has incomplete token material")?;
     let base_snapshot = store_lock.load()?;
     if &base_snapshot.generation != generation {
@@ -719,13 +1204,13 @@ where
         });
     }
 
-    match reload(auth_path) {
+    let expected = activation_reload_binding(generation, auth_path, &target_fingerprint)?;
+    match capture_activation_reload(&mut reload, auth_path, &expected) {
         Ok(summary)
-            if summary.verified_hot_swap()
-                && verify_committed_activation(
-                    store_lock, generation, auth_path, target.id, &target,
-                )
-                .is_ok() =>
+            if verify_runtime_confirmation(
+                &summary, &expected, store_lock, generation, auth_path, target.id, &target,
+            )
+            .is_ok() =>
         {
             *current_accounts = replacement_accounts;
             write_activation_record(
@@ -844,7 +1329,7 @@ where
         .zip(current_auth_generation.as_ref())
         .is_some_and(|(owned, current)| owned == current);
     let auth_previous = auth_file_matches_snapshot(auth_path, &rollback.auth);
-    let target_fingerprint = account_token_fingerprint(target)
+    let target_fingerprint = complete_account_token_fingerprint(target)
         .context("import target fingerprint disappeared during rollback")?;
     if !store_owned || (!auth_owned && !auth_previous) {
         let detail = format!(
@@ -998,6 +1483,24 @@ where
     let mut record = reconcile_legacy_token_refresh_manual_review(
         store_lock, generation, accounts, auth_path, record,
     )?;
+    if record.state == ActivationState::Confirmed {
+        record =
+            reconcile_confirmed_generation_transition(store_lock, generation, auth_path, record)?;
+        let active = active_account(accounts)
+            .context("Confirmed activation reconciliation requires one active account")?;
+        let auth_fingerprint = auth_file_fingerprint(auth_path);
+        if !activation_record_confirms_current(
+            &record,
+            active,
+            generation,
+            auth_fingerprint.as_deref(),
+        ) {
+            bail!(
+                "durable Confirmed activation is stale or does not match current store/auth state"
+            );
+        }
+        return Ok(None);
+    }
     if record.state == ActivationState::ManualReview {
         bail!(
             "automatic activation is blocked by a durable manual-review record; explicit resolution is required"
@@ -1023,7 +1526,7 @@ where
         write_activation_record(store_lock, &record)?;
         bail!(detail);
     };
-    let durable_fingerprint = account_token_fingerprint(&durable_target)
+    let durable_fingerprint = complete_account_token_fingerprint(&durable_target)
         .context("durable activation target has incomplete token material")?;
     let durable_target_id = durable_target.id;
     let outcome = resume_committed_degraded(
@@ -1040,6 +1543,59 @@ where
         reload,
     )?;
     Ok(Some((durable_target_id, outcome)))
+}
+
+fn reconcile_confirmed_generation_transition(
+    store_lock: &AccountStoreLock,
+    generation: &AccountStoreGeneration,
+    auth_path: &Path,
+    mut record: ActivationRecord,
+) -> Result<ActivationRecord> {
+    let current = store_lock.load()?;
+    if &current.generation != generation {
+        bail!("Confirmed activation reconciliation received a stale store generation");
+    }
+    let (base_generation, owned_generation) = match (
+        record.base_store_generation.as_deref(),
+        record.owned_store_generation.as_deref(),
+    ) {
+        (None, None) => return Ok(record),
+        (Some(base), Some(owned)) => (base.to_string(), owned.to_string()),
+        _ => bail!("Confirmed activation has an incomplete generation transition"),
+    };
+    if record.version != ACTIVATION_RECORD_VERSION
+        || record.kind == ActivationKind::Unknown
+        || record.store_generation.as_str() != base_generation.as_str()
+        || base_generation.as_str() == owned_generation.as_str()
+        || record.base_auth_generation.is_some()
+        || record.owned_auth_generation.is_some()
+        || record.rollback.is_some()
+    {
+        bail!("Confirmed activation generation transition is not structurally valid");
+    }
+    let active = active_account(&current.accounts)
+        .context("Confirmed generation transition requires one active account")?;
+    let active_fingerprint = complete_account_token_fingerprint(active)
+        .context("Confirmed generation transition requires complete active token material")?;
+    if record.target_account_id != active.account_id
+        || record.auth_fingerprint.as_deref() != Some(active_fingerprint.as_str())
+        || auth_file_fingerprint(auth_path).as_deref() != Some(active_fingerprint.as_str())
+    {
+        bail!("Confirmed generation transition does not match current store/auth identity");
+    }
+
+    match generation.as_str() {
+        current if current == base_generation.as_str() => {}
+        current if current == owned_generation.as_str() => {
+            record.store_generation = owned_generation;
+        }
+        _ => bail!("Confirmed generation transition does not own the current store generation"),
+    }
+    record.base_store_generation = None;
+    record.owned_store_generation = None;
+    write_activation_record(store_lock, &record)
+        .context("failed to finalize durable Confirmed generation transition")?;
+    Ok(record)
 }
 
 fn reconcile_legacy_token_refresh_manual_review(
@@ -1063,7 +1619,7 @@ fn reconcile_legacy_token_refresh_manual_review(
     if !auth_file_matches_account(auth_path, active) {
         return Ok(record);
     }
-    let Some(current_fingerprint) = account_token_fingerprint(active) else {
+    let Some(current_fingerprint) = complete_account_token_fingerprint(active) else {
         return Ok(record);
     };
 
@@ -1132,28 +1688,26 @@ where
         });
     }
 
-    let (state, summary, detail) = match reload(auth_path) {
-        Ok(summary) if runtime_convergence_proven(&summary) => {
-            match verify_committed_activation(store_lock, generation, auth_path, target.id, target)
-            {
-                Ok(()) => (ActivationState::Confirmed, summary, None),
-                Err(error) => (
-                    ActivationState::CommittedDegraded,
-                    summary,
-                    Some(format!(
-                        "runtime acknowledged reload but final store/auth proof changed: {error:#}"
-                    )),
-                ),
-            }
-        }
-        Ok(summary) => {
-            let detail = format!(
-                "degraded activation remains unconfirmed: {} verified runtime ACK(s), {} target(s) skipped",
-                summary.signaled.len(),
-                summary.skipped.len()
-            );
-            (ActivationState::CommittedDegraded, summary, Some(detail))
-        }
+    let expected = activation_reload_binding(generation, auth_path, target_fingerprint)?;
+    let (state, summary, detail) = match capture_activation_reload(reload, auth_path, &expected) {
+        Ok(summary) => match verify_runtime_confirmation(
+            &summary,
+            &expected,
+            store_lock,
+            generation,
+            auth_path,
+            target.id,
+            target,
+        ) {
+            Ok(()) => (ActivationState::Confirmed, summary, None),
+            Err(error) => (
+                ActivationState::CommittedDegraded,
+                summary,
+                Some(format!(
+                    "runtime acknowledgement did not survive final degraded-activation proof: {error:#}"
+                )),
+            ),
+        },
         Err(error) => (
             ActivationState::CommittedDegraded,
             ReloadSummary::default(),
@@ -1182,8 +1736,35 @@ where
     })
 }
 
-fn runtime_convergence_proven(summary: &ReloadSummary) -> bool {
-    summary.verified_hot_swap()
+fn capture_activation_reload<R>(
+    reload: &mut R,
+    auth_path: &Path,
+    expected: &ActivationReloadBinding,
+) -> Result<ReloadSummary>
+where
+    R: FnMut(&Path) -> Result<ReloadSummary>,
+{
+    let mut summary = reload(auth_path)?;
+    summary.bind_activation(expected)?;
+    Ok(summary)
+}
+
+fn verify_runtime_confirmation(
+    summary: &ReloadSummary,
+    expected: &ActivationReloadBinding,
+    store_lock: &AccountStoreLock,
+    generation: &AccountStoreGeneration,
+    auth_path: &Path,
+    target_id: Uuid,
+    target: &CodexAccount,
+) -> Result<()> {
+    if !summary.proves_activation(expected) {
+        bail!("runtime reload evidence is not bound to this exact activation generation");
+    }
+    verify_committed_activation(store_lock, generation, auth_path, target_id, target)?;
+    summary.revalidate_current_topology(auth_path)?;
+    verify_committed_activation(store_lock, generation, auth_path, target_id, target)
+        .context("store/auth changed during final runtime topology validation")
 }
 
 struct ActivationRollbackContext<'a> {
@@ -1485,18 +2066,320 @@ pub fn activation_record_path(store_path: &Path) -> PathBuf {
     store_path.with_extension("activation.json")
 }
 
+fn provider_io_lease_path(store_path: &Path) -> PathBuf {
+    store_path.with_extension("provider-io")
+}
+
+pub(crate) fn acquire_provider_io_lease(store_path: &Path) -> Result<secure_file::SecureFileLock> {
+    secure_file::try_lock(&provider_io_lease_path(store_path), true)?.context(
+        "another activation or irreversible provider operation owns the provider-I/O lease",
+    )
+}
+
 pub fn read_activation_record(store_lock: &AccountStoreLock) -> Result<Option<ActivationRecord>> {
-    let path = activation_record_path(store_lock.store_path());
-    match fs::read(&path) {
-        Ok(data) => serde_json::from_slice(&data)
+    read_activation_record_for_store(store_lock.store_path())
+}
+
+pub fn read_activation_record_for_store(store_path: &Path) -> Result<Option<ActivationRecord>> {
+    Ok(observe_activation_record_for_store(store_path)?.record)
+}
+
+fn observe_activation_record_for_store(store_path: &Path) -> Result<ObservedActivationRecord> {
+    let path = activation_record_path(store_path);
+    let snapshot = secure_file::observe(&path, ACTIVATION_RECORD_MAX_BYTES, true)?;
+    let record = match snapshot.bytes() {
+        Some(data) => serde_json::from_slice(data)
             .with_context(|| format!("failed to decode {}", path.display()))
             .map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+        None => Ok(None),
+    }?;
+    Ok(ObservedActivationRecord {
+        record,
+        identity: ActivationJournalIdentity {
+            generation: snapshot.generation().clone(),
+            file_identity: snapshot.file_identity(),
+            modified_unix: snapshot.modified_unix(),
+        },
+    })
+}
+
+pub(crate) fn activation_record_confirms_current(
+    record: &ActivationRecord,
+    active: &CodexAccount,
+    generation: &AccountStoreGeneration,
+    auth_fingerprint: Option<&str>,
+) -> bool {
+    let Some(active_fingerprint) = complete_account_token_fingerprint(active) else {
+        return false;
+    };
+    record.version == ACTIVATION_RECORD_VERSION
+        && record.state == ActivationState::Confirmed
+        && record.kind != ActivationKind::Unknown
+        && record.target_account_id == active.account_id
+        && record.store_generation == generation.as_str()
+        && record.auth_fingerprint.as_deref() == Some(active_fingerprint.as_str())
+        && record.base_store_generation.is_none()
+        && record.owned_store_generation.is_none()
+        && record.base_auth_generation.is_none()
+        && record.owned_auth_generation.is_none()
+        && record.rollback.is_none()
+        && auth_fingerprint == Some(active_fingerprint.as_str())
+}
+
+pub(crate) fn require_current_activation_confirmation(
+    store_path: &Path,
+    auth_path: &Path,
+) -> Result<()> {
+    let snapshot = crate::account_store::load_account_store_snapshot(store_path)?;
+    let active = active_account(&snapshot.accounts)
+        .context("activation confirmation requires one active account")?;
+    let record = read_activation_record_for_store(store_path)?
+        .context("activation confirmation record is missing")?;
+    let auth_fingerprint = crate::auth::auth_file_fingerprint(auth_path);
+    if !activation_record_confirms_current(
+        &record,
+        active,
+        &snapshot.generation,
+        auth_fingerprint.as_deref(),
+    ) {
+        bail!("activation confirmation is stale or does not match current store/auth state");
     }
+    Ok(())
+}
+
+pub(crate) fn preflight_provider_io_activation(
+    store_path: &Path,
+    auth_path: &Path,
+) -> Result<ProviderIoActivationSnapshot> {
+    let store_lock = crate::account_store::lock_account_store(store_path)?;
+    let snapshot = store_lock.load()?;
+    let record = read_activation_record(&store_lock)?
+        .context("provider I/O requires a durable Confirmed activation record")?;
+    if record.state != ActivationState::Confirmed {
+        bail!(
+            "provider I/O is blocked by unresolved activation state {:?}",
+            record.state
+        );
+    }
+    reconcile_confirmed_generation_transition(
+        &store_lock,
+        &snapshot.generation,
+        auth_path,
+        record,
+    )?;
+    let current = store_lock.load()?;
+    if current.generation != snapshot.generation {
+        bail!("account store changed during provider-I/O activation preflight");
+    }
+    let observed = observe_activation_record_for_store(store_path)?;
+    let guard = ProviderIoActivationGuard {
+        store_generation: current.generation.clone(),
+        journal: observed.identity,
+    };
+    validate_provider_io_activation_locked(&store_lock, auth_path, &guard)
+        .context("provider I/O activation preflight found stale or malformed confirmation")?;
+    Ok(ProviderIoActivationSnapshot {
+        accounts: current.accounts,
+        generation: current.generation,
+        guard,
+    })
+}
+
+pub(crate) fn validate_provider_io_activation(
+    store_path: &Path,
+    auth_path: &Path,
+    guard: &ProviderIoActivationGuard,
+) -> Result<()> {
+    let store_lock = crate::account_store::lock_account_store(store_path)?;
+    validate_provider_io_activation_locked(&store_lock, auth_path, guard)
+}
+
+pub(crate) fn validate_provider_io_activation_locked(
+    store_lock: &AccountStoreLock,
+    auth_path: &Path,
+    guard: &ProviderIoActivationGuard,
+) -> Result<()> {
+    let current = store_lock.load()?;
+    if current.generation != guard.store_generation {
+        bail!(
+            "provider-I/O activation guard found a changed store generation (expected {}, found {})",
+            guard.store_generation.as_str(),
+            current.generation.as_str()
+        );
+    }
+    let observed = observe_activation_record_for_store(store_lock.store_path())?;
+    if observed.identity != guard.journal {
+        bail!("provider-I/O activation guard found a changed activation journal");
+    }
+    let record = observed
+        .record
+        .context("provider-I/O activation guard requires a durable Confirmed record")?;
+    let active = active_account(&current.accounts)
+        .context("provider-I/O activation guard requires one active account")?;
+    let auth_fingerprint = auth_file_fingerprint(auth_path);
+    if !activation_record_confirms_current(
+        &record,
+        active,
+        &current.generation,
+        auth_fingerprint.as_deref(),
+    ) {
+        bail!("provider-I/O activation guard found stale or malformed confirmation");
+    }
+    Ok(())
+}
+
+pub(crate) fn commit_accounts_preserving_confirmed_generation_continuity(
+    store_lock: &AccountStoreLock,
+    generation: &mut AccountStoreGeneration,
+    accounts: &[CodexAccount],
+    auth_path: &Path,
+) -> Result<()> {
+    commit_accounts_with_confirmed_generation_continuity(
+        store_lock, generation, accounts, auth_path,
+    )
+}
+
+pub(crate) fn commit_accounts_with_provider_io_activation(
+    store_lock: &AccountStoreLock,
+    generation: &mut AccountStoreGeneration,
+    accounts: &[CodexAccount],
+    auth_path: &Path,
+    guard: &ProviderIoActivationGuard,
+) -> Result<()> {
+    validate_provider_io_activation_locked(store_lock, auth_path, guard)
+        .context("account-store commit refused a changed provider-I/O activation guard")?;
+    if generation.as_str() != guard.store_generation.as_str() {
+        bail!(
+            "account-store commit received a generation outside its provider-I/O activation guard"
+        );
+    }
+    let record = read_activation_record(store_lock)?
+        .context("account-store commit requires a current Confirmed activation record")?;
+    commit_accounts_from_confirmed_record_with(
+        store_lock,
+        generation,
+        accounts,
+        auth_path,
+        record,
+        write_activation_record,
+        commit_accounts,
+    )
+}
+
+pub(crate) fn commit_accounts_with_confirmed_generation_continuity(
+    store_lock: &AccountStoreLock,
+    generation: &mut AccountStoreGeneration,
+    accounts: &[CodexAccount],
+    auth_path: &Path,
+) -> Result<()> {
+    let record = read_activation_record(store_lock)?
+        .context("account-store commit requires a current Confirmed activation record")?;
+    commit_accounts_from_confirmed_record_with(
+        store_lock,
+        generation,
+        accounts,
+        auth_path,
+        record,
+        write_activation_record,
+        commit_accounts,
+    )
+}
+
+fn commit_accounts_from_confirmed_record_with<W, C>(
+    store_lock: &AccountStoreLock,
+    generation: &mut AccountStoreGeneration,
+    accounts: &[CodexAccount],
+    auth_path: &Path,
+    mut record: ActivationRecord,
+    mut write_record: W,
+    commit: C,
+) -> Result<()>
+where
+    W: FnMut(&AccountStoreLock, &ActivationRecord) -> Result<()>,
+    C: FnOnce(&AccountStoreLock, &mut AccountStoreGeneration, &[CodexAccount]) -> Result<()>,
+{
+    let previous_generation = generation.clone();
+    let current = store_lock.load()?;
+    if current.generation != previous_generation {
+        bail!(
+            "account-store commit requires the exact current generation (expected {}, found {})",
+            previous_generation.as_str(),
+            current.generation.as_str()
+        );
+    }
+    let current_active = active_account(&current.accounts)
+        .context("account-store commit requires exactly one current active account")?;
+    let proposed_active = active_account(accounts)
+        .context("account-store commit requires exactly one proposed active account")?;
+    let current_fingerprint = complete_account_token_fingerprint(current_active)
+        .context("current active account has incomplete token material")?;
+    let proposed_fingerprint = complete_account_token_fingerprint(proposed_active)
+        .context("proposed active account has incomplete token material")?;
+    let auth_fingerprint = auth_file_fingerprint(auth_path);
+    if !activation_record_confirms_current(
+        &record,
+        current_active,
+        &previous_generation,
+        auth_fingerprint.as_deref(),
+    ) {
+        bail!("account-store commit refused to break Confirmed activation-generation continuity");
+    }
+    if proposed_active.account_id != current_active.account_id
+        || proposed_fingerprint != current_fingerprint
+    {
+        bail!(
+            "account-store commit cannot carry runtime confirmation across an active token change"
+        );
+    }
+
+    let prospective_generation = store_lock.prospective_generation(accounts)?;
+    if prospective_generation == previous_generation {
+        return Ok(());
+    }
+    let mut pending_record = record.clone();
+    pending_record.base_store_generation = Some(previous_generation.as_str().to_string());
+    pending_record.owned_store_generation = Some(prospective_generation.as_str().to_string());
+    write_record(store_lock, &pending_record)
+        .context("failed to durably publish the Confirmed generation transition")?;
+    commit(store_lock, generation, accounts).context(
+        "account-store commit failed after durable Confirmed generation-transition publication; further activation is blocked until reconciliation",
+    )?;
+    if *generation != prospective_generation {
+        bail!("account-store commit returned a generation other than the journaled generation");
+    }
+
+    record.store_generation = prospective_generation.as_str().to_string();
+    record.base_store_generation = None;
+    record.owned_store_generation = None;
+    record.base_auth_generation = None;
+    record.owned_auth_generation = None;
+    record.rollback = None;
+    write_record(store_lock, &record).context(
+        "failed to finalize Confirmed generation continuity; the durable transition remains fail-closed",
+    )?;
+
+    let committed = store_lock.load()?;
+    let committed_active = active_account(&committed.accounts)
+        .context("committed account store lost its active account")?;
+    let durable_record = read_activation_record(store_lock)?
+        .context("Confirmed activation record disappeared after account-store commit")?;
+    let durable_auth_fingerprint = auth_file_fingerprint(auth_path);
+    if committed.generation != prospective_generation
+        || !activation_record_confirms_current(
+            &durable_record,
+            committed_active,
+            &committed.generation,
+            durable_auth_fingerprint.as_deref(),
+        )
+    {
+        bail!("account-store commit did not preserve exact Confirmed generation continuity");
+    }
+    Ok(())
 }
 
 fn write_activation_record(store_lock: &AccountStoreLock, record: &ActivationRecord) -> Result<()> {
+    let _provider_io_lease = acquire_provider_io_lease(store_lock.store_path())
+        .context("activation journal mutation blocked by provider I/O")?;
     let path = activation_record_path(store_lock.store_path());
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1535,6 +2418,10 @@ mod tests {
     use super::*;
     use crate::account_store::{active_account, lock_account_store, save_accounts, CodexAccount};
     use crate::auth::{auth_file_fingerprint, auth_file_matches_account, commit_auth_file};
+    use std::cell::Cell;
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     fn account(email: &str, active: bool) -> CodexAccount {
         CodexAccount {
@@ -1557,6 +2444,412 @@ mod tests {
             runtime_unusable_reason: None,
             rate_limit_reset_bank: None,
         }
+    }
+
+    fn assert_store_lock_available(store_path: &Path) -> Result<()> {
+        let lock_path = store_path.with_extension("json.lock");
+        let file = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            bail!(
+                "account-store lock was held during runtime observation: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let unlock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        if unlock_result != 0 {
+            bail!(
+                "failed to release runtime-observation probe lock: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unlocked_activation_runs_reload_and_final_topology_proof_without_store_lock() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let candidate = account("candidate@example.com", false);
+        save_accounts(&store_path, &[active.clone(), candidate.clone()])?;
+        commit_auth_file(&auth_path, &active)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let reload_store_path = store_path.clone();
+        let topology_store_path = store_path.clone();
+
+        let outcome = activate_with_unlocked_reload_with_topology(
+            &store_path,
+            &auth_path,
+            &mut generation,
+            &mut accounts,
+            candidate.id,
+            true,
+            &move |_| {
+                assert_store_lock_available(&reload_store_path)?;
+                Ok(ReloadSummary {
+                    sighup_sent: vec![42],
+                    signaled: vec![42],
+                    topology_verified: true,
+                    ..ReloadSummary::default()
+                })
+            },
+            move |summary, _| {
+                assert_store_lock_available(&topology_store_path)?;
+                if !summary.has_bound_activation_proof() {
+                    bail!("topology proof received unbound runtime evidence");
+                }
+                Ok(())
+            },
+        )?;
+
+        assert!(outcome.is_confirmed());
+        assert_eq!(
+            read_activation_record_for_store(&store_path)?.map(|record| record.state),
+            Some(ActivationState::Confirmed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_observation_rejects_symlink_without_creating_a_lock() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let journal_path = activation_record_path(&store_path);
+        let outside = dir.path().join("outside.json");
+        fs::write(&outside, b"{}")?;
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600))?;
+        symlink(&outside, &journal_path)?;
+
+        assert!(read_activation_record_for_store(&store_path).is_err());
+        assert!(journal_path.is_symlink());
+        assert!(!journal_path.with_extension("json.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_io_lease_blocks_activation_journal_mutation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let record = activation_record_ids(
+            ActivationState::Prepared,
+            &active.account_id,
+            &active.account_id,
+            &snapshot.generation,
+            account_token_fingerprint(&active),
+            None,
+        );
+        let _provider_io_lease = acquire_provider_io_lease(&store_path)?;
+
+        let error = write_activation_record(&store_lock, &record).unwrap_err();
+        assert!(format!("{error:#}").contains("provider I/O"));
+        assert!(!activation_record_path(&store_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn current_confirmation_requires_exact_state_account_generation_and_auth() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        commit_auth_file(&auth_path, &active)?;
+
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_err());
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let fingerprint = account_token_fingerprint(&active).unwrap();
+        let mut record = activation_record_ids(
+            ActivationState::Confirmed,
+            &active.account_id,
+            &active.account_id,
+            &snapshot.generation,
+            Some(fingerprint.clone()),
+            None,
+        );
+        write_activation_record(&store_lock, &record)?;
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_ok());
+
+        record.kind = ActivationKind::Unknown;
+        write_activation_record(&store_lock, &record)?;
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_err());
+        record.kind = ActivationKind::Rotation;
+        record.state = ActivationState::RolledBack;
+        write_activation_record(&store_lock, &record)?;
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_err());
+        record.state = ActivationState::Confirmed;
+        record.target_account_id = "other-account".to_string();
+        write_activation_record(&store_lock, &record)?;
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_err());
+        record.target_account_id = active.account_id.clone();
+        record.store_generation = "stale-generation".to_string();
+        write_activation_record(&store_lock, &record)?;
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_err());
+        record.store_generation = snapshot.generation.as_str().to_string();
+        record.auth_fingerprint = Some("stale-fingerprint".to_string());
+        write_activation_record(&store_lock, &record)?;
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn quota_only_commit_advances_confirmation_generation_without_reminting_evidence() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        commit_auth_file(&auth_path, &active)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let record = activation_record_ids(
+            ActivationState::Confirmed,
+            &active.account_id,
+            &active.account_id,
+            &generation,
+            account_token_fingerprint(&active),
+            None,
+        );
+        let evidence_time = record.updated_at.to_owned();
+        write_activation_record(&store_lock, &record)?;
+
+        accounts[0].plan_type = Some("pro-observed".to_string());
+        commit_accounts_with_confirmed_generation_continuity(
+            &store_lock,
+            &mut generation,
+            &accounts,
+            &auth_path,
+        )?;
+        let advanced = read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(advanced.store_generation, generation.as_str());
+        assert_eq!(advanced.updated_at, evidence_time);
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_ok());
+
+        accounts[0].access_token = "changed-without-runtime-proof".to_string();
+        let prior_to_token_change = generation.clone();
+        let error = commit_accounts_with_confirmed_generation_continuity(
+            &store_lock,
+            &mut generation,
+            &accounts,
+            &auth_path,
+        );
+        assert!(format!("{:#}", error.unwrap_err()).contains("active token change"));
+        assert_eq!(generation, prior_to_token_change);
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_ok());
+        assert_ne!(
+            store_lock.load()?.accounts[0].access_token,
+            accounts[0].access_token
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observation_commit_never_falls_back_beneath_missing_or_unresolved_activation() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        commit_auth_file(&auth_path, &active)?;
+        let store_before = fs::read(&store_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        accounts[0].plan_type = Some("observed-pro".to_string());
+
+        let missing_error = commit_accounts_preserving_confirmed_generation_continuity(
+            &store_lock,
+            &mut generation,
+            &accounts,
+            &auth_path,
+        )
+        .unwrap_err();
+        assert!(format!("{missing_error:#}").contains("current Confirmed activation record"));
+        assert_eq!(fs::read(&store_path)?, store_before);
+
+        let prepared = activation_record_ids(
+            ActivationState::Prepared,
+            &active.account_id,
+            &active.account_id,
+            &generation,
+            account_token_fingerprint(&active),
+            None,
+        );
+        write_activation_record(&store_lock, &prepared)?;
+        let unresolved_error = commit_accounts_preserving_confirmed_generation_continuity(
+            &store_lock,
+            &mut generation,
+            &accounts,
+            &auth_path,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{unresolved_error:#}").contains("Confirmed activation-generation continuity")
+        );
+        assert_eq!(fs::read(&store_path)?, store_before);
+        assert_eq!(
+            read_activation_record(&store_lock)?.unwrap().state,
+            prepared.state
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_generation_finalization_failure_leaves_durable_transition_barrier() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        commit_auth_file(&auth_path, &active)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let original_generation = snapshot.generation;
+        let mut generation = original_generation.clone();
+        let mut accounts = snapshot.accounts;
+        let record = activation_record_ids(
+            ActivationState::Confirmed,
+            &active.account_id,
+            &active.account_id,
+            &generation,
+            complete_account_token_fingerprint(&active),
+            None,
+        );
+        let evidence_time = record.updated_at.to_owned();
+        write_activation_record(&store_lock, &record)?;
+
+        accounts[0].plan_type = Some("new-observation".to_string());
+        let prospective_generation = store_lock.prospective_generation(&accounts)?;
+        let writes = Cell::new(0usize);
+        let error = commit_accounts_from_confirmed_record_with(
+            &store_lock,
+            &mut generation,
+            &accounts,
+            &auth_path,
+            record,
+            |store_lock, record| {
+                writes.set(writes.get() + 1);
+                if writes.get() == 2 {
+                    bail!("simulated final activation-journal failure");
+                }
+                write_activation_record(store_lock, record)
+            },
+            commit_accounts,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("simulated final activation-journal failure"));
+        assert_eq!(writes.get(), 2);
+        assert_eq!(generation, prospective_generation);
+        assert_eq!(store_lock.load()?.generation, prospective_generation);
+        let staged = read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(staged.store_generation, original_generation.as_str());
+        assert_eq!(
+            staged.base_store_generation.as_deref(),
+            Some(original_generation.as_str())
+        );
+        assert_eq!(
+            staged.owned_store_generation.as_deref(),
+            Some(prospective_generation.as_str())
+        );
+        assert_eq!(staged.updated_at, evidence_time);
+        drop(store_lock);
+
+        let reconciled =
+            reconcile_activation_barrier_unlocked(&store_path, &auth_path, true, &|_| {
+                bail!("generation-only reconciliation must not reload the runtime")
+            })?;
+        assert!(reconciled.is_none());
+        let store_lock = lock_account_store(&store_path)?;
+        let finalized = read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(finalized.store_generation, prospective_generation.as_str());
+        assert_eq!(finalized.base_store_generation, None);
+        assert_eq!(finalized.owned_store_generation, None);
+        assert_eq!(finalized.updated_at, evidence_time);
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn activation_rejects_whitespace_only_target_tokens_before_mutation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let mut target = account("target@example.com", false);
+        target.refresh_token = " \t ".to_string();
+        save_accounts(&store_path, &[active.clone(), target.clone()])?;
+        commit_auth_file(&auth_path, &active)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let original_generation = snapshot.generation.clone();
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+
+        let error = activate_with(
+            ActivationContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path: &auth_path,
+                target_id: target.id,
+                reload_enabled: true,
+            },
+            |_| bail!("invalid target must fail before runtime reload"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("incomplete token material"));
+        assert_eq!(store_lock.load()?.generation, original_generation);
+        assert!(read_activation_record(&store_lock)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn import_rejects_whitespace_only_inactive_tokens_before_mutation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let current = account("current@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&current))?;
+        commit_auth_file(&auth_path, &current)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let original_generation = snapshot.generation.clone();
+        let mut generation = snapshot.generation;
+        let mut current_accounts = snapshot.accounts;
+        let imported_active = account("imported@example.com", true);
+        let mut imported_inactive = account("incomplete@example.com", false);
+        imported_inactive.id_token = "   ".to_string();
+
+        let error = replace_accounts_with(
+            &store_lock,
+            &mut generation,
+            &mut current_accounts,
+            vec![imported_active, imported_inactive],
+            &auth_path,
+            false,
+            |_| bail!("invalid import must fail before runtime reload"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("incomplete token material after trimming"));
+        assert_eq!(store_lock.load()?.generation, original_generation);
+        assert!(read_activation_record(&store_lock)?.is_none());
+        Ok(())
     }
 
     fn manual_review_record(
@@ -1602,6 +2895,7 @@ mod tests {
             |_| {
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -1729,6 +3023,7 @@ mod tests {
             |_| {
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -1808,6 +3103,7 @@ mod tests {
                 }
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -1880,6 +3176,7 @@ mod tests {
                 reload_calls.set(reload_calls.get() + 1);
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -1948,6 +3245,7 @@ mod tests {
                 reload_calls.set(reload_calls.get() + 1);
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -1995,6 +3293,7 @@ mod tests {
                 commit_auth_file(&auth_path, &initial[0])?;
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -2239,6 +3538,7 @@ mod tests {
                 Ok(ReloadSummary {
                     sighup_sent: vec![42],
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -2257,6 +3557,86 @@ mod tests {
         assert_eq!(confirmed.owned_store_generation, None);
         assert!(confirmed.rollback.is_none());
         assert!(auth_file_matches_account(&auth_path, &initial[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn unlocked_manual_resolution_runs_reload_and_topology_proof_without_store_lock() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        commit_auth_file(&auth_path, &active)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let generation = store_lock.load()?.generation;
+        write_activation_record(&store_lock, &manual_review_record(&generation, &active))?;
+        drop(store_lock);
+        let reload_store_path = store_path.clone();
+        let topology_store_path = store_path.clone();
+
+        let outcome = resolve_manual_review_activation_unlocked_with_topology(
+            &store_path,
+            &auth_path,
+            &move |_| {
+                assert_store_lock_available(&reload_store_path)?;
+                Ok(ReloadSummary {
+                    sighup_sent: vec![42],
+                    signaled: vec![42],
+                    topology_verified: true,
+                    ..ReloadSummary::default()
+                })
+            },
+            move |summary, _| {
+                assert_store_lock_available(&topology_store_path)?;
+                if !summary.has_bound_activation_proof() {
+                    bail!("manual-resolution topology proof was not activation-bound");
+                }
+                Ok(())
+            },
+        )?;
+
+        assert!(outcome.is_confirmed());
+        assert_eq!(
+            read_activation_record_for_store(&store_path)?.map(|record| record.state),
+            Some(ActivationState::Confirmed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unlocked_manual_resolution_failure_preserves_reviewed_journal_bytes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        commit_auth_file(&auth_path, &active)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let generation = store_lock.load()?.generation;
+        write_activation_record(&store_lock, &manual_review_record(&generation, &active))?;
+        drop(store_lock);
+        let journal_path = activation_record_path(&store_path);
+        let original = fs::read(&journal_path)?;
+
+        let error = resolve_manual_review_activation_unlocked_with_topology(
+            &store_path,
+            &auth_path,
+            &|_| {
+                Ok(ReloadSummary {
+                    sighup_sent: vec![42],
+                    signaled: vec![42],
+                    topology_verified: true,
+                    ..ReloadSummary::default()
+                })
+            },
+            |_, _| bail!("simulated final topology change"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("simulated final topology change"));
+        assert_eq!(fs::read(&journal_path)?, original);
         Ok(())
     }
 
@@ -2466,6 +3846,7 @@ mod tests {
             |_| {
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -2594,6 +3975,7 @@ mod tests {
                     Ok(ReloadSummary {
                         sighup_sent: vec![42],
                         signaled: vec![42],
+                        topology_verified: true,
                         ..ReloadSummary::default()
                     })
                 }
@@ -2673,6 +4055,7 @@ mod tests {
                 reload_calls.set(reload_calls.get() + 1);
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
@@ -2702,6 +4085,7 @@ mod tests {
                 reload_calls.set(reload_calls.get() + 1);
                 Ok(ReloadSummary {
                     signaled: vec![42],
+                    topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },

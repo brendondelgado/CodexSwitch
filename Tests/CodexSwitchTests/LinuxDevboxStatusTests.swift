@@ -35,12 +35,172 @@ struct LinuxDevboxStatusTests {
         #expect(LinuxDevboxStatus.notConfigured.shouldShowCheckingPlaceholderBeforeRefresh)
     }
 
-    @Test("Single VPS readiness blip is suppressed after ready")
-    func singleVPSReadinessBlipIsSuppressedAfterReady() {
-        #expect(LinuxDevboxStatus.shouldSuppressTransientIssue(wasReady: true, consecutiveIssueChecks: 1))
-        #expect(!LinuxDevboxStatus.shouldSuppressTransientIssue(wasReady: true, consecutiveIssueChecks: 2))
-        #expect(!LinuxDevboxStatus.shouldSuppressTransientIssue(wasReady: false, consecutiveIssueChecks: 1))
-        #expect(!LinuxDevboxStatus.shouldSuppressTransientIssue(wasReady: nil, consecutiveIssueChecks: 1))
+    @Test("Single VPS readiness blip suppresses only its notification")
+    func singleVPSReadinessBlipSuppressesOnlyNotification() {
+        #expect(LinuxDevboxStatus.shouldSuppressTransientIssueNotification(
+            wasReady: true,
+            consecutiveIssueChecks: 1
+        ))
+        #expect(!LinuxDevboxStatus.shouldSuppressTransientIssueNotification(
+            wasReady: true,
+            consecutiveIssueChecks: 2
+        ))
+        #expect(!LinuxDevboxStatus.shouldSuppressTransientIssueNotification(
+            wasReady: false,
+            consecutiveIssueChecks: 1
+        ))
+        #expect(!LinuxDevboxStatus.shouldSuppressTransientIssueNotification(
+            wasReady: nil,
+            consecutiveIssueChecks: 1
+        ))
+    }
+
+    @Test("Every invalid VPS observation publishes non-green state and clears identity")
+    func everyInvalidObservationClearsGreenStateAndIdentity() {
+        let expectedStates: [(LinuxDevboxStatus.Invalidation, LinuxDevboxStatus.State)] = [
+            (.activeSessionUnverified, .stale),
+            (.negative, .notReady),
+            (.failed, .failed),
+            (.deferred, .stale),
+            (.decodedInvalid, .failed),
+            (.barrierBlocked, .notReady),
+            (.expired, .stale),
+        ]
+
+        #expect(expectedStates.count == LinuxDevboxStatus.Invalidation.allCases.count)
+        for (invalidation, expectedState) in expectedStates {
+            let status = LinuxDevboxStatus.invalidated(
+                by: invalidation,
+                summary: "fixture"
+            )
+
+            #expect(status.state == expectedState)
+            #expect(!status.isHealthy)
+            #expect(status.activeEmail == nil)
+            #expect(status.activeProviderAccountId == nil)
+        }
+    }
+
+    @Test("VPS account mirror freshness expires deterministically")
+    func accountMirrorFreshnessExpiresAtBoundary() {
+        let observedAt = Date(timeIntervalSince1970: 1_000)
+        let ready = LinuxDevboxStatus(
+            state: .ready,
+            summary: "verified",
+            activeEmail: "active@example.com"
+        )
+        let stale = LinuxDevboxStatus.invalidated(
+            by: .activeSessionUnverified,
+            summary: "unverified"
+        )
+
+        #expect(LinuxDevboxStatus.accountMirrorIsFresh(
+            observedAt: observedAt,
+            now: observedAt.addingTimeInterval(20),
+            maximumAge: 20
+        ))
+        #expect(!LinuxDevboxStatus.accountMirrorIsFresh(
+            observedAt: observedAt,
+            now: observedAt.addingTimeInterval(20.001),
+            maximumAge: 20
+        ))
+        #expect(!LinuxDevboxStatus.accountMirrorIsFresh(
+            observedAt: nil,
+            now: observedAt,
+            maximumAge: 20
+        ))
+        #expect(ready.hasFreshReadinessProof(
+            mirrorObservedAt: observedAt,
+            now: observedAt.addingTimeInterval(20),
+            maximumAge: 20
+        ))
+        #expect(!ready.hasFreshReadinessProof(
+            mirrorObservedAt: observedAt,
+            now: observedAt.addingTimeInterval(20.001),
+            maximumAge: 20
+        ))
+        #expect(!stale.hasFreshReadinessProof(
+            mirrorObservedAt: observedAt,
+            now: observedAt,
+            maximumAge: 20
+        ))
+        #expect(!LinuxDevboxStatus.activeSessionRequiresInvalidation(
+            hasActiveRemoteSession: true,
+            status: ready,
+            mirrorObservedAt: observedAt,
+            now: observedAt.addingTimeInterval(20),
+            maximumAge: 20
+        ))
+        #expect(LinuxDevboxStatus.activeSessionRequiresInvalidation(
+            hasActiveRemoteSession: true,
+            status: ready,
+            mirrorObservedAt: observedAt,
+            now: observedAt.addingTimeInterval(20.001),
+            maximumAge: 20
+        ))
+        #expect(!LinuxDevboxStatus.activeSessionRequiresInvalidation(
+            hasActiveRemoteSession: false,
+            status: stale,
+            mirrorObservedAt: nil,
+            now: observedAt,
+            maximumAge: 20
+        ))
+    }
+
+    @Test("VPS readiness publication requires matching generation and settings")
+    func readinessTaskContextRejectsStalePublication() {
+        let settings = LinuxDevboxMonitorSettings(
+            enabled: true,
+            host: "100.95.84.123",
+            user: "signul",
+            sshKeyPath: "~/.ssh/id_ed25519",
+            port: 22
+        )
+        let context = LinuxDevboxReadinessTaskContext(
+            generation: 7,
+            settings: settings
+        )
+        let disabled = LinuxDevboxMonitorSettings(
+            enabled: false,
+            host: settings.host,
+            user: settings.user,
+            sshKeyPath: settings.sshKeyPath,
+            port: settings.port
+        )
+        let changedHost = LinuxDevboxMonitorSettings(
+            enabled: true,
+            host: "100.95.84.124",
+            user: settings.user,
+            sshKeyPath: settings.sshKeyPath,
+            port: settings.port
+        )
+
+        #expect(context.authorizesPublication(
+            currentGeneration: 7,
+            currentSettings: settings
+        ))
+        #expect(!context.authorizesPublication(
+            currentGeneration: 8,
+            currentSettings: settings
+        ))
+        #expect(!context.authorizesPublication(
+            currentGeneration: 7,
+            currentSettings: disabled
+        ))
+        #expect(!context.authorizesPublication(
+            currentGeneration: 7,
+            currentSettings: changedHost
+        ))
+    }
+
+    @Test("Malformed VPS payload failures are decoded-invalid observations")
+    func malformedPayloadFailureIsDecodedInvalid() {
+        #expect(LinuxDevboxMonitorFailure(
+            message: "Failed to parse Linux devbox readiness JSON: malformed"
+        ).isDecodedInvalidObservation)
+        #expect(!LinuxDevboxMonitorFailure(
+            message: "SSH timed out while checking Linux devbox"
+        ).isDecodedInvalidObservation)
     }
 
     @Test("Remote poll selector is shell quoted safely")

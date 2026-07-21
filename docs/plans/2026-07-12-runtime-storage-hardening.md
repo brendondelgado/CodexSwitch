@@ -16,7 +16,8 @@ cross_dependencies:
 version_control:
   branch: main
   base_commit: 664edf6201fcd7dcdc299084392e3dad510ec9d7
-  status: local_uncommitted
+  status: deferred_frozen_unimplemented
+  last_updated: 2026-07-21
 operator_boundary:
   status: OPERATOR_DIRECTIVE_ACTIVE
   sha256: 4416348576c92302dc3836955482bd6fd86c62b2aa9b66e5c7228b0161fc14fd
@@ -27,6 +28,13 @@ operator_boundary:
 # Codex Runtime Storage Hardening Implementation Plan
 
 > **For Codex:** Execute serially in the authoritative dirty checkout. Do not install or enable the result until independent review and a separately authorized quiesced deployment.
+
+> **Current state (2026-07-21):** Deferred and frozen. The repository patch
+> driver and verified live runtime do not implement this plan. The active Linux
+> artifact contract does not require `codex-runtime-storage-leases-v1`, and all
+> generated or checked-in units keep `local_thread_store_compression` disabled.
+> The tasks below are future design requirements, not implemented or active
+> behavior.
 
 ## Operator Boundary
 
@@ -120,7 +128,7 @@ Contract and fixtures
 
 - Deduplicate plain/compressed siblings with plain precedence and ignore temporary/malformed paths.
 - Report logical rollout count, physical representation bytes, compressed population, dual-representation count, SQLite main/WAL bytes, page/freelist/live-page bytes, global log rows/bytes, and partition cardinality locally on the VPS. Any Mac-facing projection is aggregate-only, non-content, and contains no session identifiers.
-- Verify every discovered Codex runtime contains the lease capability marker before reporting activation readiness.
+- If implementation resumes, introduce and verify a reviewed lease capability marker before reporting storage-hardening activation readiness. The current runtime has no such requirement.
 - Keep per-session scans, decoded bytes, paths, hashes, titles, manifests, and catalog rows on the VPS. An aggregate-only VPS usage command may count `.jsonl.zst` files through bounded memory without returning identifiers or content.
 
 ### Task 7: Embed and guard the patch
@@ -164,4 +172,9 @@ The complete Codex workspace suite requires separate approval because shared run
 
 ## Execution Handoff
 
-Execution stays in this dedicated task and remains local. The deliverable is ready for independent review when scoped tests, patch replay, task-owned diff inspection, and the deployment packet are complete. Activation, quiesced restart, one-time SQLite physical compaction, and release publication remain separate authorizations.
+Execution is paused. Resumption requires an explicit operator authorization,
+revalidation of the controlling boundary packet, implementation in the patch
+driver, synthetic-fixture verification, and a fresh independent review. Until
+then, there is no deployable storage-hardening artifact, activation path, or
+feature enablement. Quiesced restart, SQLite physical compaction, and release
+publication remain separate authorizations even after implementation exists.

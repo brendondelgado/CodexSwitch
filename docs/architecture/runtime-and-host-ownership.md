@@ -8,6 +8,7 @@ toc:
   - Account Store Protocol
   - Activation Transaction
   - Runtime Reload
+  - Hot-Swap Reliability Closure
   - Rust CLI Activation And Handoff
   - Mac Contract
   - VPS Contract
@@ -54,7 +55,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-20
+  last_updated: 2026-07-21
 ---
 
 # Runtime And Host Ownership
@@ -373,17 +374,21 @@ successful port-8390 reload cannot conceal a stale ChatGPT SSH daemon.
 The repository-owned `--remote-control --listen ws://...` mode uses the distinct
 `headless-remote-control-app-server` runtime kind and
 `codexswitch-hotswap-headless-idle-v1` capability marker. When one or more
-initialized frontends are present, it must report internally consistent total
-initialized, eligible delivery, and completed-write counts, with at least one
-completed `account/updated` transport write. When no initialized frontend
-exists, it may instead report an explicit idle-listener acknowledgement with all
-three counts equal to zero. That idle proof is runtime convergence, not
+initialized frontends are present, the transport first attempts to enqueue the
+notification. A disconnected connection that rejects enqueue is historical
+state, not an eligible writer. The acknowledgement reports internally
+consistent initialized, successfully enqueued eligible, disconnected, and
+completed-write counts. When any eligible writer exists, every eligible writer
+must complete the underlying `account/updated` transport write. When no live
+writer accepts delivery, the headless listener may instead report an explicit
+idle-listener acknowledgement, including any initialized-but-disconnected
+historical connection count. That idle proof is runtime convergence, not
 notification of a live client: it is valid only after the same bound auth reload
 and cache fingerprint checks, and the next client initializes against that
 reloaded auth manager. Desktop and other `external-app-server` runtimes remain
-strict and cannot use idle proof. A timeout, closed writer, positive initialized
-count with zero completed writes, contradictory counts, missing capability
-marker, or runtime-kind mismatch remains degraded.
+strict and cannot use idle proof. A timeout from an eligible writer, a partial
+write set, contradictory counts, missing capability marker, or runtime-kind
+mismatch remains degraded.
 
 Successful signal delivery is recorded separately from verified acknowledgement.
 The runtime reloads backend auth before it attempts frontend delivery, so an
@@ -441,6 +446,50 @@ The Mac may publish runtime-current only when at least one expected live runtime
 acknowledges the complete target and every discovered target acknowledges. No
 runtime is an explicit configured-only degraded result, never confirmation.
 
+## Hot-Swap Reliability Closure
+
+Hot-swap readiness is acknowledgement-only. A process start after `auth.json`,
+a matching executable marker, an auth-file modification time, or successful
+signal delivery may explain state, but none can replace a current version-3
+acknowledgement. An explicit activation or rotation creates that first
+acknowledgement; observation and daemon polling never signal a runtime merely
+to renew readiness. Until an explicit convergence attempt succeeds, the
+runtime is not ready.
+
+Remote presentation is a timestamped observation, not durable truth. A failed
+probe, a durable activation barrier, a missing acknowledgement, or freshness
+expiry invalidates a prior green result immediately. The UI may retain the last
+payload for diagnosis only when it is visibly stale and cannot contribute to
+pooled readiness or account-current claims.
+
+Observation commands do not acquire create-if-missing mutation locks, repair
+file modes, save updater reconciliation, signal processes, or change account
+state. They use no-follow, owner-checked, bounded, stable reads and report an
+unknown result when those reads cannot be proven.
+
+Remote client selection and status reporting bind to one app-server version
+snapshot. If transport establishment changes the observed server version, the
+check fails instead of selecting against one version and printing another as an
+equality. Client synchronization remains an explicit command.
+
+Runtime evidence retains the acknowledgement's original timestamp and concrete
+process binding. Reading an old ACK never creates a new lease. Immediately
+before publishing `Confirmed`, the coordinator re-enumerates expected runtimes
+and proves that every bound PID, start identity, executable identity, auth-file
+identity, and acknowledgement remains current and that no new account-bearing
+runtime appeared.
+
+An asynchronous external-auth observation captures the configured account,
+swap generation, and activation generation before suspension. If any captured
+fact changes before the observation is applied, the result is stale and has no
+state effect.
+
+An injected turn does not trust a child process's success JSON by itself. It
+generates a receipt nonce, passes it through the exact rotation transaction,
+verifies the resulting request and ACK binding, reloads its own `AuthManager`
+from the acknowledged path, compares the complete fingerprint, and only then
+retries the interrupted operation once.
+
 ## Rust CLI Activation And Handoff
 
 The Rust coordinator uses distinct durable outcomes for file convergence and
@@ -482,9 +531,9 @@ manual-review reason remains a hard mutation barrier and receives no reload or
 credential write. This migration never labels file agreement as runtime
 confirmation. Missing version or kind fields decode as unknown legacy evidence,
 not as v3 rotation evidence, and are never eligible for automatic repair.
-When a daemon tick rejects an activation barrier, the outer daemon loop must
-also skip auxiliary missing-ack bootstrap reloads for that tick; barrier failure
-is side-effect free across the complete production wrapper.
+When a daemon tick rejects an activation barrier, the outer daemon loop remains
+side-effect free: it performs no quota network calls, reset effects, auth writes,
+or runtime reloads for that tick.
 On macOS, a newly started repository-owned desktop bridge may establish its
 first ACK during an explicit desktop activation only after CodexSwitch verifies
 the canonical `9223` listener, launchd PID, generated bridge files, exact
@@ -516,12 +565,36 @@ frontend delivery, and runtime acknowledgement waits all run without that
 lock. After any unlocked wait, the daemon reacquires the lock and requires the
 same store generation plus the same activation target and token fingerprint
 before committing. A `FileOnly` or `CommittedDegraded` result schedules runtime
-convergence no sooner than 60 seconds later and suppresses auxiliary ACK
-bootstrap for that iteration; it never immediately reacquires the store lock in
-a retry loop.
-An allowed missing-ack discovery attempt advances its monotonic 60-second
-cadence before probing, including when discovery finds no work or returns an
-error, so normal daemon polling cannot become a high-frequency process scan.
+convergence no sooner than 60 seconds later; it never immediately reacquires the
+store lock in a retry loop. Normal daemon polling has no missing-ACK bootstrap
+scheduler and never signals a runtime merely to refresh readiness evidence.
+
+Provider-derived quota, plan, subscription, reset-inventory, and runtime-blocker
+updates are generation-bearing account-store commits. When the current
+activation is `Confirmed`, each such commit must advance confirmation to the
+new exact store generation without changing its target or token fingerprint,
+or leave a durable barrier that blocks readiness. Reconciliation must validate
+even a nominally `Confirmed` record against the current store generation before
+the daemon performs provider I/O or mutation. A crash or journal failure between
+the store commit and continuity publication therefore fails closed on the next
+tick instead of silently running with stale confirmation.
+Operator `poll` and targeted `redeem-reset` commands perform this activation
+barrier reconciliation before their first provider callback. A staged
+`Confirmed` generation transition is finalized under the store lock first;
+`Prepared`, `ManualReview`, `FileOnly`, `CommittedDegraded`, malformed, or
+otherwise unresolved evidence blocks quota GETs, reset inventory GETs, and the
+irreversible reset POST. The resulting guard binds both the store generation and
+the activation-journal file identity and is revalidated before every callback
+and commit. The reset POST additionally holds a dedicated nonblocking
+provider-I/O lease; every activation-journal write must acquire the same lease
+or fail closed. Account-store and reset-journal locks remain released during
+the network callback, while the lease prevents a new activation from entering
+`Prepared` between final validation and the first POST byte.
+
+Current-version activation evidence requires an explicit non-unknown activation
+kind. Access, refresh, and identity tokens are complete only when each remains
+non-empty after trimming whitespace; activation, import, auth writes, and runtime
+evidence all enforce the same definition.
 
 After every runtime acknowledgement, the coordinator re-reads the locked store
 generation and complete auth token fingerprint before writing `Confirmed`. A
@@ -541,6 +614,12 @@ turn uses an ACK-sourced path, it reopens the bounded ACK and matching request
 without following symlinks, proves freshness, runtime kind, request nonce,
 current process start identity, and the current on-disk complete fingerprint.
 Stale PID artifacts or a changed auth file disable rotation.
+
+On Linux, marker and executable inspection opens the kernel-resolved process
+executable without following a mutable user path, requires a regular file, and
+binds marker evidence to the opened descriptor's device and inode. FIFO,
+symlink, replacement, or unavailable `/proc/<pid>/exe` evidence fails closed;
+bounded byte scanning is not a substitute for a nonblocking regular-file open.
 
 Bundle import is preparation followed by runtime convergence, with the two
 phases explicitly separated when deployment requires the runtime to be idle.

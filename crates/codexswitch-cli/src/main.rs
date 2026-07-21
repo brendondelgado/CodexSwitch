@@ -15,17 +15,21 @@ mod secure_drop;
 mod secure_file;
 mod token_refresh;
 
-#[cfg(test)]
-use account_store::save_accounts;
 use account_store::{
-    active_account, commit_accounts, default_store_path, load_accounts, lock_account_store,
-    mark_runtime_unusable, quota_availability_at, real_quota_snapshot, resolve_account_selector,
-    select_auto_swap_candidate_from_observations, usage_limit_runtime_block_until,
-    validate_accounts, CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
+    active_account, default_store_path, load_account_store_snapshot, load_accounts,
+    lock_account_store, mark_runtime_unusable, quota_availability_at, real_quota_snapshot,
+    resolve_account_selector, select_auto_swap_candidate_from_observations,
+    usage_limit_runtime_block_until, validate_accounts, CurrentQuotaObservations,
+    QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
 };
+#[cfg(test)]
+use account_store::{commit_accounts, save_accounts};
 use activation::{
-    activate_with, reconcile_activation_barrier, replace_accounts_with,
-    resolve_manual_review_activation, ActivationBarrierContext, ActivationContext,
+    activate_with, activate_with_unlocked_reload, commit_accounts_with_provider_io_activation,
+    preflight_provider_io_activation, reconcile_activation_barrier,
+    reconcile_activation_barrier_unlocked, replace_accounts_with,
+    resolve_manual_review_activation_unlocked, validate_provider_io_activation,
+    validate_provider_io_activation_locked, ActivationBarrierContext, ActivationContext,
     ActivationOutcome, ActivationState,
 };
 use anyhow::{bail, Context, Result};
@@ -35,19 +39,30 @@ use clap::{Parser, Subcommand};
 use import::prepare_import_bundle;
 use quota::{apply_fetch_result, fetch_quota, FetchResult};
 use rate_limit_resets::{
-    consume_rate_limit_reset, fetch_rate_limit_reset_bank, orchestrate_reset,
-    reconcile_or_attempt_reset, ConsumeResult, RateLimitResetBank, ResetOrchestrationContext,
-    ResetOrchestrationDependencies, ResetQuotaRefreshStrategy, ResetReconciliationContext,
-    ResetReconciliationDependencies, SmartResetReason,
+    consume_rate_limit_reset, fetch_rate_limit_reset_bank, orchestrate_reset_with_provider_guard,
+    reconcile_or_attempt_reset_with_provider_guard, ConsumeResult, RateLimitResetBank,
+    ResetOrchestrationContext, ResetOrchestrationDependencies, ResetQuotaRefreshStrategy,
+    ResetReconciliationContext, ResetReconciliationDependencies, SmartResetReason,
 };
-use reload::{reload_codex_hot_swap_processes, restart_codex_processes, ReloadSummary};
-use ring::digest::{digest, SHA256};
+use reload::{
+    reload_codex_hot_swap_processes, reload_codex_hot_swap_processes_for_receipt,
+    restart_codex_processes, ReloadSummary,
+};
+use ring::digest::{digest, Context as DigestContext, SHA256};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
+
+fn parse_canonical_uuid(value: &str) -> std::result::Result<Uuid, String> {
+    let parsed = Uuid::parse_str(value).map_err(|_| "expected a canonical UUID".to_string())?;
+    if parsed.hyphenated().to_string() != value {
+        return Err("expected a lowercase hyphenated canonical UUID".to_string());
+    }
+    Ok(parsed)
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "codexswitch-cli")]
@@ -142,7 +157,7 @@ enum Command {
     Swap {
         account: String,
     },
-    /// Redeem one banked reset for one blocked Pro account without activating it.
+    /// Redeem one banked reset for one blocked paid account without activating it.
     RedeemReset {
         account: String,
         #[arg(long)]
@@ -159,6 +174,13 @@ enum Command {
         /// Commit store/auth without claiming a hot swap. Intended only when no runtime is live.
         #[arg(long)]
         offline_file_only: bool,
+        /// Bind runtime reload requests and acknowledgements to this canonical UUID.
+        #[arg(
+            long,
+            value_parser = parse_canonical_uuid,
+            conflicts_with = "offline_file_only"
+        )]
+        receipt_nonce: Option<Uuid>,
         #[arg(long)]
         json: bool,
     },
@@ -255,12 +277,15 @@ fn main() -> Result<()> {
         Command::InstallPreparedCodex { json } => install_prepared_codex(json),
         Command::AutoInstallCodexUpdate { json } => auto_install_codex_update(json),
         Command::Swap { account } => swap(&store_path, &auth_path, &account),
-        Command::RedeemReset { account, json } => redeem_reset(&store_path, &account, json),
+        Command::RedeemReset { account, json } => {
+            redeem_reset(&store_path, &auth_path, &account, json)
+        }
         Command::RotateNow {
             reason,
             cooldown_seconds,
             allow_banked_reset,
             offline_file_only,
+            receipt_nonce,
             json,
         } => rotate_now(
             &store_path,
@@ -269,6 +294,7 @@ fn main() -> Result<()> {
             cooldown_seconds,
             allow_banked_reset,
             !offline_file_only,
+            receipt_nonce,
             json,
         ),
         Command::ResolveActivation { yes, json } => {
@@ -279,7 +305,7 @@ fn main() -> Result<()> {
             &auth_path,
             Duration::from_secs(interval_seconds),
         ),
-        Command::Poll { account } => poll(&store_path, account.as_deref()),
+        Command::Poll { account } => poll(&store_path, &auth_path, account.as_deref()),
         Command::RestartCodex {
             yes,
             include_app_server,
@@ -304,24 +330,13 @@ fn import_accounts(
     verb: &str,
 ) -> Result<()> {
     let imported_accounts = prepare_import_bundle(bundle, ignore_expiry)?;
-    let store_lock = lock_account_store(store_path)?;
-    let snapshot = store_lock.load()?;
-    let accounts = if preserve_active {
-        preserve_host_active_account(imported_accounts, &snapshot.accounts)?
-    } else {
-        imported_accounts
-    };
-    let account_count = accounts.len();
-    let mut generation = snapshot.generation;
-    let mut stored_accounts = snapshot.accounts;
-    let outcome = replace_accounts_with(
-        &store_lock,
-        &mut generation,
-        &mut stored_accounts,
-        accounts,
+    let (account_count, outcome) = replace_import_accounts_with_unlocked_reload(
+        store_path,
         auth_path,
+        imported_accounts,
+        preserve_active,
         !offline_file_only,
-        reload_codex_hot_swap_processes,
+        &reload_codex_hot_swap_processes,
     )?;
     require_rotation_activation(outcome, !offline_file_only)?;
     if offline_file_only {
@@ -339,6 +354,55 @@ fn import_accounts(
         );
     }
     Ok(())
+}
+
+fn replace_import_accounts_with_unlocked_reload<R>(
+    store_path: &Path,
+    auth_path: &Path,
+    imported_accounts: Vec<account_store::CodexAccount>,
+    preserve_active: bool,
+    reload_enabled: bool,
+    reload: &R,
+) -> Result<(usize, ActivationOutcome)>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    if let Some(outcome) =
+        reconcile_activation_barrier_unlocked(store_path, auth_path, reload_enabled, reload)?
+    {
+        require_confirmed_activation(outcome)
+            .context("import is blocked by unresolved prior runtime convergence")?;
+    }
+
+    let (account_count, prepared) = {
+        let store_lock = lock_account_store(store_path)?;
+        let snapshot = store_lock.load()?;
+        let replacement_accounts = if preserve_active {
+            preserve_host_active_account(imported_accounts, &snapshot.accounts)?
+        } else {
+            imported_accounts
+        };
+        let account_count = replacement_accounts.len();
+        let mut generation = snapshot.generation;
+        let mut stored_accounts = snapshot.accounts;
+        let outcome = replace_accounts_with(
+            &store_lock,
+            &mut generation,
+            &mut stored_accounts,
+            replacement_accounts,
+            auth_path,
+            false,
+            |_| bail!("runtime reload was requested during locked import preparation"),
+        )?;
+        (account_count, outcome)
+    };
+
+    if !reload_enabled || !prepared.is_file_only() {
+        return Ok((account_count, prepared));
+    }
+    let outcome = reconcile_activation_barrier_unlocked(store_path, auth_path, true, reload)?
+        .context("import activation disappeared before runtime convergence")?;
+    Ok((account_count, outcome))
 }
 
 fn preserve_host_active_account(
@@ -740,10 +804,19 @@ fn swap_with_reload<R>(
     reload: R,
 ) -> Result<(String, ReloadSummary)>
 where
-    R: FnMut(&Path) -> Result<ReloadSummary>,
+    R: Fn(&Path) -> Result<ReloadSummary>,
 {
-    let store_lock = lock_account_store(store_path)?;
-    let snapshot = store_lock.load()?;
+    let prior_summary = if let Some(outcome) =
+        reconcile_activation_barrier_unlocked(store_path, auth_path, true, &reload)?
+    {
+        Some(
+            require_confirmed_activation(outcome)
+                .context("swap is blocked by unresolved prior runtime convergence")?,
+        )
+    } else {
+        None
+    };
+    let snapshot = load_account_store_snapshot(store_path)?;
     let mut generation = snapshot.generation;
     let mut accounts = snapshot.accounts;
     let target_id = resolve_account_selector(&accounts, selector)?;
@@ -752,16 +825,19 @@ where
         .find(|account| account.id == target_id)
         .map(|account| account.email.clone())
         .context("activation target disappeared")?;
-    let outcome = activate_with(
-        ActivationContext {
-            store_lock: &store_lock,
-            generation: &mut generation,
-            accounts: &mut accounts,
-            auth_path,
-            target_id,
-            reload_enabled: true,
-        },
-        reload,
+    if active_account(&accounts).map(|account| account.id) == Some(target_id) {
+        if let Some(summary) = prior_summary {
+            return Ok((target_email, summary));
+        }
+    }
+    let outcome = activate_with_unlocked_reload(
+        store_path,
+        auth_path,
+        &mut generation,
+        &mut accounts,
+        target_id,
+        true,
+        &reload,
     )?;
     let summary = require_confirmed_activation(outcome)?;
     Ok((target_email, summary))
@@ -781,19 +857,10 @@ fn resolve_activation(store_path: &Path, auth_path: &Path, yes: bool, json: bool
         bail!("resolve-activation requires --yes after reviewing the activation record");
     }
 
-    let store_lock = lock_account_store(store_path)?;
-    let snapshot = store_lock.load()?;
-    let mut generation = snapshot.generation;
-    let mut accounts = snapshot.accounts;
-    let outcome = resolve_manual_review_activation(
-        ActivationBarrierContext {
-            store_lock: &store_lock,
-            generation: &mut generation,
-            accounts: &mut accounts,
-            auth_path,
-            reload_enabled: true,
-        },
-        reload_codex_hot_swap_processes,
+    let outcome = resolve_manual_review_activation_unlocked(
+        store_path,
+        auth_path,
+        &reload_codex_hot_swap_processes,
     )?;
     let report = ResolveActivationReport {
         state: outcome.state,
@@ -840,6 +907,28 @@ fn require_rotation_activation(
     )
 }
 
+fn require_rotation_receipt_proof(
+    summary: &ReloadSummary,
+    receipt_nonce: Option<Uuid>,
+    reload_processes: bool,
+) -> Result<()> {
+    let Some(receipt_nonce) = receipt_nonce else {
+        return Ok(());
+    };
+    if !reload_processes {
+        bail!("receipt-bound rotation requires live runtime reload");
+    }
+    if summary.receipt_nonce != Some(receipt_nonce) {
+        bail!("runtime reload did not preserve the requested receipt nonce");
+    }
+    if !summary.verified_hot_swap() {
+        bail!(
+            "receipt-bound rotation lacks complete request, acknowledgement, count, or topology proof"
+        );
+    }
+    Ok(())
+}
+
 fn ensure_reload_converged(skipped: &[(i32, String)]) -> Result<()> {
     if skipped.is_empty() {
         return Ok(());
@@ -862,9 +951,15 @@ struct RedeemResetReport {
     remaining_percent: Option<f64>,
 }
 
-pub(crate) fn redeem_reset(store_path: &Path, selector: &str, json_output: bool) -> Result<()> {
+pub(crate) fn redeem_reset(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    json_output: bool,
+) -> Result<()> {
     let report = redeem_reset_with(
         store_path,
+        auth_path,
         selector,
         fetch_quota,
         fetch_rate_limit_reset_bank,
@@ -889,6 +984,7 @@ pub(crate) fn redeem_reset(store_path: &Path, selector: &str, json_output: bool)
 
 fn redeem_reset_with<F, B, C>(
     store_path: &Path,
+    auth_path: &Path,
     selector: &str,
     fetch_quota_fn: F,
     fetch_reset_bank_fn: B,
@@ -899,8 +995,9 @@ where
     B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
     C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
 {
-    let store_lock = lock_account_store(store_path)?;
-    let snapshot = store_lock.load()?;
+    let snapshot = preflight_provider_io_activation(store_path, auth_path)
+        .context("targeted reset activation preflight failed")?;
+    let activation_guard = snapshot.guard;
     let mut generation = snapshot.generation;
     let mut accounts = snapshot.accounts;
     let target_id = resolve_account_selector(&accounts, selector)?;
@@ -908,7 +1005,15 @@ where
         .iter()
         .position(|account| account.id == target_id)
         .context("resolved reset target disappeared from the account store")?;
+    if !accounts[target_index].has_complete_token_material() {
+        bail!(
+            "banked reset redemption requires complete runtime credentials for {}",
+            accounts[target_index].email
+        );
+    }
 
+    validate_provider_io_activation(store_path, auth_path, &activation_guard)
+        .context("targeted reset activation changed before quota refresh")?;
     let quota_result = fetch_quota_fn(&accounts[target_index]).with_context(|| {
         format!(
             "failed to refresh quota for {}",
@@ -917,18 +1022,42 @@ where
     })?;
     apply_fetch_result(&mut accounts[target_index], quota_result);
 
-    if accounts[target_index].plan_priority() != 4 {
+    if accounts[target_index].plan_priority() <= 1 {
         let email = accounts[target_index].email.clone();
-        commit_accounts(&store_lock, &mut generation, &accounts)?;
-        bail!("banked reset redemption requires a Pro account; {email} is not Pro");
+        let store_lock = lock_account_store(store_path)?;
+        if store_lock.load()?.generation != generation {
+            bail!(
+                "account store changed during targeted reset observation; retry from fresh state"
+            );
+        }
+        commit_accounts_with_provider_io_activation(
+            &store_lock,
+            &mut generation,
+            &accounts,
+            auth_path,
+            &activation_guard,
+        )?;
+        bail!("banked reset redemption requires a paid account; {email} is not paid");
     }
 
     let previous_bank = accounts[target_index].rate_limit_reset_bank.clone();
-    let observed_bank = match fetch_reset_bank_fn(&accounts[target_index]) {
+    validate_provider_io_activation(store_path, auth_path, &activation_guard)
+        .context("targeted reset activation changed before reset-bank refresh")?;
+    let observed_bank_result = fetch_reset_bank_fn(&accounts[target_index]);
+    let store_lock = lock_account_store(store_path)?;
+    validate_provider_io_activation_locked(&store_lock, auth_path, &activation_guard)
+        .context("targeted reset activation changed during provider observation")?;
+    let observed_bank = match observed_bank_result {
         Ok(bank) => bank,
         Err(error) => {
             let email = accounts[target_index].email.clone();
-            commit_accounts(&store_lock, &mut generation, &accounts)?;
+            commit_accounts_with_provider_io_activation(
+                &store_lock,
+                &mut generation,
+                &accounts,
+                auth_path,
+                &activation_guard,
+            )?;
             return Err(error).with_context(|| format!("failed to refresh reset bank for {email}"));
         }
     };
@@ -948,7 +1077,7 @@ where
     accounts[target_index].runtime_unusable_reason = None;
 
     let mut submitted_reset = false;
-    let flow_result = reconcile_or_attempt_reset(
+    let flow_result = reconcile_or_attempt_reset_with_provider_guard(
         ResetReconciliationContext {
             store_lock: &store_lock,
             account: &mut accounts[target_index],
@@ -969,6 +1098,9 @@ where
                 consume_reset_fn(account, bank, request_id)
             },
         ),
+        |store_lock| {
+            validate_provider_io_activation_locked(store_lock, auth_path, &activation_guard)
+        },
     );
 
     let usable_success = flow_result
@@ -986,7 +1118,13 @@ where
         .unwrap_or(previous_banked_resets);
     let remaining_percent = real_quota_snapshot(&accounts[target_index])
         .and_then(QuotaSnapshot::minimum_remaining_percent);
-    commit_accounts(&store_lock, &mut generation, &accounts)?;
+    commit_accounts_with_provider_io_activation(
+        &store_lock,
+        &mut generation,
+        &accounts,
+        auth_path,
+        &activation_guard,
+    )?;
 
     let flow = flow_result.with_context(|| format!("reset reconciliation failed for {email}"))?;
     if !flow.is_usable_success() {
@@ -1017,6 +1155,7 @@ where
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RotateNowReport {
+    receipt_nonce: Option<Uuid>,
     reason: String,
     previous_email: String,
     previous_token_hash_prefix: String,
@@ -1027,9 +1166,13 @@ struct RotateNowReport {
     activation_state: ActivationState,
     runtime_converged: bool,
     reload_attempted: bool,
+    topology_verified: bool,
+    request_count: usize,
+    sighup_sent_processes: usize,
     signaled_processes: usize,
     restarted_processes: usize,
     skipped_processes: usize,
+    acknowledged_request_nonces: Vec<String>,
     used_banked_reset: bool,
     banked_resets_remaining: Option<u32>,
     reset_reason: Option<SmartResetReason>,
@@ -1044,9 +1187,26 @@ pub(crate) fn rotate_now(
     cooldown_seconds: i64,
     allow_banked_reset: bool,
     reload_processes: bool,
+    receipt_nonce: Option<Uuid>,
     json_output: bool,
 ) -> Result<()> {
-    let report = rotate_now_with_resets(
+    if receipt_nonce.is_some() && !reload_processes {
+        bail!("--receipt-nonce cannot be combined with --offline-file-only");
+    }
+    let receipt_evidence = std::cell::RefCell::new(ReloadSummary {
+        topology_verified: true,
+        receipt_nonce,
+        ..ReloadSummary::default()
+    });
+    let reload = |path: &Path| match receipt_nonce {
+        Some(receipt_nonce) => reload_codex_hot_swap_processes_for_receipt(path, receipt_nonce)
+            .map(|summary| {
+                merge_reload_evidence(&mut receipt_evidence.borrow_mut(), &summary);
+                summary
+            }),
+        None => reload_codex_hot_swap_processes(path),
+    };
+    let mut report = rotate_now_with_resets(
         RotateNowContext {
             store_path,
             auth_path,
@@ -1054,14 +1214,27 @@ pub(crate) fn rotate_now(
             cooldown_seconds,
             reload_processes,
             allow_banked_reset,
+            receipt_nonce,
         },
         RotateNowDependencies::new(
             fetch_quota,
             fetch_rate_limit_reset_bank,
             consume_rate_limit_reset,
-            reload_codex_hot_swap_processes,
+            reload,
         ),
     )?;
+    if receipt_nonce.is_some() {
+        let evidence = receipt_evidence.into_inner();
+        require_rotation_receipt_proof(&evidence, receipt_nonce, reload_processes)?;
+        report.topology_verified = evidence.topology_verified;
+        report.request_count = evidence.generated_request_nonces.len();
+        report.sighup_sent_processes = evidence.sighup_sent.len();
+        report.signaled_processes = evidence.signaled.len();
+        report.restarted_processes = evidence.restarted.len();
+        report.skipped_processes = evidence.skipped.len();
+        report.acknowledged_request_nonces = evidence.acknowledged_request_nonces;
+        report.skipped = evidence.skipped;
+    }
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1110,6 +1283,22 @@ pub(crate) fn rotate_now(
     Ok(())
 }
 
+fn merge_reload_evidence(aggregate: &mut ReloadSummary, summary: &ReloadSummary) {
+    aggregate.topology_verified &= summary.topology_verified;
+    aggregate
+        .sighup_sent
+        .extend_from_slice(&summary.sighup_sent);
+    aggregate.signaled.extend_from_slice(&summary.signaled);
+    aggregate.restarted.extend_from_slice(&summary.restarted);
+    aggregate.skipped.extend(summary.skipped.iter().cloned());
+    aggregate
+        .generated_request_nonces
+        .extend(summary.generated_request_nonces.iter().cloned());
+    aggregate
+        .acknowledged_request_nonces
+        .extend(summary.acknowledged_request_nonces.iter().cloned());
+}
+
 #[cfg(test)]
 fn rotate_now_with<F, R>(
     store_path: &Path,
@@ -1132,6 +1321,7 @@ where
             cooldown_seconds,
             reload_processes,
             allow_banked_reset: false,
+            receipt_nonce: None,
         },
         RotateNowDependencies::new(
             fetch_quota_fn,
@@ -1151,6 +1341,7 @@ struct RotateNowContext<'a> {
     cooldown_seconds: i64,
     reload_processes: bool,
     allow_banked_reset: bool,
+    receipt_nonce: Option<Uuid>,
 }
 
 struct RotateNowDependencies<F, B, C, R> {
@@ -1209,6 +1400,7 @@ where
         cooldown_seconds,
         reload_processes,
         allow_banked_reset,
+        receipt_nonce,
     } = context;
     let RotateNowDependencies {
         fetch_quota: fetch_quota_fn,
@@ -1216,28 +1408,40 @@ where
         consume_reset: consume_reset_fn,
         reload: reload_fn,
     } = dependencies;
-    let store_lock = lock_account_store(store_path)?;
-    let snapshot = store_lock.load()?;
-    let mut generation = snapshot.generation;
-    let mut accounts = snapshot.accounts;
-    if let Some(outcome) = reconcile_activation_barrier(
-        ActivationBarrierContext {
-            store_lock: &store_lock,
-            generation: &mut generation,
-            accounts: &mut accounts,
-            auth_path,
-            reload_enabled: reload_processes,
-        },
-        &reload_fn,
-    )? {
+    if receipt_nonce.is_some() && !reload_processes {
+        bail!("receipt-bound rotation requires live runtime reload");
+    }
+    if let Some(outcome) =
+        reconcile_activation_barrier_unlocked(store_path, auth_path, reload_processes, &reload_fn)?
+    {
         // This outcome belongs to an activation that predated the current
         // command. Offline mode may create FileOnly for the new request, but it
         // must never waive runtime convergence of an older barrier.
         require_confirmed_activation(outcome)?;
-        let refreshed = load_after_barrier(&store_lock)?;
-        generation = refreshed.generation;
-        accounts = refreshed.accounts;
+        let store_lock = lock_account_store(store_path)?;
+        let _ = load_after_barrier(&store_lock)?;
     }
+    let snapshot = preflight_provider_io_activation(store_path, auth_path)
+        .context("rotate-now provider-I/O activation preflight failed")?;
+    let activation_guard = snapshot.guard;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let fetch_quota_fn = |account: &account_store::CodexAccount| {
+        validate_provider_io_activation(store_path, auth_path, &activation_guard)
+            .context("rotate-now activation changed before quota provider I/O")?;
+        fetch_quota_fn(account)
+    };
+    let fetch_reset_bank_fn = |account: &account_store::CodexAccount| {
+        validate_provider_io_activation(store_path, auth_path, &activation_guard)
+            .context("rotate-now activation changed before reset-bank provider I/O")?;
+        fetch_reset_bank_fn(account)
+    };
+    let consume_reset_fn =
+        |account: &account_store::CodexAccount, bank: &RateLimitResetBank, request_id: Uuid| {
+            validate_provider_io_activation(store_path, auth_path, &activation_guard)
+                .context("rotate-now activation changed before reset provider submission")?;
+            consume_reset_fn(account, bank, request_id)
+        };
     let active_index = accounts
         .iter()
         .position(|account| account.is_active)
@@ -1259,70 +1463,119 @@ where
     let candidate_observations = refresh_direct_rotation_candidates(&mut accounts, &fetch_quota_fn);
 
     if reason == "usage_limit" {
-        match orchestrate_reset(
-            ResetOrchestrationContext {
-                store_lock: &store_lock,
-                accounts: &mut accounts,
-                active_index,
-                candidate_observations: Some(&candidate_observations),
-                allow_reset: allow_banked_reset,
-                direct_runtime_usage_limit: true,
-                refresh_strategy: ResetQuotaRefreshStrategy::Direct,
-                now: Utc::now(),
-            },
-            ResetOrchestrationDependencies::new(
-                |account: &account_store::CodexAccount| fetch_reset_bank_fn(account),
-                |account: &mut account_store::CodexAccount, strategy| {
-                    debug_assert_eq!(strategy, ResetQuotaRefreshStrategy::Direct);
-                    let result = fetch_quota_fn(&*account)?;
-                    apply_fetch_result(account, result);
-                    Ok(())
+        let reset_result = (|| {
+            let store_lock = lock_account_store(store_path)?;
+            validate_provider_io_activation_locked(&store_lock, auth_path, &activation_guard)
+                .context("rotate-now activation changed during reset observation")?;
+            let outcome = orchestrate_reset_with_provider_guard(
+                ResetOrchestrationContext {
+                    store_lock: &store_lock,
+                    accounts: &mut accounts,
+                    active_index,
+                    candidate_observations: Some(&candidate_observations),
+                    allow_reset: allow_banked_reset,
+                    direct_runtime_usage_limit: true,
+                    refresh_strategy: ResetQuotaRefreshStrategy::Direct,
+                    now: Utc::now(),
                 },
-                |account: &account_store::CodexAccount,
-                 bank: &RateLimitResetBank,
-                 request_id| { consume_reset_fn(account, bank, request_id) },
-                |accounts: &mut [account_store::CodexAccount], active_index: usize| {
-                    let target_id = accounts[active_index].id;
-                    activate_with(
-                        ActivationContext {
-                            store_lock: &store_lock,
-                            generation: &mut generation,
-                            accounts,
+                ResetOrchestrationDependencies::new(
+                    |account: &account_store::CodexAccount| fetch_reset_bank_fn(account),
+                    |account: &mut account_store::CodexAccount, strategy| {
+                        debug_assert_eq!(strategy, ResetQuotaRefreshStrategy::Direct);
+                        let result = fetch_quota_fn(&*account)?;
+                        apply_fetch_result(account, result);
+                        Ok(())
+                    },
+                    |account: &account_store::CodexAccount,
+                     bank: &RateLimitResetBank,
+                     request_id| consume_reset_fn(account, bank, request_id),
+                    |_accounts: &mut [account_store::CodexAccount], index: usize| Ok(index),
+                ),
+                |store_lock| {
+                    validate_provider_io_activation_locked(store_lock, auth_path, &activation_guard)
+                },
+            )?;
+            validate_provider_io_activation_locked(
+                &store_lock,
+                auth_path,
+                &activation_guard,
+            )
+            .context(
+                "rotate-now activation changed during reset network I/O; the durable reset journal remains recoverable",
+            )?;
+            let prepared_activation = if let Some(index) = outcome.completion {
+                let target_id = accounts[index].id;
+                Some(activate_with(
+                    ActivationContext {
+                        store_lock: &store_lock,
+                        generation: &mut generation,
+                        accounts: &mut accounts,
+                        auth_path,
+                        target_id,
+                        reload_enabled: false,
+                    },
+                    |_| bail!("runtime reload was requested during the locked reset commit"),
+                )?)
+            } else {
+                None
+            };
+            Ok((outcome, prepared_activation))
+        })();
+        match reset_result {
+            Ok((outcome, prepared_activation)) => {
+                if let Some(prepared_activation) = prepared_activation {
+                    let activation = if reload_processes {
+                        reconcile_activation_barrier_unlocked(
+                            store_path,
                             auth_path,
-                            target_id,
-                            reload_enabled: reload_processes,
-                        },
-                        &reload_fn,
-                    )
-                },
-            ),
-        ) {
-            Ok(outcome) => {
-                if let Some(activation) = outcome.completion {
+                            true,
+                            &reload_fn,
+                        )?
+                        .context("reset activation disappeared before runtime convergence")?
+                    } else {
+                        prepared_activation
+                    };
                     let activation_state = activation.state;
                     let summary = require_rotation_activation(activation, reload_processes)?;
-                    let next_token_fingerprint = auth::account_token_fingerprint(
-                        &accounts[active_index],
-                    )
+                    require_rotation_receipt_proof(
+                        &summary,
+                        receipt_nonce,
+                        reload_processes,
+                    )?;
+                    let refreshed = load_account_store_snapshot(store_path)?;
+                    accounts = refreshed.accounts;
+                    let next_active_index = accounts
+                        .iter()
+                        .position(|account| account.is_active)
+                        .context("reset activation lost its active account")?;
+                    let next_token_fingerprint =
+                        auth::account_token_fingerprint(&accounts[next_active_index])
                     .context("reset activation has incomplete token material")?;
                     return Ok(RotateNowReport {
+                        receipt_nonce,
                         reason: reason.to_string(),
                         previous_email: previous_email.clone(),
                         previous_token_hash_prefix,
                         next_email: previous_email,
                         next_token_hash_prefix: token_hash_prefix(
-                            &accounts[active_index].access_token,
+                            &accounts[next_active_index].access_token,
                         ),
                         next_token_fingerprint,
                         auth_path: auth_path.display().to_string(),
                         activation_state,
                         runtime_converged: summary.verified_hot_swap(),
                         reload_attempted: reload_processes,
+                        topology_verified: summary.topology_verified,
+                        request_count: summary.generated_request_nonces.len(),
+                        sighup_sent_processes: summary.sighup_sent.len(),
                         signaled_processes: summary.signaled.len(),
                         restarted_processes: summary.restarted.len(),
                         skipped_processes: summary.skipped.len(),
+                        acknowledged_request_nonces: summary
+                            .acknowledged_request_nonces
+                            .clone(),
                         used_banked_reset: true,
-                        banked_resets_remaining: accounts[active_index]
+                        banked_resets_remaining: accounts[next_active_index]
                             .rate_limit_reset_bank
                             .as_ref()
                             .map(|bank| bank.available_count),
@@ -1361,28 +1614,40 @@ where
         Utc::now(),
     )
     .cloned() else {
-        commit_accounts(&store_lock, &mut generation, &accounts)?;
+        let store_lock = lock_account_store(store_path)?;
+        if store_lock.load()?.generation != generation {
+            bail!("account store changed before rotate-now fallback commit");
+        }
+        commit_accounts_with_provider_io_activation(
+            &store_lock,
+            &mut generation,
+            &accounts,
+            auth_path,
+            &activation_guard,
+        )?;
         bail!(
             "marked {previous_email} unusable but no freshly confirmed usable replacement exists"
         );
     };
 
-    let activation = activate_with(
-        ActivationContext {
-            store_lock: &store_lock,
-            generation: &mut generation,
-            accounts: &mut accounts,
-            auth_path,
-            target_id: target.id,
-            reload_enabled: reload_processes,
-        },
+    validate_provider_io_activation(store_path, auth_path, &activation_guard)
+        .context("rotate-now activation changed before rotation")?;
+    let activation = activate_with_unlocked_reload(
+        store_path,
+        auth_path,
+        &mut generation,
+        &mut accounts,
+        target.id,
+        reload_processes,
         &reload_fn,
     )?;
     let activation_state = activation.state;
     let summary = require_rotation_activation(activation, reload_processes)?;
+    require_rotation_receipt_proof(&summary, receipt_nonce, reload_processes)?;
     let next_token_fingerprint = auth::account_token_fingerprint(&target)
         .context("rotation target has incomplete token material")?;
     Ok(RotateNowReport {
+        receipt_nonce,
         reason: reason.to_string(),
         previous_email,
         previous_token_hash_prefix,
@@ -1393,9 +1658,13 @@ where
         activation_state,
         runtime_converged: summary.verified_hot_swap(),
         reload_attempted: reload_processes,
+        topology_verified: summary.topology_verified,
+        request_count: summary.generated_request_nonces.len(),
+        sighup_sent_processes: summary.sighup_sent.len(),
         signaled_processes: summary.signaled.len(),
         restarted_processes: summary.restarted.len(),
         skipped_processes: summary.skipped.len(),
+        acknowledged_request_nonces: summary.acknowledged_request_nonces.clone(),
         used_banked_reset: false,
         banked_resets_remaining: accounts[active_index]
             .rate_limit_reset_bank
@@ -1426,9 +1695,30 @@ where
     observations
 }
 
-pub(crate) fn poll(store_path: &Path, selector: Option<&str>) -> Result<()> {
-    let store_lock = lock_account_store(store_path)?;
-    let snapshot = store_lock.load()?;
+pub(crate) fn poll(store_path: &Path, auth_path: &Path, selector: Option<&str>) -> Result<()> {
+    poll_with(
+        store_path,
+        auth_path,
+        selector,
+        fetch_quota,
+        fetch_rate_limit_reset_bank,
+    )
+}
+
+fn poll_with<F, B>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: Option<&str>,
+    fetch_quota_fn: F,
+    fetch_reset_bank_fn: B,
+) -> Result<()>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+{
+    let snapshot = preflight_provider_io_activation(store_path, auth_path)
+        .context("poll activation preflight failed")?;
+    let activation_guard = snapshot.guard;
     let mut generation = snapshot.generation;
     let mut accounts = snapshot.accounts;
     let selectors: Vec<String> = match selector {
@@ -1449,10 +1739,14 @@ pub(crate) fn poll(store_path: &Path, selector: Option<&str>) -> Result<()> {
             continue;
         };
 
-        let result = fetch_quota(&accounts[index])
+        validate_provider_io_activation(store_path, auth_path, &activation_guard)
+            .context("poll activation changed before quota callback")?;
+        let result = fetch_quota_fn(&accounts[index])
             .with_context(|| format!("failed to poll {}", accounts[index].email))?;
         apply_fetch_result(&mut accounts[index], result);
-        match fetch_rate_limit_reset_bank(&accounts[index]) {
+        validate_provider_io_activation(store_path, auth_path, &activation_guard)
+            .context("poll activation changed before reset-bank callback")?;
+        match fetch_reset_bank_fn(&accounts[index]) {
             Ok(bank) => {
                 let available_count = bank.available_count;
                 accounts[index].rate_limit_reset_bank = Some(bank);
@@ -1471,7 +1765,14 @@ pub(crate) fn poll(store_path: &Path, selector: Option<&str>) -> Result<()> {
         }
     }
 
-    commit_accounts(&store_lock, &mut generation, &accounts)?;
+    let store_lock = lock_account_store(store_path)?;
+    commit_accounts_with_provider_io_activation(
+        &store_lock,
+        &mut generation,
+        &accounts,
+        auth_path,
+        &activation_guard,
+    )?;
     Ok(())
 }
 
@@ -1484,8 +1785,12 @@ struct AuthInfo {
     token_hash_prefix: Option<String>,
 }
 
+const AUTH_DIAGNOSTIC_MAX_BYTES: usize = 1024 * 1024;
+
 fn read_auth_info(auth_path: &Path) -> Result<AuthInfo> {
-    if !auth_path.exists() {
+    let snapshot = secure_file::observe(auth_path, AUTH_DIAGNOSTIC_MAX_BYTES, true)
+        .with_context(|| format!("failed to securely observe {}", auth_path.display()))?;
+    let Some(bytes) = snapshot.bytes() else {
         return Ok(AuthInfo {
             exists: false,
             mtime: None,
@@ -1493,25 +1798,22 @@ fn read_auth_info(auth_path: &Path) -> Result<AuthInfo> {
             token_fingerprint: None,
             token_hash_prefix: None,
         });
-    }
+    };
 
-    let metadata = fs::metadata(auth_path)
-        .with_context(|| format!("failed to stat {}", auth_path.display()))?;
-    let mtime = metadata
-        .modified()
-        .ok()
-        .map(chrono::DateTime::<Utc>::from)
+    let mtime = snapshot
+        .modified_unix()
+        .and_then(|(seconds, nanoseconds)| {
+            chrono::DateTime::<Utc>::from_timestamp(seconds, nanoseconds)
+        })
         .map(|time| time.to_rfc3339());
-    let value: Value = serde_json::from_slice(
-        &fs::read(auth_path).with_context(|| format!("failed to read {}", auth_path.display()))?,
-    )
-    .with_context(|| format!("failed to decode {}", auth_path.display()))?;
+    let value: Value = serde_json::from_slice(bytes)
+        .with_context(|| format!("failed to decode {}", auth_path.display()))?;
     let tokens = value.get("tokens").and_then(|tokens| tokens.as_object());
     let account_id = tokens
         .and_then(|tokens| tokens.get("account_id"))
         .and_then(|value| value.as_str())
         .map(str::to_string);
-    let token_fingerprint = auth::auth_file_fingerprint(auth_path);
+    let token_fingerprint = diagnostic_auth_fingerprint(&value);
     let token_hash_prefix = token_fingerprint.as_deref().map(fingerprint_hash_prefix);
 
     Ok(AuthInfo {
@@ -1521,6 +1823,32 @@ fn read_auth_info(auth_path: &Path) -> Result<AuthInfo> {
         token_fingerprint,
         token_hash_prefix,
     })
+}
+
+fn diagnostic_auth_fingerprint(value: &Value) -> Option<String> {
+    let tokens = value.get("tokens")?;
+    let parts = [
+        tokens.get("id_token")?.as_str()?,
+        tokens.get("access_token")?.as_str()?,
+        tokens.get("refresh_token")?.as_str()?,
+        tokens.get("account_id")?.as_str()?,
+    ];
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    let mut context = DigestContext::new(&SHA256);
+    for part in parts {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part.as_bytes());
+    }
+    Some(
+        context
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn fingerprint_hash_prefix(fingerprint: &str) -> String {
@@ -1628,7 +1956,11 @@ mod tests {
         CodexAccount, QuotaWindow, QuotaWindowRateLimitSource, QuotaWindowSlot,
         QuotaWindowSourceMetadata,
     };
-    use std::os::unix::fs::PermissionsExt;
+    use std::ffi::CString;
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1696,6 +2028,161 @@ mod tests {
         ReloadSummary {
             sighup_sent: vec![42],
             signaled: vec![42],
+            topology_verified: true,
+            ..ReloadSummary::default()
+        }
+    }
+
+    fn confirm_provider_io_activation(store_path: &Path, auth_path: &Path) -> Result<()> {
+        let accounts = load_accounts(store_path)?;
+        let active = active_account(&accounts)
+            .context("provider-I/O test fixture requires one active account")?;
+        auth::write_auth_file(auth_path, active)?;
+        swap_with_reload(store_path, auth_path, &active.email, |_| {
+            Ok(verified_reload_summary())
+        })?;
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum BlockedProviderIoActivation {
+        State(ActivationState),
+        Missing,
+        Malformed,
+        UnknownKind,
+        StaleGeneration,
+        IncompleteTransition,
+    }
+
+    fn blocked_provider_io_activations() -> Vec<(&'static str, BlockedProviderIoActivation)> {
+        vec![
+            (
+                "prepared",
+                BlockedProviderIoActivation::State(ActivationState::Prepared),
+            ),
+            (
+                "file-only",
+                BlockedProviderIoActivation::State(ActivationState::FileOnly),
+            ),
+            (
+                "committed-degraded",
+                BlockedProviderIoActivation::State(ActivationState::CommittedDegraded),
+            ),
+            (
+                "rolled-back",
+                BlockedProviderIoActivation::State(ActivationState::RolledBack),
+            ),
+            (
+                "manual-review",
+                BlockedProviderIoActivation::State(ActivationState::ManualReview),
+            ),
+            ("missing", BlockedProviderIoActivation::Missing),
+            ("malformed", BlockedProviderIoActivation::Malformed),
+            ("unknown-kind", BlockedProviderIoActivation::UnknownKind),
+            (
+                "stale-generation",
+                BlockedProviderIoActivation::StaleGeneration,
+            ),
+            (
+                "incomplete-transition",
+                BlockedProviderIoActivation::IncompleteTransition,
+            ),
+        ]
+    }
+
+    fn overwrite_test_activation_record(
+        store_path: &Path,
+        record: &activation::ActivationRecord,
+    ) -> Result<()> {
+        let path = activation::activation_record_path(store_path);
+        fs::write(&path, serde_json::to_vec_pretty(record)?)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    fn set_test_activation_state(store_path: &Path, state: ActivationState) -> Result<()> {
+        let store_lock = lock_account_store(store_path)?;
+        let mut record = activation::read_activation_record(&store_lock)?
+            .context("test activation record disappeared")?;
+        record.state = state;
+        overwrite_test_activation_record(store_path, &record)
+    }
+
+    fn install_blocked_provider_io_activation(
+        store_path: &Path,
+        auth_path: &Path,
+        active: &CodexAccount,
+        fixture: BlockedProviderIoActivation,
+    ) -> Result<()> {
+        auth::write_auth_file(auth_path, active)?;
+        if matches!(fixture, BlockedProviderIoActivation::Missing) {
+            return Ok(());
+        }
+
+        confirm_provider_io_activation(store_path, auth_path)?;
+        let record_path = activation::activation_record_path(store_path);
+        if matches!(fixture, BlockedProviderIoActivation::Malformed) {
+            fs::write(&record_path, b"{not-json")?;
+            fs::set_permissions(record_path, fs::Permissions::from_mode(0o600))?;
+            return Ok(());
+        }
+
+        let store_lock = lock_account_store(store_path)?;
+        let mut record = activation::read_activation_record(&store_lock)?
+            .context("blocked provider-I/O fixture lost its activation record")?;
+        drop(store_lock);
+        match fixture {
+            BlockedProviderIoActivation::State(state) => record.state = state,
+            BlockedProviderIoActivation::UnknownKind => {
+                record.kind = activation::ActivationKind::Unknown;
+            }
+            BlockedProviderIoActivation::StaleGeneration => {
+                record.store_generation = "stale-generation".to_string();
+            }
+            BlockedProviderIoActivation::IncompleteTransition => {
+                record.base_store_generation = Some(record.store_generation.clone());
+            }
+            BlockedProviderIoActivation::Missing | BlockedProviderIoActivation::Malformed => {
+                unreachable!("terminal provider-I/O fixture was handled before record mutation")
+            }
+        }
+        overwrite_test_activation_record(store_path, &record)
+    }
+
+    fn assert_clean_provider_io_activation(
+        store_path: &Path,
+        auth_path: &Path,
+        expected_generation: &str,
+    ) -> Result<()> {
+        let store_lock = lock_account_store(store_path)?;
+        let current = store_lock.load()?;
+        let record = activation::read_activation_record(&store_lock)?
+            .context("activation preflight did not preserve confirmation")?;
+        assert_eq!(current.generation.as_str(), expected_generation);
+        assert_eq!(record.store_generation, expected_generation);
+        assert_eq!(record.base_store_generation, None);
+        assert_eq!(record.owned_store_generation, None);
+        let current_active = active_account(&current.accounts)
+            .context("provider callback lost the active account")?;
+        let auth_fingerprint = auth::auth_file_fingerprint(auth_path);
+        assert!(activation::activation_record_confirms_current(
+            &record,
+            current_active,
+            &current.generation,
+            auth_fingerprint.as_deref(),
+        ));
+        Ok(())
+    }
+
+    fn verified_receipt_reload_summary(receipt_nonce: Uuid) -> ReloadSummary {
+        let request_nonce = format!("{receipt_nonce}:{}", Uuid::new_v4());
+        ReloadSummary {
+            sighup_sent: vec![42],
+            signaled: vec![42],
+            topology_verified: true,
+            receipt_nonce: Some(receipt_nonce),
+            generated_request_nonces: vec![request_nonce.clone()],
+            acknowledged_request_nonces: vec![request_nonce],
             ..ReloadSummary::default()
         }
     }
@@ -1722,10 +2209,276 @@ mod tests {
         }
     }
 
+    #[test]
+    fn poll_releases_store_lock_and_advances_matching_confirmation() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let confirmed_before = activation::read_activation_record(&store_lock)?.unwrap();
+        drop(store_lock);
+
+        let quota_store_path = store_path.clone();
+        let bank_store_path = store_path.clone();
+        poll_with(
+            &store_path,
+            &auth_path,
+            None,
+            move |account| {
+                assert_store_lock_available(&quota_store_path)?;
+                fetch_from_account(account)
+            },
+            move |_account| {
+                assert_store_lock_available(&bank_store_path)?;
+                Ok(reset_bank(&["credit-a"]))
+            },
+        )?;
+
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let confirmed_after = activation::read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(confirmed_after.state, ActivationState::Confirmed);
+        assert_eq!(
+            confirmed_after.store_generation,
+            snapshot.generation.as_str()
+        );
+        assert_eq!(confirmed_after.updated_at, confirmed_before.updated_at);
+        Ok(())
+    }
+
+    #[test]
+    fn poll_revalidates_generation_after_unlocked_provider_io() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+
+        let mutation_path = store_path.clone();
+        let mut concurrent = active.clone();
+        concurrent.plan_type = Some("concurrent-plan".to_string());
+        let error = poll_with(
+            &store_path,
+            &auth_path,
+            None,
+            move |account| {
+                assert_store_lock_available(&mutation_path)?;
+                save_accounts(&mutation_path, std::slice::from_ref(&concurrent))?;
+                fetch_from_account(account)
+            },
+            |_account| Ok(reset_bank(&[])),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("provider-I/O activation guard"));
+        assert_eq!(
+            load_accounts(&store_path)?[0].plan_type.as_deref(),
+            Some("concurrent-plan")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn poll_refuses_followup_io_and_commit_after_journal_only_transition() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let store_before = fs::read(&store_path)?;
+
+        let transition_path = store_path.clone();
+        let quota_calls = Arc::new(Mutex::new(0usize));
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let error = poll_with(
+            &store_path,
+            &auth_path,
+            None,
+            {
+                let quota_calls = Arc::clone(&quota_calls);
+                move |account| {
+                    *quota_calls.lock().unwrap() += 1;
+                    set_test_activation_state(&transition_path, ActivationState::Prepared)?;
+                    fetch_from_account(account)
+                }
+            },
+            {
+                let bank_calls = Arc::clone(&bank_calls);
+                move |_account| {
+                    *bank_calls.lock().unwrap() += 1;
+                    Ok(reset_bank(&[]))
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed activation journal"));
+        assert_eq!(*quota_calls.lock().unwrap(), 1);
+        assert_eq!(*bank_calls.lock().unwrap(), 0);
+        assert_eq!(fs::read(&store_path)?, store_before);
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .unwrap()
+                .state,
+            ActivationState::Prepared
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn poll_blocks_all_provider_callbacks_until_activation_is_current() -> Result<()> {
+        for (label, fixture) in blocked_provider_io_activations() {
+            let temp = secure_temp_dir()?;
+            let store_path = temp.path().join("accounts.json");
+            let auth_path = temp.path().join("auth.json");
+            let active = account("active@example.com", true, 10.0, 10.0);
+            save_accounts(&store_path, std::slice::from_ref(&active))?;
+            install_blocked_provider_io_activation(&store_path, &auth_path, &active, fixture)?;
+
+            let quota_calls = Arc::new(Mutex::new(0usize));
+            let bank_calls = Arc::new(Mutex::new(0usize));
+            let error = poll_with(
+                &store_path,
+                &auth_path,
+                None,
+                {
+                    let quota_calls = Arc::clone(&quota_calls);
+                    move |account| {
+                        *quota_calls.lock().unwrap() += 1;
+                        fetch_from_account(account)
+                    }
+                },
+                {
+                    let bank_calls = Arc::clone(&bank_calls);
+                    move |_account| {
+                        *bank_calls.lock().unwrap() += 1;
+                        Ok(reset_bank(&[]))
+                    }
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                format!("{error:#}").contains("poll activation preflight failed"),
+                "unexpected {label} failure: {error:#}"
+            );
+            assert_eq!(*quota_calls.lock().unwrap(), 0, "{label} quota callback");
+            assert_eq!(*bank_calls.lock().unwrap(), 0, "{label} bank callback");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn poll_finalizes_staged_confirmed_generation_before_provider_callback() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut accounts = snapshot.accounts;
+        accounts[0].plan_type = Some("staged-observation".to_string());
+        let prospective_generation = store_lock.prospective_generation(&accounts)?;
+        let mut record = activation::read_activation_record(&store_lock)?
+            .context("staged provider-I/O fixture lost its activation record")?;
+        let evidence_time = record.updated_at.to_owned();
+        record.base_store_generation = Some(snapshot.generation.as_str().to_string());
+        record.owned_store_generation = Some(prospective_generation.as_str().to_string());
+        overwrite_test_activation_record(&store_path, &record)?;
+        let mut committed_generation = snapshot.generation;
+        commit_accounts(&store_lock, &mut committed_generation, &accounts)?;
+        assert_eq!(committed_generation, prospective_generation);
+        drop(store_lock);
+
+        let callback_store_path = store_path.clone();
+        let callback_auth_path = auth_path.clone();
+        let callback_generation = prospective_generation.as_str().to_string();
+        let quota_calls = Arc::new(Mutex::new(0usize));
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        poll_with(
+            &store_path,
+            &auth_path,
+            None,
+            {
+                let quota_calls = Arc::clone(&quota_calls);
+                move |account| {
+                    assert_store_lock_available(&callback_store_path)?;
+                    assert_clean_provider_io_activation(
+                        &callback_store_path,
+                        &callback_auth_path,
+                        &callback_generation,
+                    )?;
+                    *quota_calls.lock().unwrap() += 1;
+                    fetch_from_account(account)
+                }
+            },
+            {
+                let bank_calls = Arc::clone(&bank_calls);
+                move |_account| {
+                    *bank_calls.lock().unwrap() += 1;
+                    Ok(reset_bank(&[]))
+                }
+            },
+        )?;
+
+        assert_eq!(*quota_calls.lock().unwrap(), 1);
+        assert_eq!(*bank_calls.lock().unwrap(), 1);
+        let store_lock = lock_account_store(&store_path)?;
+        let finalized = activation::read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(finalized.state, ActivationState::Confirmed);
+        assert_eq!(finalized.updated_at, evidence_time);
+        assert_eq!(finalized.base_store_generation, None);
+        assert_eq!(finalized.owned_store_generation, None);
+        Ok(())
+    }
+
     fn secure_temp_dir() -> Result<TempDir> {
         let temp = TempDir::new()?;
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
         Ok(temp)
+    }
+
+    fn assert_store_lock_available(store_path: &Path) -> Result<()> {
+        let lock_path = store_path.with_extension("json.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            bail!(
+                "account-store lock was held during callback: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let unlock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        if unlock_result != 0 {
+            bail!(
+                "failed to release callback probe lock: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    fn create_fifo(path: &Path) -> Result<()> {
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        let status = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error()).context("failed to create test FIFO")
+        }
     }
 
     #[test]
@@ -1814,6 +2567,37 @@ mod tests {
     }
 
     #[test]
+    fn auth_diagnostics_rejects_symlink_fifo_and_oversized_auth_without_locking() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+
+        let outside = temp.path().join("outside.json");
+        fs::write(&outside, b"outside")?;
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600))?;
+        symlink(&outside, &auth_path)?;
+        assert!(collect_auth_diagnostics(&store_path, &auth_path).is_err());
+        assert_eq!(fs::read(&outside)?, b"outside");
+        assert!(!auth_path.with_extension("json.lock").exists());
+        fs::remove_file(&auth_path)?;
+
+        create_fifo(&auth_path)?;
+        assert!(collect_auth_diagnostics(&store_path, &auth_path).is_err());
+        assert!(!auth_path.with_extension("json.lock").exists());
+        fs::remove_file(&auth_path)?;
+
+        let oversized = fs::File::create(&auth_path)?;
+        oversized.set_len((AUTH_DIAGNOSTIC_MAX_BYTES + 1) as u64)?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let error = collect_auth_diagnostics(&store_path, &auth_path).unwrap_err();
+        assert!(format!("{error:#}").contains("byte limit"));
+        assert!(!auth_path.with_extension("json.lock").exists());
+        Ok(())
+    }
+
+    #[test]
     fn swap_production_path_passes_custom_auth_path_to_reload() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
@@ -1824,12 +2608,14 @@ mod tests {
         auth::write_auth_file(&auth_path, &active)?;
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_for_reload = Arc::clone(&observed);
+        let reload_store_path = store_path.clone();
 
         let (email, _) = swap_with_reload(
             &store_path,
             &auth_path,
             &candidate.email,
             move |observed_path| {
+                assert_store_lock_available(&reload_store_path)?;
                 observed_for_reload
                     .lock()
                     .unwrap()
@@ -1845,6 +2631,39 @@ mod tests {
     }
 
     #[test]
+    fn import_production_path_runs_runtime_reload_without_store_lock() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let replacement = account("replacement@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        auth::write_auth_file(&auth_path, &active)?;
+        let reload_store_path = store_path.clone();
+
+        let (count, outcome) = replace_import_accounts_with_unlocked_reload(
+            &store_path,
+            &auth_path,
+            vec![replacement.clone()],
+            false,
+            true,
+            &move |_| {
+                assert_store_lock_available(&reload_store_path)?;
+                Ok(verified_reload_summary())
+            },
+        )?;
+
+        assert_eq!(count, 1);
+        assert!(outcome.is_confirmed());
+        assert_eq!(
+            active_account(&load_accounts(&store_path)?).map(|account| account.account_id.clone()),
+            Some(replacement.account_id.clone())
+        );
+        assert!(auth::auth_file_matches_account(&auth_path, &replacement));
+        Ok(())
+    }
+
+    #[test]
     fn rotation_production_path_passes_custom_auth_path_to_reload() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
@@ -1855,27 +2674,80 @@ mod tests {
         auth::write_auth_file(&auth_path, &active)?;
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_for_reload = Arc::clone(&observed);
+        let receipt_nonce = Uuid::parse_str("37f84870-9b39-45ae-aee9-3e0a63e1f989").unwrap();
 
-        let report = rotate_now_with(
-            &store_path,
-            &auth_path,
-            "usage_limit",
-            18_000,
-            true,
-            fetch_from_account,
-            move |observed_path| {
-                observed_for_reload
-                    .lock()
-                    .unwrap()
-                    .push(observed_path.to_path_buf());
-                Ok(verified_reload_summary())
+        let report = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 18_000,
+                reload_processes: true,
+                allow_banked_reset: false,
+                receipt_nonce: Some(receipt_nonce),
             },
+            RotateNowDependencies::new(
+                fetch_from_account,
+                |_account| bail!("reset inventory should not be fetched"),
+                |_account, _bank, _request_id| bail!("reset should not be consumed"),
+                move |observed_path| {
+                    observed_for_reload
+                        .lock()
+                        .unwrap()
+                        .push(observed_path.to_path_buf());
+                    Ok(verified_receipt_reload_summary(receipt_nonce))
+                },
+            ),
         )?;
 
         assert_eq!(report.next_email, candidate.email);
+        assert_eq!(report.receipt_nonce, Some(receipt_nonce));
         assert_eq!(report.auth_path, auth_path.display().to_string());
+        assert!(report.topology_verified);
+        assert_eq!(report.request_count, 1);
+        assert_eq!(report.sighup_sent_processes, 1);
+        assert_eq!(report.signaled_processes, 1);
+        assert_eq!(report.acknowledged_request_nonces.len(), 1);
+        assert!(report.acknowledged_request_nonces[0].starts_with(&format!("{receipt_nonce}:")));
         assert_eq!(*observed.lock().unwrap(), vec![auth_path.clone()]);
         assert!(auth::auth_file_matches_account(&auth_path, &candidate));
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_rotation_rejects_file_only_mode_before_mutation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let candidate = account("candidate@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active.clone(), candidate])?;
+        auth::write_auth_file(&auth_path, &active)?;
+        let store_before = fs::read(&store_path)?;
+        let auth_before = fs::read(&auth_path)?;
+
+        let error = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 18_000,
+                reload_processes: false,
+                allow_banked_reset: false,
+                receipt_nonce: Some(Uuid::new_v4()),
+            },
+            RotateNowDependencies::new(
+                |_account| bail!("quota must not be fetched"),
+                |_account| bail!("reset inventory must not be fetched"),
+                |_account, _bank, _request_id| bail!("reset must not be consumed"),
+                |_path| bail!("reload must not run"),
+            ),
+        )
+        .expect_err("receipt-bound file-only rotation must fail closed");
+
+        assert!(error.to_string().contains("requires live runtime reload"));
+        assert_eq!(fs::read(&store_path)?, store_before);
+        assert_eq!(fs::read(&auth_path)?, auth_before);
         Ok(())
     }
 
@@ -1926,6 +2798,48 @@ mod tests {
                 json: true,
             } if account == "pro@example.com"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_accepts_only_canonical_receipt_uuid() -> Result<()> {
+        let canonical = "37f84870-9b39-45ae-aee9-3e0a63e1f989";
+        let parsed = Args::try_parse_from([
+            "codexswitch-cli",
+            "rotate-now",
+            "--receipt-nonce",
+            canonical,
+        ])?;
+        assert!(matches!(
+            parsed.command,
+            Command::RotateNow {
+                receipt_nonce: Some(receipt_nonce),
+                ..
+            } if receipt_nonce.hyphenated().to_string() == canonical
+        ));
+
+        for invalid in [
+            "37F84870-9B39-45AE-AEE9-3E0A63E1F989",
+            "37f848709b3945aeaee93e0a63e1f989",
+            "{37f84870-9b39-45ae-aee9-3e0a63e1f989}",
+            "not-a-uuid",
+        ] {
+            assert!(Args::try_parse_from([
+                "codexswitch-cli",
+                "rotate-now",
+                "--receipt-nonce",
+                invalid,
+            ])
+            .is_err());
+        }
+        assert!(Args::try_parse_from([
+            "codexswitch-cli",
+            "rotate-now",
+            "--receipt-nonce",
+            canonical,
+            "--offline-file-only",
+        ])
+        .is_err());
         Ok(())
     }
 
@@ -2204,6 +3118,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: false,
+                receipt_nonce: None,
             },
             RotateNowDependencies::new(
                 fetch_from_account,
@@ -2278,6 +3193,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: true,
+                receipt_nonce: None,
             },
             RotateNowDependencies::new(
                 fetch_from_account,
@@ -2356,6 +3272,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: false,
                 allow_banked_reset: true,
+                receipt_nonce: None,
             },
             RotateNowDependencies::new(
                 {
@@ -2404,6 +3321,82 @@ mod tests {
     }
 
     #[test]
+    fn rotate_now_refuses_reset_rotation_and_commit_after_journal_only_transition() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let replacement = account("replacement@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let store_before = fs::read(&store_path)?;
+
+        let transition_path = store_path.clone();
+        let quota_calls = Arc::new(Mutex::new(0usize));
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let reload_calls = Arc::new(Mutex::new(0usize));
+        let error = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 21_600,
+                reload_processes: true,
+                allow_banked_reset: true,
+                receipt_nonce: None,
+            },
+            RotateNowDependencies::new(
+                {
+                    let quota_calls = Arc::clone(&quota_calls);
+                    move |account| {
+                        *quota_calls.lock().unwrap() += 1;
+                        set_test_activation_state(&transition_path, ActivationState::Prepared)?;
+                        fetch_from_account(account)
+                    }
+                },
+                {
+                    let bank_calls = Arc::clone(&bank_calls);
+                    move |_account| {
+                        *bank_calls.lock().unwrap() += 1;
+                        Ok(reset_bank(&["credit-a"]))
+                    }
+                },
+                {
+                    let consume_calls = Arc::clone(&consume_calls);
+                    move |_account, _bank, _request_id| {
+                        *consume_calls.lock().unwrap() += 1;
+                        bail!("journal-only transition must prevent rotate-now reset POST")
+                    }
+                },
+                {
+                    let reload_calls = Arc::clone(&reload_calls);
+                    move |_| {
+                        *reload_calls.lock().unwrap() += 1;
+                        Ok(verified_reload_summary())
+                    }
+                },
+            ),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed activation journal"));
+        assert_eq!(*quota_calls.lock().unwrap(), 1);
+        assert_eq!(*bank_calls.lock().unwrap(), 0);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        assert_eq!(*reload_calls.lock().unwrap(), 0);
+        assert_eq!(fs::read(&store_path)?, store_before);
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .unwrap()
+                .state,
+            ActivationState::Prepared
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rotate_now_repairs_legacy_barrier_then_selects_fresh_target() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
@@ -2443,6 +3436,7 @@ mod tests {
         let barrier_loads = Arc::new(Mutex::new(0usize));
         let barrier_loads_for_loader = Arc::clone(&barrier_loads);
         let fresh_for_loader = fresh_target.clone();
+        let auth_for_loader = auth_path.clone();
         let report = rotate_now_with_resets_and_barrier_loader(
             RotateNowContext {
                 store_path: &store_path,
@@ -2451,6 +3445,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: false,
+                receipt_nonce: None,
             },
             RotateNowDependencies::new(
                 fetch_from_account,
@@ -2477,7 +3472,12 @@ mod tests {
                 let mut fresh_accounts = snapshot.accounts;
                 fresh_accounts.push(fresh_for_loader.clone());
                 let mut fresh_generation = snapshot.generation;
-                commit_accounts(store_lock, &mut fresh_generation, &fresh_accounts)?;
+                activation::commit_accounts_with_confirmed_generation_continuity(
+                    store_lock,
+                    &mut fresh_generation,
+                    &fresh_accounts,
+                    &auth_for_loader,
+                )?;
                 store_lock.load()
             },
         )?;
@@ -2490,6 +3490,83 @@ mod tests {
             active_account(&load_accounts(&store_path)?)
                 .map(|account| account.email.as_str().to_string()),
             Some("fresh@example.com".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_no_candidate_advances_matching_confirmed_generation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        auth::write_auth_file(&auth_path, &active)?;
+        swap_with_reload(&store_path, &auth_path, &active.email, |_| {
+            Ok(verified_reload_summary())
+        })?;
+        let store_lock = lock_account_store(&store_path)?;
+        let confirmed_before = activation::read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(confirmed_before.state, ActivationState::Confirmed);
+        drop(store_lock);
+
+        let error = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "auth_failure",
+            300,
+            true,
+            |_| bail!("no inactive account should be polled"),
+            |_| bail!("no runtime reload should occur without a candidate"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("no freshly confirmed usable replacement"));
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let confirmed_after = activation::read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(confirmed_after.state, ActivationState::Confirmed);
+        assert_eq!(
+            confirmed_after.store_generation,
+            snapshot.generation.as_str()
+        );
+        assert_eq!(confirmed_after.updated_at, confirmed_before.updated_at);
+        assert_eq!(
+            active_account(&snapshot.accounts)
+                .and_then(|account| account.runtime_unusable_reason.as_deref()),
+            Some("auth_failure")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_now_no_candidate_fails_closed_without_matching_confirmation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        auth::write_auth_file(&auth_path, &active)?;
+        let generation_before = load_account_store_snapshot(&store_path)?.generation;
+
+        let error = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "auth_failure",
+            300,
+            true,
+            |_| bail!("no inactive account should be polled"),
+            |_| bail!("no runtime reload should occur without a candidate"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("current Confirmed activation record"));
+        let snapshot = load_account_store_snapshot(&store_path)?;
+        assert_eq!(snapshot.generation, generation_before);
+        assert_eq!(
+            active_account(&snapshot.accounts)
+                .and_then(|account| account.runtime_unusable_reason.as_deref()),
+            None
         );
         Ok(())
     }
@@ -2546,6 +3623,10 @@ mod tests {
         let bank_fetches_for_closure = Arc::clone(&bank_fetches);
         let consume_calls = Arc::new(Mutex::new(0usize));
         let consume_calls_for_closure = Arc::clone(&consume_calls);
+        let quota_store_path = store_path.clone();
+        let bank_store_path = store_path.clone();
+        let consume_store_path = store_path.clone();
+        let reload_store_path = store_path.clone();
         let report = rotate_now_with_resets(
             RotateNowContext {
                 store_path: &store_path,
@@ -2554,9 +3635,11 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: true,
+                receipt_nonce: None,
             },
             RotateNowDependencies::new(
                 move |account| {
+                    assert_store_lock_available(&quota_store_path)?;
                     let mut result = fetch_from_account(account)?;
                     if account.email == "active@example.com" {
                         let mut calls = active_fetches_for_closure.lock().unwrap();
@@ -2575,6 +3658,7 @@ mod tests {
                     Ok(result)
                 },
                 move |_account| {
+                    assert_store_lock_available(&bank_store_path)?;
                     let mut calls = bank_fetches_for_closure.lock().unwrap();
                     *calls += 1;
                     let available_count = u32::from(*calls == 1);
@@ -2598,13 +3682,17 @@ mod tests {
                     })
                 },
                 move |_account, _bank, _request_id| {
+                    assert_store_lock_available(&consume_store_path)?;
                     *consume_calls_for_closure.lock().unwrap() += 1;
                     Ok(ConsumeResult {
                         code: rate_limit_resets::ConsumeCode::Reset,
                         credit_id: None,
                     })
                 },
-                |_| Ok(verified_reload_summary()),
+                move |_| {
+                    assert_store_lock_available(&reload_store_path)?;
+                    Ok(verified_reload_summary())
+                },
             ),
         )?;
 
@@ -2634,27 +3722,418 @@ mod tests {
     }
 
     #[test]
-    fn targeted_reset_redeems_only_requested_pro_and_preserves_active_auth() -> Result<()> {
+    fn rotate_now_reload_failure_leaves_recoverable_barrier_without_second_reset() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 20.0, 100.0);
+        let mut replacement = account("replacement@example.com", false, 10.0, 10.0);
+        replacement.plan_type = Some("free".to_string());
+        save_accounts(&store_path, &[active.clone(), replacement])?;
+        auth::write_auth_file(&auth_path, &active)?;
+
+        let active_fetches = Arc::new(Mutex::new(0usize));
+        let bank_fetches = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let error = rotate_now_with_resets(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 21_600,
+                reload_processes: true,
+                allow_banked_reset: true,
+                receipt_nonce: None,
+            },
+            RotateNowDependencies::new(
+                {
+                    let active_fetches = Arc::clone(&active_fetches);
+                    move |account| {
+                        let mut result = fetch_from_account(account)?;
+                        if account.email == "active@example.com" {
+                            let mut calls = active_fetches.lock().unwrap();
+                            *calls += 1;
+                            if *calls > 1 {
+                                for window in &mut result.snapshot.windows {
+                                    window.used_percent = 0.0;
+                                    window.hard_limit_reached = false;
+                                }
+                                result.snapshot.allowed = Some(true);
+                                result.snapshot.limit_reached = Some(false);
+                            }
+                        }
+                        Ok(result)
+                    }
+                },
+                {
+                    let bank_fetches = Arc::clone(&bank_fetches);
+                    move |_account| {
+                        let mut calls = bank_fetches.lock().unwrap();
+                        *calls += 1;
+                        Ok(reset_bank(if *calls == 1 { &["credit-a"] } else { &[] }))
+                    }
+                },
+                {
+                    let consume_calls = Arc::clone(&consume_calls);
+                    move |_account, _bank, _request_id| {
+                        *consume_calls.lock().unwrap() += 1;
+                        Ok(ConsumeResult {
+                            code: rate_limit_resets::ConsumeCode::Reset,
+                            credit_id: Some("credit-a".to_string()),
+                        })
+                    }
+                },
+                |_| bail!("simulated cancellation before runtime acknowledgement"),
+            ),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("activation did not publish as swapped"));
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .unwrap()
+                .state,
+            ActivationState::CommittedDegraded
+        );
+        assert_eq!(
+            active_account(&store_lock.load()?.accounts).map(|account| account.email.as_str()),
+            Some("active@example.com")
+        );
+        drop(store_lock);
+
+        let recovered =
+            reconcile_activation_barrier_unlocked(&store_path, &auth_path, true, &|_| {
+                Ok(verified_reload_summary())
+            })?
+            .context("recoverable activation barrier disappeared")?;
+        assert!(recovered.is_confirmed());
+        assert_eq!(*consume_calls.lock().unwrap(), 1);
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .unwrap()
+                .state,
+            ActivationState::Confirmed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_refuses_post_and_commit_after_journal_only_transition() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let exhausted = account("exhausted@example.com", true, 0.0, 100.0);
+        save_accounts(&store_path, std::slice::from_ref(&exhausted))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let store_before = fs::read(&store_path)?;
+
+        let transition_path = store_path.clone();
+        let quota_calls = Arc::new(Mutex::new(0usize));
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let error = redeem_reset_with(
+            &store_path,
+            &auth_path,
+            &exhausted.email,
+            {
+                let quota_calls = Arc::clone(&quota_calls);
+                move |account| {
+                    *quota_calls.lock().unwrap() += 1;
+                    fetch_from_account(account)
+                }
+            },
+            {
+                let bank_calls = Arc::clone(&bank_calls);
+                move |_account| {
+                    *bank_calls.lock().unwrap() += 1;
+                    set_test_activation_state(&transition_path, ActivationState::Prepared)?;
+                    Ok(reset_bank(&["credit-a"]))
+                }
+            },
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    bail!("journal-only transition must prevent reset POST")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed activation journal"));
+        assert_eq!(*quota_calls.lock().unwrap(), 1);
+        assert_eq!(*bank_calls.lock().unwrap(), 1);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        assert_eq!(fs::read(&store_path)?, store_before);
+        assert!(!rate_limit_resets::reset_attempt_journal_path(&store_path).exists());
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .unwrap()
+                .state,
+            ActivationState::Prepared
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_engine_revalidates_activation_immediately_before_post() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let exhausted = account("exhausted@example.com", true, 0.0, 100.0);
+        save_accounts(&store_path, std::slice::from_ref(&exhausted))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let store_before = fs::read(&store_path)?;
+        let snapshot = preflight_provider_io_activation(&store_path, &auth_path)?;
+        let activation_guard = snapshot.guard;
+        let mut accounts = snapshot.accounts;
+        let observed_bank = reset_bank(&["credit-a"]);
+        let now = observed_bank.fetched_at;
+        let store_lock = lock_account_store(&store_path)?;
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let guard_calls = Arc::new(Mutex::new(0usize));
+        let guard_store_path = store_path.clone();
+        let guard_auth_path = auth_path.clone();
+
+        let error = reconcile_or_attempt_reset_with_provider_guard(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut accounts[0],
+                previous_bank: None,
+                observed_bank,
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| bail!("cancelled reset must not reconcile inventory"),
+                |_account| bail!("cancelled reset must not reconcile quota"),
+                {
+                    let consume_calls = Arc::clone(&consume_calls);
+                    move |_account, _bank, _request_id| {
+                        *consume_calls.lock().unwrap() += 1;
+                        bail!("activation guard must run before reset POST")
+                    }
+                },
+            ),
+            {
+                let guard_calls = Arc::clone(&guard_calls);
+                move |store_lock| {
+                    *guard_calls.lock().unwrap() += 1;
+                    let mut record = activation::read_activation_record(store_lock)?
+                        .context("pre-POST test lost its activation record")?;
+                    record.state = ActivationState::Prepared;
+                    overwrite_test_activation_record(&guard_store_path, &record)?;
+                    validate_provider_io_activation_locked(
+                        store_lock,
+                        &guard_auth_path,
+                        &activation_guard,
+                    )
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("immediately before POST"));
+        assert_eq!(*guard_calls.lock().unwrap(), 1);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        assert_eq!(fs::read(&store_path)?, store_before);
+        let journal: Value = serde_json::from_slice(&fs::read(
+            rate_limit_resets::reset_attempt_journal_path(&store_path),
+        )?)?;
+        assert_eq!(journal["attempts"][0]["state"], "terminal_not_applied");
+        assert!(journal["attempts"][0]["lastError"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("cancelled before POST")));
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .unwrap()
+                .state,
+            ActivationState::Prepared
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_blocks_all_provider_callbacks_until_activation_is_current() -> Result<()> {
+        for (label, fixture) in blocked_provider_io_activations() {
+            let temp = secure_temp_dir()?;
+            let store_path = temp.path().join("accounts.json");
+            let auth_path = temp.path().join("auth.json");
+            let exhausted = account("exhausted@example.com", true, 0.0, 100.0);
+            save_accounts(&store_path, std::slice::from_ref(&exhausted))?;
+            install_blocked_provider_io_activation(&store_path, &auth_path, &exhausted, fixture)?;
+
+            let quota_calls = Arc::new(Mutex::new(0usize));
+            let bank_calls = Arc::new(Mutex::new(0usize));
+            let consume_calls = Arc::new(Mutex::new(0usize));
+            let error = redeem_reset_with(
+                &store_path,
+                &auth_path,
+                &exhausted.email,
+                {
+                    let quota_calls = Arc::clone(&quota_calls);
+                    move |account| {
+                        *quota_calls.lock().unwrap() += 1;
+                        fetch_from_account(account)
+                    }
+                },
+                {
+                    let bank_calls = Arc::clone(&bank_calls);
+                    move |_account| {
+                        *bank_calls.lock().unwrap() += 1;
+                        Ok(reset_bank(&["credit-a"]))
+                    }
+                },
+                {
+                    let consume_calls = Arc::clone(&consume_calls);
+                    move |_account, _bank, _request_id| {
+                        *consume_calls.lock().unwrap() += 1;
+                        Ok(ConsumeResult {
+                            code: rate_limit_resets::ConsumeCode::Reset,
+                            credit_id: Some("credit-a".to_string()),
+                        })
+                    }
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                format!("{error:#}").contains("targeted reset activation preflight failed"),
+                "unexpected {label} failure: {error:#}"
+            );
+            assert_eq!(*quota_calls.lock().unwrap(), 0, "{label} quota callback");
+            assert_eq!(*bank_calls.lock().unwrap(), 0, "{label} bank callback");
+            assert_eq!(*consume_calls.lock().unwrap(), 0, "{label} reset POST");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_finalizes_staged_confirmed_generation_before_provider_callback() -> Result<()>
+    {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let exhausted = account("exhausted@example.com", true, 0.0, 100.0);
+        save_accounts(&store_path, std::slice::from_ref(&exhausted))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let mut accounts = snapshot.accounts;
+        let base_generation = snapshot.generation;
+        accounts[0].plan_type = Some("plus".to_string());
+        let prospective_generation = store_lock.prospective_generation(&accounts)?;
+        let mut record = activation::read_activation_record(&store_lock)?
+            .context("staged reset fixture lost its activation record")?;
+        let evidence_time = record.updated_at.to_owned();
+        record.base_store_generation = Some(base_generation.as_str().to_string());
+        record.owned_store_generation = Some(prospective_generation.as_str().to_string());
+        overwrite_test_activation_record(&store_path, &record)?;
+        drop(store_lock);
+
+        let quota_store_path = store_path.clone();
+        let quota_auth_path = auth_path.clone();
+        let quota_generation = base_generation.as_str().to_string();
+        let bank_store_path = store_path.clone();
+        let bank_auth_path = auth_path.clone();
+        let bank_generation = base_generation.as_str().to_string();
+        let quota_calls = Arc::new(Mutex::new(0usize));
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let error = redeem_reset_with(
+            &store_path,
+            &auth_path,
+            &exhausted.email,
+            {
+                let quota_calls = Arc::clone(&quota_calls);
+                move |account| {
+                    assert_store_lock_available(&quota_store_path)?;
+                    assert_clean_provider_io_activation(
+                        &quota_store_path,
+                        &quota_auth_path,
+                        &quota_generation,
+                    )?;
+                    *quota_calls.lock().unwrap() += 1;
+                    let mut result = fetch_from_account(account)?;
+                    for window in &mut result.snapshot.windows {
+                        window.used_percent = 0.0;
+                        window.hard_limit_reached = false;
+                    }
+                    result.snapshot.allowed = Some(true);
+                    result.snapshot.limit_reached = Some(false);
+                    Ok(result)
+                }
+            },
+            {
+                let bank_calls = Arc::clone(&bank_calls);
+                move |_account| {
+                    assert_store_lock_available(&bank_store_path)?;
+                    assert_clean_provider_io_activation(
+                        &bank_store_path,
+                        &bank_auth_path,
+                        &bank_generation,
+                    )?;
+                    *bank_calls.lock().unwrap() += 1;
+                    Ok(reset_bank(&["credit-a"]))
+                }
+            },
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    bail!("usable quota must not submit a reset")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("requires a fresh blocked quota"));
+        assert_eq!(*quota_calls.lock().unwrap(), 1);
+        assert_eq!(*bank_calls.lock().unwrap(), 1);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        let store_lock = lock_account_store(&store_path)?;
+        let finalized = activation::read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(finalized.state, ActivationState::Confirmed);
+        assert_eq!(finalized.updated_at, evidence_time);
+        assert_eq!(finalized.base_store_generation, None);
+        assert_eq!(finalized.owned_store_generation, None);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_redeems_only_requested_paid_account_and_preserves_active_auth() -> Result<()>
+    {
         let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 0.0, 10.0);
         let mut exhausted = account("exhausted@example.com", false, 0.0, 100.0);
+        exhausted.plan_type = Some("plus".to_string());
         exhausted.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(7));
         exhausted.runtime_unusable_reason = Some("usage_limit".to_string());
         save_accounts(&store_path, &[active.clone(), exhausted.clone()])?;
-        auth::write_auth_file(&auth_path, &active)?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
         let auth_before = fs::read(&auth_path)?;
 
         let quota_fetches = Arc::new(Mutex::new(0usize));
         let bank_fetches = Arc::new(Mutex::new(0usize));
         let consume_calls = Arc::new(Mutex::new(0usize));
+        let quota_store_path = store_path.clone();
+        let bank_store_path = store_path.clone();
+        let consume_store_path = store_path.clone();
         let report = redeem_reset_with(
             &store_path,
+            &auth_path,
             &exhausted.email,
             {
                 let quota_fetches = Arc::clone(&quota_fetches);
                 move |account| {
+                    assert_store_lock_available(&quota_store_path)?;
                     let mut result = fetch_from_account(account)?;
                     let mut calls = quota_fetches.lock().unwrap();
                     *calls += 1;
@@ -2672,6 +4151,7 @@ mod tests {
             {
                 let bank_fetches = Arc::clone(&bank_fetches);
                 move |_account| {
+                    assert_store_lock_available(&bank_store_path)?;
                     let mut calls = bank_fetches.lock().unwrap();
                     *calls += 1;
                     Ok(if *calls == 1 {
@@ -2684,6 +4164,7 @@ mod tests {
             {
                 let consume_calls = Arc::clone(&consume_calls);
                 move |_account, _bank, _request_id| {
+                    assert_store_lock_available(&consume_store_path)?;
                     *consume_calls.lock().unwrap() += 1;
                     Ok(ConsumeResult {
                         code: rate_limit_resets::ConsumeCode::Reset,
@@ -2725,13 +4206,19 @@ mod tests {
     fn targeted_reset_rejects_usable_pro_without_consuming_credit() -> Result<()> {
         let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
         let usable = account("usable@example.com", true, 0.0, 10.0);
         save_accounts(&store_path, std::slice::from_ref(&usable))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let confirmed_before = activation::read_activation_record(&store_lock)?.unwrap();
+        drop(store_lock);
 
         let bank_calls = Arc::new(Mutex::new(0usize));
         let consume_calls = Arc::new(Mutex::new(0usize));
         let error = redeem_reset_with(
             &store_path,
+            &auth_path,
             &usable.email,
             fetch_from_account,
             {
@@ -2754,6 +4241,55 @@ mod tests {
         assert!(format!("{error:#}").contains("requires a fresh blocked quota"));
         assert_eq!(*bank_calls.lock().unwrap(), 1);
         assert_eq!(*consume_calls.lock().unwrap(), 0);
+        let store_lock = lock_account_store(&store_path)?;
+        let snapshot = store_lock.load()?;
+        let confirmed_after = activation::read_activation_record(&store_lock)?.unwrap();
+        assert_eq!(
+            confirmed_after.store_generation,
+            snapshot.generation.as_str()
+        );
+        assert_eq!(confirmed_after.updated_at, confirmed_before.updated_at);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_reset_preserves_concurrent_store_change_during_observation() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let exhausted = account("exhausted@example.com", true, 0.0, 100.0);
+        save_accounts(&store_path, std::slice::from_ref(&exhausted))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+
+        let mutation_path = store_path.clone();
+        let mut concurrent = exhausted.clone();
+        concurrent.runtime_unusable_reason = Some("concurrent-writer".to_string());
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_closure = Arc::clone(&consume_calls);
+        let error = redeem_reset_with(
+            &store_path,
+            &auth_path,
+            &exhausted.email,
+            move |account| {
+                assert_store_lock_available(&mutation_path)?;
+                save_accounts(&mutation_path, std::slice::from_ref(&concurrent))?;
+                fetch_from_account(account)
+            },
+            |_account| Ok(reset_bank(&["credit-a"])),
+            move |_account, _bank, _request_id| {
+                *consume_calls_for_closure.lock().unwrap() += 1;
+                bail!("a stale targeted observation must never consume a reset")
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("provider-I/O activation guard"));
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        let stored = load_accounts(&store_path)?;
+        assert_eq!(
+            stored[0].runtime_unusable_reason.as_deref(),
+            Some("concurrent-writer")
+        );
         Ok(())
     }
 
@@ -2761,13 +4297,16 @@ mod tests {
     fn targeted_reset_reconciles_async_quota_recovery_without_second_post() -> Result<()> {
         let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
         let exhausted = account("exhausted@example.com", true, 0.0, 100.0);
         save_accounts(&store_path, std::slice::from_ref(&exhausted))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let consume_calls = Arc::new(Mutex::new(0usize));
         let bank_fetches = Arc::new(Mutex::new(0usize));
         let first_error = redeem_reset_with(
             &store_path,
+            &auth_path,
             &exhausted.email,
             fetch_from_account,
             {
@@ -2799,6 +4338,7 @@ mod tests {
 
         let report = redeem_reset_with(
             &store_path,
+            &auth_path,
             &exhausted.email,
             |account| {
                 let mut result = fetch_from_account(account)?;
@@ -2833,18 +4373,21 @@ mod tests {
     }
 
     #[test]
-    fn targeted_reset_rejects_non_pro_without_fetching_or_consuming_credit() -> Result<()> {
+    fn targeted_reset_rejects_free_without_fetching_or_consuming_credit() -> Result<()> {
         let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
-        let mut plus = account("plus@example.com", true, 0.0, 100.0);
-        plus.plan_type = Some("plus".to_string());
-        save_accounts(&store_path, std::slice::from_ref(&plus))?;
+        let auth_path = temp.path().join("auth.json");
+        let mut free = account("free@example.com", true, 0.0, 100.0);
+        free.plan_type = Some("free".to_string());
+        save_accounts(&store_path, std::slice::from_ref(&free))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
 
         let bank_calls = Arc::new(Mutex::new(0usize));
         let consume_calls = Arc::new(Mutex::new(0usize));
         let error = redeem_reset_with(
             &store_path,
-            &plus.email,
+            &auth_path,
+            &free.email,
             fetch_from_account,
             {
                 let bank_calls = Arc::clone(&bank_calls);
@@ -2857,13 +4400,13 @@ mod tests {
                 let consume_calls = Arc::clone(&consume_calls);
                 move |_account, _bank, _request_id| {
                     *consume_calls.lock().unwrap() += 1;
-                    bail!("non-Pro account must not consume a reset")
+                    bail!("free account must not consume a reset")
                 }
             },
         )
         .unwrap_err();
 
-        assert!(format!("{error:#}").contains("requires a Pro account"));
+        assert!(format!("{error:#}").contains("requires a paid account"));
         assert_eq!(*bank_calls.lock().unwrap(), 0);
         assert_eq!(*consume_calls.lock().unwrap(), 0);
         Ok(())
@@ -2888,6 +4431,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: true,
+                receipt_nonce: None,
             },
             RotateNowDependencies::new(
                 fetch_from_account,

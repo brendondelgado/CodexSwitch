@@ -14,6 +14,9 @@ TAILSCALE_BIN="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 LOCAL_REPO="${CODEX_VPS_LOCAL_REPO:-${HOME}/SIGNUL}"
 REMOTE_REPO="${CODEX_VPS_REMOTE_REPO:-/home/signul/SIGNUL}"
 SERVICE_NAME="signul-codex-app-server.service"
+REMOTE_RELEASE_ROOT="${CODEX_VPS_REMOTE_RELEASE_ROOT:-/home/signul/.local/share/codexswitch/current}"
+REMOTE_RELEASE_CODEX="${REMOTE_RELEASE_ROOT}/patched-codex/codex"
+REMOTE_RELEASE_CLI="${REMOTE_RELEASE_ROOT}/codexswitch-cli"
 LOCAL_CLIENT_ROOT="${HOME}/.local/share/codexswitch/remote-client"
 PATCHED_REMOTE_CLIENT="${HOME}/.local/share/codexswitch/patched-mac-remote-client/codex"
 if [[ -x "/Applications/ChatGPT.app/Contents/Resources/codex" ]]; then
@@ -29,6 +32,8 @@ SSH_BIN="${CODEX_VPS_SSH_BIN:-ssh}"
 LSOF_BIN="${CODEX_VPS_LSOF_BIN:-lsof}"
 CURL_BIN="${CODEX_VPS_CURL_BIN:-/usr/bin/curl}"
 PS_BIN="${CODEX_VPS_PS_BIN:-ps}"
+ID_BIN="${CODEX_VPS_ID_BIN:-/usr/bin/id}"
+STAT_BIN="${CODEX_VPS_STAT_BIN:-/usr/bin/stat}"
 KILL_BIN="${CODEX_VPS_KILL_BIN:-kill}"
 SLEEP_BIN="${CODEX_VPS_SLEEP_BIN:-sleep}"
 SSH_CONNECT_TIMEOUT="${CODEX_VPS_SSH_CONNECT_TIMEOUT:-30}"
@@ -78,6 +83,13 @@ TUNNEL_OWNER_TOKEN=""
 TUNNEL_LOCK_HELD=0
 TUNNEL_LOCK_DIR="${CODEX_VPS_TUNNEL_LOCK_DIR:-${HOME}/.codexswitch/codex-vps-tunnel-${LOCAL_PORT}.lock}"
 TUNNEL_METADATA_FILE="${TUNNEL_LOCK_DIR}/owner"
+if [ -n "${CODEX_VPS_HELPER_PATH:-}" ]; then
+  HELPER_PATH="${CODEX_VPS_HELPER_PATH:A}"
+elif [ -n "${CODEX_VPS_SCRIPT_PATH:-}" ]; then
+  HELPER_PATH="${CODEX_VPS_SCRIPT_PATH:A}"
+else
+  HELPER_PATH="${0:A}"
+fi
 TUNNEL_HEALTH_TIMEOUT_SECONDS="${CODEX_VPS_TUNNEL_HEALTH_TIMEOUT_SECONDS:-8}"
 TUNNEL_HEALTH_FAILURE_LIMIT="${CODEX_VPS_TUNNEL_HEALTH_FAILURE_LIMIT:-4}"
 TUNNEL_HEALTH_INTERVAL_SECONDS="${CODEX_VPS_TUNNEL_HEALTH_INTERVAL_SECONDS:-2}"
@@ -93,6 +105,8 @@ REMOTE_CLIENT_AUTO_RECONNECT="${CODEX_VPS_AUTO_RECONNECT:-1}"
 REMOTE_CLIENT_RECONNECT_DELAY="${CODEX_VPS_RECONNECT_DELAY:-2}"
 REMOTE_CLIENT_RECONNECT_DELAY_MAX="${CODEX_VPS_RECONNECT_DELAY_MAX:-30}"
 REMOTE_CLIENT_RECONNECT_MAX="${CODEX_VPS_RECONNECT_MAX:-0}"
+REMOTE_VERSION_SNAPSHOT=""
+LOCAL_CLIENT_VERSION_SNAPSHOT=""
 
 log() {
   echo "codex-vps: $*" >&2
@@ -213,6 +227,50 @@ process_is_alive() {
   [[ -z "$state" || "$state" != Z* ]]
 }
 
+current_uid() {
+  "$ID_BIN" -u 2>/dev/null | tr -d '[:space:]'
+}
+
+process_identity_value() {
+  local pid="$1"
+  local field="$2"
+  local value
+  value="$("$PS_BIN" -p "$pid" -o "${field}=" 2>/dev/null)" || return 1
+  printf '%s\n' "$value" | awk '{$1=$1; print}'
+}
+
+process_uid() {
+  process_identity_value "$1" uid
+}
+
+process_executable_identity() {
+  process_identity_value "$1" comm
+}
+
+process_start_identity() {
+  process_identity_value "$1" lstart
+}
+
+path_owner_uid() {
+  local path="$1"
+  local value
+  if value="$("$STAT_BIN" -f '%u' "$path" 2>/dev/null)" && is_nonnegative_integer "$value"; then
+    printf '%s' "$value"
+    return 0
+  fi
+  "$STAT_BIN" -c '%u' "$path" 2>/dev/null
+}
+
+path_permission_mode() {
+  local path="$1"
+  local value
+  if value="$("$STAT_BIN" -f '%Lp' "$path" 2>/dev/null)" && is_nonnegative_integer "$value"; then
+    printf '%s' "$value"
+    return 0
+  fi
+  "$STAT_BIN" -c '%a' "$path" 2>/dev/null
+}
+
 sleep_for() {
   "$SLEEP_BIN" "$1"
 }
@@ -243,32 +301,151 @@ tunnel_metadata_value() {
   awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$TUNNEL_METADATA_FILE"
 }
 
+tunnel_metadata_has_exact_schema() {
+  [ -f "$TUNNEL_METADATA_FILE" ] && [ ! -L "$TUNNEL_METADATA_FILE" ] || return 1
+  awk -F= '
+    BEGIN {
+      expected["version"] = 1
+      expected["helper_path"] = 1
+      expected["owner_pid"] = 1
+      expected["owner_token"] = 1
+      expected["owner_uid"] = 1
+      expected["owner_executable"] = 1
+      expected["owner_start"] = 1
+      expected["supervisor_pid"] = 1
+      expected["supervisor_uid"] = 1
+      expected["supervisor_executable"] = 1
+      expected["supervisor_start"] = 1
+      expected["ssh_pid"] = 1
+      expected["ssh_uid"] = 1
+      expected["ssh_executable"] = 1
+      expected["ssh_start"] = 1
+      expected["local_port"] = 1
+      expected["remote_port"] = 1
+      expected["remote_host"] = 1
+    }
+    !($1 in expected) || seen[$1]++ { exit 1 }
+    END {
+      for (key in expected) {
+        if (seen[key] != 1) exit 1
+      }
+    }
+  ' "$TUNNEL_METADATA_FILE"
+}
+
+tunnel_metadata_owner_mode_ok() {
+  local uid metadata_uid metadata_mode lock_uid lock_mode
+  uid="$(current_uid)"
+  is_nonnegative_integer "$uid" || return 1
+  metadata_uid="$(path_owner_uid "$TUNNEL_METADATA_FILE" 2>/dev/null || true)"
+  metadata_mode="$(path_permission_mode "$TUNNEL_METADATA_FILE" 2>/dev/null || true)"
+  lock_uid="$(path_owner_uid "$TUNNEL_LOCK_DIR" 2>/dev/null || true)"
+  lock_mode="$(path_permission_mode "$TUNNEL_LOCK_DIR" 2>/dev/null || true)"
+  [ "$metadata_uid" = "$uid" ] && [ "$lock_uid" = "$uid" ] || return 1
+  [[ "$metadata_mode" = 600 || "$metadata_mode" = 0600 ]] || return 1
+  [[ "$lock_mode" = 700 || "$lock_mode" = 0700 ]]
+}
+
+recorded_tunnel_owner_metadata_ok() {
+  local version helper_path owner_pid owner_token owner_uid owner_executable owner_start
+  local expected_uid owner_pattern
+
+  tunnel_metadata_owner_mode_ok || return 1
+  tunnel_metadata_has_exact_schema || return 1
+  version="$(tunnel_metadata_value version 2>/dev/null || true)"
+  helper_path="$(tunnel_metadata_value helper_path 2>/dev/null || true)"
+  owner_pid="$(tunnel_metadata_value owner_pid 2>/dev/null || true)"
+  owner_token="$(tunnel_metadata_value owner_token 2>/dev/null || true)"
+  owner_uid="$(tunnel_metadata_value owner_uid 2>/dev/null || true)"
+  owner_executable="$(tunnel_metadata_value owner_executable 2>/dev/null || true)"
+  owner_start="$(tunnel_metadata_value owner_start 2>/dev/null || true)"
+  expected_uid="$(current_uid)"
+
+  [ "$version" = "3" ] && [ "$helper_path" = "$HELPER_PATH" ] || return 1
+  [ "$(tunnel_metadata_value local_port 2>/dev/null || true)" = "$LOCAL_PORT" ] || return 1
+  [ "$(tunnel_metadata_value remote_port 2>/dev/null || true)" = "$REMOTE_PORT" ] || return 1
+  [ "$(tunnel_metadata_value remote_host 2>/dev/null || true)" = "$REMOTE_HOST" ] || return 1
+  is_positive_integer "$owner_pid" || return 1
+  is_nonnegative_integer "$expected_uid" && [ "$owner_uid" = "$expected_uid" ] || return 1
+  [ -n "$owner_executable" ] && [ -n "$owner_start" ] || return 1
+  owner_pattern="^${owner_pid}-[0-9]+-[0-9]+-[0-9]+$"
+  [[ "$owner_token" =~ $owner_pattern ]]
+}
+
+metadata_process_evidence_matches() {
+  local prefix="$1"
+  local pid="$2"
+  local uid executable start expected_uid
+  expected_uid="$(current_uid)"
+  uid="$(tunnel_metadata_value "${prefix}_uid" 2>/dev/null || true)"
+  executable="$(tunnel_metadata_value "${prefix}_executable" 2>/dev/null || true)"
+  start="$(tunnel_metadata_value "${prefix}_start" 2>/dev/null || true)"
+  [ "$uid" = "$expected_uid" ] && [ -n "$executable" ] && [ -n "$start" ] || return 1
+  process_is_alive "$pid" || return 1
+  [ "$(process_uid "$pid" 2>/dev/null || true)" = "$uid" ] || return 1
+  [ "$(process_executable_identity "$pid" 2>/dev/null || true)" = "$executable" ] || return 1
+  [ "$(process_start_identity "$pid" 2>/dev/null || true)" = "$start" ]
+}
+
 tunnel_metadata_matches_current_owner() {
-  [ "$TUNNEL_LOCK_HELD" = "1" ] &&
+  [ "$TUNNEL_LOCK_HELD" = "1" ] && recorded_tunnel_owner_metadata_ok &&
     [ "$(tunnel_metadata_value owner_pid 2>/dev/null || true)" = "$TUNNEL_OWNER_PID" ] &&
-    [ "$(tunnel_metadata_value owner_token 2>/dev/null || true)" = "$TUNNEL_OWNER_TOKEN" ]
+    [ "$(tunnel_metadata_value owner_token 2>/dev/null || true)" = "$TUNNEL_OWNER_TOKEN" ] &&
+    metadata_process_evidence_matches owner "$TUNNEL_OWNER_PID"
 }
 
 write_tunnel_metadata() {
   local supervisor_pid="${1:-}"
   local ssh_pid="${2:-}"
-  local writer_pid temp_file
+  local writer_pid temp_file uid
+  local owner_uid owner_executable owner_start
+  local supervisor_uid="" supervisor_executable="" supervisor_start=""
+  local ssh_uid="" ssh_executable="" ssh_start=""
 
   [ "$TUNNEL_LOCK_HELD" = "1" ] || return 1
+  uid="$(current_uid)"
+  is_nonnegative_integer "$uid" || return 1
+  owner_uid="$(process_uid "$TUNNEL_OWNER_PID")" || return 1
+  owner_executable="$(process_executable_identity "$TUNNEL_OWNER_PID")" || return 1
+  owner_start="$(process_start_identity "$TUNNEL_OWNER_PID")" || return 1
+  [ "$owner_uid" = "$uid" ] && [ -n "$owner_executable" ] && [ -n "$owner_start" ] || return 1
+  if [ -n "$supervisor_pid" ]; then
+    supervisor_uid="$(process_uid "$supervisor_pid")" || return 1
+    supervisor_executable="$(process_executable_identity "$supervisor_pid")" || return 1
+    supervisor_start="$(process_start_identity "$supervisor_pid")" || return 1
+    [ "$supervisor_uid" = "$uid" ] && [ -n "$supervisor_executable" ] && [ -n "$supervisor_start" ] || return 1
+  fi
+  if [ -n "$ssh_pid" ]; then
+    ssh_uid="$(process_uid "$ssh_pid")" || return 1
+    ssh_executable="$(process_executable_identity "$ssh_pid")" || return 1
+    ssh_start="$(process_start_identity "$ssh_pid")" || return 1
+    [ "$ssh_uid" = "$uid" ] && [ -n "$ssh_executable" ] && [ -n "$ssh_start" ] || return 1
+  fi
   writer_pid="$(current_process_pid)"
   temp_file="${TUNNEL_METADATA_FILE}.tmp.${writer_pid}.${RANDOM}"
   umask 077
   {
-    printf 'version=1\n'
+    printf 'version=3\n'
+    printf 'helper_path=%s\n' "$HELPER_PATH"
     printf 'owner_pid=%s\n' "$TUNNEL_OWNER_PID"
     printf 'owner_token=%s\n' "$TUNNEL_OWNER_TOKEN"
+    printf 'owner_uid=%s\n' "$owner_uid"
+    printf 'owner_executable=%s\n' "$owner_executable"
+    printf 'owner_start=%s\n' "$owner_start"
     printf 'supervisor_pid=%s\n' "$supervisor_pid"
+    printf 'supervisor_uid=%s\n' "$supervisor_uid"
+    printf 'supervisor_executable=%s\n' "$supervisor_executable"
+    printf 'supervisor_start=%s\n' "$supervisor_start"
     printf 'ssh_pid=%s\n' "$ssh_pid"
+    printf 'ssh_uid=%s\n' "$ssh_uid"
+    printf 'ssh_executable=%s\n' "$ssh_executable"
+    printf 'ssh_start=%s\n' "$ssh_start"
     printf 'local_port=%s\n' "$LOCAL_PORT"
     printf 'remote_port=%s\n' "$REMOTE_PORT"
     printf 'remote_host=%s\n' "$REMOTE_HOST"
   } > "$temp_file"
   mv -f "$temp_file" "$TUNNEL_METADATA_FILE"
+  chmod 600 "$TUNNEL_METADATA_FILE"
 }
 
 refuse_unknown_tunnel_listener() {
@@ -280,7 +457,7 @@ refuse_unknown_tunnel_listener() {
 }
 
 acquire_tunnel_lock() {
-  local lock_parent existing_owner stale_lock
+  local lock_parent existing_owner existing_owner_token stale_lock
 
   TUNNEL_OWNER_PID="$(current_process_pid)"
   TUNNEL_OWNER_TOKEN="${TUNNEL_OWNER_PID}-${EPOCHSECONDS:-0}-${RANDOM}-${RANDOM}"
@@ -288,17 +465,35 @@ acquire_tunnel_lock() {
   mkdir -p "$lock_parent"
 
   if mkdir "$TUNNEL_LOCK_DIR" 2>/dev/null; then
+    chmod 700 "$TUNNEL_LOCK_DIR"
     TUNNEL_LOCK_HELD=1
     write_tunnel_metadata "" ""
     return 0
   fi
 
+  if ! recorded_tunnel_owner_metadata_ok; then
+    log "refusing tunnel startup; stored owner UID/start-time/executable provenance is invalid; leaving ${TUNNEL_LOCK_DIR} untouched"
+    return 1
+  fi
   existing_owner="$(tunnel_metadata_value owner_pid 2>/dev/null || true)"
-  if [ -n "$existing_owner" ] && process_is_alive "$existing_owner"; then
-    log "refusing tunnel startup; another codex-vps helper owns ${TUNNEL_LOCK_DIR} (PID ${existing_owner})"
+  existing_owner_token="$(tunnel_metadata_value owner_token 2>/dev/null || true)"
+  if process_is_alive "$existing_owner"; then
+    if ! metadata_process_evidence_matches owner "$existing_owner"; then
+      log "refusing tunnel startup; live PID ${existing_owner} does not match stored owner UID/start-time/executable provenance; leaving ${TUNNEL_LOCK_DIR} untouched"
+      return 1
+    fi
+    log "refusing tunnel startup; another verified codex-vps helper owns ${TUNNEL_LOCK_DIR} (PID ${existing_owner})"
     return 1
   fi
   refuse_unknown_tunnel_listener || return 1
+
+  if ! recorded_tunnel_owner_metadata_ok \
+    || [ "$(tunnel_metadata_value owner_pid 2>/dev/null || true)" != "$existing_owner" ] \
+    || [ "$(tunnel_metadata_value owner_token 2>/dev/null || true)" != "$existing_owner_token" ] \
+    || process_is_alive "$existing_owner"; then
+    log "refusing tunnel startup; ownership evidence changed while checking stale lock ${TUNNEL_LOCK_DIR}"
+    return 1
+  fi
 
   stale_lock="${TUNNEL_LOCK_DIR}.stale.${TUNNEL_OWNER_PID}.${RANDOM}"
   if ! mv "$TUNNEL_LOCK_DIR" "$stale_lock" 2>/dev/null; then
@@ -314,6 +509,7 @@ acquire_tunnel_lock() {
     log "refusing tunnel startup; another helper acquired the ownership lock"
     return 1
   fi
+  chmod 700 "$TUNNEL_LOCK_DIR"
   TUNNEL_LOCK_HELD=1
   write_tunnel_metadata "" ""
 }
@@ -403,6 +599,15 @@ codex_remote_shell_config_args() {
   fi
 
   printf '%s' "$args"
+}
+
+direct_ssh_session_command() {
+  local remote_args="$1"
+  local remote_repo remote_codex
+  remote_repo="$(printf '%q' "$REMOTE_REPO")"
+  remote_codex="$(printf '%q' "$REMOTE_RELEASE_CODEX")"
+  printf 'cd %s && exec %s %s resume %s' \
+    "$remote_repo" "$remote_codex" "$remote_args" "$THREAD_ID"
 }
 
 codex_launch_model() {
@@ -581,6 +786,7 @@ maybe_run_tailscale_ssh_check() {
 }
 
 select_ssh_transport() {
+  local tailscale_check_status
   if [ "${CODEX_VPS_USE_TAILSCALE_PROXY:-0}" != "1" ] \
     && timeout "${SSH_PROBE_TIMEOUT}s" "$SSH_BIN" "${SSH_OPTS[@]}" "$REMOTE_HOST" true >/dev/null 2>&1; then
     USE_TAILSCALE_PROXY=0
@@ -588,8 +794,12 @@ select_ssh_transport() {
     return 0
   fi
 
-  maybe_run_tailscale_ssh_check
-  case "$?" in
+  if maybe_run_tailscale_ssh_check; then
+    tailscale_check_status=0
+  else
+    tailscale_check_status="$?"
+  fi
+  case "$tailscale_check_status" in
     2) return 1 ;;
   esac
 
@@ -611,13 +821,14 @@ select_ssh_transport() {
 }
 
 remote_codex_version() {
-  local app_version
+  local app_version remote_codex
   app_version="$(app_server_codex_version 2>/dev/null || true)"
   if [ -n "$app_version" ]; then
     printf '%s\n' "$app_version"
     return 0
   fi
-  ssh_remote '~/.local/share/codexswitch/patched-codex/codex --version' 2>/dev/null | awk '{print $2}'
+  remote_codex="$(printf '%q' "$REMOTE_RELEASE_CODEX")"
+  ssh_remote "${remote_codex} --version" 2>/dev/null | awk '{print $2}'
 }
 
 app_server_codex_version() {
@@ -653,12 +864,148 @@ asyncio.run(main())
 PY
 }
 
+is_valid_codex_version() {
+  local pattern='^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$'
+  [[ "${1:-}" =~ $pattern ]]
+}
+
+capture_remote_version_snapshot() {
+  local observed
+  if [ -n "$REMOTE_VERSION_SNAPSHOT" ]; then
+    return 0
+  fi
+
+  observed="$(remote_codex_version)"
+  if ! is_valid_codex_version "$observed"; then
+    echo "codex-vps: could not determine remote Codex version on ${REMOTE_HOST}" >&2
+    return 1
+  fi
+  REMOTE_VERSION_SNAPSHOT="$observed"
+}
+
+verify_remote_version_snapshot() {
+  local observed
+  if [ -z "$REMOTE_VERSION_SNAPSHOT" ]; then
+    echo "codex-vps: remote Codex version snapshot is missing" >&2
+    return 1
+  fi
+
+  observed="$(app_server_codex_version 2>/dev/null || true)"
+  if ! is_valid_codex_version "$observed"; then
+    echo "codex-vps: established transport did not return an app-server version" >&2
+    return 1
+  fi
+  if [ "$observed" != "$REMOTE_VERSION_SNAPSHOT" ]; then
+    echo "codex-vps: remote app-server version changed during transport setup (selected ${REMOTE_VERSION_SNAPSHOT}, established ${observed}); rerun codex-vps" >&2
+    return 1
+  fi
+}
+
+verify_existing_rpc_transport() {
+  local listener_pids
+  if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" = "1" ]; then
+    if ! direct_tailscale_app_server_available; then
+      echo "codex-vps: direct app-server transport is no longer healthy" >&2
+      return 1
+    fi
+  else
+    if ! known_helper_tunnel_listener_ok; then
+      listener_pids="$(tunnel_listener_pids || true)"
+      if [ -n "$listener_pids" ]; then
+        log "refusing listener on 127.0.0.1:${LOCAL_PORT}; it is not an active tunnel with exact codex-vps provenance (PID(s): ${(j:,:)${(f)listener_pids}})"
+      fi
+      echo "codex-vps: no healthy verified app-server transport is available; --check does not create or repair a tunnel" >&2
+      return 1
+    fi
+    if ! tunnel_health_ok; then
+      echo "codex-vps: the verified existing app-server tunnel is unhealthy; --check does not repair it" >&2
+      return 1
+    fi
+  fi
+  verify_remote_version_snapshot
+}
+
+remote_doctor_json() {
+  local remote_cli
+  remote_cli="$(printf '%q' "$REMOTE_RELEASE_CLI")"
+  ssh_remote "${remote_cli} doctor --json"
+}
+
+validate_remote_doctor_json() {
+  /usr/bin/python3 -c '
+import json
+import sys
+
+def fail(message):
+    print(f"codex-vps: remote doctor not ready: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    report = json.load(sys.stdin)
+except Exception as error:
+    fail(f"invalid JSON ({error})")
+
+if not isinstance(report, dict):
+    fail("report is not an object")
+if report.get("ready") is not True:
+    fail(str(report.get("summary") or "doctor reported not ready"))
+
+if "activationBarrierClear" not in report:
+    fail("activation barrier state is missing")
+if report.get("activationBarrierClear") is not True:
+    fail("activation barrier is active or unconfirmed")
+if report.get("activationBarrier") is not False:
+    fail("activation barrier report is inconsistent")
+
+app_servers = report.get("appServers")
+if not isinstance(app_servers, list) or not app_servers:
+    fail("no app-server acknowledgement evidence")
+not_ready = [
+    str(entry.get("pid", "unknown") if isinstance(entry, dict) else "unknown")
+    for entry in app_servers
+    if not isinstance(entry, dict) or entry.get("hotSwapReady") is not True
+]
+if not_ready:
+    fail("app-server acknowledgement missing for pid(s): " + ",".join(not_ready))
+
+processes = report.get("processes")
+if not isinstance(processes, list):
+    fail("process acknowledgement list is missing")
+not_ready = [
+    str(entry.get("pid", "unknown") if isinstance(entry, dict) else "unknown")
+    for entry in processes
+    if not isinstance(entry, dict) or entry.get("hotSwapReady") is not True
+]
+if not_ready:
+    fail("runtime acknowledgement missing for pid(s): " + ",".join(not_ready))
+
+print(report.get("summary") or "ready with verified runtime acknowledgements")
+'
+}
+
+require_remote_doctor_readiness() {
+  local doctor_json doctor_summary
+  if ! doctor_json="$(remote_doctor_json 2>/dev/null)"; then
+    echo "codex-vps: remote doctor --json could not be read from the current release" >&2
+    return 1
+  fi
+  if ! doctor_summary="$(printf '%s' "$doctor_json" | validate_remote_doctor_json)"; then
+    return 1
+  fi
+  printf '%s' "$doctor_summary"
+}
+
 select_matching_local_remote_client() {
   local remote_version="$1"
-  local candidate
+  local candidate candidate_version
   for candidate in "$NPM_REMOTE_CLIENT" "$APP_BUNDLED_CLIENT" "$PATCHED_REMOTE_CLIENT" "$LOCAL_CLIENT"; do
-    if [ -x "$candidate" ] && [ "$(codex_version "$candidate")" = "$remote_version" ]; then
+    candidate_version=""
+    if [ -x "$candidate" ]; then
+      candidate_version="$(codex_version "$candidate")"
+    fi
+    if [ "$candidate_version" = "$remote_version" ]; then
       LOCAL_CLIENT="$candidate"
+      LOCAL_CLIENT_VERSION_SNAPSHOT="$candidate_version"
       return 0
     fi
   done
@@ -667,11 +1014,8 @@ select_matching_local_remote_client() {
 
 require_matching_local_remote_client() {
   local remote_version local_version
-  remote_version="$(remote_codex_version)"
-  if [ -z "$remote_version" ]; then
-    echo "codex-vps: could not determine remote Codex version on ${REMOTE_HOST}" >&2
-    exit 1
-  fi
+  capture_remote_version_snapshot || return $?
+  remote_version="$REMOTE_VERSION_SNAPSHOT"
 
   if ! select_matching_local_remote_client "$remote_version"; then
     local_version="$(codex_version "$LOCAL_CLIENT")"
@@ -689,11 +1033,8 @@ sync_local_remote_client() {
     return 2
   fi
 
-  remote_version="$(remote_codex_version)"
-  if [ -z "$remote_version" ]; then
-    echo "codex-vps: could not determine remote Codex version on ${REMOTE_HOST}" >&2
-    return 1
-  fi
+  capture_remote_version_snapshot || return $?
+  remote_version="$REMOTE_VERSION_SNAPSHOT"
   if select_matching_local_remote_client "$remote_version"; then
     echo "codex-vps client already matches remote ${remote_version}: ${LOCAL_CLIENT}"
     return 0
@@ -715,13 +1056,23 @@ sync_local_remote_client() {
   echo "codex-vps client synchronized: ${LOCAL_CLIENT} (${remote_version})"
 }
 
-verified_owned_ssh_child() {
+tunnel_process_evidence_ok() {
+  local owner_pid supervisor_pid ssh_pid
+  owner_pid="$(tunnel_metadata_value owner_pid 2>/dev/null || true)"
+  supervisor_pid="$(tunnel_metadata_value supervisor_pid 2>/dev/null || true)"
+  ssh_pid="$(tunnel_metadata_value ssh_pid 2>/dev/null || true)"
+  is_positive_integer "$owner_pid" && is_positive_integer "$supervisor_pid" && is_positive_integer "$ssh_pid" || return 1
+  metadata_process_evidence_matches owner "$owner_pid" || return 1
+  metadata_process_evidence_matches supervisor "$supervisor_pid" || return 1
+  metadata_process_evidence_matches ssh "$ssh_pid"
+}
+
+verified_recorded_ssh_child() {
   local pid="${1:-$(tunnel_metadata_value ssh_pid 2>/dev/null || true)}"
   local supervisor_pid="${2:-$(tunnel_metadata_value supervisor_pid 2>/dev/null || true)}"
   local metadata_pid metadata_supervisor metadata_port metadata_remote_port
   local actual_parent args forward ssh_name
 
-  tunnel_metadata_matches_current_owner || return 1
   metadata_pid="$(tunnel_metadata_value ssh_pid 2>/dev/null || true)"
   metadata_supervisor="$(tunnel_metadata_value supervisor_pid 2>/dev/null || true)"
   metadata_port="$(tunnel_metadata_value local_port 2>/dev/null || true)"
@@ -738,6 +1089,56 @@ verified_owned_ssh_child() {
   ssh_name="${SSH_BIN:t}"
   [[ "$args" == *"${ssh_name}"* && "$args" == *" -N "* && "$args" == *" -L ${forward} "* ]] || return 1
   [[ "$args" == *"${REMOTE_HOST}"* || "$args" == *"${TAILSCALE_TARGET}"* ]]
+}
+
+verified_owned_ssh_child() {
+  tunnel_metadata_matches_current_owner || return 1
+  tunnel_process_evidence_ok || return 1
+  verified_recorded_ssh_child "$@"
+}
+
+known_helper_tunnel_metadata_ok() {
+  local version helper_path owner_pid owner_token supervisor_pid ssh_pid
+  local metadata_host owner_pattern supervisor_parent owner_args supervisor_args helper_name
+
+  recorded_tunnel_owner_metadata_ok || return 1
+  version="$(tunnel_metadata_value version 2>/dev/null || true)"
+  helper_path="$(tunnel_metadata_value helper_path 2>/dev/null || true)"
+  owner_pid="$(tunnel_metadata_value owner_pid 2>/dev/null || true)"
+  owner_token="$(tunnel_metadata_value owner_token 2>/dev/null || true)"
+  supervisor_pid="$(tunnel_metadata_value supervisor_pid 2>/dev/null || true)"
+  ssh_pid="$(tunnel_metadata_value ssh_pid 2>/dev/null || true)"
+  metadata_host="$(tunnel_metadata_value remote_host 2>/dev/null || true)"
+
+  [ "$version" = "3" ] && [ "$helper_path" = "$HELPER_PATH" ] || return 1
+  [ "$(tunnel_metadata_value local_port 2>/dev/null || true)" = "$LOCAL_PORT" ] || return 1
+  [ "$(tunnel_metadata_value remote_port 2>/dev/null || true)" = "$REMOTE_PORT" ] || return 1
+  [ "$metadata_host" = "$REMOTE_HOST" ] || return 1
+  is_positive_integer "$owner_pid" && is_positive_integer "$supervisor_pid" && is_positive_integer "$ssh_pid" || return 1
+  [ "$owner_pid" != "$supervisor_pid" ] && [ "$owner_pid" != "$ssh_pid" ] && [ "$supervisor_pid" != "$ssh_pid" ] || return 1
+
+  owner_pattern="^${owner_pid}-[0-9]+-[0-9]+-[0-9]+$"
+  [[ "$owner_token" =~ $owner_pattern ]] || return 1
+  tunnel_process_evidence_ok || return 1
+  supervisor_parent="$("$PS_BIN" -p "$supervisor_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')"
+  [ "$supervisor_parent" = "$owner_pid" ] || return 1
+
+  helper_name="${HELPER_PATH:t}"
+  owner_args="$("$PS_BIN" -p "$owner_pid" -o args= 2>/dev/null || true)"
+  supervisor_args="$("$PS_BIN" -p "$supervisor_pid" -o args= 2>/dev/null || true)"
+  [[ "$owner_args" == *"${helper_name}"* && "$supervisor_args" == *"${helper_name}"* ]] || return 1
+  verified_recorded_ssh_child "$ssh_pid" "$supervisor_pid"
+}
+
+known_helper_tunnel_listener_ok() {
+  local expected_pid pids pid
+  known_helper_tunnel_metadata_ok || return 1
+  expected_pid="$(tunnel_metadata_value ssh_pid 2>/dev/null || true)"
+  pids="$(tunnel_listener_pids || true)"
+  [ -n "$pids" ] || return 1
+  while IFS= read -r pid; do
+    [ "$pid" = "$expected_pid" ] || return 1
+  done <<< "$pids"
 }
 
 owned_tunnel_listener_ok() {
@@ -767,6 +1168,10 @@ stop_owned_ssh_child() {
     sleep_for 0.1
   done
   if process_is_alive "$pid"; then
+    if ! verified_owned_ssh_child "$pid" "$supervisor_pid"; then
+      log "refusing to escalate signal for reused tunnel PID ${pid}"
+      return 1
+    fi
     "$KILL_BIN" -KILL "$pid" 2>/dev/null || true
   fi
   wait "$pid" 2>/dev/null || true
@@ -903,13 +1308,6 @@ run_tunnel_supervisor() {
   done
 }
 
-install_tunnel_cleanup_traps() {
-  trap cleanup_tunnel_supervisor EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  trap 'exit 129' HUP
-}
-
 start_tunnel_supervisor_for_interactive_attach() {
   if [ -n "$TUNNEL_SUPERVISOR_PID" ] && process_is_alive "$TUNNEL_SUPERVISOR_PID"; then
     wait_for_health
@@ -919,7 +1317,6 @@ start_tunnel_supervisor_for_interactive_attach() {
   if [ "$TUNNEL_LOCK_HELD" != "1" ] || ! tunnel_metadata_matches_current_owner; then
     acquire_tunnel_lock || return 1
   fi
-  install_tunnel_cleanup_traps
   run_tunnel_supervisor &
   TUNNEL_SUPERVISOR_PID="$!"
   if ! wait_for_health; then
@@ -935,8 +1332,15 @@ cleanup_tunnel_supervisor() {
   TUNNEL_CLEANUP_ACTIVE=1
   trap - EXIT INT TERM HUP
   if [ -n "$TUNNEL_SUPERVISOR_PID" ] && process_is_alive "$TUNNEL_SUPERVISOR_PID"; then
-    "$KILL_BIN" -TERM "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
-    wait "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
+    if tunnel_metadata_matches_current_owner \
+      && [ "$(tunnel_metadata_value supervisor_pid 2>/dev/null || true)" = "$TUNNEL_SUPERVISOR_PID" ] \
+      && metadata_process_evidence_matches supervisor "$TUNNEL_SUPERVISOR_PID"; then
+      "$KILL_BIN" -TERM "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
+      wait "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
+    else
+      log "refusing to signal unverified tunnel supervisor PID ${TUNNEL_SUPERVISOR_PID}"
+      child_cleanup_ok=0
+    fi
   fi
   stop_owned_ssh_child || child_cleanup_ok=0
   if [ "$child_cleanup_ok" = "1" ]; then
@@ -1101,6 +1505,10 @@ restart_remote_codex() {
 }
 
 codex_vps_main() {
+trap cleanup_tunnel_supervisor EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 validate_runtime_config || return $?
 validate_thread_command_args "$@" || return $?
 
@@ -1127,7 +1535,9 @@ if [ "${CODEX_VPS_FORCE_TUNNEL:-0}" != "1" ] && direct_tailscale_app_server_avai
   REMOTE_URL="$DIRECT_REMOTE_URL"
   log "using direct Tailscale app-server ${DIRECT_REMOTE_URL}"
 else
-  refuse_unknown_tunnel_listener
+  if [ "${1:-}" != "--check" ]; then
+    refuse_unknown_tunnel_listener
+  fi
   select_ssh_transport
 fi
 
@@ -1215,25 +1625,24 @@ if [ "${1:-}" = "--check" ] || [ "$USE_REMOTE_CLIENT" = "1" ]; then
 fi
 
 if [ "${1:-}" = "--check" ]; then
-  if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" = "1" ]; then
-    echo "codex-vps ready: direct ${DIRECT_REMOTE_URL}"
-  else
+  local doctor_summary service_status
+  if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" != "1" ]; then
     service_status="$(ssh_remote "systemctl --user is-active ${SERVICE_NAME}" 2>/dev/null || true)"
     if [ "$service_status" != "active" ]; then
       echo "codex-vps: ${SERVICE_NAME} is ${service_status:-unavailable}; run 'codex-vps start' explicitly" >&2
       return 1
     fi
-    if owned_tunnel_listener_ok && tunnel_health_ok; then
-      echo "codex-vps ready: existing local 127.0.0.1:${LOCAL_PORT} -> ${REMOTE_HOST}:127.0.0.1:${REMOTE_PORT}"
-    else
-      echo "codex-vps ready: remote service active; no existing owned local tunnel"
-    fi
   fi
+  verify_existing_rpc_transport || return $?
+  doctor_summary="$(require_remote_doctor_readiness)" || return $?
+
   if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" = "1" ]; then
-    echo "codex-vps versions: Mac remote client $(codex_version "$LOCAL_CLIENT") (remote version probe skipped on direct path)"
+    echo "codex-vps ready: direct ${DIRECT_REMOTE_URL}"
   else
-    echo "codex-vps versions: Mac remote client $(codex_version "$LOCAL_CLIENT") == VPS app-server $(remote_codex_version)"
+    echo "codex-vps ready: existing local 127.0.0.1:${LOCAL_PORT} -> ${REMOTE_HOST}:127.0.0.1:${REMOTE_PORT}"
   fi
+  echo "codex-vps doctor: ${doctor_summary}"
+  echo "codex-vps versions: Mac remote client ${LOCAL_CLIENT_VERSION_SNAPSHOT} == VPS app-server ${REMOTE_VERSION_SNAPSHOT}"
   echo "codex-vps client path: $LOCAL_CLIENT"
   echo "codex-vps model config: model=$(codex_launch_model) reasoning=$(codex_launch_reasoning_effort)"
   echo "codex-vps permissions: $(codex_launch_permission_summary)"
@@ -1248,16 +1657,17 @@ fi
 if [ "$USE_REMOTE_CLIENT" != "1" ]; then
   log "connecting over direct SSH TTY fallback..."
   REMOTE_CODEX_ARGS="$(codex_remote_shell_config_args)"
-  REMOTE_REPO_QUOTED="$(printf '%q' "$REMOTE_REPO")"
+  REMOTE_SSH_COMMAND="$(direct_ssh_session_command "$REMOTE_CODEX_ARGS")"
   if [ "$USE_TAILSCALE_PROXY" = "1" ]; then
-    exec "$SSH_BIN" -tt "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" "cd ${REMOTE_REPO_QUOTED} && exec ~/.local/share/codexswitch/patched-codex/codex ${REMOTE_CODEX_ARGS} resume ${THREAD_ID}"
+    exec "$SSH_BIN" -tt "${SSH_PROXY_OPTS[@]}" "$TAILSCALE_TARGET" "$REMOTE_SSH_COMMAND"
   fi
-  exec "$SSH_BIN" -tt "${SSH_OPTS[@]}" "$REMOTE_HOST" "cd ${REMOTE_REPO_QUOTED} && exec ~/.local/share/codexswitch/patched-codex/codex ${REMOTE_CODEX_ARGS} resume ${THREAD_ID}"
+  exec "$SSH_BIN" -tt "${SSH_OPTS[@]}" "$REMOTE_HOST" "$REMOTE_SSH_COMMAND"
 fi
 
 if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" != "1" ]; then
   start_tunnel_supervisor_for_interactive_attach
 fi
+verify_remote_version_snapshot || return $?
 
 cd "$LOCAL_REPO"
 if [ "$RESTART_AND_CONNECT" = "1" ]; then
@@ -1276,10 +1686,10 @@ run_remote_client_once() {
 }
 
 if [ "$REMOTE_CLIENT_AUTO_RECONNECT" != "1" ]; then
-  if [ -n "${CODEX_VPS_USE_PTY_BRIDGE:-}" ]; then
-    exec env TERM=xterm-256color "$PTY_BRIDGE" -- "$LOCAL_CLIENT" "${CODEX_ARGS[@]}" --remote "$REMOTE_URL" resume "$THREAD_ID"
-  fi
-  exec "$LOCAL_CLIENT" "${CODEX_ARGS[@]}" --remote "$REMOTE_URL" resume "$THREAD_ID"
+  local remote_client_status=0
+  run_remote_client_once || remote_client_status=$?
+  cleanup_tunnel_supervisor
+  return "$remote_client_status"
 fi
 
 remote_client_attempt=0
@@ -1304,8 +1714,9 @@ while true; do
   remote_client_delay="$(reconnect_delay_for_attempt "$remote_client_attempt" "$REMOTE_CLIENT_RECONNECT_DELAY" "$REMOTE_CLIENT_RECONNECT_DELAY_MAX")"
   log "remote Codex client exited with status ${remote_client_status}; reconnecting in ${remote_client_delay}s..."
   if [ "$USE_DIRECT_TAILSCALE_APP_SERVER" != "1" ]; then
-    ensure_rpc_transport || true
+    ensure_rpc_transport || exit 1
   fi
+  verify_remote_version_snapshot || exit 1
   sleep_for "$remote_client_delay"
 done
 }

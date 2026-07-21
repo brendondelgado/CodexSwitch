@@ -1,9 +1,94 @@
 import Foundation
 import UserNotifications
 
+private final class RateLimitResetNotificationDefaultsReference: @unchecked Sendable {
+    let value: UserDefaults
+
+    init(_ value: UserDefaults) {
+        self.value = value
+    }
+}
+
+final class RateLimitResetNotificationDedupeCoordinator: @unchecked Sendable {
+    typealias Enqueue = @Sendable (
+        UNNotificationRequest,
+        @escaping @Sendable (Error?) -> Void
+    ) -> Void
+
+    private let lock = NSLock()
+    private let defaultsKey: String
+    private let maximumPersistedKeys: Int
+    private var inFlightKeys = Set<String>()
+
+    init(defaultsKey: String, maximumPersistedKeys: Int) {
+        self.defaultsKey = defaultsKey
+        self.maximumPersistedKeys = maximumPersistedKeys
+    }
+
+    @discardableResult
+    func enqueue(
+        request: UNNotificationRequest,
+        dedupeKey: String,
+        userDefaults: UserDefaults,
+        using enqueue: @escaping Enqueue
+    ) -> Bool {
+        lock.lock()
+        let persistedKeys = Set(userDefaults.stringArray(forKey: defaultsKey) ?? [])
+        guard !persistedKeys.contains(dedupeKey),
+              !inFlightKeys.contains(dedupeKey) else {
+            lock.unlock()
+            return false
+        }
+        inFlightKeys.insert(dedupeKey)
+        lock.unlock()
+
+        let defaultsReference = RateLimitResetNotificationDefaultsReference(userDefaults)
+        enqueue(request) { [weak self] error in
+            self?.complete(
+                dedupeKey: dedupeKey,
+                error: error,
+                userDefaults: defaultsReference.value
+            )
+        }
+        return true
+    }
+
+    private func complete(
+        dedupeKey: String,
+        error: Error?,
+        userDefaults: UserDefaults
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        inFlightKeys.remove(dedupeKey)
+        guard error == nil else { return }
+
+        var orderedKeys: [String] = []
+        var knownKeys = Set<String>()
+        for key in userDefaults.stringArray(forKey: defaultsKey) ?? []
+            where knownKeys.insert(key).inserted {
+            orderedKeys.append(key)
+        }
+        guard knownKeys.insert(dedupeKey).inserted else { return }
+        orderedKeys.append(dedupeKey)
+        if orderedKeys.count > maximumPersistedKeys {
+            orderedKeys.removeFirst(orderedKeys.count - maximumPersistedKeys)
+        }
+        userDefaults.set(orderedKeys, forKey: defaultsKey)
+    }
+}
+
 enum NotificationManager {
     private static let tokenRefreshNotificationCooldown: TimeInterval = 12 * 3600
     private static let tokenRefreshNotificationPrefix = "tokenRefreshFailedNotificationAt."
+    private static let resetExpirationNotificationDedupeDefaultsKey =
+        "resetExpirationNotificationDedupeKeys.v1"
+    private static let maximumResetExpirationNotificationDedupeKeys = 256
+    private static let resetExpirationNotificationCoordinator =
+        RateLimitResetNotificationDedupeCoordinator(
+            defaultsKey: resetExpirationNotificationDedupeDefaultsKey,
+            maximumPersistedKeys: maximumResetExpirationNotificationDedupeKeys
+        )
 
     private static var isEnabled: Bool {
         // @AppStorage defaults to true in SettingsView; UserDefaults.bool returns false when unset
@@ -128,6 +213,122 @@ enum NotificationManager {
         }
         userDefaults.set(now.timeIntervalSince1970, forKey: key)
         return true
+    }
+
+    static func resetExpirationNotificationDedupeKey(
+        stableProviderAccountId: String,
+        expiration: Date,
+        urgency: RateLimitResetExpirationUrgency
+    ) -> String? {
+        guard urgency.sendsExpirationNotification else { return nil }
+        let normalizedAccountId = stableProviderAccountId
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .precomposedStringWithCanonicalMapping
+            .lowercased()
+        guard !normalizedAccountId.isEmpty else { return nil }
+
+        let accountComponent = Data(normalizedAccountId.utf8).base64EncodedString()
+        let expirationComponent = String(
+            expiration.timeIntervalSince1970.bitPattern,
+            radix: 16
+        )
+        return [
+            "reset-expiration",
+            accountComponent,
+            expirationComponent,
+            urgency.rawValue,
+        ].joined(separator: ".")
+    }
+
+    static func shouldNotifyResetExpiration(
+        stableProviderAccountId: String,
+        expiration: Date,
+        urgency: RateLimitResetExpirationUrgency,
+        alreadyNotifiedKeys: Set<String>
+    ) -> Bool {
+        guard let key = resetExpirationNotificationDedupeKey(
+            stableProviderAccountId: stableProviderAccountId,
+            expiration: expiration,
+            urgency: urgency
+        ) else {
+            return false
+        }
+        return !alreadyNotifiedKeys.contains(key)
+    }
+
+    static func notifyResetExpiration(
+        account: CodexAccount,
+        expiration: Date,
+        now: Date = Date(),
+        userDefaults: UserDefaults = .standard
+    ) {
+        guard isEnabled,
+              Bundle.main.bundleIdentifier != nil,
+              expiration > now,
+              let stableProviderAccountId = account.normalizedProviderAccountId else {
+            return
+        }
+        let urgency = RateLimitResetExpirationUrgency.resolve(
+            expiration: expiration,
+            now: now
+        )
+        guard let identifier = resetExpirationNotificationDedupeKey(
+            stableProviderAccountId: stableProviderAccountId,
+            expiration: expiration,
+            urgency: urgency
+        ) else {
+            return
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = "CodexSwitch: \(urgencyNotificationTitle(urgency))"
+        content.body = "\(account.email) has a banked reset expiring "
+            + expiration.formatted(date: .abbreviated, time: .shortened)
+            + ". Review that account before the credit expires."
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: content,
+            trigger: nil
+        )
+        enqueueResetExpirationNotification(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: userDefaults
+        ) { request, completion in
+            UNUserNotificationCenter.current().add(
+                request,
+                withCompletionHandler: completion
+            )
+        }
+    }
+
+    @discardableResult
+    static func enqueueResetExpirationNotification(
+        request: UNNotificationRequest,
+        dedupeKey: String,
+        userDefaults: UserDefaults,
+        coordinator: RateLimitResetNotificationDedupeCoordinator? = nil,
+        enqueue: @escaping RateLimitResetNotificationDedupeCoordinator.Enqueue
+    ) -> Bool {
+        (coordinator ?? resetExpirationNotificationCoordinator).enqueue(
+            request: request,
+            dedupeKey: dedupeKey,
+            userDefaults: userDefaults,
+            using: enqueue
+        )
+    }
+
+    private static func urgencyNotificationTitle(
+        _ urgency: RateLimitResetExpirationUrgency
+    ) -> String {
+        switch urgency {
+        case .normal: return "Banked Reset Inventory"
+        case .advisory: return "Banked Reset Expires Within 7 Days"
+        case .urgent: return "Banked Reset Expires Within 72 Hours"
+        case .critical: return "Banked Reset Expires Within 24 Hours"
+        }
     }
 
     static func notifyLinuxDevboxReadinessIssue(summary: String) {

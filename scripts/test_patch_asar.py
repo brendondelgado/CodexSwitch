@@ -257,6 +257,22 @@ CHATGPT_5440_RECENT_THREADS_CONTENT = (
     "}"
 )
 
+CHATGPT_5628_RECENT_THREADS_CONTENT = (
+    "class RequestClient{"
+    "async listRecentThreads({limit:e}){return(await this.sendRequest(`thread/list`,"
+    "{archived:!1,cursor:null,limit:e,modelProviders:null,sortKey:`updated_at`},"
+    "{priority:`background`,source:`thread_list`})).data}"
+    "async searchThreads({limit:e,query:t}){return[]}}"
+    "class RecentThreadManager{"
+    "async listRecentThreads({cursor:e,limit:t,background:n=!1}){"
+    "let r={limit:t,cursor:e,sortKey:this.params.requestClient."
+    "getCompatibleThreadSortKey(this.recentConversationSortKey),modelProviders:null,"
+    "archived:!1,sourceKinds:ie,useStateDbOnly:!0},i=await this.params.requestClient."
+    "sendRequest(`thread/list`,r,n?{priority:`background`,source:`recent_threads`}:"
+    "{source:`recent_threads`});return{...i,data:i.data.filter(e=>e.ephemeral!==!0)}}"
+    "async hydrateThreads(e,{includeTurns:t=!1}){return e}}"
+)
+
 CHATGPT_5440_STATSIG_CONTENT = (
     "async function Bootstrap(e){throw Error(`Timed out while fetching post-login "
     "Statsig bootstrap`)}"
@@ -278,6 +294,12 @@ CHATGPT_5440_STATSIG_CONTENT = (
     "children:d})}"
     "function visible(){return `Statsig: error while bootstrapping post-login client "
     "CodexStatsigProvider.async`}"
+)
+
+CHATGPT_5628_STATSIG_CONTENT = CHATGPT_5440_STATSIG_CONTENT.replace(
+    "networkConfig",
+    "featureEnabled===!0?fullNetworkConfig:restrictedNetworkConfig",
+    1,
 )
 
 CODEX_5042_MODEL_PICKER_CONTENT = (
@@ -353,6 +375,13 @@ CODEX_5059_SELECTED_MODEL_LABEL_CONTENT = (
     "return l}"
 )
 
+CHATGPT_5628_NATIVE_SELECTED_MODEL_LABEL_CONTENT = (
+    CODEX_5042_MODEL_PICKER_CONTENT
+    + "function Picker(){return `composer.modelPicker.power`}"
+    + "function Trigger(e){return jsx(Label,{model:e.model,"
+    "displayName:e.modelLabel})}"
+)
+
 CODEX_5059_REMOTE_MODEL_RECONNECT_CONTENT = (
     "function xhe(){let e=scope(),t=queryClient(),n=registry(),r=false,i=null,"
     "a=null,o=null,s={current:new Map},c={current:new Set};"
@@ -396,6 +425,21 @@ MODERN_USE_AUTH_CONTENT = (
     "function y(e,t){return{authMethod:e.account?.type}}"
     "function h(e){return e??_()}"
     "export{p as u};"
+)
+
+DIRECT_USE_AUTH_CONTENT = MODERN_USE_AUTH_CONTENT.replace(
+    "u=r(),d=2e3,f=new WeakMap;",
+    "u=r(),d=2e3;",
+    1,
+).replace(
+    "c=()=>{g(e).then(",
+    "c=()=>{e.getAccount().then(",
+    1,
+).replace(
+    "function g(e){let t=f.get(e);if(t!=null)return t;"
+    "let n=e.getAccount().finally(()=>{f.delete(e)});return f.set(e,n),n}",
+    "",
+    1,
 )
 
 WEAKMAP_USE_AUTH_CONTENT = (
@@ -999,7 +1043,7 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn("r as _csQueryKey", patched)
             self.assertIn("_qcRef=_csUseQueryClient();let n=(0,u.c)(14),", patched)
             self.assertIn(
-                "}),_invalidateAccountQueries(),e.authMethod==null?(",
+                "}),_invalidateAccountQueries(e),e.authMethod==null?(",
                 patched,
             )
             self.assertIn(patch_asar.AUTH_TRANSITION_PATCH_MARKER, patched)
@@ -1011,6 +1055,16 @@ class PatchAsarTests(unittest.TestCase):
             )
             self.assertIn("_csLogoutTimer=setTimeout", patched)
             self.assertIn("c(_csEventEpoch,!0)", patched)
+            self.assertIn(patch_asar.AUTH_SINGLE_FLIGHT_PATCH_MARKER, patched)
+            self.assertIn(
+                "_codexSwitchReadAccount(e,()=>e.getAccount()).then(",
+                patched,
+            )
+            self.assertIn(
+                'try{_csAccountReadFlights=new WeakMap;'
+                'typeof f!="undefined"&&(f=new WeakMap);if(_qcRef)',
+                patched,
+            )
             self.assertIn(
                 "e.authMethod==null&&t?.authMethod!=null?t:",
                 patched,
@@ -1033,12 +1087,17 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn(patch_asar.PATCH_MARKER, patched)
             self.assertIn(patch_asar.AUTH_CACHE_PATCH_MARKER, patched)
             self.assertIn(
-                'var _csAuthInvalidationPending=!1;function _invalidateAccountQueries(){'
+                'var _csAuthInvalidationEvents=new WeakMap;'
+                'function _invalidateAccountQueries(e){'
                 '"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
-                'if(_csAuthInvalidationPending)return;',
+                '"CODEXSWITCH_AUTH_EVENT_DEDUPE_V1";',
                 patched,
             )
-            self.assertIn('try{typeof f!="undefined"&&(f=new WeakMap)}catch{}}', patched)
+            self.assertIn(
+                'try{_csAccountReadFlights=new WeakMap;'
+                'typeof f!="undefined"&&(f=new WeakMap)}catch{}}',
+                patched,
+            )
             self.assertEqual(patched.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
             self.assertIn(
                 "p(t=>_codexSwitchResolveAuthState(t,y(e,{isCopilotApiAvailable:r,"
@@ -1049,7 +1108,11 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn("e.authMethod==null&&t?.authMethod!=null?t:", patched)
             self.assertIn("f=new WeakMap;", patched)
             self.assertIn(
-                "}),_invalidateAccountQueries(),e.authMethod==null?(",
+                "_codexSwitchReadAccount(e,()=>e.getAccount()).then(",
+                patched,
+            )
+            self.assertIn(
+                "}),_invalidateAccountQueries(e),e.authMethod==null?(",
                 patched,
             )
             self.assertIn("export{l as a,p as i,c as o};", patched)
@@ -1065,12 +1128,17 @@ class PatchAsarTests(unittest.TestCase):
             patched = target.read_text()
             self.assertEqual(patched.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
             self.assertIn(
-                'var _csAuthInvalidationPending=!1;function _invalidateAccountQueries(){'
+                'var _csAuthInvalidationEvents=new WeakMap;'
+                'function _invalidateAccountQueries(e){'
                 '"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
-                'if(_csAuthInvalidationPending)return;',
+                '"CODEXSWITCH_AUTH_EVENT_DEDUPE_V1";',
                 patched,
             )
-            self.assertIn('try{typeof _9!="undefined"&&(_9=new WeakMap)}catch{}}', patched)
+            self.assertIn(
+                'try{_csAccountReadFlights=new WeakMap;'
+                'typeof _9!="undefined"&&(_9=new WeakMap)}catch{}}',
+                patched,
+            )
             self.assertEqual(patched.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
             self.assertIn(
                 "u(t=>_codexSwitchResolveAuthState(t,$de(e,{isCopilotApiAvailable:r,"
@@ -1087,10 +1155,39 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn("hd=new WeakMap", patched)
             self.assertNotIn("hd=new WeakMap;function _invalidateAccountQueries", patched)
             self.assertIn(
-                "}),_invalidateAccountQueries(),e.authMethod==null?(",
+                "}),_invalidateAccountQueries(e),e.authMethod==null?(",
+                patched,
+            )
+            self.assertIn(
+                "_codexSwitchReadAccount(e,()=>e.getAccount()).then(",
                 patched,
             )
             self.assertIn("export{f9 as i};", patched)
+
+    def test_apply_patch_adds_module_single_flight_to_direct_account_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "use-auth-HASH.js"
+            target.write_text(DIRECT_USE_AUTH_CONTENT)
+
+            self.assertTrue(patch_asar.apply_patch(target))
+
+            patched = target.read_text()
+            self.assertEqual(
+                patched.count(patch_asar.AUTH_SINGLE_FLIGHT_PATCH_MARKER),
+                1,
+            )
+            self.assertIn(
+                "_codexSwitchReadAccount(e,()=>e.getAccount()).then(",
+                patched,
+            )
+            self.assertIn(
+                "try{_csAccountReadFlights=new WeakMap;",
+                patched,
+            )
+            self.assertTrue(patch_asar.current_auth_patch_present(patched))
+
+            self.assertTrue(patch_asar.apply_patch(target))
+            self.assertEqual(target.read_text(), patched)
 
     def test_apply_patch_repairs_nested_weakmap_v1_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1117,7 +1214,7 @@ class PatchAsarTests(unittest.TestCase):
             self.assertEqual(repaired.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
             self.assertEqual(repaired.count("function _invalidateAccountQueries"), 1)
             self.assertEqual(
-                repaired.count("_invalidateAccountQueries(),e.authMethod==null?"),
+                repaired.count("_invalidateAccountQueries(e),e.authMethod==null?"),
                 1,
             )
             self.assertLess(
@@ -1265,7 +1362,260 @@ if(state.authMethod!==null||logoutCount!==1)process.exit(4);
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_auth_invalidator_coalesces_subscriber_fanout(self):
+    def _patched_auth_runtime(self, fixture):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "use-auth-HASH.js"
+            target.write_text(fixture)
+            self.assertTrue(patch_asar.apply_patch(target))
+            patched = target.read_text()
+            self.assertIn(
+                "_codexSwitchReadAccount(e,()=>e.getAccount()).then(",
+                patched,
+            )
+            self.assertNotIn(
+                "_codexSwitchReadAccount(e,()=>g(e)).then(",
+                patched,
+            )
+            return patch_asar.re.sub(
+                r'import\{.*?\}from"[^"]+";',
+                "",
+                patched,
+            ).replace("export{p as u};", "globalThis.useAuth=p;")
+
+    def _assert_two_subscriber_auth_replay(self, fixture):
+        node = patch_asar.shutil.which("node")
+        if node is None:
+            self.skipTest("node is required for the renderer single-flight replay")
+        runtime = self._patched_auth_runtime(fixture)
+
+        script = r"""
+const stateSlots=[];
+const cleanups=[];
+let nextTimer=1;
+const timers=new Map();
+globalThis.setTimeout=(callback,delay=0)=>{
+  const id=nextTimer++;
+  timers.set(id,{callback,delay});
+  return id;
+};
+globalThis.clearTimeout=id=>{timers.delete(id)};
+const ReactMock={
+  createContext:()=>({}),
+  useState(initial){
+    const slot={value:initial};
+    stateSlots.push(slot);
+    return [slot.value,next=>{
+      slot.value=typeof next===`function`?next(slot.value):next;
+    }];
+  },
+  useEffect(effect){cleanups.push(effect())},
+};
+function e(value){return value}
+function n(){return ReactMock}
+function r(){return{c:()=>[]}}
+const _csUseQueryClient=()=>({invalidateQueries:()=>Promise.resolve()});
+const _csQueryKey=value=>[value];
+""" + runtime + r"""
+const callbacks=new Set();
+const deferred=[];
+let readCount=0;
+let logoutCount=0;
+const manager={
+  getAccount(){
+    readCount++;
+    let resolve,reject;
+    const promise=new Promise((yes,no)=>{resolve=yes;reject=no});
+    deferred.push({resolve,reject});
+    return promise;
+  },
+  addAuthStatusCallback(callback){callbacks.add(callback)},
+  removeAuthStatusCallback(callback){callbacks.delete(callback)},
+  emit(value){for(const callback of [...callbacks])callback(value)},
+};
+const options={
+  isCopilotApiAvailable:false,
+  useCopilotAuthIfAvailable:false,
+  shouldUseWindowsStartupAuthTimeout:false,
+  onLogout:()=>{logoutCount++},
+};
+const flush=async()=>{
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise(resolve=>setImmediate(resolve));
+};
+const runAllTimers=async()=>{
+  while(timers.size>0){
+    const [id,timer]=[...timers.entries()].sort((a,b)=>
+      a[1].delay-b[1].delay||a[0]-b[0]
+    )[0];
+    timers.delete(id);
+    timer.callback();
+    await flush();
+  }
+};
+async function replay(){
+  useAuth(manager,options);
+  useAuth(manager,options);
+  await flush();
+  if(readCount!==1)throw Error(`initial reads=${readCount}`);
+
+  manager.emit({authMethod:null});
+  await runAllTimers();
+  if(readCount!==2)throw Error(`null confirmation reads=${readCount}`);
+
+  manager.emit({authMethod:`chatgpt`});
+  await flush();
+  if(readCount!==3)throw Error(`authenticated reads=${readCount}`);
+
+  deferred[2].resolve({account:{type:`chatgpt`}});
+  await flush();
+  deferred[1].resolve({account:null});
+  await flush();
+  deferred[0].resolve({account:null});
+  await flush();
+  await runAllTimers();
+
+  const authStates=[stateSlots[1].value,stateSlots[3].value];
+  if(authStates.some(state=>state?.authMethod!==`chatgpt`)){
+    throw Error(`stale null won: ${JSON.stringify(authStates)}`);
+  }
+  if(readCount!==3)throw Error(`unbounded reads=${readCount}`);
+  if(logoutCount!==0)throw Error(`logout count=${logoutCount}`);
+  for(const cleanup of cleanups)cleanup?.();
+  if(callbacks.size!==0)throw Error(`callbacks retained=${callbacks.size}`);
+}
+replay().catch(error=>{console.error(error.stack);process.exit(1)});
+"""
+        completed = patch_asar.subprocess.run(
+            [node, "--eval", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_two_subscribers_share_direct_reads_across_auth_reordering(self):
+        self._assert_two_subscriber_auth_replay(DIRECT_USE_AUTH_CONTENT)
+
+    def test_two_subscribers_bypass_real_helper_cache_across_auth_reordering(self):
+        self._assert_two_subscriber_auth_replay(MODERN_USE_AUTH_CONTENT)
+
+    def test_rapid_distinct_chatgpt_broadcasts_commit_the_newest_account_result(self):
+        node = patch_asar.shutil.which("node")
+        if node is None:
+            self.skipTest("node is required for the rapid auth broadcast replay")
+        runtime = self._patched_auth_runtime(
+            MODERN_USE_AUTH_CONTENT.replace(
+                "function y(e,t){return{authMethod:e.account?.type}}",
+                "function y(e,t){return{authMethod:e.account?.type,email:e.account?.email}}",
+                1,
+            )
+        )
+        script = r"""
+const stateSlots=[];
+const cleanups=[];
+let nextTimer=1;
+const timers=new Map();
+globalThis.setTimeout=(callback,delay=0)=>{
+  const id=nextTimer++;
+  timers.set(id,{callback,delay});
+  return id;
+};
+globalThis.clearTimeout=id=>{timers.delete(id)};
+const ReactMock={
+  createContext:()=>({}),
+  useState(initial){
+    const slot={value:initial};
+    stateSlots.push(slot);
+    return [slot.value,next=>{
+      slot.value=typeof next===`function`?next(slot.value):next;
+    }];
+  },
+  useEffect(effect){cleanups.push(effect())},
+};
+function e(value){return value}
+function n(){return ReactMock}
+function r(){return{c:()=>[]}}
+let invalidationCount=0;
+const _csUseQueryClient=()=>({
+  invalidateQueries:()=>{invalidationCount++;return Promise.resolve()},
+});
+const _csQueryKey=value=>[value];
+""" + runtime + r"""
+const callbacks=new Set();
+const deferred=[];
+let readCount=0;
+const manager={
+  getAccount(){
+    readCount++;
+    let resolve;
+    const promise=new Promise(yes=>{resolve=yes});
+    deferred.push({resolve});
+    return promise;
+  },
+  addAuthStatusCallback(callback){callbacks.add(callback)},
+  removeAuthStatusCallback(callback){callbacks.delete(callback)},
+  emit(value){for(const callback of [...callbacks])callback(value)},
+};
+const options={
+  isCopilotApiAvailable:false,
+  useCopilotAuthIfAvailable:false,
+  shouldUseWindowsStartupAuthTimeout:false,
+  onLogout:()=>{throw Error(`unexpected logout`)},
+};
+const flush=async()=>{
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise(resolve=>setImmediate(resolve));
+};
+async function replay(){
+  useAuth(manager,options);
+  useAuth(manager,options);
+  await flush();
+  if(readCount!==1)throw Error(`initial reads=${readCount}`);
+
+  const first={authMethod:`chatgpt`,accountId:`first`};
+  manager.emit(first);
+  await flush();
+  if(readCount!==2)throw Error(`first broadcast reads=${readCount}`);
+  if(invalidationCount!==2)throw Error(`first invalidations=${invalidationCount}`);
+
+  const newer={authMethod:`chatgpt`,accountId:`newer`};
+  manager.emit(newer);
+  await flush();
+  if(readCount!==3)throw Error(`newer broadcast reused stale flight: ${readCount}`);
+  if(invalidationCount!==4)throw Error(`newer invalidations=${invalidationCount}`);
+  if(timers.size!==2)throw Error(`expected two pending dedupe timers, got ${timers.size}`);
+
+  deferred[2].resolve({account:{type:`chatgpt`,email:`new@example.com`}});
+  await flush();
+  deferred[1].resolve({account:{type:`chatgpt`,email:`old@example.com`}});
+  await flush();
+  deferred[0].resolve({account:null});
+  await flush();
+
+  const authStates=[stateSlots[1].value,stateSlots[3].value];
+  if(authStates.some(state=>
+    state?.authMethod!==`chatgpt`||state?.email!==`new@example.com`
+  )){
+    throw Error(`stale result won: ${JSON.stringify(authStates)}`);
+  }
+  if(readCount!==3)throw Error(`unbounded reads=${readCount}`);
+  if(timers.size!==2)throw Error(`timers were unexpectedly drained`);
+  for(const cleanup of cleanups)cleanup?.();
+  if(callbacks.size!==0)throw Error(`callbacks retained=${callbacks.size}`);
+}
+replay().catch(error=>{console.error(error.stack);process.exit(1)});
+"""
+        completed = patch_asar.subprocess.run(
+            [node, "--eval", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_auth_invalidator_dedupes_only_the_same_broadcast(self):
         node = patch_asar.shutil.which("node")
         if node is None:
             self.skipTest("node is required for the renderer invalidation fixture")
@@ -1273,13 +1623,19 @@ if(state.authMethod!==null||logoutCount!==1)process.exit(4);
         script = (
             "let timers=[];globalThis.setTimeout=e=>{timers.push(e);return timers.length};"
             "let cache=new WeakMap;"
+            + patch_asar.auth_single_flight_module_patch()
             + patch_asar.auth_invalidation_guard_patch()
             + patch_asar.weakmap_auth_invalidator_patch("cache")
-            + "let original=cache;_invalidateAccountQueries();let first=cache;"
-            "_invalidateAccountQueries();"
-            "if(first===original||cache!==first||timers.length!==1)process.exit(1);"
-            "timers.shift()();_invalidateAccountQueries();"
-            "if(cache===first||timers.length!==1)process.exit(2);"
+            + "let duplicate={authMethod:`chatgpt`},newer={authMethod:`apiKey`};"
+            "let original=cache,originalFlight=_csAccountReadFlights;"
+            "_invalidateAccountQueries(duplicate);"
+            "let first=cache,firstFlight=_csAccountReadFlights;"
+            "_invalidateAccountQueries(duplicate);"
+            "if(first===original||firstFlight===originalFlight||cache!==first||"
+            "_csAccountReadFlights!==firstFlight||timers.length!==1)process.exit(1);"
+            "_invalidateAccountQueries(newer);"
+            "if(cache===first||_csAccountReadFlights===firstFlight||timers.length!==2)"
+            "process.exit(2);"
         )
         completed = patch_asar.subprocess.run(
             [node, "--eval", script],
@@ -1514,6 +1870,39 @@ if(state.authMethod!==null||logoutCount!==1)process.exit(4);
 
             self.assertEqual(target.read_text(), once)
 
+    def test_apply_recent_threads_state_db_patch_accepts_native_safe_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-latest.js"
+            target.write_text(CHATGPT_5628_RECENT_THREADS_CONTENT)
+
+            self.assertTrue(patch_asar.apply_recent_threads_state_db_patch(target))
+            patched = target.read_text()
+
+            self.assertTrue(patch_asar.has_recent_threads_state_db_patch(patched))
+            self.assertEqual(
+                patched.count(patch_asar.RECENT_THREADS_STATE_DB_MARKER),
+                1,
+            )
+            self.assertEqual(patched.count("useStateDbOnly:!0"), 1)
+            self.assertIn("source:`thread_list`", patched)
+
+    def test_recent_threads_state_db_patch_rejects_native_false_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-unsafe.js"
+            target.write_text(
+                CHATGPT_5628_RECENT_THREADS_CONTENT.replace(
+                    "useStateDbOnly:!0",
+                    "useStateDbOnly:!1",
+                    1,
+                )
+            )
+
+            self.assertFalse(patch_asar.apply_recent_threads_state_db_patch(target))
+            self.assertNotIn(
+                patch_asar.RECENT_THREADS_STATE_DB_MARKER,
+                target.read_text(),
+            )
+
     def test_recent_threads_state_db_patch_rejects_ambiguous_manager(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "ambiguous.js"
@@ -1555,11 +1944,33 @@ if(state.authMethod!==null||logoutCount!==1)process.exit(4);
             self.assertIn("new StatsigSDK.StatsigClient", patched)
             self.assertIn("r=StableIDs.StableID.get(e.statsigClientKey)", patched)
             self.assertIn("{userID:r}", patched)
+            self.assertIn("e.networkConfig", patched)
+            self.assertIn("networkConfig:networkConfig", patched)
             self.assertIn("deviceId:r", patched)
             self.assertIn("n.initializeSync()", patched)
             self.assertIn("catch(t){return e.children}", patched)
             self.assertIn(
                 "(0,jsxRuntime.jsxs)(_codexSwitchStatsigFailOpen,{appSessionId:",
+                patched,
+            )
+
+    def test_apply_statsig_fail_open_patch_preserves_dynamic_network_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-latest.js"
+            target.write_text(CHATGPT_5628_STATSIG_CONTENT)
+
+            self.assertTrue(patch_asar.apply_statsig_fail_open_patch(target))
+            patched = target.read_text()
+
+            self.assertTrue(patch_asar.has_statsig_fail_open_patch(patched))
+            self.assertIn(
+                "networkConfig:featureEnabled===!0?fullNetworkConfig:"
+                "restrictedNetworkConfig,children:[",
+                patched,
+            )
+            self.assertIn(
+                "new StatsigSDK.StatsigClient(e.statsigClientKey,{userID:r},"
+                "e.networkConfig)",
                 patched,
             )
             self.assertNotIn(
@@ -1737,6 +2148,23 @@ if(state.authMethod!==null||logoutCount!==1)process.exit(4);
             self.assertIn("zE(n).replace(/^GPT-/iu,``).replaceAll(`-`,` `)", first)
             self.assertTrue(patch_asar.apply_selected_model_label_fallback_patch(target))
             self.assertEqual(target.read_text(), first)
+
+    def test_selected_model_label_accepts_native_option_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-main-latest.js"
+            target.write_text(CHATGPT_5628_NATIVE_SELECTED_MODEL_LABEL_CONTENT)
+
+            self.assertTrue(patch_asar.apply_model_label_fallback_patch(target))
+            self.assertTrue(patch_asar.apply_selected_model_label_fallback_patch(target))
+            patched = target.read_text()
+
+            self.assertEqual(
+                patched.count(patch_asar.SELECTED_MODEL_LABEL_FALLBACK_MARKER),
+                1,
+            )
+            self.assertIn("displayName:e.modelLabel", patched)
+            self.assertTrue(patch_asar.apply_selected_model_label_fallback_patch(target))
+            self.assertEqual(target.read_text(), patched)
 
     def test_remote_model_refresh_invalidates_same_host_catalog(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,8 +22,8 @@ cross_dependencies:
 version_control:
   branch: main
   base_commit: 664edf6201fcd7dcdc299084392e3dad510ec9d7
-  status: local_uncommitted
-  last_updated: 2026-07-13
+  status: deferred_frozen_unimplemented
+  last_updated: 2026-07-21
 operator_boundary:
   status: OPERATOR_DIRECTIVE_ACTIVE
   sha256: 4416348576c92302dc3836955482bd6fd86c62b2aa9b66e5c7228b0161fc14fd
@@ -32,6 +32,13 @@ operator_boundary:
 ---
 
 # Codex Runtime Storage Hardening Deployment Packet
+
+> **Deployment status:** No deployable implementation exists. This packet is a
+> frozen future contract only. The repository patch driver and verified live
+> runtime do not provide the lease/compression feature, the active artifact
+> contract does not require `codex-runtime-storage-leases-v1`, and checked-in
+> units keep `local_thread_store_compression` disabled. Nothing in this document
+> authorizes describing storage hardening as active.
 
 ## Operator Boundary
 
@@ -103,8 +110,8 @@ Compression controls the burst but does not provide indefinite zero-growth reten
 
 | Setting | Value | Activation state |
 |---|---:|---|
-| Codex feature | `local_thread_store_compression` | enabled by the reviewed app-server unit on a separately authorized activation |
-| Capability marker | `codex-runtime-storage-leases-v1` | required in every active Codex executable |
+| Codex feature | `local_thread_store_compression` | disabled; no checked-in unit enables it |
+| Capability marker | `codex-runtime-storage-leases-v1` | frozen future marker; absent from the active runtime requirement |
 | Compression level | 3 | private default |
 | Zstd frame checksum | enabled | mandatory |
 | Minimum inactivity | 15 minutes | private default |
@@ -187,54 +194,21 @@ Do not run the full Codex workspace test suite without explicit approval. Do not
 
 ## Deployment Gate
 
-Run read-only status and doctor first:
-
-```text
-codexswitch-cli storage status --codex-home /home/signul/.codex --json
-codexswitch-cli storage doctor --codex-home /home/signul/.codex --json
-```
-
-Activation is refused unless all conditions are true:
-
-- the repository release is pinned by a reviewed full 40- or 64-character Git
-  SHA reachable from the approved origin ref, and the runtime artifact has its
-  own reviewed full source SHA;
-- exact runtime home equals `/home/signul/.codex` for the SIGNUL deployment;
-- disk has source-sized temporary headroom plus safety reserve;
-- every active Codex PID is enumerated with PID, start time, executable path, executable fingerprint, and FD count;
-- every executable contains `codex-runtime-storage-leases-v1`;
-- no old binary shares the runtime home;
-- native Codex doctor and CodexSwitch inventory both count compressed-only rollouts and deduplicate dual representations;
-- rollout concurrency/fault tests and multi-process log-cap tests are green;
-- `local_thread_store_compression` is still false before the controlled restart.
+The gate is closed. There is no current `storage status`, `storage doctor`,
+lease-marker, compression, or migration implementation accepted for release.
+Repository and artifact deployment may proceed only for the non-storage runtime
+contract and must leave `local_thread_store_compression` disabled. Reopening
+this gate requires explicit operator authorization, an implemented patch-driver
+change, synthetic-fixture evidence, exact upstream and patch provenance, and a
+new independent review.
 
 ## Activation
 
-Activation requires a separately authorized maintenance window:
-
-1. Freeze new work through the managed daemon boundary.
-2. Wait for every managed turn to become terminal; refuse ambiguous external processes.
-3. Record `storage status --json` as the before artifact.
-4. Prepare the reviewed lease-aware runtime as an input artifact only. A helper
-   must not copy it into a live path, replace a public CLI, enable a unit, or
-   restart a process.
-5. Stage and inspect the immutable repository release with
-   `CODEXSWITCH_GIT_SHA=<full-sha>`, the approved origin ref, full runtime source
-   SHA, and `scripts/install-linux.sh`; stage-only changes no live pointer or
-   process.
-6. Activate only through the same full-SHA installer invocation with explicit
-   restart flags. Unit bytes, pointers, boot links, prior inactive service
-   posture, and any requested import remain one rollback-protected transaction;
-   mixed old/new writers are forbidden.
-7. Re-run `storage doctor --json` and require every live executable to contain the capability marker.
-8. Treat `local_thread_store_compression` as immutable release configuration;
-   do not toggle it with a direct mutable feature command.
-9. Verify the first bounded pass. Never use raw `kill`, broad `pkill`, a direct
-   service command, or a mutable install helper as a deployment shortcut.
-
-No direct feature, install, enable, or restart command in this packet is an
-authorized deployment path. The immutable full-SHA installer transaction is the
-only activation boundary.
+Storage-hardening activation is prohibited while this packet is frozen. Do not
+enable the feature flag, require the frozen marker, run compression or migration,
+or infer activation from a normal Linux runtime release. A future superseding
+packet must define the reviewed activation and rollback procedure after the
+feature is actually implemented.
 
 ## Verification Metrics
 
@@ -279,12 +253,11 @@ The logs migration is additive and must remain on binary rollback. Do not down-m
 
 ## Repository State
 
-**Status:** repository policy and deployment wiring are active for review as of
-2026-07-13. The immutable runtime must contain
-`codex-runtime-storage-leases-v1`; the checked-in app-server definition enables
-`local_thread_store_compression` and applies bounded pass, inactivity, and hot
-storage defaults. This repository state is not evidence of VPS deployment or
-feature activation.
+**Status:** deferred, frozen, unimplemented, and disabled as of 2026-07-21. The
+active runtime marker contract does not include
+`codex-runtime-storage-leases-v1`; the checked-in app-server definition does not
+enable `local_thread_store_compression`. This repository state is not evidence
+of VPS deployment or feature activation.
 
 **External-write attestation:** Zero session/log bytes and zero per-session or content-derived session/log metadata were written to R2, Cloudflare, Neon, the Mac, SecureDrop, or any other external destination. No real VPS session/log contents were received or copied to the Mac. The frozen boundary packet and the earlier storage workpack were read-only policy/aggregate context; the temporary Mac file used to verify the boundary packet was removed. No live VPS compression, migration, plain-representation retirement, log-row retirement, deletion, restart, feature activation, or install occurred.
 
@@ -297,10 +270,12 @@ feature activation.
 All three bind to operator packet SHA-256 `4416348576c92302dc3836955482bd6fd86c62b2aa9b66e5c7228b0161fc14fd` and prohibit session/log bytes or per-session/content-derived metadata outside the VPS.
 
 **Verification state:** Linux deployment fixtures use synthetic runtime/session
-data only. They prove the capability marker requirement, immutable release
-retention, exact systemd resource policy, and non-live activation behavior.
-Native Codex rollout/thread-store/state tests and any live storage migration
-remain separate gates before an operator authorizes deployment.
+data only. They prove that the frozen marker is not an active requirement, the
+feature flag is absent from generated and checked-in units, and normal release
+retention and systemd policy remain independent of storage hardening. Native
+Codex rollout/thread-store/state implementation tests do not exist for an
+accepted storage-hardening patch; any future implementation and live migration
+remain separate gates.
 
 ## Authorization Holds
 

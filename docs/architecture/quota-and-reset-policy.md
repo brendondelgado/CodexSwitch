@@ -11,6 +11,8 @@ toc:
   - Candidate Ranking
   - Banked Reset Policy
   - Durable Redemption
+  - Manual Redemption
+  - Reset Expiration Urgency
   - Presentation Rules
   - Policy Examples
   - Shared Test Contract
@@ -28,7 +30,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-15
+  last_updated: 2026-07-21
 ---
 
 # Quota And Reset Policy
@@ -146,12 +148,13 @@ automatic-reset option. An explicit operator command may request one manual
 redemption, but it does not create a second background owner.
 
 `codexswitch-cli redeem-reset <account>` is that manual entrypoint. It accepts
-one exact account selector, requires a Pro account with a fresh blocked quota
-observation and a fresh available credit, and never changes the active account
-or auth file. Each invocation uses the canonical account-store reset journal,
+one exact account selector, requires a paid account with complete runtime
+credentials, a normalized stable provider identity, a fresh blocked quota
+observation, and a fresh available credit with an explicit future expiration,
+and never changes the active account or auth file. Each invocation uses the canonical account-store reset journal,
 submits at most one credit, reconciles a newer inventory and quota observation,
 and commits the refreshed target account before reporting success. A usable
-account, a non-Pro account, an unknown or stale quota, or an unresolved prior
+account, a free account, an unknown or stale quota, or an unresolved prior
 attempt fails closed without sending a consume request. The command may still
 reconcile an existing journaled attempt after quota becomes usable; that replay
 is observation-only and cannot submit another credit.
@@ -166,6 +169,27 @@ prepared -> submitted -> reconciling -> confirmed-pending-persistence -> confirm
 
 Before the POST, persist and read back account identity, reset credit identity, request UUID, starting inventory, starting quota, owner, and timestamp. Persist and read back every transition to `submitted` before sending the POST and every transition to `reconciling` before returning an uncertain result. Journal mutations use the shared descriptor-anchored, cross-process locked, generation-checked secure-file transaction; only a proven committed generation becomes in-memory authoritative state. A timeout, process crash, HTTP 5xx, malformed body, delayed inventory update, or persistence failure leaves the prior proven state authoritative and never authorizes an immediate second POST.
 
+The initially authorized bank remains the immutable decision baseline through
+preflight and final authorization. Every newer inventory observation passes
+through one transition classifier before it can become authoritative. A quota
+GET followed by a changed inventory cannot silently rebase the decision or
+authorize the next credit against the older quota observation.
+
+The final in-process authorization re-fetches quota and inventory and requires
+the complete available-credit list and count to match the prepared attempt. It
+also revalidates the exact activation generation and phase, mutation lease,
+durable configured files, external-redemption hold, and the complete submitted
+journal value. The journal readback must exactly equal the expected submitted
+attempt, including account, credit, starting count, bank and quota timestamps,
+creation and submission times, state, and response code. A submission permit is
+valid for at most ten seconds and is single-use. The local-submission expectation
+is recorded only after that authorization succeeds and immediately before
+transport begins. It is bound to the attempt UUID, credit UUID, provider account,
+and starting count, and can explain exactly one decrement of exactly that credit.
+Any larger decrement, different removed credit, replacement at the same count,
+or later additional decrement is external activity and creates the persisted
+15-minute hold.
+
 Success requires fresh evidence that:
 
 - the selected reset inventory decreased or the selected credit became consumed, and
@@ -176,7 +200,82 @@ refreshed account state must be durably committed and read back before the
 journal can become terminal `confirmed`; a crash or persistence failure keeps
 redemption suppressed.
 
-Reconciliation uses stable provider account identity so a changed local UUID cannot bypass duplicate-spend protection.
+Reconciliation uses the normalized stable provider account identity at every
+journal read, comparison, and write boundary, including legacy records, so a
+changed local UUID, case, or surrounding whitespace cannot bypass
+duplicate-spend protection.
+
+## Manual Redemption
+
+The menu app exposes the same one-account manual operation on each eligible
+account. The action names the account, confirms before submission, and consumes
+only that account's oldest-expiring available credit. It requires a fresh paid
+account inventory whose available credits all have normalized identifiers and
+explicit future expirations, complete runtime credentials, a fresh quota
+observation proving that the account is blocked, no unresolved attempt for the
+normalized stable provider account, and exclusive ownership of the
+account-mutation lease. Manual intent may override capacity
+conservation and the 24-hour natural-recovery guard, but it cannot override
+freshness, paid-account eligibility, duplicate-spend protection, or journal safety.
+The journal records manual intent. Routine higher-tier promotion excludes that
+account while the attempt is unresolved and after successful reconciliation
+until failure-driven rotation or explicit operator selection successfully
+activates the recovered account. That activation durably releases the
+route-specific suppression. An unreadable reset journal blocks both automatic
+routing and manual reset submission until a later bounded read restores the
+unresolved-attempt and suppression state.
+The live suppression index uses normalized provider identity rather than the
+local account UUID. Account removal and re-addition therefore preserve the
+route hold, a later pending attempt cannot replace an existing durable hold,
+and a successfully released pending attempt cannot be re-suppressed when its
+reconciliation completes. A release may clear live state only when the
+provider-specific suppression revision still matches the value captured before
+journal I/O, preventing an older activation from erasing a newer redemption.
+Restore uses the same provider revision and skips in-flight releases and
+pre-journal pending intent, so a stale journal read cannot reinstate a released
+hold or erase a newer one.
+An unreleased successful manual-suppression record is retained independently of
+ordinary terminal-history age and count pruning; at most the newest unreleased
+record per provider account is protected.
+
+The selected credit's disappearance proves a local decrement only while its
+recorded expiration remains in the future at the refreshed observation. If the
+credit could have expired naturally, count decrease plus absence is inventory
+churn and cannot finalize the attempt without explicit consumed evidence.
+Inventory `fetchedAt` is the response-completion time, never the request-start
+time, so a credit expiring while the GET is in flight cannot appear unexpired.
+
+A manual redemption never changes the configured account, writes `auth.json`,
+initiates a swap, or reloads a local runtime. It may proceed from an exact
+`confirmed` or `committed_degraded` activation journal when the durable
+configured files and exclusive mutation lease still match. The UI remains in
+redeeming or reconciling state until a
+newer inventory and quota observation prove the result. An uncertain result is
+shown as unresolved and cannot enable a second submission.
+
+## Reset Expiration Urgency
+
+Available credits are ordered by expiration and attributed to their account in
+the menu. Urgency uses one injected `now` and the oldest available credit:
+
+- more than seven days: normal inventory styling;
+- seven days or less: advisory styling and one deduplicated notification;
+- 72 hours or less: urgent orange styling with a slow pulse;
+- 24 hours or less: critical red styling with a faster pulse.
+
+The pulse changes opacity without changing layout and is disabled when Reduce
+Motion is enabled. Notifications are deduplicated by stable provider account,
+credit expiration, and urgency band, so regular polling cannot repeat the same
+alert while escalation to a more urgent band remains visible. A dedupe key is
+persisted only after the system accepts the notification. One in-flight key
+suppresses concurrent duplicates; enqueue failure clears that transient claim
+so a later poll retries.
+
+A cached bank is fresh only when it is both within the time bound and
+structurally valid at the current observation time. Natural expiration removes
+capacity without implying another client redeemed a credit, so it updates the
+inventory and urgency presentation without creating an external-redemption
+hold.
 
 ## Presentation Rules
 
@@ -186,6 +285,14 @@ Reconciliation uses stable provider account identity so a changed local UUID can
 - Label weekly-only operation through the meter itself; do not show an alarming missing-five-hour error.
 - Separate local Mac status from VPS status.
 - Separate remaining quota from reset inventory.
+- Attribute the next reset expiration to its account and sort expiration
+  notices by urgency, then exact expiration.
+- Provide an account-specific redemption control only when current evidence
+  and coordinator state can authorize one reset. Unreadable ownership state,
+  any active redemption, missing configured or activation state, unresolved
+  attempts, and active local or external holds keep unavailable actions disabled
+  with an explicit
+  reason.
 - Show reset attempt states such as pending reconciliation rather than guessing success.
 - Show stale or unknown observations as stale or unknown, never as zero or full.
 - When the provider reports global exhaustion and still supplies quota windows,

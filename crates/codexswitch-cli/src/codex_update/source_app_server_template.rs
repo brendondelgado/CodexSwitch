@@ -336,10 +336,15 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
                     };
                     let (
                         initialized_frontend_count,
+                        skipped_frontend_count,
                         eligible_frontend_count,
+                        rejected_frontend_count,
                         frontend_write_count,
                     ) = frontend_delivery;
-                    if eligible_frontend_count > initialized_frontend_count
+                    if skipped_frontend_count
+                        .checked_add(eligible_frontend_count)
+                        .and_then(|count| count.checked_add(rejected_frontend_count))
+                            != Some(initialized_frontend_count)
                         || frontend_write_count > eligible_frontend_count
                     {
                         tracing::error!(
@@ -347,15 +352,20 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
                         );
                         continue;
                     }
-                    let idle_listener_ready = initialized_frontend_count == 0
+                    let idle_listener_ready = eligible_frontend_count == 0
                         && expected_runtime_kind == "headless-remote-control-app-server";
                     if idle_listener_ready {
                         tracing::info!(
-                            "CodexSwitch idle app-server auth reload acknowledged without an initialized frontend"
+                            "CodexSwitch idle app-server auth reload acknowledged without an eligible frontend writer"
                         );
-                    } else if frontend_write_count == 0 {
+                    } else if eligible_frontend_count == 0 {
                         tracing::error!(
-                            "CodexSwitch account/updated reached initialized frontends without a completed writer"
+                            "CodexSwitch strict app-server has no eligible frontend writer"
+                        );
+                        continue;
+                    } else if frontend_write_count != eligible_frontend_count {
+                        tracing::error!(
+                            "CodexSwitch account/updated did not complete every eligible frontend write"
                         );
                         continue;
                     } else {
@@ -379,7 +389,9 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
                         "frontendNotified": frontend_write_count > 0,
                         "frontendWriteCount": frontend_write_count,
                         "initializedFrontendCount": initialized_frontend_count,
+                        "skippedFrontendCount": skipped_frontend_count,
                         "eligibleFrontendCount": eligible_frontend_count,
+                        "rejectedFrontendCount": rejected_frontend_count,
                         "idleListenerReady": idle_listener_ready,
                         "authGeneration": auth_generation,
                     });

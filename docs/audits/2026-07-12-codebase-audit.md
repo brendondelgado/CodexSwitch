@@ -22,7 +22,7 @@ version_control:
   branch: main
   base_commit: 664edf6
   status: active-audit
-  last_updated: 2026-07-13
+  last_updated: 2026-07-21
 ---
 
 # CodexSwitch Codebase Audit
@@ -33,7 +33,9 @@ The reliability failures were not caused by one broken threshold. CodexSwitch ac
 
 The repository has strong individual mechanisms, but orchestration grew faster than its contracts. The cleanup therefore prioritizes state ownership and transaction boundaries before cosmetic refactoring.
 
-Current audit completion is approximately 90 percent. Repository remediation is in progress; no live VPS release has been activated from this audit.
+Current audit completion is approximately 96 percent. Repository remediation
+and deterministic local verification are complete; full native CI and live
+activation remain. No live VPS release has been activated from this audit.
 
 ## Severity Model
 
@@ -59,6 +61,11 @@ Current audit completion is approximately 90 percent. Repository remediation is 
 | The Linux Codex updater activated a prepared binary while the managed app-server was live | The updater stopped the systemd unit, hit its stop timeout, SIGKILLed the entire live cgroup, then attempted a second daemon restart | Preparation and activation are being separated; automatic update may stage but must not replace or restart a live managed runtime |
 | Same-version updater reconciliation could erase a failed activation | A replaced binary was later reported as installed even though runtime restart failed, hiding the interrupted session and leaving provenance ambiguous | Installation state is being split from activation state; same-version observation cannot promote a failed activation |
 | Token-bearing Mac-to-VPS bundles use a single SHA-256 passphrase derivation | Offline guessing of a captured credential bundle is needlessly cheap despite AES-GCM encryption | Introduce a versioned, high-iteration PBKDF2-HMAC-SHA256 format in Swift and Rust while retaining read-only compatibility for existing short-lived bundles |
+| VPS readiness accepted app-server start time without a process-bound reload acknowledgement | The menu app reported a current systemd app-server as hot-swap ready while its ACK was absent and the daemon was blocked by `ManualReview` | Remove start-time readiness fallback; only an explicit activation or rotation may create the first current ACK, and observers remain not ready until then |
+| A disconnected initialized remote-control frontend could prevent acknowledgement indefinitely | A version probe or closed client left historical connection state, backend auth reloaded, frontend delivery proved zero writes, and activation degraded into a durable barrier | Count only successfully enqueued live writers as eligible, require all eligible writes, and permit strict headless idle proof only when no live writer accepts delivery |
+| Historical ACKs could be reread and assigned a fresh runtime-evidence lease | A process that acknowledged old auth could authorize a later swap after its identity or auth changed | Retain original ACK time and process binding, use one five-minute freshness contract, and revalidate topology immediately before confirmation |
+| An in-flight external-auth observation was not bound to swap generation | A delayed read could reverse a newer completed local swap | Capture configured account, swap generation, and activation generation before suspension; discard stale results |
+| In-turn retry trusted a shape-valid child report instead of the turn's exact ACK | A stale control CLI could claim success while the interrupted turn still held old auth, surfacing the original usage-limit error | Pass a turn-generated receipt nonce through rotation, verify the resulting bound ACK, reload the turn-local `AuthManager`, and retry only after fingerprint agreement |
 
 ## High Findings
 
@@ -67,6 +74,9 @@ Current audit completion is approximately 90 percent. Repository remediation is 
 | Five-hour and weekly windows were mandatory fields | Weekly-only paid accounts appeared empty, exhausted, or incorrect | Optional-window model and fixtures implemented; Swift/Rust/UI migration in progress |
 | Remote VPS observation could affect Mac active state | Wrong local account or suppressed Mac auto-swap | Host boundaries corrected in repository; regression tests in progress |
 | `codex-vps --check` performed hidden repair/start work | Diagnosis could mutate a live incident | Status made observational; explicit start/restart/sync commands added |
+| `codex-vps --check` selected and displayed different remote version observations | A transport change selected a `0.144.4` client and later printed it as equal to a `0.144.6` app-server | Bind selection, transport validation, and output to one version snapshot; fail if the post-transport observation changes |
+| Failed VPS checks retained the last green Mac presentation | A blocked daemon and missing current ACK looked ready until the user noticed rotation had stopped | Invalidate green state on any failed or expired observation and display retained payload only as stale diagnostics |
+| Read-only CLI status paths created locks and reconciled updater state | Diagnostics could fail in restricted environments and mutate the incident they were inspecting | Add stable no-follow observation reads and an in-memory updater report that never creates locks or saves state |
 | Thread healing rewrote state opportunistically | Remote thread drift and unsafe concurrent repair | Automatic healing retired; explicit repair runbook added |
 | SecureDrop archive/path validation was incomplete | Traversal, symlink, TOCTOU, or wrong-file deletion | Structured validation and rehash-before-delete added |
 | Updater ownership was split | Repeated downloads, storage refill, conflicting installs | Temporary workspace ownership and cleanup added; one-owner contract documented |
@@ -77,7 +87,7 @@ Current audit completion is approximately 90 percent. Repository remediation is 
 | Reset-bank fetch timestamps masqueraded as inventory changes | Every poll churned account persistence and UI work and could trigger VPS credential sync for telemetry-only state | Semantic inventory gating, telemetry-only context routing, five-minute background freshness, and at-most-sixty-second decision evidence for any fresh blocked quota implemented; dedicated deterministic tests added, native execution pending |
 | Inactive exhausted Pro accounts polled every five seconds | A pool of exhausted Pro accounts generated continuous provider traffic, log bursts, and coalesced account-store writes even though manual-reset detection only promises one-minute freshness | Exhausted Pro polling now uses the one-minute manual-reset cadence, waking earlier only for a nearer natural reset; weekly-only regression coverage added |
 | Active quota telemetry flushed on the same five-second cadence as active polling | Healthy operation could rewrite the complete account store continuously even when no user-visible quota value changed, increasing disk churn and widening cross-process write contention | Preserve immediate in-memory updates and immediate durability for user mutations, but coalesce telemetry behind a bounded write interval with an explicit shutdown flush; deterministic coordinator coverage required |
-| Equal-tier reset candidates ignored cross-account credit expiration | Swift and Rust selected the oldest credit within one account but used stable account identity before expiration when choosing between Pro accounts, allowing a sooner-expiring reset to be wasted | Rank eligible reset candidates by plan tier, then earliest available-credit expiration, with stable identity only as the final tie-breaker; shared fixture and language-specific regressions required |
+| Equal-tier reset candidates ignored cross-account credit expiration | Swift and Rust selected the oldest credit within one account but used stable account identity before expiration when choosing between Pro accounts, allowing a sooner-expiring reset to be wasted | Swift and Rust now rank eligible reset candidates by plan tier, earliest explicit future expiration, then stable identity; dedicated language and standalone replay coverage added |
 | Reset-policy test helpers used quota reset dates from 2001 | Hardened stale-evidence checks correctly refused redemption, but five legacy fixtures still asserted that a reset should be spent | Test quota windows now use future reset evidence, manual-reset fixtures carry a concrete provider credit ID, and the obsolete pool-reset wrapper is removed |
 | Systemd policy was fragmented across stale drop-ins | Deployed behavior could differ from repository | Repository-owned allowlist and immutable release work in progress |
 | Knowledge sync could compare the same path every 15 seconds | Extreme logical read volume with no useful transfer | Same-path rejection added; deployed unit retirement pending activation gate |
@@ -87,6 +97,21 @@ Current audit completion is approximately 90 percent. Repository remediation is 
 | SecureDrop loaded every transferred file into memory and rewrote its complete audit log for each event | Large transfers could spike Mac or VPS memory, while concurrent writers could lose audit entries and growing logs made every transfer progressively more expensive | Replace file hashing with bounded streaming and audit persistence with locked append-only writes plus bounded rotation; focused cross-process tests pending |
 | `SwapLog.recentEntries` read the complete current daily log despite having no caller | A future accidental call could allocate tens of megabytes on the app process, while the dead API obscured the actual append-only logging contract | Remove the unused whole-file reader; diagnostic inspection remains an explicit operator action outside the app |
 | Reset reconciliation used production `expect` assertions after local guards | A future refactor could turn stale or malformed provider evidence into a daemon crash instead of a conservative suppression result | Replace panic-based invariant recovery with explicit optional-evidence matching while preserving fail-closed reconciliation |
+| Reset provider callbacks ran while orchestration owned broad store or journal locks | Slow quota, inventory, or consume requests could block status, activation, or recovery, while an interrupted callback left ambiguous lock ownership | Provider callbacks now run outside both locks; exact store generation and reset-attempt identity are revalidated before every transition, and concurrent mutation fails closed without a second consume |
+| Manual redemption could trigger a later routine plan upgrade | The confirmation promised no account switch, but a timer-based hold eventually made the recovered account a proactive promotion target | Persist manual intent and suppress routine promotion until a genuine failover or explicit operator selection successfully activates the account; release that suppression durably |
+| Unreadable reset journal startup failed open | The swap monitor could run with empty unresolved-attempt and manual-suppression state | Gate automatic routing and manual redemption on readable journal state and retry bounded reads without blocking app launch |
+| Selected-credit natural expiry looked like successful local redemption | An expiring selected credit could disappear with a count decrement and finalize an attempt that the provider never consumed | Persist the selected expiration and require it to remain future at observation time before absence can prove the exact local decrement |
+| Request-start time was stored as reset inventory observation time | A credit expiring during a slow inventory GET could still satisfy pre-expiry reconciliation | Timestamp inventory at response completion and validate the full bank against that time |
+| Unreleased manual route suppressions were ordinary terminal history | Age or count pruning could silently re-enable routine promotion without an activation | Protect only the newest unreleased successful suppression per provider until activation durably releases it |
+| Natural credit expiry looked like external redemption | An ordinary expiration could create a 15-minute hold and hide later urgent credits | Classify prior inventory at its observation time, subtract credits that naturally expired by the new observation, and reserve external holds for unexplained decrements |
+| Timestamp-fresh malformed reset inventory stayed current | Expired or count-mismatched cached credits could remain visible for five minutes while redemption was disabled without a refresh | Cached freshness now requires the complete structurally valid available-credit set at the current time; invalid caches refresh immediately and present as stale until replaced |
+| Provider observation commits advanced the account store without advancing `Confirmed` activation evidence | Readiness correctly rejected the now-stale confirmation, making healthy polling disable hot-swap until another convergence | Exact generation continuity now advances with every observational commit or leaves a durable fail-closed barrier; focused tests added, independent review clean, canonical CI pending |
+| A rotate-now continuity store commit could precede its journal update | Journal failure or process interruption could leave a stale `Confirmed` record that reconciliation treated as complete | `Confirmed` is validated on every reconciliation and continuity uses a recoverable two-phase journal transition before store commit; focused tests added, independent review clean, canonical CI pending |
+| Linux `poll` retained the global account-store lock across provider requests | A slow multi-account poll could block rotation, reset reconciliation, and daemon commits for cumulative network time | Poll now snapshots under lock, performs provider I/O unlocked, and requires exact store and activation-journal identities before commit; focused tests added, independent review clean, canonical CI pending |
+| Operator `poll` and `redeem-reset` could bypass or race an unresolved activation barrier | Observation could corrupt a prepared/manual-review generation, while targeted redemption could POST after a journal-only transition that preserved the store generation | Provider work now binds exact store and activation-journal identities, revalidates each effect, preserves Confirmed continuity at commit, and holds a dedicated provider-I/O lease across the unlocked irreversible POST; focused tests added, independent review clean, canonical CI pending |
+| Runtime marker inspection reopened a mutable executable path | A FIFO replacement could block indefinitely and a same-path binary update could validate a different image than the running process | Marker inspection now uses a no-follow regular descriptor bound to kernel process identity and rejects path replacement; focused tests added, independent review clean, canonical CI pending |
+| Activation paths accepted whitespace-only token material | Manual activation or import could publish malformed auth while other paths considered the account incomplete | One trimmed complete-token predicate now governs rotation, import, auth evidence, and readiness; focused tests added, independent review clean, canonical CI pending |
+| Current-version `Confirmed` records accepted an unknown activation kind | Malformed or legacy-shaped evidence could authorize generation continuity without explicit provenance | Current confirmation now rejects unknown kind and keeps legacy evidence behind the migration barrier; focused tests added, independent review clean, canonical CI pending |
 
 ## Structural Debt
 
@@ -167,9 +192,15 @@ Delete or extract code only after call-site proof and tests:
 
 Repository completion requires:
 
-1. Python and shell tests for scripts and transport. Current full result: 125 tests passed.
-2. Swift syntax/type checks and focused domain tests within available SDK constraints. Current standalone reset harness passes; native SwiftUI test execution remains blocked by missing `SwiftUIMacros` in the selected Command Line Tools.
-3. Rust formatting and locked offline tests using a temporary target and one job. Current result: 177 unit and 3 integration tests passed; all targets pass Clippy with warnings denied.
+1. Python and shell tests for scripts and transport. Current results: 127
+   patcher tests, 24 `codex-vps` Python tests, the shell transport replay, six
+   Linux artifact tests, six Linux build-workflow tests, five Mac build-script
+   tests, and 73 Linux resource-policy tests pass.
+2. Swift syntax checks and the standalone banked-reset replay pass. The full
+   native Swift package suite is assigned to the permanent macOS CI gate.
+3. Rust formatting passes without creating a local `target/`. The full locked
+   Rust contract suite and generated-turn execution are assigned to the
+   permanent single-job Linux CI gate so this Mac does not perform the build.
 4. Cross-language fixtures for quota and selection parity.
 5. Diff review for secrets, dead branches, frontmatter, and accidental generated files.
 6. A read-only live health/provenance check.

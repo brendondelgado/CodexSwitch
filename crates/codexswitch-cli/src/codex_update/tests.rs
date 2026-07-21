@@ -136,8 +136,6 @@ mod tests {
                 "--no-fork",
                 "/home/test/.codex/app-server-daemon/app-server.pid.lock",
                 "/home/test/.local/share/codexswitch/current/patched-codex/codex",
-                "-c",
-                "features.local_thread_store_compression=true",
                 "app-server",
                 "--remote-control",
                 "--listen",
@@ -1117,6 +1115,7 @@ esac
         assert!(unit.lines().any(|line| line == "TimeoutStopSec=120"));
         assert!(unit.lines().any(|line| line == "SendSIGKILL=no"));
         assert!(!unit.lines().any(|line| line.starts_with("ExecStop=")));
+        assert!(!unit.contains("local_thread_store_compression"));
     }
 
     #[test]
@@ -1982,7 +1981,8 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
     }
 
     #[test]
-    fn app_server_frontend_write_ack_patch_counts_completed_initialized_writers() -> Result<()> {
+    fn app_server_frontend_write_ack_patch_counts_only_successfully_enqueued_writers() -> Result<()>
+    {
         let temp = tempfile::tempdir()?;
         let outgoing = temp.path().join("outgoing_message.rs");
         let transport = temp.path().join("transport.rs");
@@ -2012,11 +2012,20 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         let outgoing = fs::read_to_string(outgoing)?;
         let transport = fs::read_to_string(transport)?;
         assert!(outgoing.contains("BroadcastWithWriteAck"));
-        assert!(outgoing.contains("write_complete_tx: oneshot::Sender<(usize, usize, usize)>"));
+        assert!(outgoing
+            .contains("write_complete_tx: oneshot::Sender<(usize, usize, usize, usize, usize)>"));
         assert!(transport.contains("connection_state.initialized.load"));
         assert!(transport.contains("initialized_frontend_count"));
+        assert!(transport.contains("skipped_frontend_count"));
+        assert!(transport
+            .contains("initialized_frontend_count.saturating_sub(target_connections.len())"));
         assert!(transport.contains("eligible_frontend_count"));
+        assert!(transport.contains("rejected_frontend_count"));
+        assert!(transport.contains("let mut rejected_frontend_count = 0usize"));
         assert!(transport.contains("Some(connection_write_tx)"));
+        assert!(transport.contains("if !send_message_to_connection("));
+        assert!(transport.contains("eligible_frontend_count += 1"));
+        assert!(transport.contains("rejected_frontend_count += 1"));
         assert!(transport.contains("completed_writes"));
         assert!(transport.contains("matches!(result, Ok(Ok(())))"));
         Ok(())
@@ -2295,7 +2304,6 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
     fn checking_crash_replay_restores_serialized_preparation_failure() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let state_path = temp.path().join("codex-cli-update.json");
-        let lock_path = temp.path().join("codex-update.lock");
         let now = automatic_update_test_time();
         let mut state = automatic_update_test_state(UpdateStatus::Failed, now);
         state.installed_version = Some("0.145.0".to_string());
@@ -2316,7 +2324,6 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         let reconciliations = std::cell::Cell::new(0);
 
         let report = status_report_at(
-            &lock_path,
             &state_path,
             || Some("0.145.0".to_string()),
             |state| {
@@ -2335,14 +2342,13 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         );
         assert_eq!(report.error.as_deref(), Some("source preparation failed"));
         let persisted = load_state_at(&state_path)?;
-        assert_eq!(persisted.status, UpdateStatus::Failed);
+        assert_eq!(persisted.status, UpdateStatus::Checking);
         assert!(persisted.unresolved_failure.is_some());
         Ok(())
     }
 
     #[test]
-    fn concurrent_status_reader_cannot_run_mutating_reconciliation_without_updater_lock(
-    ) -> Result<()> {
+    fn status_reader_observes_without_creating_or_acquiring_updater_lock() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let state_path = temp.path().join("codex-cli-update.json");
         let lock_path = temp.path().join("codex-update.lock");
@@ -2360,13 +2366,10 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         );
         state.status = UpdateStatus::Checking;
         save_state_at(&state_path, &state)?;
-        let held_lock = UpdaterOperationLock::try_acquire_at(&lock_path)?
-            .context("failed to acquire simulated concurrent updater lock")?;
         let installed_observations = std::cell::Cell::new(0);
         let reconciliations = std::cell::Cell::new(0);
 
         let report = status_report_at(
-            &lock_path,
             &state_path,
             || {
                 installed_observations.set(installed_observations.get() + 1);
@@ -2379,10 +2382,23 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         )?;
 
         assert_eq!(report.status, UpdateStatus::Failed);
-        assert_eq!(installed_observations.get(), 0);
+        assert_eq!(installed_observations.get(), 1);
         assert_eq!(reconciliations.get(), 0);
         assert_eq!(load_state_at(&state_path)?.status, UpdateStatus::Checking);
-        drop(held_lock);
+        assert!(!lock_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn status_reader_does_not_create_missing_state_or_parent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path().join("missing-data-dir");
+        let state_path = data_dir.join("codex-cli-update.json");
+
+        let report = status_report_at(&state_path, || None, |_| false)?;
+
+        assert_eq!(report.status, UpdateStatus::Idle);
+        assert!(!data_dir.exists());
         Ok(())
     }
 
@@ -3735,6 +3751,41 @@ impl AuthManager {
     }
 
     #[test]
+    fn turn_patch_declares_sha2_dependency_idempotently() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = temp_dir.path().join("codex-rs");
+        let core = workspace.join("core");
+        let turn = core.join("src/session/turn.rs");
+        fs::create_dir_all(turn.parent().unwrap()).unwrap();
+        fs::write(
+            core.join("Cargo.toml"),
+            "[package]\nname = \"codex-core\"\n\n[dependencies]\nserde = { workspace = true }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("Cargo.lock"),
+            r#"version = 4
+
+[[package]]
+name = "codex-core"
+version = "0.0.0"
+dependencies = [
+ "serde",
+]
+"#,
+        )
+        .unwrap();
+
+        patch_turn_rotation_dependencies(&turn).unwrap();
+        patch_turn_rotation_dependencies(&turn).unwrap();
+
+        let manifest = fs::read_to_string(core.join("Cargo.toml")).unwrap();
+        assert_eq!(manifest.matches("sha2 = { workspace = true }").count(), 1);
+        let lockfile = fs::read_to_string(workspace.join("Cargo.lock")).unwrap();
+        assert_eq!(lockfile.matches(" \"sha2\",\n").count(), 1);
+    }
+
+    #[test]
     fn source_patch_reconciles_placeholder_workspace_lock_versions_idempotently() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest = temp_dir.path().join("Cargo.toml");
@@ -3932,17 +3983,20 @@ async fn run_turn() {
         assert!(patched.contains("codexswitch-hotswap-headless-idle-v1"));
         assert!(patched.contains("codexswitch_external_runtime_kind()"));
         assert!(patched.contains("headless-remote-control-app-server"));
-        assert!(patched.contains(
-            "codexswitch_validate_v3_binding(&request, expected_runtime_kind)"
-        ));
+        assert!(
+            patched.contains("codexswitch_validate_v3_binding(&request, expected_runtime_kind)")
+        );
         assert!(patched.contains("BroadcastWithWriteAck"));
         assert!(patched.contains("codexswitch_reload_auth_json_verified"));
         assert!(patched.contains("frontendWriteCount"));
         assert!(patched.contains("initializedFrontendCount"));
+        assert!(patched.contains("skippedFrontendCount"));
         assert!(patched.contains("eligibleFrontendCount"));
+        assert!(patched.contains("rejectedFrontendCount"));
         assert!(patched.contains("idleListenerReady"));
         assert!(patched.contains("frontend delivery proof failed"));
-        assert!(patched.contains("initialized frontends without a completed writer"));
+        assert!(patched.contains("strict app-server has no eligible frontend writer"));
+        assert!(patched.contains("did not complete every eligible frontend write"));
         assert!(patched.contains("requestNonce"));
         assert!(patched.contains("processIdentity"));
         assert!(patched.contains("kernelExecutableIdentity"));
@@ -4232,12 +4286,22 @@ async fn run_turn() {
         assert!(patched.contains("codexswitch_rotate_after_usage_limit"));
         assert!(patched.contains("codexswitch_usage_limit_retry_attempted"));
         assert!(patched.contains("codexswitch_rotate_after_auth_failure"));
-        assert!(patched.contains("codexswitch_auth_failure_retry_attempted"));
+        assert!(patched.contains("codexswitch_auth_reload_retry_attempted"));
+        assert!(patched.contains("codexswitch_auth_rotation_retry_attempted"));
         assert!(patched.contains("rotate-now"));
-        assert_eq!(patched.matches(".arg(\"rotate-now\")").count(), 2);
+        assert_eq!(patched.matches(".arg(\"rotate-now\")").count(), 1);
         assert!(!patched.contains(".arg(\"--no-reload\")"));
-        assert_eq!(patched.matches(".arg(\"--auth\")").count(), 2);
-        assert_eq!(patched.matches(".arg(&auth_path)").count(), 2);
+        assert_eq!(patched.matches(".arg(\"--auth\")").count(), 1);
+        assert!(patched.contains(".arg(\"--receipt-nonce\")"));
+        assert_eq!(patched.matches(".arg(&auth_path)").count(), 1);
+        assert!(patched.contains("codexswitch_resolve_linux_managed_control_cli_at"));
+        assert!(patched.contains("release-manifest.tsv"));
+        assert!(patched.contains("codexswitch-release-v3"));
+        assert!(patched.contains("cli_sha256"));
+        assert!(patched.contains("/proc/self/fd/"));
+        assert!(patched.contains("control_cli.is_still_current()"));
+        assert!(!patched.contains("std::env::var(\"CODEXSWITCH_CLI\")"));
+        assert!(!patched.contains("\"codexswitch-cli\".to_string()"));
         assert!(patched.contains("fn codexswitch_run_bounded_rotation("));
         assert!(patched.contains("fn codexswitch_capture_bounded_stream<R>("));
         assert!(patched.contains(".stdout(std::process::Stdio::piped())"));
@@ -4248,11 +4312,15 @@ async fn run_turn() {
         assert!(patched.contains("codexswitch_read_bounded_json(&request_path, REQUEST_MAX_BYTES)"));
         assert!(!patched.contains("std::fs::read(&ack_path)"));
         assert!(patched.contains("fn codexswitch_bound_auth_path_v3("));
+        assert!(patched.contains("fn codexswitch_bound_auth_path_for_external_change_v3("));
+        assert!(patched.contains("allow_auth_file_identity_drift"));
         assert!(patched.contains("codexswitch_current_start_identity()"));
         assert!(patched.contains("\"local-interactive-cli\""));
         assert!(patched.contains("processIdentity"));
         assert!(patched.contains("binding.get(\"requestNonce\")"));
         assert!(patched.contains("ack.get(\"binding\")? != binding"));
+        assert!(patched.contains("codexswitch_request_nonce_matches_receipt"));
+        assert!(patched.contains("issued_not_before.is_some_and"));
         assert!(patched.contains("acknowledged_at < issued_at"));
         assert!(patched.contains("ACK_MAX_AGE_MILLISECONDS"));
         assert!(patched.contains("loadedTokenFingerprint"));
@@ -4260,14 +4328,54 @@ async fn run_turn() {
         assert!(patched.contains("codexswitch_auth_file_identity(&auth_path)"));
         assert!(patched.contains("fn codexswitch_verified_rotation_result("));
         assert!(patched.contains("codexswitch-runtime-rotation-handoff-v1"));
+        assert!(patched.contains("report.get(\"receiptNonce\")"));
         assert!(patched.contains("report.get(\"runtimeConverged\")"));
+        assert!(patched.contains("report.get(\"topologyVerified\")"));
+        assert!(patched.contains("report.get(\"requestCount\")"));
+        assert!(patched.contains("report.get(\"sighupSentProcesses\")"));
+        assert!(patched.contains("report.get(\"acknowledgedRequestNonces\")"));
         assert!(patched.contains("report.get(\"nextTokenFingerprint\")"));
+        let rotation_start = patched
+            .find("async fn codexswitch_rotate_after_failure(")
+            .unwrap();
+        let rotation_end = patched[rotation_start..]
+            .find("async fn codexswitch_rotate_after_usage_limit(")
+            .map(|offset| rotation_start + offset)
+            .unwrap();
+        let rotation_source = &patched[rotation_start..rotation_end];
         assert_eq!(
-            patched
+            rotation_source
                 .matches("codexswitch_reload_auth_json_verified(&auth_path)")
                 .count(),
-            2
+            1,
+            "post-ACK convergence permits at most one fallback reload"
         );
+        assert!(rotation_source.contains("if !manager_already_matches_handoff"));
+        assert!(rotation_source.contains("own_handoff.auth_generation"));
+        assert!(rotation_source.contains("pre_rotation_auth_generation"));
+        assert!(!rotation_source.contains("if !changed"));
+        let external_reload_start = patched
+            .find("async fn codexswitch_reload_changed_external_auth(")
+            .unwrap();
+        let external_reload_end = patched[external_reload_start..]
+            .find("async fn codexswitch_rotate_after_failure(")
+            .map(|offset| external_reload_start + offset)
+            .unwrap();
+        let external_reload_source = &patched[external_reload_start..external_reload_end];
+        assert_eq!(
+            external_reload_source
+                .matches("codexswitch_reload_auth_json_verified(&auth_path)")
+                .count(),
+            1,
+            "external auth recovery permits at most one fallback reload"
+        );
+        assert!(external_reload_source.contains("codexswitch_external_auth_handoff_matches("));
+        assert!(external_reload_source.contains("request_auth_generation"));
+        assert!(external_reload_source.contains("bound_handoff_is_still_current"));
+        assert!(
+            external_reload_source.contains("post_reload_generation <= generation_before_fallback")
+        );
+        assert!(!external_reload_source.contains("if !changed"));
         assert!(!patched.contains("~/.codex/auth.json"));
         assert!(patched.contains("CODEXSWITCH_ROTATE_TIMEOUT_SECONDS"));
         assert!(patched.contains("const DEFAULT_SECONDS: u64 = 120"));
@@ -4288,7 +4396,37 @@ async fn run_turn() {
         );
         assert_eq!(
             patched
-                .matches("let mut codexswitch_auth_failure_retry_attempted = false;")
+                .matches("let mut codexswitch_auth_reload_retry_attempted = false;")
+                .count(),
+            1
+        );
+        assert_eq!(
+            patched
+                .matches("let mut codexswitch_auth_rotation_retry_attempted = false;")
+                .count(),
+            1
+        );
+        assert_eq!(
+            patched
+                .matches("codexswitch_request_auth_generation,\n                        )\n                        .await")
+                .count(),
+            1
+        );
+        assert_eq!(
+            patched
+                .matches("let codexswitch_request_auth_generation = turn_context")
+                .count(),
+            1
+        );
+        assert_eq!(
+            patched
+                .matches("codexswitch_rotate_after_usage_limit(&sess, &turn_context).await")
+                .count(),
+            1
+        );
+        assert_eq!(
+            patched
+                .matches("codexswitch_rotate_after_auth_failure(&sess, &turn_context).await")
                 .count(),
             1
         );
@@ -4298,6 +4436,437 @@ async fn run_turn() {
             .map(|index| successful_status_index + index)
             .unwrap();
         assert!(reload_index > successful_status_index);
+    }
+
+    #[test]
+    fn interrupted_turn_direct_contract_rejects_stale_ack_and_bad_counts() {
+        let receipt = "37f84870-9b39-45ae-aee9-3e0a63e1f989";
+        let request = format!("{receipt}:1a7c3ffb-bfd8-4719-9b45-c2e350469d9c");
+        assert!(interrupted_turn_receipt_ack_is_current(
+            receipt, &request, 1_001, 1_002, 1_000,
+        ));
+        assert!(!interrupted_turn_receipt_ack_is_current(
+            receipt, &request, 999, 1_002, 1_000,
+        ));
+        assert!(!interrupted_turn_receipt_ack_is_current(
+            "0cfe69d8-d7f8-4640-84c1-d88acd278983",
+            &request,
+            1_001,
+            1_002,
+            1_000,
+        ));
+
+        assert!(interrupted_turn_report_counts_are_complete(
+            2, 2, 2, 2, 0, 0, true,
+        ));
+        assert!(!interrupted_turn_report_counts_are_complete(
+            2, 2, 2, 1, 0, 0, true,
+        ));
+        assert!(!interrupted_turn_report_counts_are_complete(
+            2, 2, 2, 2, 0, 0, false,
+        ));
+    }
+
+    #[cfg(unix)]
+    struct ManagedControlFixture {
+        _temporary: tempfile::TempDir,
+        home: PathBuf,
+        install_root: PathBuf,
+        release_dir: PathBuf,
+        release_id: String,
+        cli: PathBuf,
+        manifest: PathBuf,
+        current: PathBuf,
+        public: PathBuf,
+        cli_sha256: String,
+    }
+
+    #[cfg(unix)]
+    impl ManagedControlFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+
+            let temporary = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temporary.path()).unwrap();
+            let home = root.join("home");
+            let local = home.join(".local");
+            let bin = local.join("bin");
+            let share = local.join("share");
+            let install_root = share.join("codexswitch");
+            let releases = install_root.join("releases");
+            let release_id = format!("0.1.0-{}", "a".repeat(40));
+            let release_dir = releases.join(&release_id);
+            fs::create_dir_all(&release_dir).unwrap();
+            for directory in [&home, &local, &bin, &share, &install_root, &releases] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+
+            let cli = release_dir.join("codexswitch-cli");
+            let cli_bytes = b"deterministic-codexswitch-control-fixture\n";
+            fs::write(&cli, cli_bytes).unwrap();
+            fs::set_permissions(&cli, fs::Permissions::from_mode(0o555)).unwrap();
+            let cli_sha256 = ring::digest::digest(&ring::digest::SHA256, cli_bytes)
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let manifest = release_dir.join("release-manifest.tsv");
+            fs::write(&manifest, Self::manifest_contents(&release_id, &cli_sha256)).unwrap();
+            fs::set_permissions(&manifest, fs::Permissions::from_mode(0o444)).unwrap();
+            fs::set_permissions(&release_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+            let current = install_root.join("current");
+            symlink(Path::new("releases").join(&release_id), &current).unwrap();
+            let public = bin.join("codexswitch-cli");
+            symlink(current.join("codexswitch-cli"), &public).unwrap();
+
+            Self {
+                _temporary: temporary,
+                home,
+                install_root,
+                release_dir,
+                release_id,
+                cli,
+                manifest,
+                current,
+                public,
+                cli_sha256,
+            }
+        }
+
+        fn manifest_contents(release_id: &str, cli_sha256: &str) -> String {
+            let hash = "1".repeat(64);
+            format!(
+                "format\tcodexswitch-release-v3\n\
+                 release_id\t{release_id}\n\
+                 git_sha\t{}\n\
+                 package_version\t0.1.0\n\
+                 build_epoch\t1783915200\n\
+                 cli_version\tcodexswitch-cli 0.1.0\n\
+                 cli_sha256\t{cli_sha256}\n\
+                 codex_source_sha\t{}\n\
+                 upstream_codex_git_sha\t{}\n\
+                 source_patch_sha256\t{hash}\n\
+                 sourcePatchSha256\t{hash}\n\
+                 artifact_manifest_sha256\t{hash}\n\
+                 artifact_total_bytes\t4096\n\
+                 codex_version\t0.144.6\n\
+                 codex_sha256\t{hash}\n\
+                 codex_code_mode_host_sha256\t{hash}\n\
+                 codex_marker_contract\tcodexswitch-hotswap-full-v3\n\
+                 systemd_payload\tcodexswitch.service\n\
+                 codexswitch_unit_sha256\t{hash}\n\
+                 codexswitch_dropin_sha256\t{hash}\n\
+                 app_server_unit_sha256\t{hash}\n\
+                 app_server_dropin_sha256\t{hash}\n",
+                "b".repeat(40),
+                "c".repeat(40),
+                "c".repeat(40),
+            )
+        }
+
+        fn resolve(&self) -> Option<CodexSwitchControlCli> {
+            codexswitch_resolve_linux_managed_control_cli_at(&self.home, unsafe { libc::geteuid() })
+        }
+
+        fn rewrite_manifest(&self, contents: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.release_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&self.manifest, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::write(&self.manifest, contents).unwrap();
+            fs::set_permissions(&self.manifest, fs::Permissions::from_mode(0o444)).unwrap();
+            fs::set_permissions(&self.release_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_turn_resolves_exact_production_managed_cli_layout() {
+        let fixture = ManagedControlFixture::new();
+        let resolved = fixture.resolve().expect("production layout must resolve");
+        assert_eq!(resolved.canonical_path, fixture.cli);
+        assert_eq!(resolved.expected_sha256, fixture.cli_sha256);
+        assert!(resolved.is_still_current());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_turn_rejects_unmanaged_escaping_or_ambiguous_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let arbitrary = ManagedControlFixture::new();
+        fs::remove_file(&arbitrary.public).unwrap();
+        symlink(&arbitrary.cli, &arbitrary.public).unwrap();
+        assert!(arbitrary.resolve().is_none());
+
+        let escaping = ManagedControlFixture::new();
+        fs::remove_file(&escaping.current).unwrap();
+        symlink(Path::new("../outside"), &escaping.current).unwrap();
+        assert!(escaping.resolve().is_none());
+
+        let terminal_link = ManagedControlFixture::new();
+        fs::set_permissions(
+            &terminal_link.release_dir,
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::remove_file(&terminal_link.cli).unwrap();
+        symlink("release-manifest.tsv", &terminal_link.cli).unwrap();
+        fs::set_permissions(
+            &terminal_link.release_dir,
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        assert!(terminal_link.resolve().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_turn_rejects_wrong_owner_writable_release_and_bad_manifest_binding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let wrong_owner = ManagedControlFixture::new();
+        assert!(codexswitch_resolve_linux_managed_control_cli_at(
+            &wrong_owner.home,
+            unsafe { libc::geteuid() }.wrapping_add(1),
+        )
+        .is_none());
+
+        let writable = ManagedControlFixture::new();
+        fs::set_permissions(&writable.release_dir, fs::Permissions::from_mode(0o575)).unwrap();
+        assert!(writable.resolve().is_none());
+
+        let wrong_hash = ManagedControlFixture::new();
+        wrong_hash.rewrite_manifest(&ManagedControlFixture::manifest_contents(
+            &wrong_hash.release_id,
+            &"0".repeat(64),
+        ));
+        assert!(wrong_hash.resolve().is_none());
+
+        let missing_binding = ManagedControlFixture::new();
+        let malformed = ManagedControlFixture::manifest_contents(
+            &missing_binding.release_id,
+            &missing_binding.cli_sha256,
+        )
+        .lines()
+        .filter(|line| !line.starts_with("cli_sha256\t"))
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        missing_binding.rewrite_manifest(&malformed);
+        assert!(missing_binding.resolve().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_turn_detects_current_link_replacement_after_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ManagedControlFixture::new();
+        let resolved = fixture.resolve().expect("production layout must resolve");
+        fs::remove_file(&fixture.current).unwrap();
+        symlink(Path::new("releases/replaced-release"), &fixture.current).unwrap();
+        assert!(!resolved.is_still_current());
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    struct AuthConvergenceSnapshot {
+        fingerprint: &'static str,
+        provider_account_id: &'static str,
+        generation: u64,
+    }
+
+    #[cfg(unix)]
+    fn interrupted_turn_auth_convergence_harness(
+        initial: AuthConvergenceSnapshot,
+        handoff: AuthConvergenceSnapshot,
+        pre_rotation_generation: u64,
+        reload_results: &[AuthConvergenceSnapshot],
+    ) -> (bool, usize) {
+        let matches = |snapshot: AuthConvergenceSnapshot| {
+            codexswitch_auth_handoff_matches(
+                Some(snapshot.fingerprint),
+                Some(snapshot.provider_account_id),
+                snapshot.generation,
+                handoff.fingerprint,
+                handoff.provider_account_id,
+                handoff.generation,
+                pre_rotation_generation,
+            )
+        };
+        if matches(initial) {
+            return (true, 0);
+        }
+        let Some(after_reload) = reload_results.first().copied() else {
+            return (false, 1);
+        };
+        (matches(after_reload), 1)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_turn_auth_convergence_accepts_already_converged_or_one_reload() {
+        let old = AuthConvergenceSnapshot {
+            fingerprint: "old",
+            provider_account_id: "old-account",
+            generation: 11,
+        };
+        let handoff = AuthConvergenceSnapshot {
+            fingerprint: "new",
+            provider_account_id: "new-account",
+            generation: 12,
+        };
+        assert_eq!(
+            interrupted_turn_auth_convergence_harness(handoff, handoff, 11, &[]),
+            (true, 0),
+            "the SIGHUP-converged manager must not be reloaded again"
+        );
+        assert_eq!(
+            interrupted_turn_auth_convergence_harness(old, handoff, 11, &[handoff]),
+            (true, 1),
+            "a manager that has not observed SIGHUP gets one fallback reload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_turn_external_auth_accepts_receipt_bound_sighup_without_fallback_reload() {
+        let request_generation = 41;
+        let handoff = AuthConvergenceSnapshot {
+            fingerprint: "new-full-token-fingerprint",
+            provider_account_id: "new-account",
+            generation: 42,
+        };
+        let already_converged = codexswitch_external_auth_handoff_matches(
+            Some(handoff.fingerprint),
+            Some(handoff.provider_account_id),
+            handoff.generation,
+            Some(handoff.fingerprint),
+            Some(handoff.provider_account_id),
+            handoff.fingerprint,
+            handoff.provider_account_id,
+            handoff.generation,
+            request_generation,
+        );
+        assert!(already_converged);
+        assert!(!codexswitch_external_auth_handoff_matches(
+            Some(handoff.fingerprint),
+            Some(handoff.provider_account_id),
+            request_generation,
+            Some(handoff.fingerprint),
+            Some(handoff.provider_account_id),
+            handoff.fingerprint,
+            handoff.provider_account_id,
+            handoff.generation,
+            request_generation,
+        ));
+        assert!(!codexswitch_external_auth_handoff_matches(
+            Some(handoff.fingerprint),
+            Some("wrong-account"),
+            handoff.generation,
+            Some(handoff.fingerprint),
+            Some(handoff.provider_account_id),
+            handoff.fingerprint,
+            handoff.provider_account_id,
+            handoff.generation,
+            request_generation,
+        ));
+        assert!(!codexswitch_external_auth_handoff_matches(
+            Some(handoff.fingerprint),
+            Some(handoff.provider_account_id),
+            handoff.generation,
+            Some("wrong-disk-fingerprint"),
+            Some(handoff.provider_account_id),
+            handoff.fingerprint,
+            handoff.provider_account_id,
+            handoff.generation,
+            request_generation,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_turn_auth_convergence_rejects_stale_or_wrong_ack_without_second_reload() {
+        let handoff = AuthConvergenceSnapshot {
+            fingerprint: "new",
+            provider_account_id: "new-account",
+            generation: 12,
+        };
+        let stale_generation = AuthConvergenceSnapshot {
+            generation: 11,
+            ..handoff
+        };
+        assert_eq!(
+            interrupted_turn_auth_convergence_harness(
+                stale_generation,
+                stale_generation,
+                11,
+                &[stale_generation],
+            ),
+            (false, 1)
+        );
+
+        let wrong_fingerprint = AuthConvergenceSnapshot {
+            fingerprint: "wrong",
+            ..handoff
+        };
+        assert_eq!(
+            interrupted_turn_auth_convergence_harness(
+                wrong_fingerprint,
+                handoff,
+                11,
+                &[wrong_fingerprint],
+            ),
+            (false, 1)
+        );
+        let wrong_account = AuthConvergenceSnapshot {
+            provider_account_id: "wrong-account",
+            ..handoff
+        };
+        assert_eq!(
+            interrupted_turn_auth_convergence_harness(wrong_account, handoff, 11, &[wrong_account]),
+            (false, 1)
+        );
+
+        assert_eq!(
+            interrupted_turn_auth_convergence_harness(
+                wrong_fingerprint,
+                handoff,
+                11,
+                &[wrong_fingerprint, handoff],
+            ),
+            (false, 1),
+            "a failed fallback must not consume a second reload result"
+        );
+    }
+
+    #[test]
+    fn interrupted_turn_direct_retry_budget_is_one_auth_retry_plus_one_rotation_retry() {
+        let mut auth = InterruptedTurnRetryBudget::default();
+        assert_eq!(
+            auth.auth_failure(true, true),
+            Some(InterruptedTurnRetryAction::ExternalAuthRetry)
+        );
+        assert_eq!(
+            auth.auth_failure(true, true),
+            Some(InterruptedTurnRetryAction::RotationRetry)
+        );
+        assert_eq!(auth.auth_failure(true, true), None);
+
+        let mut unchanged_auth = InterruptedTurnRetryBudget::default();
+        assert_eq!(
+            unchanged_auth.auth_failure(false, false),
+            Some(InterruptedTurnRetryAction::RotationRetry)
+        );
+        assert_eq!(unchanged_auth.auth_failure(false, false), None);
+
+        let mut usage = InterruptedTurnRetryBudget::default();
+        assert_eq!(
+            usage.usage_failure(),
+            Some(InterruptedTurnRetryAction::RotationRetry)
+        );
+        assert_eq!(usage.usage_failure(), None);
     }
 
     #[test]
@@ -4414,14 +4983,22 @@ async fn run_turn() {
             "unix and non-unix usage helpers should not be duplicated"
         );
         assert!(patched.contains("codexswitch_rotate_after_auth_failure"));
-        assert!(patched.contains("codexswitch_auth_failure_retry_attempted"));
+        assert!(patched.contains("codexswitch_auth_reload_retry_attempted"));
+        assert!(patched.contains("codexswitch_auth_rotation_retry_attempted"));
         assert!(patched.contains("codexswitch_is_auth_invalidated_error(&err)"));
-        assert!(patched.contains(".arg(\"token_expired\")"));
-        assert!(patched.contains(".arg(\"2592000\")"));
-        assert_eq!(patched.matches(".arg(\"rotate-now\")").count(), 2);
+        assert!(patched.contains("\"token_expired\""));
+        assert!(patched.contains("\"2592000\""));
+        assert_eq!(patched.matches(".arg(\"rotate-now\")").count(), 1);
         assert!(!patched.contains(".arg(\"--no-reload\")"));
-        assert_eq!(patched.matches(".arg(\"--auth\")").count(), 2);
-        assert_eq!(patched.matches(".arg(&auth_path)").count(), 2);
+        assert_eq!(patched.matches(".arg(\"--auth\")").count(), 1);
+        assert!(patched.contains(".arg(\"--receipt-nonce\")"));
+        assert_eq!(patched.matches(".arg(&auth_path)").count(), 1);
+        assert!(patched.contains("codexswitch_resolve_linux_managed_control_cli_at"));
+        assert!(patched.contains("release-manifest.tsv"));
+        assert!(patched.contains("cli_sha256"));
+        assert!(patched.contains("control_cli.execution_path()"));
+        assert!(!patched.contains("std::env::var(\"CODEXSWITCH_CLI\")"));
+        assert!(!patched.contains("\"codexswitch-cli\".to_string()"));
         assert!(patched.contains("fn codexswitch_run_bounded_rotation("));
         assert!(patched.contains("fn codexswitch_capture_bounded_stream<R>("));
         assert!(patched.contains(".stdout(std::process::Stdio::piped())"));
@@ -4432,9 +5009,13 @@ async fn run_turn() {
         assert!(patched.contains("codexswitch_read_bounded_json(&request_path, REQUEST_MAX_BYTES)"));
         assert!(!patched.contains("std::fs::read(&ack_path)"));
         assert!(patched.contains("fn codexswitch_bound_auth_path_v3("));
+        assert!(patched.contains("fn codexswitch_bound_auth_path_for_external_change_v3("));
+        assert!(patched.contains("allow_auth_file_identity_drift"));
         assert!(patched.contains("codexswitch_current_start_identity()"));
         assert!(patched.contains("processIdentity"));
         assert!(patched.contains("ack.get(\"binding\")? != binding"));
+        assert!(patched.contains("codexswitch_request_nonce_matches_receipt"));
+        assert!(patched.contains("issued_not_before.is_some_and"));
         assert!(patched.contains("acknowledged_at < issued_at"));
         assert!(patched.contains("ACK_MAX_AGE_MILLISECONDS"));
         assert!(patched.contains("loadedTokenFingerprint"));
@@ -4442,10 +5023,34 @@ async fn run_turn() {
         assert!(patched.contains("codexswitch_auth_file_identity(&auth_path)"));
         assert!(patched.contains("fn codexswitch_verified_rotation_result("));
         assert!(patched.contains("codexswitch-runtime-rotation-handoff-v1"));
+        assert!(patched.contains("report.get(\"receiptNonce\")"));
+        assert!(patched.contains("report.get(\"requestCount\")"));
+        assert!(patched.contains("report.get(\"acknowledgedRequestNonces\")"));
         assert!(patched.contains("codexswitch_reload_auth_json_verified(&auth_path)"));
+        assert!(patched.contains("if !manager_already_matches_handoff"));
+        assert!(patched.contains("own_handoff.auth_generation"));
+        assert!(!patched.contains("if !changed\n        || loaded_fingerprint"));
         assert!(!patched.contains("auth_manager.reload().await"));
         assert!(patched.contains("CODEXSWITCH_ROTATE_TIMEOUT_SECONDS"));
         assert!(!patched.contains("std::time::Duration::from_secs(10)"));
+        assert_eq!(
+            patched
+                .matches("codexswitch_rotate_after_usage_limit(&sess, &turn_context).await")
+                .count(),
+            1
+        );
+        assert_eq!(
+            patched
+                .matches("codexswitch_request_auth_generation,\n                        )\n                        .await")
+                .count(),
+            1
+        );
+        assert_eq!(
+            patched
+                .matches("codexswitch_rotate_after_auth_failure(&sess, &turn_context).await")
+                .count(),
+            1
+        );
     }
 
     #[test]

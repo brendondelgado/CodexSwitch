@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import Security
 
-struct LinuxDevboxMonitorSettings: Sendable {
+struct LinuxDevboxMonitorSettings: Equatable, Sendable {
     let enabled: Bool
     let host: String
     let user: String
@@ -13,6 +13,18 @@ struct LinuxDevboxMonitorSettings: Sendable {
     var isConfigured: Bool {
         enabled && !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !user.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+struct LinuxDevboxReadinessTaskContext: Equatable, Sendable {
+    let generation: UInt64
+    let settings: LinuxDevboxMonitorSettings
+
+    func authorizesPublication(
+        currentGeneration: UInt64,
+        currentSettings: LinuxDevboxMonitorSettings
+    ) -> Bool {
+        generation == currentGeneration && settings == currentSettings
     }
 }
 
@@ -109,8 +121,30 @@ struct LinuxDevboxStatus: Equatable, Sendable {
         case notConfigured
         case checking
         case ready
+        case stale
         case notReady
         case failed
+    }
+
+    enum Invalidation: CaseIterable, Equatable, Sendable {
+        case activeSessionUnverified
+        case negative
+        case failed
+        case deferred
+        case decodedInvalid
+        case barrierBlocked
+        case expired
+
+        var state: State {
+            switch self {
+            case .negative, .barrierBlocked:
+                return .notReady
+            case .failed, .decodedInvalid:
+                return .failed
+            case .activeSessionUnverified, .deferred, .expired:
+                return .stale
+            }
+        }
     }
 
     let state: State
@@ -144,6 +178,18 @@ struct LinuxDevboxStatus: Equatable, Sendable {
         activeProviderAccountId: nil
     )
 
+    static func invalidated(
+        by invalidation: Invalidation,
+        summary: String
+    ) -> LinuxDevboxStatus {
+        LinuxDevboxStatus(
+            state: invalidation.state,
+            summary: summary,
+            activeEmail: nil,
+            activeProviderAccountId: nil
+        )
+    }
+
     var isVisible: Bool {
         state != .notConfigured
     }
@@ -156,15 +202,54 @@ struct LinuxDevboxStatus: Equatable, Sendable {
         state == .notConfigured
     }
 
-    static func shouldSuppressTransientIssue(wasReady: Bool?, consecutiveIssueChecks: Int) -> Bool {
+    static func shouldSuppressTransientIssueNotification(
+        wasReady: Bool?,
+        consecutiveIssueChecks: Int
+    ) -> Bool {
         wasReady == true && consecutiveIssueChecks < 2
+    }
+
+    static func accountMirrorIsFresh(
+        observedAt: Date?,
+        now: Date,
+        maximumAge: TimeInterval
+    ) -> Bool {
+        guard let observedAt, maximumAge >= 0 else { return false }
+        let age = now.timeIntervalSince(observedAt)
+        return age >= 0 && age <= maximumAge
+    }
+
+    func hasFreshReadinessProof(
+        mirrorObservedAt: Date?,
+        now: Date,
+        maximumAge: TimeInterval
+    ) -> Bool {
+        state == .ready && Self.accountMirrorIsFresh(
+            observedAt: mirrorObservedAt,
+            now: now,
+            maximumAge: maximumAge
+        )
+    }
+
+    static func activeSessionRequiresInvalidation(
+        hasActiveRemoteSession: Bool,
+        status: LinuxDevboxStatus,
+        mirrorObservedAt: Date?,
+        now: Date,
+        maximumAge: TimeInterval
+    ) -> Bool {
+        hasActiveRemoteSession && !status.hasFreshReadinessProof(
+            mirrorObservedAt: mirrorObservedAt,
+            now: now,
+            maximumAge: maximumAge
+        )
     }
 
     var icon: String {
         switch state {
         case .ready: return "checkmark.circle.fill"
         case .checking: return "clock.arrow.circlepath"
-        case .notReady, .failed: return "exclamationmark.triangle.fill"
+        case .stale, .notReady, .failed: return "exclamationmark.triangle.fill"
         case .notConfigured: return "server.rack"
         }
     }
@@ -178,6 +263,8 @@ struct LinuxDevboxStatus: Equatable, Sendable {
             return "VPS CLI — Ready"
         case .checking:
             return "VPS CLI — Checking hot-swap readiness"
+        case .stale:
+            return "VPS CLI — Stale: \(summary)"
         case .notReady:
             return "VPS CLI — Not ready: \(summary)"
         case .failed:
@@ -214,6 +301,10 @@ struct LinuxDevboxMonitorFailure: Error, Equatable, Sendable {
     ) {
         self.message = message
         self.credentialSyncDisposition = credentialSyncDisposition
+    }
+
+    var isDecodedInvalidObservation: Bool {
+        message.hasPrefix("Failed to parse Linux devbox ")
     }
 }
 

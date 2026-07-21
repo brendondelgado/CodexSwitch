@@ -7,7 +7,7 @@ unit:signul-codex-app-server.service:WorkingDirectory	/home/signul/SIGNUL
 unit:signul-codex-app-server.service:Environment	CODEX_HOME=/home/signul/.codex
 unit:signul-codex-app-server.service:EnvironmentFile	-/home/signul/SIGNUL/.env.vps.pipeline
 unit:signul-codex-app-server.service:UMask	0077
-unit:signul-codex-app-server.service:ExecStart	/usr/bin/flock --shared --no-fork %h/.local/share/codexswitch/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork %h/.codex/app-server-daemon/app-server.pid.lock %h/.local/share/codexswitch/current/patched-codex/codex -c features.local_thread_store_compression=true app-server --remote-control --listen ws://127.0.0.1:8390
+unit:signul-codex-app-server.service:ExecStart	/usr/bin/flock --shared --no-fork %h/.local/share/codexswitch/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork %h/.codex/app-server-daemon/app-server.pid.lock %h/.local/share/codexswitch/current/patched-codex/codex app-server --remote-control --listen ws://127.0.0.1:8390
 unit:signul-codex-app-server.service:KillSignal	SIGINT
 unit:signul-codex-app-server.service:KillMode	mixed
 unit:signul-codex-app-server.service:TimeoutStopSec	120

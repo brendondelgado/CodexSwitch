@@ -1,0 +1,808 @@
+name: Build Linux x86_64 Runtime Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      codexswitch_git_sha:
+        description: Exact 40-character CodexSwitch commit selected from main
+        required: true
+        type: string
+      upstream_codex_version:
+        description: Stable upstream Codex version, for example 0.144.4
+        required: true
+        type: string
+      upstream_codex_git_sha:
+        description: Exact 40-character peeled commit behind the upstream rust-v version tag
+        required: true
+        type: string
+
+permissions:
+  attestations: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: linux-runtime-${{ github.sha }}-${{ inputs.upstream_codex_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build native Linux x86_64 runtime set
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      UPSTREAM_REPO_URL: https://github.com/openai/codex.git
+      TARGET_TRIPLE: x86_64-unknown-linux-gnu
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_INCREMENTAL: "0"
+      LC_ALL: C.UTF-8
+      TZ: UTC
+
+    steps:
+      - name: Require a main-branch dispatch with exact inputs
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_REF_TYPE: ${{ github.ref_type }}
+          EXPECTED_CODEXSWITCH_SHA: ${{ inputs.codexswitch_git_sha }}
+          EXPECTED_UPSTREAM_CODEX_SHA: ${{ inputs.upstream_codex_git_sha }}
+          UPSTREAM_CODEX_VERSION: ${{ inputs.upstream_codex_version }}
+        run: |
+          set -euo pipefail
+          sha_pattern='^[0-9a-f]{40}$'
+          version_pattern='^[0-9]+\.[0-9]+\.[0-9]+$'
+
+          if [[ "$DISPATCH_REF_TYPE" != "branch" || "$DISPATCH_REF" != "refs/heads/main" ]]; then
+            echo "::error::this workflow may be dispatched only from refs/heads/main"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_CODEXSWITCH_SHA" =~ $sha_pattern ]]; then
+            echo "::error::codexswitch_git_sha must be 40 lowercase hexadecimal characters"
+            exit 1
+          fi
+          if [[ ! "$GITHUB_SHA" =~ $sha_pattern || "$EXPECTED_CODEXSWITCH_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::codexswitch_git_sha must equal the exact main dispatch commit"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_UPSTREAM_CODEX_SHA" =~ $sha_pattern ]]; then
+            echo "::error::upstream_codex_git_sha must be 40 lowercase hexadecimal characters"
+            exit 1
+          fi
+          if [[ ! "$UPSTREAM_CODEX_VERSION" =~ $version_pattern ]]; then
+            echo "::error::upstream_codex_version must be a stable three-component version"
+            exit 1
+          fi
+
+      - name: Require the native Ubuntu x86_64 runner
+        run: |
+          set -euo pipefail
+          source /etc/os-release
+          runner_arch="$(uname -m)"
+          debian_arch="$(dpkg --print-architecture)"
+          if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "24.04" ]]; then
+            echo "::error::expected Ubuntu 24.04, found ${PRETTY_NAME:-unknown}"
+            exit 1
+          fi
+          if [[ "$(uname -s)" != "Linux" || "$runner_arch" != "x86_64" || "$debian_arch" != "amd64" ]]; then
+            echo "::error::ubuntu-24.04 did not provide native Linux x86_64: $(uname -s) / $runner_arch / $debian_arch"
+            exit 1
+          fi
+          echo "Runner: ${PRETTY_NAME} / $runner_arch"
+
+      - name: Check out the exact dispatched CodexSwitch commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.codexswitch_git_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Lock CodexSwitch provenance
+        id: provenance
+        env:
+          EXPECTED_CODEXSWITCH_SHA: ${{ inputs.codexswitch_git_sha }}
+          EXPECTED_UPSTREAM_CODEX_SHA: ${{ inputs.upstream_codex_git_sha }}
+          UPSTREAM_CODEX_VERSION: ${{ inputs.upstream_codex_version }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [[ "$actual_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::CodexSwitch checkout does not match the dispatch commit"
+            exit 1
+          fi
+          if [[ "$actual_sha" != "$EXPECTED_CODEXSWITCH_SHA" ]]; then
+            echo "::error::CodexSwitch checkout does not match the requested commit"
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+            echo "::error::CodexSwitch checkout is not clean before the build"
+            exit 1
+          fi
+
+          build_epoch="$(git show -s --format=%ct HEAD)"
+          if [[ ! "$build_epoch" =~ ^[0-9]+$ ]] || [[ "$build_epoch" == "0" ]]; then
+            echo "::error::CodexSwitch commit has an invalid build epoch"
+            exit 1
+          fi
+          short_sha="${actual_sha:0:12}"
+          artifact_name="codexswitch-linux-x86_64-runtime-${short_sha}-codex-${UPSTREAM_CODEX_VERSION}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            printf 'source_sha=%s\n' "$actual_sha"
+            printf 'build_epoch=%s\n' "$build_epoch"
+            printf 'upstream_version=%s\n' "$UPSTREAM_CODEX_VERSION"
+            printf 'expected_upstream_sha=%s\n' "$EXPECTED_UPSTREAM_CODEX_SHA"
+            printf 'artifact_name=%s\n' "$artifact_name"
+          } >> "$GITHUB_OUTPUT"
+          {
+            printf 'SOURCE_DATE_EPOCH=%s\n' "$build_epoch"
+            printf 'CODEXSWITCH_SOURCE_SHA=%s\n' "$actual_sha"
+            printf 'UPSTREAM_CODEX_VERSION=%s\n' "$UPSTREAM_CODEX_VERSION"
+            printf 'CONTROL_TARGET_DIR=%s/codexswitch-linux-target\n' "$RUNNER_TEMP"
+            printf 'UPSTREAM_SOURCE_DIR=%s/codex-linux-upstream\n' "$RUNNER_TEMP"
+            printf 'UPSTREAM_TARGET_DIR=%s/codex-linux-target\n' "$RUNNER_TEMP"
+            printf 'PATCH_DRIVER=%s/patch-codex-linux-source\n' "$RUNNER_TEMP"
+            printf 'ARTIFACT_DIR=%s/codexswitch-linux-runtime-artifact\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare the Rust and native inspection toolchain
+        run: |
+          set -euo pipefail
+          rustc -Vv
+          cargo -V
+          rustup target add "$TARGET_TRIPLE"
+          for command in cc file jq readelf sha256sum stat strings timeout; do
+            command -v "$command" >/dev/null
+          done
+
+      - name: Restore remote Cargo downloads
+        id: cargo_download_cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: linux-runtime-downloads-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-${{ github.sha }}
+          restore-keys: |
+            linux-runtime-downloads-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-
+            linux-runtime-downloads-v1-${{ runner.arch }}-
+
+      - name: Build the exact CodexSwitch control plane
+        id: control_plane
+        run: |
+          set -euo pipefail
+          mapfile -t package_versions < <(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -er '.packages[] | select(.name == "codexswitch-cli") | .version'
+          )
+          if (( ${#package_versions[@]} != 1 )) \
+            || [[ ! "${package_versions[0]}" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::failed to resolve one safe codexswitch-cli package version"
+            exit 1
+          fi
+          package_version="${package_versions[0]}"
+
+          CARGO_TARGET_DIR="$CONTROL_TARGET_DIR" cargo build \
+            --locked \
+            --release \
+            --target "$TARGET_TRIPLE" \
+            --jobs "$CARGO_BUILD_JOBS" \
+            -p codexswitch-cli
+
+          control_binary="$CONTROL_TARGET_DIR/$TARGET_TRIPLE/release/codexswitch-cli"
+          if [[ ! -f "$control_binary" || -L "$control_binary" || ! -x "$control_binary" || ! -s "$control_binary" ]]; then
+            echo "::error::Cargo did not produce a regular executable codexswitch-cli"
+            exit 1
+          fi
+          control_bytes="$(stat -c '%s' "$control_binary")"
+          if (( control_bytes <= 0 || control_bytes > 2147483648 )); then
+            echo "::error::codexswitch-cli exceeds the 2 GiB artifact member limit"
+            exit 1
+          fi
+
+          install -d -m 0755 "$ARTIFACT_DIR"
+          install -m 0755 "$control_binary" "$ARTIFACT_DIR/codexswitch-cli"
+          version_output="$("$ARTIFACT_DIR/codexswitch-cli" --version)"
+          expected_version="codexswitch-cli ${package_version} (git ${CODEXSWITCH_SOURCE_SHA}, built ${SOURCE_DATE_EPOCH})"
+          if [[ "$version_output" != "$expected_version" || "$version_output" == *-dirty* ]]; then
+            echo "::error::codexswitch-cli does not embed the exact clean dispatched provenance"
+            exit 1
+          fi
+          if (( ${#version_output} > 512 )); then
+            echo "::error::codexswitch-cli build version exceeds the manifest limit"
+            exit 1
+          fi
+
+          # install-linux invokes import during an approved bundle transaction and daemon via systemd.
+          "$ARTIFACT_DIR/codexswitch-cli" \
+            --store "$RUNNER_TEMP/install-linux-command-probe/accounts.json" \
+            --auth "$RUNNER_TEMP/install-linux-command-probe/auth.json" \
+            import --help >/dev/null
+          "$ARTIFACT_DIR/codexswitch-cli" daemon --help >/dev/null
+          "$ARTIFACT_DIR/codexswitch-cli" resolve-activation --help >/dev/null
+
+          printf 'build_version=%s\n' "$version_output" >> "$GITHUB_OUTPUT"
+          printf 'package_version=%s\n' "$package_version" >> "$GITHUB_OUTPUT"
+          rm -rf -- "$CONTROL_TARGET_DIR"
+
+      - name: Compile the exact-commit source patch driver
+        run: |
+          set -euo pipefail
+          CODEXSWITCH_REPOSITORY_ROOT="$GITHUB_WORKSPACE" \
+            rustc \
+              --edition=2021 \
+              -D warnings \
+              -C opt-level=1 \
+              Tests/Fixtures/BuildFork/patch_codex_source.rs \
+              -o "$PATCH_DRIVER"
+          test -x "$PATCH_DRIVER"
+
+      - name: Check out the exact peeled upstream Codex tag
+        id: upstream
+        env:
+          EXPECTED_UPSTREAM_CODEX_SHA: ${{ steps.provenance.outputs.expected_upstream_sha }}
+        run: |
+          set -euo pipefail
+          upstream_tag="rust-v${UPSTREAM_CODEX_VERSION}"
+          if [[ -e "$UPSTREAM_SOURCE_DIR" || -L "$UPSTREAM_SOURCE_DIR" ]]; then
+            echo "::error::upstream source destination already exists"
+            exit 1
+          fi
+
+          git init --quiet "$UPSTREAM_SOURCE_DIR"
+          git -C "$UPSTREAM_SOURCE_DIR" remote add origin "$UPSTREAM_REPO_URL"
+          git -C "$UPSTREAM_SOURCE_DIR" fetch \
+            --quiet \
+            --depth=1 \
+            --no-tags \
+            origin \
+            "refs/tags/${upstream_tag}:refs/tags/${upstream_tag}"
+
+          tag_ref="refs/tags/${upstream_tag}"
+          tag_object_sha="$(git -C "$UPSTREAM_SOURCE_DIR" rev-parse --verify "$tag_ref")"
+          peeled_upstream_sha="$(git -C "$UPSTREAM_SOURCE_DIR" rev-parse --verify "${tag_ref}^{commit}")"
+          if [[ "$peeled_upstream_sha" != "$EXPECTED_UPSTREAM_CODEX_SHA" ]]; then
+            echo "::error::peeled upstream tag resolved to $peeled_upstream_sha instead of $EXPECTED_UPSTREAM_CODEX_SHA"
+            exit 1
+          fi
+
+          git -C "$UPSTREAM_SOURCE_DIR" -c advice.detachedHead=false \
+            checkout --quiet --detach "$peeled_upstream_sha"
+          actual_head="$(git -C "$UPSTREAM_SOURCE_DIR" rev-parse --verify 'HEAD^{commit}')"
+          origin_url="$(git -C "$UPSTREAM_SOURCE_DIR" remote get-url origin)"
+          if [[ "$actual_head" != "$peeled_upstream_sha" ]]; then
+            echo "::error::upstream checkout does not match the peeled tag commit"
+            exit 1
+          fi
+          if [[ "$(git -C "$UPSTREAM_SOURCE_DIR" tag --points-at HEAD)" != "$upstream_tag" ]]; then
+            echo "::error::upstream checkout is not pointed to by only $upstream_tag"
+            exit 1
+          fi
+          if [[ "$origin_url" != "$UPSTREAM_REPO_URL" ]]; then
+            echo "::error::unexpected upstream remote: $origin_url"
+            exit 1
+          fi
+          if [[ -n "$(git -C "$UPSTREAM_SOURCE_DIR" status --porcelain --untracked-files=normal)" ]]; then
+            echo "::error::upstream checkout is dirty before patching"
+            exit 1
+          fi
+
+          {
+            printf 'tag=%s\n' "$upstream_tag"
+            printf 'tag_object_sha=%s\n' "$tag_object_sha"
+            printf 'sha=%s\n' "$peeled_upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Apply the exact-commit source patches
+        id: patches
+        run: |
+          set -euo pipefail
+          "$PATCH_DRIVER" "$UPSTREAM_SOURCE_DIR"
+          git -C "$UPSTREAM_SOURCE_DIR" diff --check
+
+          if git -C "$UPSTREAM_SOURCE_DIR" diff --quiet; then
+            echo "::error::the exact-commit source patch driver made no changes"
+            exit 1
+          fi
+          if ! git -C "$UPSTREAM_SOURCE_DIR" diff --cached --quiet --exit-code; then
+            echo "::error::the source patch driver unexpectedly staged changes"
+            exit 1
+          fi
+          if [[ -n "$(git -C "$UPSTREAM_SOURCE_DIR" ls-files --others --exclude-standard)" ]]; then
+            echo "::error::the source patch created unexpected untracked files"
+            exit 1
+          fi
+
+          patch_sha256="$(
+            git -C "$UPSTREAM_SOURCE_DIR" -c color.ui=false \
+              diff --binary --full-index --no-ext-diff HEAD -- \
+              | sha256sum \
+              | awk '{print $1}'
+          )"
+          if [[ ! "$patch_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::failed to derive the patched-source diff hash"
+            exit 1
+          fi
+          printf 'sha256=%s\n' "$patch_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Normalize patched upstream source mtimes
+        env:
+          EXPECTED_PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          (
+            cd "$UPSTREAM_SOURCE_DIR"
+            git ls-files -z | xargs -0 touch -h --date="@$SOURCE_DATE_EPOCH" --
+          )
+
+          observed_patch_sha256="$(
+            git -C "$UPSTREAM_SOURCE_DIR" -c color.ui=false \
+              diff --binary --full-index --no-ext-diff HEAD -- \
+              | sha256sum \
+              | awk '{print $1}'
+          )"
+          if [[ "$observed_patch_sha256" != "$EXPECTED_PATCH_SHA256" ]]; then
+            echo "::error::mtime normalization changed the patched-source identity"
+            exit 1
+          fi
+
+      - name: Derive exact upstream target cache ABI
+        id: target_cache_abi
+        working-directory: ${{ runner.temp }}/codex-linux-upstream/codex-rs
+        env:
+          PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          abi_input="$RUNNER_TEMP/linux-upstream-target-cache-abi.txt"
+          {
+            printf 'format=codexswitch-linux-upstream-target-cache-abi-v1\n'
+            printf 'runnerImage=ubuntu-24.04\n'
+            printf 'runnerArch=%s\n' "$(uname -m)"
+            printf 'rustcVv<<EOF\n'
+            rustc -Vv
+            printf 'EOF\n'
+            printf 'cargoV<<EOF\n'
+            cargo -V
+            printf 'EOF\n'
+            printf 'osRelease<<EOF\n'
+            cat /etc/os-release
+            printf 'EOF\n'
+            printf 'uname<<EOF\n'
+            uname -srvm
+            printf 'EOF\n'
+            printf 'ccVersion<<EOF\n'
+            cc --version
+            printf 'EOF\n'
+            printf 'ldVersion<<EOF\n'
+            ld --version
+            printf 'EOF\n'
+            printf 'glibcVersion<<EOF\n'
+            ldd --version
+            printf 'EOF\n'
+            printf 'targetTriple=%s\n' "$TARGET_TRIPLE"
+            printf 'upstreamSha=%s\n' "$UPSTREAM_SHA"
+            printf 'patchSha256=%s\n' "$PATCH_SHA256"
+            printf 'codexSwitchSha=%s\n' "$CODEXSWITCH_SOURCE_SHA"
+            printf 'sourceDateEpoch=%s\n' "$SOURCE_DATE_EPOCH"
+            printf 'cargoFlags=--locked --release --target %s\n' "$TARGET_TRIPLE"
+            printf 'cargoPackages=codex-cli,codex-code-mode-host\n'
+            printf 'CARGO_BUILD_JOBS=%s\n' "$CARGO_BUILD_JOBS"
+            printf 'CARGO_PROFILE_RELEASE_LTO=%s\n' "$CARGO_PROFILE_RELEASE_LTO"
+            printf 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=%s\n' "$CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+            printf 'CARGO_INCREMENTAL=%s\n' "$CARGO_INCREMENTAL"
+          } > "$abi_input"
+
+          cache_abi_sha256="$(sha256sum "$abi_input" | awk '{print $1}')"
+          if [[ ! "$cache_abi_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::failed to derive the upstream target cache ABI"
+            exit 1
+          fi
+          printf 'sha256=%s\n' "$cache_abi_sha256" >> "$GITHUB_OUTPUT"
+          echo "Upstream target cache ABI: $cache_abi_sha256"
+
+      - name: Restore exact upstream Cargo target cache
+        id: upstream_target_cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/codex-linux-target/
+          key: linux-runtime-target-v1-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}-${{ steps.provenance.outputs.source_sha }}
+
+      - name: Build the patched Codex runtime pair
+        working-directory: ${{ runner.temp }}/codex-linux-upstream/codex-rs
+        run: |
+          set -euo pipefail
+          df -h .
+          CARGO_TARGET_DIR="$UPSTREAM_TARGET_DIR" cargo build \
+            --locked \
+            --release \
+            --target "$TARGET_TRIPLE" \
+            --jobs "$CARGO_BUILD_JOBS" \
+            -p codex-cli \
+            -p codex-code-mode-host
+
+      - name: Revalidate both source trees after compilation
+        env:
+          EXPECTED_PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+          EXPECTED_UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          EXPECTED_UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          observed_codexswitch_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [[ "$observed_codexswitch_sha" != "$CODEXSWITCH_SOURCE_SHA" ]]; then
+            echo "::error::CodexSwitch source no longer matches the locked source commit"
+            exit 1
+          fi
+          if [[ "$observed_codexswitch_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::CodexSwitch source no longer matches the dispatch commit"
+            exit 1
+          fi
+          if ! git diff --quiet --exit-code; then
+            echo "::error::CodexSwitch tracked source changed during compilation"
+            exit 1
+          fi
+          if ! git diff --cached --quiet --exit-code; then
+            echo "::error::CodexSwitch source changes were staged during compilation"
+            exit 1
+          fi
+          if [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+            echo "::error::CodexSwitch build created untracked source-tree files"
+            exit 1
+          fi
+
+          upstream_tag_ref="refs/tags/${EXPECTED_UPSTREAM_TAG}"
+          observed_upstream_sha="$(git -C "$UPSTREAM_SOURCE_DIR" rev-parse --verify 'HEAD^{commit}')"
+          observed_peeled_sha="$(git -C "$UPSTREAM_SOURCE_DIR" rev-parse --verify "${upstream_tag_ref}^{commit}")"
+          if [[ "$observed_upstream_sha" != "$EXPECTED_UPSTREAM_SHA" \
+            || "$observed_peeled_sha" != "$EXPECTED_UPSTREAM_SHA" ]]; then
+            echo "::error::upstream source commit or peeled tag changed during compilation"
+            exit 1
+          fi
+          if [[ -n "$(git -C "$UPSTREAM_SOURCE_DIR" ls-files --others --exclude-standard)" ]]; then
+            echo "::error::upstream build created untracked source-tree files"
+            exit 1
+          fi
+          if ! git -C "$UPSTREAM_SOURCE_DIR" diff --cached --quiet --exit-code; then
+            echo "::error::upstream build staged source-tree changes"
+            exit 1
+          fi
+          observed_patch_sha256="$(
+            git -C "$UPSTREAM_SOURCE_DIR" -c color.ui=false \
+              diff --binary --full-index --no-ext-diff HEAD -- \
+              | sha256sum \
+              | awk '{print $1}'
+          )"
+          if [[ "$observed_patch_sha256" != "$EXPECTED_PATCH_SHA256" ]]; then
+            echo "::error::patched upstream source changed during compilation"
+            exit 1
+          fi
+
+      - name: Stage the exact runtime executables
+        run: |
+          set -euo pipefail
+          runtime_build_dir="$UPSTREAM_TARGET_DIR/$TARGET_TRIPLE/release"
+          for name in codex codex-code-mode-host; do
+            source_path="$runtime_build_dir/$name"
+            if [[ ! -f "$source_path" || -L "$source_path" || ! -x "$source_path" || ! -s "$source_path" ]]; then
+              echo "::error::Cargo did not produce a regular executable $name"
+              exit 1
+            fi
+            install -m 0755 "$source_path" "$ARTIFACT_DIR/$name"
+          done
+
+      - name: Validate Linux architecture and runtime contracts
+        env:
+          CONTROL_BUILD_VERSION: ${{ steps.control_plane.outputs.build_version }}
+        run: |
+          set -euo pipefail
+
+          validate_linux_x86_64_elf() {
+            local path="$1"
+            local bytes description header
+            if [[ ! -f "$path" || -L "$path" || ! -x "$path" || ! -s "$path" ]]; then
+              echo "::error::$path is not a nonempty regular executable"
+              return 1
+            fi
+            bytes="$(stat -c '%s' "$path")"
+            if (( bytes <= 0 || bytes > 2147483648 )); then
+              echo "::error::$path exceeds the 2 GiB artifact member limit"
+              return 1
+            fi
+            description="$(file -Lb -- "$path")"
+            header="$(readelf -h -- "$path")"
+            if [[ "$description" != *"ELF 64-bit LSB"* || "$description" != *"x86-64"* ]]; then
+              echo "::error::$path is not a Linux-compatible x86-64 ELF executable: $description"
+              return 1
+            fi
+            if ! grep -Eq '^[[:space:]]*Class:[[:space:]]+ELF64$' <<< "$header" \
+              || ! grep -Eq "^[[:space:]]*Data:[[:space:]]+2's complement, little endian$" <<< "$header" \
+              || ! grep -Eq '^[[:space:]]*Machine:[[:space:]]+Advanced Micro Devices X86-64$' <<< "$header" \
+              || ! grep -Eq '^[[:space:]]*Type:[[:space:]]+(EXEC|DYN)' <<< "$header"; then
+              echo "::error::$path has an unexpected ELF header"
+              return 1
+            fi
+          }
+
+          validate_linux_x86_64_elf "$ARTIFACT_DIR/codex"
+          validate_linux_x86_64_elf "$ARTIFACT_DIR/codex-code-mode-host"
+          validate_linux_x86_64_elf "$ARTIFACT_DIR/codexswitch-cli"
+
+          codex_version_output="$("$ARTIFACT_DIR/codex" --version)"
+          if [[ "$codex_version_output" != "codex-cli $UPSTREAM_CODEX_VERSION" ]]; then
+            echo "::error::codex version mismatch: $codex_version_output"
+            exit 1
+          fi
+          if [[ "$("$ARTIFACT_DIR/codexswitch-cli" --version)" != "$CONTROL_BUILD_VERSION" ]]; then
+            echo "::error::codexswitch-cli provenance changed after staging"
+            exit 1
+          fi
+          timeout 10 "$ARTIFACT_DIR/codex" app-server --help >/dev/null
+          "$ARTIFACT_DIR/codexswitch-cli" \
+            --store "$RUNNER_TEMP/install-linux-command-probe/accounts.json" \
+            --auth "$RUNNER_TEMP/install-linux-command-probe/auth.json" \
+            import --help >/dev/null
+          "$ARTIFACT_DIR/codexswitch-cli" daemon --help >/dev/null
+          "$ARTIFACT_DIR/codexswitch-cli" resolve-activation --help >/dev/null
+
+          marker_dump="$RUNNER_TEMP/codex-linux-runtime.strings"
+          strings -a "$ARTIFACT_DIR/codex" > "$marker_dump"
+          required_markers=(
+            "sighup-verified"
+            "SIGHUP: auth reloaded"
+            "hotswap-ack"
+            "CodexSwitch rotated accounts after a usage limit"
+            "CodexSwitch rotated accounts after an auth failure"
+            "Auth changed, opening new WebSocket with fresh credentials"
+            "codexswitch-runtime-convergence-v3"
+            "codexswitch-runtime-rotation-handoff-v1"
+            "CodexSwitch account/updated frontend write acknowledged after auth reload"
+            "codexswitch-hotswap-contract-v3"
+            "codexswitch-hotswap-headless-idle-v1"
+            "codexswitch-hotswap-cli-contract-v3"
+          )
+          for marker in "${required_markers[@]}"; do
+            if ! grep -Fq -- "$marker" "$marker_dump"; then
+              echo "::error::codex is missing required runtime marker: $marker"
+              exit 1
+            fi
+          done
+
+          if grep -Fq -- "Usage: /goal <objective>" "$marker_dump"; then
+            :
+          elif grep -Fq -- "Pursuing goal" "$marker_dump" \
+            && grep -Fq -- "thread/goal/set" "$marker_dump"; then
+            :
+          else
+            echo "::error::codex is missing the /goal capability markers"
+            exit 1
+          fi
+
+      - name: Generate and verify the canonical SHA-256 manifest
+        id: manifest
+        env:
+          CONTROL_BUILD_VERSION: ${{ steps.control_plane.outputs.build_version }}
+        run: |
+          set -euo pipefail
+
+          file_sha256() {
+            sha256sum "$1" | awk '{print $1}'
+          }
+          file_bytes() {
+            stat -c '%s' "$1"
+          }
+
+          codex_bytes="$(file_bytes "$ARTIFACT_DIR/codex")"
+          helper_bytes="$(file_bytes "$ARTIFACT_DIR/codex-code-mode-host")"
+          control_bytes="$(file_bytes "$ARTIFACT_DIR/codexswitch-cli")"
+          codex_sha256="$(file_sha256 "$ARTIFACT_DIR/codex")"
+          helper_sha256="$(file_sha256 "$ARTIFACT_DIR/codex-code-mode-host")"
+          control_sha256="$(file_sha256 "$ARTIFACT_DIR/codexswitch-cli")"
+
+          jq -n \
+            --arg format "codexswitch-linux-runtime-artifact-v1" \
+            --arg sourceSha "$CODEXSWITCH_SOURCE_SHA" \
+            --arg buildVersion "$CONTROL_BUILD_VERSION" \
+            --arg upstreamVersion "$UPSTREAM_CODEX_VERSION" \
+            --arg upstreamSha "${{ steps.upstream.outputs.sha }}" \
+            --arg patchSha256 "${{ steps.patches.outputs.sha256 }}" \
+            --arg targetTriple "$TARGET_TRIPLE" \
+            --arg architecture "x86_64" \
+            --argjson buildEpoch "$SOURCE_DATE_EPOCH" \
+            --argjson codexBytes "$codex_bytes" \
+            --arg codexSha256 "$codex_sha256" \
+            --argjson helperBytes "$helper_bytes" \
+            --arg helperSha256 "$helper_sha256" \
+            --argjson controlBytes "$control_bytes" \
+            --arg controlSha256 "$control_sha256" \
+            '{
+              format: $format,
+              codexSwitchGitSha: $sourceSha,
+              codexSwitchBuildVersion: $buildVersion,
+              upstreamCodexVersion: $upstreamVersion,
+              upstreamCodexGitSha: $upstreamSha,
+              sourcePatchSha256: $patchSha256,
+              targetTriple: $targetTriple,
+              architecture: $architecture,
+              buildEpoch: $buildEpoch,
+              files: [
+                {name: "codex", bytes: $codexBytes, sha256: $codexSha256},
+                {name: "codex-code-mode-host", bytes: $helperBytes, sha256: $helperSha256},
+                {name: "codexswitch-cli", bytes: $controlBytes, sha256: $controlSha256}
+              ]
+            }' > "$ARTIFACT_DIR/manifest.json"
+          chmod 0644 "$ARTIFACT_DIR/manifest.json"
+
+          manifest_bytes="$(file_bytes "$ARTIFACT_DIR/manifest.json")"
+          if (( manifest_bytes <= 0 || manifest_bytes > 65536 )); then
+            echo "::error::manifest.json exceeds the 64 KiB artifact manifest limit"
+            exit 1
+          fi
+          artifact_bytes=$((codex_bytes + helper_bytes + control_bytes + manifest_bytes))
+          if (( artifact_bytes > 2147483648 )); then
+            echo "::error::complete artifact exceeds the 2 GiB release limit"
+            exit 1
+          fi
+
+          jq -e \
+            --arg sourceSha "$CODEXSWITCH_SOURCE_SHA" \
+            --arg buildVersion "$CONTROL_BUILD_VERSION" \
+            --arg upstreamVersion "$UPSTREAM_CODEX_VERSION" \
+            --arg upstreamSha "${{ steps.upstream.outputs.sha }}" \
+            --arg patchSha256 "${{ steps.patches.outputs.sha256 }}" \
+            --argjson buildEpoch "$SOURCE_DATE_EPOCH" \
+            '
+              type == "object" and
+              (keys == ["architecture", "buildEpoch", "codexSwitchBuildVersion", "codexSwitchGitSha", "files", "format", "sourcePatchSha256", "targetTriple", "upstreamCodexGitSha", "upstreamCodexVersion"]) and
+              .format == "codexswitch-linux-runtime-artifact-v1" and
+              .codexSwitchGitSha == $sourceSha and
+              (.codexSwitchGitSha | test("^[0-9a-f]{40}$")) and
+              .codexSwitchBuildVersion == $buildVersion and
+              (.codexSwitchBuildVersion | (length > 0 and length <= 512)) and
+              .upstreamCodexVersion == $upstreamVersion and
+              (.upstreamCodexVersion | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+              .upstreamCodexGitSha == $upstreamSha and
+              (.upstreamCodexGitSha | test("^[0-9a-f]{40}$")) and
+              .sourcePatchSha256 == $patchSha256 and
+              (.sourcePatchSha256 | test("^[0-9a-f]{64}$")) and
+              .targetTriple == "x86_64-unknown-linux-gnu" and
+              .architecture == "x86_64" and
+              .buildEpoch == $buildEpoch and
+              (.buildEpoch | (type == "number" and . > 0)) and
+              ([.files[].name] == ["codex", "codex-code-mode-host", "codexswitch-cli"]) and
+              (all(.files[];
+                (keys == ["bytes", "name", "sha256"]) and
+                (.bytes | (type == "number" and . > 0 and . <= 2147483648)) and
+                (.sha256 | test("^[0-9a-f]{64}$"))
+              ))
+            ' "$ARTIFACT_DIR/manifest.json" >/dev/null
+
+          expected_inventory="$RUNNER_TEMP/expected-linux-artifact-inventory.tsv"
+          actual_inventory="$RUNNER_TEMP/actual-linux-artifact-inventory.tsv"
+          printf '%s\tf\n' codex codex-code-mode-host codexswitch-cli manifest.json \
+            | LC_ALL=C sort > "$expected_inventory"
+          find -P "$ARTIFACT_DIR" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' \
+            | LC_ALL=C sort > "$actual_inventory"
+          diff -u "$expected_inventory" "$actual_inventory"
+
+          while IFS=$'\t' read -r member file_type; do
+            if [[ "$file_type" != "f" || ! -f "$ARTIFACT_DIR/$member" || -L "$ARTIFACT_DIR/$member" ]]; then
+              echo "::error::artifact member is not an exact regular non-symlink file: $member"
+              exit 1
+            fi
+          done < "$expected_inventory"
+          for name in codex codex-code-mode-host codexswitch-cli; do
+            if [[ "$(stat -c '%a' "$ARTIFACT_DIR/$name")" != "755" ]]; then
+              echo "::error::artifact executable has an unexpected mode: $name"
+              exit 1
+            fi
+            manifest_member_bytes="$(jq -r --arg name "$name" '.files[] | select(.name == $name) | .bytes' "$ARTIFACT_DIR/manifest.json")"
+            manifest_member_sha256="$(jq -r --arg name "$name" '.files[] | select(.name == $name) | .sha256' "$ARTIFACT_DIR/manifest.json")"
+            if [[ "$manifest_member_bytes" != "$(file_bytes "$ARTIFACT_DIR/$name")" \
+              || "$manifest_member_sha256" != "$(file_sha256 "$ARTIFACT_DIR/$name")" ]]; then
+              echo "::error::manifest identity mismatch for $name"
+              exit 1
+            fi
+          done
+          if [[ "$(stat -c '%a' "$ARTIFACT_DIR/manifest.json")" != "644" ]]; then
+            echo "::error::manifest.json has an unexpected mode"
+            exit 1
+          fi
+
+          manifest_sha256="$(file_sha256 "$ARTIFACT_DIR/manifest.json")"
+          printf 'sha256=%s\n' "$manifest_sha256" >> "$GITHUB_OUTPUT"
+          printf 'bytes=%s\n' "$manifest_bytes" >> "$GITHUB_OUTPUT"
+
+      - name: Attest all exact Linux runtime artifact members
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/codexswitch-linux-runtime-artifact/codex
+            ${{ runner.temp }}/codexswitch-linux-runtime-artifact/codex-code-mode-host
+            ${{ runner.temp }}/codexswitch-linux-runtime-artifact/codexswitch-cli
+            ${{ runner.temp }}/codexswitch-linux-runtime-artifact/manifest.json
+
+      - name: Upload only the verified four-file Linux runtime artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.provenance.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/codexswitch-linux-runtime-artifact/codex
+            ${{ runner.temp }}/codexswitch-linux-runtime-artifact/codex-code-mode-host
+            ${{ runner.temp }}/codexswitch-linux-runtime-artifact/codexswitch-cli
+            ${{ runner.temp }}/codexswitch-linux-runtime-artifact/manifest.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: false
+
+      - name: Record build evidence
+        env:
+          ARTIFACT_NAME: ${{ steps.provenance.outputs.artifact_name }}
+          CONTROL_BUILD_VERSION: ${{ steps.control_plane.outputs.build_version }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_TAG_OBJECT_SHA: ${{ steps.upstream.outputs.tag_object_sha }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+          MANIFEST_SHA256: ${{ steps.manifest.outputs.sha256 }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Linux x86_64 Runtime Artifact"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Dispatch ref | \`$GITHUB_REF\` |"
+            echo "| CodexSwitch SHA | \`$CODEXSWITCH_SOURCE_SHA\` |"
+            echo "| CodexSwitch build version | \`$CONTROL_BUILD_VERSION\` |"
+            echo "| Upstream tag | \`$UPSTREAM_TAG\` |"
+            echo "| Upstream tag object | \`$UPSTREAM_TAG_OBJECT_SHA\` |"
+            echo "| Upstream peeled SHA | \`$UPSTREAM_SHA\` |"
+            echo "| Patched diff SHA-256 | \`$PATCH_SHA256\` |"
+            echo "| Target | \`$TARGET_TRIPLE\` |"
+            echo "| Runner architecture | \`$(uname -m)\` |"
+            echo "| Build epoch | \`$SOURCE_DATE_EPOCH\` |"
+            echo "| Manifest SHA-256 | \`$MANIFEST_SHA256\` |"
+            echo "| Artifact | \`$ARTIFACT_NAME\` |"
+            echo "| Upload digest | \`$ARTIFACT_DIGEST\` |"
+            echo "| Retention | 7 days |"
+            echo "| Download modes | Restore the three binaries to \`0755\`; GitHub artifacts normalize files to \`0644\` |"
+            echo "| Deployment or activation | Not performed |"
+            echo
+            echo "### Files"
+            echo
+            echo "| Name | Bytes | SHA-256 |"
+            echo "| --- | ---: | --- |"
+            jq -r '.files[] | "| `\(.name)` | \(.bytes) | `\(.sha256)` |"' "$ARTIFACT_DIR/manifest.json"
+            echo "| \`manifest.json\` | ${{ steps.manifest.outputs.bytes }} | \`$MANIFEST_SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save verified upstream Cargo target cache
+        if: ${{ success() && steps.upstream_target_cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/codex-linux-target/
+          key: linux-runtime-target-v1-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}-${{ steps.provenance.outputs.source_sha }}
+
+      - name: Remove ephemeral upstream Cargo target
+        if: ${{ always() }}
+        run: rm -rf -- "$RUNNER_TEMP/codex-linux-target"
+
+      - name: Save remote Cargo downloads
+        if: ${{ always() && steps.cargo_download_cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: linux-runtime-downloads-v1-${{ runner.arch }}-${{ inputs.upstream_codex_git_sha }}-${{ github.sha }}

@@ -24,6 +24,8 @@ toc:
   - Rollback
 cross_dependencies:
   - ../../scripts/install-linux.sh
+  - ../../scripts/stage-linux-runtime-artifact.sh
+  - ../../scripts/verify_linux_runtime_artifact.py
   - ../../scripts/lib/observe-managed-systemd.py
   - ../../scripts/lib/observe-managed-daemon.py
   - ../../scripts/lib/install-linux-common.sh
@@ -67,7 +69,7 @@ version_control:
   branch: main
   base_commit: 664edf6201fcd7dcdc299084392e3dad510ec9d7
   status: local_uncommitted
-  last_updated: 2026-07-13
+  last_updated: 2026-07-21
 ---
 
 # Linux Repository Deployment
@@ -123,10 +125,11 @@ symlink alias.
 
 ## Build Provenance
 
-The requested full SHA must be exactly 40 or 64 lowercase hexadecimal
-characters and an ancestor of one explicitly approved fetched origin ref. No
-uppercase normalization or intermediate 41-63-character form is accepted. The
-default is `refs/remotes/origin/main`; override it only with a reviewed
+The requested CodexSwitch SHA must be exactly the 40-character lowercase SHA
+recorded by the Linux artifact manifest and must be an ancestor of one
+explicitly approved fetched origin ref. The installer does not shorten or
+substitute this value. The default approved ref is
+`refs/remotes/origin/main`; override it only with a reviewed
 `refs/remotes/origin/...` ref:
 
 ```bash
@@ -139,7 +142,7 @@ The installer obtains the package version from Cargo metadata and uses the
 commit timestamp as `SOURCE_DATE_EPOCH`. The resulting CLI must report exactly:
 
 ```text
-codexswitch-cli <package-version> (git <first-12-sha>, built <commit-epoch>)
+codexswitch-cli <package-version> (git <full-40-character-sha>, built <commit-epoch>)
 ```
 
 Any `unknown`, `dirty`, version, SHA, or epoch mismatch rejects publication.
@@ -208,26 +211,41 @@ installer-owned snapshots are eligible for conservative cleanup.
 
 ## Runtime Artifact
 
-Each release contains an immutable copy of the patched Codex runtime. Supply a
-reviewed input directory and provenance for a new release:
+Each release contains an immutable copy of the patched Codex runtime. Download
+the exact four-member artifact produced by
+`.github/workflows/build-linux-runtime.yml`, then create a reviewed private
+snapshot:
 
 ```bash
-export CODEXSWITCH_CODEX_RUNTIME_DIR=<directory-containing-codex-and-codex-code-mode-host>
-export CODEXSWITCH_CODEX_VERSION=<expected-codex-version>
-export CODEXSWITCH_CODEX_SOURCE_SHA=<full-upstream-source-sha>
+scripts/stage-linux-runtime-artifact.sh \
+  <downloaded-four-file-artifact-directory> \
+  <new-reviewed-artifact-directory>
+export CODEXSWITCH_LINUX_ARTIFACT_DIR=<new-reviewed-artifact-directory>
 ```
 
-The installer requires regular executable `codex` and
-`codex-code-mode-host` files, an exact `codex-cli <version>` response, app-server
-help readiness, SHA-256 digests, and the complete current hot-swap marker
-contract, including `codex-runtime-storage-leases-v1`. Provenance and both
-digests are recorded in `release-manifest.tsv` and rechecked before activation
-or any separately requested post-commit start.
+The staging command snapshots every member without execute permission, verifies
+the exact manifest schema, per-file SHA-256 and size, and the complete artifact
+size against the 2 GiB release ceiling. It then verifies GitHub build
+attestations for `manifest.json`, `codex`, `codex-code-mode-host`, and
+`codexswitch-cli` against the fixed repository, workflow, main source ref, and
+the manifest's exact CodexSwitch commit. Only after a second byte-identity check
+does it create the reviewed destination and restore executable modes. The
+download directory is never executable or accepted directly by the installer.
 
-The app-server unit executes the immutable runtime through `current` with
-`features.local_thread_store_compression=true`. The feature is admitted only
-for a lease-capable runtime; active writers retain their lease, and only
-inactive stable rollouts enter bounded lossless compression.
+At the installer boundary, `manifest.json` is authoritative. The installer
+revalidates the exact inventory, total and per-file bounds, SHA-256 values,
+sizes, full CodexSwitch commit, control-plane build version, upstream Codex
+version and peeled commit, source patch SHA-256, target triple, architecture,
+and build epoch. Caller-supplied runtime version or source-SHA substitutions are
+not accepted. The release manifest persists the artifact manifest digest,
+upstream peeled commit, and `sourcePatchSha256`, then rechecks them before
+activation or any separately requested post-commit start.
+
+Runtime-storage hardening remains frozen, unimplemented in the reviewed patch
+driver, and disabled. `codex-runtime-storage-leases-v1` is not part of the
+active runtime marker contract, and the checked-in app-server unit does not set
+`features.local_thread_store_compression=true`. Neither repository wiring nor
+an artifact build is evidence that storage hardening is active.
 
 ## Runtime Convergence Contract
 
@@ -402,16 +420,16 @@ version-matched synced client path.
 
 ## Stage
 
-Choose one reviewed commit and runtime artifact, then dry-run and stage:
+Choose one reviewed commit and its attested runtime artifact, then dry-run and
+stage:
 
 ```bash
 export CODEXSWITCH_GIT_SHA=<full-git-sha>
 export CODEXSWITCH_APPROVED_ORIGIN_REF=refs/remotes/origin/main
 export CODEXSWITCH_INSTALL_ROOT="$HOME/.local/share/codexswitch"
 export CODEXSWITCH_BUILD_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/codexswitch/build"
-export CODEXSWITCH_CODEX_RUNTIME_DIR=<reviewed-runtime-directory>
-export CODEXSWITCH_CODEX_VERSION=<version>
-export CODEXSWITCH_CODEX_SOURCE_SHA=<full-source-sha>
+scripts/stage-linux-runtime-artifact.sh <download-directory> <reviewed-directory>
+export CODEXSWITCH_LINUX_ARTIFACT_DIR=<reviewed-directory>
 
 CODEXSWITCH_DRY_RUN=1 scripts/install-linux.sh
 scripts/install-linux.sh
@@ -673,6 +691,15 @@ journal exists, the next activation can prove the owner is gone, remove only
 its exact PID-owned partial systemd snapshot, and acquire a fresh lock. An
 ownerless or live-owner lock is never reclaimed.
 
+Token-bound systemd start barriers participate in the same stale-owner
+recovery. Before publishing a replacement activation lock, the installer may
+remove barriers only when the complete required barrier set is present, every
+file is regular and byte-for-byte bound to the validated dead lock owner, and
+the activation lock remains unchanged while the installer holds the filesystem
+mutex. A missing, partial, linked, changed, or live-owner barrier set fails
+closed before activation. After exact removal, the installer reloads the user
+manager and verifies that no managed barrier remains visible before proceeding.
+
 Each systemd transaction also carries a random generation and an HMAC owner
 manifest bound to its exact directory, PID/start identity, activation token,
 and installer-owned key. Retention deletes only snapshots whose strict owner
@@ -724,7 +751,7 @@ CODEXSWITCH_ACTIVATE=1 CODEXSWITCH_START_APP_SERVER=1 scripts/install-linux.sh
 ```
 
 Every invocation above must retain the reviewed
-`CODEXSWITCH_GIT_SHA=<full-40-or-64-character-sha>`, approved origin ref, and
+`CODEXSWITCH_GIT_SHA=<full-40-character-sha>`, approved origin ref, and
 runtime provenance from staging. An encrypted account import is also an
 activation action and requires an immutable bundle digest. The installer passes
 the anchored bundle to `codexswitch-cli import --offline-file-only`; the command

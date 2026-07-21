@@ -41,7 +41,12 @@ struct RateLimitResetServiceTests {
         }
         let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
 
-        let bank = try await service.fetchBank(for: Self.account(), force: true, now: now)
+        let bank = try await service.fetchBank(
+            for: Self.account(),
+            force: true,
+            now: now,
+            observationCompletedAt: now
+        )
 
         #expect(bank.availableCount == 2)
         #expect(bank.totalEarnedCount == 3)
@@ -63,6 +68,176 @@ struct RateLimitResetServiceTests {
         }
     }
 
+    @Test("Timestamp-fresh malformed cached inventory is refreshed")
+    func refreshesStructurallyInvalidCachedInventory() async throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let response = RateLimitResetHTTPResponse(
+            statusCode: 200,
+            data: Data(
+                """
+                {
+                  "available_count": 1,
+                  "total_earned_count": 1,
+                  "credits": [
+                    {
+                      "id": "fresh-credit",
+                      "status": "available",
+                      "expires_at": "2026-07-31T12:00:00Z"
+                    }
+                  ]
+                }
+                """.utf8
+            )
+        )
+        let harness = ResetTransportHarness([.response(response)])
+        let service = RateLimitResetService { request in try harness.send(request) }
+        var account = Self.account()
+        account.rateLimitResetBank = RateLimitResetBank(
+            availableCount: 1,
+            totalEarnedCount: 1,
+            credits: [],
+            fetchedAt: now.addingTimeInterval(-1)
+        )
+
+        let refreshed = try await service.fetchBank(
+            for: account,
+            now: now,
+            observationCompletedAt: now
+        )
+
+        #expect(refreshed.oldestExpiringCredit(at: now)?.id == "fresh-credit")
+        #expect(harness.requestBodies().count == 1)
+    }
+
+    @Test("Inventory count must match the complete available-credit list")
+    func rejectsPartialInventoryPayload() async throws {
+        let data = Data(
+            """
+            {
+              "available_count": 2,
+              "total_earned_count": 2,
+              "credits": [
+                {
+                  "id": "only-credit",
+                  "status": "available",
+                  "expires_at": "2026-07-31T12:00:00Z"
+                }
+              ]
+            }
+            """.utf8
+        )
+        let service = RateLimitResetService { _ in
+            RateLimitResetHTTPResponse(statusCode: 200, data: data)
+        }
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+
+        await #expect(throws: RateLimitResetServiceError.malformedInventory) {
+            try await service.fetchBank(
+                for: Self.account(),
+                force: true,
+                now: now,
+                observationCompletedAt: now
+            )
+        }
+    }
+
+    @Test("Zero count with an unexpired available credit is malformed")
+    func rejectsContradictoryZeroCountInventory() async throws {
+        let data = Data(
+            """
+            {
+              "available_count": 0,
+              "total_earned_count": 1,
+              "credits": [
+                {
+                  "id": "hidden-credit",
+                  "status": "available",
+                  "expires_at": "2026-07-31T12:00:00Z"
+                }
+              ]
+            }
+            """.utf8
+        )
+        let service = RateLimitResetService { _ in
+            RateLimitResetHTTPResponse(statusCode: 200, data: data)
+        }
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+
+        await #expect(throws: RateLimitResetServiceError.malformedInventory) {
+            try await service.fetchBank(
+                for: Self.account(),
+                force: true,
+                now: now,
+                observationCompletedAt: now
+            )
+        }
+    }
+
+    @Test("Available credits require a present future expiration")
+    func rejectsAvailableCreditWithoutExpiration() async throws {
+        let data = Data(
+            """
+            {
+              "available_count": 1,
+              "total_earned_count": 1,
+              "credits": [
+                {
+                  "id": "expiry-unknown",
+                  "status": "available",
+                  "expires_at": null
+                }
+              ]
+            }
+            """.utf8
+        )
+        let service = RateLimitResetService { _ in
+            RateLimitResetHTTPResponse(statusCode: 200, data: data)
+        }
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+
+        await #expect(throws: RateLimitResetServiceError.malformedInventory) {
+            try await service.fetchBank(
+                for: Self.account(),
+                force: true,
+                now: now,
+                observationCompletedAt: now
+            )
+        }
+    }
+
+    @Test("Inventory completion time prevents mid-request expiry attribution")
+    func rejectsCreditThatExpiredDuringInventoryRequest() async throws {
+        let data = Data(
+            """
+            {
+              "available_count": 1,
+              "total_earned_count": 1,
+              "credits": [
+                {
+                  "id": "expired-during-request",
+                  "status": "available",
+                  "expires_at": "2026-07-12T12:00:10Z"
+                }
+              ]
+            }
+            """.utf8
+        )
+        let service = RateLimitResetService { _ in
+            RateLimitResetHTTPResponse(statusCode: 200, data: data)
+        }
+        let requestStartedAt = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let requestCompletedAt = requestStartedAt.addingTimeInterval(20)
+
+        await #expect(throws: RateLimitResetServiceError.malformedInventory) {
+            try await service.fetchBank(
+                for: Self.account(),
+                force: true,
+                now: requestStartedAt,
+                observationCompletedAt: requestCompletedAt
+            )
+        }
+    }
+
     @Test("Count-only inventory cannot trigger redemption without a credit ID")
     func countOnlyInventoryIsNotRedeemable() {
         let bank = RateLimitResetBank(
@@ -74,6 +249,21 @@ struct RateLimitResetServiceTests {
 
         #expect(!bank.hasAvailableReset())
         #expect(bank.oldestExpiringCredit() == nil)
+    }
+
+    @Test("Partial credit inventory cannot authorize redemption")
+    func partialInventoryIsNotRedeemable() throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let complete = Self.bank(now: now, expiresIn: 86_400)
+        let partial = RateLimitResetBank(
+            availableCount: 2,
+            totalEarnedCount: 2,
+            credits: complete.credits,
+            fetchedAt: now
+        )
+
+        #expect(!partial.hasAvailableReset(at: now))
+        #expect(partial.oldestExpiringCredit(at: now) == nil)
     }
 
     @Test("Conservation policy rotates within a tier before spending resets")
@@ -316,6 +506,27 @@ struct RateLimitResetServiceTests {
         #expect(reverse?.accountId == alpha.id)
     }
 
+    @Test("Pool selector spends the earliest-expiring reset within a tier")
+    func poolSelectorPrioritizesExpirationWithinTier() throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        var alpha = Self.account(
+            email: "alpha@example.com",
+            snapshot: Self.weeklyOnlySnapshot(used: 100, now: now, resetAfter: 3 * 86_400)
+        )
+        var zulu = Self.account(
+            email: "zulu@example.com",
+            snapshot: Self.weeklyOnlySnapshot(used: 100, now: now, resetAfter: 3 * 86_400)
+        )
+        alpha.rateLimitResetBank = Self.bank(now: now, expiresIn: 7 * 86_400)
+        zulu.rateLimitResetBank = Self.bank(now: now, expiresIn: 2 * 86_400)
+
+        let forward = RateLimitResetPolicy.selectRedemptionCandidate(from: [alpha, zulu], now: now)
+        let reverse = RateLimitResetPolicy.selectRedemptionCandidate(from: [zulu, alpha], now: now)
+
+        #expect(forward?.accountId == zulu.id)
+        #expect(reverse?.accountId == zulu.id)
+    }
+
     @Test("Windowless snapshot cannot spend a reset")
     func windowlessSnapshotCannotSpendReset() throws {
         let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
@@ -359,6 +570,186 @@ struct RateLimitResetServiceTests {
         ) == nil)
     }
 
+    @Test("Automatic reset candidates require paid plans and complete runtime credentials")
+    func automaticRedemptionRequiresPaidCompleteAccount() throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let bank = Self.bank(now: now, expiresIn: 86_400)
+        var free = Self.account(
+            email: "free@example.com",
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 100,
+                now: now,
+                resetAfter: 3 * 86_400
+            ),
+            planType: "free"
+        )
+        free.rateLimitResetBank = bank
+        var incomplete = Self.account(
+            email: "incomplete@example.com",
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 100,
+                now: now,
+                resetAfter: 3 * 86_400
+            ),
+            planType: "pro"
+        )
+        incomplete.refreshToken = "  "
+        incomplete.rateLimitResetBank = bank
+        var complete = Self.account(
+            email: "complete@example.com",
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 100,
+                now: now,
+                resetAfter: 3 * 86_400
+            ),
+            planType: "pro"
+        )
+        complete.rateLimitResetBank = bank
+
+        #expect(RateLimitResetPolicy.redemptionReason(
+            for: free,
+            allAccounts: [free],
+            bank: bank,
+            now: now
+        ) == nil)
+        #expect(RateLimitResetPolicy.redemptionReason(
+            for: incomplete,
+            allAccounts: [incomplete],
+            bank: bank,
+            now: now
+        ) == nil)
+        #expect(RateLimitResetPolicy.selectRedemptionCandidate(
+            from: [free, incomplete],
+            now: now
+        ) == nil)
+        #expect(RateLimitResetPolicy.selectRedemptionCandidate(
+            from: [free, incomplete, complete],
+            now: now
+        )?.accountId == complete.id)
+    }
+
+    @Test("Manual redemption targets one fresh blocked Pro without applying pool conservation")
+    func manualRedemptionEligibilityIsAccountSpecific() throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let bank = Self.bank(now: now, expiresIn: 7 * 86_400)
+        let blockedPro = Self.account(
+            email: "blocked-pro@example.com",
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 100,
+                now: now,
+                resetAfter: 12 * 60 * 60
+            ),
+            planType: "pro"
+        )
+        let usablePro = Self.account(
+            email: "usable-pro@example.com",
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 20,
+                now: now,
+                resetAfter: 3 * 86_400
+            ),
+            planType: "pro"
+        )
+
+        #expect(RateLimitResetPolicy.redemptionReason(
+            for: blockedPro,
+            allAccounts: [blockedPro, usablePro],
+            bank: bank,
+            now: now
+        ) == nil)
+        #expect(RateLimitResetPolicy.canManuallyRedeem(
+            for: blockedPro,
+            bank: bank,
+            now: now
+        ))
+    }
+
+    @Test("Manual redemption fails closed for usable, free, and stale evidence")
+    func manualRedemptionRequiresFreshBlockedPaidEvidence() throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let freshBank = Self.bank(now: now, expiresIn: 7 * 86_400)
+        let usablePro = Self.account(
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 20,
+                now: now,
+                resetAfter: 3 * 86_400
+            ),
+            planType: "pro"
+        )
+        let blockedPlus = Self.account(
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 100,
+                now: now,
+                resetAfter: 3 * 86_400
+            ),
+            planType: "plus"
+        )
+        let blockedFree = Self.account(
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 100,
+                now: now,
+                resetAfter: 3 * 86_400
+            ),
+            planType: "free"
+        )
+        let blockedPro = Self.account(
+            snapshot: Self.weeklyOnlySnapshot(
+                used: 100,
+                now: now,
+                resetAfter: 3 * 86_400
+            ),
+            planType: "pro"
+        )
+        let staleBank = Self.bank(
+            now: now.addingTimeInterval(-61),
+            expiresIn: 7 * 86_400
+        )
+        var incompletePro = blockedPro
+        incompletePro.idToken = "\n"
+
+        #expect(!RateLimitResetPolicy.canManuallyRedeem(
+            for: usablePro,
+            bank: freshBank,
+            now: now
+        ))
+        #expect(RateLimitResetPolicy.canManuallyRedeem(
+            for: blockedPlus,
+            bank: freshBank,
+            now: now
+        ))
+        #expect(!RateLimitResetPolicy.canManuallyRedeem(
+            for: blockedFree,
+            bank: freshBank,
+            now: now
+        ))
+        #expect(!RateLimitResetPolicy.canManuallyRedeem(
+            for: blockedPro,
+            bank: staleBank,
+            now: now
+        ))
+        #expect(!RateLimitResetPolicy.canManuallyRedeem(
+            for: incompletePro,
+            bank: freshBank,
+            now: now
+        ))
+    }
+
+    @Test("Manual redemption never resumes automatic account switching")
+    func manualRedemptionDoesNotResumeAutomaticSwap() {
+        #expect(!AppDelegate.automaticSwapMayResume(
+            after: .manual,
+            operationRequestedResume: true
+        ))
+        #expect(AppDelegate.automaticSwapMayResume(
+            after: .weeklyPressure,
+            operationRequestedResume: true
+        ))
+        #expect(!AppDelegate.automaticSwapMayResume(
+            after: .weeklyPressure,
+            operationRequestedResume: false
+        ))
+    }
+
     @Test("A reset near expiration is used for an exhausted window")
     func expiringResetPolicy() throws {
         let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
@@ -383,6 +774,274 @@ struct RateLimitResetServiceTests {
             bank: bank,
             now: now
         ) == .expiringSoon)
+    }
+
+    @Test("New journal writes canonicalize stable provider account identity")
+    func newJournalWritesCanonicalProviderIdentity() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let harness = ResetTransportHarness([.transportFailure])
+        let service = RateLimitResetService(
+            transport: { request in try harness.send(request) },
+            journalURL: journalURL
+        )
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        var account = Self.account()
+        account.accountId = "  Provider-New\n"
+
+        await #expect(throws: RateLimitResetServiceError.self) {
+            try await service.consume(
+                for: account,
+                bank: Self.bank(now: now, expiresIn: 86_400),
+                now: now
+            )
+        }
+
+        let unresolved = try #require(await service.unresolvedAttempt(
+            for: "PROVIDER-NEW"
+        ))
+        #expect(unresolved.providerAccountId == "provider-new")
+        let persisted = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: journalURL)
+        ) as? [String: Any]
+        let attempts = try #require(persisted?["attempts"] as? [[String: Any]])
+        #expect(attempts.first?["providerAccountId"] as? String == "provider-new")
+    }
+
+    @Test("Journal persists manual redemption intent")
+    func journalPersistsManualRedemptionIntent() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let harness = ResetTransportHarness([.transportFailure])
+        let service = RateLimitResetService(
+            transport: { request in try harness.send(request) },
+            journalURL: journalURL
+        )
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+
+        await #expect(throws: RateLimitResetServiceError.self) {
+            try await service.consume(
+                for: Self.account(),
+                bank: Self.bank(now: now, expiresIn: 86_400),
+                now: now,
+                redemptionReason: .manual
+            )
+        }
+
+        let attempt = try #require(await service.allAttempts().first)
+        #expect(attempt.redemptionReason == .manual)
+    }
+
+    @Test("Legacy attempts without redemption reason decode safely")
+    func legacyAttemptWithoutRedemptionReasonDecodes() throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let attempt = RateLimitResetAttempt(
+            id: UUID(),
+            providerAccountId: "provider-legacy",
+            creditId: "credit-legacy",
+            startingAvailableCount: 1,
+            startingBankFetchedAt: now,
+            startingQuotaFetchedAt: now,
+            createdAt: now,
+            submittedAt: now,
+            state: .reconciling,
+            consumeResponseCode: "reset",
+            updatedAt: now
+        )
+        let encoded = try JSONEncoder().encode(attempt)
+        let object = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        #expect(object["redemptionReason"] == nil)
+
+        let decoded = try JSONDecoder().decode(RateLimitResetAttempt.self, from: encoded)
+        #expect(decoded.redemptionReason == nil)
+        #expect(decoded.creditExpiresAt == nil)
+        #expect(decoded.routineSwapSuppressionReleasedAt == nil)
+    }
+
+    @Test("Malformed reset journal is unreadable rather than empty")
+    func malformedResetJournalFailsClosed() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let transaction = SecureAtomicFileTransaction(
+            path: journalURL.path,
+            subject: "malformed reset journal test"
+        )
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            _ = try lockedFile.replace(
+                Data("not-json".utf8),
+                expectedGeneration: current.generation
+            )
+        }
+        let service = RateLimitResetService(
+            transport: { _ in throw ResetTransportFailure() },
+            journalURL: journalURL
+        )
+
+        await #expect(throws: RateLimitResetServiceError.self) {
+            _ = try await service.allAttempts()
+        }
+    }
+
+    @Test("Unreleased manual route suppression is exempt from terminal pruning")
+    func unreleasedManualSuppressionSurvivesPruning() throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let old = now.addingTimeInterval(-(31 * 24 * 60 * 60))
+        let protected = RateLimitResetAttempt(
+            id: UUID(),
+            providerAccountId: "provider-protected",
+            creditId: "credit-protected",
+            startingAvailableCount: 1,
+            startingBankFetchedAt: old,
+            startingQuotaFetchedAt: old,
+            creditExpiresAt: old.addingTimeInterval(3_600),
+            redemptionReason: .manual,
+            createdAt: old,
+            submittedAt: old,
+            state: .succeeded,
+            consumeResponseCode: "reset",
+            updatedAt: old
+        )
+        let released = RateLimitResetAttempt(
+            id: UUID(),
+            providerAccountId: "provider-released",
+            creditId: "credit-released",
+            startingAvailableCount: 1,
+            startingBankFetchedAt: old,
+            startingQuotaFetchedAt: old,
+            creditExpiresAt: old.addingTimeInterval(3_600),
+            redemptionReason: .manual,
+            createdAt: old,
+            submittedAt: old,
+            state: .succeeded,
+            consumeResponseCode: "reset",
+            routineSwapSuppressionReleasedAt: old.addingTimeInterval(1),
+            updatedAt: old.addingTimeInterval(1)
+        )
+        let transaction = SecureAtomicFileTransaction(
+            path: journalURL.path,
+            subject: "manual suppression prune test"
+        )
+        let data = try JSONEncoder().encode(LegacyResetJournalEnvelope(
+            version: RateLimitResetAttemptJournal.version,
+            attempts: [protected, released]
+        ))
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            _ = try lockedFile.replace(data, expectedGeneration: current.generation)
+        }
+        var journal = RateLimitResetAttemptJournal(url: journalURL)
+        let current = RateLimitResetAttempt(
+            id: UUID(),
+            providerAccountId: "provider-current",
+            creditId: "credit-current",
+            startingAvailableCount: 1,
+            startingBankFetchedAt: now,
+            startingQuotaFetchedAt: now,
+            creditExpiresAt: now.addingTimeInterval(3_600),
+            createdAt: now,
+            submittedAt: nil,
+            state: .prepared,
+            consumeResponseCode: nil,
+            updatedAt: now
+        )
+
+        try journal.prepare(current, now: now)
+        let attempts = try journal.allAttempts()
+
+        #expect(attempts.contains(where: { $0.id == protected.id }))
+        #expect(!attempts.contains(where: { $0.id == released.id }))
+        #expect(attempts.contains(where: { $0.id == current.id }))
+    }
+
+    @Test("Consume rejects incomplete runtime credentials before journal or transport")
+    func consumeRejectsIncompleteRuntimeCredentials() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let harness = ResetTransportHarness([
+            .response(RateLimitResetHTTPResponse(
+                statusCode: 200,
+                data: Data("{\"code\":\"reset\"}".utf8)
+            )),
+        ])
+        let service = RateLimitResetService(
+            transport: { request in try harness.send(request) },
+            journalURL: journalURL
+        )
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        var account = Self.account()
+        account.refreshToken = " "
+
+        await #expect(throws: RateLimitResetServiceError.submissionUnauthorized) {
+            try await service.consume(
+                for: account,
+                bank: Self.bank(now: now, expiresIn: 86_400),
+                now: now
+            )
+        }
+        #expect(harness.requestBodies().isEmpty)
+        #expect(try await service.allAttempts().isEmpty)
+    }
+
+    @Test("Legacy journal identity variants block a parallel reset owner")
+    func legacyJournalIdentityVariantsRemainOneOwner() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let legacyAttempt = RateLimitResetAttempt(
+            id: UUID(uuidString: "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb")!,
+            providerAccountId: "  Provider-Legacy\n",
+            creditId: "credit-legacy",
+            startingAvailableCount: 1,
+            startingBankFetchedAt: now,
+            startingQuotaFetchedAt: now,
+            createdAt: now,
+            submittedAt: now,
+            state: .reconciling,
+            consumeResponseCode: "reset",
+            updatedAt: now
+        )
+        let legacyData = try JSONEncoder().encode(LegacyResetJournalEnvelope(
+            version: RateLimitResetAttemptJournal.version,
+            attempts: [legacyAttempt]
+        ))
+        let transaction = SecureAtomicFileTransaction(
+            path: journalURL.path,
+            subject: "legacy reset journal test"
+        )
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            _ = try lockedFile.replace(
+                legacyData,
+                expectedGeneration: current.generation
+            )
+        }
+
+        let harness = ResetTransportHarness([])
+        let service = RateLimitResetService(
+            transport: { request in try harness.send(request) },
+            journalURL: journalURL
+        )
+        let loaded = try #require(await service.unresolvedAttempt(
+            for: "provider-legacy"
+        ))
+        #expect(loaded.id == legacyAttempt.id)
+        #expect(loaded.providerAccountId == "provider-legacy")
+
+        var account = Self.account()
+        account.accountId = "\tPROVIDER-LEGACY  "
+        await #expect(throws: RateLimitResetServiceError.unresolvedAttempt(legacyAttempt.id)) {
+            try await service.consume(
+                for: account,
+                bank: Self.bank(now: now.addingTimeInterval(1), expiresIn: 86_400),
+                now: now.addingTimeInterval(1)
+            )
+        }
+        #expect(harness.requestBodies().isEmpty)
     }
 
     @Test("Transport uncertainty sends exactly one POST and survives restart")
@@ -474,6 +1133,7 @@ struct RateLimitResetServiceTests {
             journalURL: journalURL
         )
         let gate = ResetSubmissionAuthorizationGate()
+        let submissionTracker = ResetSubmissionCallbackCounter()
         let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
         let account = Self.account()
         let consume = Task {
@@ -485,6 +1145,9 @@ struct RateLimitResetServiceTests {
                     await gate.waitForDecision()
                         ? authorizedResetSubmissionPermit(for: attempt)
                         : nil
+                },
+                submissionWillStart: { _ in
+                    submissionTracker.record()
                 }
             )
         }
@@ -495,7 +1158,157 @@ struct RateLimitResetServiceTests {
             try await consume.value
         }
         #expect(harness.requestBodies().isEmpty)
+        #expect(submissionTracker.read() == 0)
         #expect(try await service.unresolvedAttempt(for: account.accountId) == nil)
+    }
+
+    @Test("Submission callback runs once after a lease-only manual permit is authorized")
+    func submissionCallbackRunsAtTransportBoundary() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let harness = ResetTransportHarness([
+            .response(RateLimitResetHTTPResponse(
+                statusCode: 200,
+                data: Data("{\"code\":\"nothing_to_reset\"}".utf8)
+            )),
+        ])
+        let service = RateLimitResetService(
+            transport: { request in try harness.send(request) },
+            journalURL: journalURL
+        )
+        let submissionTracker = ResetSubmissionCallbackCounter()
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+
+        let result = try await service.consume(
+            for: Self.account(),
+            bank: Self.bank(now: now, expiresIn: 86_400),
+            now: now,
+            authorizeSubmission: { attempt in
+                authorizedResetSubmissionPermit(
+                    for: attempt,
+                    requiredPhase: .committedDegraded,
+                    includesRuntimePermit: false,
+                    runtimeAuthorizationRequired: false
+                )
+            },
+            submissionWillStart: { _ in
+                submissionTracker.record()
+            }
+        )
+
+        #expect(result == .nothingToReset)
+        #expect(submissionTracker.read() == 1)
+        #expect(harness.requestBodies().count == 1)
+    }
+
+    @Test("Lease-only transport authorization expires after ten seconds")
+    func leaseOnlySubmissionPermitHasBoundedLifetime() throws {
+        let issuedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let attempt = RateLimitResetAttempt(
+            id: UUID(),
+            providerAccountId: "provider-permit-age",
+            creditId: "credit-1",
+            startingAvailableCount: 1,
+            startingBankFetchedAt: issuedAt,
+            startingQuotaFetchedAt: issuedAt,
+            createdAt: issuedAt,
+            submittedAt: issuedAt,
+            state: .submitted,
+            consumeResponseCode: nil,
+            updatedAt: issuedAt
+        )
+        let permit = authorizedResetSubmissionPermit(
+            for: attempt,
+            requiredPhase: .committedDegraded,
+            includesRuntimePermit: false,
+            runtimeAuthorizationRequired: false,
+            issuedAt: issuedAt
+        )
+
+        #expect(permit.matches(attempt, at: issuedAt.addingTimeInterval(9.999)))
+        #expect(!permit.matches(
+            attempt,
+            at: issuedAt.addingTimeInterval(
+                RateLimitResetSubmissionPermit.transportAuthorizationLifetime
+            )
+        ))
+    }
+
+    @Test("Final journal readback must exactly equal the submitted attempt")
+    func finalJournalReadbackRejectsTimestampMutation() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let harness = ResetTransportHarness([
+            .response(RateLimitResetHTTPResponse(
+                statusCode: 200,
+                data: Data("{\"code\":\"reset\"}".utf8)
+            )),
+        ])
+        let callback = ResetSubmissionCallbackCounter()
+        let service = RateLimitResetService(
+            transport: { request in try harness.send(request) },
+            journalURL: journalURL
+        )
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+
+        await #expect(throws: RateLimitResetServiceError.submissionUnauthorized) {
+            try await service.consume(
+                for: Self.account(),
+                bank: Self.bank(now: now, expiresIn: 86_400),
+                now: now,
+                authorizeSubmission: { submittedAttempt in
+                    var competingJournal = RateLimitResetAttemptJournal(url: journalURL)
+                    _ = try? competingJournal.markSubmitted(
+                        id: submittedAttempt.id,
+                        at: now.addingTimeInterval(1)
+                    )
+                    return authorizedResetSubmissionPermit(for: submittedAttempt)
+                },
+                submissionWillStart: { _ in callback.record() }
+            )
+        }
+
+        #expect(callback.read() == 0)
+        #expect(harness.requestBodies().isEmpty)
+        #expect(try await service.unresolvedAttempt(for: Self.account().accountId) == nil)
+    }
+
+    @Test("A required runtime permit cannot be omitted before reset transport")
+    func requiredRuntimePermitFailsClosed() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let harness = ResetTransportHarness([
+            .response(RateLimitResetHTTPResponse(
+                statusCode: 200,
+                data: Data("{\"code\":\"reset\"}".utf8)
+            )),
+        ])
+        let service = RateLimitResetService(
+            transport: { request in try harness.send(request) },
+            journalURL: journalURL
+        )
+        let submissionTracker = ResetSubmissionCallbackCounter()
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+
+        await #expect(throws: RateLimitResetServiceError.submissionUnauthorized) {
+            try await service.consume(
+                for: Self.account(),
+                bank: Self.bank(now: now, expiresIn: 86_400),
+                now: now,
+                authorizeSubmission: { attempt in
+                    authorizedResetSubmissionPermit(
+                        for: attempt,
+                        includesRuntimePermit: false
+                    )
+                },
+                submissionWillStart: { _ in
+                    submissionTracker.record()
+                }
+            )
+        }
+
+        #expect(submissionTracker.read() == 0)
+        #expect(harness.requestBodies().isEmpty)
     }
 
     @Test(arguments: [500, 503])
@@ -686,6 +1499,155 @@ struct RateLimitResetServiceTests {
         )
         #expect(succeeded.state == .succeeded)
         #expect(try await service.unresolvedAttempt(for: account.accountId) == nil)
+    }
+
+    @Test("Selected credit expiration cannot prove reset consumption")
+    func selectedCreditExpirationRemainsUnresolved() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let service = RateLimitResetService(
+            transport: { _ in
+                RateLimitResetHTTPResponse(
+                    statusCode: 200,
+                    data: Data("{\"code\":\"reset\"}".utf8)
+                )
+            },
+            journalURL: journalURL
+        )
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let account = Self.account(snapshot: Self.snapshot(
+            fiveHourUsed: 20,
+            weeklyUsed: 100,
+            now: now
+        ))
+        _ = try await service.consume(
+            for: account,
+            bank: Self.bank(now: now, expiresIn: 10),
+            now: now
+        )
+        let observedAt = now.addingTimeInterval(20)
+        let expiredBank = RateLimitResetBank(
+            availableCount: 0,
+            totalEarnedCount: 1,
+            credits: [],
+            fetchedAt: observedAt
+        )
+
+        let outcome = try await service.reconcile(
+            for: account,
+            bank: expiredBank,
+            snapshot: Self.snapshot(
+                fiveHourUsed: 10,
+                weeklyUsed: 10,
+                now: observedAt
+            ),
+            now: observedAt
+        )
+
+        guard case .unresolved(let attempt) = outcome else {
+            Issue.record("Natural expiration must not finalize the reset attempt")
+            return
+        }
+        #expect(attempt.creditExpiresAt == now.addingTimeInterval(10))
+    }
+
+    @Test("Successful activation release is durable in the reset journal")
+    func manualSwapSuppressionReleasePersists() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let service = RateLimitResetService(
+            transport: { _ in
+                RateLimitResetHTTPResponse(
+                    statusCode: 200,
+                    data: Data("{\"code\":\"reset\"}".utf8)
+                )
+            },
+            journalURL: journalURL
+        )
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let account = Self.account(snapshot: Self.snapshot(
+            fiveHourUsed: 20,
+            weeklyUsed: 100,
+            now: now
+        ))
+        let result = try await service.consume(
+            for: account,
+            bank: Self.bank(now: now, expiresIn: 86_400),
+            now: now,
+            redemptionReason: .manual
+        )
+        guard case .reconciliationRequired(let attemptId) = result else {
+            Issue.record("Expected a reconciliation-required manual reset")
+            return
+        }
+        let observedAt = now.addingTimeInterval(30)
+        let consumedBank = RateLimitResetBank(
+            availableCount: 0,
+            totalEarnedCount: 1,
+            credits: [],
+            fetchedAt: observedAt
+        )
+        guard case .pendingPersistence = try await service.reconcile(
+            for: account,
+            bank: consumedBank,
+            snapshot: Self.snapshot(
+                fiveHourUsed: 10,
+                weeklyUsed: 10,
+                now: observedAt
+            ),
+            now: observedAt
+        ) else {
+            Issue.record("Expected the manual reset to await persistence")
+            return
+        }
+        _ = try await service.finalizeReconciliationAfterPersistence(
+            attemptId: attemptId,
+            now: observedAt
+        )
+
+        let didRelease = try await service.releaseManualSwapSuppression(
+            for: account.accountId,
+            now: observedAt.addingTimeInterval(1)
+        )
+
+        #expect(didRelease)
+        let attempts = try await service.allAttempts()
+        let released = try #require(attempts.first {
+            $0.id == attemptId
+        })
+        #expect(released.routineSwapSuppressionReleasedAt == observedAt.addingTimeInterval(1))
+    }
+
+    @Test("Activation can durably release suppression while reconciliation is pending")
+    func pendingManualSwapSuppressionReleasePersists() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let service = RateLimitResetService(
+            transport: { _ in throw ResetTransportFailure() },
+            journalURL: journalURL
+        )
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let account = Self.account()
+
+        await #expect(throws: RateLimitResetServiceError.self) {
+            try await service.consume(
+                for: account,
+                bank: Self.bank(now: now, expiresIn: 86_400),
+                now: now,
+                redemptionReason: .manual
+            )
+        }
+        let releasedAt = now.addingTimeInterval(1)
+        #expect(try await service.releaseManualSwapSuppression(
+            for: account.accountId,
+            now: releasedAt
+        ))
+
+        let attempt = try #require(await service.unresolvedAttempt(
+            for: account.accountId
+        ))
+        #expect(attempt.state == .reconciling)
+        #expect(attempt.routineSwapSuppressionReleasedAt == releasedAt)
     }
 
     @Test("Reconciliation matches consumed credit through normalized identifier")
@@ -1338,6 +2300,11 @@ struct RateLimitResetServiceTests {
     }
 }
 
+private struct LegacyResetJournalEnvelope: Codable {
+    let version: Int
+    let attempts: [RateLimitResetAttempt]
+}
+
 private struct InjectedJournalFailure: Error {}
 
 private actor ResetSubmissionAuthorizationGate {
@@ -1360,6 +2327,19 @@ private actor ResetSubmissionAuthorizationGate {
     func resume(authorized: Bool) {
         decisionContinuation?.resume(returning: authorized)
         decisionContinuation = nil
+    }
+}
+
+private final class ResetSubmissionCallbackCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func record() {
+        lock.withLock { count += 1 }
+    }
+
+    func read() -> Int {
+        lock.withLock { count }
     }
 }
 

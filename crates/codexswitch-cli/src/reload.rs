@@ -2,6 +2,7 @@
 use crate::auth::auth_file_fingerprint;
 #[cfg(not(target_os = "linux"))]
 use crate::bounded_command;
+use crate::secure_file::{self, SecureFileGeneration};
 use anyhow::{bail, Context, Result};
 #[cfg(not(target_os = "linux"))]
 use chrono::{Local, NaiveDateTime, TimeZone};
@@ -20,6 +21,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexProcess {
@@ -31,12 +33,50 @@ pub struct CodexProcess {
     pub executable: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedHeadlessAppServerIdentity {
+    pub(crate) pid: i32,
+    pub(crate) owner_uid: u32,
+    pub(crate) executable: PathBuf,
+    pub(crate) start_identity: String,
+    pub(crate) kernel_executable_identity: HotSwapKernelExecutableIdentity,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReloadSummary {
     pub sighup_sent: Vec<i32>,
     pub signaled: Vec<i32>,
     pub restarted: Vec<i32>,
     pub skipped: Vec<(i32, String)>,
+    pub(crate) topology_verified: bool,
+    pub(crate) receipt_nonce: Option<Uuid>,
+    pub(crate) generated_request_nonces: Vec<String>,
+    pub(crate) acknowledged_request_nonces: Vec<String>,
+    activation_binding: Option<ActivationReloadBinding>,
+    runtime_evidence: Option<RuntimeReloadEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivationReloadBinding {
+    pub(crate) store_generation: String,
+    pub(crate) auth_generation: SecureFileGeneration,
+    pub(crate) complete_token_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeReloadProof {
+    topology: RuntimeTopologyIdentity,
+    request: HotSwapRequest,
+    acknowledgement: HotSwapAck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeReloadEvidence {
+    include_app_server: bool,
+    auth_generation: SecureFileGeneration,
+    complete_token_fingerprint: String,
+    topology: Vec<RuntimeTopologyIdentity>,
+    proofs: Vec<RuntimeReloadProof>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +88,11 @@ pub enum ReloadConvergence {
 
 impl ReloadSummary {
     pub fn convergence(&self) -> ReloadConvergence {
-        if !self.signaled.is_empty() && self.skipped.is_empty() {
+        if self.topology_verified
+            && !self.signaled.is_empty()
+            && self.skipped.is_empty()
+            && self.receipt_proof_is_complete()
+        {
             ReloadConvergence::VerifiedHotSwap
         } else if self.signaled.is_empty() && self.restarted.is_empty() && self.skipped.is_empty() {
             ReloadConvergence::NoRuntimeTargets
@@ -59,6 +103,92 @@ impl ReloadSummary {
 
     pub fn verified_hot_swap(&self) -> bool {
         self.convergence() == ReloadConvergence::VerifiedHotSwap
+    }
+
+    pub(crate) fn bind_activation(&mut self, expected: &ActivationReloadBinding) -> Result<()> {
+        if !self.verified_hot_swap() {
+            bail!("runtime reload is incomplete and cannot be bound to an activation");
+        }
+        if let Some(bound) = self.activation_binding.as_ref() {
+            if bound != expected {
+                bail!(
+                    "runtime reload evidence is already bound to a different store/auth generation"
+                );
+            }
+            return Ok(());
+        }
+        match self.runtime_evidence.as_ref() {
+            Some(evidence)
+                if evidence.auth_generation == expected.auth_generation
+                    && evidence.complete_token_fingerprint
+                        == expected.complete_token_fingerprint => {}
+            Some(_) => bail!(
+                "runtime reload evidence does not match the activation auth generation/fingerprint"
+            ),
+            None => {
+                #[cfg(not(test))]
+                bail!("runtime reload lacks exact ACK/topology evidence");
+            }
+        }
+        self.activation_binding = Some(expected.clone());
+        Ok(())
+    }
+
+    pub(crate) fn proves_activation(&self, expected: &ActivationReloadBinding) -> bool {
+        self.verified_hot_swap()
+            && self.activation_binding.as_ref() == Some(expected)
+            && match self.runtime_evidence.as_ref() {
+                Some(evidence) => {
+                    evidence.auth_generation == expected.auth_generation
+                        && evidence.complete_token_fingerprint
+                            == expected.complete_token_fingerprint
+                        && runtime_reload_evidence_is_complete(evidence)
+                }
+                None => cfg!(test),
+            }
+    }
+
+    pub(crate) fn has_bound_activation_proof(&self) -> bool {
+        self.activation_binding.is_some()
+    }
+
+    pub(crate) fn revalidate_current_topology(&self, auth_path: &Path) -> Result<()> {
+        let Some(evidence) = self.runtime_evidence.as_ref() else {
+            #[cfg(test)]
+            return if self.activation_binding.is_some() {
+                Ok(())
+            } else {
+                bail!("test reload evidence is not activation-bound")
+            };
+            #[cfg(not(test))]
+            bail!("runtime reload lacks exact ACK/topology evidence");
+        };
+        revalidate_runtime_reload_evidence(evidence, auth_path)
+    }
+
+    fn receipt_proof_is_complete(&self) -> bool {
+        let Some(receipt_nonce) = self.receipt_nonce else {
+            return true;
+        };
+        if self.generated_request_nonces.is_empty()
+            || self.generated_request_nonces.len() != self.sighup_sent.len()
+            || self.generated_request_nonces.len() != self.signaled.len()
+            || self.generated_request_nonces.len() != self.acknowledged_request_nonces.len()
+            || !self.restarted.is_empty()
+        {
+            return false;
+        }
+        let generated = self.generated_request_nonces.iter().collect::<HashSet<_>>();
+        let acknowledged = self
+            .acknowledged_request_nonces
+            .iter()
+            .collect::<HashSet<_>>();
+        generated.len() == self.generated_request_nonces.len()
+            && acknowledged.len() == self.acknowledged_request_nonces.len()
+            && generated == acknowledged
+            && generated
+                .iter()
+                .all(|nonce| hot_swap_request_nonce_matches_receipt(nonce, receipt_nonce))
     }
 }
 
@@ -85,6 +215,7 @@ const GOAL_USAGE_MARKER: &[u8] = b"Usage: /goal <objective>";
 const GOAL_PURSUING_MARKER: &[u8] = b"Pursuing goal";
 const GOAL_SET_MARKER: &[u8] = b"thread/goal/set";
 const HOT_SWAP_ARTIFACT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const HOT_SWAP_ACK_FRESHNESS: Duration = Duration::from_secs(5 * 60);
 const HOT_SWAP_ARTIFACT_MAX_SCAN: usize = 20_000;
 const HOT_SWAP_ARTIFACT_MAX_REMOVALS: usize = 2_048;
 const HOT_SWAP_ARTIFACT_MAX_COUNT: usize = 512;
@@ -123,7 +254,7 @@ const HOT_SWAP_ARTIFACT_RETENTION: HotSwapArtifactRetention = HotSwapArtifactRet
 const PS_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 static HOT_SWAP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum HotSwapRuntimeKind {
     ExternalAppServer,
@@ -513,7 +644,7 @@ pub fn restart_codex_processes(include_app_server: bool, yes: bool) -> Result<Re
     Ok(restart_discovered_processes_with(
         targets,
         current_process_identity,
-        send_signal,
+        signal_validated_process,
         wait_for_process_exit,
     ))
 }
@@ -526,7 +657,7 @@ fn restart_discovered_processes_with<I, S, W>(
 ) -> RestartSummary
 where
     I: FnMut(i32) -> Option<CodexProcess>,
-    S: FnMut(i32, i32) -> std::io::Result<()>,
+    S: FnMut(&CodexProcess, i32) -> std::io::Result<()>,
     W: FnMut(&CodexProcess, Duration) -> ProcessWaitOutcome,
 {
     let mut summary = RestartSummary::default();
@@ -546,7 +677,7 @@ where
             ));
             continue;
         }
-        if let Err(error) = signal(process.pid, libc::SIGTERM) {
+        if let Err(error) = signal(&process, libc::SIGTERM) {
             summary.skipped.push((
                 process.pid,
                 format!("SIGTERM failed for validated process identity: {error}"),
@@ -582,7 +713,7 @@ where
             ));
             continue;
         }
-        if let Err(error) = signal(process.pid, libc::SIGKILL) {
+        if let Err(error) = signal(&process, libc::SIGKILL) {
             summary.skipped.push((
                 process.pid,
                 format!("SIGKILL failed for validated process identity: {error}"),
@@ -604,6 +735,7 @@ where
     summary
 }
 
+#[cfg(not(target_os = "linux"))]
 fn send_signal(pid: i32, signal: i32) -> std::io::Result<()> {
     let status = unsafe { libc::kill(pid, signal) };
     if status == 0 {
@@ -613,8 +745,104 @@ fn send_signal(pid: i32, signal: i32) -> std::io::Result<()> {
     }
 }
 
+fn signal_validated_process(process: &CodexProcess, signal: i32) -> std::io::Result<()> {
+    if !process_identity_is_current(process) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "process identity changed before signal",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        signal_linux_process_with_pidfd(
+            process,
+            signal,
+            |pid| pidfd_open(pid),
+            current_process_identity,
+            |pidfd, signal| pidfd_send_signal(pidfd, signal),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        send_signal(process.pid, signal)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_linux_process_with_pidfd<Open, Observe, Signal>(
+    expected: &CodexProcess,
+    signal: i32,
+    open_pidfd: Open,
+    observe: Observe,
+    signal_pidfd: Signal,
+) -> std::io::Result<()>
+where
+    Open: FnOnce(i32) -> std::io::Result<i32>,
+    Observe: FnOnce(i32) -> Option<CodexProcess>,
+    Signal: FnOnce(i32, i32) -> std::io::Result<()>,
+{
+    let pidfd = open_pidfd(expected.pid)?;
+    struct PidFd(i32);
+    impl Drop for PidFd {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+    let pidfd = PidFd(pidfd);
+    let observed = observe(expected.pid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "process disappeared after pidfd_open",
+        )
+    })?;
+    if !process_identity_matches(expected, &observed) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "process identity changed after pidfd_open",
+        ));
+    }
+    signal_pidfd(pidfd.0, signal)
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: i32) -> std::io::Result<i32> {
+    let result = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result as i32)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_send_signal(pidfd: i32, signal: i32) -> std::io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub fn reload_codex_hot_swap_processes(auth_path: &Path) -> Result<ReloadSummary> {
     reload_codex_processes(true, auth_path)
+}
+
+pub(crate) fn reload_codex_hot_swap_processes_for_receipt(
+    auth_path: &Path,
+    receipt_nonce: Uuid,
+) -> Result<ReloadSummary> {
+    reload_codex_processes_with_receipt(true, auth_path, Some(receipt_nonce))
 }
 
 pub fn reload_codex_cli_hot_swap_processes(auth_path: &Path) -> Result<ReloadSummary> {
@@ -631,7 +859,7 @@ pub fn discover_hot_swap_processes_missing_current_ack(
             continue;
         };
         let binary_has_markers =
-            binary_has_sighup_support_for_runtime(&process.executable, runtime_kind);
+            running_process_has_sighup_support_for_runtime(&process, runtime_kind).is_some();
         if process_is_sighup_safe_target(&process, binary_has_markers)
             && !process_has_current_hot_swap_ack_for_runtime(&process, auth_path, runtime_kind)
         {
@@ -641,9 +869,82 @@ pub fn discover_hot_swap_processes_missing_current_ack(
     Ok(missing)
 }
 
+pub(crate) fn bind_managed_headless_app_server_identity(
+    pid: i32,
+    owner_uid: u32,
+    executable: PathBuf,
+) -> Result<ManagedHeadlessAppServerIdentity> {
+    let processes = discover_codex_app_server_processes()?;
+    let process = processes
+        .iter()
+        .find(|process| process.pid == pid)
+        .context("managed systemd app-server PID was not discovered")?;
+    if process.owner_uid != owner_uid || process.executable != executable {
+        bail!("managed systemd app-server process does not match unit ownership");
+    }
+    managed_headless_identity_for_process(process)
+}
+
+fn managed_headless_identity_for_process(
+    process: &CodexProcess,
+) -> Result<ManagedHeadlessAppServerIdentity> {
+    let (_, kernel_executable_identity) = hot_swap_process_binding(process)?;
+    managed_headless_identity_from_kernel(process, kernel_executable_identity)
+}
+
+fn managed_headless_identity_from_kernel(
+    process: &CodexProcess,
+    kernel_executable_identity: HotSwapKernelExecutableIdentity,
+) -> Result<ManagedHeadlessAppServerIdentity> {
+    if hot_swap_runtime_kind(process) != Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer) {
+        bail!("managed systemd app-server is not the expected headless remote-control runtime");
+    }
+    Ok(ManagedHeadlessAppServerIdentity {
+        pid: process.pid,
+        owner_uid: process.owner_uid,
+        executable: process.executable.clone(),
+        start_identity: process.start_identity.clone(),
+        kernel_executable_identity,
+    })
+}
+
 fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<ReloadSummary> {
-    let mut summary = ReloadSummary::default();
+    reload_codex_processes_with_receipt(include_app_server, auth_path, None)
+}
+
+fn reload_codex_processes_with_receipt(
+    include_app_server: bool,
+    auth_path: &Path,
+    receipt_nonce: Option<Uuid>,
+) -> Result<ReloadSummary> {
     let processes = discover_codex_restart_targets(include_app_server)?;
+    reload_discovered_codex_processes(
+        processes,
+        auth_path,
+        receipt_nonce,
+        include_app_server,
+        || Ok(()),
+        || discover_codex_restart_targets(include_app_server),
+    )
+}
+
+fn reload_discovered_codex_processes<Guard, Discover>(
+    processes: Vec<CodexProcess>,
+    auth_path: &Path,
+    receipt_nonce: Option<Uuid>,
+    include_app_server: bool,
+    mut before_signal: Guard,
+    final_discover: Discover,
+) -> Result<ReloadSummary>
+where
+    Guard: FnMut() -> Result<()>,
+    Discover: FnOnce() -> Result<Vec<CodexProcess>>,
+{
+    let mut summary = ReloadSummary {
+        receipt_nonce,
+        ..ReloadSummary::default()
+    };
+    let mut generated_requests = Vec::new();
     let protected_pids = processes
         .iter()
         .filter_map(|process| u32::try_from(process.pid).ok())
@@ -657,23 +958,40 @@ fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<
         )?;
     }
     let auth_path = absolute_auth_path(auth_path)?;
-    for process in processes {
+    let initial_auth_generation =
+        secure_file::observe(&auth_path, HOT_SWAP_AUTH_FILE_MAX_BYTES as usize, false)?
+            .generation()
+            .clone();
+    for process in &processes {
         let Some(runtime_kind) = hot_swap_runtime_kind(&process) else {
             summary
                 .skipped
                 .push((process.pid, "unsupported Codex runtime kind".to_string()));
             continue;
         };
-        let binary_has_markers =
-            binary_has_sighup_support_for_runtime(&process.executable, runtime_kind);
-        if !binary_has_markers {
+        let Some(marker_executable_identity) =
+            running_process_has_sighup_support_for_runtime(process, runtime_kind)
+        else {
             summary.skipped.push((
                 process.pid,
                 "missing runtime-specific SIGHUP hot-swap markers".to_string(),
             ));
             continue;
+        };
+        if let Err(error) = before_signal() {
+            summary.skipped.push((
+                process.pid,
+                format!("pre-signal activation/provenance validation failed: {error:#}"),
+            ));
+            continue;
         }
-        let request = match write_hot_swap_request(&process, &auth_path, runtime_kind) {
+        let request = match write_hot_swap_request_for_receipt(
+            process,
+            &auth_path,
+            runtime_kind,
+            receipt_nonce,
+            &marker_executable_identity,
+        ) {
             Ok(request) => request,
             Err(error) => {
                 summary.skipped.push((
@@ -683,6 +1001,10 @@ fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<
                 continue;
             }
         };
+        summary
+            .generated_request_nonces
+            .push(request.binding.request_nonce.clone());
+        generated_requests.push((process.pid, request.clone(), runtime_kind));
         if let Some(ack_path) = hot_swap_ack_path(process.pid) {
             let _ = fs::remove_file(ack_path);
         }
@@ -693,11 +1015,30 @@ fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<
             ));
             continue;
         }
-        let signal_result = send_signal(process.pid, libc::SIGHUP);
+        if let Err(error) = before_signal() {
+            summary.skipped.push((
+                process.pid,
+                format!("final pre-signal activation/provenance validation failed: {error:#}"),
+            ));
+            continue;
+        }
+        if !hot_swap_binding_matches_current(&request.binding, process, &auth_path, runtime_kind) {
+            summary.skipped.push((
+                process.pid,
+                "process start or kernel executable identity changed before SIGHUP".to_string(),
+            ));
+            continue;
+        }
+        let signal_result = signal_validated_process(process, libc::SIGHUP);
         if signal_result.is_ok() {
             summary.sighup_sent.push(process.pid);
-            if wait_for_hot_swap_ack(&process, &request, runtime_kind, Duration::from_secs(5)) {
+            if wait_for_hot_swap_ack(&process, &request, runtime_kind, Duration::from_secs(5))
+                .is_some()
+            {
                 summary.signaled.push(process.pid);
+                summary
+                    .acknowledged_request_nonces
+                    .push(request.binding.request_nonce.clone());
             } else {
                 summary.skipped.push((
                     process.pid,
@@ -714,7 +1055,311 @@ fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<
             ));
         }
     }
+    match final_discover() {
+        Ok(observed) => {
+            finalize_reload_topology(
+                &mut summary,
+                &processes,
+                &observed,
+                &auth_path,
+                |process, _auth_path, runtime_kind| {
+                    generated_requests
+                        .iter()
+                        .find(|(pid, _, kind)| *pid == process.pid && *kind == runtime_kind)
+                        .is_some_and(|(_, request, _)| {
+                            current_hot_swap_ack_for_request(process, request, runtime_kind)
+                                .is_some()
+                        })
+                },
+            );
+            if summary.topology_verified {
+                match collect_runtime_reload_evidence(
+                    include_app_server,
+                    &initial_auth_generation,
+                    &observed,
+                    &auth_path,
+                    &generated_requests,
+                ) {
+                    Ok(evidence) => summary.runtime_evidence = Some(evidence),
+                    Err(error) => {
+                        summary.topology_verified = false;
+                        summary.skipped.push((
+                            0,
+                            format!("final runtime evidence collection failed: {error:#}"),
+                        ));
+                    }
+                }
+            }
+        }
+        Err(error) => summary.skipped.push((
+            0,
+            format!("final runtime topology discovery failed: {error:#}"),
+        )),
+    }
     Ok(summary)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RuntimeTopologyIdentity {
+    pid: i32,
+    owner_uid: u32,
+    start_identity: String,
+    started_at_unix: u64,
+    executable: PathBuf,
+    runtime_kind: Option<HotSwapRuntimeKind>,
+}
+
+fn runtime_topology_identity(process: &CodexProcess) -> RuntimeTopologyIdentity {
+    RuntimeTopologyIdentity {
+        pid: process.pid,
+        owner_uid: process.owner_uid,
+        start_identity: process.start_identity.clone(),
+        started_at_unix: process.started_at_unix,
+        executable: process.executable.clone(),
+        runtime_kind: hot_swap_runtime_kind(process),
+    }
+}
+
+fn finalize_reload_topology<Ack>(
+    summary: &mut ReloadSummary,
+    expected: &[CodexProcess],
+    observed: &[CodexProcess],
+    auth_path: &Path,
+    mut ack_is_current: Ack,
+) where
+    Ack: FnMut(&CodexProcess, &Path, HotSwapRuntimeKind) -> bool,
+{
+    summary.topology_verified = false;
+    let expected_topology = expected
+        .iter()
+        .map(runtime_topology_identity)
+        .collect::<HashSet<_>>();
+    let observed_topology = observed
+        .iter()
+        .map(runtime_topology_identity)
+        .collect::<HashSet<_>>();
+    if expected_topology.len() != expected.len() || observed_topology.len() != observed.len() {
+        summary.skipped.push((
+            0,
+            "duplicate account-bearing runtime identity discovered during final topology validation"
+                .to_string(),
+        ));
+        return;
+    }
+    for missing in expected_topology.difference(&observed_topology) {
+        summary.skipped.push((
+            missing.pid,
+            "runtime exited or changed identity after acknowledgement".to_string(),
+        ));
+    }
+    for appeared in observed_topology.difference(&expected_topology) {
+        summary.skipped.push((
+            appeared.pid,
+            "account-bearing runtime appeared after reload discovery".to_string(),
+        ));
+    }
+    if expected_topology != observed_topology {
+        return;
+    }
+
+    let mut every_ack_is_current = true;
+    for process in expected {
+        let Some(runtime_kind) = hot_swap_runtime_kind(process) else {
+            summary
+                .skipped
+                .push((process.pid, "final runtime kind is unsupported".to_string()));
+            every_ack_is_current = false;
+            continue;
+        };
+        if !ack_is_current(process, auth_path, runtime_kind) {
+            summary.skipped.push((
+                process.pid,
+                "runtime acknowledgement was not current at final topology validation".to_string(),
+            ));
+            every_ack_is_current = false;
+        }
+    }
+    summary.topology_verified = every_ack_is_current;
+}
+
+fn collect_runtime_reload_evidence(
+    include_app_server: bool,
+    initial_auth_generation: &SecureFileGeneration,
+    observed: &[CodexProcess],
+    auth_path: &Path,
+    generated_requests: &[(i32, HotSwapRequest, HotSwapRuntimeKind)],
+) -> Result<RuntimeReloadEvidence> {
+    let final_auth = secure_file::observe(auth_path, HOT_SWAP_AUTH_FILE_MAX_BYTES as usize, false)?;
+    if final_auth.generation() != initial_auth_generation {
+        bail!("auth secure-file generation changed while runtime reload was in flight");
+    }
+    let auth_identity = hot_swap_auth_file_identity(auth_path)?;
+    let topology = observed
+        .iter()
+        .map(runtime_topology_identity)
+        .collect::<Vec<_>>();
+    let mut proofs = Vec::with_capacity(observed.len());
+    for process in observed {
+        let runtime_kind = hot_swap_runtime_kind(process)
+            .context("final topology contains an unsupported runtime kind")?;
+        let mut matches = generated_requests
+            .iter()
+            .filter(|(pid, _, kind)| *pid == process.pid && *kind == runtime_kind);
+        let (_, request, _) = matches
+            .next()
+            .context("final topology has no exact request-bound runtime")?;
+        if matches.next().is_some() {
+            bail!("final topology has duplicate request evidence for one runtime");
+        }
+        if request.binding.auth_file_identity != auth_identity {
+            bail!("request auth identity changed before final evidence collection");
+        }
+        let acknowledgement = current_hot_swap_ack_for_request(process, request, runtime_kind)
+            .context("final runtime acknowledgement is missing or stale")?;
+        proofs.push(RuntimeReloadProof {
+            topology: runtime_topology_identity(process),
+            request: request.clone(),
+            acknowledgement,
+        });
+    }
+    let evidence = RuntimeReloadEvidence {
+        include_app_server,
+        auth_generation: final_auth.generation().clone(),
+        complete_token_fingerprint: auth_identity.complete_token_fingerprint,
+        topology,
+        proofs,
+    };
+    if !runtime_reload_evidence_is_complete(&evidence) {
+        bail!("collected runtime evidence is internally inconsistent");
+    }
+    Ok(evidence)
+}
+
+fn runtime_reload_evidence_is_complete(evidence: &RuntimeReloadEvidence) -> bool {
+    if evidence.topology.is_empty()
+        || evidence.proofs.len() != evidence.topology.len()
+        || evidence.topology.iter().collect::<HashSet<_>>().len() != evidence.topology.len()
+    {
+        return false;
+    }
+    let mut proof_topology = HashSet::new();
+    let mut nonces = HashSet::new();
+    for proof in &evidence.proofs {
+        let binding = &proof.request.binding;
+        if !proof_topology.insert(proof.topology.clone())
+            || !nonces.insert(binding.request_nonce.as_str())
+            || !evidence.topology.contains(&proof.topology)
+            || binding.process_identity.pid != proof.topology.pid
+            || binding.process_identity.owner_uid != proof.topology.owner_uid
+            || proof.topology.runtime_kind != Some(binding.runtime_kind)
+            || binding.auth_file_identity.complete_token_fingerprint
+                != evidence.complete_token_fingerprint
+            || !hot_swap_ack_matches_request(
+                &proof.acknowledgement,
+                &proof.request,
+                binding.runtime_kind,
+                current_unix_timestamp_milliseconds(),
+            )
+        {
+            return false;
+        }
+    }
+    proof_topology.len() == evidence.topology.len()
+}
+
+fn revalidate_runtime_reload_evidence(
+    evidence: &RuntimeReloadEvidence,
+    auth_path: &Path,
+) -> Result<()> {
+    if !runtime_reload_evidence_is_complete(evidence) {
+        bail!("runtime reload evidence is incomplete or stale");
+    }
+    let auth = secure_file::observe(auth_path, HOT_SWAP_AUTH_FILE_MAX_BYTES as usize, false)?;
+    if auth.generation() != &evidence.auth_generation {
+        bail!("auth secure-file generation changed after runtime acknowledgement");
+    }
+    let auth_identity = hot_swap_auth_file_identity(auth_path)?;
+    if auth_identity.complete_token_fingerprint != evidence.complete_token_fingerprint {
+        bail!("auth fingerprint changed after runtime acknowledgement");
+    }
+
+    let observed = discover_codex_restart_targets(evidence.include_app_server)?;
+    let observed_topology = observed
+        .iter()
+        .map(runtime_topology_identity)
+        .collect::<Vec<_>>();
+    let expected_set = evidence.topology.iter().collect::<HashSet<_>>();
+    let observed_set = observed_topology.iter().collect::<HashSet<_>>();
+    if expected_set.len() != evidence.topology.len()
+        || observed_set.len() != observed_topology.len()
+        || expected_set != observed_set
+    {
+        bail!("account-bearing runtime topology changed after acknowledgement");
+    }
+
+    for proof in &evidence.proofs {
+        let process = observed
+            .iter()
+            .find(|process| runtime_topology_identity(process) == proof.topology)
+            .context("acknowledged runtime disappeared during final activation validation")?;
+        let runtime_kind = proof
+            .topology
+            .runtime_kind
+            .context("acknowledged runtime kind disappeared")?;
+        if proof.request.binding.auth_file_identity != auth_identity
+            || !hot_swap_binding_matches_current(
+                &proof.request.binding,
+                process,
+                auth_path,
+                runtime_kind,
+            )
+        {
+            bail!("runtime process/kernel/auth binding changed after acknowledgement");
+        }
+        let current_ack =
+            current_hot_swap_ack_for_request(process, &proof.request, runtime_kind)
+                .context("runtime acknowledgement became stale before activation confirmation")?;
+        if current_ack != proof.acknowledgement {
+            bail!("runtime acknowledgement changed before activation confirmation");
+        }
+    }
+    Ok(())
+}
+
+fn open_bounded_regular_file_nofollow(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(fs::File, fs::Metadata)> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to open regular file {}", path.display()))?;
+    let metadata = validate_opened_regular_file(&file, path, max_bytes)?;
+    Ok((file, metadata))
+}
+
+fn validate_opened_regular_file(
+    file: &fs::File,
+    display_path: &Path,
+    max_bytes: u64,
+) -> Result<fs::Metadata> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened file {}", display_path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "opened path is not a regular file: {}",
+            display_path.display()
+        );
+    }
+    if metadata.len() > max_bytes {
+        bail!(
+            "opened file exceeds the {max_bytes} byte limit: {}",
+            display_path.display()
+        );
+    }
+    Ok(metadata)
 }
 
 #[cfg(test)]
@@ -734,13 +1379,8 @@ pub fn binary_has_sighup_support_for_runtime(
     if is_deleted_proc_exe_path(path) {
         return false;
     }
-    if fs::metadata(path)
-        .map(|metadata| metadata.len() > BINARY_MARKER_SCAN_MAX_BYTES)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    let Ok(file) = fs::File::open(path) else {
+    let Ok((file, _)) = open_bounded_regular_file_nofollow(path, BINARY_MARKER_SCAN_MAX_BYTES)
+    else {
         return false;
     };
     binary_stream_has_sighup_support_for_runtime(
@@ -843,7 +1483,14 @@ fn binary_stream_has_sighup_support_for_runtime<R: Read>(
     let mut state = BinaryMarkerState::default();
 
     loop {
-        let Ok(bytes_read) = reader.read(&mut buffer) else {
+        let remaining = max_bytes.saturating_add(1).saturating_sub(total_read);
+        if remaining == 0 {
+            return false;
+        }
+        let read_size = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let Ok(bytes_read) = reader.read(&mut buffer[..read_size]) else {
             return false;
         };
         if bytes_read == 0 {
@@ -916,6 +1563,226 @@ pub(crate) struct HotSwapKernelExecutableIdentity {
     pub(crate) inode: u64,
 }
 
+struct OpenedRuntimeExecutable {
+    file: fs::File,
+    identity: HotSwapKernelExecutableIdentity,
+}
+
+fn observe_running_process_executable(
+    process: &CodexProcess,
+    max_bytes: u64,
+) -> Result<OpenedRuntimeExecutable> {
+    if !process_identity_is_current(process) {
+        bail!("runtime process identity changed before executable observation");
+    }
+    let observed = open_kernel_process_executable_once(process, max_bytes)?;
+    if observed.identity.canonical_path.ends_with(" (deleted)") {
+        bail!("runtime process executable has been unlinked or replaced");
+    }
+    if !process_identity_is_current(process) {
+        bail!("runtime process identity changed during executable observation");
+    }
+    let confirmation = open_kernel_process_executable_once(process, max_bytes)?;
+    if confirmation.identity != observed.identity || !process_identity_is_current(process) {
+        bail!("runtime kernel executable identity changed during observation");
+    }
+    Ok(observed)
+}
+
+#[cfg(target_os = "linux")]
+fn open_kernel_process_executable_once(
+    process: &CodexProcess,
+    max_bytes: u64,
+) -> Result<OpenedRuntimeExecutable> {
+    let executable_link = PathBuf::from(format!("/proc/{}/exe", process.pid));
+    let executable_target_before = fs::read_link(&executable_link).with_context(|| {
+        format!(
+            "failed to read kernel executable link {}",
+            executable_link.display()
+        )
+    })?;
+    if !executable_target_before.is_absolute() {
+        bail!(
+            "kernel executable link is not absolute: {}",
+            executable_target_before.display()
+        );
+    }
+
+    // This kernel-owned magic link must be followed to bind the descriptor to the live image.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&executable_link)
+        .with_context(|| {
+            format!(
+                "failed to open kernel executable {}",
+                executable_link.display()
+            )
+        })?;
+    let metadata = validate_opened_regular_file(&file, &executable_link, max_bytes)?;
+    let executable_target_after = fs::read_link(&executable_link).with_context(|| {
+        format!(
+            "failed to re-read kernel executable link {}",
+            executable_link.display()
+        )
+    })?;
+    if executable_target_before != executable_target_after {
+        bail!("runtime kernel executable link changed during descriptor acquisition");
+    }
+    let canonical_path = executable_target_after
+        .to_str()
+        .context("runtime kernel executable path must be valid UTF-8")?
+        .to_string();
+    Ok(OpenedRuntimeExecutable {
+        file,
+        identity: HotSwapKernelExecutableIdentity {
+            canonical_path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[repr(C)]
+struct MacProcRegionInfo {
+    protection: u32,
+    max_protection: u32,
+    inheritance: u32,
+    flags: u32,
+    offset: u64,
+    behavior: u32,
+    user_wired_count: u32,
+    user_tag: u32,
+    pages_resident: u32,
+    pages_shared_now_private: u32,
+    pages_swapped_out: u32,
+    pages_dirtied: u32,
+    ref_count: u32,
+    shadow_depth: u32,
+    share_mode: u32,
+    private_pages_resident: u32,
+    shared_pages_resident: u32,
+    object_id: u32,
+    depth: u32,
+    address: u64,
+    size: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacProcRegionWithPathInfo {
+    region: MacProcRegionInfo,
+    vnode: libc::vnode_info_path,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_vnode_path(vnode: &libc::vnode_info_path) -> Option<PathBuf> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            vnode.vip_path.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(&vnode.vip_path),
+        )
+    };
+    let length = bytes.iter().position(|byte| *byte == 0)?;
+    (length > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..length])))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_kernel_executable_identity(
+    process: &CodexProcess,
+) -> Result<HotSwapKernelExecutableIdentity> {
+    const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
+    const MAX_REGION_PROBES: usize = 16_384;
+
+    let canonical_path = process
+        .executable
+        .to_str()
+        .context("runtime kernel executable path must be valid UTF-8")?
+        .to_string();
+    let mut address = 0_u64;
+    for _ in 0..MAX_REGION_PROBES {
+        let mut info = std::mem::MaybeUninit::<MacProcRegionWithPathInfo>::zeroed();
+        let expected_size = std::mem::size_of::<MacProcRegionWithPathInfo>();
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                process.pid,
+                PROC_PIDREGIONPATHINFO,
+                address,
+                info.as_mut_ptr().cast(),
+                expected_size as libc::c_int,
+            )
+        };
+        if bytes != expected_size as libc::c_int {
+            bail!("failed to read runtime executable vnode from the process map");
+        }
+        let info = unsafe { info.assume_init() };
+        if macos_vnode_path(&info.vnode).as_deref() == Some(process.executable.as_path()) {
+            let stat = &info.vnode.vip_vi.vi_stat;
+            if stat.vst_mode & libc::S_IFMT as u16 != libc::S_IFREG as u16 {
+                bail!("runtime executable process mapping is not a regular file");
+            }
+            return Ok(HotSwapKernelExecutableIdentity {
+                canonical_path,
+                device: u64::from(stat.vst_dev),
+                inode: stat.vst_ino,
+            });
+        }
+        let next_address = info
+            .region
+            .address
+            .checked_add(info.region.size)
+            .context("runtime process map address overflow")?;
+        if next_address <= address {
+            bail!("runtime process map did not advance");
+        }
+        address = next_address;
+    }
+    bail!("runtime executable vnode was not found within the process-map scan limit")
+}
+
+#[cfg(target_os = "macos")]
+fn open_kernel_process_executable_once(
+    process: &CodexProcess,
+    max_bytes: u64,
+) -> Result<OpenedRuntimeExecutable> {
+    let identity = macos_kernel_executable_identity(process)?;
+    let (file, metadata) = open_bounded_regular_file_nofollow(&process.executable, max_bytes)?;
+    if metadata.dev() != identity.device || metadata.ino() != identity.inode {
+        bail!("opened executable does not match the kernel process mapping");
+    }
+    Ok(OpenedRuntimeExecutable { file, identity })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_kernel_process_executable_once(
+    _process: &CodexProcess,
+    _max_bytes: u64,
+) -> Result<OpenedRuntimeExecutable> {
+    bail!("authoritative process executable descriptors are unsupported on this platform")
+}
+
+fn running_process_has_sighup_support_for_runtime(
+    process: &CodexProcess,
+    runtime_kind: HotSwapRuntimeKind,
+) -> Option<HotSwapKernelExecutableIdentity> {
+    let observed =
+        observe_running_process_executable(process, BINARY_MARKER_SCAN_MAX_BYTES).ok()?;
+    let identity = observed.identity.clone();
+    if !binary_stream_has_sighup_support_for_runtime(
+        observed.file,
+        BINARY_MARKER_SCAN_MAX_BYTES,
+        BINARY_MARKER_SCAN_CHUNK_BYTES,
+        runtime_kind,
+    ) {
+        return None;
+    }
+    let confirmation =
+        observe_running_process_executable(process, BINARY_MARKER_SCAN_MAX_BYTES).ok()?;
+    (confirmation.identity == identity).then_some(identity)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct HotSwapAuthFileIdentity {
@@ -960,7 +1827,11 @@ pub(crate) struct HotSwapAck {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) initialized_frontend_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) skipped_frontend_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) eligible_frontend_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rejected_frontend_count: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) idle_listener_ready: bool,
 }
@@ -1003,7 +1874,6 @@ pub fn process_has_current_hot_swap_ack_for_runtime(
         &request,
         runtime_kind,
         current_unix_timestamp_milliseconds(),
-        HOT_SWAP_ARTIFACT_MAX_AGE,
     ) && process_identity_is_current(process)
 }
 
@@ -1012,27 +1882,48 @@ fn process_has_hot_swap_ack_for_request(
     request: &HotSwapRequest,
     runtime_kind: HotSwapRuntimeKind,
 ) -> bool {
+    current_hot_swap_ack_for_request(process, request, runtime_kind).is_some()
+}
+
+fn current_hot_swap_ack_for_request(
+    process: &CodexProcess,
+    request: &HotSwapRequest,
+    runtime_kind: HotSwapRuntimeKind,
+) -> Option<HotSwapAck> {
     if !process_identity_is_current(process) {
-        return false;
+        return None;
     }
-    let Some(path) = hot_swap_ack_path(process.pid) else {
-        return false;
+    let (Some(ack_path), Some(request_path)) = (
+        hot_swap_ack_path(process.pid),
+        hot_swap_request_path(process.pid),
+    ) else {
+        return None;
     };
-    let Some(ack) = read_hot_swap_ack(&path) else {
-        return false;
+    let (Some(persisted_request), Some(ack)) = (
+        read_hot_swap_request(&request_path),
+        read_hot_swap_ack(&ack_path),
+    ) else {
+        return None;
     };
-    hot_swap_binding_matches_current(
-        &request.binding,
-        process,
-        Path::new(&request.binding.auth_file_identity.canonical_path),
-        runtime_kind,
-    ) && hot_swap_ack_matches_request(
-        &ack,
-        request,
-        runtime_kind,
-        current_unix_timestamp_milliseconds(),
-        Duration::from_secs(5 * 60),
-    ) && process_identity_is_current(process)
+    let matches = persisted_request == *request
+        && hot_swap_binding_matches_current(
+            &request.binding,
+            process,
+            Path::new(&request.binding.auth_file_identity.canonical_path),
+            runtime_kind,
+        )
+        && hot_swap_ack_matches_request(
+            &ack,
+            request,
+            runtime_kind,
+            current_unix_timestamp_milliseconds(),
+        )
+        && process_identity_is_current(process);
+    (matches
+        && read_hot_swap_request(&request_path).as_ref() == Some(&persisted_request)
+        && read_hot_swap_ack(&ack_path).as_ref() == Some(&ack)
+        && process_identity_is_current(process))
+    .then_some(ack)
 }
 
 fn hot_swap_ack_matches_request(
@@ -1040,7 +1931,6 @@ fn hot_swap_ack_matches_request(
     request: &HotSwapRequest,
     runtime_kind: HotSwapRuntimeKind,
     now_milliseconds: u64,
-    max_age: Duration,
 ) -> bool {
     let expected_fingerprint = request
         .binding
@@ -1053,53 +1943,53 @@ fn hot_swap_ack_matches_request(
         && ack.acknowledged_at_unix_milliseconds >= request.binding.issued_at_unix_milliseconds
         && ack.acknowledged_at_unix_milliseconds <= now_milliseconds.saturating_add(60_000)
         && now_milliseconds.saturating_sub(ack.acknowledged_at_unix_milliseconds)
-            <= max_age.as_millis() as u64
+            <= HOT_SWAP_ACK_FRESHNESS.as_millis() as u64
         && ack.loaded_token_fingerprint == expected_fingerprint
         && ack.active_token_fingerprint == expected_fingerprint
         && match runtime_kind {
             HotSwapRuntimeKind::ExternalAppServer => {
-                external_app_server_ack_is_verified(ack, false, true)
+                external_app_server_ack_is_verified(ack, false)
             }
             HotSwapRuntimeKind::HeadlessRemoteControlAppServer => {
-                external_app_server_ack_is_verified(ack, true, false)
+                external_app_server_ack_is_verified(ack, true)
             }
             HotSwapRuntimeKind::LocalInteractiveCli => {
                 !ack.frontend_notified
                     && ack.frontend_write_count == 0
                     && ack.reconnect_ready
                     && ack.initialized_frontend_count.is_none()
+                    && ack.skipped_frontend_count.is_none()
                     && ack.eligible_frontend_count.is_none()
+                    && ack.rejected_frontend_count.is_none()
                     && !ack.idle_listener_ready
             }
         }
 }
 
-fn external_app_server_ack_is_verified(
-    ack: &HotSwapAck,
-    allow_idle_listener: bool,
-    allow_legacy_missing_frontend_counts: bool,
-) -> bool {
+fn external_app_server_ack_is_verified(ack: &HotSwapAck, allow_idle_listener: bool) -> bool {
+    let (Some(initialized), Some(skipped), Some(eligible), Some(rejected)) = (
+        ack.initialized_frontend_count,
+        ack.skipped_frontend_count,
+        ack.eligible_frontend_count,
+        ack.rejected_frontend_count,
+    ) else {
+        return false;
+    };
+    let counts_are_consistent = skipped
+        .checked_add(eligible)
+        .and_then(|count| count.checked_add(rejected))
+        == Some(initialized);
     let delivered_to_frontend = !ack.idle_listener_ready
         && ack.frontend_notified
-        && ack.frontend_write_count > 0
-        && match (ack.initialized_frontend_count, ack.eligible_frontend_count) {
-            (None, None) => allow_legacy_missing_frontend_counts,
-            (Some(initialized), Some(eligible)) => {
-                initialized > 0
-                    && eligible > 0
-                    && eligible <= initialized
-                    && ack.frontend_write_count <= eligible
-            }
-            _ => false,
-        };
+        && eligible > 0
+        && ack.frontend_write_count == eligible;
     let idle_listener = allow_idle_listener
         && ack.idle_listener_ready
         && !ack.frontend_notified
         && ack.frontend_write_count == 0
-        && ack.initialized_frontend_count == Some(0)
-        && ack.eligible_frontend_count == Some(0);
+        && eligible == 0;
 
-    !ack.reconnect_ready && (delivered_to_frontend || idle_listener)
+    counts_are_consistent && !ack.reconnect_ready && (delivered_to_frontend || idle_listener)
 }
 
 fn hot_swap_ack_path(pid: i32) -> Option<PathBuf> {
@@ -1253,30 +2143,18 @@ fn absolute_auth_path(path: &Path) -> Result<PathBuf> {
 fn hot_swap_process_binding(
     process: &CodexProcess,
 ) -> Result<(HotSwapProcessIdentity, HotSwapKernelExecutableIdentity)> {
+    let kernel_executable_identity =
+        observe_running_process_executable(process, BINARY_MARKER_SCAN_MAX_BYTES)?.identity;
+    hot_swap_process_binding_from_kernel(process, kernel_executable_identity)
+}
+
+fn hot_swap_process_binding_from_kernel(
+    process: &CodexProcess,
+    kernel_executable_identity: HotSwapKernelExecutableIdentity,
+) -> Result<(HotSwapProcessIdentity, HotSwapKernelExecutableIdentity)> {
     let (start_seconds, start_microseconds) = process_start_components(process)
         .context("runtime process start identity cannot be represented by convergence v3")?;
-    let canonical_executable = fs::canonicalize(&process.executable).with_context(|| {
-        format!(
-            "failed to resolve runtime executable {}",
-            process.executable.display()
-        )
-    })?;
-    let metadata = fs::symlink_metadata(&canonical_executable).with_context(|| {
-        format!(
-            "failed to inspect runtime executable {}",
-            canonical_executable.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "runtime executable must resolve to a regular non-symlink file: {}",
-            canonical_executable.display()
-        );
-    }
-    let executable_path = canonical_executable
-        .to_str()
-        .context("runtime executable path must be valid UTF-8")?
-        .to_string();
+    let executable_path = kernel_executable_identity.canonical_path.clone();
     Ok((
         HotSwapProcessIdentity {
             pid: process.pid,
@@ -1285,11 +2163,7 @@ fn hot_swap_process_binding(
             start_seconds,
             start_microseconds,
         },
-        HotSwapKernelExecutableIdentity {
-            canonical_path: executable_path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        },
+        kernel_executable_identity,
     ))
 }
 
@@ -1322,9 +2196,9 @@ fn process_start_components(process: &CodexProcess) -> Option<(u64, u64)> {
 
 fn hot_swap_auth_file_identity(path: &Path) -> Result<HotSwapAuthFileIdentity> {
     let absolute = absolute_auth_path(path)?;
-    let canonical = fs::canonicalize(&absolute)
-        .with_context(|| format!("failed to resolve auth file {}", absolute.display()))?;
-    let canonical_text = canonical
+    let observed = secure_file::observe(&absolute, HOT_SWAP_AUTH_FILE_MAX_BYTES as usize, false)?;
+    let canonical_text = observed
+        .path()
         .to_str()
         .context("auth path must be valid UTF-8")?;
     if canonical_text.len() > HOT_SWAP_AUTH_PATH_MAX_BYTES {
@@ -1333,43 +2207,14 @@ fn hot_swap_auth_file_identity(path: &Path) -> Result<HotSwapAuthFileIdentity> {
             HOT_SWAP_AUTH_PATH_MAX_BYTES
         );
     }
-    let metadata = fs::symlink_metadata(&canonical)
-        .with_context(|| format!("failed to inspect auth file {}", canonical.display()))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.uid() != unsafe { libc_geteuid() }
-        || metadata.len() > HOT_SWAP_AUTH_FILE_MAX_BYTES
-    {
-        bail!(
-            "auth file must be a bounded regular file owned by the current user: {}",
-            canonical.display()
-        );
-    }
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&canonical)
-        .with_context(|| format!("failed to open auth file {}", canonical.display()))?;
-    let opened = file.metadata()?;
-    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-        bail!("auth file changed identity while opened");
-    }
-    let mut data = Vec::with_capacity(metadata.len() as usize);
-    std::io::Read::by_ref(&mut file)
-        .take(HOT_SWAP_AUTH_FILE_MAX_BYTES + 1)
-        .read_to_end(&mut data)?;
-    if data.len() as u64 > HOT_SWAP_AUTH_FILE_MAX_BYTES {
-        bail!("auth file exceeded its bounded read limit");
-    }
-    let current = fs::symlink_metadata(&canonical)?;
-    if current.file_type().is_symlink()
-        || current.dev() != metadata.dev()
-        || current.ino() != metadata.ino()
-    {
-        bail!("auth file changed identity while read");
-    }
+    let (device, inode) = observed
+        .file_identity()
+        .context("auth file observation has no regular-file identity")?;
+    let data = observed
+        .bytes()
+        .context("auth file disappeared during secure observation")?;
     let value: serde_json::Value =
-        serde_json::from_slice(&data).context("auth file is malformed")?;
+        serde_json::from_slice(data).context("auth file is malformed")?;
     let tokens = value
         .get("tokens")
         .context("auth file has no token object")?;
@@ -1402,8 +2247,8 @@ fn hot_swap_auth_file_identity(path: &Path) -> Result<HotSwapAuthFileIdentity> {
             .context("auth file has incomplete token material")?;
     Ok(HotSwapAuthFileIdentity {
         canonical_path: canonical_text.to_string(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
+        device,
+        inode,
         account_id: account_id.to_string(),
         complete_token_fingerprint,
     })
@@ -1416,7 +2261,7 @@ fn complete_token_fingerprint(
     account_id: &str,
 ) -> Option<String> {
     let parts = [id_token, access_token, refresh_token, account_id];
-    if parts.iter().any(|part| part.is_empty()) {
+    if parts.iter().any(|part| part.trim().is_empty()) {
         return None;
     }
     let mut digest = DigestContext::new(&SHA256);
@@ -1427,19 +2272,42 @@ fn complete_token_fingerprint(
     Some(hex_digest(digest.finish().as_ref()))
 }
 
-fn hot_swap_binding(
+fn hot_swap_binding_for_receipt(
     process: &CodexProcess,
     auth_path: &Path,
     runtime_kind: HotSwapRuntimeKind,
+    receipt_nonce: Option<Uuid>,
 ) -> Result<HotSwapBinding> {
-    let (process_identity, kernel_executable_identity) = hot_swap_process_binding(process)?;
+    let kernel_executable_identity =
+        observe_running_process_executable(process, BINARY_MARKER_SCAN_MAX_BYTES)?.identity;
+    hot_swap_binding_for_receipt_from_kernel(
+        process,
+        auth_path,
+        runtime_kind,
+        receipt_nonce,
+        kernel_executable_identity,
+    )
+}
+
+fn hot_swap_binding_for_receipt_from_kernel(
+    process: &CodexProcess,
+    auth_path: &Path,
+    runtime_kind: HotSwapRuntimeKind,
+    receipt_nonce: Option<Uuid>,
+    kernel_executable_identity: HotSwapKernelExecutableIdentity,
+) -> Result<HotSwapBinding> {
+    let (process_identity, kernel_executable_identity) =
+        hot_swap_process_binding_from_kernel(process, kernel_executable_identity)?;
     Ok(HotSwapBinding {
         contract_version: HOT_SWAP_REQUEST_CONTRACT_VERSION,
         process_identity,
         kernel_executable_identity,
         runtime_kind,
         auth_file_identity: hot_swap_auth_file_identity(auth_path)?,
-        request_nonce: next_hot_swap_request_nonce(process),
+        request_nonce: receipt_nonce.map_or_else(
+            || next_hot_swap_request_nonce(process),
+            next_hot_swap_request_nonce_for_receipt,
+        ),
         issued_at_unix_milliseconds: current_unix_timestamp_milliseconds(),
     })
 }
@@ -1483,6 +2351,21 @@ fn hot_swap_request_nonce_is_valid(nonce: &str) -> bool {
         && nonce.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
+fn hot_swap_request_nonce_matches_receipt(nonce: &str, receipt_nonce: Uuid) -> bool {
+    let Some((receipt, request)) = nonce.split_once(':') else {
+        return false;
+    };
+    receipt == receipt_nonce.hyphenated().to_string()
+        && Uuid::parse_str(request)
+            .ok()
+            .is_some_and(|parsed| parsed.hyphenated().to_string() == request)
+}
+
+fn next_hot_swap_request_nonce_for_receipt(receipt_nonce: Uuid) -> String {
+    HOT_SWAP_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{receipt_nonce}:{}", Uuid::new_v4())
+}
+
 fn next_hot_swap_request_nonce(process: &CodexProcess) -> String {
     let sequence = HOT_SWAP_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -1504,26 +2387,72 @@ fn process_start_identity_token(process: &CodexProcess) -> String {
     identity_hash[..16].to_string()
 }
 
-fn write_hot_swap_request(
+fn write_hot_swap_request_for_receipt(
     process: &CodexProcess,
     auth_path: &Path,
     runtime_kind: HotSwapRuntimeKind,
+    receipt_nonce: Option<Uuid>,
+    expected_kernel_executable_identity: &HotSwapKernelExecutableIdentity,
 ) -> Result<HotSwapRequest> {
     let path = hot_swap_request_path(process.pid).context("HOME is unavailable")?;
-    write_hot_swap_request_at(&path, process, auth_path, runtime_kind)
+    write_hot_swap_request_at_for_receipt(
+        &path,
+        process,
+        auth_path,
+        runtime_kind,
+        receipt_nonce,
+        Some(expected_kernel_executable_identity),
+    )
 }
 
+#[cfg(test)]
 fn write_hot_swap_request_at(
     path: &Path,
     process: &CodexProcess,
     auth_path: &Path,
     runtime_kind: HotSwapRuntimeKind,
+    kernel_executable_identity: HotSwapKernelExecutableIdentity,
+) -> Result<HotSwapRequest> {
+    let request = HotSwapRequest {
+        binding: hot_swap_binding_for_receipt_from_kernel(
+            process,
+            auth_path,
+            runtime_kind,
+            None,
+            kernel_executable_identity,
+        )?,
+    };
+    persist_hot_swap_request_at(path, process.pid, request)
+}
+
+fn write_hot_swap_request_at_for_receipt(
+    path: &Path,
+    process: &CodexProcess,
+    auth_path: &Path,
+    runtime_kind: HotSwapRuntimeKind,
+    receipt_nonce: Option<Uuid>,
+    expected_kernel_executable_identity: Option<&HotSwapKernelExecutableIdentity>,
 ) -> Result<HotSwapRequest> {
     let parent = path.parent().context("SIGHUP request path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let request = HotSwapRequest {
-        binding: hot_swap_binding(process, auth_path, runtime_kind)?,
+        binding: hot_swap_binding_for_receipt(process, auth_path, runtime_kind, receipt_nonce)?,
     };
+    if expected_kernel_executable_identity
+        .is_some_and(|expected| request.binding.kernel_executable_identity != *expected)
+    {
+        bail!("runtime executable identity changed after marker verification");
+    }
+    persist_hot_swap_request_at(path, process.pid, request)
+}
+
+fn persist_hot_swap_request_at(
+    path: &Path,
+    pid: i32,
+    request: HotSwapRequest,
+) -> Result<HotSwapRequest> {
+    let parent = path.parent().context("SIGHUP request path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let encoded = serde_json::to_vec(&request).context("failed to encode SIGHUP request")?;
     if encoded.len() > HOT_SWAP_REQUEST_MAX_BYTES {
         bail!(
@@ -1533,7 +2462,7 @@ fn write_hot_swap_request_at(
     }
     let temporary = parent.join(format!(
         ".{}.json.tmp-{}-{}",
-        process.pid,
+        pid,
         std::process::id(),
         HOT_SWAP_REQUEST_SEQUENCE.load(Ordering::Relaxed)
     ));
@@ -1601,15 +2530,15 @@ fn wait_for_hot_swap_ack(
     request: &HotSwapRequest,
     runtime_kind: HotSwapRuntimeKind,
     timeout: Duration,
-) -> bool {
+) -> Option<HotSwapAck> {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if process_has_hot_swap_ack_for_request(process, request, runtime_kind) {
-            return true;
+        if let Some(ack) = current_hot_swap_ack_for_request(process, request, runtime_kind) {
+            return Some(ack);
         }
         thread::sleep(Duration::from_millis(100));
     }
-    process_has_hot_swap_ack_for_request(process, request, runtime_kind)
+    current_hot_swap_ack_for_request(process, request, runtime_kind)
 }
 
 pub fn process_is_sighup_safe_target(process: &CodexProcess, binary_has_markers: bool) -> bool {
@@ -1811,6 +2740,7 @@ unsafe fn libc_geteuid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     fn restart_test_process() -> CodexProcess {
@@ -1822,6 +2752,19 @@ mod tests {
             command_line: "/usr/local/bin/codex".to_string(),
             executable: PathBuf::from("/usr/local/bin/codex"),
         }
+    }
+
+    fn external_runtime_marker_fixture() -> Vec<u8> {
+        let mut data = Vec::new();
+        for marker in COMMON_SIGHUP_MARKERS
+            .into_iter()
+            .chain(EXTERNAL_APP_SERVER_MARKERS)
+            .chain([GOAL_USAGE_MARKER])
+        {
+            data.extend_from_slice(marker);
+            data.push(b'\n');
+        }
+        data
     }
 
     #[cfg(target_os = "macos")]
@@ -1879,8 +2822,8 @@ mod tests {
         let summary = restart_discovered_processes_with(
             vec![expected],
             |_pid| Some(changed.clone()),
-            |pid, signal| {
-                signals.push((pid, signal));
+            |process, signal| {
+                signals.push((process.pid, signal));
                 Ok(())
             },
             |_process, _timeout| panic!("an un-signaled process must not be waited on"),
@@ -1899,8 +2842,8 @@ mod tests {
         let summary = restart_discovered_processes_with(
             vec![restart_test_process()],
             |_pid| None,
-            |pid, signal| {
-                signals.push((pid, signal));
+            |process, signal| {
+                signals.push((process.pid, signal));
                 Ok(())
             },
             |_process, _timeout| panic!("an un-signaled process must not be waited on"),
@@ -1934,8 +2877,8 @@ mod tests {
                     Some(reused.clone())
                 }
             },
-            |pid, signal| {
-                signals.push((pid, signal));
+            |process, signal| {
+                signals.push((process.pid, signal));
                 Ok(())
             },
             |_process, _timeout| ProcessWaitOutcome::TimedOut,
@@ -1960,8 +2903,8 @@ mod tests {
                 identity_checks.set(check + 1);
                 (check == 0).then(|| expected.clone())
             },
-            |pid, signal| {
-                signals.push((pid, signal));
+            |process, signal| {
+                signals.push((process.pid, signal));
                 Ok(())
             },
             |_process, _timeout| ProcessWaitOutcome::TimedOut,
@@ -1970,6 +2913,42 @@ mod tests {
         assert_eq!(signals, vec![(42, libc::SIGTERM)]);
         assert_eq!(summary.terminated, vec![42]);
         assert!(summary.skipped.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_signal_refuses_identity_change_after_pidfd_open() {
+        use std::os::fd::AsRawFd;
+
+        let expected = restart_test_process();
+        let replacement = CodexProcess {
+            start_identity: "replacement-start".to_string(),
+            ..expected.clone()
+        };
+        let null = fs::File::open("/dev/null").unwrap();
+        let signal_calls = std::cell::Cell::new(0usize);
+
+        let error = signal_linux_process_with_pidfd(
+            &expected,
+            libc::SIGHUP,
+            |_| {
+                let fd = unsafe { libc::dup(null.as_raw_fd()) };
+                if fd < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(fd)
+                }
+            },
+            |_| Some(replacement),
+            |_, _| {
+                signal_calls.set(signal_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(signal_calls.get(), 0);
     }
 
     #[test]
@@ -2097,6 +3076,159 @@ mod tests {
         assert!(!is_headless_remote_control_app_server_command_line(
             "/home/signul/codex app-server --remote-control --listen unix://"
         ));
+    }
+
+    #[test]
+    fn managed_headless_identity_binds_owner_executable_start_and_kernel() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let executable = temp.path().join("codex");
+        fs::write(&executable, b"runtime")?;
+        let process = CodexProcess {
+            pid: 42,
+            owner_uid: 1001,
+            start_identity: "linux:123".to_string(),
+            started_at_unix: 1,
+            command_line: format!(
+                "{} app-server --remote-control --listen ws://127.0.0.1:8390",
+                executable.display()
+            ),
+            executable,
+        };
+        let executable_metadata = fs::metadata(&process.executable)?;
+        let expected_kernel_identity = HotSwapKernelExecutableIdentity {
+            canonical_path: fs::canonicalize(&process.executable)?.display().to_string(),
+            device: executable_metadata.dev(),
+            inode: executable_metadata.ino(),
+        };
+        let expected =
+            managed_headless_identity_from_kernel(&process, expected_kernel_identity.clone())?;
+        assert_eq!(expected.pid, process.pid);
+        assert_eq!(expected.owner_uid, process.owner_uid);
+        assert_eq!(expected.executable, process.executable);
+        assert_eq!(expected.start_identity, process.start_identity);
+        assert_eq!(
+            expected.kernel_executable_identity,
+            expected_kernel_identity
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn final_topology_revalidation_rejects_exit_appearance_identity_kind_and_stale_ack() {
+        let expected_process = CodexProcess {
+            pid: 42,
+            owner_uid: 1001,
+            start_identity: "linux:123".to_string(),
+            started_at_unix: 1,
+            command_line: "/tmp/codex app-server --remote-control --listen ws://127.0.0.1:8390"
+                .to_string(),
+            executable: PathBuf::from("/tmp/codex"),
+        };
+        let expected = vec![expected_process.clone()];
+        assert!(!ReloadSummary {
+            signaled: vec![42],
+            ..ReloadSummary::default()
+        }
+        .verified_hot_swap());
+        let verify = |observed: &[CodexProcess], ack_is_current: bool| {
+            let mut summary = ReloadSummary {
+                signaled: vec![42],
+                ..ReloadSummary::default()
+            };
+            finalize_reload_topology(
+                &mut summary,
+                &expected,
+                observed,
+                Path::new("/tmp/auth.json"),
+                |_, _, _| ack_is_current,
+            );
+            summary
+        };
+
+        assert!(verify(&expected, true).verified_hot_swap());
+        assert!(!verify(&[], true).verified_hot_swap());
+        assert!(
+            !verify(&[expected_process.clone(), expected_process.clone()], true)
+                .verified_hot_swap()
+        );
+
+        let appeared = CodexProcess {
+            pid: 43,
+            start_identity: "linux:456".to_string(),
+            ..expected_process.clone()
+        };
+        assert!(!verify(&[expected_process.clone(), appeared], true).verified_hot_swap());
+
+        let changed_start = CodexProcess {
+            start_identity: "linux:124".to_string(),
+            ..expected_process.clone()
+        };
+        assert!(!verify(&[changed_start], true).verified_hot_swap());
+
+        let changed_executable = CodexProcess {
+            executable: PathBuf::from("/tmp/other-codex"),
+            ..expected_process.clone()
+        };
+        assert!(!verify(&[changed_executable], true).verified_hot_swap());
+
+        let changed_kind = CodexProcess {
+            command_line: "/tmp/codex app-server --listen ws://127.0.0.1:8390".to_string(),
+            ..expected_process
+        };
+        assert!(!verify(&[changed_kind], true).verified_hot_swap());
+        assert!(!verify(&expected, false).verified_hot_swap());
+    }
+
+    #[test]
+    fn activation_reload_binding_is_one_shot_and_generation_exact() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+        let auth_path = temp.path().join("auth.json");
+        fs::write(&auth_path, b"auth-generation-a")?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let first_auth_generation = secure_file::observe(&auth_path, 1024, false)?
+            .generation()
+            .clone();
+        let first = ActivationReloadBinding {
+            store_generation: "store-generation-a".to_string(),
+            auth_generation: first_auth_generation,
+            complete_token_fingerprint: "a".repeat(64),
+        };
+        let mut summary = ReloadSummary {
+            sighup_sent: vec![42],
+            signaled: vec![42],
+            topology_verified: true,
+            ..ReloadSummary::default()
+        };
+
+        summary.bind_activation(&first)?;
+        assert!(summary.proves_activation(&first));
+
+        let newer_store = ActivationReloadBinding {
+            store_generation: "store-generation-b".to_string(),
+            ..first.clone()
+        };
+        assert!(summary.bind_activation(&newer_store).is_err());
+        assert!(!summary.proves_activation(&newer_store));
+
+        fs::write(&auth_path, b"auth-generation-b")?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let newer_auth = ActivationReloadBinding {
+            auth_generation: secure_file::observe(&auth_path, 1024, false)?
+                .generation()
+                .clone(),
+            ..first.clone()
+        };
+        assert!(summary.bind_activation(&newer_auth).is_err());
+        assert!(!summary.proves_activation(&newer_auth));
+
+        let newer_fingerprint = ActivationReloadBinding {
+            complete_token_fingerprint: "b".repeat(64),
+            ..first
+        };
+        assert!(summary.bind_activation(&newer_fingerprint).is_err());
+        assert!(!summary.proves_activation(&newer_fingerprint));
+        Ok(())
     }
 
     #[test]
@@ -2393,10 +3525,13 @@ mod tests {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../Tests/Fixtures/RuntimeConvergence/reload-contract-v3.json"
         ))?;
-        Ok((
-            serde_json::from_value(fixture["requestArtifact"].clone())?,
-            serde_json::from_value(fixture["acknowledgement"].clone())?,
-        ))
+        let request = serde_json::from_value(fixture["requestArtifact"].clone())?;
+        let mut ack: HotSwapAck = serde_json::from_value(fixture["acknowledgement"].clone())?;
+        ack.initialized_frontend_count.get_or_insert(1);
+        ack.skipped_frontend_count.get_or_insert(0);
+        ack.eligible_frontend_count.get_or_insert(1);
+        ack.rejected_frontend_count.get_or_insert(0);
+        Ok((request, ack))
     }
 
     #[test]
@@ -2409,7 +3544,6 @@ mod tests {
             &request,
             HotSwapRuntimeKind::ExternalAppServer,
             ack.acknowledged_at_unix_milliseconds,
-            Duration::from_secs(300),
         ));
 
         let generated_runtime = include_str!("codex_update/source_app_server_template.rs");
@@ -2431,10 +3565,35 @@ mod tests {
             "codexswitch-hotswap-contract-v3",
             "codexswitch-hotswap-headless-idle-v1",
             "codexswitch-hotswap-cli-contract-v3",
+            "skippedFrontendCount",
+            "rejectedFrontendCount",
         ] {
             assert!(generated_runtime.contains(required), "missing {required}");
         }
         assert!(!generated_runtime.contains("format!(\"{pid}.nonce\")"));
+        Ok(())
+    }
+
+    #[test]
+    fn ack_freshness_matches_the_generated_turn_contract_without_a_renewal_signal() -> Result<()> {
+        let (_, ack) = shared_v3_fixture()?;
+        assert_eq!(HOT_SWAP_ACK_FRESHNESS, Duration::from_secs(5 * 60));
+        assert!(hot_swap_ack_matches_request(
+            &ack,
+            &HotSwapRequest {
+                binding: ack.binding.clone(),
+            },
+            ack.binding.runtime_kind,
+            ack.acknowledged_at_unix_milliseconds,
+        ));
+
+        let generated_turn = include_str!("codex_update/source_turn_template.rs");
+        assert_eq!(
+            generated_turn
+                .matches("const ACK_MAX_AGE_MILLISECONDS: u64 = 5 * 60 * 1_000;")
+                .count(),
+            1
+        );
         Ok(())
     }
 
@@ -2448,7 +3607,6 @@ mod tests {
                 &request,
                 HotSwapRuntimeKind::ExternalAppServer,
                 now,
-                Duration::from_secs(300),
             )
         };
         assert!(matches(&ack));
@@ -2468,9 +3626,18 @@ mod tests {
         let mut no_frontend_write = ack.clone();
         no_frontend_write.frontend_write_count = 0;
         assert!(!matches(&no_frontend_write));
-        let mut stale = ack;
-        stale.acknowledged_at_unix_milliseconds = now.saturating_sub(301_000);
-        assert!(!matches(&stale));
+        assert!(hot_swap_ack_matches_request(
+            &ack,
+            &request,
+            HotSwapRuntimeKind::ExternalAppServer,
+            now.saturating_add(HOT_SWAP_ACK_FRESHNESS.as_millis() as u64),
+        ));
+        assert!(!hot_swap_ack_matches_request(
+            &ack,
+            &request,
+            HotSwapRuntimeKind::ExternalAppServer,
+            now.saturating_add(HOT_SWAP_ACK_FRESHNESS.as_millis() as u64 + 1),
+        ));
         Ok(())
     }
 
@@ -2486,15 +3653,29 @@ mod tests {
                 &request,
                 HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
                 now,
-                Duration::from_secs(300),
             )
         };
 
         let mut delivered = idle.clone();
-        assert!(!matches(&delivered));
         delivered.initialized_frontend_count = Some(2);
+        delivered.skipped_frontend_count = Some(0);
         delivered.eligible_frontend_count = Some(2);
+        delivered.rejected_frontend_count = Some(0);
+        assert!(!matches(&delivered));
+        delivered.frontend_write_count = 2;
         assert!(matches(&delivered));
+
+        let mut disconnected = delivered.clone();
+        disconnected.eligible_frontend_count = Some(1);
+        disconnected.rejected_frontend_count = Some(1);
+        disconnected.frontend_write_count = 1;
+        assert!(matches(&disconnected));
+
+        let mut skipped = delivered.clone();
+        skipped.skipped_frontend_count = Some(1);
+        skipped.eligible_frontend_count = Some(1);
+        skipped.frontend_write_count = 1;
+        assert!(matches(&skipped));
 
         let mut missing_initialized_count = delivered.clone();
         missing_initialized_count.initialized_frontend_count = None;
@@ -2504,29 +3685,40 @@ mod tests {
         missing_eligible_count.eligible_frontend_count = None;
         assert!(!matches(&missing_eligible_count));
 
+        let mut missing_skipped_count = delivered.clone();
+        missing_skipped_count.skipped_frontend_count = None;
+        assert!(!matches(&missing_skipped_count));
+
+        let mut missing_rejected_count = delivered.clone();
+        missing_rejected_count.rejected_frontend_count = None;
+        assert!(!matches(&missing_rejected_count));
+
         let mut inconsistent_delivery_counts = delivered.clone();
         inconsistent_delivery_counts.initialized_frontend_count = Some(1);
         inconsistent_delivery_counts.eligible_frontend_count = Some(2);
         assert!(!matches(&inconsistent_delivery_counts));
 
-        let mut writes_exceed_eligible_count = delivered;
-        writes_exceed_eligible_count.frontend_write_count = 3;
-        assert!(!matches(&writes_exceed_eligible_count));
+        let mut partial_delivery = delivered;
+        partial_delivery.frontend_write_count = 1;
+        assert!(!matches(&partial_delivery));
 
         idle.frontend_notified = false;
         idle.frontend_write_count = 0;
-        idle.initialized_frontend_count = Some(0);
+        idle.initialized_frontend_count = Some(2);
+        idle.skipped_frontend_count = Some(1);
         idle.eligible_frontend_count = Some(0);
+        idle.rejected_frontend_count = Some(1);
         idle.idle_listener_ready = true;
         assert!(matches(&idle));
 
         let mut missing_idle_counts = idle.clone();
         missing_idle_counts.initialized_frontend_count = None;
+        missing_idle_counts.skipped_frontend_count = None;
         missing_idle_counts.eligible_frontend_count = None;
         assert!(!matches(&missing_idle_counts));
 
         let mut initialized_without_delivery = idle.clone();
-        initialized_without_delivery.initialized_frontend_count = Some(1);
+        initialized_without_delivery.rejected_frontend_count = Some(0);
         assert!(!matches(&initialized_without_delivery));
 
         let mut contradictory_counts = idle.clone();
@@ -2547,19 +3739,19 @@ mod tests {
             &strict_request,
             HotSwapRuntimeKind::ExternalAppServer,
             strict_idle.acknowledged_at_unix_milliseconds,
-            Duration::from_secs(300),
         ));
         strict_idle.frontend_notified = false;
         strict_idle.frontend_write_count = 0;
         strict_idle.initialized_frontend_count = Some(0);
+        strict_idle.skipped_frontend_count = Some(0);
         strict_idle.eligible_frontend_count = Some(0);
+        strict_idle.rejected_frontend_count = Some(0);
         strict_idle.idle_listener_ready = true;
         assert!(!hot_swap_ack_matches_request(
             &strict_idle,
             &strict_request,
             HotSwapRuntimeKind::ExternalAppServer,
             strict_idle.acknowledged_at_unix_milliseconds,
-            Duration::from_secs(300),
         ));
         Ok(())
     }
@@ -2571,13 +3763,16 @@ mod tests {
         ack.binding = request.binding.clone();
         ack.frontend_notified = false;
         ack.frontend_write_count = 0;
+        ack.initialized_frontend_count = None;
+        ack.skipped_frontend_count = None;
+        ack.eligible_frontend_count = None;
+        ack.rejected_frontend_count = None;
         ack.reconnect_ready = true;
         assert!(hot_swap_ack_matches_request(
             &ack,
             &request,
             HotSwapRuntimeKind::LocalInteractiveCli,
             ack.acknowledged_at_unix_milliseconds,
-            Duration::from_secs(300),
         ));
         ack.reconnect_ready = false;
         assert!(!hot_swap_ack_matches_request(
@@ -2585,7 +3780,6 @@ mod tests {
             &request,
             HotSwapRuntimeKind::LocalInteractiveCli,
             ack.acknowledged_at_unix_milliseconds,
-            Duration::from_secs(300),
         ));
         Ok(())
     }
@@ -2623,6 +3817,65 @@ mod tests {
     }
 
     #[test]
+    fn hot_swap_auth_identity_uses_nofollow_nonblocking_observation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let auth_path = dir.path().join("auth.json");
+        fs::write(
+            &auth_path,
+            r#"{"tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh","account_id":"account"}}"#,
+        )?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+
+        let identity = hot_swap_auth_file_identity(&auth_path)?;
+        let metadata = fs::metadata(&auth_path)?;
+        assert_eq!(
+            (identity.device, identity.inode),
+            (metadata.dev(), metadata.ino())
+        );
+
+        let linked = dir.path().join("linked-auth.json");
+        symlink(&auth_path, &linked)?;
+        assert!(hot_swap_auth_file_identity(&linked).is_err());
+
+        let fifo = dir.path().join("auth.fifo");
+        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+        if unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to create auth FIFO");
+        }
+        assert!(hot_swap_auth_file_identity(&fifo).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn hot_swap_auth_identity_rejects_whitespace_only_token_material() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let auth_path = dir.path().join("auth.json");
+
+        for token_name in ["id_token", "access_token", "refresh_token"] {
+            let mut auth = serde_json::json!({
+                "tokens": {
+                    "id_token": "id",
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "account_id": "account"
+                }
+            });
+            auth["tokens"][token_name] = serde_json::Value::String(" \t\r\n".to_string());
+            fs::write(&auth_path, serde_json::to_vec(&auth)?)?;
+            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+
+            let error = hot_swap_auth_file_identity(&auth_path).unwrap_err();
+            assert!(
+                error.to_string().contains("incomplete token material"),
+                "unexpected error for {token_name}: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn request_nonces_are_unique_even_within_one_second() {
         let process = CodexProcess {
             pid: 42,
@@ -2636,6 +3889,55 @@ mod tests {
             next_hot_swap_request_nonce(&process),
             next_hot_swap_request_nonce(&process)
         );
+    }
+
+    #[test]
+    fn receipt_bound_request_nonce_rejects_mismatch_and_noncanonical_uuid() {
+        let receipt = Uuid::parse_str("37f84870-9b39-45ae-aee9-3e0a63e1f989").unwrap();
+        let nonce = next_hot_swap_request_nonce_for_receipt(receipt);
+        assert!(hot_swap_request_nonce_matches_receipt(&nonce, receipt));
+        assert!(!hot_swap_request_nonce_matches_receipt(
+            &nonce,
+            Uuid::parse_str("0cfe69d8-d7f8-4640-84c1-d88acd278983").unwrap(),
+        ));
+        assert!(!hot_swap_request_nonce_matches_receipt(
+            "37F84870-9B39-45AE-AEE9-3E0A63E1F989:1a7c3ffb-bfd8-4719-9b45-c2e350469d9c",
+            receipt,
+        ));
+        assert!(!hot_swap_request_nonce_matches_receipt(
+            "37f84870-9b39-45ae-aee9-3e0a63e1f989:not-a-uuid",
+            receipt,
+        ));
+    }
+
+    #[test]
+    fn receipt_reload_summary_fails_closed_on_nonce_or_count_mismatch() {
+        let receipt = Uuid::parse_str("37f84870-9b39-45ae-aee9-3e0a63e1f989").unwrap();
+        let nonce = next_hot_swap_request_nonce_for_receipt(receipt);
+        let complete = ReloadSummary {
+            sighup_sent: vec![42],
+            signaled: vec![42],
+            topology_verified: true,
+            receipt_nonce: Some(receipt),
+            generated_request_nonces: vec![nonce.clone()],
+            acknowledged_request_nonces: vec![nonce],
+            ..ReloadSummary::default()
+        };
+        assert!(complete.verified_hot_swap());
+
+        let mut wrong_ack = complete.clone();
+        wrong_ack.acknowledged_request_nonces = vec![next_hot_swap_request_nonce_for_receipt(
+            Uuid::parse_str("0cfe69d8-d7f8-4640-84c1-d88acd278983").unwrap(),
+        )];
+        assert!(!wrong_ack.verified_hot_swap());
+
+        let mut missing_ack = complete.clone();
+        missing_ack.acknowledged_request_nonces.clear();
+        assert!(!missing_ack.verified_hot_swap());
+
+        let mut count_mismatch = complete;
+        count_mismatch.sighup_sent.push(43);
+        assert!(!count_mismatch.verified_hot_swap());
     }
 
     #[test]
@@ -2681,12 +3983,19 @@ mod tests {
             command_line: "codex".to_string(),
             executable,
         };
+        let executable_metadata = fs::metadata(&process.executable)?;
+        let kernel_executable_identity = HotSwapKernelExecutableIdentity {
+            canonical_path: fs::canonicalize(&process.executable)?.display().to_string(),
+            device: executable_metadata.dev(),
+            inode: executable_metadata.ino(),
+        };
 
         let request = write_hot_swap_request_at(
             &request_path,
             &process,
             &auth_path,
             HotSwapRuntimeKind::LocalInteractiveCli,
+            kernel_executable_identity.clone(),
         )?;
         let persisted: HotSwapRequest = serde_json::from_slice(&fs::read(&request_path)?)?;
 
@@ -2695,6 +4004,10 @@ mod tests {
         assert_eq!(
             persisted.binding.runtime_kind,
             HotSwapRuntimeKind::LocalInteractiveCli
+        );
+        assert_eq!(
+            persisted.binding.kernel_executable_identity,
+            kernel_executable_identity
         );
         assert_eq!(
             persisted.binding.auth_file_identity.canonical_path,
@@ -2737,6 +4050,176 @@ mod tests {
         };
 
         assert!(!process_identity_matches(&expected, &reused));
+    }
+
+    #[test]
+    fn process_binding_keeps_observed_kernel_identity_after_path_replacement() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let executable = dir.path().join("codex");
+        let replacement = dir.path().join("replacement");
+        fs::write(&executable, b"original executable")?;
+        let original_metadata = fs::metadata(&executable)?;
+        let observed_identity = HotSwapKernelExecutableIdentity {
+            canonical_path: fs::canonicalize(&executable)?.display().to_string(),
+            device: original_metadata.dev(),
+            inode: original_metadata.ino(),
+        };
+        let process = CodexProcess {
+            pid: 42,
+            owner_uid: 501,
+            start_identity: "linux:123".to_string(),
+            started_at_unix: 2_000,
+            command_line: executable.display().to_string(),
+            executable: executable.clone(),
+        };
+
+        fs::write(&replacement, b"replacement executable")?;
+        fs::rename(&replacement, &executable)?;
+        let replacement_metadata = fs::metadata(&executable)?;
+        let (process_identity, kernel_identity) =
+            hot_swap_process_binding_from_kernel(&process, observed_identity.clone())?;
+
+        assert_eq!(kernel_identity, observed_identity);
+        assert_eq!(
+            process_identity.executable_path,
+            observed_identity.canonical_path
+        );
+        assert_ne!(
+            (kernel_identity.device, kernel_identity.inode),
+            (replacement_metadata.dev(), replacement_metadata.ino())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_marker_probe_rejects_symlinks_and_fifos() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("codex");
+        fs::write(&binary, external_runtime_marker_fixture())?;
+
+        let linked = dir.path().join("linked-codex");
+        symlink(&binary, &linked)?;
+        assert!(!binary_has_sighup_support_for_runtime(
+            &linked,
+            HotSwapRuntimeKind::ExternalAppServer,
+        ));
+
+        let fifo = dir.path().join("codex.fifo");
+        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+        if unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to create marker FIFO");
+        }
+        assert!(!binary_has_sighup_support_for_runtime(
+            &fifo,
+            HotSwapRuntimeKind::ExternalAppServer,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_marker_probe_stays_bound_to_opened_inode_after_path_replacement() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("codex");
+        let replacement = dir.path().join("replacement");
+        fs::write(&binary, external_runtime_marker_fixture())?;
+        fs::write(&replacement, b"no runtime markers")?;
+
+        let (opened, opened_metadata) =
+            open_bounded_regular_file_nofollow(&binary, BINARY_MARKER_SCAN_MAX_BYTES)?;
+        fs::rename(&replacement, &binary)?;
+        let replacement_metadata = fs::metadata(&binary)?;
+        assert_ne!(
+            (opened_metadata.dev(), opened_metadata.ino()),
+            (replacement_metadata.dev(), replacement_metadata.ino())
+        );
+        assert!(binary_stream_has_sighup_support_for_runtime(
+            opened,
+            BINARY_MARKER_SCAN_MAX_BYTES,
+            BINARY_MARKER_SCAN_CHUNK_BYTES,
+            HotSwapRuntimeKind::ExternalAppServer,
+        ));
+        assert!(!binary_has_sighup_support_for_runtime(
+            &binary,
+            HotSwapRuntimeKind::ExternalAppServer,
+        ));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_executable_identity_comes_from_proc_descriptor_and_rejects_stale_identity(
+    ) -> Result<()> {
+        struct ChildGuard(std::process::Child);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|candidate| candidate.is_file())
+            .context("sleep executable is unavailable")?;
+        let dir = tempfile::tempdir()?;
+        let runtime = dir.path().join("codex");
+        fs::copy(sleep, &runtime)?;
+        let mut child = ChildGuard(
+            std::process::Command::new(&runtime)
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?,
+        );
+        let pid = i32::try_from(child.0.id()).context("child PID does not fit i32")?;
+        let mut process = None;
+        for _ in 0..100 {
+            process = read_linux_process_identity(pid);
+            if process.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let process = process.context("failed to observe child process identity")?;
+        let original_metadata = fs::metadata(&runtime)?;
+        let original = open_kernel_process_executable_once(&process, BINARY_MARKER_SCAN_MAX_BYTES)?;
+        assert_eq!(
+            (original.identity.device, original.identity.inode),
+            (original_metadata.dev(), original_metadata.ino())
+        );
+
+        let mut stale_process = process.clone();
+        stale_process.start_identity.push_str("-stale");
+        assert!(
+            observe_running_process_executable(&stale_process, BINARY_MARKER_SCAN_MAX_BYTES)
+                .is_err()
+        );
+
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, b"replacement path contents")?;
+        fs::rename(&replacement, &runtime)?;
+        let replacement_metadata = fs::metadata(&runtime)?;
+        let after_replacement =
+            open_kernel_process_executable_once(&process, BINARY_MARKER_SCAN_MAX_BYTES)?;
+        assert_eq!(after_replacement.identity.device, original.identity.device);
+        assert_eq!(after_replacement.identity.inode, original.identity.inode);
+        assert_ne!(
+            (
+                after_replacement.identity.device,
+                after_replacement.identity.inode
+            ),
+            (replacement_metadata.dev(), replacement_metadata.ino())
+        );
+        assert!(
+            observe_running_process_executable(&process, BINARY_MARKER_SCAN_MAX_BYTES).is_err()
+        );
+
+        child.0.kill()?;
+        child.0.wait()?;
+        Ok(())
     }
 
     #[test]

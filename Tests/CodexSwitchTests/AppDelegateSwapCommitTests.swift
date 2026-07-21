@@ -21,6 +21,54 @@ private final class ReloadCallCounter: @unchecked Sendable {
 
 @Suite("Account activation reload transaction")
 struct AppDelegateSwapCommitTests {
+    @Test("Delayed external auth reads are discarded after a newer swap and replayed")
+    func delayedExternalAuthReadUsesCurrentActivationContext() {
+        let configuredAccountId = UUID()
+        let activationGeneration = UUID()
+        let captured = ExternalAuthObservationContext(
+            configuredAccountId: configuredAccountId,
+            swapGeneration: 7,
+            activationGeneration: activationGeneration
+        )
+        let newerSwap = ExternalAuthObservationContext(
+            configuredAccountId: configuredAccountId,
+            swapGeneration: 8,
+            activationGeneration: UUID()
+        )
+
+        #expect(!AppDelegate.externalAuthObservationIsCurrent(
+            captured: captured,
+            current: newerSwap
+        ))
+        #expect(AppDelegate.externalAuthObservationIsCurrent(
+            captured: newerSwap,
+            current: newerSwap
+        ))
+
+        for changed in [
+            ExternalAuthObservationContext(
+                configuredAccountId: UUID(),
+                swapGeneration: captured.swapGeneration,
+                activationGeneration: captured.activationGeneration
+            ),
+            ExternalAuthObservationContext(
+                configuredAccountId: captured.configuredAccountId,
+                swapGeneration: captured.swapGeneration + 1,
+                activationGeneration: captured.activationGeneration
+            ),
+            ExternalAuthObservationContext(
+                configuredAccountId: captured.configuredAccountId,
+                swapGeneration: captured.swapGeneration,
+                activationGeneration: UUID()
+            ),
+        ] {
+            #expect(!AppDelegate.externalAuthObservationIsCurrent(
+                captured: captured,
+                current: changed
+            ))
+        }
+    }
+
     @Test("Manual account switches do not require source runtime-current proof")
     func manualSwapUsesDurableSourceAuthorization() {
         #expect(!AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
@@ -177,7 +225,11 @@ struct AppDelegateSwapCommitTests {
                 discoveredRuntimeCount: 2,
                 acknowledgedRuntimeCount: 2
             ),
-            desktopReload: .reloaded(method: "account/login/start")
+            desktopReload: .reloaded(
+                method: "account/login/start",
+                discoveredRuntimeCount: 1,
+                acknowledgedRuntimeCount: 1
+            )
         )
 
         #expect(completion.outcome == .runtimeCurrent)
@@ -193,7 +245,11 @@ struct AppDelegateSwapCommitTests {
                 discoveredRuntimeCount: 2,
                 acknowledgedRuntimeCount: 1
             ),
-            desktopReload: .reloaded(method: "account/login/start")
+            desktopReload: .reloaded(
+                method: "account/login/start",
+                discoveredRuntimeCount: 1,
+                acknowledgedRuntimeCount: 1
+            )
         )
 
         #expect(completion.outcome == .restartRequired)
@@ -206,7 +262,13 @@ struct AppDelegateSwapCommitTests {
     func failedDesktopStopsBeforeCLIReload() async {
         let cliCalls = ReloadCallCounter()
         let transaction = AccountActivationReloadTransaction(
-            desktopReload: { _ in .failed("strict_ack_timeout") },
+            desktopReload: { _ in
+                .failed(
+                    "strict_ack_timeout",
+                    discoveredRuntimeCount: 3,
+                    acknowledgedRuntimeCount: 2
+                )
+            },
             cliReload: {
                 cliCalls.increment()
                 return CodexReloadSummary(
@@ -226,17 +288,26 @@ struct AppDelegateSwapCommitTests {
             Issue.record("Expected a degraded completion")
             return
         }
-        #expect(desktop == .failed("strict_ack_timeout"))
+        #expect(desktop == .failed(
+            "strict_ack_timeout",
+            discoveredRuntimeCount: 3,
+            acknowledgedRuntimeCount: 2
+        ))
         #expect(completion.outcome == .restartRequired)
-        #expect(completion.discoveredRuntimeCount == 1)
-        #expect(completion.acknowledgedRuntimeCount == 0)
+        #expect(completion.discoveredRuntimeCount == 3)
+        #expect(completion.acknowledgedRuntimeCount == 2)
     }
 
     @Test("Unsupported desktop transaction cannot be rescued by CLI signalling")
     func unsupportedDesktopStopsBeforeCLIReload() async {
         let cliCalls = ReloadCallCounter()
         let transaction = AccountActivationReloadTransaction(
-            desktopReload: { _ in .unsupported },
+            desktopReload: { _ in
+                .unsupported(
+                    discoveredRuntimeCount: 4,
+                    acknowledgedRuntimeCount: 1
+                )
+            },
             cliReload: {
                 cliCalls.increment()
                 return CodexReloadSummary(
@@ -257,6 +328,8 @@ struct AppDelegateSwapCommitTests {
             return
         }
         #expect(completion.outcome == .restartRequired)
+        #expect(completion.discoveredRuntimeCount == 4)
+        #expect(completion.acknowledgedRuntimeCount == 1)
         #expect(completion.detail?.contains("desktop_json_rpc_unsupported") == true)
     }
 
@@ -264,7 +337,13 @@ struct AppDelegateSwapCommitTests {
     func postDesktopAuthorizationLossStopsBeforeCLIReload() async {
         let cliCalls = ReloadCallCounter()
         let transaction = AccountActivationReloadTransaction(
-            desktopReload: { _ in .reloaded(method: "account/login/start") },
+            desktopReload: { _ in
+                .reloaded(
+                    method: "account/login/start",
+                    discoveredRuntimeCount: 1,
+                    acknowledgedRuntimeCount: 1
+                )
+            },
             cliReload: {
                 cliCalls.increment()
                 return CodexReloadSummary(
@@ -284,6 +363,47 @@ struct AppDelegateSwapCommitTests {
             Issue.record("Expected cancellation after the desktop await")
             return
         }
+    }
+
+    @MainActor
+    @Test("Runtime identity loss immediately before confirmation blocks persistence")
+    func runtimeRevalidationStopsConfirmationPersistence() async {
+        let accountId = UUID()
+        let activationGeneration = UUID()
+        let now = Date()
+        let state = AccountActivationState.committedDegraded(
+            targetAccountId: accountId,
+            detail: .runtimeAcknowledgementIncomplete,
+            activationGeneration: activationGeneration,
+            retryAttempt: 0,
+            nextRetryAt: now,
+            at: now
+        )
+        let permit = AccountActivationEffectPermit(
+            targetAccountId: accountId,
+            activationGeneration: activationGeneration,
+            requiredPhase: .committedDegraded,
+            leaseGeneration: 1,
+            runtimePermit: nil,
+            leaseAuthorization: { true },
+            durableStateProvider: { state }
+        )
+        let persistenceCalls = ReloadCallCounter()
+
+        let result = await AccountActivationConfirmationTransaction().confirm(
+            AccountActivationConfirmationOperations(
+                verifyDurableFiles: { true },
+                authorizeConfirmation: { permit },
+                reauthorizeConfirmation: { _ in nil },
+                persistConfirmation: { _ in
+                    persistenceCalls.increment()
+                    return state
+                }
+            )
+        )
+
+        #expect(result == .blocked(.runtimeRevalidation))
+        #expect(persistenceCalls.read() == 0)
     }
 
     @Test("Auth readback verifies the complete token set")

@@ -3,6 +3,19 @@ import os
 
 private let rateLimitResetLogger = Logger(subsystem: "com.codexswitch", category: "RateLimitReset")
 
+enum RateLimitResetProviderAccountIdentity {
+    static func normalize(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.precomposedStringWithCanonicalMapping.lowercased()
+    }
+
+    static func matches(_ lhs: String, _ rhs: String) -> Bool {
+        guard let lhs = normalize(lhs), let rhs = normalize(rhs) else { return false }
+        return lhs == rhs
+    }
+}
+
 enum RateLimitResetSettings {
     static let automaticRedemptionDefaultsKey = "automaticRateLimitResetRedemption"
 }
@@ -54,24 +67,265 @@ struct RateLimitResetAttempt: Codable, Identifiable, Sendable, Equatable {
     let startingAvailableCount: Int
     let startingBankFetchedAt: Date
     let startingQuotaFetchedAt: Date?
+    let creditExpiresAt: Date?
+    let redemptionReason: RateLimitResetRedemptionReason?
     let createdAt: Date
     var submittedAt: Date?
     var state: RateLimitResetAttemptState
     var consumeResponseCode: String?
+    var routineSwapSuppressionReleasedAt: Date?
     var updatedAt: Date
+
+    init(
+        id: UUID,
+        providerAccountId: String,
+        creditId: String,
+        startingAvailableCount: Int,
+        startingBankFetchedAt: Date,
+        startingQuotaFetchedAt: Date?,
+        creditExpiresAt: Date? = nil,
+        redemptionReason: RateLimitResetRedemptionReason? = nil,
+        createdAt: Date,
+        submittedAt: Date?,
+        state: RateLimitResetAttemptState,
+        consumeResponseCode: String?,
+        routineSwapSuppressionReleasedAt: Date? = nil,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.providerAccountId = providerAccountId
+        self.creditId = creditId
+        self.startingAvailableCount = startingAvailableCount
+        self.startingBankFetchedAt = startingBankFetchedAt
+        self.startingQuotaFetchedAt = startingQuotaFetchedAt
+        self.creditExpiresAt = creditExpiresAt
+        self.redemptionReason = redemptionReason
+        self.createdAt = createdAt
+        self.submittedAt = submittedAt
+        self.state = state
+        self.consumeResponseCode = consumeResponseCode
+        self.routineSwapSuppressionReleasedAt = routineSwapSuppressionReleasedAt
+        self.updatedAt = updatedAt
+    }
+
+    var normalizedProviderAccountId: String? {
+        RateLimitResetProviderAccountIdentity.normalize(providerAccountId)
+    }
+
+    func normalizedForJournal() -> Self? {
+        guard let normalizedProviderAccountId else { return nil }
+        return Self(
+            id: id,
+            providerAccountId: normalizedProviderAccountId,
+            creditId: creditId,
+            startingAvailableCount: startingAvailableCount,
+            startingBankFetchedAt: startingBankFetchedAt,
+            startingQuotaFetchedAt: startingQuotaFetchedAt,
+            creditExpiresAt: creditExpiresAt,
+            redemptionReason: redemptionReason,
+            createdAt: createdAt,
+            submittedAt: submittedAt,
+            state: state,
+            consumeResponseCode: consumeResponseCode,
+            routineSwapSuppressionReleasedAt: routineSwapSuppressionReleasedAt,
+            updatedAt: updatedAt
+        )
+    }
+}
+
+struct RateLimitResetSubmissionExpectation: Equatable, Sendable {
+    let attemptId: UUID
+    let providerAccountId: String
+    let creditId: String
+    let startingAvailableCount: Int
+    let startingBankFetchedAt: Date
+    let startingQuotaFetchedAt: Date?
+    let creditExpiresAt: Date?
+    let createdAt: Date
+    var explainedExpectedDecrement: Bool
+
+    init(attempt: RateLimitResetAttempt) {
+        self.attemptId = attempt.id
+        self.providerAccountId = attempt.normalizedProviderAccountId
+            ?? attempt.providerAccountId
+        self.creditId = attempt.creditId
+        self.startingAvailableCount = attempt.startingAvailableCount
+        self.startingBankFetchedAt = attempt.startingBankFetchedAt
+        self.startingQuotaFetchedAt = attempt.startingQuotaFetchedAt
+        self.creditExpiresAt = attempt.creditExpiresAt
+        self.createdAt = attempt.createdAt
+        self.explainedExpectedDecrement = false
+    }
+
+    func retained(while attempt: RateLimitResetAttempt?) -> Self? {
+        guard let attempt,
+              !attempt.state.isTerminal,
+              attempt.id == attemptId,
+              RateLimitResetProviderAccountIdentity.matches(
+                  attempt.providerAccountId,
+                  providerAccountId
+              ),
+              attempt.creditId == creditId,
+              attempt.startingAvailableCount == startingAvailableCount,
+              attempt.startingBankFetchedAt == startingBankFetchedAt,
+              attempt.startingQuotaFetchedAt == startingQuotaFetchedAt,
+              attempt.creditExpiresAt == creditExpiresAt,
+              attempt.createdAt == createdAt else {
+            return nil
+        }
+        return self
+    }
+}
+
+enum RateLimitResetInventoryTransitionDisposition: Equatable, Sendable {
+    case baselineEstablished
+    case unchanged
+    case changedWithoutRedemption
+    case expectedLocalDecrement
+    case externalRedemption
+}
+
+struct RateLimitResetInventoryTransition: Equatable, Sendable {
+    let disposition: RateLimitResetInventoryTransitionDisposition
+    let updatedExpectation: RateLimitResetSubmissionExpectation?
+
+    var observedExternalRedemption: Bool {
+        disposition == .externalRedemption
+    }
+
+    static func classify(
+        previousBank: RateLimitResetBank?,
+        refreshedBank: RateLimitResetBank,
+        localExpectation: RateLimitResetSubmissionExpectation?,
+        observedProviderAccountId: String,
+        now: Date
+    ) -> Self {
+        guard let previousBank else {
+            return Self(
+                disposition: .baselineEstablished,
+                updatedExpectation: localExpectation
+            )
+        }
+        let refreshedObservationDate = max(now, refreshedBank.fetchedAt)
+        guard let previousCredits = previousBank.structurallyValidAvailableCredits(
+            at: previousBank.fetchedAt
+        ),
+              let refreshedCredits = refreshedBank.structurallyValidAvailableCredits(
+                  at: refreshedObservationDate
+              ) else {
+            return Self(
+                disposition: .externalRedemption,
+                updatedExpectation: localExpectation
+            )
+        }
+        if previousBank.availableCount == refreshedBank.availableCount,
+           previousCredits == refreshedCredits {
+            return Self(
+                disposition: .unchanged,
+                updatedExpectation: localExpectation
+            )
+        }
+
+        let matchingExpectation = localExpectation.flatMap { expectation in
+            RateLimitResetProviderAccountIdentity.matches(
+                expectation.providerAccountId,
+                observedProviderAccountId
+            ) ? expectation : nil
+        }
+        if var matchingExpectation,
+           !matchingExpectation.explainedExpectedDecrement,
+           matchingExpectation.startingAvailableCount > 0,
+           previousBank.availableCount == matchingExpectation.startingAvailableCount,
+           refreshedBank.availableCount == matchingExpectation.startingAvailableCount - 1,
+           matchingExpectation.creditExpiresAt.map({ $0 > refreshedObservationDate }) == true,
+           previousCredits.contains(where: { $0.id == matchingExpectation.creditId }),
+           !refreshedCredits.contains(where: { $0.id == matchingExpectation.creditId }),
+           previousCredits.filter({ $0.id != matchingExpectation.creditId }) == refreshedCredits {
+            matchingExpectation.explainedExpectedDecrement = true
+            return Self(
+                disposition: .expectedLocalDecrement,
+                updatedExpectation: matchingExpectation
+            )
+        }
+
+        let naturallyExpiredIdentifiers = Set(previousCredits.compactMap { credit -> String? in
+            guard let expiresAt = credit.expiresAt,
+                  expiresAt <= refreshedObservationDate else {
+                return nil
+            }
+            return credit.id
+        })
+        let previousCreditsAfterNaturalExpiry = previousCredits.filter {
+            !naturallyExpiredIdentifiers.contains($0.id)
+        }
+        let expectedCountAfterNaturalExpiry = previousBank.availableCount
+            - naturallyExpiredIdentifiers.count
+        if refreshedBank.availableCount == expectedCountAfterNaturalExpiry,
+           previousCreditsAfterNaturalExpiry == refreshedCredits {
+            return Self(
+                disposition: .changedWithoutRedemption,
+                updatedExpectation: localExpectation
+            )
+        }
+
+        let previousIdentifiers = Set(previousCredits.map(\.id))
+        let refreshedIdentifiers = Set(refreshedCredits.map(\.id))
+        let removedIdentifiers = previousIdentifiers
+            .subtracting(refreshedIdentifiers)
+            .subtracting(naturallyExpiredIdentifiers)
+        let changeOccurredDuringMatchingSubmission = matchingExpectation != nil
+        let externalRedemptionObserved = refreshedBank.availableCount < expectedCountAfterNaturalExpiry
+            || !removedIdentifiers.isEmpty
+            || changeOccurredDuringMatchingSubmission
+        return Self(
+            disposition: externalRedemptionObserved
+                ? .externalRedemption
+                : .changedWithoutRedemption,
+            updatedExpectation: localExpectation
+        )
+    }
+}
+
+enum RateLimitResetOrchestrationCapability: Hashable, Sendable {
+    case runtimeAuthorization
+    case authWrite
+    case accountSwap
+    case accountActivation
+}
+
+struct RateLimitResetOrchestrationPlan: Equatable, Sendable {
+    let requestedCapabilities: Set<RateLimitResetOrchestrationCapability>
+
+    init(reason: RateLimitResetRedemptionReason) {
+        requestedCapabilities = reason == .manual ? [] : [.runtimeAuthorization]
+    }
+
+    var requiresRuntimeAuthorization: Bool {
+        requestedCapabilities.contains(.runtimeAuthorization)
+    }
+
+    @MainActor
+    func requestRuntimeAuthorization(
+        using provider: () async -> AccountActivationRuntimePermit?
+    ) async -> AccountActivationRuntimePermit? {
+        guard requiresRuntimeAuthorization else { return nil }
+        return await provider()
+    }
 }
 
 struct RateLimitResetSubmissionPermit: Sendable, Equatable {
+    static let transportAuthorizationLifetime: TimeInterval = 10
+
     let attemptId: UUID
     let providerAccountId: String
     let creditId: String
     let targetAccountId: UUID
     let activationGeneration: UUID
     let leaseGeneration: UInt64
-    let runtimePermit: AccountActivationRuntimePermit
+    let runtimeAuthorizationRequired: Bool
+    let runtimePermit: AccountActivationRuntimePermit?
     let activationEffectPermit: AccountActivationEffectPermit
     let issuedAt: Date
-    private let oneShotNonce: UUID
 
     init(
         attemptId: UUID,
@@ -80,41 +334,50 @@ struct RateLimitResetSubmissionPermit: Sendable, Equatable {
         targetAccountId: UUID,
         activationGeneration: UUID,
         leaseGeneration: UInt64,
-        runtimePermit: AccountActivationRuntimePermit,
+        runtimeAuthorizationRequired: Bool = true,
+        runtimePermit: AccountActivationRuntimePermit?,
         activationEffectPermit: AccountActivationEffectPermit,
-        issuedAt: Date,
-        oneShotNonce: UUID = UUID()
+        issuedAt: Date
     ) {
         self.attemptId = attemptId
-        self.providerAccountId = providerAccountId
+        self.providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+            providerAccountId
+        ) ?? providerAccountId
         self.creditId = creditId
         self.targetAccountId = targetAccountId
         self.activationGeneration = activationGeneration
         self.leaseGeneration = leaseGeneration
+        self.runtimeAuthorizationRequired = runtimeAuthorizationRequired
         self.runtimePermit = runtimePermit
         self.activationEffectPermit = activationEffectPermit
         self.issuedAt = issuedAt
-        self.oneShotNonce = oneShotNonce
     }
 
     func matches(_ attempt: RateLimitResetAttempt, at date: Date) -> Bool {
-        attempt.id == attemptId
-            && attempt.providerAccountId == providerAccountId
-            && attempt.creditId == creditId
-            && runtimePermit.targetAccountId == targetAccountId
+        guard attempt.id == attemptId,
+              RateLimitResetProviderAccountIdentity.matches(
+                  attempt.providerAccountId,
+                  providerAccountId
+              ),
+              attempt.creditId == creditId,
+              activationEffectPermit.targetAccountId == targetAccountId,
+              activationEffectPermit.activationGeneration == activationGeneration,
+              activationEffectPermit.leaseGeneration == leaseGeneration,
+              activationEffectPermit.runtimePermit == runtimePermit,
+              !runtimeAuthorizationRequired || runtimePermit != nil,
+              issuedAt <= date,
+              date.timeIntervalSince(issuedAt) < Self.transportAuthorizationLifetime,
+              activationEffectPermit.isCurrentlyAuthorized(at: date) else {
+            return false
+        }
+        guard let runtimePermit else { return true }
+        return runtimePermit.targetAccountId == targetAccountId
             && runtimePermit.activationGeneration == activationGeneration
-            && runtimePermit.requiredPhase == .confirmed
+            && runtimePermit.requiredPhase == activationEffectPermit.requiredPhase
             && runtimePermit.evidence.runtimeCurrentAccountId == targetAccountId
-            && activationEffectPermit.targetAccountId == targetAccountId
-            && activationEffectPermit.activationGeneration == activationGeneration
-            && activationEffectPermit.requiredPhase == .confirmed
-            && activationEffectPermit.leaseGeneration == leaseGeneration
-            && activationEffectPermit.runtimePermit == runtimePermit
             && runtimePermit.evidence.observedAt <= issuedAt
             && runtimePermit.evidence.expiresAt > issuedAt
-            && issuedAt <= date
             && runtimePermit.evidence.expiresAt > date
-            && activationEffectPermit.isCurrentlyAuthorized(at: date)
     }
 }
 
@@ -129,6 +392,7 @@ actor RateLimitResetService {
     typealias SubmissionAuthorization = @Sendable (
         RateLimitResetAttempt
     ) async -> RateLimitResetSubmissionPermit?
+    typealias SubmissionWillStart = @Sendable (RateLimitResetAttempt) -> Void
 
     private static let inventoryURL = URL(
         string: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
@@ -167,11 +431,13 @@ actor RateLimitResetService {
     func fetchBank(
         for account: CodexAccount,
         force: Bool = false,
-        now: Date = Date()
+        now: Date = Date(),
+        observationCompletedAt: Date? = nil
     ) async throws -> RateLimitResetBank {
         if !force,
            let bank = account.rateLimitResetBank,
-           bank.isFresh(at: now) {
+           bank.isFresh(at: now),
+           bank.structurallyValidAvailableCredits(at: now) != nil {
             return bank
         }
 
@@ -187,6 +453,7 @@ actor RateLimitResetService {
         guard response.statusCode == 200 else {
             throw RateLimitResetServiceError.httpError(response.statusCode)
         }
+        let fetchedAt = max(now, observationCompletedAt ?? Date())
 
         do {
             let payload = try JSONDecoder().decode(InventoryPayload.self, from: response.data)
@@ -194,12 +461,16 @@ actor RateLimitResetService {
                 throw RateLimitResetServiceError.malformedInventory
             }
             let credits = try payload.credits.map { try $0.credit() }
-            return RateLimitResetBank(
+            let bank = RateLimitResetBank(
                 availableCount: payload.availableCount,
                 totalEarnedCount: payload.totalEarnedCount,
                 credits: credits,
-                fetchedAt: now
+                fetchedAt: fetchedAt
             )
+            guard bank.structurallyValidAvailableCredits(at: fetchedAt) != nil else {
+                throw RateLimitResetServiceError.malformedInventory
+            }
+            return bank
         } catch let error as RateLimitResetServiceError {
             throw error
         } catch {
@@ -213,22 +484,33 @@ actor RateLimitResetService {
         bank: RateLimitResetBank,
         now: Date = Date(),
         redeemRequestId: UUID = UUID(),
-        authorizeSubmission: @escaping SubmissionAuthorization
+        redemptionReason: RateLimitResetRedemptionReason? = nil,
+        authorizeSubmission: @escaping SubmissionAuthorization,
+        submissionWillStart: @escaping SubmissionWillStart = { _ in }
     ) async throws -> RateLimitResetConsumeResult {
-        guard let creditId = bank.oldestExpiringCredit(at: now)?.id else {
+        guard account.hasCompleteRuntimeCredentials,
+              let providerAccountId = account.normalizedProviderAccountId else {
+            throw RateLimitResetServiceError.submissionUnauthorized
+        }
+        guard let selectedCredit = bank.oldestExpiringCredit(at: now),
+              let creditExpiresAt = selectedCredit.expiresAt else {
             throw RateLimitResetServiceError.missingCreditIdentifier
         }
+        let creditId = selectedCredit.id
         let attempt = RateLimitResetAttempt(
             id: redeemRequestId,
-            providerAccountId: account.accountId,
+            providerAccountId: providerAccountId,
             creditId: creditId,
             startingAvailableCount: bank.availableCount,
             startingBankFetchedAt: bank.fetchedAt,
             startingQuotaFetchedAt: account.realQuotaSnapshot?.fetchedAt,
+            creditExpiresAt: creditExpiresAt,
+            redemptionReason: redemptionReason,
             createdAt: now,
             submittedAt: nil,
             state: .prepared,
             consumeResponseCode: nil,
+            routineSwapSuppressionReleasedAt: nil,
             updatedAt: now
         )
         try journal.prepare(attempt, now: now)
@@ -242,8 +524,8 @@ actor RateLimitResetService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(body)
 
-        try journal.markSubmitted(id: attempt.id, at: now)
-        guard let permit = await authorizeSubmission(attempt) else {
+        let submittedAttempt = try journal.markSubmitted(id: attempt.id, at: now)
+        guard let permit = await authorizeSubmission(submittedAttempt) else {
             try journal.markNotApplied(
                 id: attempt.id,
                 responseCode: "authorization_lost",
@@ -256,10 +538,8 @@ actor RateLimitResetService {
         let journalAttempt = try journal.unresolvedAttempt(
             for: attempt.providerAccountId
         )
-        guard journalAttempt?.id == attempt.id,
-              journalAttempt?.state == .submitted,
-              journalAttempt?.creditId == attempt.creditId,
-              permit.matches(attempt, at: finalAuthorizationAt) else {
+        guard journalAttempt == submittedAttempt,
+              permit.matches(submittedAttempt, at: finalAuthorizationAt) else {
             try journal.markNotApplied(
                 id: attempt.id,
                 responseCode: "authorization_lost",
@@ -268,6 +548,7 @@ actor RateLimitResetService {
             throw RateLimitResetServiceError.submissionUnauthorized
         }
 
+        submissionWillStart(submittedAttempt)
         let response: RateLimitResetHTTPResponse
         do {
             response = try await transport(request)
@@ -306,11 +587,23 @@ actor RateLimitResetService {
     }
 
     func unresolvedProviderAccountIds() throws -> Set<String> {
-        Set(try journal.allAttempts().filter { !$0.state.isTerminal }.map(\.providerAccountId))
+        Set(try journal.allAttempts().filter { !$0.state.isTerminal }.compactMap(
+            \.normalizedProviderAccountId
+        ))
     }
 
     func allAttempts() throws -> [RateLimitResetAttempt] {
         try journal.allAttempts()
+    }
+
+    func releaseManualSwapSuppression(
+        for providerAccountId: String,
+        now: Date = Date()
+    ) throws -> Bool {
+        try journal.releaseManualSwapSuppression(
+            for: providerAccountId,
+            at: now
+        )
     }
 
     func finalizeReconciliationAfterPersistence(
@@ -350,6 +643,7 @@ actor RateLimitResetService {
             || status == "used"
         let missingWithCountDecrease = matchingCredit == nil
             && bank.availableCount < attempt.startingAvailableCount
+            && attempt.creditExpiresAt.map { $0 > bank.fetchedAt } == true
         let inventoryProvesConsumption = explicitlyConsumed || missingWithCountDecrease
         let quotaProvesRecovery = snapshot.isImmediatelyUsable
 
@@ -379,6 +673,7 @@ struct RateLimitResetAttemptJournal {
         case submitted
         case reconciling
         case pendingPersistence
+        case suppressionRelease
         case terminal
     }
 
@@ -439,6 +734,11 @@ struct RateLimitResetAttemptJournal {
     }
 
     mutating func prepare(_ attempt: RateLimitResetAttempt, now: Date) throws {
+        guard let attempt = attempt.normalizedForJournal() else {
+            throw RateLimitResetServiceError.journalUnavailable(
+                "reset attempt has no stable provider account identity"
+            )
+        }
         try transact(boundary: .prepared, now: now) { attempts in
             if let unresolved = Self.unresolvedAttempt(
                 for: attempt.providerAccountId,
@@ -460,12 +760,16 @@ struct RateLimitResetAttemptJournal {
         }
     }
 
-    mutating func markSubmitted(id: UUID, at date: Date) throws {
+    mutating func markSubmitted(id: UUID, at date: Date) throws -> RateLimitResetAttempt {
         try update(id: id, boundary: .submitted) {
             $0.submittedAt = date
             $0.state = .submitted
             $0.updatedAt = date
         }
+        guard let attempt = attempts.first(where: { $0.id == id }) else {
+            throw RateLimitResetServiceError.journalUnavailable("reset attempt disappeared")
+        }
+        return attempt
     }
 
     mutating func markReconciling(id: UUID, responseCode: String?, at date: Date) throws {
@@ -482,6 +786,35 @@ struct RateLimitResetAttemptJournal {
             $0.consumeResponseCode = responseCode
             $0.updatedAt = date
         }
+    }
+
+    mutating func releaseManualSwapSuppression(
+        for providerAccountId: String,
+        at date: Date
+    ) throws -> Bool {
+        guard let providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+            providerAccountId
+        ) else {
+            throw RateLimitResetServiceError.journalUnavailable(
+                "manual reset suppression has no stable provider account identity"
+            )
+        }
+        var released = false
+        try transact(boundary: .suppressionRelease, now: date) { attempts in
+            for index in attempts.indices where
+                attempts[index].redemptionReason == .manual
+                    && attempts[index].state != .notApplied
+                    && attempts[index].routineSwapSuppressionReleasedAt == nil
+                    && RateLimitResetProviderAccountIdentity.matches(
+                        attempts[index].providerAccountId,
+                        providerAccountId
+                    ) {
+                attempts[index].routineSwapSuppressionReleasedAt = date
+                attempts[index].updatedAt = date
+                released = true
+            }
+        }
+        return released
     }
 
     mutating func markPendingPersistence(
@@ -566,8 +899,15 @@ struct RateLimitResetAttemptJournal {
         for providerAccountId: String,
         in attempts: [RateLimitResetAttempt]
     ) -> RateLimitResetAttempt? {
-        attempts
-            .filter { $0.providerAccountId == providerAccountId && !$0.state.isTerminal }
+        guard let providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+            providerAccountId
+        ) else {
+            return nil
+        }
+        return attempts
+            .filter {
+                $0.normalizedProviderAccountId == providerAccountId && !$0.state.isTerminal
+            }
             .max { $0.createdAt < $1.createdAt }
     }
 
@@ -577,11 +917,33 @@ struct RateLimitResetAttemptJournal {
     ) -> [RateLimitResetAttempt] {
         let cutoff = now.addingTimeInterval(-terminalRetentionInterval)
         let unresolved = attempts.filter { !$0.state.isTerminal }
+        var protectedManualSuppressionByProvider: [String: RateLimitResetAttempt] = [:]
+        for attempt in attempts where
+            attempt.state == .succeeded
+                && attempt.redemptionReason == .manual
+                && attempt.routineSwapSuppressionReleasedAt == nil {
+            guard let providerAccountId = attempt.normalizedProviderAccountId else { continue }
+            if protectedManualSuppressionByProvider[providerAccountId].map({
+                $0.updatedAt < attempt.updatedAt
+            }) ?? true {
+                protectedManualSuppressionByProvider[providerAccountId] = attempt
+            }
+        }
+        let protectedAttemptIds = Set(
+            protectedManualSuppressionByProvider.values.map(\.id)
+        )
+        let protectedManualSuppressions = protectedManualSuppressionByProvider.values.sorted {
+            $0.updatedAt > $1.updatedAt
+        }
         let terminal = attempts
-            .filter { $0.state.isTerminal && $0.updatedAt >= cutoff }
+            .filter {
+                $0.state.isTerminal
+                    && !protectedAttemptIds.contains($0.id)
+                    && $0.updatedAt >= cutoff
+            }
             .sorted { $0.updatedAt > $1.updatedAt }
             .prefix(maximumTerminalAttempts)
-        return unresolved + terminal
+        return unresolved + protectedManualSuppressions + terminal
     }
 
     private static func decode(_ data: Data?) throws -> [RateLimitResetAttempt] {
@@ -592,13 +954,28 @@ struct RateLimitResetAttemptJournal {
                 "unsupported reset journal version \(envelope.version)"
             )
         }
-        return envelope.attempts
+        return try envelope.attempts.map { attempt in
+            guard let normalized = attempt.normalizedForJournal() else {
+                throw RateLimitResetServiceError.journalUnavailable(
+                    "reset attempt has no stable provider account identity"
+                )
+            }
+            return normalized
+        }
     }
 
     private static func encode(_ attempts: [RateLimitResetAttempt]) throws -> Data {
+        let normalizedAttempts = try attempts.map { attempt in
+            guard let normalized = attempt.normalizedForJournal() else {
+                throw RateLimitResetServiceError.journalUnavailable(
+                    "reset attempt has no stable provider account identity"
+                )
+            }
+            return normalized
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return try encoder.encode(Envelope(version: version, attempts: attempts))
+        return try encoder.encode(Envelope(version: version, attempts: normalizedAttempts))
     }
 }
 

@@ -142,7 +142,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .reloaded(method: "account/login/start"))
+        #expect(result == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
         let requests = await sender.recordedRequests()
         try #require(requests.count == 2)
         #expect(requestMethod(in: requests[0].payload) == "account/login/start")
@@ -151,6 +155,30 @@ struct DesktopRuntimeReloadClientTests {
 
         let verificationParams = requestParams(in: requests[1].payload) as? [String: Bool]
         #expect(verificationParams?["refreshToken"] == false)
+    }
+
+    @Test("Strict reload failure preserves discovered and acknowledged runtime counts")
+    func strictReloadFailurePreservesPartialCounts() async {
+        let (client, _) = makeClient(
+            responses: [
+                .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+                .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
+            ],
+            strictReload: { _, _, _, _ in
+                CodexReloadSummary(
+                    discoveredRuntimeCount: 3,
+                    acknowledgedRuntimeCount: 2
+                )
+            }
+        )
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed(
+            "strict desktop reload incomplete acknowledged=2/3",
+            discoveredRuntimeCount: 3,
+            acknowledgedRuntimeCount: 2
+        ))
     }
 
     @Test("reload accepts current app-server responses without jsonrpc member")
@@ -162,7 +190,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .reloaded(method: "account/login/start"))
+        #expect(result == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
     }
 
     @Test("matching account ID verifies when target email is unavailable")
@@ -174,7 +206,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount(email: ""))
 
-        #expect(result == .reloaded(method: "account/login/start"))
+        #expect(result == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
     }
 
     @Test(
@@ -196,7 +232,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount(email: ""))
 
-        #expect(result == .failed("desktop account ID is invalid"))
+        #expect(result == .failed(
+            "desktop account ID is invalid",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
     }
 
     @Test("account ID comparison is case sensitive")
@@ -208,7 +248,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount(email: ""))
 
-        #expect(result == .failed("desktop account ID mismatch"))
+        #expect(result == .failed(
+            "desktop account ID mismatch",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
     }
 
     @Test("conflicting account ID aliases are ambiguous")
@@ -220,7 +264,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount(email: ""))
 
-        #expect(result == .failed("desktop account identity is ambiguous"))
+        #expect(result == .failed(
+            "desktop account identity is ambiguous",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
     }
 
     @Test(
@@ -255,7 +303,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("desktop account identity missing"))
+        #expect(result == .failed(
+            "desktop account identity missing",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
     }
 
     @Test("mismatched account ID fails even when email and plan match")
@@ -267,7 +319,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("desktop account ID mismatch"))
+        #expect(result == .failed(
+            "desktop account ID mismatch",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
     }
 
     @Test("reload rejects a different normalized email")
@@ -279,7 +335,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("desktop account email mismatch"))
+        #expect(result == .failed(
+            "desktop account email mismatch",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
         let requests = await sender.recordedRequests()
         #expect(requests.count == 2)
     }
@@ -293,7 +353,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("desktop account plan mismatch"))
+        #expect(result == .failed(
+            "desktop account plan mismatch",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
     }
 
     @Test("equivalent ChatGPT plan aliases verify as the same tier")
@@ -307,7 +371,11 @@ struct DesktopRuntimeReloadClientTests {
             account: makeAccount(planType: "ChatGPT Pro Monthly")
         )
 
-        #expect(result == .reloaded(method: "account/login/start"))
+        #expect(result == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
     }
 
     @Test("unknown target plan does not conflict with a meaningful server plan")
@@ -321,7 +389,11 @@ struct DesktopRuntimeReloadClientTests {
             account: makeAccount(planType: "unknown")
         )
 
-        #expect(result == .reloaded(method: "account/login/start"))
+        #expect(result == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
     }
 
     @Test("null account verification fails closed")
@@ -333,7 +405,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("desktop account missing"))
+        #expect(result == .failed(
+            "desktop account missing",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
     }
 
     @Test("non-ChatGPT account verification fails closed")
@@ -345,7 +421,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("desktop account is not ChatGPT"))
+        #expect(result == .failed(
+            "desktop account is not ChatGPT",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
     }
 
     @Test("account verification method not found is unsupported")
@@ -353,11 +433,14 @@ struct DesktopRuntimeReloadClientTests {
         let (client, sender) = makeClient(responses: [
             .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
             .string(#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#)
-        ])
+        ], runtimePIDs: [42, 43, 44])
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .unsupported)
+        #expect(result == .unsupported(
+            discoveredRuntimeCount: 3,
+            acknowledgedRuntimeCount: 0
+        ))
         let requests = await sender.recordedRequests()
         #expect(requests.count == 2)
     }
@@ -371,7 +454,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("invalid account verification response"))
+        #expect(result == .failed(
+            "invalid account verification response",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
         let requests = await sender.recordedRequests()
         #expect(requests.count == 2)
     }
@@ -385,7 +472,11 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("timeout"))
+        #expect(result == .failed(
+            "timeout",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
         let requests = await sender.recordedRequests()
         #expect(requests.count == 2)
     }
@@ -424,11 +515,33 @@ struct DesktopRuntimeReloadClientTests {
 
         let result = await client.reloadAuth(account: makeAccount())
 
-        #expect(result == .failed("desktop runtime binding drift"))
+        #expect(result == .failed(
+            "desktop runtime binding drift",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
         #expect(currentnessChecks.read() == 2)
         #expect(socketOwners.read().isEmpty)
         #expect(await sender.recordedRequests().isEmpty)
         #expect(strictCalls.read() == 0)
+    }
+
+    @Test("Pre-admission failure preserves all discovered runtime counts")
+    func preAdmissionFailurePreservesDiscoveredCounts() async {
+        let (client, sender) = makeClient(
+            responses: [],
+            runtimePIDs: [42, 43, 44],
+            missingSocketBindingPIDs: [44]
+        )
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(result == .failed(
+            "desktop runtime socket binding incomplete",
+            discoveredRuntimeCount: 3,
+            acknowledgedRuntimeCount: 0
+        ))
+        #expect(await sender.recordedRequests().isEmpty)
     }
 
     @Test("PID admission covers typed desktop discovery through strict ACK completion")
@@ -476,8 +589,16 @@ struct DesktopRuntimeReloadClientTests {
         let firstResult = await firstTask.value
         let secondResult = await secondTask.value
 
-        #expect(firstResult == .reloaded(method: "account/login/start"))
-        #expect(secondResult == .reloaded(method: "account/login/start"))
+        #expect(firstResult == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
+        #expect(secondResult == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
         #expect(secondDiscoveryRuns.read() == 1)
         #expect(await secondSender.recordedRequests().count == 2)
     }
@@ -489,7 +610,7 @@ struct DesktopRuntimeReloadClientTests {
             method: "account/login/start"
         )
 
-        #expect(result == .unsupported)
+        #expect(result == .unsupported())
     }
 
     @Test("method-not-found probe response advances unsupported probe")
@@ -587,6 +708,8 @@ struct DesktopRuntimeReloadClientTests {
 
     private func makeClient(
         responses: [DesktopRuntimeWebSocketEvent],
+        runtimePIDs: [Int32] = [42],
+        missingSocketBindingPIDs: Set<Int32> = [],
         gate: CodexReloadAttemptGate = CodexReloadAttemptGate(),
         runtimeDiscoveryDidRun: (@Sendable () -> Void)? = nil,
         socketBindingIsCurrent: @escaping @Sendable (
@@ -602,7 +725,11 @@ struct DesktopRuntimeReloadClientTests {
             DesktopRuntimeReloadClientTests.successfulStrictSummary
         }
     ) -> (DesktopRuntimeReloadClient, StubDesktopRuntimeRequestSender) {
-        let target = runtimeTarget()
+        let targets = runtimePIDs.map { runtimeTarget(pid: $0) }
+        let portsByPID = Dictionary(uniqueKeysWithValues: targets.enumerated().map {
+            index, target in
+            (target.process.identity.pid, UInt16(9_223 + index))
+        })
         let sender = StubDesktopRuntimeRequestSender(responses: responses)
         let client = DesktopRuntimeReloadClient(
             requestSender: { payload, port in
@@ -613,19 +740,24 @@ struct DesktopRuntimeReloadClientTests {
                 gate: gate,
                 preliminaryDiscovery: {
                     .snapshot(CodexPGrepProcessSnapshot(
-                        pids: [target.process.identity.pid],
+                        pids: targets.map(\.process.identity.pid),
                         isComplete: true
                     ))
                 },
                 runtimeDiscovery: { _, _ in
                     runtimeDiscoveryDidRun?()
                     return CodexRuntimeDiscoverySnapshot(
-                        targets: [target],
+                        targets: targets,
                         isComplete: true
                     )
                 },
-                socketBinding: {
-                    CodexDesktopRuntimeSocketBinding(target: $0, port: 9223)
+                socketBinding: { target in
+                    let pid = target.process.identity.pid
+                    guard !missingSocketBindingPIDs.contains(pid),
+                          let port = portsByPID[pid] else {
+                        return nil
+                    }
+                    return CodexDesktopRuntimeSocketBinding(target: target, port: port)
                 },
                 socketBindingIsCurrent: socketBindingIsCurrent,
                 strictReload: strictReload

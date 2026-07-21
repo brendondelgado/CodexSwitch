@@ -1,6 +1,34 @@
 import Foundation
 import Testing
+import UserNotifications
 @testable import CodexSwitch
+
+private final class ResetNotificationEnqueueHarness: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completions: [@Sendable (Error?) -> Void] = []
+
+    func enqueue(
+        _ request: UNNotificationRequest,
+        completion: @escaping @Sendable (Error?) -> Void
+    ) {
+        lock.lock()
+        completions.append(completion)
+        lock.unlock()
+    }
+
+    func count() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return completions.count
+    }
+
+    func complete(at index: Int, error: Error?) {
+        lock.lock()
+        let completion = completions[index]
+        lock.unlock()
+        completion(error)
+    }
+}
 
 @Suite("AppDelegate notifications")
 struct AppDelegateNotificationTests {
@@ -299,6 +327,152 @@ struct AppDelegateNotificationTests {
             now: now.addingTimeInterval(13 * 3600),
             userDefaults: defaults
         ))
+    }
+
+    @Test("Reset expiration dedupe key uses stable account, exact expiration, and urgency")
+    func resetExpirationDedupeKeyContract() throws {
+        let expiration = Date(timeIntervalSince1970: 1_800_500_000.125)
+        let advisoryKey = try #require(
+            NotificationManager.resetExpirationNotificationDedupeKey(
+                stableProviderAccountId: " provider-123 ",
+                expiration: expiration,
+                urgency: .advisory
+            )
+        )
+
+        #expect(advisoryKey == NotificationManager.resetExpirationNotificationDedupeKey(
+            stableProviderAccountId: "PROVIDER-123",
+            expiration: expiration,
+            urgency: .advisory
+        ))
+        #expect(advisoryKey != NotificationManager.resetExpirationNotificationDedupeKey(
+            stableProviderAccountId: "provider-456",
+            expiration: expiration,
+            urgency: .advisory
+        ))
+        #expect(advisoryKey != NotificationManager.resetExpirationNotificationDedupeKey(
+            stableProviderAccountId: "provider-123",
+            expiration: expiration.addingTimeInterval(0.001),
+            urgency: .advisory
+        ))
+        #expect(advisoryKey != NotificationManager.resetExpirationNotificationDedupeKey(
+            stableProviderAccountId: "provider-123",
+            expiration: expiration,
+            urgency: .urgent
+        ))
+        #expect(NotificationManager.resetExpirationNotificationDedupeKey(
+            stableProviderAccountId: "provider-123",
+            expiration: expiration,
+            urgency: .normal
+        ) == nil)
+
+        #expect(!NotificationManager.shouldNotifyResetExpiration(
+            stableProviderAccountId: "provider-123",
+            expiration: expiration,
+            urgency: .advisory,
+            alreadyNotifiedKeys: [advisoryKey]
+        ))
+        #expect(NotificationManager.shouldNotifyResetExpiration(
+            stableProviderAccountId: "provider-123",
+            expiration: expiration,
+            urgency: .urgent,
+            alreadyNotifiedKeys: [advisoryKey]
+        ))
+    }
+
+    @Test("Reset expiration dedupe persists only after successful enqueue")
+    func resetExpirationDedupePersistsAfterSuccess() {
+        let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaultsKey = "reset-test-success.\(UUID().uuidString)"
+        let coordinator = RateLimitResetNotificationDedupeCoordinator(
+            defaultsKey: defaultsKey,
+            maximumPersistedKeys: 8
+        )
+        let harness = ResetNotificationEnqueueHarness()
+        let dedupeKey = "reset-success"
+        let request = UNNotificationRequest(
+            identifier: dedupeKey,
+            content: UNMutableNotificationContent(),
+            trigger: nil
+        )
+
+        #expect(NotificationManager.enqueueResetExpirationNotification(
+            request: request,
+            dedupeKey: dedupeKey,
+            userDefaults: defaults,
+            coordinator: coordinator
+        ) { request, completion in
+            harness.enqueue(request, completion: completion)
+        })
+        #expect(defaults.stringArray(forKey: defaultsKey) == nil)
+        #expect(!NotificationManager.enqueueResetExpirationNotification(
+            request: request,
+            dedupeKey: dedupeKey,
+            userDefaults: defaults,
+            coordinator: coordinator
+        ) { request, completion in
+            harness.enqueue(request, completion: completion)
+        })
+        #expect(harness.count() == 1)
+
+        harness.complete(at: 0, error: nil)
+        #expect(defaults.stringArray(forKey: defaultsKey) == [dedupeKey])
+        #expect(!NotificationManager.enqueueResetExpirationNotification(
+            request: request,
+            dedupeKey: dedupeKey,
+            userDefaults: defaults,
+            coordinator: coordinator
+        ) { request, completion in
+            harness.enqueue(request, completion: completion)
+        })
+    }
+
+    @Test("Failed reset expiration enqueue clears in-flight state and retries")
+    func resetExpirationDedupeRetriesAfterFailure() {
+        let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaultsKey = "reset-test-retry.\(UUID().uuidString)"
+        let coordinator = RateLimitResetNotificationDedupeCoordinator(
+            defaultsKey: defaultsKey,
+            maximumPersistedKeys: 8
+        )
+        let harness = ResetNotificationEnqueueHarness()
+        let dedupeKey = "reset-retry"
+        let request = UNNotificationRequest(
+            identifier: dedupeKey,
+            content: UNMutableNotificationContent(),
+            trigger: nil
+        )
+        let enqueue: RateLimitResetNotificationDedupeCoordinator.Enqueue = {
+            request, completion in
+            harness.enqueue(request, completion: completion)
+        }
+
+        #expect(NotificationManager.enqueueResetExpirationNotification(
+            request: request,
+            dedupeKey: dedupeKey,
+            userDefaults: defaults,
+            coordinator: coordinator,
+            enqueue: enqueue
+        ))
+        harness.complete(at: 0, error: NSError(domain: "test", code: 1))
+        #expect(defaults.stringArray(forKey: defaultsKey) == nil)
+
+        #expect(NotificationManager.enqueueResetExpirationNotification(
+            request: request,
+            dedupeKey: dedupeKey,
+            userDefaults: defaults,
+            coordinator: coordinator,
+            enqueue: enqueue
+        ))
+        #expect(harness.count() == 2)
+        harness.complete(at: 1, error: nil)
+        #expect(defaults.stringArray(forKey: defaultsKey) == [dedupeKey])
     }
 
     private func isolatedDefaults() -> UserDefaults {

@@ -13,6 +13,7 @@ use uuid::Uuid;
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
 const LOCK_UN: i32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,10 @@ impl SecureFileGeneration {
 pub struct SecureFileSnapshot {
     bytes: Option<Vec<u8>>,
     generation: SecureFileGeneration,
+    path: PathBuf,
+    device: Option<u64>,
+    inode: Option<u64>,
+    modified_unix: Option<(i64, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +59,18 @@ impl SecureFileSnapshot {
     pub fn generation(&self) -> &SecureFileGeneration {
         &self.generation
     }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file_identity(&self) -> Option<(u64, u64)> {
+        self.device.zip(self.inode)
+    }
+
+    pub fn modified_unix(&self) -> Option<(i64, u32)> {
+        self.modified_unix
+    }
 }
 
 pub struct SecureFileLock {
@@ -63,12 +80,87 @@ pub struct SecureFileLock {
     name: OsString,
 }
 
+/// Reads a secure file without creating a lock file or repairing filesystem
+/// metadata. Observational commands use this path so diagnostics cannot mutate
+/// the state they are trying to explain.
+pub fn observe(path: &Path, max_bytes: usize, allow_missing: bool) -> Result<SecureFileSnapshot> {
+    let path = normalize_path(path)?;
+    let directory = open_parent_directory(&path, false)?;
+    let name = file_name(&path)?.to_os_string();
+    let mut file = match open_file_at(
+        &directory.file,
+        &name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    ) {
+        Ok(file) => file,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(missing_snapshot(&path));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to open {}", path.display()));
+        }
+    };
+    validate_owned_regular(&file, &path)?;
+    let before = stable_file_identity(&file, &path)?;
+    let length =
+        usize::try_from(before.length).context("secure file length does not fit in memory")?;
+    validate_length(length, max_bytes, &path)?;
+
+    let mut bytes = Vec::with_capacity(length);
+    std::io::Read::by_ref(&mut file)
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    validate_length(bytes.len(), max_bytes, &path)?;
+    if stable_file_identity(&file, &path)? != before {
+        bail!("secure file {} changed during observation", path.display());
+    }
+
+    let reopened = open_file_at(
+        &directory.file,
+        &name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )
+    .with_context(|| format!("failed to reopen {}", path.display()))?;
+    validate_owned_regular(&reopened, &path)?;
+    if stable_file_identity(&reopened, &path)? != before {
+        bail!(
+            "secure file {} was replaced during observation",
+            path.display()
+        );
+    }
+
+    Ok(SecureFileSnapshot {
+        generation: generation_for_bytes(&bytes),
+        bytes: Some(bytes),
+        path,
+        device: Some(before.device),
+        inode: Some(before.inode),
+        modified_unix: stable_modified_unix(before),
+    })
+}
+
 struct SecureDirectory {
     file: fs::File,
     path: PathBuf,
 }
 
 pub fn lock(path: &Path, create_parent: bool) -> Result<SecureFileLock> {
+    try_lock_inner(path, create_parent, false)?
+        .context("blocking secure-file lock unexpectedly returned unavailable")
+}
+
+pub fn try_lock(path: &Path, create_parent: bool) -> Result<Option<SecureFileLock>> {
+    try_lock_inner(path, create_parent, true)
+}
+
+fn try_lock_inner(
+    path: &Path,
+    create_parent: bool,
+    nonblocking: bool,
+) -> Result<Option<SecureFileLock>> {
     let path = normalize_path(path)?;
     let directory = open_parent_directory(&path, create_parent)?;
     let name = file_name(&path)?.to_os_string();
@@ -85,14 +177,22 @@ pub fn lock(path: &Path, create_parent: bool) -> Result<SecureFileLock> {
     validate_owned_regular_identity(&lock_file, &lock_path)?;
     set_mode(&lock_file, &lock_path, FILE_MODE)?;
     validate_owned_regular(&lock_file, &lock_path)?;
-    flock(lock_file.as_raw_fd(), LOCK_EX)
-        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(SecureFileLock {
+    let acquired = if nonblocking {
+        try_flock_exclusive(lock_file.as_raw_fd())?
+    } else {
+        flock(lock_file.as_raw_fd(), LOCK_EX)
+            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        true
+    };
+    if !acquired {
+        return Ok(None);
+    }
+    Ok(Some(SecureFileLock {
         lock_file,
         directory,
         path,
         name,
-    })
+    }))
 }
 
 impl SecureFileLock {
@@ -105,7 +205,7 @@ impl SecureFileLock {
         ) {
             Ok(file) => file,
             Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(missing_snapshot());
+                return Ok(missing_snapshot(&self.path));
             }
             Err(error) => {
                 return Err(error)
@@ -115,7 +215,8 @@ impl SecureFileLock {
         validate_owned_regular_identity(&file, &self.path)?;
         set_mode(&file, &self.path, FILE_MODE)?;
         validate_owned_regular(&file, &self.path)?;
-        let length = usize::try_from(file.metadata()?.len())
+        let identity = stable_file_identity(&file, &self.path)?;
+        let length = usize::try_from(identity.length)
             .context("secure file length does not fit in memory")?;
         validate_length(length, max_bytes, &self.path)?;
         let mut bytes = Vec::with_capacity(length);
@@ -127,6 +228,10 @@ impl SecureFileLock {
         Ok(SecureFileSnapshot {
             generation: generation_for_bytes(&bytes),
             bytes: Some(bytes),
+            path: self.path.clone(),
+            device: Some(identity.device),
+            inode: Some(identity.inode),
+            modified_unix: stable_modified_unix(identity),
         })
     }
 
@@ -530,10 +635,14 @@ fn oversized_generation(metadata: &fs::Metadata) -> SecureFileGeneration {
     ))
 }
 
-fn missing_snapshot() -> SecureFileSnapshot {
+fn missing_snapshot(path: &Path) -> SecureFileSnapshot {
     SecureFileSnapshot {
         bytes: None,
         generation: missing_generation().clone(),
+        path: path.to_path_buf(),
+        device: None,
+        inode: None,
+        modified_unix: None,
     }
 }
 
@@ -589,6 +698,39 @@ fn descriptor_identity(file: &fs::File, path: &Path) -> Result<(u64, u64)> {
         .metadata()
         .with_context(|| format!("failed to fstat {}", path.display()))?;
     Ok((metadata.dev(), metadata.ino()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+fn stable_file_identity(file: &fs::File, path: &Path) -> Result<StableFileIdentity> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to fstat {}", path.display()))?;
+    Ok(StableFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+fn stable_modified_unix(identity: StableFileIdentity) -> Option<(i64, u32)> {
+    u32::try_from(identity.modified_nanoseconds)
+        .ok()
+        .filter(|nanoseconds| *nanoseconds < 1_000_000_000)
+        .map(|nanoseconds| (identity.modified_seconds, nanoseconds))
 }
 
 fn open_directory_at(directory: &fs::File, name: &OsStr) -> std::io::Result<fs::File> {
@@ -687,6 +829,24 @@ fn flock(fd: i32, operation: i32) -> Result<()> {
     }
 }
 
+fn try_flock_exclusive(fd: i32) -> Result<bool> {
+    unsafe extern "C" {
+        #[link_name = "flock"]
+        fn c_flock(fd: i32, operation: i32) -> i32;
+    }
+    loop {
+        if unsafe { c_flock(fd, LOCK_EX | LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(code) if code == libc::EINTR => continue,
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => return Ok(false),
+            _ => return Err(error).context("nonblocking flock failed"),
+        }
+    }
+}
+
 fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
@@ -702,6 +862,18 @@ mod tests {
         fs::write(&temporary, bytes)?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(FILE_MODE))?;
         fs::rename(temporary, path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nonblocking_lock_reports_contention_without_releasing_the_owner() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("provider-io");
+        let owner = try_lock(&path, true)?.context("first nonblocking lock was unavailable")?;
+
+        assert!(try_lock(&path, true)?.is_none());
+        drop(owner);
+        assert!(try_lock(&path, true)?.is_some());
         Ok(())
     }
 
@@ -757,6 +929,37 @@ mod tests {
             transaction.load(1024, false)?.generation(),
             committed.generation()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn observe_reads_without_creating_a_lock_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(DIRECTORY_MODE))?;
+        let path = temp.path().join("state.json");
+        fs::write(&path, b"observed")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(FILE_MODE))?;
+
+        let snapshot = observe(&path, 1024, false)?;
+
+        assert_eq!(snapshot.bytes(), Some(b"observed".as_slice()));
+        assert!(!temp.path().join("state.json.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn observe_rejects_wrong_mode_without_repairing_it() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(DIRECTORY_MODE))?;
+        let path = temp.path().join("state.json");
+        fs::write(&path, b"observed")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+
+        let error = observe(&path, 1024, false).unwrap_err();
+
+        assert!(format!("{error:#}").contains("expected 600"));
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o644);
+        assert!(!temp.path().join("state.json.lock").exists());
         Ok(())
     }
 

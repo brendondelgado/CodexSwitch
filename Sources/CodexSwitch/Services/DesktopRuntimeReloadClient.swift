@@ -11,10 +11,48 @@ enum DesktopReloadCapability: Sendable, Equatable {
 }
 
 enum DesktopReloadResult: Sendable, Equatable {
-    case reloaded(method: String)
+    case reloaded(
+        method: String,
+        discoveredRuntimeCount: Int = 0,
+        acknowledgedRuntimeCount: Int = 0
+    )
     case noDesktopRuntime
-    case unsupported
-    case failed(String)
+    case unsupported(
+        discoveredRuntimeCount: Int = 0,
+        acknowledgedRuntimeCount: Int = 0
+    )
+    case failed(
+        String,
+        discoveredRuntimeCount: Int = 0,
+        acknowledgedRuntimeCount: Int = 0
+    )
+
+    func preservingRuntimeCounts(
+        discovered: Int,
+        acknowledged: Int
+    ) -> DesktopReloadResult {
+        switch self {
+        case .reloaded(let method, _, _):
+            return .reloaded(
+                method: method,
+                discoveredRuntimeCount: discovered,
+                acknowledgedRuntimeCount: acknowledged
+            )
+        case .noDesktopRuntime:
+            return .noDesktopRuntime
+        case .unsupported:
+            return .unsupported(
+                discoveredRuntimeCount: discovered,
+                acknowledgedRuntimeCount: acknowledged
+            )
+        case .failed(let reason, _, _):
+            return .failed(
+                reason,
+                discoveredRuntimeCount: discovered,
+                acknowledgedRuntimeCount: acknowledged
+            )
+        }
+    }
 }
 
 struct CodexDesktopRuntimeSocketBinding: Sendable, Equatable {
@@ -55,7 +93,11 @@ private struct AdmittedDesktopRuntime: Sendable {
 private enum AdmittedDesktopRuntimeResult: Sendable {
     case found(AdmittedDesktopRuntime)
     case noRuntime
-    case failed(String)
+    case failed(
+        String,
+        discoveredRuntimeCount: Int,
+        acknowledgedRuntimeCount: Int
+    )
 }
 
 private enum DesktopRuntimeSocketError: Error {
@@ -99,7 +141,7 @@ struct DesktopRuntimeReloadClient: Sendable {
             context = admitted
         case .noRuntime:
             return .appServerUnavailable
-        case .failed(let reason):
+        case .failed(let reason, _, _):
             return .failed(reason)
         }
         defer { context.admission.release() }
@@ -151,8 +193,12 @@ struct DesktopRuntimeReloadClient: Sendable {
             context = admitted
         case .noRuntime:
             return .noDesktopRuntime
-        case .failed(let reason):
-            return .failed(reason)
+        case .failed(let reason, let discovered, let acknowledged):
+            return .failed(
+                reason,
+                discoveredRuntimeCount: discovered,
+                acknowledgedRuntimeCount: acknowledged
+            )
         }
         defer { context.admission.release() }
 
@@ -194,7 +240,10 @@ struct DesktopRuntimeReloadClient: Sendable {
         }
 
         guard case .reloaded = jsonRPCResult else {
-            return jsonRPCResult
+            return jsonRPCResult.preservingRuntimeCounts(
+                discovered: context.discovery.targets.count,
+                acknowledged: 0
+            )
         }
 
         let strictSummary = dependencies.strictReload(
@@ -207,10 +256,16 @@ struct DesktopRuntimeReloadClient: Sendable {
             return .failed(
                 "strict desktop reload incomplete acknowledged="
                     + "\(strictSummary.acknowledgedRuntimeCount)/"
-                    + "\(strictSummary.discoveredRuntimeCount)"
+                    + "\(strictSummary.discoveredRuntimeCount)",
+                discoveredRuntimeCount: strictSummary.discoveredRuntimeCount,
+                acknowledgedRuntimeCount: strictSummary.acknowledgedRuntimeCount
             )
         }
-        return jsonRPCResult
+        return .reloaded(
+            method: method,
+            discoveredRuntimeCount: strictSummary.discoveredRuntimeCount,
+            acknowledgedRuntimeCount: strictSummary.acknowledgedRuntimeCount
+        )
     }
 
     nonisolated static func probeRequest(method: String, id: Int) -> [String: Any] {
@@ -370,7 +425,7 @@ struct DesktopRuntimeReloadClient: Sendable {
         case .success:
             return nil
         case .methodNotFound:
-            return .unsupported
+            return .unsupported()
         case .transportClosed:
             return .failed("transport closed")
         case .timeout:
@@ -614,7 +669,11 @@ struct DesktopRuntimeReloadClient: Sendable {
         case .noMatches:
             return .noRuntime
         case .failed(let reason):
-            return .failed("desktop runtime discovery failed: \(reason)")
+            return .failed(
+                "desktop runtime discovery failed: \(reason)",
+                discoveredRuntimeCount: 0,
+                acknowledgedRuntimeCount: 0
+            )
         case .snapshot:
             break
         }
@@ -622,7 +681,11 @@ struct DesktopRuntimeReloadClient: Sendable {
         let preliminaryPIDs = SwapEngine.preliminaryReloadPIDs(from: discoveryResult)
         guard !preliminaryPIDs.isEmpty,
               preliminaryPIDs.allSatisfy({ $0 > 0 }) else {
-            return .failed("desktop runtime discovery produced no admissible PID")
+            return .failed(
+                "desktop runtime discovery produced no admissible PID",
+                discoveredRuntimeCount: preliminaryPIDs.count,
+                acknowledgedRuntimeCount: 0
+            )
         }
 
         let admission = dependencies.gate.acquireAdmission(preliminaryPIDs)
@@ -642,7 +705,14 @@ struct DesktopRuntimeReloadClient: Sendable {
             admission.release()
             return discovery.isComplete && discovery.targets.isEmpty
                 ? .noRuntime
-                : .failed("desktop runtime identity discovery incomplete")
+                : .failed(
+                    "desktop runtime identity discovery incomplete",
+                    discoveredRuntimeCount: max(
+                        preliminaryPIDs.count,
+                        discovery.targets.count
+                    ),
+                    acknowledgedRuntimeCount: 0
+                )
         }
 
         let bindings = discovery.targets.compactMap(dependencies.socketBinding)
@@ -660,7 +730,11 @@ struct DesktopRuntimeReloadClient: Sendable {
                       )
               }) else {
             admission.release()
-            return .failed("desktop runtime socket binding incomplete")
+            return .failed(
+                "desktop runtime socket binding incomplete",
+                discoveredRuntimeCount: discovery.targets.count,
+                acknowledgedRuntimeCount: 0
+            )
         }
 
         return .found(AdmittedDesktopRuntime(

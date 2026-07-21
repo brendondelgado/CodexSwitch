@@ -15,8 +15,8 @@ struct RateLimitResetCredit: Codable, Identifiable, Sendable, Equatable {
     }
 
     func isAvailable(at date: Date) -> Bool {
-        guard isAvailable else { return false }
-        return expiresAt.map { $0 > date } ?? true
+        guard isAvailable, let expiresAt else { return false }
+        return expiresAt > date
     }
 
     var normalizedRedemptionIdentifier: String? {
@@ -45,19 +45,27 @@ struct RateLimitResetBank: Codable, Sendable, Equatable {
     let credits: [RateLimitResetCredit]
     let fetchedAt: Date
 
-    func availableCredits(at date: Date = Date()) -> [RateLimitResetCredit] {
-        guard availableCount > 0 else { return [] }
+    func structurallyValidAvailableCredits(
+        at date: Date = Date()
+    ) -> [RateLimitResetCredit]? {
+        guard availableCount >= 0,
+              totalEarnedCount >= 0,
+              availableCount <= totalEarnedCount,
+              !credits.contains(where: { $0.isAvailable && $0.expiresAt == nil }) else {
+            return nil
+        }
 
         var identifiers = Set<String>()
         var normalizedCredits: [RateLimitResetCredit] = []
         for credit in credits where credit.isAvailable(at: date) {
             guard let normalized = credit.normalizedForRedemption(),
                   identifiers.insert(normalized.id).inserted else {
-                return []
+                return nil
             }
             normalizedCredits.append(normalized)
         }
 
+        guard normalizedCredits.count == availableCount else { return nil }
         return normalizedCredits.sorted {
             switch ($0.expiresAt, $1.expiresAt) {
             case let (lhs?, rhs?):
@@ -67,6 +75,10 @@ struct RateLimitResetBank: Codable, Sendable, Equatable {
             case (_, nil): return true
             }
         }
+    }
+
+    func availableCredits(at date: Date = Date()) -> [RateLimitResetCredit] {
+        structurallyValidAvailableCredits(at: date) ?? []
     }
 
     func oldestExpiringCredit(at date: Date = Date()) -> RateLimitResetCredit? {
@@ -86,7 +98,8 @@ struct RateLimitResetBank: Codable, Sendable, Equatable {
     }
 }
 
-enum RateLimitResetRedemptionReason: String, Sendable, Equatable {
+enum RateLimitResetRedemptionReason: String, Codable, Sendable, Equatable {
+    case manual = "manual"
     case weeklyPressure = "weekly_pressure"
     case poolExhausted = "pool_exhausted"
     case expiringSoon = "expiring_soon"
@@ -103,6 +116,43 @@ struct RateLimitResetRedemptionCandidate: Equatable, Sendable {
 enum RateLimitResetPolicy {
     static let expiringSoonInterval: TimeInterval = 24 * 60 * 60
     static let naturalResetProtectionInterval: TimeInterval = 24 * 60 * 60
+
+    static func manualRedemptionUnavailableReason(
+        for account: CodexAccount,
+        bank: RateLimitResetBank?,
+        now: Date = Date()
+    ) -> String? {
+        guard account.planPriority > 1 else {
+            return "Manual redemption is available only for paid accounts"
+        }
+        guard account.hasCompleteRuntimeCredentials else {
+            return "Complete runtime credentials are required to redeem a reset"
+        }
+        guard let bank,
+              bank.isFresh(at: now),
+              bank.hasAvailableReset(at: now) else {
+            return "No fresh banked reset is available"
+        }
+        guard let snapshot = account.realQuotaSnapshot(at: now),
+              snapshot.isFresh(at: now) else {
+            return "Refresh quota before redeeming a reset"
+        }
+        guard !snapshot.hasExpiredExhaustedWindow(now: now) else {
+            return "Refresh quota to confirm the account is still blocked"
+        }
+        guard snapshot.isDenied || !snapshot.blockingWindows.isEmpty else {
+            return "This account still has usable quota"
+        }
+        return nil
+    }
+
+    static func canManuallyRedeem(
+        for account: CodexAccount,
+        bank: RateLimitResetBank?,
+        now: Date = Date()
+    ) -> Bool {
+        manualRedemptionUnavailableReason(for: account, bank: bank, now: now) == nil
+    }
 
     static func selectRedemptionCandidate(
         from accounts: [CodexAccount],
@@ -134,6 +184,19 @@ enum RateLimitResetPolicy {
             if lhs.0.planPriority != rhs.0.planPriority {
                 return lhs.0.planPriority > rhs.0.planPriority
             }
+            switch (
+                lhs.1.bank.nextExpiration(at: now),
+                rhs.1.bank.nextExpiration(at: now)
+            ) {
+            case let (left?, right?) where left != right:
+                return left < right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                break
+            }
             return lhs.0.isOrderedBeforeByStableIdentity(rhs.0)
         }.first?.1
     }
@@ -145,7 +208,9 @@ enum RateLimitResetPolicy {
         runtimeUsageLimit: Bool = false,
         now: Date = Date()
     ) -> RateLimitResetRedemptionReason? {
-        guard bank.isFresh(at: now),
+        guard account.planPriority > 1,
+              account.hasCompleteRuntimeCredentials,
+              bank.isFresh(at: now),
               bank.hasAvailableReset(at: now),
               let snapshot = account.realQuotaSnapshot(at: now),
               snapshot.isFresh(at: now),

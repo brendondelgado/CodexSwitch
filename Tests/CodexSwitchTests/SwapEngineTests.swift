@@ -459,7 +459,10 @@ struct SwapEngineTests {
             frontendNotified: !isCLI,
             frontendWriteCount: isCLI ? 0 : 1,
             authGeneration: isCLI ? 7 : nil,
-            reconnectReady: isCLI ? true : nil
+            reconnectReady: isCLI ? true : nil,
+            initializedFrontendCount: isCLI ? nil : 1,
+            eligibleFrontendCount: isCLI ? nil : 1,
+            rejectedFrontendCount: isCLI ? nil : 0
         )
     }
 
@@ -928,6 +931,30 @@ struct SwapEngineTests {
         )
 
         #expect(upgrade?.id == readyPro.id)
+    }
+
+    @Test("Routine plan upgrade excludes an account protected after manual reset")
+    func planUpgradeExcludesManualResetTarget() {
+        let activePlus = makeAccount(
+            fiveHourRemaining: 80,
+            weeklyRemaining: 80,
+            planType: "plus",
+            isActive: true
+        )
+        let manuallyRecoveredPro = makeAccount(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 100,
+            planType: "pro"
+        )
+
+        #expect(SwapEngine.selectPlanUpgradeCandidate(
+            active: activePlus,
+            from: [activePlus, manuallyRecoveredPro],
+            excluding: [manuallyRecoveredPro.id]
+        ) == nil)
+        #expect(SwapEngine.selectAutoSwapCandidate(
+            from: [activePlus, manuallyRecoveredPro]
+        )?.id == manuallyRecoveredPro.id)
     }
 
     @Test("Active Pro does not downgrade to Plus")
@@ -1683,6 +1710,7 @@ struct SwapEngineTests {
             (
                 initialized: Int?,
                 eligible: Int?,
+                rejected: Int?,
                 notified: Bool,
                 completed: Int,
                 idle: Bool
@@ -1698,6 +1726,7 @@ struct SwapEngineTests {
                 reconnectReady: nil,
                 initializedFrontendCount: initialized,
                 eligibleFrontendCount: eligible,
+                rejectedFrontendCount: rejected,
                 idleListenerReady: idle
             )
         }
@@ -1715,29 +1744,52 @@ struct SwapEngineTests {
             ) != nil
         }
 
-        #expect(isValid(candidate(0, 0, false, 0, true)))
-        #expect(isValid(candidate(2, 2, true, 1, false)))
-        #expect(!isValid(candidate(nil, nil, true, 1, false)))
-        #expect(!isValid(candidate(nil, 2, true, 1, false)))
-        #expect(!isValid(candidate(2, nil, true, 1, false)))
-        #expect(!isValid(candidate(1, 2, true, 1, false)))
-        #expect(!isValid(candidate(nil, nil, false, 0, true)))
-        #expect(!isValid(candidate(1, 1, false, 0, true)))
-        #expect(!isValid(candidate(0, 1, false, 0, true)))
-        #expect(!isValid(candidate(0, 0, false, 0, false)))
-        #expect(!isValid(candidate(1, 1, false, 0, false)))
-        #expect(!isValid(candidate(1, 1, true, 2, false)))
+        #expect(isValid(candidate(0, 0, 0, false, 0, true)))
+        #expect(isValid(candidate(1, 0, 1, false, 0, true)))
+        #expect(isValid(candidate(2, 2, 0, true, 2, false)))
+        #expect(isValid(candidate(2, 1, 1, true, 1, false)))
+        #expect(!isValid(candidate(nil, nil, nil, true, 1, false)))
+        #expect(!isValid(candidate(2, 2, nil, true, 2, false)))
+        #expect(!isValid(candidate(nil, 2, 0, true, 2, false)))
+        #expect(!isValid(candidate(2, nil, 0, true, 2, false)))
+        #expect(!isValid(candidate(1, 2, 0, true, 2, false)))
+        #expect(!isValid(candidate(2, 1, 0, true, 1, false)))
+        #expect(!isValid(candidate(0, 0, 0, false, 0, false)))
+        #expect(!isValid(candidate(1, 1, 0, false, 0, false)))
+        #expect(!isValid(candidate(2, 2, 0, true, 1, false)))
 
         let strictTarget = runtimeTarget(pid: 42, runtimeKind: .externalAppServer)
         let strictBinding = reloadBinding(target: strictTarget)
-        let strictLegacyArtifacts = artifactSnapshots(binding: strictBinding)
+        let strictCompleteArtifacts = artifactSnapshots(binding: strictBinding)
         #expect(SwapEngine.validatedReloadAcknowledgement(
-            request: strictLegacyArtifacts.0,
-            acknowledgement: strictLegacyArtifacts.1,
+            request: strictCompleteArtifacts.0,
+            acknowledgement: strictCompleteArtifacts.1,
             currentBinding: strictBinding,
             expectedBinding: strictBinding,
             nowUnixMilliseconds: now
         ) != nil)
+
+        let strictMissingCounts = CodexReloadAcknowledgement(
+            binding: strictBinding,
+            acknowledgedAtUnixMilliseconds: 1_500_100,
+            loadedTokenFingerprint: strictBinding.authFileIdentity.completeTokenFingerprint,
+            activeTokenFingerprint: strictBinding.authFileIdentity.completeTokenFingerprint,
+            frontendNotified: true,
+            frontendWriteCount: 1,
+            authGeneration: 7,
+            reconnectReady: nil
+        )
+        let strictMissingCountArtifacts = artifactSnapshots(
+            binding: strictBinding,
+            acknowledgement: strictMissingCounts
+        )
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: strictMissingCountArtifacts.0,
+            acknowledgement: strictMissingCountArtifacts.1,
+            currentBinding: strictBinding,
+            expectedBinding: strictBinding,
+            nowUnixMilliseconds: now
+        ) == nil)
 
         let strictIdle = CodexReloadAcknowledgement(
             binding: strictBinding,
@@ -1750,6 +1802,7 @@ struct SwapEngineTests {
             reconnectReady: nil,
             initializedFrontendCount: 0,
             eligibleFrontendCount: 0,
+            rejectedFrontendCount: 0,
             idleListenerReady: true
         )
         let strictArtifacts = artifactSnapshots(
@@ -1838,6 +1891,48 @@ struct SwapEngineTests {
             nowUnixMilliseconds: now,
             maximumArtifactAgeMilliseconds: 1_000,
             maximumFutureSkewMilliseconds: 10
+        ) == nil)
+    }
+
+    @Test("Startup and response ACK admission share the five-minute age limit")
+    func startupAndResponseAdmissionRejectACKsOlderThanFiveMinutes() {
+        let target = runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI)
+        let timestamp: Int64 = 1_500_000
+        let binding = reloadBinding(
+            target: target,
+            issuedAtUnixMilliseconds: timestamp
+        )
+        let artifacts = artifactSnapshots(
+            binding: binding,
+            acknowledgement: acknowledgement(
+                binding: binding,
+                acknowledgedAtUnixMilliseconds: timestamp
+            ),
+            requestModifiedAt: timestamp,
+            acknowledgementModifiedAt: timestamp
+        )
+        let boundary = timestamp + SwapEngine.maximumReloadAcknowledgementAgeMilliseconds
+
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: binding,
+            expectedBinding: nil,
+            nowUnixMilliseconds: boundary
+        ) != nil)
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: binding,
+            expectedBinding: nil,
+            nowUnixMilliseconds: boundary + 1
+        ) == nil)
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: binding,
+            expectedBinding: binding,
+            nowUnixMilliseconds: boundary + 1
         ) == nil)
     }
 

@@ -5,6 +5,8 @@ struct PopoverContentView: View {
     var onAddAccount: () -> Void
     var onForceSwap: (UUID) -> Void
     var onReauthenticate: (UUID) -> Void
+    var onRedeemReset: (UUID) -> Void
+    var resetRedemptionAuthorization: (UUID) -> RateLimitResetCoordinatorAuthorization
     var onOpenSettings: () -> Void
 
     private static let relativeFormatter = RelativeDateTimeFormatter()
@@ -125,6 +127,11 @@ struct PopoverContentView: View {
 
     var body: some View {
         let _ = manager.uiRefreshRevision
+        let resetOverviewItems = RateLimitResetOverviewItem.make(
+            accounts: manager.sortedAccounts,
+            presentations: manager.rateLimitResetPresentations,
+            now: Date()
+        )
         VStack(spacing: 0) {
             HStack {
                 Text("CodexSwitch")
@@ -204,6 +211,11 @@ struct PopoverContentView: View {
                                     vpsRuntimePresentation: manager.vpsRuntimePresentation(for: account),
                                     pollingError: manager.pollingErrors[account.id],
                                     rateLimitResetPresentation: manager.rateLimitResetPresentations[account.id],
+                                    rateLimitResetCoordinatorAuthorization:
+                                        resetRedemptionAuthorization(account.id),
+                                    onRedeemReset: {
+                                        onRedeemReset(account.id)
+                                    },
                                     onReauthenticate: {
                                         onReauthenticate(account.id)
                                     }
@@ -213,6 +225,11 @@ struct PopoverContentView: View {
                             }
                         }
                         .padding(10)
+                    }
+
+                    if !resetOverviewItems.isEmpty {
+                        Divider()
+                        RateLimitResetOverviewView(items: resetOverviewItems)
                     }
 
                     // Pooled usage meter — aggregate capacity vs Pro
@@ -519,5 +536,86 @@ struct PopoverContentView: View {
             .padding(.vertical, 8)
         }
         .frame(width: Self.popoverWidth, height: Self.popoverHeight)
+    }
+}
+
+private struct RateLimitResetOverviewView: View {
+    let items: [RateLimitResetOverviewItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Reset expirations", systemImage: "clock.arrow.circlepath")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+
+            ForEach(items) { item in
+                RateLimitResetOverviewRow(item: item)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+}
+
+private struct RateLimitResetOverviewRow: View {
+    let item: RateLimitResetOverviewItem
+
+    private static let expirationFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    var body: some View {
+        if let errorMessage = item.errorMessage {
+            HStack(spacing: 5) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                Text(item.accountEmail)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text("Error • \(item.availableCount) last-known • \(errorMessage)")
+                    .foregroundStyle(.red)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .font(.system(size: 9, weight: .medium))
+            .help("Reset inventory error for \(item.accountEmail): \(errorMessage). Last-known count: \(item.availableCount)")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                "Reset inventory error for \(item.accountEmail): \(errorMessage). "
+                    + "Last-known count: \(item.availableCount)"
+            )
+        } else if let expiration = item.expiration, let urgency = item.urgency {
+            HStack(spacing: 5) {
+                Image(systemName: urgency.systemImage)
+                    .foregroundStyle(urgency.presentationColor)
+                Text(item.accountEmail)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(
+                    "\(urgency.displayName) • \(item.availableCount) • "
+                        + Self.expirationFormatter.string(from: expiration)
+                )
+                .foregroundStyle(urgency.presentationColor)
+                .lineLimit(1)
+            }
+            .font(.system(size: 9, weight: .medium))
+            .rateLimitResetUrgencyPulse(urgency)
+            .help(
+                "\(urgency.accessibilityDescription) for \(item.accountEmail). "
+                    + "Oldest reset expires \(Self.expirationFormatter.string(from: expiration))"
+            )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                "\(item.accountEmail), \(item.availableCount) banked resets. "
+                    + "\(urgency.accessibilityDescription). Oldest expires "
+                    + Self.expirationFormatter.string(from: expiration)
+            )
+        }
     }
 }

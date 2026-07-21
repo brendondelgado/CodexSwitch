@@ -5,14 +5,18 @@ toc:
   - Backend Contract
   - Automatic Redemption Policy
   - Redemption Ownership
+  - Manual Redemption And Expiration Alerts
   - State And Synchronization
   - Verification Contract
 cross_dependencies:
   - docs/architecture/quota-and-reset-policy.md
   - Sources/CodexSwitch/Models/CodexAccount.swift
   - Sources/CodexSwitch/Services/RateLimitResetService.swift
+  - Sources/CodexSwitch/Services/NotificationManager.swift
   - Sources/CodexSwitch/App/AppDelegate.swift
+  - Sources/CodexSwitch/Models/RateLimitResetPresentation.swift
   - Sources/CodexSwitch/Views/AccountCardView.swift
+  - Sources/CodexSwitch/Views/PopoverContentView.swift
   - Sources/CodexSwitch/Views/PooledUsageMeterView.swift
   - crates/codexswitch-cli/src/account_store.rs
   - crates/codexswitch-cli/src/rate_limit_resets.rs
@@ -22,6 +26,8 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
+  status: canonical
+  last_updated: 2026-07-21
 ---
 
 # CodexSwitch Banked Resets
@@ -32,7 +38,7 @@ The canonical selection and natural-reset policy is
 `docs/architecture/quota-and-reset-policy.md`. This page documents the backend
 adapter, ownership, and verification details and must not redefine that policy.
 
-Eligible Codex Plus and Pro accounts can hold banked rate-limit resets. OpenAI
+Paid accounts may report banked rate-limit resets. OpenAI
 documents that these rewards can expire 30 days after grant and that applying a
 reset is a separate user action after a usage limit is reached. A reset is not
 an API credit balance and is not transferable.
@@ -93,8 +99,8 @@ Replacement and reset selection is pool-wide and follows this order:
 1. Use immediately usable capacity in the same or a higher plan tier. This
    capacity check includes the active account even though the active account is
    not a rotation destination.
-2. Rank eligible reset candidates by plan priority, then by stable account
-   identity within a tier.
+2. Rank eligible reset candidates by plan priority, then by the account's
+   oldest available-credit expiration, then by stable account identity.
 3. For an exhausted Pro account with only usable lower-tier capacity available,
    apply the Pro reset when its blocking natural reset is more than 24 hours
    away. After inventory and quota reconcile, activate that Pro account before
@@ -135,7 +141,10 @@ owner. The VPS daemon continues to poll quota and rotate accounts, but automatic
 reset redemption has no daemon opt-in. Automatic in-turn recovery calls
 `rotate-now` without reset ownership and therefore rotates only. Manual CLI
 redemption remains available for an operator-controlled recovery through
-`rotate-now --allow-banked-reset`.
+`redeem-reset <account>`. That command accepts one exact blocked paid account,
+requires its complete runtime credential set and normalized stable provider
+identity, consumes at most one credit, never activates the account, and replays
+an existing uncertain journal without submitting a second credit.
 
 Running two automatic owners is a correctness failure even though each consume
 request has its own idempotency key. Two owners can select different available
@@ -149,12 +158,92 @@ on 2026-07-13 at 07:09:48 UTC runs without reset redemption. Removing the daemon
 opt-in makes that single-owner boundary structural rather than configuration
 advice.
 
-As defense in depth, a host that observes `available_count` fall without its own
-redemption in flight treats the change as an external redemption. It must force
-a fresh quota read and suppress automatic redemption for that account for at
-least 15 minutes, unless a newer, non-placeholder quota response first proves
-the account usable. It must not consume another credit using the quota snapshot
-that preceded the inventory drop.
+As defense in depth, every fresh inventory passes one transition classifier
+before replacing the previous authoritative bank. The decision baseline is not
+rebased by preflight, final authorization, background refresh, or reconciliation.
+A host that observes an available credit disappear without an exact one-credit
+local expectation treats the change as an external redemption. A local
+expectation is bound to one attempt UUID, one credit UUID, one provider account,
+and one starting count; it can explain only the transition from `N` to `N - 1`
+that removes that selected credit while preserving every other available credit
+and while the selected credit's recorded expiration remains in the future. A
+selected credit that could have expired naturally cannot prove redemption from
+absence and count decrease alone.
+The inventory observation timestamp is captured after the provider response
+completes, preventing a credit that expires during the request from being
+treated as a pre-expiry disappearance.
+A submitted expectation remains attached to its exact unresolved journal entry
+until that attempt becomes terminal or its one decrement is explained; task
+cleanup alone cannot discard it. Provider account identifiers are normalized at
+every journal read, comparison, and write boundary, including legacy entries, so
+case or surrounding whitespace cannot create a second redemption owner.
+A `3 -> 1` transition, a different removed credit, a same-count replacement, or
+an additional later decrement creates the persisted 15-minute external hold.
+CodexSwitch must force a quota read newer than that observation and must not
+consume another credit using the quota snapshot that preceded the change.
+
+## Manual Redemption And Expiration Alerts
+
+Each eligible account card exposes one reset icon button. It is enabled only
+for a fresh blocked paid account with complete runtime credentials and a fresh
+available reset. An available credit must have a normalized identifier and an
+explicit future expiration; missing or expired expiration evidence makes the
+inventory malformed and cannot authorize redemption. The confirmation names the
+account, spends its oldest-expiring available credit, and explicitly states that
+the configured account will not change. Redeeming, reconciling,
+error, stale, and external-hold states replace the action until the durable
+journal proves another submission is safe.
+
+Manual intent is persisted with the reset attempt. While that attempt is
+unresolved and after it reconciles, routine plan-upgrade logic must not switch
+to the recovered account until a real usage failure or explicit operator
+selection successfully activates it. That activation durably releases the
+route-specific suppression. Usage-failure routing remains available throughout.
+Live suppression state is keyed by the normalized provider account identity,
+not the disposable local account UUID, so removing and re-adding an account
+cannot bypass the hold. Starting or failing a later manual attempt cannot
+downgrade an older durable hold, and reconciliation cannot restore a hold that
+the journal already records as released. An activation release captures the
+provider's live suppression revision before journal I/O and clears it only if
+no newer manual operation changed that revision while the actor was suspended.
+Journal restore applies independently per provider and is discarded when its
+captured revision is stale, a release is in flight, or it would erase a local
+pending intent that has not reached the journal yet.
+The newest unreleased successful suppression per provider account is exempt
+from ordinary terminal journal pruning, keeping restart behavior durable without
+unbounded per-account history.
+
+If the reset journal is unreadable during startup, automatic routing and manual
+redemption remain blocked while the app retries bounded journal reads. No empty
+in-memory default is allowed to stand in for unknown reset ownership.
+
+Manual redemption does not reload a desktop or CLI runtime. Immediately before
+transport, CodexSwitch requires an unchanged complete available-credit list and
+count relative to the immutable decision baseline, a clear persisted
+external-redemption hold, the same exact activation generation and phase,
+matching durable configured files, the exclusive mutation lease, and an exact
+readback of the complete submitted journal value. The resulting lease-only
+transport permit expires after ten seconds. Only then does CodexSwitch publish
+the attempt-bound one-credit local expectation. Immediately before the POST,
+the Linux control plane also acquires a dedicated provider-I/O lease and
+revalidates the exact activation-journal identity. Account and reset-journal
+locks remain released for network I/O, but activation-journal mutation fails
+closed until the POST returns and the lease is released.
+
+The action model receives coordinator authorization as production state, not as
+a second copy of reset policy. Unreadable hold storage, any active redemption,
+missing configured or activation state, unresolved attempts, and active local or
+external holds disable each affected button with the coordinator's reason before
+confirmation.
+
+The popover includes an unframed reset-expiration list ordered by exact expiry
+and stable account identity. Credits enter advisory styling at seven days,
+urgent orange pulsing at 72 hours, and critical red faster pulsing at 24 hours.
+Reduce Motion disables pulsing without hiding urgency. System notifications
+are deduplicated by provider account, expiration, and urgency band, allowing a
+new alert only when the same credit crosses a more urgent boundary. The key is
+persisted after successful enqueue, never before it. An in-flight claim blocks a
+duplicate enqueue for the same key; failure releases the claim for a later retry.
 
 ## State And Synchronization
 
@@ -163,6 +252,12 @@ expiration metadata, and fetch time. The Mac uses a five-minute background
 freshness window and at-most-sixty-second decision evidence. Ranking
 observations must never overwrite the durable "before" bank used to detect an
 external redemption.
+
+Timestamp freshness alone is insufficient. Cached inventory is current only
+when its complete available-credit list still matches the count at the current
+time, every available credit has a normalized identifier and future expiration,
+and identifiers are unique. A naturally expired credit is inventory churn, not
+an external redemption, and must not create the 15-minute external hold.
 
 Mac and VPS account stores use the same camel-case JSON shape. Rotation
 ownership and redemption ownership are separate: both hosts may protect their
@@ -181,9 +276,11 @@ quota confirmation.
 ## Verification Contract
 
 Tests must cover inventory parsing, oldest-expiring selection, each policy
-branch, pool-wide plan ordering, stable same-tier ordering, active-account
+branch, pool-wide plan ordering, same-tier expiration and stable tie ordering,
+active-account
 capacity suppression, the 24-hour natural-reset guard and pool-exhaustion
-override, count-only inventory suppression, malformed responses,
+override, count-only inventory suppression, zero-count and partial-count
+contradictions, malformed responses,
 uncertain-request reconciliation, and consume response codes. Pure policy tests
 must prove that an inactive exhausted Pro ranks ahead of an active usable Plus,
 while a near natural reset or another usable Pro prevents redemption.
@@ -191,6 +288,20 @@ Cross-host tests must prove that the daemon exposes no automatic redemption
 option. Mac tests must prove that an external
 inventory decrement survives restart and blocks a second redemption for 15
 minutes, while newer usable quota evidence may clear the hold early.
+Mac tests must also prove that manual redemption can use a lease-only durable
+activation permit without a runtime reload, while automatic redemption still
+requires confirmed runtime evidence, and that any available-credit inventory
+change revokes the final submission permit. The orchestration boundary must use
+the production mode contract to prove that manual mode requests no runtime
+authorization, auth write, swap, or activation, while automatic mode requires
+runtime authorization. Transition tests must cover preflight external rebasing,
+the exact local `N -> N - 1` explanation, `3 -> 1`, wrong-credit removal, and an
+additional later decrement. Journal tests must reject any non-exact submitted
+attempt readback. Notification tests must prove enqueue success persistence,
+failure and later retry, and duplicate in-flight suppression. UI tests must also cover
+account-specific eligibility, confirmation routing,
+urgency boundaries, layout-stable pulse values, Reduce Motion behavior, sorted
+account attribution, error presentation, and notification deduplication.
 Independent-process lock tests launch nested Swift Testing runs through
 `swiftpm-testing-helper` when SwiftPM exposes an `.xctest` bundle as argument
 zero; the bundle binary itself is not an executable process entrypoint.
@@ -202,13 +313,22 @@ When the active Command Line Tools package does not include `TestingMacros`,
 compile and run `scripts/test-banked-resets.swift` with the reset model and
 service sources as the deterministic local replay. The harness resolves the
 macOS temporary-directory alias before creating its journal so the secure
-no-symlink storage contract is exercised against the canonical path. The normal
+no-symlink storage contract is exercised against the canonical path. It passes
+account-bound runtime and lease evidence through the production submission
+permit, while an injected scripted transport keeps every request in-process;
+the replay cannot make a network request or consume a real reset. The normal
 Swift Testing suite remains the canonical CI path when full Xcode is available.
 
 Run the deterministic replay from the repository root:
 
 ```bash
-swiftc -parse-as-library -o /private/tmp/test-banked-resets \
+replay_root="$(mktemp -d /private/tmp/codexswitch-banked-reset-replay.XXXXXX)"
+trap 'find "$replay_root" -depth -delete' EXIT
+mkdir -p "$replay_root/module-cache" "$replay_root/tmp"
+TMPDIR="$replay_root/tmp" \
+CLANG_MODULE_CACHE_PATH="$replay_root/module-cache" \
+swiftc -module-cache-path "$replay_root/module-cache" \
+  -parse-as-library -o "$replay_root/test-banked-resets" \
   scripts/test-banked-resets.swift \
   Sources/CodexSwitch/Models/QuotaSnapshot.swift \
   Sources/CodexSwitch/Models/CodexAccount.swift \
@@ -216,5 +336,5 @@ swiftc -parse-as-library -o /private/tmp/test-banked-resets \
   Sources/CodexSwitch/Services/UsageResponseParser.swift \
   Sources/CodexSwitch/Services/RateLimitResetService.swift \
   Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
-/private/tmp/test-banked-resets
+"$replay_root/test-banked-resets"
 ```

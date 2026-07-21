@@ -71,7 +71,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-20
+  last_updated: 2026-07-21
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -88,7 +88,7 @@ A Codex runtime is hot-swap ready only when all three facts are true:
 
 1. **Store state:** CodexSwitch has an active account selected and at least one usable fallback account.
 2. **Auth file state:** `~/.codex/auth.json` matches CodexSwitch's active account token source.
-3. **Runtime state:** each live Codex runtime has acknowledged a reload after the latest swap signal.
+3. **Runtime state:** each live Codex runtime has acknowledged a reload after the latest swap signal. Process start time is never substitute evidence.
 
 Marker strings such as `sighup-verified` and `SIGHUP: auth reloaded` are necessary but not sufficient. They prove the binary was patched; they do not prove the running process loaded the new token.
 
@@ -115,24 +115,31 @@ internal queue is not delivery. This proof is ACK contract version 3 and is adve
 without notifying the renderer leaves the visible account and React Query caches
 stale. Desktop readiness therefore requires the runtime marker for this full
 contract; a historical `desktop-auth-watcher-ready` file is not live evidence.
-The ASAR auth callback must also contain the current versioned cache-invalidation
-marker. A bare `_invalidateAccountQueries` function name is not sufficient: the
-July 19, 2026 renderer incident placed that helper inside a lazy initializer while
-calling it from module scope, producing an unhandled `ReferenceError`, provider
-unmount, renderer remount, and lost composer text. Reject and migrate that unsafe
-generation before launching the desktop app.
+The ASAR auth callback must also contain the complete current renderer patch:
+`CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3`,
+`CODEXSWITCH_AUTH_EVENT_DEDUPE_V1`,
+`CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1`, and
+`CODEXSWITCH_AUTH_TRANSITION_V2`. A bare `_invalidateAccountQueries` function
+name is not sufficient: the July 19, 2026 renderer incident placed that helper
+inside a lazy initializer while calling it from module scope, producing an
+unhandled `ReferenceError`, provider unmount, renderer remount, and lost composer
+text. Reject and migrate that unsafe generation before launching the desktop app.
 
 The repository-owned `--remote-control --listen ws://...` service instead binds
 the request and ACK to `headless-remote-control-app-server` and advertises
-`codexswitch-hotswap-headless-idle-v1`. When its transport reports exactly zero
-initialized and eligible frontends, it may acknowledge an idle listener after
-the same auth reload and cache checks. That ACK explicitly marks idle-listener
-readiness, reports zero completed writes, and reports no frontend notification.
-It proves that a future client will initialize against the new auth manager; it
-does not claim a currently connected client was notified. A timeout or failed
-proof channel is not zero-frontends evidence. If any initialized frontend
-exists, at least one completed write remains mandatory. The strict
-`external-app-server` kind never accepts this idle shape.
+`codexswitch-hotswap-headless-idle-v1`. An initialized connection becomes
+eligible only after its transport accepts the notification. A disconnected
+historical connection that rejects enqueue before eligibility is excluded from
+the eligible-writer count and does not block an idle-listener ACK. When no live
+writer accepts delivery, the service may acknowledge an idle listener after the
+same auth reload and cache checks. That ACK explicitly marks idle-listener
+readiness, reports zero eligible and completed writes, and reports no frontend
+notification. It proves that a future client will initialize against the new
+auth manager; it does not claim a currently connected client was notified. Once
+any writer accepts the notification, the idle shape is forbidden and every
+eligible writer must complete the transport write. An accepted-but-undelivered
+writer, timeout, partial write set, or failed proof channel remains degraded.
+The strict `external-app-server` kind never accepts the idle shape.
 
 A local interactive CLI embeds an in-process app-server but has no desktop
 renderer writer. Its `local-interactive-cli` acknowledgement may complete after
@@ -334,6 +341,23 @@ CodexSwitch must evaluate these independently:
   signal only after `proc_pidpath` independently resolves the same executable
   identity captured at discovery. A changed or unavailable kernel path fails
   closed; a prepared update must converge process identity before reload.
+- **Linux executable evidence:** marker probing must use the kernel-resolved
+  running executable, opened without following a mutable path and proven to be
+  a regular file. A FIFO, symlink, device/inode change, or unavailable
+  `/proc/<pid>/exe` blocks reload rather than falling back to the pathname.
+- **Generation continuity:** quota and reset observation commits must either
+  advance a matching `Confirmed` activation to the exact new account-store
+  generation or leave a durable barrier. Reconciliation validates `Confirmed`
+  records too; a store/journal split cannot be treated as ready.
+- **Operator observation preflight:** `poll` and `redeem-reset` reconcile and
+  validate the activation barrier before any provider callback. Transitional or
+  unresolved activation state must produce zero quota, inventory, and consume
+  requests. The guard must bind activation-journal identity as well as store
+  generation, and reset consumption must hold the provider-I/O lease across the
+  unlocked POST while production activation writes prove that they fail closed
+  under the same lease.
+- **Credential completeness:** access, refresh, and identity tokens containing
+  only whitespace are incomplete in activation, import, and runtime evidence.
 - **SIGHUP ownership:** current upstream app-server builds may register `SIGHUP` as a graceful shutdown signal. The patched runtime must remove that shutdown branch so the CodexSwitch auth-reload task is the only SIGHUP subscriber. A valid ack followed by process exit is a failed hot-swap, not readiness.
 - **macOS process discovery:** exclude ChatGPT framework services, renderers, and crash reporters by executable identity. A helper command containing a bundle path that ends in `Codex` is not an interactive CLI and must never be reported or signaled as one.
 - **Cross-owner stale rotation record:** a recognized version-3 legacy degraded-token mismatch may adopt the one exact store/auth active account, but it must reload and acknowledge that account before continuing to a requested replacement. Unrecognized manual-review records remain hard barriers.
@@ -391,6 +415,24 @@ versions. CodexSwitch's fallback updater must accept both `ChatGPT.app` and
 legacy `Codex.app` archive layouts, install to the current product name, verify
 the stock OpenAI signature, and let the normal patch monitor reapply desktop
 compatibility only after the app has quit.
+
+Every new desktop build is a compatibility fixture before it is an install
+candidate. Run `scripts/patch-asar.py` against the exact downloaded bundle in a
+staging directory, require a complete repack and strict signature verification,
+then extract the staged ASAR and verify every required marker. Do not launch,
+quit, or foreground the live ChatGPT app during this proof. A changed minified
+shape is a release blocker until a small regression fixture describes the new
+semantic contract and the full patcher suite passes.
+
+The patcher may mark an upstream-native safe path without rewriting it, but only
+after proving the behavior narrowly. For example, the recent-thread manager may
+already hard-code `useStateDbOnly: true`, and the selected model trigger may
+already consume the normalized option `modelLabel`. The marker attests that
+verified data flow. Ambiguous managers, a false state-database flag, a missing
+label consumer, or an unrecognized network-config expression must fail closed.
+The Statsig fail-open wrapper must receive the exact network configuration from
+the failed bootstrap branch; it must not guess a global default when upstream
+selects configuration dynamically.
 
 ## Desktop Bridge Verification
 
@@ -757,7 +799,11 @@ Incident note from 2026-05-03 03:34 UTC: the Mac menu app reported `LINUX_DEVBOX
 - VPS ack evidence: `~/.codexswitch/hotswap-ack/2765261.json` was created at `03:34:32.122Z`.
 - Next Mac monitor check: `03:34:55.618Z` returned ready.
 
-Treat one recovered not-ready result after a previously ready VPS as a transient bootstrap blip in the UI; suppress orange flicker until two consecutive issue checks fail. Still log the first blip as `LINUX_DEVBOX_TRANSIENT_*` so a recurring pattern remains visible. Two consecutive issue checks are real operator-visible not-ready state.
+This incident records the former daemon-bootstrap behavior; it is not the
+current contract. A restarted runtime without a current acknowledgement remains
+not ready until an explicit activation or rotation proves convergence. Do not
+signal it from a status probe or suppress that missing proof as a transient
+green state.
 
 ## Verification Checklist
 
@@ -765,7 +811,9 @@ Before claiming hot-swap is fixed or ready:
 
 - [ ] `codexswitch-cli auth-diagnostics` shows active account hash equals `auth.json` hash.
 - [ ] `codexswitch-cli doctor` reports live runtimes as verified, not merely patched.
-- [ ] A fresh app-server restart is auto-acknowledged by the daemon bootstrap reload without waiting for a real quota swap.
+- [ ] A fresh app-server restart remains not ready until an explicit activation
+  or rotation creates a current acknowledgement; daemon polling and status
+  checks send no bootstrap signal.
 - [ ] A fresh Mac `9223` bridge restart can bootstrap its first ACK during an
   explicit desktop activation, but only when the launchd PID, generated bridge
   files, their embedded exact managed route, expected runtime/helper hashes,
@@ -785,7 +833,7 @@ Before claiming hot-swap is fixed or ready:
 - [ ] Exiting the final historical CLI and resuming through the managed launcher re-arms an exhausted same-target journal without relaunching CodexSwitch.
 - [ ] The installed desktop version matches the latest official appcast release, or a newer signed release is staged for the next safe quit.
 - [ ] The installed ASAR contains exactly one Fast compatibility marker declaration, and the patched renderer still honors an explicit `featureRequirements.fast_mode == false` prohibition.
-- [ ] The installed ASAR contains `CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3` and `CODEXSWITCH_AUTH_TRANSITION_V2` exactly once each, contains no nested legacy WeakMap helper, and executable fixtures prove subscriber invalidations coalesce and stale null reads cannot overwrite a newer authenticated generation. A same-account auth notification must produce no redundant account-read fanout, `_invalidateAccountQueries is not defined`, provider unmount, route remount, tokenless `401`, or window reload.
+- [ ] The installed ASAR contains `CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3`, `CODEXSWITCH_AUTH_EVENT_DEDUPE_V1`, `CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1`, and `CODEXSWITCH_AUTH_TRANSITION_V2` exactly once each, contains no nested legacy WeakMap helper, and executable fixtures prove subscriber invalidations coalesce while rapid distinct `chatgpt` events still produce distinguishable newest-account results. A same-account auth notification must produce no redundant account-read fanout, stale null overwrite, `_invalidateAccountQueries is not defined`, provider unmount, route remount, tokenless `401`, or window reload.
 - [ ] The installed ASAR contains `CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2`; its fallback adds no immediate mount refresh, polls at 60 seconds, retains native callback and startup updates, and clears its single timer on unmount.
 - [ ] The installed ASAR contains `CODEXSWITCH_RECENT_THREADS_STATE_DB_V1`, ordinary sidebar `thread/list` requests use `useStateDbOnly: true`, and archive/search/hydration behavior is unchanged.
 - [ ] The installed ASAR contains `CODEXSWITCH_STATSIG_FAIL_OPEN_V1` exactly once, and the failed post-login bootstrap branch mounts the synchronous fail-open provider rather than the unbounded async identity/client fallback.
@@ -817,7 +865,7 @@ Every future hot-swap change must include tests for:
 - A fresh ACK from the running PID remains authoritative when the executable at that path was replaced after process start or the executable path cannot be resolved.
 - Desktop readiness rejects binaries that reload backend auth without broadcasting `account/updated` to the shell.
 - Missing or malformed auth produces no successful ACK and does not replace valid cached auth with `None`.
-- Only the capability-bound `headless-remote-control-app-server` kind may use an explicit zero-count idle-listener ACK after verified auth reload. Strict external app-servers, a timeout, contradictory count, closed frontend writer, initialized frontend with zero completed writes, or same-second stale ACK cannot.
+- Only the capability-bound `headless-remote-control-app-server` kind may use an explicit zero-count idle-listener ACK after verified auth reload. Rejected-before-eligibility historical connections are excluded from the writer count, but any writer that accepted the notification is eligible and forbids the idle shape until its transport write completes. Strict external app-servers, an accepted-but-undelivered writer, timeout, contradictory count, or same-second stale ACK cannot use the idle shape.
 - A successfully delivered SIGHUP marks runtime auth as potentially changed even when no ACK follows; import rollback requires verified compensating convergence or a durable `ManualReview` result.
 - The SIGHUP request nonce is unique per signal and must be echoed by the matching PID ACK.
 - An external app-server rejects a CLI-kind ACK, and a local interactive CLI accepts only its CLI-kind ACK with exact nonce/fingerprints plus auth-generation/reconnect readiness.
@@ -835,8 +883,21 @@ Every future hot-swap change must include tests for:
   store/auth agreement before publishing configured-only recovery.
 - App-server patching targets the `AuthManager` captured by `MessageProcessor`, not an earlier preload/auth probe.
 - Expired or quota-exhausted active accounts rotate to usable candidates and rewrite `auth.json`.
-- Runtime `UsageLimitReached` inside Codex rotates once, reloads the active `AuthManager`, and retries the turn before surfacing an error.
-- In-turn usage-limit and auth-failure rotation passes the exact verified auth path to normal `rotate-now`, uses a bounded configurable timeout and output limit, requires the CLI's verified-runtime result, reloads that exact path through the turn `AuthManager`, compares the complete fingerprint, and retries only once. The injected path must not contain `--no-reload` or synthesize a default auth path.
+- Runtime `UsageLimitReached` inside Codex generates a canonical receipt UUID,
+  invokes only `$HOME/.local/bin/codexswitch-cli`, rotates once, reloads the
+  active turn `AuthManager`, and retries before surfacing the original error.
+- In-turn usage-limit and auth-failure rotation passes the exact verified auth
+  path and receipt UUID to normal `rotate-now`, uses a bounded timeout and
+  per-stream output limit, and requires a confirmed report whose request count,
+  SIGHUP count, ACK nonce set, and final topology all prove that same receipt.
+  The turn rereads its own request and ACK, requires a newer complete token
+  fingerprint, reloads that exact path through its own `AuthManager`, and
+  retries only after loaded and active fingerprints agree. The injected path
+  must not use `PATH`, `CODEXSWITCH_CLI`, `--no-reload`, or a synthesized auth
+  path.
+- An auth failure first attempts one verified reload when another owner already
+  changed the bound auth file. It rotates only if that reload cannot recover the
+  turn, and each recovery branch has an independent one-attempt guard.
 - Injected path binding rejects stale/future ACKs, PID-reuse start identities,
   wrong runtime kinds, mismatched or missing request nonces, changed disk auth
   fingerprints, symlinked artifacts, and oversized ACK/request files.
@@ -879,7 +940,9 @@ Every future hot-swap change must include tests for:
 - Remote/client wrapper processes are not signaled as if they were account-bearing runtimes.
 - CLI readiness/status checks are read-only and never send SIGHUP to bootstrap acknowledgement.
 - `doctor` and UI copy say `not verified` or `restart required` instead of showing a green state when acknowledgement is missing.
-- A single VPS not-ready check after a ready state is debounced, but two consecutive not-ready checks still surface orange and notify.
+- A missing or expired VPS acknowledgement invalidates green immediately; the
+  diagnostic payload may remain visible only as stale and never contributes to
+  readiness.
 
 ## Incident Review Questions
 

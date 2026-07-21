@@ -14,9 +14,12 @@ struct AccountCardView: View {
     var vpsRuntimePresentation: VPSRuntimeAccountPresentation = .disconnected
     var pollingError: String? = nil
     var rateLimitResetPresentation: RateLimitResetInventoryPresentation? = nil
+    var rateLimitResetCoordinatorAuthorization: RateLimitResetCoordinatorAuthorization = .authorized
+    var onRedeemReset: (() -> Void)? = nil
     let onReauthenticate: (() -> Void)?
     let onForceSwap: (() -> Void)?
     @State private var isHovering = false
+    @State private var isConfirmingResetRedemption = false
 
     private static let activeGreen = Color(red: 0.15, green: 0.68, blue: 0.25)
     private static let renewalFormatter: DateFormatter = {
@@ -35,6 +38,13 @@ struct AccountCardView: View {
     private static let resetExpiryFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.setLocalizedDateFormatFromTemplate("MMM d")
+        return formatter
+    }()
+
+    private static let resetExpiryDetailFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
         return formatter
     }()
 
@@ -148,7 +158,13 @@ struct AccountCardView: View {
         return "5h triggered \(Self.primedFormatter.string(from: primedAt))"
     }
 
-    private var rateLimitResetLine: (text: String, color: Color, help: String)? {
+    private var rateLimitResetLine: (
+        text: String,
+        color: Color,
+        help: String,
+        systemImage: String,
+        urgency: RateLimitResetExpirationUrgency?
+    )? {
         guard let rateLimitResetPresentation else {
             return nil
         }
@@ -157,38 +173,66 @@ struct AccountCardView: View {
         let holdUntilText: String?
         let color: Color
         let help: String
+        let systemImage: String
+        let urgency: RateLimitResetExpirationUrgency?
         switch rateLimitResetPresentation {
         case .current(_, let nextExpiration):
             nextExpirationText = nextExpiration.map {
                 Self.resetExpiryFormatter.string(from: $0)
             }
             holdUntilText = nil
-            color = .teal
-            help = "Current reset inventory"
+            urgency = nextExpiration.map {
+                RateLimitResetExpirationUrgency.resolve(expiration: $0, now: Date())
+            }
+            color = urgency?.presentationColor ?? .teal
+            systemImage = urgency?.systemImage ?? "arrow.counterclockwise.circle.fill"
+            if let nextExpiration, let urgency {
+                help = "\(urgency.accessibilityDescription). Oldest banked reset expires "
+                    + Self.resetExpiryDetailFormatter.string(from: nextExpiration)
+            } else {
+                help = "Current reset inventory"
+            }
+        case .error(let message, let lastKnownCount):
+            nextExpirationText = nil
+            holdUntilText = nil
+            color = .red
+            systemImage = "exclamationmark.triangle.fill"
+            urgency = nil
+            help = "Reset inventory error: \(message). Last-known count: \(max(0, lastKnownCount))"
         case .stale:
             nextExpirationText = nil
             holdUntilText = nil
             color = .orange
+            systemImage = "clock.badge.exclamationmark.fill"
+            urgency = nil
             help = "Last-known reset inventory"
         case .externalHold(let until):
             nextExpirationText = nil
             holdUntilText = Self.resetHoldFormatter.string(from: until)
             color = .orange
+            systemImage = "pause.circle.fill"
+            urgency = nil
             help = "Reset redemption is temporarily on hold"
         case .redeeming:
             nextExpirationText = nil
             holdUntilText = nil
             color = .blue
+            systemImage = "arrow.counterclockwise.circle.fill"
+            urgency = nil
             help = "Reset redemption is in progress"
         case .reconciling:
             nextExpirationText = nil
             holdUntilText = nil
             color = .orange
+            systemImage = "arrow.triangle.2.circlepath.circle.fill"
+            urgency = nil
             help = "Reset inventory is reconciling"
         case .refreshing:
             nextExpirationText = nil
             holdUntilText = nil
             color = .blue
+            systemImage = "arrow.clockwise.circle.fill"
+            urgency = nil
             help = "Reset inventory is refreshing"
         }
 
@@ -199,7 +243,9 @@ struct AccountCardView: View {
                 holdUntilText: holdUntilText
             ),
             color,
-            help
+            help,
+            systemImage,
+            urgency
         )
     }
 
@@ -213,6 +259,8 @@ struct AccountCardView: View {
             return "Redeeming banked reset"
         case .reconciling:
             return "Reconciling reset inventory"
+        case .error(let message, let lastKnownCount):
+            return "Reset error: \(message) • last-known: \(resetCountText(lastKnownCount))"
         case .externalHold:
             return holdUntilText.map { "Reset hold until \($0)" }
                 ?? "Reset redemption on hold"
@@ -233,6 +281,28 @@ struct AccountCardView: View {
         let normalizedCount = max(0, count)
         let noun = normalizedCount == 1 ? "reset" : "resets"
         return "\(normalizedCount) banked \(noun)"
+    }
+
+    func resetRedemptionActionPresentation(
+        at now: Date = Date()
+    ) -> RateLimitResetRedemptionActionPresentation {
+        RateLimitResetRedemptionActionPresentation.resolve(
+            account: account,
+            inventory: rateLimitResetPresentation,
+            coordinatorAuthorization: rateLimitResetCoordinatorAuthorization,
+            now: now
+        )
+    }
+
+    @discardableResult
+    @MainActor
+    func handleConfirmedResetRedemption(at now: Date = Date()) -> Bool {
+        guard resetRedemptionActionPresentation(at: now).isEnabled,
+              let onRedeemReset else {
+            return false
+        }
+        onRedeemReset()
+        return true
     }
 
     var requiresReauthentication: Bool {
@@ -372,12 +442,41 @@ struct AccountCardView: View {
             }
 
             if let rateLimitResetLine {
+                let redemptionAction = resetRedemptionActionPresentation()
+                let redemptionIsConnected = onRedeemReset != nil
                 HStack(spacing: 4) {
-                    Image(systemName: "arrow.counterclockwise.circle.fill")
-                        .font(.system(size: 9))
-                    Text(rateLimitResetLine.text)
-                        .font(.system(size: 9, weight: .medium))
-                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        Image(systemName: rateLimitResetLine.systemImage)
+                            .font(.system(size: 9))
+                        Text(rateLimitResetLine.text)
+                            .font(.system(size: 9, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .rateLimitResetUrgencyPulse(rateLimitResetLine.urgency)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(rateLimitResetLine.help)
+
+                    Spacer(minLength: 2)
+
+                    Button {
+                        isConfirmingResetRedemption = true
+                    } label: {
+                        Label(
+                            "Redeem one banked reset for \(account.email)",
+                            systemImage: "arrow.counterclockwise"
+                        )
+                        .labelStyle(.iconOnly)
+                    }
+                    .font(.system(size: 9, weight: .semibold))
+                    .buttonStyle(.plain)
+                    .disabled(!redemptionAction.isEnabled || !redemptionIsConnected)
+                    .help(redemptionIsConnected
+                        ? redemptionAction.helpText
+                        : "Manual reset redemption is not connected")
+                    .accessibilityLabel("Redeem one banked reset for \(account.email)")
+                    .accessibilityHint(redemptionIsConnected
+                        ? redemptionAction.helpText
+                        : "Manual reset redemption is not connected")
                 }
                 .foregroundStyle(rateLimitResetLine.color)
                 .help(rateLimitResetLine.help)
@@ -524,6 +623,82 @@ struct AccountCardView: View {
                 NSPasteboard.general.setString(account.email, forType: .string)
             }
         }
+        .confirmationDialog(
+            "Redeem one banked reset for \(account.email)?",
+            isPresented: $isConfirmingResetRedemption,
+            titleVisibility: .visible
+        ) {
+            Button("Redeem Oldest Reset", role: .destructive) {
+                _ = handleConfirmedResetRedemption()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This spends the oldest-expiring available reset for this account. It does not switch accounts.")
+        }
+    }
+}
+
+extension RateLimitResetExpirationUrgency {
+    var presentationColor: Color {
+        switch self {
+        case .normal: return .teal
+        case .advisory: return .yellow
+        case .urgent: return .orange
+        case .critical: return .red
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .normal: return "arrow.counterclockwise.circle.fill"
+        case .advisory: return "clock.badge.exclamationmark"
+        case .urgent: return "exclamationmark.circle.fill"
+        case .critical: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .normal: return "Normal"
+        case .advisory: return "Advisory"
+        case .urgent: return "Urgent"
+        case .critical: return "Critical"
+        }
+    }
+
+    var accessibilityDescription: String {
+        switch self {
+        case .normal: return "Reset expiration is more than 7 days away"
+        case .advisory: return "Advisory: reset expires within 7 days"
+        case .urgent: return "Urgent: reset expires within 72 hours"
+        case .critical: return "Critical: reset expires within 24 hours"
+        }
+    }
+}
+
+private struct RateLimitResetUrgencyPulseModifier: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let urgency: RateLimitResetExpirationUrgency?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let urgency, urgency.pulsePeriod != nil, !reduceMotion {
+            TimelineView(.animation(
+                minimumInterval: urgency == .critical ? 1.0 / 30.0 : 1.0 / 20.0
+            )) { context in
+                content.opacity(urgency.pulseOpacity(at: context.date, reduceMotion: false))
+            }
+        } else {
+            content.opacity(1)
+        }
+    }
+}
+
+extension View {
+    func rateLimitResetUrgencyPulse(
+        _ urgency: RateLimitResetExpirationUrgency?
+    ) -> some View {
+        modifier(RateLimitResetUrgencyPulseModifier(urgency: urgency))
     }
 }
 

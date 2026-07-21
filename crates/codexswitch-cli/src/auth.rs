@@ -187,15 +187,12 @@ pub fn account_token_fingerprint(account: &CodexAccount) -> Option<String> {
 }
 
 pub fn auth_file_fingerprint(path: &Path) -> Option<String> {
-    let transaction = secure_file::lock(path, false).ok()?;
-    let snapshot = transaction.load(AUTH_FILE_MAX_BYTES, false).ok()?;
+    let snapshot = secure_file::observe(path, AUTH_FILE_MAX_BYTES, false).ok()?;
     auth_fingerprint_from_bytes(snapshot.bytes()?)
 }
 
 pub fn auth_file_generation(path: &Path) -> Option<SecureFileGeneration> {
-    let transaction = secure_file::lock(path, false).ok()?;
-    transaction
-        .load(AUTH_FILE_MAX_BYTES, true)
+    secure_file::observe(path, AUTH_FILE_MAX_BYTES, true)
         .ok()
         .map(|snapshot| snapshot.generation().clone())
 }

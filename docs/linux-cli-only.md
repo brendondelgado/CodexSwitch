@@ -31,7 +31,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-13
+  last_updated: 2026-07-21
 ---
 
 # Linux CLI-Only CodexSwitch
@@ -67,11 +67,10 @@ pipe, or any other public-CLI replacement bypasses release provenance,
 ```bash
 git clone <codexswitch-repo>
 cd CodexSwitch
-export CODEXSWITCH_GIT_SHA=<full-40-or-64-character-git-sha>
+export CODEXSWITCH_GIT_SHA=<full-40-character-git-sha>
 export CODEXSWITCH_APPROVED_ORIGIN_REF=refs/remotes/origin/main
-export CODEXSWITCH_CODEX_RUNTIME_DIR=<reviewed-runtime-directory>
-export CODEXSWITCH_CODEX_VERSION=<reviewed-runtime-version>
-export CODEXSWITCH_CODEX_SOURCE_SHA=<full-40-or-64-character-source-sha>
+scripts/stage-linux-runtime-artifact.sh <download-directory> <reviewed-directory>
+export CODEXSWITCH_LINUX_ARTIFACT_DIR=<reviewed-directory>
 
 CODEXSWITCH_DRY_RUN=1 scripts/install-linux.sh
 scripts/install-linux.sh
@@ -198,11 +197,11 @@ full-SHA immutable installer transaction above.
 The checked-in persistent units enforce cgroup ceilings, not advisory watermarks
 alone. The maintenance daemon uses `MemoryMax=6G` and `MemorySwapMax=2G`; the
 session-bearing app-server uses `MemoryMax=14G`, `MemorySwapMax=2G`, and
-`MemoryLow=512M`. The app-server release must contain
-`codex-runtime-storage-leases-v1` and enables lease-aware local thread-store
-compression. Active sessions are never cleanup candidates; inactive stable
-rollouts move through bounded lossless hot retention, and over-budget state
-fails closed instead of deleting unarchived history.
+`MemoryLow=512M`. Runtime-storage hardening is deferred and disabled: the active
+artifact contract does not require `codex-runtime-storage-leases-v1`, and the
+app-server unit does not enable `local_thread_store_compression`. No repository,
+artifact, or unit state should be described as active storage hardening until a
+future implementation and separately authorized review replace this freeze.
 
 Codex updates must refresh both active VPS app-server lifecycles. The
 `signul-codex-app-server.service` WebSocket listener on `127.0.0.1:8390` serves

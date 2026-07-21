@@ -151,6 +151,7 @@ struct CodexReloadAcknowledgement: Codable, Equatable, Sendable {
     let reconnectReady: Bool?
     let initializedFrontendCount: Int?
     let eligibleFrontendCount: Int?
+    let rejectedFrontendCount: Int?
     let idleListenerReady: Bool?
 
     init(
@@ -164,6 +165,7 @@ struct CodexReloadAcknowledgement: Codable, Equatable, Sendable {
         reconnectReady: Bool?,
         initializedFrontendCount: Int? = nil,
         eligibleFrontendCount: Int? = nil,
+        rejectedFrontendCount: Int? = nil,
         idleListenerReady: Bool? = nil
     ) {
         self.binding = binding
@@ -176,6 +178,7 @@ struct CodexReloadAcknowledgement: Codable, Equatable, Sendable {
         self.reconnectReady = reconnectReady
         self.initializedFrontendCount = initializedFrontendCount
         self.eligibleFrontendCount = eligibleFrontendCount
+        self.rejectedFrontendCount = rejectedFrontendCount
         self.idleListenerReady = idleListenerReady
     }
 }
@@ -359,6 +362,8 @@ enum SwapEngine {
     private static let codexAuthPath = NSString("~/.codex/auth.json").expandingTildeInPath
     private static let maximumAuthFileBytes = 1_048_576
     private static let maximumReloadArtifactBytes = 65_536
+    static let maximumReloadAcknowledgementAge: TimeInterval = 5 * 60
+    static let maximumReloadAcknowledgementAgeMilliseconds: Int64 = 5 * 60 * 1_000
     private static let resetTieFiveHourTolerance = 2.0
     private static let resetTieWeeklyTolerance = 5.0
     nonisolated static let reloadAttemptGate = CodexReloadAttemptGate()
@@ -424,11 +429,12 @@ enum SwapEngine {
     static func selectPlanUpgradeCandidate(
         active: CodexAccount,
         from accounts: [CodexAccount],
+        excluding excludedAccountIds: Set<UUID> = [],
         now: Date = Date()
     ) -> CodexAccount? {
         rankedEligibleCandidates(
             from: accounts,
-            excluding: [active.id],
+            excluding: excludedAccountIds.union([active.id]),
             now: now,
             additionalEligibility: { $0.planPriority > active.planPriority }
         ).first
@@ -1870,7 +1876,7 @@ enum SwapEngine {
         currentBinding: CodexReloadBinding,
         expectedBinding: CodexReloadBinding?,
         nowUnixMilliseconds: Int64,
-        maximumArtifactAgeMilliseconds: Int64 = 2_592_000_000,
+        maximumArtifactAgeMilliseconds: Int64 = maximumReloadAcknowledgementAgeMilliseconds,
         maximumFutureSkewMilliseconds: Int64 = 30_000
     ) -> CodexReloadAcknowledgement? {
         guard maximumArtifactAgeMilliseconds >= 0,
@@ -1963,6 +1969,18 @@ enum SwapEngine {
             && binding.authFileIdentity == observation.authFileIdentity
     }
 
+    nonisolated static func acknowledgementSupportsPassiveRuntimeEvidence(
+        _ acknowledgement: CodexReloadAcknowledgement,
+        observation: CodexRuntimeObservation
+    ) -> Bool {
+        bindingMatchesObservation(acknowledgement.binding, observation)
+            && acknowledgement.loadedTokenFingerprint
+                == observation.authFileIdentity.completeTokenFingerprint
+            && acknowledgement.activeTokenFingerprint
+                == observation.authFileIdentity.completeTokenFingerprint
+            && acknowledgementShapeIsValid(acknowledgement)
+    }
+
     private nonisolated static func acknowledgementShapeIsValid(
         _ acknowledgement: CodexReloadAcknowledgement
     ) -> Bool {
@@ -1970,14 +1988,12 @@ enum SwapEngine {
         case .externalAppServer:
             return externalAppServerAcknowledgementIsValid(
                 acknowledgement,
-                allowIdleListener: false,
-                allowLegacyMissingFrontendCounts: true
+                allowIdleListener: false
             )
         case .headlessRemoteControlAppServer:
             return externalAppServerAcknowledgementIsValid(
                 acknowledgement,
-                allowIdleListener: true,
-                allowLegacyMissingFrontendCounts: false
+                allowIdleListener: true
             )
         case .localInteractiveCLI:
             return !acknowledgement.frontendNotified
@@ -1986,50 +2002,36 @@ enum SwapEngine {
                 && acknowledgement.reconnectReady == true
                 && acknowledgement.initializedFrontendCount == nil
                 && acknowledgement.eligibleFrontendCount == nil
+                && acknowledgement.rejectedFrontendCount == nil
                 && acknowledgement.idleListenerReady != true
         }
     }
 
     private nonisolated static func externalAppServerAcknowledgementIsValid(
         _ acknowledgement: CodexReloadAcknowledgement,
-        allowIdleListener: Bool,
-        allowLegacyMissingFrontendCounts: Bool
+        allowIdleListener: Bool
     ) -> Bool {
+        guard let initialized = acknowledgement.initializedFrontendCount,
+              let eligible = acknowledgement.eligibleFrontendCount,
+              let rejected = acknowledgement.rejectedFrontendCount,
+              initialized >= 0,
+              eligible >= 0,
+              rejected >= 0,
+              eligible <= Int.max - rejected,
+              eligible + rejected == initialized else {
+            return false
+        }
         let deliveredToFrontend = acknowledgement.idleListenerReady != true
             && acknowledgement.frontendNotified
-            && acknowledgement.frontendWriteCount > 0
-            && frontendDeliveryCountsAreValid(
-                acknowledgement,
-                allowLegacyMissingCounts: allowLegacyMissingFrontendCounts
-            )
+            && eligible > 0
+            && acknowledgement.frontendWriteCount == eligible
         let idleListener = allowIdleListener
             && acknowledgement.idleListenerReady == true
             && !acknowledgement.frontendNotified
             && acknowledgement.frontendWriteCount == 0
-            && acknowledgement.initializedFrontendCount == 0
-            && acknowledgement.eligibleFrontendCount == 0
+            && eligible == 0
         return acknowledgement.reconnectReady != true
             && (deliveredToFrontend || idleListener)
-    }
-
-    private nonisolated static func frontendDeliveryCountsAreValid(
-        _ acknowledgement: CodexReloadAcknowledgement,
-        allowLegacyMissingCounts: Bool
-    ) -> Bool {
-        switch (
-            acknowledgement.initializedFrontendCount,
-            acknowledgement.eligibleFrontendCount
-        ) {
-        case (nil, nil):
-            return allowLegacyMissingCounts
-        case let (.some(initialized), .some(eligible)):
-            return initialized > 0
-                && eligible > 0
-                && eligible <= initialized
-                && acknowledgement.frontendWriteCount <= eligible
-        default:
-            return false
-        }
     }
 
     private nonisolated static func bindingIsStructurallyValid(

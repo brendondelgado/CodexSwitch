@@ -1,0 +1,92 @@
+name: Hot-swap contract
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hot-swap-contract-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scripts-and-swift:
+    name: Script and Swift contracts
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CODEXSWITCH_ALLOW_LIVE_DESKTOP_PATCH: "0"
+      CODEXSWITCH_RUN_LIVE_DESKTOP_RELOAD: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Lint workflows with actionlint v1.7.11
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GOBIN="$RUNNER_TEMP/actionlint-bin"
+          export GOCACHE="$RUNNER_TEMP/actionlint-go-cache"
+          export GOPATH="$RUNNER_TEMP/actionlint-gopath"
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
+          "$GOBIN/actionlint" -ignore 'SC2129' .github/workflows/*.yml
+
+      - name: Run patch and transport contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v node >/dev/null
+          command -v python3 >/dev/null
+          command -v zsh >/dev/null
+          python3 scripts/test_patch_asar.py
+          python3 scripts/test_codex_vps.py
+          zsh scripts/test_codex_vps.sh
+          python3 scripts/test_build_app.py
+          python3 scripts/test_build_linux_runtime.py
+          python3 scripts/test_linux_runtime_artifact.py
+          python3 scripts/test_linux_resource_policy.py
+
+      - name: Run full Swift contract suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_tmp="$RUNNER_TEMP/hot-swap-swift-tests"
+          install -d -m 0700 "$test_tmp"
+          CODEXSWITCH_TEST_TMPDIR="$test_tmp" \
+            TMPDIR="$test_tmp" \
+            swift test --jobs 1 --no-parallel
+
+  rust:
+    name: Full Linux control-plane contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run full codexswitch-cli contract suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 0077
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/hot-swap-cargo-target"
+          cargo test --locked --jobs 1 -p codexswitch-cli
+
+      - name: Compile and execute generated upstream turn contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test_generated_runtime_contract.py --require-execution

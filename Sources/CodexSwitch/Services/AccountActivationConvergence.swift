@@ -35,15 +35,20 @@ enum AccountActivationConvergenceEvaluator {
         }
 
         switch desktopReload {
-        case .reloaded:
-            desktopCounts = (1, 1)
+        case .reloaded(_, let discovered, let acknowledged):
+            desktopCounts = (discovered, acknowledged)
+            if discovered <= 0 || acknowledged != discovered {
+                divergenceDetails.append(
+                    "desktop_acknowledged_\(acknowledged)_of_\(discovered)"
+                )
+            }
         case .noDesktopRuntime:
             desktopCounts = (0, 0)
-        case .unsupported:
-            desktopCounts = (1, 0)
+        case .unsupported(let discovered, let acknowledged):
+            desktopCounts = (discovered, acknowledged)
             divergenceDetails.append("desktop_json_rpc_unsupported")
-        case .failed(let reason):
-            desktopCounts = (1, 0)
+        case .failed(let reason, let discovered, let acknowledged):
+            desktopCounts = (discovered, acknowledged)
             divergenceDetails.append("desktop_json_rpc_failed_\(reason)")
         }
 
@@ -128,6 +133,7 @@ struct AccountActivationReloadTransaction: Sendable {
 enum AccountActivationConfirmationFailureStage: Equatable, Sendable {
     case durableReadback
     case authorization
+    case runtimeRevalidation
     case journalPersistence
 }
 
@@ -140,9 +146,29 @@ enum AccountActivationConfirmationResult: Equatable, Sendable {
 struct AccountActivationConfirmationOperations {
     let verifyDurableFiles: @MainActor @Sendable () async -> Bool
     let authorizeConfirmation: @MainActor @Sendable () async -> AccountActivationEffectPermit?
+    let reauthorizeConfirmation: @MainActor @Sendable (
+        AccountActivationEffectPermit
+    ) async -> AccountActivationEffectPermit?
     let persistConfirmation: @MainActor @Sendable (
         AccountActivationEffectPermit
     ) async -> AccountActivationState?
+
+    init(
+        verifyDurableFiles: @escaping @MainActor @Sendable () async -> Bool,
+        authorizeConfirmation: @escaping @MainActor @Sendable () async
+            -> AccountActivationEffectPermit?,
+        reauthorizeConfirmation: @escaping @MainActor @Sendable (
+            AccountActivationEffectPermit
+        ) async -> AccountActivationEffectPermit? = { $0 },
+        persistConfirmation: @escaping @MainActor @Sendable (
+            AccountActivationEffectPermit
+        ) async -> AccountActivationState?
+    ) {
+        self.verifyDurableFiles = verifyDurableFiles
+        self.authorizeConfirmation = authorizeConfirmation
+        self.reauthorizeConfirmation = reauthorizeConfirmation
+        self.persistConfirmation = persistConfirmation
+    }
 }
 
 struct AccountActivationConfirmationTransaction: Sendable {
@@ -157,7 +183,11 @@ struct AccountActivationConfirmationTransaction: Sendable {
               permit.isCurrentlyAuthorized() else {
             return .blocked(.authorization)
         }
-        guard let confirmed = await operations.persistConfirmation(permit) else {
+        guard let revalidatedPermit = await operations.reauthorizeConfirmation(permit),
+              revalidatedPermit.isCurrentlyAuthorized() else {
+            return .blocked(.runtimeRevalidation)
+        }
+        guard let confirmed = await operations.persistConfirmation(revalidatedPermit) else {
             return .blocked(.journalPersistence)
         }
         return .confirmed(confirmed)

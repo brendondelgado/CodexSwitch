@@ -310,6 +310,8 @@ enum DesktopPatchManager {
         NSString("~/.codexswitch/desktop-patch.lock").expandingTildeInPath
 
     private nonisolated static let authPatchMarker = "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3"
+    private nonisolated static let authEventDedupePatchMarker = "CODEXSWITCH_AUTH_EVENT_DEDUPE_V1"
+    private nonisolated static let authSingleFlightPatchMarker = "CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1"
     private nonisolated static let authTransitionPatchMarker = "CODEXSWITCH_AUTH_TRANSITION_V2"
     private nonisolated static let remoteRecentsPatchMarker = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2"
     private nonisolated static let modelLabelFallbackMarker = "CODEXSWITCH_MODEL_LABEL_FALLBACK"
@@ -740,8 +742,7 @@ enum DesktopPatchManager {
                 computerUsePluginSignatureCompatible: false
             )
         }
-        let auth = fileContainsMarker(authPatchMarker, at: asarPath)
-            && fileContainsMarker(authTransitionPatchMarker, at: asarPath)
+        let auth = authPatchMarkersPresent(at: asarPath)
             && fileContainsMarker(modelLabelFallbackMarker, at: asarPath)
             && fileContainsMarker(modelAvailabilityFallbackMarker, at: asarPath)
             && fileContainsMarker(selectedModelLabelFallbackMarker, at: asarPath)
@@ -763,6 +764,15 @@ enum DesktopPatchManager {
             versionCompatible: versionCompatible,
             computerUsePluginSignatureCompatible: pluginSignatureCompatible
         )
+    }
+
+    nonisolated static func authPatchMarkersPresent(at path: String) -> Bool {
+        [
+            authPatchMarker,
+            authEventDedupePatchMarker,
+            authSingleFlightPatchMarker,
+            authTransitionPatchMarker,
+        ].allSatisfy { fileContainsMarker($0, at: path) }
     }
 
     nonisolated static func computerUsePluginSignatureCompatible(

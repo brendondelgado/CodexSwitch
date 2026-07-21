@@ -171,8 +171,9 @@ not from `pgrep` text. A signal path must:
 5. Read the canonical no-follow auth file once, bind its descriptor-derived
    device/inode and complete token fingerprint, then form the immutable binding.
 6. Establish capability from complete startup request and ACK evidence matching
-   the current observation. The one exception is first-ACK bootstrap for the
-   repository-owned desktop bridge on port `9223`: its launchd PID, generated
+   the current observation. The one exception is first-ACK bootstrap during an
+   explicit desktop activation for the repository-owned bridge on port `9223`:
+   its launchd PID, generated
    bridge files, the exact managed launcher embedded in those bridge files,
    expected runtime/helper hashes, and the running executable vnode must all
    match before CodexSwitch may write one request and send one signal. The
