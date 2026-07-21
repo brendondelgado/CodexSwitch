@@ -273,6 +273,19 @@ issue a second POST. `already_redeemed` is accepted only as reconciliation
 evidence for that same persisted identifier and only with fresh inventory and
 quota confirmation.
 
+The Rust reset-attempt journal uses format 3. Each new local attempt preserves
+the immutable selected credit, its exact expiration, and the complete sorted
+set of normalized credit identifiers that were available at submission. A
+missing selected credit proves consumption only when it is still unexpired,
+the count changed by exactly one, and every other starting identifier remains.
+An explicit terminal provider status for that selected identifier remains
+valid evidence. Unresolved format-1 or format-2 attempts that lack the new
+inventory proof migrate to manual review and can never authorize another POST.
+Inventory time is captured after the response body completes. Credit IDs larger
+than the journal evidence bound are rejected before attempt creation, and the
+coordinator rechecks the saved journal for a manual-review sentinel plus the
+exact request UUID before acquiring the provider-I/O lease.
+
 ## Verification Contract
 
 Tests must cover inventory parsing, oldest-expiring selection, each policy

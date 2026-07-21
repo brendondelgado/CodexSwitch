@@ -28,8 +28,9 @@ pub const RESET_BANK_REFRESH_INTERVAL: ChronoDuration = ChronoDuration::minutes(
 pub const RESET_RECONCILIATION_INTERVAL: ChronoDuration = ChronoDuration::minutes(2);
 const EXPIRING_SOON_INTERVAL: ChronoDuration = ChronoDuration::hours(24);
 const NATURAL_RESET_PROTECTION_INTERVAL: ChronoDuration = ChronoDuration::hours(24);
-const RESET_ATTEMPT_JOURNAL_VERSION: u32 = 2;
-const RESET_ATTEMPT_JOURNAL_LEGACY_VERSION: u32 = 1;
+const RESET_ATTEMPT_JOURNAL_VERSION: u32 = 3;
+const RESET_ATTEMPT_JOURNAL_VERSION_1: u32 = 1;
+const RESET_ATTEMPT_JOURNAL_VERSION_2: u32 = 2;
 const RESET_TERMINAL_RETENTION: ChronoDuration = ChronoDuration::days(30);
 const RESET_TERMINAL_ENTRY_CAP: usize = 64;
 const RESET_UNRESOLVED_ENTRY_CAP: usize = 128;
@@ -72,7 +73,10 @@ impl RateLimitResetBank {
             let Some(identifier) = credit.normalized_id() else {
                 return None;
             };
-            if !credit.is_available(now) || !identifiers.insert(identifier) {
+            if identifier.len() > RESET_IDENTIFIER_MAX_BYTES
+                || !credit.is_available(now)
+                || !identifiers.insert(identifier)
+            {
                 return None;
             }
             available.push(credit);
@@ -448,6 +452,10 @@ struct ResetAttempt {
     #[serde(default)]
     stable_owner: Option<String>,
     selected_credit_id: Option<String>,
+    #[serde(default)]
+    selected_credit_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pre_available_credit_ids: Vec<String>,
     request_id: Uuid,
     pre_inventory_generation: String,
     #[serde(default)]
@@ -1103,20 +1111,32 @@ where
 
             if active_attempt.is_none() {
                 if let Some(previous) = previous_bank.as_ref() {
-                    if inventory_decreased(previous, &observed_bank) {
-                        let selected_credit_id =
-                            externally_consumed_credit(previous, &observed_bank);
+                    if let Some(evidence) =
+                        external_inventory_decrease_evidence(previous, &observed_bank, now)
+                    {
+                        let request_id = Uuid::new_v4();
                         journal.attempts.push(new_reset_attempt(
                             account,
                             previous,
-                            selected_credit_id,
-                            Uuid::new_v4(),
+                            evidence.selected_credit_id,
+                            request_id,
                             now,
                             ResetAttemptOrigin::ExternalInventoryDecrease,
                             ResetAttemptState::ConsumptionObserved,
                         ));
-                        active_attempt = Some(journal.attempts.len() - 1);
                         journal_transaction.save(&mut journal, now)?;
+                        if let Some(manual_review) = journal.manual_review.as_ref() {
+                            return Ok(ResetPreparation::Suppressed(manual_review.reason.clone()));
+                        }
+                        active_attempt = journal
+                            .attempts
+                            .iter()
+                            .position(|attempt| attempt.request_id == request_id);
+                        if active_attempt.is_none() {
+                            bail!(
+                                "external reset evidence disappeared during durable journal preparation"
+                            );
+                        }
                     }
                 }
             }
@@ -1149,8 +1169,17 @@ where
             // A crash after this durable write is intentionally uncertain.
             // Every replay observes this exact attempt and cannot repeat the POST.
             journal_transaction.save(&mut journal, now)?;
+            if let Some(manual_review) = journal.manual_review.as_ref() {
+                return Ok(ResetPreparation::Suppressed(manual_review.reason.clone()));
+            }
+            let attempt = journal
+                .attempts
+                .iter()
+                .find(|attempt| attempt.request_id == request_id)
+                .cloned()
+                .context("prepared reset attempt disappeared during durable journal write")?;
             Ok(ResetPreparation::Submit {
-                attempt: journal.attempts[attempt_index].clone(),
+                attempt,
                 bank: observed_bank.clone(),
             })
         },
@@ -1230,9 +1259,8 @@ where
         })?;
     drop(provider_io_lease);
 
-    let (response_code, selected_credit_id, state, last_error) = match consume_result {
+    let (response_code, state, last_error) = match consume_result {
         Ok(result) => {
-            let selected_credit_id = result.credit_id.or(selected_credit_id);
             let state = if matches!(
                 result.code,
                 ConsumeCode::NoCredit | ConsumeCode::NothingToReset
@@ -1241,11 +1269,27 @@ where
             } else {
                 ResetAttemptState::Uncertain
             };
-            (Some(result.code), selected_credit_id, state, None)
+            let returned_credit_id = result
+                .credit_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|identifier| !identifier.is_empty());
+            let selected_credit_id = selected_credit_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|identifier| !identifier.is_empty());
+            let last_error = returned_credit_id
+                .zip(selected_credit_id)
+                .filter(|(returned, selected)| returned != selected)
+                .map(|(returned, selected)| {
+                    format!(
+                        "reset response named credit {returned}, but the durable request selected {selected}; reconciliation requires the selected credit"
+                    )
+                });
+            (Some(result.code), state, last_error)
         }
         Err(error) => (
             None,
-            selected_credit_id,
             ResetAttemptState::Uncertain,
             Some(format!("reset request outcome is uncertain: {error:#}")),
         ),
@@ -1258,7 +1302,6 @@ where
             |journal, attempt_index| {
                 let attempt = &mut journal.attempts[attempt_index];
                 attempt.response_code = response_code;
-                attempt.selected_credit_id = selected_credit_id;
                 attempt.state = state;
                 attempt.last_error = last_error;
             },
@@ -1327,11 +1370,27 @@ fn new_reset_attempt(
     origin: ResetAttemptOrigin,
     state: ResetAttemptState,
 ) -> ResetAttempt {
+    let pre_available_credits = bank
+        .structurally_valid_available_credits(bank.fetched_at)
+        .unwrap_or_default();
+    let selected_credit_expires_at = selected_credit_id.as_deref().and_then(|selected_id| {
+        pre_available_credits
+            .iter()
+            .find(|credit| credit.normalized_id() == Some(selected_id.trim()))
+            .and_then(|credit| credit.expires_at)
+    });
+    let pre_available_credit_ids = pre_available_credits
+        .into_iter()
+        .filter_map(RateLimitResetCredit::normalized_id)
+        .map(str::to_string)
+        .collect();
     ResetAttempt {
         account_id: account.account_id.clone(),
         local_account_id: account.id,
         stable_owner: Some(reset_attempt_owner(account)),
         selected_credit_id,
+        selected_credit_expires_at,
+        pre_available_credit_ids,
         request_id,
         pre_inventory_generation: inventory_generation(bank),
         starting_quota_generation: Some(quota_evidence_generation(account)),
@@ -1468,7 +1527,7 @@ where
 
     let consumption_observed = inventory_fresh
         && inventory_is_newer_than_attempt(&updated_attempt, &bank)
-        && inventory_is_consumed(&updated_attempt, &bank);
+        && inventory_is_consumed(&updated_attempt, &bank, now);
     let external_hold_active = updated_attempt.origin
         == ResetAttemptOrigin::ExternalInventoryDecrease
         && now < updated_attempt.reconciliation_deadline;
@@ -1521,17 +1580,86 @@ where
     Ok(result)
 }
 
-fn inventory_is_consumed(attempt: &ResetAttempt, bank: &RateLimitResetBank) -> bool {
-    if bank.available_count < attempt.pre_inventory_count {
-        return true;
-    }
+fn inventory_is_consumed(
+    attempt: &ResetAttempt,
+    bank: &RateLimitResetBank,
+    now: DateTime<Utc>,
+) -> bool {
     let Some(selected_credit_id) = attempt.selected_credit_id.as_deref() else {
         return false;
     };
-    bank.credits
+    let selected_credit_id = selected_credit_id.trim();
+    if bank
+        .credits
         .iter()
-        .find(|credit| credit.normalized_id() == Some(selected_credit_id.trim()))
+        .find(|credit| credit.normalized_id() == Some(selected_credit_id))
         .is_some_and(RateLimitResetCredit::has_terminal_consumption_status)
+    {
+        return true;
+    }
+
+    let Some(selected_credit_expires_at) = attempt.selected_credit_expires_at else {
+        return false;
+    };
+    let observation_at = now.max(bank.fetched_at);
+    if selected_credit_expires_at <= observation_at
+        || bank.available_count.checked_add(1) != Some(attempt.pre_inventory_count)
+        || attempt.pre_available_credit_ids.len() != attempt.pre_inventory_count as usize
+    {
+        return false;
+    }
+
+    let mut starting_ids = std::collections::HashSet::new();
+    if attempt.pre_available_credit_ids.iter().any(|identifier| {
+        let identifier = identifier.trim();
+        identifier.is_empty() || !starting_ids.insert(identifier)
+    }) || !starting_ids.contains(selected_credit_id)
+    {
+        return false;
+    }
+
+    let Some(observed_credits) = bank.structurally_valid_available_credits(observation_at) else {
+        return false;
+    };
+    let observed_ids = observed_credits
+        .into_iter()
+        .filter_map(RateLimitResetCredit::normalized_id)
+        .collect::<Vec<_>>();
+    let expected_ids = attempt
+        .pre_available_credit_ids
+        .iter()
+        .map(|identifier| identifier.trim())
+        .filter(|identifier| *identifier != selected_credit_id)
+        .collect::<Vec<_>>();
+
+    observed_ids == expected_ids
+}
+
+fn reset_attempt_has_complete_inventory_evidence(attempt: &ResetAttempt) -> bool {
+    let Some(selected_credit_id) = attempt
+        .selected_credit_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|identifier| !identifier.is_empty())
+    else {
+        return false;
+    };
+    let Some(selected_credit_expires_at) = attempt.selected_credit_expires_at else {
+        return false;
+    };
+    if attempt.pre_available_credit_ids.len() != attempt.pre_inventory_count as usize
+        || attempt
+            .pre_inventory_fetched_at
+            .is_none_or(|fetched_at| selected_credit_expires_at <= fetched_at)
+    {
+        return false;
+    }
+
+    let mut identifiers = std::collections::HashSet::new();
+    attempt.pre_available_credit_ids.iter().all(|identifier| {
+        let identifier = identifier.trim();
+        !identifier.is_empty() && identifiers.insert(identifier)
+    }) && identifiers.contains(selected_credit_id)
 }
 
 fn inventory_is_newer_than_attempt(attempt: &ResetAttempt, bank: &RateLimitResetBank) -> bool {
@@ -1541,28 +1669,66 @@ fn inventory_is_newer_than_attempt(attempt: &ResetAttempt, bank: &RateLimitReset
         && inventory_generation(bank) != attempt.pre_inventory_generation
 }
 
-fn inventory_decreased(previous: &RateLimitResetBank, observed: &RateLimitResetBank) -> bool {
-    observed.available_count < previous.available_count
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalInventoryDecreaseEvidence {
+    selected_credit_id: Option<String>,
 }
 
-fn externally_consumed_credit(
+fn external_inventory_decrease_evidence(
     previous: &RateLimitResetBank,
     observed: &RateLimitResetBank,
-) -> Option<String> {
-    previous
-        .credits
+    now: DateTime<Utc>,
+) -> Option<ExternalInventoryDecreaseEvidence> {
+    if observed.available_count >= previous.available_count {
+        return None;
+    }
+
+    let observation_at = now.max(observed.fetched_at);
+    let Some(previous_credits) = previous.structurally_valid_available_credits(previous.fetched_at)
+    else {
+        return Some(ExternalInventoryDecreaseEvidence {
+            selected_credit_id: None,
+        });
+    };
+    let Some(observed_credits) = observed.structurally_valid_available_credits(observation_at)
+    else {
+        return Some(ExternalInventoryDecreaseEvidence {
+            selected_credit_id: None,
+        });
+    };
+
+    let expected_after_natural_expiry = previous_credits
         .iter()
-        .filter(|credit| credit.is_available(previous.fetched_at))
-        .find(|credit| {
-            observed
-                .credits
-                .iter()
-                .find(|candidate| candidate.normalized_id() == credit.normalized_id())
-                .map(RateLimitResetCredit::has_terminal_consumption_status)
-                .unwrap_or(observed.available_count < previous.available_count)
+        .copied()
+        .filter(|credit| {
+            credit
+                .expires_at
+                .is_some_and(|expiration| expiration > observation_at)
         })
-        .and_then(RateLimitResetCredit::normalized_id)
-        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let observed_ids = observed_credits
+        .iter()
+        .filter_map(|credit| credit.normalized_id())
+        .collect::<Vec<_>>();
+    let expected_ids = expected_after_natural_expiry
+        .iter()
+        .filter_map(|credit| credit.normalized_id())
+        .collect::<Vec<_>>();
+    if observed.available_count == expected_after_natural_expiry.len() as u32
+        && observed_ids == expected_ids
+    {
+        return None;
+    }
+
+    let observed_id_set = observed_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let selected_credit_id = expected_after_natural_expiry
+        .into_iter()
+        .filter_map(RateLimitResetCredit::normalized_id)
+        .find(|identifier| !observed_id_set.contains(identifier))
+        .map(str::to_string);
+    Some(ExternalInventoryDecreaseEvidence { selected_credit_id })
 }
 
 fn inventory_generation(bank: &RateLimitResetBank) -> String {
@@ -1759,7 +1925,9 @@ fn decode_reset_attempt_journal(
         .with_context(|| format!("failed to decode {}", path.display()))?;
     if !matches!(
         journal.version,
-        RESET_ATTEMPT_JOURNAL_LEGACY_VERSION | RESET_ATTEMPT_JOURNAL_VERSION
+        RESET_ATTEMPT_JOURNAL_VERSION_1
+            | RESET_ATTEMPT_JOURNAL_VERSION_2
+            | RESET_ATTEMPT_JOURNAL_VERSION
     ) {
         bail!(
             "unsupported reset-attempt journal version {} in {}",
@@ -1767,20 +1935,29 @@ fn decode_reset_attempt_journal(
             path.display()
         );
     }
-    let legacy_version = journal.version == RESET_ATTEMPT_JOURNAL_LEGACY_VERSION;
-    if legacy_version {
-        journal.version = RESET_ATTEMPT_JOURNAL_VERSION;
+    let original_version = journal.version;
+    if original_version == RESET_ATTEMPT_JOURNAL_VERSION_1 {
         for attempt in &mut journal.attempts {
             attempt.stable_owner = Some(reset_attempt_owner_from_account_id(&attempt.account_id));
         }
     }
+    journal.version = RESET_ATTEMPT_JOURNAL_VERSION;
     let truncated_fields = sanitize_reset_attempt_journal(&mut journal);
-    let incomplete_unresolved = journal
+    let incomplete_quota_evidence = journal
         .attempts
         .iter()
         .filter(|attempt| {
             !attempt.state.is_terminal()
                 && (attempt.stable_owner.is_none() || attempt.starting_quota_generation.is_none())
+        })
+        .count();
+    let incomplete_inventory_evidence = journal
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            !attempt.state.is_terminal()
+                && attempt.origin == ResetAttemptOrigin::LocalRequest
+                && !reset_attempt_has_complete_inventory_evidence(attempt)
         })
         .count();
     if truncated_fields > 0 {
@@ -1793,19 +1970,32 @@ fn decode_reset_attempt_journal(
             ),
         );
     }
-    if incomplete_unresolved > 0 {
+    if incomplete_quota_evidence > 0 {
         mark_reset_journal_manual_review(
             &mut journal,
             now,
             0,
             format!(
-                "{incomplete_unresolved} unresolved legacy reset attempt(s) lack a durable starting quota generation; manual review is required"
+                "{incomplete_quota_evidence} unresolved legacy reset attempt(s) lack a durable starting quota generation; manual review is required"
+            ),
+        );
+    }
+    if incomplete_inventory_evidence > 0 {
+        mark_reset_journal_manual_review(
+            &mut journal,
+            now,
+            0,
+            format!(
+                "{incomplete_inventory_evidence} unresolved legacy reset attempt(s) lack exact selected-credit expiration or starting inventory evidence; manual review is required"
             ),
         );
     }
     Ok((
         journal,
-        legacy_version || truncated_fields > 0 || incomplete_unresolved > 0,
+        original_version != RESET_ATTEMPT_JOURNAL_VERSION
+            || truncated_fields > 0
+            || incomplete_quota_evidence > 0
+            || incomplete_inventory_evidence > 0,
     ))
 }
 
@@ -1884,6 +2074,9 @@ fn sanitize_reset_attempt_journal(journal: &mut ResetAttemptJournal) -> usize {
             &mut attempt.selected_credit_id,
             RESET_IDENTIFIER_MAX_BYTES,
         ));
+        for identifier in &mut attempt.pre_available_credit_ids {
+            truncated += usize::from(truncate_field(identifier, RESET_IDENTIFIER_MAX_BYTES));
+        }
         truncated += usize::from(truncate_optional_field(
             &mut attempt.stable_owner,
             RESET_GENERATION_MAX_BYTES,
@@ -2093,34 +2286,40 @@ struct BackendConsumeCredit {
 
 pub fn fetch_rate_limit_reset_bank(account: &CodexAccount) -> Result<RateLimitResetBank> {
     let client = reset_http_client()?;
-    fetch_rate_limit_reset_bank_with(account, Utc::now(), |account| {
-        let response = client
-            .get(RESET_CREDITS_URL)
-            .bearer_auth(&account.access_token)
-            .header("ChatGPT-Account-Id", &account.account_id)
-            .header("Accept", "application/json")
-            .send()
-            .with_context(|| format!("failed to fetch reset bank for {}", account.email))?;
-        let status = response.status().as_u16();
-        let body = response
-            .bytes()
-            .context("failed to read reset-bank response body")?
-            .to_vec();
-        Ok(HttpResponse { status, body })
-    })
+    fetch_rate_limit_reset_bank_with(
+        account,
+        |account| {
+            let response = client
+                .get(RESET_CREDITS_URL)
+                .bearer_auth(&account.access_token)
+                .header("ChatGPT-Account-Id", &account.account_id)
+                .header("Accept", "application/json")
+                .send()
+                .with_context(|| format!("failed to fetch reset bank for {}", account.email))?;
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .context("failed to read reset-bank response body")?
+                .to_vec();
+            Ok(HttpResponse { status, body })
+        },
+        Utc::now,
+    )
 }
 
-fn fetch_rate_limit_reset_bank_with<F>(
+fn fetch_rate_limit_reset_bank_with<F, N>(
     account: &CodexAccount,
-    now: DateTime<Utc>,
     fetch: F,
+    completed_at: N,
 ) -> Result<RateLimitResetBank>
 where
     F: FnOnce(&CodexAccount) -> Result<HttpResponse>,
+    N: FnOnce() -> DateTime<Utc>,
 {
     let response = fetch(account)?;
+    let fetched_at = completed_at();
     match response.status {
-        200 => parse_reset_bank(&response.body, now),
+        200 => parse_reset_bank(&response.body, fetched_at),
         401 => bail!(
             "token expired while fetching reset bank for {}",
             account.email
@@ -2520,12 +2719,20 @@ mod tests {
             &attempt,
             &missing_same_count
         ));
-        assert!(!inventory_is_consumed(&attempt, &missing_same_count));
+        assert!(!inventory_is_consumed(
+            &attempt,
+            &missing_same_count,
+            missing_same_count.fetched_at
+        ));
 
         let mut terminal_same_count = initial.clone();
         terminal_same_count.fetched_at = now + ChronoDuration::seconds(1);
         terminal_same_count.credits[0].status = "redeemed".to_string();
-        assert!(inventory_is_consumed(&attempt, &terminal_same_count));
+        assert!(inventory_is_consumed(
+            &attempt,
+            &terminal_same_count,
+            terminal_same_count.fetched_at
+        ));
 
         let mut decreased_but_not_newer = initial.clone();
         decreased_but_not_newer.available_count -= 1;
@@ -2615,13 +2822,13 @@ mod tests {
         });
         let parsed = fetch_rate_limit_reset_bank_with(
             &account("a@example.com", true, 10.0, 10.0),
-            now,
             |_| {
                 Ok(HttpResponse {
                     status: 200,
                     body: serde_json::to_vec(&response)?,
                 })
             },
+            || now,
         )?;
 
         assert_eq!(parsed.available_count, 2);
@@ -2640,16 +2847,49 @@ mod tests {
         let now = Utc::now();
         let error = fetch_rate_limit_reset_bank_with(
             &account("a@example.com", true, 10.0, 10.0),
-            now,
             |_| {
                 Ok(HttpResponse {
                     status: 200,
                     body: br#"{"available_count":3}"#.to_vec(),
                 })
             },
+            || now,
         )
         .unwrap_err();
         assert!(error.to_string().contains("decode reset-bank"));
+    }
+
+    #[test]
+    fn inventory_timestamp_is_captured_after_response_completion() -> Result<()> {
+        let request_started_at = fixed_policy_now();
+        let response_completed_at = request_started_at + ChronoDuration::seconds(30);
+        let response = json!({
+            "available_count": 0,
+            "total_earned_count": 1,
+            "credits": []
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fetch_events = Arc::clone(&events);
+        let completion_events = Arc::clone(&events);
+
+        let parsed = fetch_rate_limit_reset_bank_with(
+            &account("a@example.com", true, 10.0, 10.0),
+            move |_| {
+                fetch_events.lock().unwrap().push("response");
+                Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&response)?,
+                })
+            },
+            move || {
+                completion_events.lock().unwrap().push("completed_at");
+                response_completed_at
+            },
+        )?;
+
+        assert_eq!(parsed.fetched_at, response_completed_at);
+        assert_eq!(*events.lock().unwrap(), ["response", "completed_at"]);
+        Ok(())
     }
 
     #[test]
@@ -2671,6 +2911,10 @@ mod tests {
         let mut missing_expiration = bank(now, &[ChronoDuration::days(10)]);
         missing_expiration.credits[0].expires_at = None;
         assert!(!missing_expiration.has_available_reset(now));
+
+        let mut oversized_identifier = bank(now, &[ChronoDuration::days(10)]);
+        oversized_identifier.credits[0].id = "x".repeat(RESET_IDENTIFIER_MAX_BYTES + 1);
+        assert!(!oversized_identifier.has_available_reset(now));
 
         let mut active = policy_account(
             "active@example.com",
@@ -2713,6 +2957,55 @@ mod tests {
             .to_string()
             .contains("no concrete unexpired available credit"));
         assert_eq!(*send_calls.lock().unwrap(), 0);
+
+        let oversized_send_calls = Arc::new(Mutex::new(0usize));
+        let oversized_send_calls_for_closure = Arc::clone(&oversized_send_calls);
+        let error = consume_rate_limit_reset_with(
+            &active,
+            &oversized_identifier,
+            now,
+            Uuid::new_v4(),
+            move |_account, _request| {
+                *oversized_send_calls_for_closure.lock().unwrap() += 1;
+                Ok(HttpResponse {
+                    status: 200,
+                    body: br#"{"code":"reset"}"#.to_vec(),
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("no concrete unexpired available credit"));
+        assert_eq!(*oversized_send_calls.lock().unwrap(), 0);
+
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        let store_lock = lock_account_store(&store_path)?;
+        let mut working_account = store_lock.load()?.accounts.remove(0);
+        let flow = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut working_account,
+                previous_bank: None,
+                observed_bank: oversized_identifier,
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| bail!("malformed inventory must not trigger an inventory callback"),
+                |_account| bail!("malformed inventory must not trigger a quota callback"),
+                |_account, _bank, _request_id| {
+                    bail!("malformed inventory must not trigger a reset POST")
+                },
+            ),
+        )?;
+        assert_eq!(flow.state, ResetFlowState::NoAttempt);
+        let journal = load_reset_attempt_journal(&reset_attempt_journal_path(&store_path))?;
+        assert!(journal.attempts.is_empty());
+        assert!(journal.manual_review.is_none());
         Ok(())
     }
 
@@ -3526,6 +3819,15 @@ mod tests {
                     assert_eq!(attempt.pre_inventory_count, 1);
                     assert!(!attempt.pre_inventory_generation.is_empty());
                     assert_eq!(
+                        attempt.selected_credit_expires_at,
+                        Some(now + ChronoDuration::days(10))
+                    );
+                    assert_eq!(
+                        attempt.pre_available_credit_ids,
+                        vec!["credit-0".to_string()]
+                    );
+                    assert!(reset_attempt_has_complete_inventory_evidence(attempt));
+                    assert_eq!(
                         attempt.stable_owner.as_deref(),
                         Some(reset_attempt_owner(request_account).as_str())
                     );
@@ -3844,6 +4146,225 @@ mod tests {
     }
 
     #[test]
+    fn selected_credit_natural_expiration_remains_unresolved_without_a_second_post() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = fixed_policy_now();
+        let initial_bank = bank(now, &[ChronoDuration::seconds(10)]);
+        let mut account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut account, now);
+        let posts = Arc::new(Mutex::new(0usize));
+        let first_posts = Arc::clone(&posts);
+
+        let first = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: None,
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| Ok(initial_bank.clone()),
+                |_account| Ok(()),
+                move |_account, _bank, _request_id| {
+                    *first_posts.lock().unwrap() += 1;
+                    Err(anyhow!("timeout"))
+                },
+            ),
+        )?;
+        assert_eq!(first.state, ResetFlowState::Suppressed);
+
+        let journal = load_reset_attempt_journal(&reset_attempt_journal_path(&store_path))?;
+        let attempt = journal.attempts.last().unwrap();
+        assert_eq!(
+            attempt.selected_credit_expires_at,
+            Some(now + ChronoDuration::seconds(10))
+        );
+        assert_eq!(
+            attempt.pre_available_credit_ids,
+            vec!["credit-0".to_string()]
+        );
+
+        let observed_at = now + ChronoDuration::seconds(20);
+        let expired_bank = RateLimitResetBank {
+            available_count: 0,
+            total_earned_count: 1,
+            credits: Vec::new(),
+            fetched_at: now + ChronoDuration::seconds(5),
+        };
+        let replay_posts = Arc::clone(&posts);
+        let replay = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: Some(&initial_bank),
+                observed_bank: expired_bank.clone(),
+                attempt_reset: true,
+                now: observed_at,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| Ok(expired_bank.clone()),
+                |account| {
+                    make_quota_usable(account, observed_at + ChronoDuration::seconds(1));
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    *replay_posts.lock().unwrap() += 1;
+                    bail!("natural expiry reconciliation must not issue a second POST")
+                },
+            ),
+        )?;
+
+        assert_eq!(replay.state, ResetFlowState::Suppressed);
+        assert!(!replay.consumption_observed);
+        assert!(replay.quota_reconciled);
+        assert_eq!(*posts.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn different_credit_disappearance_cannot_prove_the_selected_redemption() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = fixed_policy_now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10), ChronoDuration::days(20)]);
+        let mut account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut account, now);
+        let posts = Arc::new(Mutex::new(0usize));
+        let first_posts = Arc::clone(&posts);
+
+        let first = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: None,
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| Ok(initial_bank.clone()),
+                |_account| Ok(()),
+                move |_account, _bank, _request_id| {
+                    *first_posts.lock().unwrap() += 1;
+                    Err(anyhow!("timeout"))
+                },
+            ),
+        )?;
+        assert_eq!(first.state, ResetFlowState::Suppressed);
+
+        let observed_at = now + ChronoDuration::seconds(30);
+        let mut wrong_credit_removed = initial_bank.clone();
+        wrong_credit_removed.available_count = 1;
+        wrong_credit_removed.credits.remove(1);
+        wrong_credit_removed.fetched_at = observed_at;
+        let replay_posts = Arc::clone(&posts);
+        let replay = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: Some(&initial_bank),
+                observed_bank: wrong_credit_removed.clone(),
+                attempt_reset: true,
+                now: observed_at,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| Ok(wrong_credit_removed.clone()),
+                |account| {
+                    make_quota_usable(account, observed_at + ChronoDuration::seconds(1));
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    *replay_posts.lock().unwrap() += 1;
+                    bail!("wrong-credit reconciliation must not issue a second POST")
+                },
+            ),
+        )?;
+
+        assert_eq!(replay.state, ResetFlowState::Suppressed);
+        assert!(!replay.consumption_observed);
+        assert_eq!(*posts.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_credit_decrease_cannot_prove_one_selected_redemption() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = fixed_policy_now();
+        let initial_bank = bank(
+            now,
+            &[
+                ChronoDuration::days(10),
+                ChronoDuration::days(20),
+                ChronoDuration::days(30),
+            ],
+        );
+        let mut account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut account, now);
+        let posts = Arc::new(Mutex::new(0usize));
+        let first_posts = Arc::clone(&posts);
+
+        let first = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: None,
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| Ok(initial_bank.clone()),
+                |_account| Ok(()),
+                move |_account, _bank, _request_id| {
+                    *first_posts.lock().unwrap() += 1;
+                    Err(anyhow!("timeout"))
+                },
+            ),
+        )?;
+        assert_eq!(first.state, ResetFlowState::Suppressed);
+
+        let observed_at = now + ChronoDuration::seconds(30);
+        let mut multiple_removed = initial_bank.clone();
+        multiple_removed.available_count = 1;
+        multiple_removed.credits.drain(0..2);
+        multiple_removed.fetched_at = observed_at;
+        let replay_posts = Arc::clone(&posts);
+        let replay = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: Some(&initial_bank),
+                observed_bank: multiple_removed.clone(),
+                attempt_reset: true,
+                now: observed_at,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| Ok(multiple_removed.clone()),
+                |account| {
+                    make_quota_usable(account, observed_at + ChronoDuration::seconds(1));
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    *replay_posts.lock().unwrap() += 1;
+                    bail!("multi-credit reconciliation must not issue a second POST")
+                },
+            ),
+        )?;
+
+        assert_eq!(replay.state, ResetFlowState::Suppressed);
+        assert!(!replay.consumption_observed);
+        assert_eq!(*posts.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn replay_requires_quota_generation_change_without_reissuing_post() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
@@ -4001,7 +4522,7 @@ mod tests {
         );
         attempt.submitted_at = Some(now);
         let mut legacy = serde_json::to_value(ResetAttemptJournal {
-            version: RESET_ATTEMPT_JOURNAL_LEGACY_VERSION,
+            version: RESET_ATTEMPT_JOURNAL_VERSION_1,
             attempts: vec![attempt],
             manual_review: None,
         })?;
@@ -4038,6 +4559,47 @@ mod tests {
             ),
         )?;
         assert_eq!(flow.state, ResetFlowState::Suppressed);
+        Ok(())
+    }
+
+    #[test]
+    fn version_two_unresolved_attempt_without_credit_evidence_requires_manual_review() -> Result<()>
+    {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let journal_path = reset_attempt_journal_path(&store_path);
+        let now = fixed_policy_now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let account = account("active@example.com", true, 100.0, 100.0);
+        let mut attempt = new_reset_attempt(
+            &account,
+            &initial_bank,
+            Some("credit-0".to_string()),
+            Uuid::new_v4(),
+            now,
+            ResetAttemptOrigin::LocalRequest,
+            ResetAttemptState::Uncertain,
+        );
+        attempt.submitted_at = Some(now);
+        let mut legacy = serde_json::to_value(ResetAttemptJournal {
+            version: RESET_ATTEMPT_JOURNAL_VERSION_2,
+            attempts: vec![attempt],
+            manual_review: None,
+        })?;
+        let legacy_attempt = legacy["attempts"][0].as_object_mut().unwrap();
+        legacy_attempt.remove("selectedCreditExpiresAt");
+        legacy_attempt.remove("preAvailableCreditIds");
+        fs::write(&journal_path, serde_json::to_vec_pretty(&legacy)?)?;
+
+        let migrated = load_reset_attempt_journal(&journal_path)?;
+
+        assert_eq!(migrated.version, RESET_ATTEMPT_JOURNAL_VERSION);
+        assert!(migrated
+            .manual_review
+            .as_ref()
+            .is_some_and(|sentinel| sentinel.reason.contains("starting inventory evidence")));
+        assert!(migrated.attempts[0].selected_credit_expires_at.is_none());
+        assert!(migrated.attempts[0].pre_available_credit_ids.is_empty());
         Ok(())
     }
 
@@ -4186,6 +4748,21 @@ mod tests {
     }
 
     #[test]
+    fn natural_credit_expiration_is_not_an_external_inventory_decrease() {
+        let now = fixed_policy_now();
+        let previous = bank(now, &[ChronoDuration::seconds(10)]);
+        let observed_at = now + ChronoDuration::seconds(20);
+        let observed = RateLimitResetBank {
+            available_count: 0,
+            total_earned_count: previous.total_earned_count,
+            credits: Vec::new(),
+            fetched_at: now + ChronoDuration::seconds(5),
+        };
+
+        assert!(external_inventory_decrease_evidence(&previous, &observed, observed_at).is_none());
+    }
+
+    #[test]
     fn inventory_decrease_does_not_depend_on_cross_host_wall_clock_order() {
         let now = Utc::now();
         let previous = bank(
@@ -4199,7 +4776,7 @@ mod tests {
             fetched_at: now,
         };
 
-        assert!(inventory_decreased(&previous, &observed));
+        assert!(external_inventory_decrease_evidence(&previous, &observed, now).is_some());
     }
 
     #[test]

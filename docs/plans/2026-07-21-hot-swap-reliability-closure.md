@@ -15,6 +15,7 @@ cross_dependencies:
   - ../../crates/codexswitch-cli/src/activation.rs
   - ../../crates/codexswitch-cli/src/readiness.rs
   - ../../crates/codexswitch-cli/src/reload.rs
+  - ../../crates/codexswitch-cli/src/rate_limit_resets.rs
   - ../../crates/codexswitch-cli/src/codex_update/source_app_server_patching.rs
   - ../../crates/codexswitch-cli/src/codex_update/source_app_server_template.rs
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
@@ -67,6 +68,14 @@ These observations distinguish configured account state, auth-file state, runnin
 - Bind external-auth observations to swap and activation generations, preserve typed partial desktop counts, and revalidate concrete runtime topology before confirmation.
 - Use one five-minute acknowledgement freshness boundary across runtime, daemon, readiness, and injected-turn validation. Only an explicit activation or rotation may mint fresh reload evidence; observers never signal a runtime merely to renew readiness, and expired evidence is reported as not ready.
 - Bind an injected turn to the exact control executable, receipt nonce, post-rotation ACK, and independently reloaded turn-local `AuthManager`.
+- Persist the Rust reset attempt's selected-credit expiration and complete
+  normalized starting credit-ID set. Disappearance proves a local redemption
+  only for the exact selected, still-unexpired credit and an exact one-credit
+  transition that preserves every other starting credit; natural expiry and a
+  different or multiple removed credit remain unresolved without another POST.
+  Inventory observations are timestamped only after the complete response is
+  read, oversized identifiers fail before journaling, and a post-save sentinel
+  or missing exact-attempt readback cancels submission before provider I/O.
 - Add a CI reliability workflow covering Swift tests, Rust contract tests, Python and shell harnesses, patch generation, and workflow linting.
 - Exercise the exact latest desktop bundle in staging and keep compact fixtures for every changed upstream semantic shape; never learn compatibility by mutating the live app.
 - Build the Mac app and managed runtime from the exact reviewed commit, with attestations and manifests checked before activation.
@@ -91,6 +100,10 @@ These observations distinguish configured account state, auth-file state, runnin
 | Runtime exits or appears after ACK | Final topology revalidation blocks confirmation |
 | External auth read returns after a newer swap | Stale observation is discarded without changing account state |
 | Child rotation report lacks the turn receipt nonce | Original turn is not retried |
+| Selected banked reset expires before reconciliation | Attempt remains unresolved; no second POST |
+| A different credit or more than one credit disappears | Attempt remains unresolved and the unexplained change is not attributed locally |
+| Credit expires while inventory GET is in flight | Response-completion time classifies natural expiry; no consumption proof or external hold |
+| Provider supplies an oversized credit identifier | Inventory is not redeemable; no reset attempt or POST |
 | Latest desktop minified shape is unknown or ambiguous | Staged patch fails before repack; live app is untouched |
 | Latest desktop already implements the safe data flow | Narrow proof adds the compatibility marker without changing behavior |
 
