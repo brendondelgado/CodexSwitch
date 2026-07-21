@@ -503,7 +503,7 @@ fn main() {
     let owner_uid = unsafe { libc::geteuid() };
     let resolved = codexswitch_resolve_linux_managed_control_cli_at(&fixture.home, owner_uid)
         .expect("the generated production managed-symlink layout must resolve");
-    assert_eq!(resolved.canonical_path(), fixture.cli);
+    assert_eq!(resolved.canonical_path, fixture.cli);
     assert_eq!(resolved.expected_sha256, fixture.cli_sha256);
     assert!(resolved.execution_path().is_some());
     assert!(resolved.is_still_current());
