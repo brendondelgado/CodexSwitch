@@ -4187,6 +4187,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "fixture child launched explicitly by the kernel executable identity test"]
+    fn process_executable_identity_fixture_waits() {
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn process_executable_identity_comes_from_proc_descriptor_and_rejects_stale_identity(
     ) -> Result<()> {
         struct ChildGuard(std::process::Child);
@@ -4198,17 +4205,18 @@ mod tests {
             }
         }
 
-        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-            .into_iter()
-            .map(Path::new)
-            .find(|candidate| candidate.is_file())
-            .context("sleep executable is unavailable")?;
         let dir = tempfile::tempdir()?;
         let runtime = dir.path().join("codex");
-        fs::copy(sleep, &runtime)?;
+        let test_executable = std::env::current_exe().context("test executable is unavailable")?;
+        fs::copy(test_executable, &runtime)?;
         let mut child = ChildGuard(
             std::process::Command::new(&runtime)
-                .arg("30")
+                .args([
+                    "--exact",
+                    "reload::tests::process_executable_identity_fixture_waits",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())

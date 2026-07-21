@@ -100,6 +100,7 @@ These observations distinguish configured account state, auth-file state, runnin
 | Runtime exits or appears after ACK | Final topology revalidation blocks confirmation |
 | External auth read returns after a newer swap | Stale observation is discarded without changing account state |
 | Child rotation report lacks the turn receipt nonce | Original turn is not retried |
+| Linux kernel-executable identity test runs on a hosted runner | A copied self-test fixture owns the observed inode; replacing its path leaves the live `/proc/<pid>/exe` descriptor bound to the original image |
 | Selected banked reset expires before reconciliation | Attempt remains unresolved; no second POST |
 | A different credit or more than one credit disappears | Attempt remains unresolved and the unexplained change is not attributed locally |
 | Credit expires while inventory GET is in flight | Response-completion time classifies natural expiry; no consumption proof or external hold |
