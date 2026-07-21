@@ -578,6 +578,63 @@ struct AccountActivationStateTests {
         #expect(try await coordinator.load() == review)
     }
 
+    @Test("Verified external auth recovery re-enters same-target convergence only")
+    func verifiedExternalAuthRecoveryIsNarrow() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let target = UUID()
+        let now = Date(timeIntervalSince1970: 1_800_001_100)
+        let coordinator = AccountActivationCoordinator(url: url)
+
+        _ = try await coordinator.beginPreparing(
+            targetAccountId: target,
+            kind: .automatic,
+            at: now
+        )
+        _ = try await coordinator.markCommittedDegraded(
+            targetAccountId: target,
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0,
+            detail: .runtimeAcknowledgementIncomplete,
+            at: now
+        )
+        _ = try await coordinator.markManualReview(
+            targetAccountId: target,
+            detail: .externalAuthInvalid,
+            at: now
+        )
+
+        let generation = UUID()
+        let recovered = try await coordinator.recoverVerifiedExternalAuth(
+            targetAccountId: target,
+            newActivationGeneration: generation,
+            at: now.addingTimeInterval(1)
+        )
+        #expect(recovered.phase == .committedDegraded)
+        #expect(recovered.configuredAccountId == target)
+        #expect(recovered.activationGeneration == generation)
+        #expect(recovered.detail == .externalAuthObserved)
+        #expect(recovered.retryAttempt == 0)
+        #expect(recovered.automaticRetryTarget(at: now.addingTimeInterval(1)) == target)
+
+        _ = try await coordinator.markManualReview(
+            targetAccountId: target,
+            detail: .configuredFilesInconsistent,
+            at: now.addingTimeInterval(2)
+        )
+        let beforeRejectedRecovery = try Data(contentsOf: url)
+        do {
+            _ = try await coordinator.recoverVerifiedExternalAuth(
+                targetAccountId: target,
+                at: now.addingTimeInterval(3)
+            )
+            Issue.record("Inconsistent durable files must remain a hard barrier")
+        } catch {
+            #expect(error is AccountActivationCoordinatorError)
+        }
+        #expect(try Data(contentsOf: url) == beforeRejectedRecovery)
+    }
+
     @Test("Automatic requests preserve expired confirmation without arming reload")
     func expiredEvidenceFailsClosedWithoutAutomaticDemotion() async throws {
         let url = temporaryJournalURL()

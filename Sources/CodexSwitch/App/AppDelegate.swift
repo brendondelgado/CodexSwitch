@@ -396,6 +396,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 )
             }
             return
+        case .invalid(let reason) where reason.isRetryableObservationFailure:
+            SwapLog.append(.debug(
+                "EXTERNAL_AUTH_OBSERVATION_DEFERRED reason=\(reason.rawValue)"
+            ))
+            return
         case .invalid:
             guard accountManager.configuredAccount != nil else { return }
             if accountManager.activationState?.detail != .externalAuthInvalid {
@@ -405,14 +410,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 )
             }
             return
-        case .unreadable:
-            guard accountManager.configuredAccount != nil else { return }
-            if accountManager.activationState?.detail != .externalAuthUnreadable {
-                await enterActivationManualReview(
-                    targetAccountId: accountManager.configuredAccount?.id,
-                    detail: .externalAuthUnreadable
-                )
-            }
+        case .unreadable(let reason):
+            SwapLog.append(.debug(
+                "EXTERNAL_AUTH_OBSERVATION_DEFERRED reason=\(reason.rawValue)"
+            ))
             return
         case .valid(let account):
             imported = account
@@ -450,7 +451,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             || existing.accessToken != target.accessToken
             || existing.refreshToken != target.refreshToken
             || existing.idToken != target.idToken
-        guard targetChanged || credentialsChanged else { return }
+        if !targetChanged, !credentialsChanged {
+            guard Self.verifiedExternalAuthRecoveryTarget(
+                state: accountManager.activationState,
+                configuredAccountId: configured?.id,
+                observedTargetAccountId: target.id
+            ) != nil else {
+                return
+            }
+            await startSameTargetRuntimeRetry(
+                to: target,
+                source: "external_auth_recovered"
+            )
+            return
+        }
 
         if let state = accountManager.activationState,
            state.phase != .confirmed,
@@ -4421,6 +4435,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return targetAccountId
     }
 
+    nonisolated static func verifiedExternalAuthRecoveryTarget(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        observedTargetAccountId: UUID
+    ) -> UUID? {
+        guard let state,
+              state.phase == .manualReview,
+              state.detail?.allowsVerifiedExternalAuthRecovery == true,
+              state.configuredAccountId == observedTargetAccountId,
+              configuredAccountId == observedTargetAccountId else {
+            return nil
+        }
+        return observedTargetAccountId
+    }
+
     nonisolated static func retryExhaustedTopologyRecoveryTarget(
         state: AccountActivationState?,
         configuredAccountId: UUID?,
@@ -4457,7 +4486,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let resetsRetryBudget = source == "manual"
             || source == "launch_recovery"
             || source == "runtime_topology_recovery"
-        let activationGeneration = resetsRetryBudget
+        let recoversExternalAuthBarrier = source == "external_auth_recovered"
+        let startsFreshGeneration = resetsRetryBudget || recoversExternalAuthBarrier
+        let activationGeneration = startsFreshGeneration
             ? UUID()
             : accountManager.activationState?.activationGeneration ?? UUID()
         let scoped = await accountMutationTransaction.withActivationLease(
@@ -4466,7 +4497,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ) { [weak self] lease in
             guard let self, !self.isExiting else { return false }
             do {
-                if resetsRetryBudget {
+                if startsFreshGeneration {
+                    if recoversExternalAuthBarrier {
+                        guard await self.durableConfiguredFilesMatch(target) else {
+                            self.accountManager.publishActivationNotice(
+                                "Stored account and auth file still disagree; activation remains paused"
+                            )
+                            return false
+                        }
+                    }
                     if self.accountManager.activationState?.phase == .manualReview,
                        self.accountManager.activationState?.detail
                         == .durableConfigurationChanged {
@@ -4477,23 +4516,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             return false
                         }
                     }
-                    let reset = try await self.accountActivationCoordinator
-                        .resetForManualSameTargetRetry(
-                            targetAccountId: target.id,
-                            newActivationGeneration: activationGeneration,
-                            authorizeEffect: { [accountMutationTransaction] state in
-                                accountMutationTransaction.leaseAuthorizes(
-                                    lease,
-                                    targetAccountId: target.id,
-                                    activationGeneration: activationGeneration
-                                )
-                                    && state?.configuredAccountId == target.id
-                                    && state.map {
-                                        $0.phase == .committedDegraded
-                                            || $0.phase == .manualReview
-                                    } == true
-                            }
-                        )
+                    let reset: AccountActivationState
+                    if recoversExternalAuthBarrier {
+                        reset = try await self.accountActivationCoordinator
+                            .recoverVerifiedExternalAuth(
+                                targetAccountId: target.id,
+                                newActivationGeneration: activationGeneration,
+                                authorizeEffect: { [accountMutationTransaction] state in
+                                    accountMutationTransaction.leaseAuthorizes(
+                                        lease,
+                                        targetAccountId: target.id,
+                                        activationGeneration: activationGeneration
+                                    )
+                                        && state?.configuredAccountId == target.id
+                                        && state?.phase == .manualReview
+                                        && state?.detail?
+                                            .allowsVerifiedExternalAuthRecovery == true
+                                }
+                            )
+                    } else {
+                        reset = try await self.accountActivationCoordinator
+                            .resetForManualSameTargetRetry(
+                                targetAccountId: target.id,
+                                newActivationGeneration: activationGeneration,
+                                authorizeEffect: { [accountMutationTransaction] state in
+                                    accountMutationTransaction.leaseAuthorizes(
+                                        lease,
+                                        targetAccountId: target.id,
+                                        activationGeneration: activationGeneration
+                                    )
+                                        && state?.configuredAccountId == target.id
+                                        && state.map {
+                                            $0.phase == .committedDegraded
+                                                || $0.phase == .manualReview
+                                        } == true
+                                }
+                            )
+                    }
                     guard reset.phase == .committedDegraded,
                           reset.configuredAccountId == target.id,
                           reset.activationGeneration == activationGeneration,

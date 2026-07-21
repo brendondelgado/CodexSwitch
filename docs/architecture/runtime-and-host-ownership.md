@@ -164,6 +164,18 @@ reset the count by returning to `Preparing`. Exhausting the ceiling enters
 counts. The UI must present that partial convergence explicitly; it must not
 collapse verified progress into a generic zero-runtime or "no swaps" state.
 
+External-auth observation treats a concurrent file replacement, an unavailable
+read, and ordinary content changes inside an opened ancestor directory as
+retryable observation failures, not proof that configured credentials are
+invalid. Ancestor validation binds device, inode, owner, group, mode, and the
+opened path; mutable directory size and timestamps are not identity evidence.
+If a prior deterministic external-auth failure already produced `ManualReview`,
+a later descriptor-anchored valid read may recover only when it identifies the
+same configured account and the durable account store and complete auth token
+set still match. Recovery enters a fresh same-target `CommittedDegraded`
+generation and requires current runtime acknowledgements before `Confirmed`;
+it never clears the barrier from observation alone.
+
 An explicit operator request may escape a valid `CommittedDegraded` barrier by
 selecting another account. It may also escape `ManualReview` only when that
 state was produced by the bounded automatic-retry ceiling. The request starts a

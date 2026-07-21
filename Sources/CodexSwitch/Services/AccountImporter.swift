@@ -13,6 +13,15 @@ enum AccountAuthObservationFailure: String, Equatable, Sendable {
     case malformed
     case incompleteCredentials
     case readFailed
+
+    var isRetryableObservationFailure: Bool {
+        switch self {
+        case .ancestorChanged, .changedDuringRead, .readFailed:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 enum AccountAuthObservation: Sendable {
@@ -284,6 +293,7 @@ enum AccountImporter {
         before.st_dev == after.st_dev
             && before.st_ino == after.st_ino
             && before.st_uid == after.st_uid
+            && before.st_gid == after.st_gid
             && before.st_mode == after.st_mode
             && before.st_nlink == after.st_nlink
             && before.st_size == after.st_size
@@ -291,6 +301,14 @@ enum AccountImporter {
             && before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec
             && before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec
             && before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec
+    }
+
+    private static func directoryIdentityIsStable(_ before: stat, _ after: stat) -> Bool {
+        before.st_dev == after.st_dev
+            && before.st_ino == after.st_ino
+            && before.st_uid == after.st_uid
+            && before.st_gid == after.st_gid
+            && before.st_mode == after.st_mode
     }
 
     private static func pathBindingMatches(
@@ -310,7 +328,7 @@ enum AccountImporter {
     private static func ancestorIsStableAndBound(_ ancestor: OpenedAncestor) -> Bool {
         var final = stat()
         guard fstat(ancestor.descriptor, &final) == 0,
-              metadataIsStable(ancestor.metadata, final),
+              directoryIdentityIsStable(ancestor.metadata, final),
               directoryIsTrusted(final) else {
             return false
         }

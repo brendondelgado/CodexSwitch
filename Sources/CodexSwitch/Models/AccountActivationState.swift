@@ -45,6 +45,15 @@ enum AccountActivationDetail: String, Codable, Equatable, Sendable {
     var allowsManualCrossTargetEscape: Bool {
         self == .automaticRetryLimitReached
     }
+
+    var allowsVerifiedExternalAuthRecovery: Bool {
+        switch self {
+        case .externalAuthAbsent, .externalAuthInvalid, .externalAuthUnreadable:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 enum AccountActivationRequestKind: Equatable, Sendable {

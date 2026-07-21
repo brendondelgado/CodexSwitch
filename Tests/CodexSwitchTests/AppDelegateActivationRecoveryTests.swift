@@ -148,4 +148,47 @@ struct AppDelegateActivationRecoveryTests {
         #expect(manualReviewWrites == 1)
         #expect(try await coordinator.load()?.phase == .manualReview)
     }
+
+    @Test("Only matching external auth barriers recover from a stable observation")
+    func externalAuthRecoveryTargetIsNarrow() {
+        let target = UUID()
+        let other = UUID()
+        let review = AccountActivationState.manualReview(
+            targetAccountId: target,
+            detail: .externalAuthInvalid,
+            at: Date(timeIntervalSince1970: 1_800_100_100)
+        )
+
+        #expect(AppDelegate.verifiedExternalAuthRecoveryTarget(
+            state: review,
+            configuredAccountId: target,
+            observedTargetAccountId: target
+        ) == target)
+        #expect(AppDelegate.verifiedExternalAuthRecoveryTarget(
+            state: review,
+            configuredAccountId: other,
+            observedTargetAccountId: target
+        ) == nil)
+        #expect(AppDelegate.verifiedExternalAuthRecoveryTarget(
+            state: review,
+            configuredAccountId: target,
+            observedTargetAccountId: other
+        ) == nil)
+
+        let inconsistent = AccountActivationState.manualReview(
+            targetAccountId: target,
+            detail: .configuredFilesInconsistent,
+            at: Date(timeIntervalSince1970: 1_800_100_100)
+        )
+        #expect(AppDelegate.verifiedExternalAuthRecoveryTarget(
+            state: inconsistent,
+            configuredAccountId: target,
+            observedTargetAccountId: target
+        ) == nil)
+
+        #expect(AccountAuthObservationFailure.ancestorChanged.isRetryableObservationFailure)
+        #expect(AccountAuthObservationFailure.changedDuringRead.isRetryableObservationFailure)
+        #expect(AccountAuthObservationFailure.readFailed.isRetryableObservationFailure)
+        #expect(!AccountAuthObservationFailure.malformed.isRetryableObservationFailure)
+    }
 }

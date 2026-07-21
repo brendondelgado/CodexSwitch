@@ -128,6 +128,28 @@ struct AccountImporterObservationTests {
         }
     }
 
+    @Test("Unrelated ancestor directory content churn preserves a valid observation")
+    func ancestorContentChurnRemainsValid() throws {
+        let url = try temporaryAuthURL()
+        let root = url.deletingLastPathComponent()
+        let unrelated = root.appendingPathComponent("unrelated-session-write")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeAuth(to: url)
+
+        let observation = AccountImporter.observeCurrentAccount(
+            from: url.path,
+            testHooks: .init(afterOpeningAncestors: {
+                try! Data("unrelated".utf8).write(to: unrelated)
+            })
+        )
+
+        guard case .valid(let account) = observation else {
+            Issue.record("Unrelated directory churn must not invalidate auth identity")
+            return
+        }
+        #expect(account.accountId == "provider-account")
+    }
+
     @Test("A concurrent auth rewrite invalidates the descriptor read")
     func concurrentRewriteFailsClosed() throws {
         let url = try temporaryAuthURL()

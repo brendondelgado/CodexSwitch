@@ -364,6 +364,33 @@ actor AccountActivationCoordinator {
     }
 
     @discardableResult
+    func recoverVerifiedExternalAuth(
+        targetAccountId: UUID,
+        newActivationGeneration: UUID = UUID(),
+        authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
+        at date: Date = Date()
+    ) throws -> AccountActivationState {
+        try transition(authorizeEffect: authorizeEffect) { current in
+            guard let current,
+                  current.phase == .manualReview,
+                  current.configuredAccountId == targetAccountId,
+                  current.detail?.allowsVerifiedExternalAuthRecovery == true else {
+                throw AccountActivationCoordinatorError.invalidTransition(
+                    "external-auth recovery requires a matching observation barrier"
+                )
+            }
+            return .committedDegraded(
+                targetAccountId: targetAccountId,
+                detail: .externalAuthObserved,
+                activationGeneration: newActivationGeneration,
+                retryAttempt: 0,
+                nextRetryAt: date,
+                at: date
+            )
+        }
+    }
+
+    @discardableResult
     func markConfirmed(
         targetAccountId: UUID,
         expectedActivationGeneration: UUID,
