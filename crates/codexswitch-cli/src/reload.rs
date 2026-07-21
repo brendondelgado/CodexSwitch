@@ -153,6 +153,13 @@ fn discover_codex_processes(include_app_server: bool) -> Result<Vec<CodexProcess
     discover_codex_processes_platform(include_app_server)
 }
 
+fn process_matches_discovery_scope(process: &CodexProcess, include_app_server: bool) -> bool {
+    is_codex_cli_runtime(&process.command_line, &process.executable)
+        || (include_app_server
+            && is_native_codex_runtime(&process.executable)
+            && is_codex_app_server_command_line(&process.command_line))
+}
+
 #[cfg(target_os = "linux")]
 fn discover_codex_processes_platform(include_app_server: bool) -> Result<Vec<CodexProcess>> {
     let current_uid = unsafe { libc_geteuid() };
@@ -173,11 +180,7 @@ fn discover_codex_processes_platform(include_app_server: bool) -> Result<Vec<Cod
         if process.owner_uid != current_uid {
             continue;
         }
-        let is_cli = is_codex_cli_runtime(&process.command_line, &process.executable);
-        let is_app_server = include_app_server
-            && is_native_codex_runtime(&process.executable)
-            && is_codex_app_server_command_line(&process.command_line);
-        if !is_cli && !is_app_server {
+        if !process_matches_discovery_scope(&process, include_app_server) {
             continue;
         }
         processes.push(process);
@@ -248,6 +251,7 @@ fn discover_codex_processes_platform(include_app_server: bool) -> Result<Vec<Cod
         Ok(processes
             .into_iter()
             .filter_map(enrich_macos_process_identity)
+            .filter(|process| process_matches_discovery_scope(process, include_app_server))
             .collect())
     }
     #[cfg(not(target_os = "macos"))]
@@ -292,21 +296,17 @@ fn parse_ps_processes(
         let Some(executable) = executable_from_command_line(command_line) else {
             continue;
         };
-        let is_cli = is_codex_cli_runtime(command_line, &executable);
-        let is_app_server = include_app_server
-            && is_native_codex_runtime(&executable)
-            && is_codex_app_server_command_line(command_line);
-        if !is_cli && !is_app_server {
-            continue;
-        }
-        processes.push(CodexProcess {
+        let process = CodexProcess {
             pid,
             owner_uid: uid,
             start_identity,
             started_at_unix,
             command_line: command_line.to_string(),
             executable,
-        });
+        };
+        if process_matches_discovery_scope(&process, include_app_server) {
+            processes.push(process);
+        }
     }
     processes
 }
@@ -1675,13 +1675,12 @@ pub fn is_codex_cli_command_line(command_line: &str) -> bool {
 fn is_codex_cli_runtime(command_line: &str, executable: &Path) -> bool {
     is_codex_cli_command_line(command_line)
         && !is_shell_wrapper_runtime(executable)
-        && !is_desktop_framework_helper(executable)
+        && !is_macos_application_bundle_executable(executable)
 }
 
-fn is_desktop_framework_helper(executable: &Path) -> bool {
+fn is_macos_application_bundle_executable(executable: &Path) -> bool {
     let path = executable.to_string_lossy().to_ascii_lowercase();
-    path.contains("/applications/chatgpt.app/contents/frameworks/")
-        || path.contains("/applications/codex.app/contents/frameworks/")
+    path.contains(".app/contents/")
 }
 
 pub fn is_codex_app_server_command_line(command_line: &str) -> bool {
@@ -1993,6 +1992,17 @@ mod tests {
                 "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
             )
         ));
+        let computer_use = CodexProcess {
+            pid: 42,
+            owner_uid: 501,
+            start_identity: "macos:computer-use".to_string(),
+            started_at_unix: 1,
+            command_line: "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService".to_string(),
+            executable: PathBuf::from(
+                "/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService",
+            ),
+        };
+        assert!(!process_matches_discovery_scope(&computer_use, true));
         assert!(is_codex_app_server_command_line(
             "/usr/bin/codex app-server --listen ws://127.0.0.1:8390"
         ));

@@ -115,7 +115,11 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
 
     let daemon_running = daemon_is_running()?;
     if !daemon_running {
-        issues.push("codexswitch daemon is not running".to_string());
+        issues.push(if cfg!(target_os = "macos") {
+            "CodexSwitch menu coordinator is not running".to_string()
+        } else {
+            "codexswitch daemon is not running".to_string()
+        });
     }
 
     let mut binary_marker_cache = HashMap::new();
@@ -401,7 +405,7 @@ fn ps_output_has_codexswitch_daemon(ps_output: &str, current_uid: u32, current_p
             return false;
         };
         uid_text.parse::<u32>().ok() == Some(current_uid)
-            && is_codexswitch_daemon_command_line(command_line)
+            && is_codexswitch_coordinator_command_line(command_line)
     })
 }
 
@@ -419,6 +423,20 @@ fn split_first_ps_field(input: &str) -> Option<(&str, &str)> {
 
 fn is_codexswitch_daemon_command_line(command_line: &str) -> bool {
     command_line.contains("codexswitch-cli") && command_line.contains(" daemon")
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn is_codexswitch_coordinator_command_line(command_line: &str) -> bool {
+    if is_codexswitch_daemon_command_line(command_line) {
+        return true;
+    }
+    command_line
+        .split_whitespace()
+        .next()
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|executable| {
+            executable.ends_with("/codexswitch.app/contents/macos/codexswitch")
+        })
 }
 
 unsafe fn libc_geteuid() -> u32 {
@@ -538,6 +556,17 @@ invalid row
 
         assert!(ps_output_has_codexswitch_daemon(ps_output, 501, 999));
         assert!(!ps_output_has_codexswitch_daemon(ps_output, 501, 412));
+    }
+
+    #[test]
+    fn ps_daemon_parser_recognizes_the_macos_menu_coordinator() {
+        let ps_output = "\
+  510  501 /Applications/CodexSwitch.app/Contents/MacOS/CodexSwitch
+  511  501 /Users/me/Developer/CodexSwitch/.build/debug/CodexSwitchTests
+";
+
+        assert!(ps_output_has_codexswitch_daemon(ps_output, 501, 999));
+        assert!(!ps_output_has_codexswitch_daemon(ps_output, 501, 510));
     }
 
     #[test]
