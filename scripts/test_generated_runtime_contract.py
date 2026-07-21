@@ -389,6 +389,7 @@ impl ManagedFixture {
         let release_id = format!("0.1.0-{}", "a".repeat(40));
         let release_dir = releases.join(&release_id);
         std::fs::create_dir_all(&release_dir).expect("create managed release");
+        std::fs::create_dir_all(&bin).expect("create managed binary directory");
         for directory in [&home, &local, &bin, &share, &install_root, &releases] {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))
                 .expect("secure managed directory");
