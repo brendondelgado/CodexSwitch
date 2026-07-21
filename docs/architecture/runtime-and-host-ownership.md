@@ -407,6 +407,16 @@ patch readiness therefore requires a versioned auth-cache marker that proves thi
 scope contract; the historical unversioned `_invalidateAccountQueries` marker is
 not sufficient evidence and must be upgraded before activation.
 
+`account/login/start` may emit a transient status notification with no auth
+method before the same transaction's authoritative `account/read` completes.
+When the renderer already has authenticated state, that intermediate notification
+must retain the prior state: it must not invoke logout handling, clear the loaded
+desktop token, or replace application routes. The cache is still invalidated and
+the account read still runs. Its result is authoritative: a resolved unauthenticated
+account performs the normal logout transition, while a resolved authenticated
+account atomically replaces the prior account state. Patch generation V3 proves
+both the scope-safe cache invalidator and this deferred transition behavior.
+
 The version-3 reload nonce is an opaque cross-language correlation identifier.
 Swift and Rust writers may encode it differently, so readers validate that it
 is bounded printable ASCII and rely on the complete process, executable, auth

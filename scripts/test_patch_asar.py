@@ -791,6 +791,20 @@ class PatchAsarTests(unittest.TestCase):
                 "}),_invalidateAccountQueries(),c()};return e.addAuthStatusCallback",
                 patched,
             )
+            self.assertIn(patch_asar.AUTH_TRANSITION_PATCH_MARKER, patched)
+            self.assertIn(
+                "p(t=>_codexSwitchResolveAuthState(t,y(e,{isCopilotApiAvailable:r,"
+                "useCopilotAuthIfAvailable:i}),o))",
+                patched,
+            )
+            self.assertIn(
+                "e.authMethod==null&&t?.authMethod!=null?t:",
+                patched,
+            )
+            self.assertNotIn(
+                "e.authMethod==null&&t?.authMethod!=null?(o?.(),_()):",
+                patched,
+            )
             self.assertIn("export{p as u};", patched)
 
     def test_apply_patch_supports_weakmap_use_auth_bundle_without_vscode_import(self):
@@ -805,10 +819,17 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn(patch_asar.PATCH_MARKER, patched)
             self.assertIn(patch_asar.AUTH_CACHE_PATCH_MARKER, patched)
             self.assertIn(
-                'function _invalidateAccountQueries(){"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2";'
+                'function _invalidateAccountQueries(){"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
                 'try{typeof f!="undefined"&&(f=new WeakMap)}catch{}}',
                 patched,
             )
+            self.assertEqual(patched.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
+            self.assertIn(
+                "p(t=>_codexSwitchResolveAuthState(t,y(e,{isCopilotApiAvailable:r,"
+                "useCopilotAuthIfAvailable:i}),o))",
+                patched,
+            )
+            self.assertIn("e.authMethod==null&&t?.authMethod!=null?t:", patched)
             self.assertIn("f=new WeakMap;", patched)
             self.assertIn(
                 "}),_invalidateAccountQueries(),c()};return e.addAuthStatusCallback",
@@ -827,10 +848,17 @@ class PatchAsarTests(unittest.TestCase):
             patched = target.read_text()
             self.assertEqual(patched.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
             self.assertIn(
-                'function _invalidateAccountQueries(){"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2";'
+                'function _invalidateAccountQueries(){"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
                 'try{typeof _9!="undefined"&&(_9=new WeakMap)}catch{}}',
                 patched,
             )
+            self.assertEqual(patched.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
+            self.assertIn(
+                "u(t=>_codexSwitchResolveAuthState(t,$de(e,{isCopilotApiAvailable:r,"
+                "useCopilotAuthIfAvailable:i}),o))",
+                patched,
+            )
+            self.assertIn("e.authMethod==null&&t?.authMethod!=null?t:", patched)
             self.assertLess(
                 patched.index("function _invalidateAccountQueries"),
                 patched.index("var m9,h9,g9,_9,v9="),
@@ -866,6 +894,7 @@ class PatchAsarTests(unittest.TestCase):
                 repaired,
             )
             self.assertEqual(repaired.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
+            self.assertEqual(repaired.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
             self.assertEqual(repaired.count("function _invalidateAccountQueries"), 1)
             self.assertEqual(repaired.count("_invalidateAccountQueries(),l()"), 1)
             self.assertLess(
@@ -884,16 +913,59 @@ class PatchAsarTests(unittest.TestCase):
                 "function _invalidateAccountQueries(){if(_qcRef){"
                 "_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]});"
                 "_qcRef.invalidateQueries({queryKey:_csQueryKey(`account-info`)})}}"
-                "function hook(){_invalidateAccountQueries()}export{hook as h};"
+                + WEAKMAP_USE_AUTH_CONTENT.replace(
+                    "}),c()};return e.addAuthStatusCallback",
+                    "}),_invalidateAccountQueries(),c()};return e.addAuthStatusCallback",
+                    1,
+                )
             )
 
             self.assertTrue(patch_asar.apply_patch(target))
 
             upgraded = target.read_text()
             self.assertEqual(upgraded.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
+            self.assertEqual(upgraded.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
             self.assertIn("Promise.allSettled", upgraded)
+            self.assertIn("_codexSwitchResolveAuthState", upgraded)
             self.assertNotIn(
                 "function _invalidateAccountQueries(){if(_qcRef)",
+                upgraded,
+            )
+
+            self.assertTrue(patch_asar.apply_patch(target))
+            self.assertEqual(target.read_text(), upgraded)
+
+    def test_apply_patch_upgrades_v2_auth_transition_without_layering_helpers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "use-auth-HASH.js"
+            last_import = 'import{t as o}from"./use-global-state-BKadSfwQ.js";'
+            legacy_helper = (
+                'function _invalidateAccountQueries(){'
+                '"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2";'
+                'try{typeof f!="undefined"&&(f=new WeakMap)}catch{}}'
+            )
+            legacy = WEAKMAP_USE_AUTH_CONTENT.replace(
+                last_import,
+                last_import + legacy_helper,
+                1,
+            ).replace(
+                "}),c()};return e.addAuthStatusCallback",
+                "}),_invalidateAccountQueries(),c()};return e.addAuthStatusCallback",
+                1,
+            )
+            target.write_text(legacy)
+
+            self.assertTrue(patch_asar.apply_patch(target))
+
+            upgraded = target.read_text()
+            self.assertNotIn(patch_asar.LEGACY_AUTH_CACHE_PATCH_MARKER, upgraded)
+            self.assertEqual(upgraded.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
+            self.assertEqual(upgraded.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
+            self.assertEqual(upgraded.count("function _invalidateAccountQueries"), 1)
+            self.assertEqual(upgraded.count("function _codexSwitchResolveAuthState"), 1)
+            self.assertIn("e.authMethod==null&&t?.authMethod!=null?t:", upgraded)
+            self.assertNotIn(
+                "e.authMethod==null&&t?.authMethod!=null?(o?.(),_()):",
                 upgraded,
             )
 
