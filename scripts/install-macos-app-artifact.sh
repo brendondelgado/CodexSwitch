@@ -437,6 +437,10 @@ with zipfile.ZipFile(archive) as handle:
         "CodexSwitch.app/Contents/Info.plist",
         "CodexSwitch.app/Contents/MacOS/CodexSwitch",
         "CodexSwitch.app/Contents/Resources/patch-asar.py",
+        "CodexSwitch.app/Contents/Resources/asar-tool/package.json",
+        "CodexSwitch.app/Contents/Resources/asar-tool/package-lock.json",
+        "CodexSwitch.app/Contents/Resources/asar-tool/node_modules/@electron/asar/bin/asar.mjs",
+        "CodexSwitch.app/Contents/Resources/asar-tool/node_modules/@electron/asar/lib/asar.js",
     }
     if not required.issubset(seen):
         raise SystemExit("app archive is missing a required bundle member")
@@ -465,6 +469,10 @@ verify_bundle() {
   local bundle="$1"
   local executable="$bundle/Contents/MacOS/CodexSwitch"
   local patcher="$bundle/Contents/Resources/patch-asar.py"
+  local asar_cli="$bundle/Contents/Resources/asar-tool/node_modules/@electron/asar/bin/asar.mjs"
+  local asar_module="$bundle/Contents/Resources/asar-tool/node_modules/@electron/asar/lib/asar.js"
+  local asar_package="$bundle/Contents/Resources/asar-tool/package.json"
+  local asar_lock="$bundle/Contents/Resources/asar-tool/package-lock.json"
   local linked special signature
 
   [[ -d "$bundle" && ! -L "$bundle" ]] || {
@@ -489,6 +497,22 @@ verify_bundle() {
     print -u2 "bundled patch-asar.py is missing or linked"
     return 1
   }
+  [[ -f "$asar_cli" && ! -L "$asar_cli" && -s "$asar_cli" ]] || {
+    print -u2 "bundled ASAR CLI is missing or linked"
+    return 1
+  }
+  [[ -f "$asar_module" && ! -L "$asar_module" && -s "$asar_module" ]] || {
+    print -u2 "bundled ASAR module is missing or linked"
+    return 1
+  }
+  [[ -f "$asar_package" && ! -L "$asar_package" && -s "$asar_package" ]] || {
+    print -u2 "bundled ASAR package manifest is missing or linked"
+    return 1
+  }
+  [[ -f "$asar_lock" && ! -L "$asar_lock" && -s "$asar_lock" ]] || {
+    print -u2 "bundled ASAR lockfile is missing or linked"
+    return 1
+  }
   [[ -f "$repo_root/scripts/patch-asar.py" && ! -L "$repo_root/scripts/patch-asar.py" ]] || {
     print -u2 "reviewed source patch-asar.py is missing or linked"
     return 1
@@ -507,6 +531,30 @@ verify_bundle() {
   }
   [[ "$(file_sha256 "$patcher")" == "$expected_patcher_sha256" ]] || {
     print -u2 "bundled patch-asar.py hash does not match the manifest"
+    return 1
+  }
+  (( $(file_bytes "$asar_cli") <= 1048576 )) || {
+    print -u2 "bundled ASAR CLI exceeds 1 MiB"
+    return 1
+  }
+  (( $(file_bytes "$asar_module") <= 1048576 )) || {
+    print -u2 "bundled ASAR module exceeds 1 MiB"
+    return 1
+  }
+  (( $(file_bytes "$asar_package") <= 65536 )) || {
+    print -u2 "bundled ASAR package manifest exceeds 64 KiB"
+    return 1
+  }
+  (( $(file_bytes "$asar_lock") <= 1048576 )) || {
+    print -u2 "bundled ASAR lockfile exceeds 1 MiB"
+    return 1
+  }
+  /usr/bin/cmp -s "$repo_root/tools/asar-tool/package.json" "$asar_package" || {
+    print -u2 "bundled ASAR package manifest differs from the reviewed source"
+    return 1
+  }
+  /usr/bin/cmp -s "$repo_root/tools/asar-tool/package-lock.json" "$asar_lock" || {
+    print -u2 "bundled ASAR lockfile differs from the reviewed source"
     return 1
   }
 

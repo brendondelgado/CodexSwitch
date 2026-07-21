@@ -284,7 +284,8 @@ set. The app workflow accepts only one input: the full CodexSwitch commit SHA
 selected by the dispatch ref. It requires `refs/heads/main`, a clean exact
 checkout, and a native arm64 `macos-15` runner.
 
-The workflow first runs the complete Swift suite with `--jobs 1 --no-parallel`
+The workflow first runs the Python patcher, bundle-builder, and artifact
+contract suites, then the complete Swift suite with `--jobs 1 --no-parallel`
 in a private temporary directory. It then calls `scripts/build-app.sh` without
 `--install` using these deterministic values:
 
@@ -295,7 +296,13 @@ CODEXSWITCH_SOURCE_REVISION=<full dispatched commit>
 CODEXSWITCH_BUILD_NUMBER=<commit epoch>
 CODEXSWITCH_VERSION=1.0.0
 CODEXSWITCH_CODESIGN_IDENTITY=-
+CODEXSWITCH_REQUIRE_BUNDLED_ASAR_TOOL=1
 ```
+
+Before the app build, the workflow runs `npm ci` with scripts and binary links
+disabled against `tools/asar-tool/package-lock.json`. The resulting regular
+files are bundled under `Contents/Resources/asar-tool`; runtime patch retries
+never install or download npm packages.
 
 The resulting app is validated before packaging and after a fresh ZIP
 round-trip. `ditto` packages the bundle without resource forks, extended
@@ -343,14 +350,17 @@ The completed run must prove:
    signature.
 6. Bundled `patch-asar.py` exactly matches the dispatched source, and its hash
    and the executable hash match the manifest.
-7. The executable contains none of `LINUX_DEVBOX_ACTIVE_PUSH`,
+7. The app contains a non-symlink ASAR CLI and module, and its package manifest
+   and lockfile exactly match the dispatched source pin for `@electron/asar`
+   `4.2.0`; the pinned CLI passes a smoke test under Node `22.12.0` or newer.
+8. The executable contains none of `LINUX_DEVBOX_ACTIVE_PUSH`,
    `pendingLinuxDevboxActive`, or `pushLinuxDevboxActiveAccount`.
-8. ZIP preflight accepts only bounded, relative, non-link entries under
+9. ZIP preflight accepts only bounded, relative, non-link entries under
    `CodexSwitch.app`, and all bundle checks pass after extraction into a fresh
    directory.
-9. The source checkout is clean at the exact SHA after build output has been
+10. The source checkout is clean at the exact SHA after build output has been
    removed.
-10. Pinned official actions attest both exact members before the separate
+11. Pinned official actions attest both exact members before the separate
     artifact is uploaded.
 
 ## Download And Install The App
@@ -381,10 +391,11 @@ and archive bounds, safely extracts the ZIP, and repeats the complete bundle
 contract before it creates an `/Applications` staging directory or asks the
 running app to quit. The liveness gate covers every process launched from a
 bundle named `CodexSwitch.app`, including stale development-build watchdog
-targets, rather than checking only `/Applications`. It never recompiles or
-re-signs the bundle. Replacement is transactional: validation or launch failure
-restores and relaunches the prior app, while a preactivation failure leaves the
-installed app unchanged.
+targets, rather than checking only `/Applications`. It rejects a missing or
+unpinned bundled ASAR tool and never compiles, downloads, or re-signs the
+bundle. Replacement is transactional: validation or launch failure restores
+and relaunches the prior app, while a preactivation failure leaves the installed
+app unchanged.
 
 ## Failure Handling
 

@@ -108,7 +108,49 @@ jobs:
           command -v lipo >/dev/null
           command -v codesign >/dev/null
           command -v ditto >/dev/null
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.test_macos_app_artifact
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+            scripts.test_patch_asar \
+            scripts.test_build_app \
+            scripts.test_macos_app_artifact
+
+      - name: Prepare the lockfile-pinned ASAR tool
+        run: |
+          set -euo pipefail
+          command -v node >/dev/null
+          command -v npm >/dev/null
+          node -e '
+            const [major, minor] = process.versions.node.split(".").map(Number);
+            if (major < 22 || (major === 22 && minor < 12)) process.exit(1);
+          '
+          asar_tool_stage="$RUNNER_TEMP/codexswitch-asar-tool-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          asar_npm_cache="$RUNNER_TEMP/codexswitch-asar-npm-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf -- "$asar_tool_stage" "$asar_npm_cache"
+          install -d -m 0700 "$asar_tool_stage" "$asar_npm_cache"
+          cp tools/asar-tool/package.json tools/asar-tool/package-lock.json "$asar_tool_stage/"
+          npm_config_cache="$asar_npm_cache" npm ci \
+            --prefix "$asar_tool_stage" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            --bin-links=false
+          jq -e '
+            .lockfileVersion == 3 and
+            .packages[""].dependencies["@electron/asar"] == "4.2.0" and
+            .packages["node_modules/@electron/asar"].version == "4.2.0"
+          ' "$asar_tool_stage/package-lock.json" >/dev/null
+          test -f "$asar_tool_stage/node_modules/@electron/asar/bin/asar.mjs"
+          test -f "$asar_tool_stage/node_modules/@electron/asar/lib/asar.js"
+          test "$(node "$asar_tool_stage/node_modules/@electron/asar/bin/asar.mjs" --version)" = "v4.2.0"
+          linked="$(find "$asar_tool_stage" -type l -print -quit)"
+          if [[ -n "$linked" ]]; then
+            echo "::error::prepared ASAR tool contains a symlink: $linked"
+            exit 1
+          fi
+          {
+            printf 'CODEXSWITCH_ASAR_TOOL_DIR=%s\n' "$asar_tool_stage"
+            printf 'CODEXSWITCH_ASAR_NPM_CACHE=%s\n' "$asar_npm_cache"
+            printf 'CODEXSWITCH_REQUIRE_BUNDLED_ASAR_TOOL=1\n'
+          } >> "$GITHUB_ENV"
 
       - name: Verify the Swift app and test suite
         run: |
@@ -133,6 +175,8 @@ jobs:
             CODEXSWITCH_BUILD_NUMBER="$SOURCE_DATE_EPOCH" \
             CODEXSWITCH_VERSION="$APP_VERSION" \
             CODEXSWITCH_CODESIGN_IDENTITY=- \
+            CODEXSWITCH_ASAR_TOOL_DIR="$CODEXSWITCH_ASAR_TOOL_DIR" \
+            CODEXSWITCH_REQUIRE_BUNDLED_ASAR_TOOL=1 \
             ./scripts/build-app.sh
 
       - name: Validate, package, and round-trip the app
@@ -156,6 +200,10 @@ jobs:
             local bundle="$1"
             local executable="$bundle/Contents/MacOS/CodexSwitch"
             local patcher="$bundle/Contents/Resources/patch-asar.py"
+            local asar_cli="$bundle/Contents/Resources/asar-tool/node_modules/@electron/asar/bin/asar.mjs"
+            local asar_module="$bundle/Contents/Resources/asar-tool/node_modules/@electron/asar/lib/asar.js"
+            local asar_package="$bundle/Contents/Resources/asar-tool/package.json"
+            local asar_lock="$bundle/Contents/Resources/asar-tool/package-lock.json"
             local linked special signature
 
             [[ -d "$bundle" && ! -L "$bundle" ]] || fail "app bundle is missing or linked: $bundle"
@@ -167,8 +215,24 @@ jobs:
               || fail "app executable is missing, linked, or not executable"
             [[ -f "$patcher" && ! -L "$patcher" && -s "$patcher" ]] \
               || fail "bundled patch-asar.py is missing or linked"
+            [[ -f "$asar_cli" && ! -L "$asar_cli" && -s "$asar_cli" ]] \
+              || fail "bundled ASAR CLI is missing or linked"
+            [[ -f "$asar_module" && ! -L "$asar_module" && -s "$asar_module" ]] \
+              || fail "bundled ASAR module is missing or linked"
+            [[ -f "$asar_package" && ! -L "$asar_package" && -s "$asar_package" ]] \
+              || fail "bundled ASAR package manifest is missing or linked"
+            [[ -f "$asar_lock" && ! -L "$asar_lock" && -s "$asar_lock" ]] \
+              || fail "bundled ASAR lockfile is missing or linked"
             (( $(file_bytes "$executable") <= 268435456 )) || fail "app executable exceeds 256 MiB"
             (( $(file_bytes "$patcher") <= 4194304 )) || fail "bundled patch-asar.py exceeds 4 MiB"
+            (( $(file_bytes "$asar_cli") <= 1048576 )) || fail "bundled ASAR CLI exceeds 1 MiB"
+            (( $(file_bytes "$asar_module") <= 1048576 )) || fail "bundled ASAR module exceeds 1 MiB"
+            (( $(file_bytes "$asar_package") <= 65536 )) || fail "bundled ASAR package manifest exceeds 64 KiB"
+            (( $(file_bytes "$asar_lock") <= 1048576 )) || fail "bundled ASAR lockfile exceeds 1 MiB"
+            /usr/bin/cmp -s tools/asar-tool/package.json "$asar_package" \
+              || fail "bundled ASAR package manifest differs from the dispatched source"
+            /usr/bin/cmp -s tools/asar-tool/package-lock.json "$asar_lock" \
+              || fail "bundled ASAR lockfile differs from the dispatched source"
 
             [[ "$(plist_value "$bundle" CFBundleSourceRevision)" == "$CODEXSWITCH_SOURCE_SHA" ]] \
               || fail "app plist has the wrong source revision"
@@ -254,6 +318,10 @@ jobs:
                   "CodexSwitch.app/Contents/Info.plist",
                   "CodexSwitch.app/Contents/MacOS/CodexSwitch",
                   "CodexSwitch.app/Contents/Resources/patch-asar.py",
+                  "CodexSwitch.app/Contents/Resources/asar-tool/package.json",
+                  "CodexSwitch.app/Contents/Resources/asar-tool/package-lock.json",
+                  "CodexSwitch.app/Contents/Resources/asar-tool/node_modules/@electron/asar/bin/asar.mjs",
+                  "CodexSwitch.app/Contents/Resources/asar-tool/node_modules/@electron/asar/lib/asar.js",
               }
               if not required.issubset(seen):
                   raise SystemExit("app archive is missing a required bundle member")
@@ -439,4 +507,7 @@ jobs:
           rm -rf -- .build build
           if [[ -n "${APP_ROUNDTRIP_DIR:-}" && -n "${APP_ARTIFACT_DIR:-}" ]]; then
             rm -rf -- "$APP_ROUNDTRIP_DIR" "$APP_ARTIFACT_DIR"
+          fi
+          if [[ -n "${CODEXSWITCH_ASAR_TOOL_DIR:-}" && -n "${CODEXSWITCH_ASAR_NPM_CACHE:-}" ]]; then
+            rm -rf -- "$CODEXSWITCH_ASAR_TOOL_DIR" "$CODEXSWITCH_ASAR_NPM_CACHE"
           fi

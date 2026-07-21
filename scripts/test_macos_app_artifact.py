@@ -32,9 +32,11 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
 
     def test_swift_gate_precedes_deterministic_release_build(self) -> None:
         workflow = self.workflow
+        asar_tool = workflow.index("Prepare the lockfile-pinned ASAR tool")
         tests = workflow.index("Verify the Swift app and test suite")
         build = workflow.index("Build the deterministic release app")
         package = workflow.index("Validate, package, and round-trip the app")
+        self.assertLess(asar_tool, tests)
         self.assertLess(tests, build)
         self.assertLess(build, package)
         swift_gate = workflow[tests:build]
@@ -50,10 +52,44 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
             'CODEXSWITCH_BUILD_NUMBER="$SOURCE_DATE_EPOCH"',
             'CODEXSWITCH_VERSION="$APP_VERSION"',
             "CODEXSWITCH_CODESIGN_IDENTITY=-",
+            'CODEXSWITCH_ASAR_TOOL_DIR="$CODEXSWITCH_ASAR_TOOL_DIR"',
+            "CODEXSWITCH_REQUIRE_BUNDLED_ASAR_TOOL=1",
             "./scripts/build-app.sh",
         ):
             self.assertIn(setting, build_step)
         self.assertNotIn("--install", build_step)
+
+    def test_artifact_gate_runs_patcher_builder_and_installer_contracts(self) -> None:
+        workflow = self.workflow
+        gate = workflow[
+            workflow.index("Verify the app artifact contract") :
+            workflow.index("Prepare the lockfile-pinned ASAR tool")
+        ]
+        for suite in (
+            "scripts.test_patch_asar",
+            "scripts.test_build_app",
+            "scripts.test_macos_app_artifact",
+        ):
+            self.assertIn(suite, gate)
+
+    def test_workflow_prepares_and_validates_the_pinned_asar_tool(self) -> None:
+        workflow = self.workflow
+        prepare = workflow.index("Prepare the lockfile-pinned ASAR tool")
+        tests = workflow.index("Verify the Swift app and test suite")
+        preparation = workflow[prepare:tests]
+        for contract in (
+            "tools/asar-tool/package-lock.json",
+            "npm ci",
+            "--ignore-scripts",
+            "--bin-links=false",
+            "process.versions.node",
+            "major < 22",
+            'dependencies["@electron/asar"] == "4.2.0"',
+            'packages["node_modules/@electron/asar"].version == "4.2.0"',
+            'asar.mjs\" --version)\" = \"v4.2.0\"',
+            "find \"$asar_tool_stage\" -type l",
+        ):
+            self.assertIn(contract, preparation)
 
     def test_bundle_validation_runs_before_and_after_ditto_round_trip(self) -> None:
         workflow = self.workflow
@@ -77,6 +113,12 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
             "codesign --verify --deep --strict",
             '"Signature=adhoc"',
             "cmp -s scripts/patch-asar.py",
+            "asar-tool/node_modules/@electron/asar/bin/asar.mjs",
+            "asar-tool/node_modules/@electron/asar/lib/asar.js",
+            "asar-tool/package.json",
+            "asar-tool/package-lock.json",
+            'cmp -s tools/asar-tool/package.json "$asar_package"',
+            'cmp -s tools/asar-tool/package-lock.json "$asar_lock"',
             "LINUX_DEVBOX_ACTIVE_PUSH",
             "pendingLinuxDevboxActive",
             "pushLinuxDevboxActiveAccount",
@@ -85,6 +127,10 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
         self.assertIn("len(entries) > 4096", contract)
         self.assertIn("total > 1073741824", contract)
         self.assertIn("linked or special app archive entry", contract)
+        self.assertIn(
+            '"CodexSwitch.app/Contents/Resources/asar-tool/package-lock.json"',
+            contract,
+        )
 
     def test_manifest_and_uploaded_member_set_are_exact_and_bounded(self) -> None:
         workflow = self.workflow
@@ -201,6 +247,22 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
         self.assertNotIn("build-app.sh", installer)
         self.assertNotIn("codesign --force", installer)
         self.assertNotIn("codesign --sign", installer)
+
+    def test_installer_rejects_missing_or_unpinned_asar_tool(self) -> None:
+        installer = self.installer
+        for contract in (
+            "asar-tool/node_modules/@electron/asar/bin/asar.mjs",
+            "asar-tool/node_modules/@electron/asar/lib/asar.js",
+            "asar-tool/package.json",
+            "asar-tool/package-lock.json",
+            "bundled ASAR CLI is missing or linked",
+            "bundled ASAR module is missing or linked",
+            "bundled ASAR package manifest is missing or linked",
+            "bundled ASAR lockfile is missing or linked",
+            'cmp -s "$repo_root/tools/asar-tool/package.json" "$asar_package"',
+            'cmp -s "$repo_root/tools/asar-tool/package-lock.json" "$asar_lock"',
+        ):
+            self.assertIn(contract, installer)
 
     def test_installer_has_atomic_swap_and_both_rollback_paths(self) -> None:
         installer = self.installer

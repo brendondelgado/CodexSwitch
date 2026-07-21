@@ -466,8 +466,8 @@ class PatchAsarTests(unittest.TestCase):
                 os.environ,
                 {"CODEXSWITCH_ASAR_JS": str(asar_js)},
             ), patch.object(
-                patch_asar.shutil,
-                "which",
+                patch_asar,
+                "resolve_node_path",
                 return_value="/usr/local/bin/node",
             ):
                 self.assertEqual(
@@ -489,14 +489,147 @@ class PatchAsarTests(unittest.TestCase):
                 "ASAR_TOOL_ROOT",
                 tool_root,
             ), patch.object(
-                patch_asar.shutil,
-                "which",
+                patch_asar,
+                "resolve_node_path",
                 return_value="/usr/local/bin/node",
             ):
                 self.assertEqual(
                     patch_asar.resolve_asar_cmd(),
                     ["/usr/local/bin/node", str(asar_cli)],
                 )
+
+    def test_resolve_asar_cmd_prefers_bundled_tool_over_owned_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundled_root = root / "bundled"
+            owned_root = root / "owned"
+            bundled_cli = bundled_root / "node_modules/@electron/asar/bin/asar.mjs"
+            owned_cli = owned_root / "node_modules/@electron/asar/bin/asar.mjs"
+            for cli in (bundled_cli, owned_cli):
+                cli.parent.mkdir(parents=True)
+                cli.write_text("// fixture")
+            with patch.dict(
+                os.environ,
+                {"CODEXSWITCH_ASAR_JS": ""},
+            ), patch.object(
+                patch_asar,
+                "BUNDLED_ASAR_TOOL_ROOT",
+                bundled_root,
+            ), patch.object(
+                patch_asar,
+                "ASAR_TOOL_ROOT",
+                owned_root,
+            ), patch.object(
+                patch_asar,
+                "resolve_node_path",
+                return_value="/usr/local/bin/node",
+            ):
+                self.assertEqual(
+                    patch_asar.resolve_asar_cmd(),
+                    ["/usr/local/bin/node", str(bundled_cli)],
+                )
+
+    def test_node_candidates_prefer_target_app_runtime_then_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resources = Path(tmp)
+            bundled_node = resources / "cua_node/bin/node"
+            bundled_node.parent.mkdir(parents=True)
+            bundled_node.write_text("#!/bin/sh\n")
+            bundled_node.chmod(0o755)
+            with patch.object(
+                patch_asar,
+                "APP_RESOURCES",
+                resources,
+            ), patch.object(
+                patch_asar.shutil,
+                "which",
+                return_value="/usr/local/bin/node",
+            ):
+                self.assertEqual(
+                    patch_asar.node_candidates(),
+                    [str(bundled_node), "/usr/local/bin/node"],
+                )
+
+            bundled_node.chmod(0o644)
+            with patch.object(
+                patch_asar,
+                "APP_RESOURCES",
+                resources,
+            ), patch.object(
+                patch_asar.shutil,
+                "which",
+                return_value="/usr/local/bin/node",
+            ):
+                self.assertEqual(patch_asar.node_candidates(), ["/usr/local/bin/node"])
+
+    def test_modern_asar_uses_compatible_path_node_when_bundled_node_is_old(self):
+        modern_cli = Path("/tool/node_modules/@electron/asar/bin/asar.mjs")
+        versions = {
+            "/app/cua_node/bin/node": (20, 18, 0),
+            "/opt/homebrew/bin/node": (22, 12, 0),
+        }
+        with patch.object(
+            patch_asar,
+            "asar_cli_candidates",
+            return_value=[modern_cli],
+        ), patch.object(
+            patch_asar,
+            "node_candidates",
+            return_value=list(versions),
+        ), patch.object(
+            patch_asar,
+            "node_version",
+            side_effect=versions.get,
+        ), patch.dict(
+            os.environ,
+            {"CODEXSWITCH_ASAR_JS": ""},
+        ):
+            self.assertEqual(
+                patch_asar.resolve_asar_cmd(),
+                ["/opt/homebrew/bin/node", str(modern_cli)],
+            )
+
+    def test_node_version_requires_successful_semantic_version_output(self):
+        cases = (
+            (0, "v22.12.0\n", (22, 12, 0)),
+            (0, "not-a-version\n", None),
+            (1, "v24.0.0\n", None),
+        )
+        for returncode, stdout, expected in cases:
+            with self.subTest(returncode=returncode, stdout=stdout), patch.object(
+                patch_asar.subprocess,
+                "run",
+                return_value=patch_asar.subprocess.CompletedProcess(
+                    ["node", "--version"],
+                    returncode,
+                    stdout,
+                    "",
+                ),
+            ):
+                self.assertEqual(patch_asar.node_version("node"), expected)
+
+    def test_resolve_asar_cmd_never_falls_back_to_npx(self):
+        with patch.object(
+            patch_asar,
+            "asar_cli_candidates",
+            return_value=[],
+        ), patch.dict(
+            os.environ,
+            {"CODEXSWITCH_ASAR_JS": ""},
+        ):
+            self.assertEqual(patch_asar.resolve_asar_cmd(), [])
+
+    def test_run_asar_does_not_spawn_without_compatible_offline_tool(self):
+        with patch.object(
+            patch_asar,
+            "ASAR_CMD",
+            [],
+        ), patch.object(
+            patch_asar.subprocess,
+            "run",
+        ) as run:
+            self.assertIsNone(patch_asar.run_asar("list", "app.asar", timeout=30))
+            run.assert_not_called()
 
     def test_asar_module_path_supports_commonjs_and_esm_cli_layouts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -544,9 +677,9 @@ class PatchAsarTests(unittest.TestCase):
                         "resolve_asar_module_path",
                         return_value=module,
                     ), patch.object(
-                        patch_asar.shutil,
-                        "which",
-                        return_value=node,
+                        patch_asar,
+                        "ASAR_CMD",
+                        [node, str(package / "bin" / "asar.mjs")],
                     ):
                         self.assertEqual(
                             patch_asar.compute_electron_asar_header_hash(archive),

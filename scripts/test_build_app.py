@@ -41,6 +41,13 @@ class BuildAppInstallerTests(unittest.TestCase):
         self.assertIn('source_tree_fingerprint', SCRIPT)
         self.assertIn('dirty.%s', SCRIPT)
 
+    def test_release_bundle_requires_prepared_pinned_asar_tool(self) -> None:
+        self.assertIn('CODEXSWITCH_ASAR_TOOL_DIR', SCRIPT)
+        self.assertIn('CODEXSWITCH_REQUIRE_BUNDLED_ASAR_TOOL', SCRIPT)
+        self.assertIn('Contents/Resources/asar-tool', SCRIPT)
+        self.assertIn('node_modules/@electron/asar', SCRIPT)
+        self.assertIn('find "$ASAR_TOOL_DESTINATION" -type l', SCRIPT)
+
 
 if __name__ == "__main__":
     unittest.main()

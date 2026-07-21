@@ -88,6 +88,8 @@ ASAR_TOOL_ROOT = Path(
         str(Path.home() / ".codexswitch" / "tools" / "asar"),
     )
 ).expanduser()
+BUNDLED_ASAR_TOOL_ROOT = Path(__file__).resolve().parent / "asar-tool"
+MODERN_ASAR_MINIMUM_NODE = (22, 12, 0)
 
 # Marker to detect if already patched
 PATCH_MARKER = "_invalidateAccountQueries"
@@ -686,10 +688,11 @@ def asar_cli_candidates() -> list[Path]:
         "node_modules/@electron/asar/bin/asar.js",
         "node_modules/asar/bin/asar.js",
     ]
-    for pattern in owned_patterns:
-        candidate = ASAR_TOOL_ROOT / pattern
-        if candidate.is_file():
-            candidates.append(candidate)
+    for tool_root in (BUNDLED_ASAR_TOOL_ROOT, ASAR_TOOL_ROOT):
+        for pattern in owned_patterns:
+            candidate = tool_root / pattern
+            if candidate.is_file() and not candidate.is_symlink():
+                candidates.append(candidate)
 
     npm_dir = Path.home() / ".npm" / "_npx"
     npm_patterns = [
@@ -701,7 +704,7 @@ def asar_cli_candidates() -> list[Path]:
         candidate
         for pattern in npm_patterns
         for candidate in npm_dir.glob(pattern)
-        if candidate.is_file()
+        if candidate.is_file() and not candidate.is_symlink()
     ]
     candidates.extend(
         sorted(
@@ -713,19 +716,75 @@ def asar_cli_candidates() -> list[Path]:
     return list(dict.fromkeys(candidates))
 
 
+def node_candidates() -> list[str]:
+    """Return existing Node runtimes without installing or mutating anything."""
+    candidates: list[str] = []
+    bundled_node = APP_RESOURCES / "cua_node" / "bin" / "node"
+    if bundled_node.is_file() and os.access(bundled_node, os.X_OK):
+        candidates.append(str(bundled_node))
+    path_node = shutil.which("node")
+    if path_node:
+        candidates.append(path_node)
+    return list(dict.fromkeys(candidates))
+
+
+def node_version(node: str) -> tuple[int, int, int] | None:
+    """Return a semantic Node version tuple for an executable candidate."""
+    try:
+        result = subprocess.run(
+            [node, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", result.stdout.strip())
+    if result.returncode != 0 or not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def asar_cli_requires_modern_node(asar_cli: Path) -> bool:
+    """Modern @electron/asar ESM releases require Node 22.12 or newer."""
+    return asar_cli.suffix == ".mjs" or "@electron" in asar_cli.parts
+
+
+def node_supports_asar_cli(node: str, asar_cli: Path) -> bool:
+    version = node_version(node)
+    if version is None:
+        return False
+    return (
+        not asar_cli_requires_modern_node(asar_cli)
+        or version >= MODERN_ASAR_MINIMUM_NODE
+    )
+
+
+def resolve_node_path(asar_cli: Path | None = None) -> str | None:
+    """Return the first runtime compatible with the selected ASAR CLI."""
+    for node in node_candidates():
+        if asar_cli is None:
+            if node_version(node) is not None:
+                return node
+        elif node_supports_asar_cli(node, asar_cli):
+            return node
+    return None
+
+
 def resolve_asar_cmd() -> list[str]:
     """Use an existing CommonJS or ESM ASAR CLI without downloading one."""
-    node = shutil.which("node")
+    candidates: list[Path] = []
     override = os.environ.get("CODEXSWITCH_ASAR_JS")
-    if node and override:
+    if override:
         asar_js = Path(override).expanduser()
-        if asar_js.is_file():
-            return [node, str(asar_js)]
-    if node:
-        candidates = asar_cli_candidates()
-        if candidates:
-            return [node, str(candidates[0])]
-    return ["npx", "--no-install", "asar"]
+        if asar_js.is_file() and not asar_js.is_symlink():
+            candidates.append(asar_js)
+    candidates.extend(asar_cli_candidates())
+    for asar_cli in dict.fromkeys(candidates):
+        node = resolve_node_path(asar_cli)
+        if node:
+            return [node, str(asar_cli)]
+    return []
 
 
 ASAR_CMD = resolve_asar_cmd()
@@ -775,13 +834,9 @@ def asar_module_path_for_cli(asar_cli: Path) -> Path | None:
 
 def resolve_asar_module_path(command: list[str] | None = None) -> Path | None:
     """Return an importable CommonJS or ESM ASAR module for header hashing."""
-    command = command or ASAR_CMD
+    command = ASAR_CMD if command is None else command
     if len(command) >= 2 and Path(command[0]).name == "node":
         module_path = asar_module_path_for_cli(Path(command[1]))
-        if module_path:
-            return module_path
-    for asar_cli in asar_cli_candidates():
-        module_path = asar_module_path_for_cli(asar_cli)
         if module_path:
             return module_path
     return None
@@ -794,10 +849,10 @@ def compute_electron_asar_header_hash(asar_path: Path) -> str:
     archive file hash. Using the same `asar.getRawHeader()` package that packs
     the archive keeps this aligned with Electron's own check.
     """
-    node = shutil.which("node")
-    asar_module_path = resolve_asar_module_path()
-    if not node or not asar_module_path:
+    asar_module_path = resolve_asar_module_path(ASAR_CMD)
+    if len(ASAR_CMD) < 2 or not asar_module_path:
         raise RuntimeError("node/asar package unavailable for ASAR integrity hashing")
+    node = ASAR_CMD[0]
 
     script = """
 const crypto = require('crypto');
@@ -877,6 +932,22 @@ def make_workdir() -> Path:
 # ---------------------------------------------------------------------------
 # asar extract / pack
 # ---------------------------------------------------------------------------
+def run_asar(*arguments: str, timeout: int) -> subprocess.CompletedProcess[str] | None:
+    """Run the selected offline ASAR tool, or report a visible blocked state."""
+    if not ASAR_CMD:
+        print(
+            "ERROR: No compatible offline ASAR tool and Node runtime are available. "
+            "CodexSwitch will not invoke npx or download a package during repair."
+        )
+        return None
+    return subprocess.run(
+        [*ASAR_CMD, *arguments],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
 def extract_asar(asar_path: Path, dest: Path) -> bool:
     """Extract an asar archive.
 
@@ -885,10 +956,9 @@ def extract_asar(asar_path: Path, dest: Path) -> bool:
     extract the backup, the companion dir has a different name, so we copy
     the original unpacked dir alongside the archive first.
     """
-    result = subprocess.run(
-        [*ASAR_CMD, "extract", str(asar_path), str(dest)],
-        capture_output=True, text=True, timeout=120,
-    )
+    result = run_asar("extract", str(asar_path), str(dest), timeout=120)
+    if result is None:
+        return False
     if result.returncode != 0:
         print(f"asar extract stderr: {result.stderr.strip()}")
     return result.returncode == 0
@@ -902,14 +972,16 @@ def pack_asar(src: Path, dest_asar: Path) -> bool:
     repacked asar tries to embed them as regular files, which breaks
     require() for native addons and crashes the app on launch.
     """
-    result = subprocess.run(
-        [
-            *ASAR_CMD, "pack",
-            str(src), str(dest_asar),
-            "--unpack", UNPACK_GLOB,
-        ],
-        capture_output=True, text=True, timeout=120,
+    result = run_asar(
+        "pack",
+        str(src),
+        str(dest_asar),
+        "--unpack",
+        UNPACK_GLOB,
+        timeout=120,
     )
+    if result is None:
+        return False
     if result.returncode != 0:
         print(f"asar pack stderr: {result.stderr.strip()}")
     return result.returncode == 0
@@ -917,10 +989,9 @@ def pack_asar(src: Path, dest_asar: Path) -> bool:
 
 def validate_asar(asar_path: Path) -> bool:
     """Validate the repacked asar by listing its contents."""
-    result = subprocess.run(
-        [*ASAR_CMD, "list", str(asar_path)],
-        capture_output=True, text=True, timeout=30,
-    )
+    result = run_asar("list", str(asar_path), timeout=30)
+    if result is None:
+        return False
     if result.returncode != 0:
         print(f"asar list stderr: {result.stderr.strip()}")
         return False

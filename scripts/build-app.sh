@@ -30,6 +30,7 @@ import sys
 root = Path(sys.argv[1])
 paths = [path for path in (root / "Sources").rglob("*") if path.is_file()]
 paths.extend([root / "Package.swift", root / "scripts" / "patch-asar.py"])
+paths.extend(sorted((root / "tools" / "asar-tool").glob("package*.json")))
 
 digest = hashlib.sha256()
 for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
@@ -138,6 +139,36 @@ cp "$BUILD_BINARY" "$APP_BUNDLE/Contents/MacOS/"
 # depending on whichever checkout happens to exist.
 cp "$PROJECT_DIR/scripts/patch-asar.py" "$APP_BUNDLE/Contents/Resources/patch-asar.py"
 chmod 755 "$APP_BUNDLE/Contents/Resources/patch-asar.py"
+
+# Bundle the pinned ASAR tool prepared by the artifact build. Local developer
+# builds may omit it, but release artifacts require the self-contained tool so
+# desktop repair never downloads dependencies in the background.
+ASAR_TOOL_SOURCE="${CODEXSWITCH_ASAR_TOOL_DIR:-$PROJECT_DIR/tools/asar-tool}"
+ASAR_TOOL_DESTINATION="$APP_BUNDLE/Contents/Resources/asar-tool"
+if [[ -d "$ASAR_TOOL_SOURCE/node_modules/@electron/asar" \
+    && -f "$ASAR_TOOL_SOURCE/package.json" \
+    && -f "$ASAR_TOOL_SOURCE/package-lock.json" \
+    && -f "$ASAR_TOOL_SOURCE/node_modules/@electron/asar/bin/asar.mjs" \
+    && -f "$ASAR_TOOL_SOURCE/node_modules/@electron/asar/lib/asar.js" \
+    && ! -L "$ASAR_TOOL_SOURCE/package.json" \
+    && ! -L "$ASAR_TOOL_SOURCE/package-lock.json" ]] \
+    && cmp -s "$PROJECT_DIR/tools/asar-tool/package.json" "$ASAR_TOOL_SOURCE/package.json" \
+    && cmp -s "$PROJECT_DIR/tools/asar-tool/package-lock.json" "$ASAR_TOOL_SOURCE/package-lock.json"; then
+    mkdir -p "$ASAR_TOOL_DESTINATION"
+    cp "$ASAR_TOOL_SOURCE/package.json" "$ASAR_TOOL_DESTINATION/package.json"
+    cp "$ASAR_TOOL_SOURCE/package-lock.json" "$ASAR_TOOL_DESTINATION/package-lock.json"
+    cp -R "$ASAR_TOOL_SOURCE/node_modules" "$ASAR_TOOL_DESTINATION/node_modules"
+    linked_asar_tool_member="$(find "$ASAR_TOOL_DESTINATION" -type l -print -quit)"
+    if [[ -n "$linked_asar_tool_member" ]]; then
+        echo "error: bundled ASAR tool contains a symlink: $linked_asar_tool_member" >&2
+        exit 2
+    fi
+elif [[ "${CODEXSWITCH_REQUIRE_BUNDLED_ASAR_TOOL:-0}" == "1" ]]; then
+    echo "error: required prepared ASAR tool is missing at $ASAR_TOOL_SOURCE" >&2
+    exit 2
+else
+    echo "Warning: building without bundled ASAR tool; desktop repair will remain blocked without an offline tool" >&2
+fi
 
 # Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST

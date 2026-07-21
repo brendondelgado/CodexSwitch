@@ -54,8 +54,11 @@ Swift test suite serially, then invokes the existing `scripts/build-app.sh`
 without installation using release configuration, one SwiftPM job, the full
 commit as `CODEXSWITCH_SOURCE_REVISION`, the commit epoch as
 `CODEXSWITCH_BUILD_NUMBER`, version `1.0.0`, and explicit ad-hoc signing. The
-workflow never compiles the Rust runtime, installs the app, modifies a release,
-or mutates a host outside its ephemeral runner.
+workflow also installs the exact `@electron/asar` version recorded by
+`tools/asar-tool/package-lock.json` into an ephemeral staging directory and
+bundles that prepared tool inside the app. It never compiles the Rust runtime,
+installs the app, modifies a release, or mutates a host outside its ephemeral
+runner.
 
 Both uploaded members receive GitHub build-provenance attestations before the
 artifact is uploaded. Ad-hoc code signing proves bundle integrity after
@@ -67,7 +70,9 @@ silently authorizing the other.
 ## Build Gate
 
 The native artifact workflow must compile and run the complete Swift app test
-suite before building any release executable. Compilation uses one job, and
+suite before building any release executable. It also runs the Python patcher,
+bundle-builder, and artifact-installer contract suites before preparing release
+dependencies. Compilation uses one job, and
 test execution is explicitly non-parallel because the suite exercises shared
 process state, subprocess admission, signal delivery, and updater leases.
 Swift Testing executes tests concurrently by default; limiting SwiftPM build
@@ -199,8 +204,11 @@ archive, executable, and patcher must all match the manifest.
 Before packaging and again after a fresh extraction, the workflow verifies the
 exact plist source revision, build epoch, app version, bundle identifier, and
 executable name; a thin arm64 Mach-O executable; a strict deep ad-hoc code
-signature; byte equality between the bundled and source `patch-asar.py`; and
-absence of the removed VPS active-push markers.
+signature; byte equality between the bundled and source `patch-asar.py`; the
+presence of a regular, non-symlink ASAR CLI and module; byte equality between
+the bundled and source ASAR package manifest and lockfile pinned to
+`@electron/asar` `4.2.0`; a successful CLI smoke test under Node `22.12.0` or
+newer; and absence of the removed VPS active-push markers.
 
 ## Staging
 
@@ -272,7 +280,9 @@ The installer then inspects the ZIP for unsafe entries, extracts it into a new
 private directory, and repeats every workflow bundle validation against the
 clean source checkout. It does not compile, download, patch, or re-sign. Any
 failure through this point leaves `/Applications/CodexSwitch.app` and its
-running process untouched.
+running process untouched. In particular, it rejects an app whose bundled ASAR
+CLI, module, package manifest, or lockfile is absent, linked, empty, oversized,
+or differs from the reviewed source.
 
 Activation copies the already validated bundle into a same-filesystem staging
 directory under `/Applications`, validates that copy, asks the old app to quit,
