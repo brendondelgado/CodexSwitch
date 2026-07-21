@@ -87,6 +87,46 @@ pub enum ReloadConvergence {
 }
 
 impl ReloadSummary {
+    #[cfg(test)]
+    pub(crate) fn with_sighup_sent(mut self, pids: Vec<i32>) -> Self {
+        self.sighup_sent = pids;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_signaled(mut self, pids: Vec<i32>) -> Self {
+        self.signaled = pids;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_skipped(mut self, skipped: Vec<(i32, String)>) -> Self {
+        self.skipped = skipped;
+        self
+    }
+
+    pub(crate) fn with_topology_verified(mut self, topology_verified: bool) -> Self {
+        self.topology_verified = topology_verified;
+        self
+    }
+
+    pub(crate) fn with_receipt_nonce(mut self, receipt_nonce: Option<Uuid>) -> Self {
+        self.receipt_nonce = receipt_nonce;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_generated_request_nonces(mut self, nonces: Vec<String>) -> Self {
+        self.generated_request_nonces = nonces;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_acknowledged_request_nonces(mut self, nonces: Vec<String>) -> Self {
+        self.acknowledged_request_nonces = nonces;
+        self
+    }
+
     pub fn convergence(&self) -> ReloadConvergence {
         if self.topology_verified
             && !self.signaled.is_empty()

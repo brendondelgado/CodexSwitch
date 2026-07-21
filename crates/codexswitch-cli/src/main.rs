@@ -1191,11 +1191,11 @@ pub(crate) fn rotate_now(
     if receipt_nonce.is_some() && !reload_processes {
         bail!("--receipt-nonce cannot be combined with --offline-file-only");
     }
-    let receipt_evidence = std::cell::RefCell::new(ReloadSummary {
-        topology_verified: true,
-        receipt_nonce,
-        ..ReloadSummary::default()
-    });
+    let receipt_evidence = std::cell::RefCell::new(
+        ReloadSummary::default()
+            .with_topology_verified(true)
+            .with_receipt_nonce(receipt_nonce),
+    );
     let reload = |path: &Path| match receipt_nonce {
         Some(receipt_nonce) => reload_codex_hot_swap_processes_for_receipt(path, receipt_nonce)
             .map(|summary| {
@@ -2026,12 +2026,10 @@ mod tests {
     }
 
     fn verified_reload_summary() -> ReloadSummary {
-        ReloadSummary {
-            sighup_sent: vec![42],
-            signaled: vec![42],
-            topology_verified: true,
-            ..ReloadSummary::default()
-        }
+        ReloadSummary::default()
+            .with_sighup_sent(vec![42])
+            .with_signaled(vec![42])
+            .with_topology_verified(true)
     }
 
     fn confirm_provider_io_activation(store_path: &Path, auth_path: &Path) -> Result<()> {
@@ -2177,15 +2175,13 @@ mod tests {
 
     fn verified_receipt_reload_summary(receipt_nonce: Uuid) -> ReloadSummary {
         let request_nonce = format!("{receipt_nonce}:{}", Uuid::new_v4());
-        ReloadSummary {
-            sighup_sent: vec![42],
-            signaled: vec![42],
-            topology_verified: true,
-            receipt_nonce: Some(receipt_nonce),
-            generated_request_nonces: vec![request_nonce.clone()],
-            acknowledged_request_nonces: vec![request_nonce],
-            ..ReloadSummary::default()
-        }
+        ReloadSummary::default()
+            .with_sighup_sent(vec![42])
+            .with_signaled(vec![42])
+            .with_topology_verified(true)
+            .with_receipt_nonce(Some(receipt_nonce))
+            .with_generated_request_nonces(vec![request_nonce.clone()])
+            .with_acknowledged_request_nonces(vec![request_nonce])
     }
 
     fn reset_bank(credit_ids: &[&str]) -> RateLimitResetBank {

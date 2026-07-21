@@ -1153,12 +1153,10 @@ mod tests {
     }
 
     fn verified_reload_summary() -> ReloadSummary {
-        ReloadSummary {
-            sighup_sent: vec![42],
-            signaled: vec![42],
-            topology_verified: true,
-            ..ReloadSummary::default()
-        }
+        ReloadSummary::default()
+            .with_sighup_sent(vec![42])
+            .with_signaled(vec![42])
+            .with_topology_verified(true)
     }
 
     fn confirm_daemon_activation(store_path: &Path, auth_path: &Path) -> Result<()> {
@@ -1667,12 +1665,10 @@ mod tests {
             |_| Ok(()),
             move |_| {
                 *reloads_for_closure.lock().unwrap() += 1;
-                Ok(ReloadSummary {
-                    sighup_sent: vec![42],
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )
         .unwrap_err();
@@ -1791,12 +1787,7 @@ mod tests {
             Duration::ZERO,
             ready_fetch,
             |_| Ok(()),
-            |_| {
-                Ok(ReloadSummary {
-                    skipped: vec![(42, "ack timeout".to_string())],
-                    ..ReloadSummary::default()
-                })
-            },
+            |_| Ok(ReloadSummary::default().with_skipped(vec![(42, "ack timeout".to_string())])),
         )?;
         assert_eq!(
             first_tick.next_interval,
@@ -1903,12 +1894,7 @@ mod tests {
             Duration::ZERO,
             ready_fetch,
             |_| Ok(()),
-            |_| {
-                Ok(ReloadSummary {
-                    skipped: vec![(42, "ack timeout".to_string())],
-                    ..ReloadSummary::default()
-                })
-            },
+            |_| Ok(ReloadSummary::default().with_skipped(vec![(42, "ack timeout".to_string())])),
         )?;
         assert_eq!(
             first_tick.next_interval,
@@ -1960,12 +1946,7 @@ mod tests {
                         bail!("reset consumption must remain unreachable")
                     }
                 },
-                |_| {
-                    Ok(ReloadSummary {
-                        skipped: vec![(42, "ack timeout".to_string())],
-                        ..ReloadSummary::default()
-                    })
-                },
+                |_| Ok(ReloadSummary::default().with_skipped(vec![(42, "ack timeout".to_string())])),
             ),
         )?;
 
@@ -2005,23 +1986,22 @@ mod tests {
         )?;
         confirm_daemon_activation(&store_path, &auth_path)?;
 
-        let first_tick = run_once_report_with(
-            &store_path,
-            &auth_path,
-            Duration::ZERO,
-            ready_fetch,
-            |_| Ok(()),
-            {
-                let store_path = store_path.clone();
-                move |_| {
-                    assert_store_lock_available(&store_path)?;
-                    Ok(ReloadSummary {
-                        skipped: vec![(42, "ack timeout".to_string())],
-                        ..ReloadSummary::default()
-                    })
-                }
-            },
-        )?;
+        let first_tick =
+            run_once_report_with(
+                &store_path,
+                &auth_path,
+                Duration::ZERO,
+                ready_fetch,
+                |_| Ok(()),
+                {
+                    let store_path = store_path.clone();
+                    move |_| {
+                        assert_store_lock_available(&store_path)?;
+                        Ok(ReloadSummary::default()
+                            .with_skipped(vec![(42, "ack timeout".to_string())]))
+                    }
+                },
+            )?;
         assert!(!first_tick.swapped);
         assert_eq!(
             first_tick.next_interval,
@@ -2076,11 +2056,9 @@ mod tests {
                 let store_path = store_path.clone();
                 move |_| {
                     assert_store_lock_available(&store_path)?;
-                    Ok(ReloadSummary {
-                        signaled: vec![42],
-                        topology_verified: true,
-                        ..ReloadSummary::default()
-                    })
+                    Ok(ReloadSummary::default()
+                        .with_signaled(vec![42])
+                        .with_topology_verified(true))
                 }
             },
         )?;

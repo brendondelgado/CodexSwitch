@@ -95,8 +95,8 @@ struct AccountActivationRuntimeSnapshotSet: Sendable {
 
 enum AccountActivationRuntimeEvidencePreflight {
     static func performRenewal(
-        desktopReload: () async -> DesktopReloadResult,
-        cliReload: () async -> CodexReloadSummary
+        desktopReload: @Sendable () async -> DesktopReloadResult,
+        cliReload: @Sendable () async -> CodexReloadSummary
     ) async -> AccountActivationRuntimeRenewal {
         let desktop = await desktopReload()
         let cli: CodexReloadSummary
@@ -120,9 +120,9 @@ enum AccountActivationRuntimeEvidencePreflight {
         expectedAuthIdentity: CodexAuthFileIdentity,
         lifetime: TimeInterval = AccountActivationCoordinator.runtimeEvidenceLifetime,
         generation: UUID = UUID(),
-        renew: () async -> AccountActivationRuntimeRenewal,
-        capture: () async -> AccountActivationRuntimeSnapshotSet?,
-        runtimeBindingIsCurrent: (CodexReloadBinding) -> Bool
+        renew: @Sendable () async -> AccountActivationRuntimeRenewal,
+        capture: @Sendable () async -> AccountActivationRuntimeSnapshotSet?,
+        runtimeBindingIsCurrent: @Sendable (CodexReloadBinding) -> Bool
     ) async -> AccountActivationRuntimeEvidenceDecision {
         let renewal = await renew()
         let completion = AccountActivationConvergenceEvaluator.completion(

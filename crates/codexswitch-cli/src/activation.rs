@@ -2490,12 +2490,10 @@ mod tests {
             true,
             &move |_| {
                 assert_store_lock_available(&reload_store_path)?;
-                Ok(ReloadSummary {
-                    sighup_sent: vec![42],
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
             move |summary, _| {
                 assert_store_lock_available(&topology_store_path)?;
@@ -2893,11 +2891,9 @@ mod tests {
                 reload_enabled: true,
             },
             |_| {
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
 
@@ -2977,12 +2973,7 @@ mod tests {
                 target_id,
                 reload_enabled: true,
             },
-            |_| {
-                Ok(ReloadSummary {
-                    skipped: vec![(42, "ack timeout".to_string())],
-                    ..ReloadSummary::default()
-                })
-            },
+            |_| Ok(ReloadSummary::default().with_skipped(vec![(42, "ack timeout".to_string())])),
         )?;
 
         assert_eq!(outcome.state, ActivationState::CommittedDegraded);
@@ -3021,11 +3012,9 @@ mod tests {
                 reload_enabled: true,
             },
             |_| {
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
         assert_eq!(converged.state, ActivationState::Confirmed);
@@ -3101,11 +3090,9 @@ mod tests {
                         Some(refreshed_fingerprint.as_str())
                     );
                 }
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
 
@@ -3174,11 +3161,9 @@ mod tests {
             },
             |_| {
                 reload_calls.set(reload_calls.get() + 1);
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
 
@@ -3243,11 +3228,9 @@ mod tests {
             },
             |_| {
                 reload_calls.set(reload_calls.get() + 1);
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
 
@@ -3291,11 +3274,9 @@ mod tests {
             },
             |_| {
                 commit_auth_file(&auth_path, &initial[0])?;
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
 
@@ -3535,12 +3516,10 @@ mod tests {
                 reload_enabled: true,
             },
             |_| {
-                Ok(ReloadSummary {
-                    sighup_sent: vec![42],
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
 
@@ -3581,12 +3560,10 @@ mod tests {
             &auth_path,
             &move |_| {
                 assert_store_lock_available(&reload_store_path)?;
-                Ok(ReloadSummary {
-                    sighup_sent: vec![42],
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
             move |summary, _| {
                 assert_store_lock_available(&topology_store_path)?;
@@ -3624,12 +3601,10 @@ mod tests {
             &store_path,
             &auth_path,
             &|_| {
-                Ok(ReloadSummary {
-                    sighup_sent: vec![42],
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
             |_, _| bail!("simulated final topology change"),
         )
@@ -3844,11 +3819,9 @@ mod tests {
                 Ok(owned)
             },
             |_| {
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
 
@@ -3966,18 +3939,14 @@ mod tests {
                 let call = reload_calls.get();
                 reload_calls.set(call + 1);
                 if call == 0 {
-                    Ok(ReloadSummary {
-                        sighup_sent: vec![42],
-                        skipped: vec![(42, "frontend delivery failed".to_string())],
-                        ..ReloadSummary::default()
-                    })
+                    Ok(ReloadSummary::default()
+                        .with_sighup_sent(vec![42])
+                        .with_skipped(vec![(42, "frontend delivery failed".to_string())]))
                 } else {
-                    Ok(ReloadSummary {
-                        sighup_sent: vec![42],
-                        signaled: vec![42],
-                        topology_verified: true,
-                        ..ReloadSummary::default()
-                    })
+                    Ok(ReloadSummary::default()
+                        .with_sighup_sent(vec![42])
+                        .with_signaled(vec![42])
+                        .with_topology_verified(true))
                 }
             },
         )?;
@@ -4012,11 +3981,9 @@ mod tests {
             true,
             |_| {
                 reload_calls.set(reload_calls.get() + 1);
-                Ok(ReloadSummary {
-                    sighup_sent: vec![42],
-                    skipped: vec![(42, "frontend delivery failed".to_string())],
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_skipped(vec![(42, "frontend delivery failed".to_string())]))
             },
         )?;
 
@@ -4053,11 +4020,9 @@ mod tests {
             false,
             |_| {
                 reload_calls.set(reload_calls.get() + 1);
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?;
 
@@ -4083,11 +4048,9 @@ mod tests {
             },
             |_| {
                 reload_calls.set(reload_calls.get() + 1);
-                Ok(ReloadSummary {
-                    signaled: vec![42],
-                    topology_verified: true,
-                    ..ReloadSummary::default()
-                })
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
             },
         )?
         .context("file-only import barrier disappeared before convergence")?;

@@ -165,8 +165,6 @@ enum CodexDesktopBridgeKeepAlive {
         guard let launchAgentPID = managedLaunchAgentPID() else {
             return denyBootstrap(binding, reason: "launchd_pid_unavailable")
         }
-        let route = verifiedRoute.route
-
         let authorized = firstAcknowledgementBootstrapIsAuthorized(
             binding: binding,
             socketPort: socketPort,
