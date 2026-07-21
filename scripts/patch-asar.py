@@ -87,8 +87,12 @@ ASAR_BACKUP = BACKUP_ROOT / "app.asar.bak"
 PATCH_MARKER = "_invalidateAccountQueries"
 LEGACY_AUTH_CACHE_PATCH_MARKER = "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V2"
 AUTH_CACHE_PATCH_MARKER = "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3"
-AUTH_TRANSITION_PATCH_MARKER = "CODEXSWITCH_AUTH_TRANSITION_V1"
+LEGACY_AUTH_TRANSITION_PATCH_MARKER = "CODEXSWITCH_AUTH_TRANSITION_V1"
+AUTH_TRANSITION_PATCH_MARKER = "CODEXSWITCH_AUTH_TRANSITION_V2"
 AUTH_TRANSITION_HELPER = "_codexSwitchResolveAuthState"
+AUTH_TRANSITION_LOGOUT_DELAY_MS = 10_000
+AUTH_INVALIDATION_GUARD = "_csAuthInvalidationPending"
+AUTH_INVALIDATION_COALESCE_MS = 100
 FAST_FALLBACK_MARKER = "_bundledFastModels"
 HEADROOM_ENV_MARKER = "CODEXSWITCH_HEADROOM_BASE_URL"
 HEADROOM_TRANSPORT_PATCH_MARKER = "CODEXSWITCH_HEADROOM_TRANSPORT_PATCH"
@@ -1364,16 +1368,17 @@ def identify_aliases(content: str) -> tuple[str, str] | None:
 
 def current_auth_patch_present(content: str) -> bool:
     """Return whether the renderer has the scope-safe auth patch generation."""
-    transition_call = re.search(
-        rf'([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)=>'
-        rf'{AUTH_TRANSITION_HELPER}\(\2,',
-        content,
-    )
     return (
         PATCH_MARKER in content
         and AUTH_CACHE_PATCH_MARKER in content
         and AUTH_TRANSITION_PATCH_MARKER in content
-        and transition_call is not None
+        and LEGACY_AUTH_TRANSITION_PATCH_MARKER not in content
+        and content.count(AUTH_TRANSITION_PATCH_MARKER) == 1
+        and "_csAuthEpoch=0" in content
+        and "_csLogoutTimer=null" in content
+        and "_csReadEpoch===_csAuthEpoch" in content
+        and "_csLogoutTimer=setTimeout" in content
+        and f"var {AUTH_INVALIDATION_GUARD}=!1" in content
     )
 
 
@@ -1389,41 +1394,121 @@ def module_patch_insert_position(content: str) -> int:
     return strict_directive.end() if strict_directive else 0
 
 
-def auth_transition_module_patch() -> str:
-    """Build the authoritative account-read transition helper."""
+def legacy_auth_transition_module_patch() -> str:
+    """Return the renderer transition helper shipped by patch generation V1."""
     return (
         f'function {AUTH_TRANSITION_HELPER}(e,t,n){{'
-        f'"{AUTH_TRANSITION_PATCH_MARKER}";try{{'
+        f'"{LEGACY_AUTH_TRANSITION_PATCH_MARKER}";try{{'
         't?.authMethod==null&&e?.authMethod!=null&&n?.()'
         '}catch{}return t}'
     )
 
 
+def auth_transition_module_patch() -> str:
+    """Build the latest-generation-wins renderer auth transition helper."""
+    return (
+        f'function {AUTH_TRANSITION_HELPER}(e,t,n,r,i){{'
+        f'"{AUTH_TRANSITION_PATCH_MARKER}";'
+        'if(!r)return e;'
+        'if(t?.authMethod==null&&e?.authMethod!=null){'
+        'if(!i)return e;try{n?.()}catch{}}return t}'
+    )
+
+
+def auth_invalidation_guard_patch() -> str:
+    """Build the short coalescing window shared by auth-status subscribers."""
+    return f'var {AUTH_INVALIDATION_GUARD}=!1;'
+
+
+def guarded_auth_invalidator(body: str) -> str:
+    """Wrap one cache invalidation so a broadcast performs one shared reset."""
+    return (
+        f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";'
+        f'if({AUTH_INVALIDATION_GUARD})return;'
+        f'{AUTH_INVALIDATION_GUARD}=!0;'
+        f'setTimeout(()=>{{{AUTH_INVALIDATION_GUARD}=!1}},'
+        f'{AUTH_INVALIDATION_COALESCE_MS});try{{{body}}}catch{{}}}}'
+    )
+
+
+def query_client_auth_invalidator_patch(query_key_builder: str) -> str:
+    """Build the guarded React Query auth-cache invalidator."""
+    body = (
+        'if(_qcRef)void Promise.allSettled(['
+        '_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]}),'
+        f'_qcRef.invalidateQueries({{queryKey:{query_key_builder}(`account-info`)}})'
+        '])'
+    )
+    return guarded_auth_invalidator(body)
+
+
+def weakmap_auth_invalidator_patch(weakmap_var: str) -> str:
+    """Build the guarded account-read promise-cache invalidator."""
+    return guarded_auth_invalidator(
+        f'typeof {weakmap_var}!="undefined"&&({weakmap_var}=new WeakMap)'
+    )
+
+
 def query_client_auth_module_patch(query_key_builder: str, *, include_ref: bool) -> str:
-    """Build a no-throw module-scope React Query cache invalidator."""
+    """Build a no-throw, coalesced module-scope React Query invalidator."""
     ref_declaration = "var _qcRef=null;" if include_ref else ""
     return (
         ref_declaration
-        + f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";try{{'
-        + 'if(_qcRef)void Promise.allSettled(['
-        + '_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]}),'
-        + f'_qcRef.invalidateQueries({{queryKey:{query_key_builder}(`account-info`)}})'
-        + '])}catch{}}}'
+        + auth_invalidation_guard_patch()
+        + query_client_auth_invalidator_patch(query_key_builder)
         + auth_transition_module_patch()
     )
 
 
-def apply_renderer_auth_transition_patch(content: str) -> str | None:
-    """Defer transient unauthenticated notifications to the account read."""
-    existing_call = re.search(
-        rf'([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)=>'
-        rf'{AUTH_TRANSITION_HELPER}\(\2,',
-        content,
-    )
-    if AUTH_TRANSITION_PATCH_MARKER in content and existing_call:
+def coalesce_auth_invalidator(content: str) -> str | None:
+    """Upgrade a recognized V3 invalidator without layering another helper."""
+    guard = auth_invalidation_guard_patch()
+    if guard in content:
         return content
 
-    transient_branch_re = re.compile(
+    candidates: list[tuple[str, str]] = []
+    weakmap_var = find_weakmap_account_cache_var(content)
+    if weakmap_var:
+        legacy_weakmap = (
+            f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";try{{'
+            f'typeof {weakmap_var}!="undefined"&&({weakmap_var}=new WeakMap)'
+            '}catch{}}'
+        )
+        if content.count(legacy_weakmap) == 1:
+            candidates.append(
+                (legacy_weakmap, guard + weakmap_auth_invalidator_patch(weakmap_var))
+            )
+
+    builders = set(re.findall(r'queryKey:([A-Za-z_$][\w$]*)\(`account-info`\)', content))
+    for builder in builders:
+        legacy_query = (
+            f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";try{{'
+            'if(_qcRef)void Promise.allSettled(['
+            '_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]}),'
+            f'_qcRef.invalidateQueries({{queryKey:{builder}(`account-info`)}})'
+            '])}catch{}}'
+        )
+        if content.count(legacy_query) == 1:
+            candidates.append(
+                (legacy_query, guard + query_client_auth_invalidator_patch(builder))
+            )
+
+    if len(candidates) != 1:
+        print(
+            "ERROR: Expected one recognized auth invalidator to coalesce, "
+            f"found {len(candidates)}"
+        )
+        return None
+    old, new = candidates[0]
+    return content.replace(old, new, 1)
+
+
+def apply_renderer_auth_transition_patch(content: str) -> str | None:
+    """Make renderer auth commits ordered and require confirmed logout."""
+    if current_auth_patch_present(content):
+        return content
+
+    native_branch_re = re.compile(
         r'(?P<setter>[A-Za-z_$][\w$]*)\('
         r'(?P<state>[A-Za-z_$][\w$]*)=>'
         r'(?P<event>[A-Za-z_$][\w$]*)\.authMethod==null&&'
@@ -1431,19 +1516,27 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
         r'\((?P<logout>[A-Za-z_$][\w$]*)\?\.\(\),'
         r'(?P<empty>[A-Za-z_$][\w$]*)\(\)\):'
     )
-    branch_matches = list(transient_branch_re.finditer(content))
-    if len(branch_matches) != 1:
+    retained_branch_re = re.compile(
+        r'(?P<setter>[A-Za-z_$][\w$]*)\('
+        r'(?P<state>[A-Za-z_$][\w$]*)=>'
+        r'(?P<event>[A-Za-z_$][\w$]*)\.authMethod==null&&'
+        r'(?P=state)\?\.authMethod!=null\?'
+        r'(?P=state):'
+    )
+    native_matches = list(native_branch_re.finditer(content))
+    retained_matches = list(retained_branch_re.finditer(content))
+    if len(native_matches) + len(retained_matches) != 1:
         print(
             "ERROR: Expected one transient desktop auth transition, "
-            f"found {len(branch_matches)}"
+            f"found native={len(native_matches)} retained={len(retained_matches)}"
         )
         return None
 
-    branch = branch_matches[0]
+    branch = native_matches[0] if native_matches else retained_matches[0]
     setter = branch.group("setter")
     state = branch.group("state")
-    logout = branch.group("logout")
-    authoritative_setter_re = re.compile(
+    event = branch.group("event")
+    native_setter_re = re.compile(
         rf'{re.escape(setter)}\('
         r'(?P<next>[A-Za-z_$][\w$]*\('
         r'[A-Za-z_$][\w$]*,\{'
@@ -1451,33 +1544,151 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
         r'useCopilotAuthIfAvailable:[A-Za-z_$][\w$]*'
         r'\}\))\)'
     )
-    setter_matches = list(authoritative_setter_re.finditer(content))
-    if len(setter_matches) != 1:
+    legacy_setter_re = re.compile(
+        rf'{re.escape(setter)}\({re.escape(state)}=>'
+        rf'{AUTH_TRANSITION_HELPER}\({re.escape(state)},'
+        r'(?P<next>[A-Za-z_$][\w$]*\('
+        r'[A-Za-z_$][\w$]*,\{'
+        r'isCopilotApiAvailable:[A-Za-z_$][\w$]*,'
+        r'useCopilotAuthIfAvailable:[A-Za-z_$][\w$]*'
+        r'\}\)),'
+        r'(?P<logout>[A-Za-z_$][\w$]*)\)\)'
+    )
+    native_setters = list(native_setter_re.finditer(content))
+    legacy_setters = list(legacy_setter_re.finditer(content))
+    if len(native_setters) + len(legacy_setters) != 1:
         print(
             "ERROR: Expected one authoritative desktop account state write, "
-            f"found {len(setter_matches)}"
+            f"found native={len(native_setters)} legacy={len(legacy_setters)}"
         )
         return None
 
-    patched = authoritative_setter_re.sub(
-        lambda match: (
-            f'{setter}({state}=>{AUTH_TRANSITION_HELPER}('
-            f'{state},{match.group("next")},{logout}))'
-        ),
-        content,
-        count=1,
+    authoritative = native_setters[0] if native_setters else legacy_setters[0]
+    logout = branch.group("logout") if native_matches else authoritative.group("logout")
+    wrapper_re = re.compile(
+        r'(?P<wrapper>[A-Za-z_$][\w$]*)=\(\)=>\{'
+        r'(?:(?P<connection>[A-Za-z_$][\w$]*)\.getAccount\(\)|'
+        r'[A-Za-z_$][\w$]*\((?P<helper_connection>[A-Za-z_$][\w$]*)\))'
+        r'\.then\('
     )
-    patched, branch_count = transient_branch_re.subn(
+    wrappers = list(wrapper_re.finditer(content))
+    if len(wrappers) != 1:
+        print(f"ERROR: Expected one desktop account read wrapper, found {len(wrappers)}")
+        return None
+    wrapper_match = wrappers[0]
+    wrapper = wrapper_match.group("wrapper")
+    connection = wrapper_match.group("connection") or wrapper_match.group("helper_connection")
+
+    callback_head_re = re.compile(
+        rf'let (?P<callback>[A-Za-z_$][\w$]*)={re.escape(event)}=>\{{'
+        rf'{re.escape(setter)}\('
+    )
+    callback_heads = list(callback_head_re.finditer(content))
+    if len(callback_heads) != 1:
+        print(f"ERROR: Expected one desktop auth callback head, found {len(callback_heads)}")
+        return None
+    callback = callback_heads[0].group("callback")
+
+    local_re = re.compile(
+        r'let (?P<cancel>[A-Za-z_$][\w$]*)=!1,'
+        r'(?P<done>[A-Za-z_$][\w$]*)=!1,'
+        r'(?P<startup>[A-Za-z_$][\w$]*)=null,'
+        rf'{re.escape(wrapper)}=\(\)=>\{{'
+    )
+    locals_found = list(local_re.finditer(content))
+    if len(locals_found) != 1:
+        print(f"ERROR: Expected one desktop auth effect local set, found {len(locals_found)}")
+        return None
+    local = locals_found[0]
+
+    patched = content
+    legacy_helper = legacy_auth_transition_module_patch()
+    if LEGACY_AUTH_TRANSITION_PATCH_MARKER in patched:
+        if patched.count(legacy_helper) != 1:
+            print("ERROR: Cannot safely upgrade unrecognized V1 auth transition helper")
+            return None
+        patched = patched.replace(legacy_helper, auth_transition_module_patch(), 1)
+    elif AUTH_TRANSITION_PATCH_MARKER not in patched:
+        insert_pos = module_patch_insert_position(patched)
+        helper = auth_transition_module_patch()
+        patched = patched[:insert_pos] + helper + patched[insert_pos:]
+
+    patched = local_re.sub(
         lambda match: (
-            f'{match.group("setter")}({match.group("state")}=>'
-            f'{match.group("event")}.authMethod==null&&'
-            f'{match.group("state")}?.authMethod!=null?'
-            f'{match.group("state")}:'
+            f'let {match.group("cancel")}=!1,{match.group("done")}=!1,'
+            f'{match.group("startup")}=null,_csAuthEpoch=0,'
+            f'_csLogoutTimer=null,{wrapper}=('
+            '_csReadEpoch=_csAuthEpoch,_csConfirmLogout=!1)=>{'
         ),
         patched,
         count=1,
     )
-    if branch_count != 1 or AUTH_TRANSITION_HELPER not in patched:
+    transition_write = (
+        f'{setter}({state}=>{AUTH_TRANSITION_HELPER}('
+        f'{state},{authoritative.group("next")},{logout},'
+        '_csReadEpoch===_csAuthEpoch,_csConfirmLogout))'
+    )
+    if legacy_setters:
+        patched = legacy_setter_re.sub(transition_write, patched, count=1)
+    else:
+        patched = native_setter_re.sub(transition_write, patched, count=1)
+
+    if native_matches:
+        patched = native_branch_re.sub(
+            lambda match: (
+                f'{match.group("setter")}({match.group("state")}=>'
+                f'{match.group("event")}.authMethod==null&&'
+                f'{match.group("state")}?.authMethod!=null?'
+                f'{match.group("state")}:'
+            ),
+            patched,
+            count=1,
+        )
+
+    patched = callback_head_re.sub(
+        lambda match: (
+            f'let {match.group("callback")}={event}=>{{'
+            '_csAuthEpoch++;let _csEventEpoch=_csAuthEpoch;'
+            f'{setter}('
+        ),
+        patched,
+        count=1,
+    )
+    callback_tail = (
+        f'}}),{PATCH_MARKER}(),{wrapper}()}};return '
+        f'{connection}.addAuthStatusCallback({callback})'
+    )
+    callback_tail_replacement = (
+        f'}}),{PATCH_MARKER}(),{event}.authMethod==null?('
+        '_csLogoutTimer!=null&&clearTimeout(_csLogoutTimer),'
+        '_csLogoutTimer=setTimeout(()=>{_csLogoutTimer=null,'
+        f'{wrapper}(_csEventEpoch,!0)}},{AUTH_TRANSITION_LOGOUT_DELAY_MS})):'
+        '(_csLogoutTimer!=null&&clearTimeout(_csLogoutTimer),'
+        f'_csLogoutTimer=null,{wrapper}(_csEventEpoch))}};return '
+        f'{connection}.addAuthStatusCallback({callback})'
+    )
+    if patched.count(callback_tail) != 1:
+        print("ERROR: Cannot find desktop auth callback refresh tail")
+        return None
+    patched = patched.replace(callback_tail, callback_tail_replacement, 1)
+
+    cleanup = (
+        f'()=>{{{local.group("cancel")}=!0,'
+        f'{local.group("startup")}!=null&&clearTimeout({local.group("startup")}),'
+        f'{connection}.removeAuthStatusCallback({callback})}}'
+    )
+    cleanup_replacement = (
+        f'()=>{{{local.group("cancel")}=!0,'
+        f'{local.group("startup")}!=null&&clearTimeout({local.group("startup")}),'
+        '_csLogoutTimer!=null&&clearTimeout(_csLogoutTimer),'
+        f'{connection}.removeAuthStatusCallback({callback})}}'
+    )
+    if patched.count(cleanup) != 1:
+        print("ERROR: Cannot find desktop auth callback cleanup")
+        return None
+    patched = patched.replace(cleanup, cleanup_replacement, 1)
+
+    if not current_auth_patch_present(patched):
         print("ERROR: Desktop auth transition patch did not converge")
         return None
     return patched
@@ -1499,13 +1710,19 @@ def upgrade_scope_safe_auth_patch(file_path: Path, content: str) -> bool:
         AUTH_CACHE_PATCH_MARKER,
         1,
     )
-    if AUTH_TRANSITION_PATCH_MARKER not in patched:
+    patched = coalesce_auth_invalidator(patched)
+    if patched is None:
+        return False
+    if (
+        AUTH_TRANSITION_PATCH_MARKER not in patched
+        and LEGACY_AUTH_TRANSITION_PATCH_MARKER not in patched
+    ):
         insert_pos = module_patch_insert_position(patched)
         helper = auth_transition_module_patch()
         patched = patched[:insert_pos] + helper + patched[insert_pos:]
     patched = apply_renderer_auth_transition_patch(patched)
     if patched is None or not current_auth_patch_present(patched):
-        print("ERROR: Existing auth patch could not be upgraded to V3")
+        print("ERROR: Existing auth patch could not be upgraded to auth transition V2")
         return False
 
     file_path.write_text(patched)
@@ -1654,8 +1871,8 @@ def apply_weakmap_use_auth_patch(file_path: Path, content: str | None = None) ->
 
     insert_pos = module_patch_insert_position(patched)
     cache_patch = (
-        f'function {PATCH_MARKER}(){{"{AUTH_CACHE_PATCH_MARKER}";'
-        f'try{{typeof {weakmap_var}!="undefined"&&({weakmap_var}=new WeakMap)}}catch{{}}}}'
+        auth_invalidation_guard_patch()
+        + weakmap_auth_invalidator_patch(weakmap_var)
         + auth_transition_module_patch()
     )
     patched = patched[:insert_pos] + cache_patch + patched[insert_pos:]
@@ -1720,8 +1937,9 @@ def apply_patch(file_path: Path) -> bool:
        addAuthStatusCallback), insert a call to _invalidateAccountQueries()
        before the existing getAccount() call so caches are busted first.
 
-    4. Retain authenticated state across a transient null auth notification;
-       let the following account read authoritatively commit login or logout.
+    4. Retain authenticated state across a transient null auth notification,
+       accept only the newest account-read generation, and require a delayed
+       current-generation confirmation before committing logout.
     """
     content = file_path.read_text()
 

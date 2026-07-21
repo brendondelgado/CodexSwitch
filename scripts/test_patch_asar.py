@@ -788,15 +788,18 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn("r as _csQueryKey", patched)
             self.assertIn("_qcRef=_csUseQueryClient();let n=(0,u.c)(14),", patched)
             self.assertIn(
-                "}),_invalidateAccountQueries(),c()};return e.addAuthStatusCallback",
+                "}),_invalidateAccountQueries(),e.authMethod==null?(",
                 patched,
             )
             self.assertIn(patch_asar.AUTH_TRANSITION_PATCH_MARKER, patched)
             self.assertIn(
                 "p(t=>_codexSwitchResolveAuthState(t,y(e,{isCopilotApiAvailable:r,"
-                "useCopilotAuthIfAvailable:i}),o))",
+                "useCopilotAuthIfAvailable:i}),o,_csReadEpoch===_csAuthEpoch,"
+                "_csConfirmLogout))",
                 patched,
             )
+            self.assertIn("_csLogoutTimer=setTimeout", patched)
+            self.assertIn("c(_csEventEpoch,!0)", patched)
             self.assertIn(
                 "e.authMethod==null&&t?.authMethod!=null?t:",
                 patched,
@@ -819,20 +822,23 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn(patch_asar.PATCH_MARKER, patched)
             self.assertIn(patch_asar.AUTH_CACHE_PATCH_MARKER, patched)
             self.assertIn(
-                'function _invalidateAccountQueries(){"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
-                'try{typeof f!="undefined"&&(f=new WeakMap)}catch{}}',
+                'var _csAuthInvalidationPending=!1;function _invalidateAccountQueries(){'
+                '"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
+                'if(_csAuthInvalidationPending)return;',
                 patched,
             )
+            self.assertIn('try{typeof f!="undefined"&&(f=new WeakMap)}catch{}}', patched)
             self.assertEqual(patched.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
             self.assertIn(
                 "p(t=>_codexSwitchResolveAuthState(t,y(e,{isCopilotApiAvailable:r,"
-                "useCopilotAuthIfAvailable:i}),o))",
+                "useCopilotAuthIfAvailable:i}),o,_csReadEpoch===_csAuthEpoch,"
+                "_csConfirmLogout))",
                 patched,
             )
             self.assertIn("e.authMethod==null&&t?.authMethod!=null?t:", patched)
             self.assertIn("f=new WeakMap;", patched)
             self.assertIn(
-                "}),_invalidateAccountQueries(),c()};return e.addAuthStatusCallback",
+                "}),_invalidateAccountQueries(),e.authMethod==null?(",
                 patched,
             )
             self.assertIn("export{l as a,p as i,c as o};", patched)
@@ -848,14 +854,17 @@ class PatchAsarTests(unittest.TestCase):
             patched = target.read_text()
             self.assertEqual(patched.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
             self.assertIn(
-                'function _invalidateAccountQueries(){"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
-                'try{typeof _9!="undefined"&&(_9=new WeakMap)}catch{}}',
+                'var _csAuthInvalidationPending=!1;function _invalidateAccountQueries(){'
+                '"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
+                'if(_csAuthInvalidationPending)return;',
                 patched,
             )
+            self.assertIn('try{typeof _9!="undefined"&&(_9=new WeakMap)}catch{}}', patched)
             self.assertEqual(patched.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
             self.assertIn(
                 "u(t=>_codexSwitchResolveAuthState(t,$de(e,{isCopilotApiAvailable:r,"
-                "useCopilotAuthIfAvailable:i}),o))",
+                "useCopilotAuthIfAvailable:i}),o,_csReadEpoch===_csAuthEpoch,"
+                "_csConfirmLogout))",
                 patched,
             )
             self.assertIn("e.authMethod==null&&t?.authMethod!=null?t:", patched)
@@ -867,7 +876,7 @@ class PatchAsarTests(unittest.TestCase):
             self.assertIn("hd=new WeakMap", patched)
             self.assertNotIn("hd=new WeakMap;function _invalidateAccountQueries", patched)
             self.assertIn(
-                "}),_invalidateAccountQueries(),l()};return e.addAuthStatusCallback",
+                "}),_invalidateAccountQueries(),e.authMethod==null?(",
                 patched,
             )
             self.assertIn("export{f9 as i};", patched)
@@ -896,7 +905,10 @@ class PatchAsarTests(unittest.TestCase):
             self.assertEqual(repaired.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
             self.assertEqual(repaired.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
             self.assertEqual(repaired.count("function _invalidateAccountQueries"), 1)
-            self.assertEqual(repaired.count("_invalidateAccountQueries(),l()"), 1)
+            self.assertEqual(
+                repaired.count("_invalidateAccountQueries(),e.authMethod==null?"),
+                1,
+            )
             self.assertLess(
                 repaired.index("function _invalidateAccountQueries"),
                 repaired.index("var m9,h9,g9,_9,v9="),
@@ -971,6 +983,100 @@ class PatchAsarTests(unittest.TestCase):
 
             self.assertTrue(patch_asar.apply_patch(target))
             self.assertEqual(target.read_text(), upgraded)
+
+    def test_apply_patch_upgrades_v1_transition_to_latest_generation_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            legacy = (
+                'function _invalidateAccountQueries(){'
+                '"CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3";'
+                'try{typeof _9!="undefined"&&(_9=new WeakMap)}catch{}}'
+                + patch_asar.legacy_auth_transition_module_patch()
+                + CODEX_4753_WEAKMAP_AUTH_CONTENT
+            ).replace(
+                "u($de(e,{isCopilotApiAvailable:r,useCopilotAuthIfAvailable:i}))",
+                "u(t=>_codexSwitchResolveAuthState(t,$de(e,{"
+                "isCopilotApiAvailable:r,useCopilotAuthIfAvailable:i}),o))",
+                1,
+            ).replace(
+                "e.authMethod==null&&t?.authMethod!=null?(o?.(),p9()):",
+                "e.authMethod==null&&t?.authMethod!=null?t:",
+                1,
+            ).replace(
+                "}),l()};return e.addAuthStatusCallback",
+                "}),_invalidateAccountQueries(),l()};return e.addAuthStatusCallback",
+                1,
+            )
+            target.write_text(legacy)
+
+            self.assertTrue(patch_asar.apply_patch(target))
+
+            upgraded = target.read_text()
+            self.assertNotIn(
+                patch_asar.LEGACY_AUTH_TRANSITION_PATCH_MARKER,
+                upgraded,
+            )
+            self.assertEqual(upgraded.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
+            self.assertEqual(upgraded.count("function _codexSwitchResolveAuthState"), 1)
+            self.assertIn("_csReadEpoch===_csAuthEpoch", upgraded)
+            self.assertIn("_csLogoutTimer=setTimeout", upgraded)
+            self.assertIn("l(_csEventEpoch,!0)", upgraded)
+
+            self.assertTrue(patch_asar.apply_patch(target))
+            self.assertEqual(target.read_text(), upgraded)
+
+    def test_auth_transition_helper_ignores_stale_null_reads(self):
+        node = patch_asar.shutil.which("node")
+        if node is None:
+            self.skipTest("node is required for the renderer transition fixture")
+
+        script = patch_asar.auth_transition_module_patch() + """
+let state={authMethod:`chatgpt`,email:`old@example.com`};
+let logoutCount=0;
+const loggedOut=()=>{logoutCount++};
+const empty={authMethod:null,email:null};
+const replacement={authMethod:`chatgpt`,email:`new@example.com`};
+state=_codexSwitchResolveAuthState(state,replacement,loggedOut,true,false);
+state=_codexSwitchResolveAuthState(state,empty,loggedOut,false,true);
+if(state.email!==`new@example.com`||logoutCount!==0)process.exit(1);
+state=_codexSwitchResolveAuthState(state,empty,loggedOut,true,false);
+if(state.email!==`new@example.com`||logoutCount!==0)process.exit(2);
+state=_codexSwitchResolveAuthState(state,empty,loggedOut,true,true);
+if(state.authMethod!==null||logoutCount!==1)process.exit(3);
+state=_codexSwitchResolveAuthState(state,replacement,loggedOut,false,false);
+if(state.authMethod!==null||logoutCount!==1)process.exit(4);
+"""
+        completed = patch_asar.subprocess.run(
+            [node, "--eval", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_auth_invalidator_coalesces_subscriber_fanout(self):
+        node = patch_asar.shutil.which("node")
+        if node is None:
+            self.skipTest("node is required for the renderer invalidation fixture")
+
+        script = (
+            "let timers=[];globalThis.setTimeout=e=>{timers.push(e);return timers.length};"
+            "let cache=new WeakMap;"
+            + patch_asar.auth_invalidation_guard_patch()
+            + patch_asar.weakmap_auth_invalidator_patch("cache")
+            + "let original=cache;_invalidateAccountQueries();let first=cache;"
+            "_invalidateAccountQueries();"
+            "if(first===original||cache!==first||timers.length!==1)process.exit(1);"
+            "timers.shift()();_invalidateAccountQueries();"
+            "if(cache===first||timers.length!==1)process.exit(2);"
+        )
+        completed = patch_asar.subprocess.run(
+            [node, "--eval", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_find_fast_mode_file_matches_bundle_by_content(self):
         with tempfile.TemporaryDirectory() as tmp:

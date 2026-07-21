@@ -408,14 +408,24 @@ scope contract; the historical unversioned `_invalidateAccountQueries` marker is
 not sufficient evidence and must be upgraded before activation.
 
 `account/login/start` may emit a transient status notification with no auth
-method before the same transaction's authoritative `account/read` completes.
-When the renderer already has authenticated state, that intermediate notification
-must retain the prior state: it must not invoke logout handling, clear the loaded
-desktop token, or replace application routes. The cache is still invalidated and
-the account read still runs. Its result is authoritative: a resolved unauthenticated
-account performs the normal logout transition, while a resolved authenticated
-account atomically replaces the prior account state. Patch generation V3 proves
-both the scope-safe cache invalidator and this deferred transition behavior.
+method before the same transaction's `account/read` completes. Multiple status
+notifications can overlap, and their reads can finish out of order. Every status
+notification therefore advances a renderer-local auth generation. A read may
+commit state only while its captured generation is still current; stale reads
+must preserve the current state regardless of their result. Cache invalidation
+is coalesced across hook subscribers for one short broadcast window so a single
+status event cannot fan out into redundant account reads.
+
+When the renderer already has authenticated state, a null status notification
+must retain that state, cancel any older confirmation, and schedule a bounded
+logout confirmation. A later authenticated notification cancels the pending
+logout and starts the current-generation account read immediately. Only a null
+read from the still-current confirmation generation may invoke logout handling,
+clear the loaded desktop token, or replace application routes. An authenticated
+current-generation read atomically replaces the prior account state. Auth-cache
+generation V3 plus auth-transition generation V2 prove the scope-safe,
+subscriber-coalesced invalidator, latest-generation-wins ordering, and confirmed
+logout behavior.
 
 The version-3 reload nonce is an opaque cross-language correlation identifier.
 Swift and Rust writers may encode it differently, so readers validate that it

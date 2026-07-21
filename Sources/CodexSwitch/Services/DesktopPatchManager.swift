@@ -310,7 +310,7 @@ enum DesktopPatchManager {
         NSString("~/.codexswitch/desktop-patch.lock").expandingTildeInPath
 
     private nonisolated static let authPatchMarker = "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3"
-    private nonisolated static let authTransitionPatchMarker = "CODEXSWITCH_AUTH_TRANSITION_V1"
+    private nonisolated static let authTransitionPatchMarker = "CODEXSWITCH_AUTH_TRANSITION_V2"
     private nonisolated static let remoteRecentsPatchMarker = "CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2"
     private nonisolated static let modelLabelFallbackMarker = "CODEXSWITCH_MODEL_LABEL_FALLBACK"
     private nonisolated static let modelAvailabilityFallbackMarker = "CODEXSWITCH_MODEL_AVAILABILITY_FALLBACK"

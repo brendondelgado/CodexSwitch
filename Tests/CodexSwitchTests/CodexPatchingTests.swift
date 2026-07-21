@@ -250,7 +250,7 @@ struct CodexPatchingTests {
 
         try Data(
             "_invalidateAccountQueries CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3 "
-                .appending("CODEXSWITCH_AUTH_TRANSITION_V1 ")
+                .appending("CODEXSWITCH_AUTH_TRANSITION_V2 ")
                 .appending("CODEXSWITCH_REMOTE_RECENTS_REFRESH_PATCH_V2 ")
                 .appending("CODEXSWITCH_RECENT_THREADS_STATE_DB_V1 ")
                 .appending("CODEXSWITCH_STATSIG_FAIL_OPEN_V1 ")
