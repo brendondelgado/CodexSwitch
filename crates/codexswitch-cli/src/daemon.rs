@@ -2,8 +2,8 @@ use crate::account_store::{
     active_account, lock_account_store, mark_runtime_unusable, quota_availability_at,
     real_quota_snapshot, select_auto_swap_candidate_from_observations,
     select_plan_upgrade_candidate, select_plan_upgrade_candidate_from_observations,
-    usage_limit_runtime_block_until, AccountStoreGeneration, AccountStoreLock,
-    AccountStoreSnapshot, CodexAccount, CurrentQuotaObservations, QuotaAvailability,
+    usage_limit_runtime_block_until, AccountStoreGeneration, AccountStoreSnapshot, CodexAccount,
+    CurrentQuotaObservations, QuotaAvailability,
 };
 #[cfg(test)]
 use crate::account_store::{load_accounts, save_accounts};
@@ -287,6 +287,7 @@ where
     let snapshot = preflight_provider_io_activation(store_path, auth_path)
         .context("daemon provider-I/O activation preflight failed")?;
     let activation_guard = snapshot.guard;
+    let mut generation = snapshot.generation;
     let mut accounts = snapshot.accounts;
     let fetch_quota_fn = |account: &CodexAccount| {
         validate_provider_io_activation(store_path, auth_path, &activation_guard)
@@ -757,7 +758,6 @@ where
         }
         (store_lock.load()?, record.target_account_id)
     };
-    let mut generation = snapshot.generation;
     let mut accounts = snapshot.accounts;
     let active_index = accounts
         .iter()

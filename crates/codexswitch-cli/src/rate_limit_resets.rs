@@ -1561,7 +1561,7 @@ fn externally_consumed_credit(
                 .map(RateLimitResetCredit::has_terminal_consumption_status)
                 .unwrap_or(observed.available_count < previous.available_count)
         })
-        .filter_map(RateLimitResetCredit::normalized_id)
+        .and_then(RateLimitResetCredit::normalized_id)
         .map(str::to_string)
 }
 

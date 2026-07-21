@@ -26,11 +26,9 @@ use account_store::{
 use account_store::{commit_accounts, save_accounts};
 use activation::{
     activate_with, activate_with_unlocked_reload, commit_accounts_with_provider_io_activation,
-    preflight_provider_io_activation, reconcile_activation_barrier,
-    reconcile_activation_barrier_unlocked, replace_accounts_with,
+    preflight_provider_io_activation, reconcile_activation_barrier_unlocked, replace_accounts_with,
     resolve_manual_review_activation_unlocked, validate_provider_io_activation,
-    validate_provider_io_activation_locked, ActivationBarrierContext, ActivationContext,
-    ActivationOutcome, ActivationState,
+    validate_provider_io_activation_locked, ActivationContext, ActivationOutcome, ActivationState,
 };
 use anyhow::{bail, Context, Result};
 use auth::default_auth_path;
@@ -1463,7 +1461,10 @@ where
     let candidate_observations = refresh_direct_rotation_candidates(&mut accounts, &fetch_quota_fn);
 
     if reason == "usage_limit" {
-        let reset_result = (|| {
+        let reset_result: Result<(
+            rate_limit_resets::ResetOrchestrationResult<usize>,
+            Option<ActivationOutcome>,
+        )> = (|| {
             let store_lock = lock_account_store(store_path)?;
             validate_provider_io_activation_locked(&store_lock, auth_path, &activation_guard)
                 .context("rotate-now activation changed during reset observation")?;

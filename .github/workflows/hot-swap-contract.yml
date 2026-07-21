@@ -58,7 +58,6 @@ jobs:
           python3 scripts/test_build_app.py
           python3 scripts/test_build_linux_runtime.py
           python3 scripts/test_linux_runtime_artifact.py
-          python3 scripts/test_linux_resource_policy.py
 
       - name: Run full Swift contract suite
         shell: bash
@@ -91,6 +90,13 @@ jobs:
           umask 0077
           export CARGO_TARGET_DIR="$RUNNER_TEMP/hot-swap-cargo-target"
           cargo test --locked --jobs 1 -p codexswitch-cli
+
+      - name: Run Linux installer resource-policy contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v timeout >/dev/null
+          python3 scripts/test_linux_resource_policy.py
 
       - name: Compile and execute generated upstream turn contract
         shell: bash
