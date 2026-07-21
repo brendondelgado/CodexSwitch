@@ -32,11 +32,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export GOBIN="$RUNNER_TEMP/actionlint-bin"
-          export GOCACHE="$RUNNER_TEMP/actionlint-go-cache"
-          export GOPATH="$RUNNER_TEMP/actionlint-gopath"
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
-          "$GOBIN/actionlint" -ignore 'SC2129' .github/workflows/*.yml
+          actionlint_root="$RUNNER_TEMP/actionlint-1.7.11"
+          actionlint_archive="$RUNNER_TEMP/actionlint-1.7.11-darwin-arm64.tar.gz"
+          install -d -m 0700 "$actionlint_root"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors \
+            --output "$actionlint_archive" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.11/actionlint_1.7.11_darwin_arm64.tar.gz
+          printf '%s  %s\n' \
+            a21ba7366d8329e7223faee0ed69eb13da27fe8acabb356bb7eb0b7f1e1cb6d8 \
+            "$actionlint_archive" | shasum -a 256 --check
+          tar -xzf "$actionlint_archive" -C "$actionlint_root"
+          "$actionlint_root/actionlint" -ignore 'SC2129' .github/workflows/*.yml
 
       - name: Run patch and transport contracts
         shell: bash
