@@ -82,6 +82,12 @@ BACKUP_ROOT = Path(
     )
 ).expanduser()
 ASAR_BACKUP = BACKUP_ROOT / "app.asar.bak"
+ASAR_TOOL_ROOT = Path(
+    os.environ.get(
+        "CODEXSWITCH_ASAR_TOOL_ROOT",
+        str(Path.home() / ".codexswitch" / "tools" / "asar"),
+    )
+).expanduser()
 
 # Marker to detect if already patched
 PATCH_MARKER = "_invalidateAccountQueries"
@@ -672,8 +678,43 @@ def usable_codesign_identity_available() -> bool:
     return True
 
 
+def asar_cli_candidates() -> list[Path]:
+    """Return existing ASAR CLIs without installing or mutating a cache."""
+    candidates: list[Path] = []
+    owned_patterns = [
+        "node_modules/@electron/asar/bin/asar.mjs",
+        "node_modules/@electron/asar/bin/asar.js",
+        "node_modules/asar/bin/asar.js",
+    ]
+    for pattern in owned_patterns:
+        candidate = ASAR_TOOL_ROOT / pattern
+        if candidate.is_file():
+            candidates.append(candidate)
+
+    npm_dir = Path.home() / ".npm" / "_npx"
+    npm_patterns = [
+        "*/node_modules/@electron/asar/bin/asar.mjs",
+        "*/node_modules/@electron/asar/bin/asar.js",
+        "*/node_modules/asar/bin/asar.js",
+    ]
+    npm_candidates = [
+        candidate
+        for pattern in npm_patterns
+        for candidate in npm_dir.glob(pattern)
+        if candidate.is_file()
+    ]
+    candidates.extend(
+        sorted(
+            npm_candidates,
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    )
+    return list(dict.fromkeys(candidates))
+
+
 def resolve_asar_cmd() -> list[str]:
-    """Use a cached asar CLI when disk pressure makes `npx` unreliable."""
+    """Use an existing CommonJS or ESM ASAR CLI without downloading one."""
     node = shutil.which("node")
     override = os.environ.get("CODEXSWITCH_ASAR_JS")
     if node and override:
@@ -681,13 +722,9 @@ def resolve_asar_cmd() -> list[str]:
         if asar_js.is_file():
             return [node, str(asar_js)]
     if node:
-        npm_dir = Path.home() / ".npm" / "_npx"
-        for asar_js in sorted(
-            npm_dir.glob("*/node_modules/asar/bin/asar.js"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        ):
-            return [node, str(asar_js)]
+        candidates = asar_cli_candidates()
+        if candidates:
+            return [node, str(candidates[0])]
     return ["npx", "--no-install", "asar"]
 
 
@@ -728,23 +765,25 @@ def codex_app_is_running() -> bool:
     return False
 
 
-def resolve_asar_module_dir() -> Path | None:
-    """Return a require-able `asar` package directory for integrity hashing."""
-    if len(ASAR_CMD) >= 2 and ASAR_CMD[0].endswith("node"):
-        asar_js = Path(ASAR_CMD[1])
-        if asar_js.name == "asar.js":
-            package_dir = asar_js.parent.parent
-            if (package_dir / "lib" / "asar.js").exists():
-                return package_dir
-    npm_dir = Path.home() / ".npm" / "_npx"
-    for asar_js in sorted(
-        npm_dir.glob("*/node_modules/asar/bin/asar.js"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    ):
-        package_dir = asar_js.parent.parent
-        if (package_dir / "lib" / "asar.js").exists():
-            return package_dir
+def asar_module_path_for_cli(asar_cli: Path) -> Path | None:
+    """Resolve a legacy or modern CLI to its importable package entry point."""
+    if asar_cli.name not in {"asar.js", "asar.mjs"}:
+        return None
+    module_path = asar_cli.parent.parent / "lib" / "asar.js"
+    return module_path if module_path.is_file() else None
+
+
+def resolve_asar_module_path(command: list[str] | None = None) -> Path | None:
+    """Return an importable CommonJS or ESM ASAR module for header hashing."""
+    command = command or ASAR_CMD
+    if len(command) >= 2 and Path(command[0]).name == "node":
+        module_path = asar_module_path_for_cli(Path(command[1]))
+        if module_path:
+            return module_path
+    for asar_cli in asar_cli_candidates():
+        module_path = asar_module_path_for_cli(asar_cli)
+        if module_path:
+            return module_path
     return None
 
 
@@ -756,19 +795,30 @@ def compute_electron_asar_header_hash(asar_path: Path) -> str:
     the archive keeps this aligned with Electron's own check.
     """
     node = shutil.which("node")
-    asar_module_dir = resolve_asar_module_dir()
-    if not node or not asar_module_dir:
+    asar_module_path = resolve_asar_module_path()
+    if not node or not asar_module_path:
         raise RuntimeError("node/asar package unavailable for ASAR integrity hashing")
 
     script = """
 const crypto = require('crypto');
-const asar = require(process.argv[1]);
-const archive = process.argv[2];
-const header = asar.getRawHeader(archive).headerString;
-console.log(crypto.createHash('sha256').update(header).digest('hex'));
+const { pathToFileURL } = require('url');
+(async () => {
+  const loaded = await import(pathToFileURL(process.argv[1]).href);
+  const candidate = loaded.default ?? loaded;
+  const getRawHeader = loaded.getRawHeader ?? candidate.getRawHeader;
+  if (typeof getRawHeader !== 'function') {
+    throw new Error('ASAR module does not export getRawHeader');
+  }
+  const archive = process.argv[2];
+  const header = getRawHeader(archive).headerString;
+  console.log(crypto.createHash('sha256').update(header).digest('hex'));
+})().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});
 """
     result = subprocess.run(
-        [node, "-e", script, str(asar_module_dir), str(asar_path)],
+        [node, "-e", script, str(asar_module_path), str(asar_path)],
         capture_output=True,
         text=True,
         timeout=30,

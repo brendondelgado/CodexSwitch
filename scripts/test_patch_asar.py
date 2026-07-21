@@ -475,6 +475,84 @@ class PatchAsarTests(unittest.TestCase):
                     ["/usr/local/bin/node", str(asar_js)],
                 )
 
+    def test_resolve_asar_cmd_prefers_owned_modern_esm_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool_root = Path(tmp)
+            asar_cli = tool_root / "node_modules/@electron/asar/bin/asar.mjs"
+            asar_cli.parent.mkdir(parents=True)
+            asar_cli.write_text("// fixture")
+            with patch.dict(
+                os.environ,
+                {"CODEXSWITCH_ASAR_JS": ""},
+            ), patch.object(
+                patch_asar,
+                "ASAR_TOOL_ROOT",
+                tool_root,
+            ), patch.object(
+                patch_asar.shutil,
+                "which",
+                return_value="/usr/local/bin/node",
+            ):
+                self.assertEqual(
+                    patch_asar.resolve_asar_cmd(),
+                    ["/usr/local/bin/node", str(asar_cli)],
+                )
+
+    def test_asar_module_path_supports_commonjs_and_esm_cli_layouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for package_name, cli_name in (("asar", "asar.js"), ("@electron/asar", "asar.mjs")):
+                with self.subTest(package_name=package_name):
+                    package = root / package_name.replace("/", "-")
+                    cli = package / "bin" / cli_name
+                    module = package / "lib" / "asar.js"
+                    cli.parent.mkdir(parents=True)
+                    module.parent.mkdir(parents=True)
+                    cli.write_text("// cli")
+                    module.write_text("// module")
+
+                    self.assertEqual(
+                        patch_asar.asar_module_path_for_cli(cli),
+                        module,
+                    )
+
+    def test_compute_asar_header_hash_imports_commonjs_and_esm_modules(self):
+        node = patch_asar.shutil.which("node")
+        if node is None:
+            self.skipTest("node is required for the ASAR integrity fixture")
+
+        expected = patch_asar.hashlib.sha256(b"fixture-header").hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "app.asar"
+            archive.write_bytes(b"fixture archive")
+            fixtures = {
+                "commonjs": "module.exports={getRawHeader(){return {headerString:`fixture-header`}}};",
+                "esm": "export function getRawHeader(){return {headerString:`fixture-header`}}",
+            }
+            for module_kind, source in fixtures.items():
+                with self.subTest(module_kind=module_kind):
+                    package = root / module_kind
+                    module = package / "lib" / "asar.js"
+                    module.parent.mkdir(parents=True)
+                    module.write_text(source)
+                    if module_kind == "esm":
+                        (package / "package.json").write_text('{"type":"module"}')
+
+                    with patch.object(
+                        patch_asar,
+                        "resolve_asar_module_path",
+                        return_value=module,
+                    ), patch.object(
+                        patch_asar.shutil,
+                        "which",
+                        return_value=node,
+                    ):
+                        self.assertEqual(
+                            patch_asar.compute_electron_asar_header_hash(archive),
+                            expected,
+                        )
+
     def test_resolve_default_app_path_prefers_unified_chatgpt_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

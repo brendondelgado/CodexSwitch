@@ -770,6 +770,14 @@ contents. It must reject a linked or foreign-owned cache root and must not scan
 or remove unrelated application caches. This cleanup prevents failed native
 updater downloads from accumulating after CodexSwitch assumes update ownership.
 
+The desktop patch toolchain must use an already-installed ASAR package and must
+support both legacy CommonJS `asar` and modern ESM `@electron/asar` layouts for
+extract, pack, and Electron header-integrity hashing. Tool discovery is bounded
+to an explicit override, the CodexSwitch-owned tool root, and existing npm
+execution caches; normal patch retries must not download another package or
+create a new unbounded cache. A missing compatible package is a visible blocked
+state, not permission to loop on background downloads.
+
 Renderer patch markers identify behavior generations, not merely function names.
 The patcher must migrate a recognized unsafe generation in the staged artifact,
 and both the patch manager and installed-app locator must reject that generation
