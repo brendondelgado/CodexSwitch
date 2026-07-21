@@ -51,6 +51,23 @@ use std::sync::atomic::Ordering;"#,
     )?;
     patch_file_before(
         path,
+        "    /// Current cached auth (clone) without attempting a refresh.",
+        r#"    /// CodexSwitch AuthManager identity bridge for runtime convergence.
+    pub fn codexswitch_auth_fingerprint(&self) -> Option<String> {
+        self.auth_cached()
+            .and_then(|auth| auth.codexswitch_auth_fingerprint())
+    }
+
+    pub fn codexswitch_provider_account_id(&self) -> Option<String> {
+        self.auth_cached()
+            .and_then(|auth| auth.codexswitch_provider_account_id())
+    }
+
+"#,
+        "CodexSwitch AuthManager identity bridge",
+    )?;
+    patch_file_before(
+        path,
         "    /// Returns the precise kind of credentials backing this authentication.",
         r#"    /// Hashes the complete token set used by the live runtime without exposing it.
     pub fn codexswitch_auth_fingerprint(&self) -> Option<String> {
@@ -60,7 +77,7 @@ use std::sync::atomic::Ordering;"#,
     }
 
 "#,
-        "pub fn codexswitch_auth_fingerprint(&self)",
+        ".and_then(AuthDotJson::codexswitch_fingerprint)",
     )?;
     patch_file_before(
         path,

@@ -3586,13 +3586,29 @@ impl AuthManager {
         assert!(patched
             .contains("auth_generation: AtomicU64::new(0),\n            auth_route_config: None,"));
         assert!(patched.contains("pub fn auth_generation(&self) -> u64"));
-        assert!(patched.contains("pub fn codexswitch_auth_fingerprint(&self)"));
+        assert_eq!(
+            patched
+                .matches("pub fn codexswitch_auth_fingerprint(&self)")
+                .count(),
+            2
+        );
         assert_eq!(
             patched
                 .matches("pub fn codexswitch_provider_account_id(&self)")
                 .count(),
-            2
+            3
         );
+        let auth_manager_impl = patched
+            .split_once("impl AuthManager {")
+            .expect("fixture must retain the AuthManager impl")
+            .1;
+        assert!(auth_manager_impl.contains("CodexSwitch AuthManager identity bridge"));
+        assert!(auth_manager_impl.contains(
+            "self.auth_cached()\n            .and_then(|auth| auth.codexswitch_auth_fingerprint())"
+        ));
+        assert!(auth_manager_impl.contains(
+            "self.auth_cached()\n            .and_then(|auth| auth.codexswitch_provider_account_id())"
+        ));
         assert!(patched.contains("self.tokens.as_ref()?.account_id.as_deref()?"));
         assert!(patched.contains("pub fn codexswitch_fingerprint(&self)"));
         assert!(patched.contains("fn codexswitch_read_auth_json_bounded("));

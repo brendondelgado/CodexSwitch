@@ -253,6 +253,12 @@ driver derives the version-qualified reference from existing source-less
 workspace packages and rejects missing or conflicting evidence. It never
 regenerates the upstream lockfile or resolves newer transitive dependencies.
 
+Runtime auth identity helpers have two explicit owners. `CodexAuth` computes
+the complete-token fingerprint and provider account ID; `AuthManager` exposes
+forwarding methods for turn rotation and convergence checks. Source-patch tests
+must assert both method names inside the intended impl blocks, not merely
+search for those names anywhere in the generated file.
+
 Runtime-storage hardening remains frozen, unimplemented in the reviewed patch
 driver, and disabled. `codex-runtime-storage-leases-v1` is not part of the
 active runtime marker contract, and the checked-in app-server unit does not set
