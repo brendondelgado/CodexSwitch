@@ -1,0 +1,40 @@
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_38fad0da60783f 3457,3498,3547-3559,3568,4051,4172,4577,4685,4695,6465
+  s_70c8e194852bb5::t_65a36a379d0e2a 214,441,2635,3235,3238,3279,3285,3299,3339,3352,3366
+  s_70c8e194852bb5::t_2829736d3d59d1 1336-1339,1344-1345,1348-1351,1353-1358,5097-5118,5122-5123,5136-5141
+  s_70c8e194852bb5::t_5e6296f586bae1 5142-5143
+Sources/CodexSwitch/Services/ExternalRateLimitResetHoldStore.swift
+  s_70c8e194852bb5::t_65a36a379d0e2a 220-257
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_a0d99652137d03 821-824
+  s_70c8e194852bb5::t_e665e5a42369dd 831-833
+Tests/CodexSwitchTests/AppDelegateActivationRecoveryTests.swift
+  s_70c8e194852bb5::t_2829736d3d59d1 7-22
+Sources/CodexSwitch/Services/AccountActivationCoordinator.swift
+  s_70c8e194852bb5::t_2829736d3d59d1 4,12-13,175,506,509,539
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_e665e5a42369dd 279-283
+  s_70c8e194852bb5::t_a0d99652137d03 299-302
+Tests/CodexSwitchTests/AccountActivationStateTests.swift
+  s_70c8e194852bb5::t_d3a91ec46d613d 102-148,792-807
+  s_70c8e194852bb5::t_ecf08f1e8dae19 808
+Tests/CodexSwitchTests/AccountActivationTransactionTests.swift
+  s_70c8e194852bb5::t_2829736d3d59d1 478,481-483,486-487,498,501-502,508,511-512,527,530-531,542-543
+  s_70c8e194852bb5::t_83559fd71865a6 461,465-467,471-472,492-495,497,521,525-526,536,540-541
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "b5a290bf2c48a97b42e8d2afa887f3e02105909e",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
