@@ -1612,7 +1612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         guard policyAuthority?.authorizes() ?? true else {
                             return .failed("automatic policy lease expired")
                         }
-                        await DesktopRuntimeReloadClient().reloadAuth(
+                        return await DesktopRuntimeReloadClient().reloadAuth(
                             account: account,
                             authorizeEffect: {
                                 policyAuthority?.authorizes() ?? true
@@ -1627,7 +1627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                 operationFailed: true
                             )
                         }
-                        await Task.detached(priority: .userInitiated) {
+                        return await Task.detached(priority: .userInitiated) {
                             SwapEngine.signalCodexReload(
                                 authorizeEffect: {
                                     policyAuthority?.authorizes() ?? true
