@@ -106,9 +106,24 @@ struct AccountActivationStateTests {
         let configuredTarget = UUID()
         let requestedTarget = UUID()
         let seed = AccountActivationCoordinator(url: url)
-        let initial = try await seed.bootstrapCommittedDegraded(
+        let now = Date()
+        _ = try await seed.beginPreparing(
             targetAccountId: configuredTarget,
-            detail: .launchRuntimeEvidenceExpired
+            kind: .automatic,
+            at: now
+        )
+        _ = try await seed.markCommittedDegraded(
+            targetAccountId: configuredTarget,
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1,
+            detail: .runtimeConfirmationPending,
+            at: now
+        )
+        let initial = try await confirm(
+            seed,
+            targetAccountId: configuredTarget,
+            runtimeCount: 1,
+            at: now
         )
         let initialBytes = try Data(contentsOf: url)
         let authorization = ActivationAuthorizationFlag(true)
