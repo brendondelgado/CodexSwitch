@@ -1247,7 +1247,9 @@ enum SwapEngine {
               let components = URLComponents(string: listenerValues[0]),
               components.scheme?.lowercased() == "ws",
               let host = components.host?.lowercased(),
-              ["127.0.0.1", "localhost", "::1"].contains(host),
+              ["127.0.0.1", "localhost", "::1"].contains(
+                  host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+              ),
               let port = components.port,
               port > 0 else {
             return false
