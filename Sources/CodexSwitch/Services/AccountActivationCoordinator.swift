@@ -466,10 +466,12 @@ actor AccountActivationCoordinator {
         targetAccountId: UUID,
         expectedActivationGeneration: UUID,
         evidence: AccountActivationRuntimeEvidence,
-        at date: Date = Date()
+        at date: Date = Date(),
+        authorizeEffect: StateEffectAuthorization = { _ in true }
     ) throws -> AccountActivationState {
         try transition { current in
-            guard let current,
+            guard authorizeEffect(current),
+                  let current,
                   current.phase == .confirmed,
                   current.configuredAccountId == targetAccountId,
                   current.activationGeneration == expectedActivationGeneration else {

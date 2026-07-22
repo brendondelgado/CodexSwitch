@@ -338,6 +338,8 @@ struct KeychainStore: Sendable {
         switch error {
         case .lockFailed(let path, let operation, let code):
             return .lockFailed(path: path, operation: operation, code: code)
+        case .lockTimedOut(let path, let timeout):
+            return .lockTimedOut(path: path, timeout: timeout)
         case .operationFailed(let path, let operation, let code):
             return .fileOperationFailed(path: path, operation: operation, code: code)
         case .unsafePath(let path, let reason):
@@ -433,6 +435,7 @@ enum KeychainError: Error, Equatable, LocalizedError {
     case invalidLegacyCredentialResult
     case invalidActiveAccountCount(Int)
     case lockFailed(path: String, operation: String, code: Int32)
+    case lockTimedOut(path: String, timeout: TimeInterval)
     case fileOperationFailed(path: String, operation: String, code: Int32)
     case unsafePath(path: String, reason: String)
     case staleGeneration(expected: String, actual: String)
@@ -457,6 +460,8 @@ enum KeychainError: Error, Equatable, LocalizedError {
             return "A nonempty account store must contain exactly one active account; found \(count)"
         case .lockFailed(let path, let operation, let code):
             return "Account store lock \(operation) failed for \(path): errno \(code)"
+        case .lockTimedOut(let path, let timeout):
+            return "Account store lock timed out after \(timeout) seconds for \(path)"
         case .fileOperationFailed(let path, let operation, let code):
             return "Account store \(operation) failed for \(path): errno \(code)"
         case .unsafePath(let path, let reason):

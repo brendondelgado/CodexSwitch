@@ -71,7 +71,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-21
+  last_updated: 2026-07-22
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -811,6 +811,38 @@ Before claiming hot-swap is fixed or ready:
 
 - [ ] `codexswitch-cli auth-diagnostics` shows active account hash equals `auth.json` hash.
 - [ ] `codexswitch-cli doctor` reports live runtimes as verified, not merely patched.
+- [ ] A deliberately suspended automatic-policy fixture expires its lease at 30
+  seconds, logs `AUTOMATIC_POLICY_GATE_TIMEOUT`, and permits the next monitor
+  evaluation; completion of the stale fixture cannot clear or authorize the
+  replacement evaluation.
+- [ ] Cancelling an automatic-policy evaluation revokes its authority before a
+  queued swap can persist `Preparing`; normal completion may hand off only before
+  the original monotonic deadline and only through the typed mutation lease.
+- [ ] Expiring authorization after a desktop login response suppresses the
+  verification RPC and strict SIGHUP; CLI request persistence and signal delivery
+  perform the same per-effect authorization check.
+- [ ] Holding the account-store lock past its acquisition deadline produces a
+  distinct lock-timeout result, leaves protected bytes unchanged, and permits a
+  later transaction after the holder releases the lock.
+- [ ] After desktop and current CLI ACKs succeed but one historical CLI remains
+  unacknowledged, a same-target retry reuses the two current ACKs and sends no
+  second desktop JSON-RPC notification or SIGHUP to either current runtime.
+- [ ] With two desktop app-server PIDs and only one exact target-account ACK, the
+  retry sends `account/login/start` and `account/read` only to the missing PID;
+  an ACK for another account or token fingerprint is never reusable.
+- [ ] With two desktop app-server PIDs initially missing ACKs, let the first PID
+  complete JSON-RPC verification and strict ACK, then fail the second PID's login
+  RPC. The retry sends both RPCs only to the second PID and counts the first PID's
+  durable ACK without refreshing it again.
+- [ ] A still-running historical CLI with a valid prior v3 request/ACK pair can
+  receive and acknowledge a new auth fingerprint even when it is no longer the
+  current managed-route hash; changing its PID/start identity, executable vnode,
+  runtime kind, canonical auth path/device, nonce, or ACK shape rejects that
+  capability proof. Replacing the request after a failed signal must leave a
+  private capability receipt that permits a later retry only for the same exact
+  live process, and the receipt expires after 30 days. A newer valid request/ACK
+  pair must replace an older receipt before request mutation; after rollover and
+  request replacement, the receipt must decode to the newer ACK.
 - [ ] A fresh app-server restart remains not ready until an explicit activation
   or rotation creates a current acknowledgement; daemon polling and status
   checks send no bootstrap signal.
@@ -868,6 +900,8 @@ Every future hot-swap change must include tests for:
 - Only the capability-bound `headless-remote-control-app-server` kind may use an explicit zero-count idle-listener ACK after verified auth reload. Rejected-before-eligibility historical connections are excluded from the writer count, but any writer that accepted the notification is eligible and forbids the idle shape until its transport write completes. Strict external app-servers, an accepted-but-undelivered writer, timeout, contradictory count, or same-second stale ACK cannot use the idle shape.
 - A successfully delivered SIGHUP marks runtime auth as potentially changed even when no ACK follows; import rollback requires verified compensating convergence or a durable `ManualReview` result.
 - The SIGHUP request nonce is unique per signal and must be echoed by the matching PID ACK.
+- Reused ACK PIDs and newly acknowledged PIDs are tracked separately; only the
+  latter may produce a `SIGHUP_SENT` event.
 - An external app-server rejects a CLI-kind ACK, and a local interactive CLI accepts only its CLI-kind ACK with exact nonce/fingerprints plus auth-generation/reconnect readiness.
 - A stale in-process app-server handler exits on a closed outgoing channel before it can read the request; the request remains available for the live handler and injected-turn binding, while `account/updated` delivery to the TUI remains best-effort.
 - A stale `desktop-auth-watcher-ready` file cannot make a current desktop process report ready.

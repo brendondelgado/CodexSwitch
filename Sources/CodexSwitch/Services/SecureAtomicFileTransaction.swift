@@ -1,5 +1,6 @@
 import CryptoKit
 import Darwin
+import Dispatch
 import Foundation
 
 struct SecureAtomicFileTransaction: Sendable {
@@ -58,12 +59,16 @@ struct SecureAtomicFileTransaction: Sendable {
     private let fileName: String
     private let lockFileName: String
     private let subject: String
+    private let lockAcquisitionTimeout: TimeInterval
+    private let lockRetryInterval: TimeInterval
     private let testHooks: TestHooks
 
     init(
         path: String,
         lockFileName: String? = nil,
         subject: String = "secure file",
+        lockAcquisitionTimeout: TimeInterval = 1,
+        lockRetryInterval: TimeInterval = 0.02,
         testHooks: TestHooks = TestHooks()
     ) {
         let expanded = NSString(string: path).expandingTildeInPath
@@ -72,6 +77,12 @@ struct SecureAtomicFileTransaction: Sendable {
         self.fileName = (expanded as NSString).lastPathComponent
         self.lockFileName = lockFileName ?? "\((expanded as NSString).lastPathComponent).lock"
         self.subject = subject
+        self.lockAcquisitionTimeout = lockAcquisitionTimeout.isFinite
+            ? max(0, lockAcquisitionTimeout)
+            : 1
+        self.lockRetryInterval = lockRetryInterval.isFinite
+            ? max(0.001, lockRetryInterval)
+            : 0.02
         self.testHooks = testHooks
     }
 
@@ -101,13 +112,58 @@ struct SecureAtomicFileTransaction: Sendable {
         guard fchmod(lockDescriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
             throw SecureAtomicFileError.lockFailed(path: lockPath, operation: "chmod", code: errno)
         }
-        guard flock(lockDescriptor, LOCK_EX) == 0 else {
-            throw SecureAtomicFileError.lockFailed(path: lockPath, operation: "flock", code: errno)
-        }
+        try acquireExclusiveLock(lockDescriptor, path: lockPath)
         defer { _ = flock(lockDescriptor, LOCK_UN) }
 
         try testHooks.afterLock?()
         return try operation(LockedFile(transaction: self, parentDescriptor: parentDescriptor))
+    }
+
+    private func acquireExclusiveLock(_ descriptor: Int32, path: String) throws {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let maximumTimeout = TimeInterval(UInt64.max / 1_000_000_000)
+        let timeoutNanoseconds = lockAcquisitionTimeout >= maximumTimeout
+            ? UInt64.max
+            : UInt64(lockAcquisitionTimeout * 1_000_000_000)
+        let deadlineResult = startedAt.addingReportingOverflow(timeoutNanoseconds)
+        let deadline = deadlineResult.overflow ? UInt64.max : deadlineResult.partialValue
+        var isFirstAttempt = true
+        while true {
+            let beforeAttempt = DispatchTime.now().uptimeNanoseconds
+            if !isFirstAttempt, beforeAttempt >= deadline {
+                throw SecureAtomicFileError.lockTimedOut(
+                    path: path,
+                    timeout: lockAcquisitionTimeout
+                )
+            }
+            isFirstAttempt = false
+
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                return
+            }
+
+            let code = errno
+            if code == EINTR {
+                continue
+            }
+            guard code == EWOULDBLOCK || code == EAGAIN else {
+                throw SecureAtomicFileError.lockFailed(
+                    path: path,
+                    operation: "flock",
+                    code: code
+                )
+            }
+
+            let afterAttempt = DispatchTime.now().uptimeNanoseconds
+            guard afterAttempt < deadline else {
+                throw SecureAtomicFileError.lockTimedOut(
+                    path: path,
+                    timeout: lockAcquisitionTimeout
+                )
+            }
+            let remaining = TimeInterval(deadline - afterAttempt) / 1_000_000_000
+            Thread.sleep(forTimeInterval: min(lockRetryInterval, remaining))
+        }
     }
 
     private func validateConfiguredPath() throws {
@@ -596,6 +652,7 @@ struct SecureAtomicFileTransaction: Sendable {
 
 enum SecureAtomicFileError: Error, Equatable, LocalizedError {
     case lockFailed(path: String, operation: String, code: Int32)
+    case lockTimedOut(path: String, timeout: TimeInterval)
     case operationFailed(path: String, operation: String, code: Int32)
     case unsafePath(path: String, reason: String)
     case staleGeneration(expected: String, actual: String)
@@ -605,6 +662,8 @@ enum SecureAtomicFileError: Error, Equatable, LocalizedError {
         switch self {
         case .lockFailed(let path, let operation, let code):
             return "Secure-file lock \(operation) failed for \(path): errno \(code)"
+        case .lockTimedOut(let path, let timeout):
+            return "Secure-file lock timed out after \(timeout) seconds for \(path)"
         case .operationFailed(let path, let operation, let code):
             return "Secure-file \(operation) failed for \(path): errno \(code)"
         case .unsafePath(let path, let reason):

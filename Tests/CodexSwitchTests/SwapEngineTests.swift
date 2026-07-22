@@ -1300,10 +1300,17 @@ struct SwapEngineTests {
             hasStartupAcknowledgement: false,
             managedRuntimeBootstrapAuthorized: false
         ))
+        #expect(SwapEngine.cliReloadCapabilityIsAuthorized(
+            binding: cliBinding,
+            hasStartupAcknowledgement: false,
+            managedRuntimeBootstrapAuthorized: false,
+            priorRuntimeCapabilityAuthorized: true
+        ))
         #expect(!SwapEngine.cliReloadCapabilityIsAuthorized(
             binding: desktopBinding,
             hasStartupAcknowledgement: false,
-            managedRuntimeBootstrapAuthorized: true
+            managedRuntimeBootstrapAuthorized: true,
+            priorRuntimeCapabilityAuthorized: true
         ))
     }
 
@@ -1894,6 +1901,248 @@ struct SwapEngineTests {
         ) == nil)
     }
 
+    @Test("Prior v3 ACK proves only the same live runtime capability")
+    func priorAcknowledgementCanAuthorizeNewAuthFingerprint() {
+        let target = runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI)
+        let previous = reloadBinding(
+            target: target,
+            accountID: "previous-account",
+            tokenFingerprint: String(repeating: "a", count: 64)
+        )
+        let current = reloadBinding(
+            target: target,
+            accountID: "current-account",
+            tokenFingerprint: String(repeating: "b", count: 64)
+        )
+        let artifacts = artifactSnapshots(binding: previous)
+
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: current,
+            expectedBinding: nil,
+            nowUnixMilliseconds: 1_500_200
+        ) == nil)
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: current,
+            expectedBinding: nil,
+            nowUnixMilliseconds: 1_500_200,
+            requireCurrentAuthFileIdentity: false
+        ) != nil)
+
+        let replacedExecutable = reloadBinding(
+            target: target,
+            executableInode: current.kernelExecutableIdentity.inode + 1,
+            accountID: "current-account",
+            tokenFingerprint: String(repeating: "b", count: 64)
+        )
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: replacedExecutable,
+            expectedBinding: nil,
+            nowUnixMilliseconds: 1_500_200,
+            requireCurrentAuthFileIdentity: false
+        ) == nil)
+
+        let differentAuthRoot = reloadBinding(
+            target: target,
+            authPath: "/Users/me/.other-codex/auth.json",
+            accountID: "current-account",
+            tokenFingerprint: String(repeating: "b", count: 64)
+        )
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: differentAuthRoot,
+            expectedBinding: nil,
+            nowUnixMilliseconds: 1_500_200,
+            requireCurrentAuthFileIdentity: false
+        ) == nil)
+
+        let differentAuthDevice = reloadBinding(
+            target: target,
+            authDevice: current.authFileIdentity.device + 1,
+            accountID: "current-account",
+            tokenFingerprint: String(repeating: "b", count: 64)
+        )
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: differentAuthDevice,
+            expectedBinding: nil,
+            nowUnixMilliseconds: 1_500_200,
+            requireCurrentAuthFileIdentity: false
+        ) == nil)
+    }
+
+    @Test("Identity-bound capability receipt survives request replacement")
+    func priorAcknowledgementPersistsDurableRuntimeCapability() throws {
+        let fileManager = FileManager.default
+        let home = try makeSecureTestDirectoryURL(prefix: "codexswitch-capability")
+        defer { try? fileManager.removeItem(at: home) }
+        let root = home.appendingPathComponent(".codexswitch", isDirectory: true)
+        let requestDirectory = root.appendingPathComponent(
+            "hotswap-request",
+            isDirectory: true
+        )
+        let acknowledgementDirectory = root.appendingPathComponent(
+            "hotswap-ack",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(
+            at: requestDirectory,
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(
+            at: acknowledgementDirectory,
+            withIntermediateDirectories: false
+        )
+        for directory in [root, requestDirectory, acknowledgementDirectory] {
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directory.path
+            )
+        }
+
+        let now = Date()
+        let nowMilliseconds = Int64(now.timeIntervalSince1970 * 1_000)
+        let ownerUID = UInt32(getuid())
+        let target = runtimeTarget(
+            pid: 41,
+            runtimeKind: .localInteractiveCLI,
+            ownerUID: ownerUID
+        )
+        let authPath = home
+            .appendingPathComponent(".codex/auth.json")
+            .standardizedFileURL.path
+        let previous = reloadBinding(
+            target: target,
+            issuedAtUnixMilliseconds: nowMilliseconds - 1_000,
+            authPath: authPath,
+            accountID: "previous-account",
+            tokenFingerprint: String(repeating: "a", count: 64)
+        )
+        let current = reloadBinding(
+            target: target,
+            issuedAtUnixMilliseconds: nowMilliseconds,
+            authPath: authPath,
+            authInode: previous.authFileIdentity.inode + 1,
+            accountID: "current-account",
+            tokenFingerprint: String(repeating: "b", count: 64)
+        )
+        let previousAcknowledgement = acknowledgement(
+            binding: previous,
+            acknowledgedAtUnixMilliseconds: nowMilliseconds - 900
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let requestURL = requestDirectory.appendingPathComponent("41.json")
+        let acknowledgementURL = acknowledgementDirectory.appendingPathComponent("41.json")
+        try encoder.encode(CodexReloadRequestArtifact(binding: previous)).write(to: requestURL)
+        try encoder.encode(previousAcknowledgement).write(to: acknowledgementURL)
+        for artifact in [requestURL, acknowledgementURL] {
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: artifact.path
+            )
+        }
+
+        #expect(SwapEngine.ensurePriorRuntimeCapabilityReceipt(
+            matching: current,
+            homeDirectory: home,
+            now: now,
+            bindingIsCurrent: { $0 == current }
+        ))
+
+        let receiptURL = root
+            .appendingPathComponent("hotswap-capability", isDirectory: true)
+            .appendingPathComponent("41.json")
+        let receiptAttributes = try fileManager.attributesOfItem(atPath: receiptURL.path)
+        #expect((receiptAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+
+        try encoder.encode(CodexReloadRequestArtifact(binding: current)).write(
+            to: requestURL,
+            options: .atomic
+        )
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: requestURL.path
+        )
+        #expect(SwapEngine.runtimeCapabilityReceiptAcknowledgement(
+            matching: current,
+            homeDirectory: home,
+            now: now.addingTimeInterval(1),
+            bindingIsCurrent: { $0 == current }
+        ) == previousAcknowledgement)
+
+        let currentAcknowledgement = acknowledgement(
+            binding: current,
+            acknowledgedAtUnixMilliseconds: nowMilliseconds + 1_000
+        )
+        try encoder.encode(currentAcknowledgement).write(
+            to: acknowledgementURL,
+            options: .atomic
+        )
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: acknowledgementURL.path
+        )
+        #expect(SwapEngine.ensurePriorRuntimeCapabilityReceipt(
+            matching: current,
+            homeDirectory: home,
+            now: now.addingTimeInterval(2),
+            bindingIsCurrent: { $0 == current }
+        ))
+
+        let next = reloadBinding(
+            target: target,
+            issuedAtUnixMilliseconds: nowMilliseconds + 2_000,
+            authPath: authPath,
+            authInode: current.authFileIdentity.inode + 1,
+            accountID: "next-account",
+            tokenFingerprint: String(repeating: "c", count: 64)
+        )
+        try encoder.encode(CodexReloadRequestArtifact(binding: next)).write(
+            to: requestURL,
+            options: .atomic
+        )
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: requestURL.path
+        )
+        #expect(SwapEngine.runtimeCapabilityReceiptAcknowledgement(
+            matching: next,
+            homeDirectory: home,
+            now: now.addingTimeInterval(3),
+            bindingIsCurrent: { $0 == next }
+        ) == currentAcknowledgement)
+
+        let wrongAuthRoot = reloadBinding(
+            target: target,
+            issuedAtUnixMilliseconds: nowMilliseconds,
+            authPath: home.appendingPathComponent("other/auth.json").path,
+            authDevice: current.authFileIdentity.device,
+            authInode: current.authFileIdentity.inode,
+            accountID: current.authFileIdentity.accountID,
+            tokenFingerprint: current.authFileIdentity.completeTokenFingerprint
+        )
+        #expect(SwapEngine.runtimeCapabilityReceiptAcknowledgement(
+            matching: wrongAuthRoot,
+            homeDirectory: home,
+            now: now.addingTimeInterval(1),
+            bindingIsCurrent: { _ in true }
+        ) == nil)
+        #expect(SwapEngine.runtimeCapabilityReceiptAcknowledgement(
+            matching: current,
+            homeDirectory: home,
+            now: now.addingTimeInterval(30 * 24 * 60 * 60 + 2),
+            bindingIsCurrent: { _ in true }
+        ) == nil)
+    }
+
     @Test("Startup and response ACK admission share the five-minute age limit")
     func startupAndResponseAdmissionRejectACKsOlderThanFiveMinutes() {
         let target = runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI)
@@ -1999,6 +2248,87 @@ struct SwapEngineTests {
         #expect(!incomplete.isComplete)
         #expect(incomplete.runtimes.isEmpty)
         #expect(!providersCalled)
+    }
+
+    @Test("Desktop ACK reuse is per runtime and exact target account")
+    func acknowledgedDesktopRuntimePIDsMatchTargetAccount() {
+        let firstTarget = runtimeTarget(pid: 41, runtimeKind: .externalAppServer)
+        let secondTarget = runtimeTarget(pid: 42, runtimeKind: .externalAppServer)
+        let thirdTarget = runtimeTarget(pid: 43, runtimeKind: .externalAppServer)
+        let fourthTarget = runtimeTarget(pid: 44, runtimeKind: .externalAppServer)
+        let discovery = CodexRuntimeDiscoverySnapshot(
+            targets: [firstTarget, secondTarget, thirdTarget, fourthTarget],
+            isComplete: true
+        )
+        let expectedFingerprint = String(repeating: "a", count: 64)
+        let firstBinding = reloadBinding(
+            target: firstTarget,
+            accountID: "target-account",
+            tokenFingerprint: expectedFingerprint
+        )
+        let secondBinding = reloadBinding(
+            target: secondTarget,
+            accountID: "other-account",
+            tokenFingerprint: expectedFingerprint
+        )
+        let thirdBinding = reloadBinding(
+            target: thirdTarget,
+            accountID: "target-account",
+            tokenFingerprint: String(repeating: "b", count: 64)
+        )
+        let fourthBinding = reloadBinding(
+            target: fourthTarget,
+            accountID: "target-account",
+            tokenFingerprint: expectedFingerprint
+        )
+        let observations = [
+            firstTarget.process.identity.pid: CodexRuntimeObservation(
+                target: firstTarget,
+                authFileIdentity: firstBinding.authFileIdentity
+            ),
+            secondTarget.process.identity.pid: CodexRuntimeObservation(
+                target: secondTarget,
+                authFileIdentity: secondBinding.authFileIdentity
+            ),
+            thirdTarget.process.identity.pid: CodexRuntimeObservation(
+                target: thirdTarget,
+                authFileIdentity: thirdBinding.authFileIdentity
+            ),
+            fourthTarget.process.identity.pid: CodexRuntimeObservation(
+                target: firstTarget,
+                authFileIdentity: fourthBinding.authFileIdentity
+            ),
+        ]
+        let acknowledgements = [
+            firstTarget.process.identity.pid: acknowledgement(binding: firstBinding),
+            secondTarget.process.identity.pid: acknowledgement(binding: secondBinding),
+            thirdTarget.process.identity.pid: acknowledgement(binding: thirdBinding),
+            fourthTarget.process.identity.pid: acknowledgement(binding: fourthBinding),
+        ]
+
+        let acknowledged = SwapEngine.alreadyAcknowledgedRuntimePIDs(
+            discovery,
+            expectedAccountID: "target-account",
+            expectedCompleteTokenFingerprint: expectedFingerprint,
+            observationProvider: { observations[$0.process.identity.pid] },
+            startupAcknowledgementProvider: {
+                acknowledgements[$0.target.process.identity.pid]
+            },
+            observationIsCurrent: { _ in true }
+        )
+
+        #expect(acknowledged == [41])
+        #expect(SwapEngine.alreadyAcknowledgedRuntimePIDs(
+            CodexRuntimeDiscoverySnapshot(
+                targets: discovery.targets,
+                isComplete: false
+            ),
+            expectedAccountID: "target-account",
+            expectedCompleteTokenFingerprint: expectedFingerprint,
+            observationProvider: { observations[$0.process.identity.pid] },
+            startupAcknowledgementProvider: { _ in nil },
+            observationIsCurrent: { _ in true }
+        ).isEmpty)
     }
 
     @Test("Status evidence rejects argv runtime-kind drift during ACK acceptance")
@@ -2136,6 +2466,49 @@ struct SwapEngineTests {
         #expect(acknowledgementWaits.read() == 0)
         #expect(execution.acknowledgedPIDs.isEmpty)
         #expect(execution.operationFailed)
+    }
+
+    @Test("Already-current ACK suppresses request persistence and repeated signal")
+    func alreadyAcknowledgedRuntimeIsNotReloadedAgain() {
+        let target = runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI)
+        let binding = reloadBinding(target: target)
+        let persisted = LockedTestState(false)
+        let signaled = LockedTestState(false)
+        let waited = LockedTestState(false)
+
+        let execution = SwapEngine.executeReloadBatch(
+            preliminaryPIDs: [41],
+            discoveryProvider: {
+                CodexRuntimeDiscoverySnapshot(targets: [target], isComplete: true)
+            },
+            requiredOwnerUID: 501,
+            candidateIsEligible: { _ in true },
+            makeBinding: { _ in binding },
+            hotSwapSupport: { _ in true },
+            alreadyAcknowledged: { _ in true },
+            bindingIsCurrent: { _ in true },
+            persistRequest: { _ in
+                persisted.update { $0 = true }
+                return true
+            },
+            signal: { _ in
+                signaled.update { $0 = true }
+                return true
+            },
+            awaitAcknowledgements: { _ in
+                waited.update { $0 = true }
+                return []
+            },
+            gate: CodexReloadAttemptGate()
+        )
+
+        #expect(execution.acknowledgedPIDs == [41])
+        #expect(execution.newlyAcknowledgedPIDs.isEmpty)
+        #expect(execution.reusedAcknowledgedPIDs == [41])
+        #expect(!execution.operationFailed)
+        #expect(!persisted.read())
+        #expect(!signaled.read())
+        #expect(!waited.read())
     }
 
     @Test("Auth evidence is complete, bounded, mode checked, and no-follow")

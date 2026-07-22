@@ -55,7 +55,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-21
+  last_updated: 2026-07-22
 ---
 
 # Runtime And Host Ownership
@@ -115,7 +115,7 @@ observe -> choose -> lock -> revalidate -> commit auth/store
 
 The auth commit includes access token, refresh token, identity token when present, provider account identity, and required metadata. Sending only a new access token can appear successful until the next refresh and is prohibited.
 
-`auth.json` uses the same Swift secure-file transaction as the account store: descriptor-anchored no-follow traversal, a same-directory exclusive lock, generation recheck, unique `O_EXCL` temporary file forced to mode `0600`, complete write, file and directory `fsync`, atomic rename, and exact-byte no-follow readback. The readback must decode to the complete intended token set before reload begins.
+`auth.json` uses the same Swift secure-file transaction as the account store: descriptor-anchored no-follow traversal, a same-directory exclusive lock, generation recheck, unique `O_EXCL` temporary file forced to mode `0600`, complete write, file and directory `fsync`, atomic rename, and exact-byte no-follow readback. Lock acquisition is nonblocking and bounded; contention returns a distinct timeout without reading, writing, deleting, or bypassing the protected file. The readback must decode to the complete intended token set before reload begins.
 
 The secure transaction can prove generation ownership, but the Mac activation
 barrier does not roll back after an active credential mutation has durably
@@ -260,6 +260,37 @@ Every automatic entry point uses this one fresh gate before it selects a target
 or writes `Preparing`, including quota exhaustion, plan upgrade, invalid-token,
 and usage-unavailable callbacks. Passing an older gate on a downstream helper
 does not authorize target selection made from stale runtime ownership.
+
+The Mac automatic-policy evaluator is a bounded, generation-owned single
+flight. Each evaluation receives a unique revocable authority with a monotonic
+30-second deadline; wall-clock changes cannot extend it. The authority is
+carried through runtime renewal and confirmed-evidence persistence and is
+checked immediately before every reload, journal transition, reset effect, and
+swap entry. When the deadline expires, CodexSwitch revokes the authority,
+cancels the task, and allows the next monitor tick to retry. A late task cannot
+clear a newer evaluator or authorize target selection, reset redemption,
+credential writes, or a swap. An already-admitted bounded network request may
+finish, but no later stage may consume it after revocation. This watchdog is a
+last-resort liveness boundary; every subprocess, file lock, WebSocket request,
+and acknowledgement wait inside the evaluator retains its narrower deadline.
+Timeouts are logged with the trigger and lease generation so a silent stuck
+percentage cannot disable future swaps.
+
+Runtime renewal carries the revocable callback into the desktop JSON-RPC and
+CLI signal transactions. Each login request, verification request, request-file
+commit, strict reload, and signal rechecks it at the effect boundary; expiry
+during an earlier wait suppresses the next effect instead of relying only on a
+check after the whole reload returns.
+
+Successful evaluator completion releases the single-flight slot but does not
+prematurely revoke an already admitted decision. Its authority remains usable
+only until the original monotonic deadline and only to enter the existing typed
+account-mutation lease. The activation coordinator checks both authorities
+inside its executor immediately before it persists `Preparing`; that durable
+transition is the handoff point, after which the activation generation and
+mutation lease own the bounded transaction. Cancellation revokes the policy
+authority immediately. A queued task that reaches the handoff after cancellation
+or deadline expiry therefore changes no account, auth, or activation file.
 
 Proof captured before an `await` cannot authorize a later mutation. After every
 preparatory suspension point, and again immediately before the first credential
@@ -550,6 +581,37 @@ making the CLI batch incomplete. A historical process lacking the v3 CLI
 contract remains a restart-required runtime and is never reported current. Its
 presence does not erase successful desktop or current-CLI acknowledgements from
 the activation journal or status presentation.
+An exact still-running historical CLI that previously returned a valid v3 ACK
+may use that prior request/ACK pair as capability proof for a later auth
+fingerprint. The proof remains bound to the same PID, process start time, owner,
+runtime kind, executable path, executable vnode, canonical auth path, auth
+filesystem device, request nonce, and valid CLI ACK shape; it authorizes only a
+new verified request and signal, never current account evidence by itself.
+Before replacing that process's request, CodexSwitch persists the validated
+proof as a private identity-bound capability receipt. The receipt remains valid
+for at most 30 days and only while that exact process-start and executable-vnode
+identity is still live; PID reuse, executable replacement, auth-root change, or
+device change rejects it. When both a receipt and a newer valid request/ACK pair
+exist, CodexSwitch must atomically roll the receipt forward to the newer proof
+before replacing the request; a failed rollover blocks the new signal. This
+bounded receipt lets a transient failed signal be retried without destroying the
+freshest historical proof. A missing, malformed, stale, or identity-mismatched
+capability proof remains restart-required.
+
+Runtime acknowledgements are cumulative within one configured-account
+convergence attempt. Before sending JSON-RPC or SIGHUP, the coordinator checks
+whether each exact live binding already has a valid ACK for the requested
+provider account and current complete token fingerprint. Already-current targets
+count as acknowledged and are not signalled again. Desktop reuse is per PID: a
+partial retry sends JSON-RPC only to desktop runtimes missing that exact target
+ACK, while strict convergence still counts both reused and newly acknowledged
+PIDs. Each desktop PID's verified JSON-RPC result is followed immediately by its
+strict identity-bound ACK before the coordinator advances to the next PID. A
+later PID failure therefore leaves earlier successful PIDs durable and reusable.
+Logs distinguish reused evidence from a newly sent SIGHUP. A retry targets only
+missing runtimes, so one unsupported or unacknowledged historical CLI cannot
+cause repeated desktop auth notifications, window refreshes, or composer loss
+in a runtime that already converged.
 After that process exits, a throttled topology-change check may re-arm the
 exhausted same-target convergence once without relaunching CodexSwitch. The
 check is observational; the subsequent mutation path still performs full route,

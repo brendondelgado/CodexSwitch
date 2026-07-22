@@ -1,4 +1,5 @@
 import AppKit
+import Dispatch
 import SwiftUI
 import os
 import Darwin
@@ -189,6 +190,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     nonisolated static let configMaintenanceInterval: TimeInterval = 15 * 60
     nonisolated static let linuxDevboxCredentialSyncRetryDelay: TimeInterval = 5
     nonisolated static let retryExhaustedTopologyCheckInterval: TimeInterval = 15
+    nonisolated static let automaticPolicyGateTimeout: TimeInterval = 30
 
     // Set in applicationDidFinishLaunching before any other access
     private var statusItem: NSStatusItem!
@@ -304,6 +306,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var pendingSwapTargetAccountId: UUID?
     private var swapConvergenceTask: Task<Void, Never>?
     private var automaticPolicyGateTask: Task<Void, Never>?
+    private var automaticPolicyGateWatchdogTask: Task<Void, Never>?
+    private var automaticPolicyLeaseState = AccountAutomaticPolicyLeaseState()
     private var retryExhaustedTopologyCheckTask: Task<Void, Never>?
     private var lastRetryExhaustedTopologyCheckAt: Date?
     private var lastAttemptedRetryExhaustedTopology: CodexLocalCLIRuntimeTopology?
@@ -1512,9 +1516,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func durableConfigurationAllowsRuntimePermit(
         for account: CodexAccount,
         activationGeneration: UUID,
-        requiredPhase: AccountActivationPhase
+        requiredPhase: AccountActivationPhase,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
     ) async -> Bool {
+        guard policyAuthority?.authorizes() ?? true else { return false }
         let status = await durableConfiguredFilesStatus(account)
+        guard policyAuthority?.authorizes() ?? true else { return false }
         if status == .unavailable, requiredPhase == .confirmed {
             SwapLog.append(.debug(
                 "ACTIVATION_CONFIRMED_EVIDENCE_REFRESH_DEFERRED target=\(account.id.uuidString) reason=durable_read_unavailable"
@@ -1524,6 +1531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             status,
             requiredPhase: requiredPhase
         ) {
+            guard policyAuthority?.authorizes() ?? true else { return }
             guard self.accountManager.activationState?.phase == requiredPhase,
                   self.accountManager.activationState?.configuredAccountId == account.id,
                   self.accountManager.activationState?.activationGeneration
@@ -1565,8 +1573,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func captureFreshLocalRuntimeEvidence(
-        for account: CodexAccount
+        for account: CodexAccount,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
     ) async -> AccountActivationRuntimeEvidenceDecision {
+        guard policyAuthority?.authorizes() ?? true else {
+            return .denied(
+                detail: .runtimeEvidenceExpired,
+                discoveredRuntimeCount: 0,
+                acknowledgedRuntimeCount: 0
+            )
+        }
         let expectedAuthIdentity: CodexAuthFileIdentity? = await Task.detached(priority: .userInitiated) {
             let authURL = URL(fileURLWithPath: Self.codexAuthPath)
             guard Self.authFileMatches(account: account, atPath: Self.codexAuthPath),
@@ -1578,7 +1594,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             return expectedAuthIdentity
         }.value
-        guard let expectedAuthIdentity else {
+        guard policyAuthority?.authorizes() ?? true,
+              let expectedAuthIdentity else {
             return .denied(
                 detail: .durableConfigurationChanged,
                 discoveredRuntimeCount: 0,
@@ -1586,25 +1603,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
         }
 
-        return await AccountActivationRuntimeEvidencePreflight.renewAndEvaluate(
+        let decision = await AccountActivationRuntimeEvidencePreflight.renewAndEvaluate(
             expectedAccountId: account.id,
             expectedAuthIdentity: expectedAuthIdentity,
             renew: {
                 await AccountActivationRuntimeEvidencePreflight.performRenewal(
                     desktopReload: {
+                        guard policyAuthority?.authorizes() ?? true else {
+                            return .failed("automatic policy lease expired")
+                        }
                         await DesktopRuntimeReloadClient().reloadAuth(
-                            account: account
+                            account: account,
+                            authorizeEffect: {
+                                policyAuthority?.authorizes() ?? true
+                            }
                         )
                     },
                     cliReload: {
+                        guard policyAuthority?.authorizes() ?? true else {
+                            return CodexReloadSummary(
+                                discoveredRuntimeCount: 0,
+                                acknowledgedRuntimeCount: 0,
+                                operationFailed: true
+                            )
+                        }
                         await Task.detached(priority: .userInitiated) {
-                            SwapEngine.signalCodexReload()
+                            SwapEngine.signalCodexReload(
+                                authorizeEffect: {
+                                    policyAuthority?.authorizes() ?? true
+                                }
+                            )
                         }.value
                     }
                 )
             },
             capture: {
-                await Task.detached(priority: .userInitiated) { () -> AccountActivationRuntimeSnapshotSet? in
+                guard policyAuthority?.authorizes() ?? true else { return nil }
+                let snapshots = await Task.detached(priority: .userInitiated) { () -> AccountActivationRuntimeSnapshotSet? in
                     let authURL = URL(fileURLWithPath: Self.codexAuthPath)
                     guard Self.authFileMatches(
                         account: account,
@@ -1625,11 +1660,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         observedAt: Date()
                     )
                 }.value
+                guard policyAuthority?.authorizes() ?? true else { return nil }
+                return snapshots
             },
             runtimeBindingIsCurrent: { binding in
                 SwapEngine.reloadBindingIsCurrent(binding)
             }
         )
+        guard policyAuthority?.authorizes() ?? true else {
+            return .denied(
+                detail: .runtimeEvidenceExpired,
+                discoveredRuntimeCount: 0,
+                acknowledgedRuntimeCount: 0
+            )
+        }
+        return decision
     }
 
     private func revalidatedRuntimeEvidence(
@@ -1644,9 +1689,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return current
     }
 
-    private func activationStateForRequest(at _: Date = Date()) async -> AccountActivationState? {
+    private func activationStateForRequest(
+        at _: Date = Date(),
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
+    ) async -> AccountActivationState? {
         do {
             let durable = try await accountActivationCoordinator.load()
+            guard policyAuthority?.authorizes() ?? true else { return nil }
             if durable != accountManager.activationState {
                 accountManager.publishActivationState(durable)
                 statusBarController?.updateIcon()
@@ -1654,6 +1703,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             return durable
         } catch {
+            guard policyAuthority?.authorizes() ?? true else { return nil }
             await enterActivationManualReview(
                 targetAccountId: accountManager.activationState?.configuredAccountId,
                 detail: .journalUnavailable
@@ -1665,12 +1715,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func requireFreshLocalRuntimePermit(
         for account: CodexAccount,
         activationGeneration: UUID,
-        requiredPhase: AccountActivationPhase
+        requiredPhase: AccountActivationPhase,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
     ) async -> AccountActivationRuntimePermit? {
-        guard accountManager.activationState?.phase == requiredPhase,
+        guard policyAuthority?.authorizes() ?? true,
+              accountManager.activationState?.phase == requiredPhase,
               accountManager.activationState?.configuredAccountId == account.id,
               accountManager.activationState?.activationGeneration == activationGeneration,
               accountManager.configuredAccount?.id == account.id else {
+            guard policyAuthority?.authorizes() ?? true else { return nil }
             await enterActivationManualReview(
                 targetAccountId: account.id,
                 detail: .durableConfigurationChanged
@@ -1680,16 +1733,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard await durableConfigurationAllowsRuntimePermit(
             for: account,
             activationGeneration: activationGeneration,
-            requiredPhase: requiredPhase
+            requiredPhase: requiredPhase,
+            policyAuthority: policyAuthority
         ) else {
             return nil
         }
 
-        let decision = await captureFreshLocalRuntimeEvidence(for: account)
-        guard accountManager.activationState?.phase == requiredPhase,
+        let decision = await captureFreshLocalRuntimeEvidence(
+            for: account,
+            policyAuthority: policyAuthority
+        )
+        guard policyAuthority?.authorizes() ?? true,
+              accountManager.activationState?.phase == requiredPhase,
               accountManager.activationState?.configuredAccountId == account.id,
               accountManager.activationState?.activationGeneration == activationGeneration,
               accountManager.configuredAccount?.id == account.id else {
+            guard policyAuthority?.authorizes() ?? true else { return nil }
             await enterActivationManualReview(
                 targetAccountId: account.id,
                 detail: .durableConfigurationChanged
@@ -1699,7 +1758,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard await durableConfigurationAllowsRuntimePermit(
             for: account,
             activationGeneration: activationGeneration,
-            requiredPhase: requiredPhase
+            requiredPhase: requiredPhase,
+            policyAuthority: policyAuthority
         ) else {
             return nil
         }
@@ -1710,13 +1770,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return nil
             }
             if requiredPhase == .confirmed {
+                guard policyAuthority?.authorizes() ?? true else { return nil }
                 do {
                     let refreshed = try await accountActivationCoordinator
                         .refreshConfirmedRuntimeEvidence(
                             targetAccountId: account.id,
                             expectedActivationGeneration: activationGeneration,
-                            evidence: evidence
+                            evidence: evidence,
+                            authorizeEffect: { state in
+                                (policyAuthority?.authorizes() ?? true)
+                                    && state?.phase == requiredPhase
+                                    && state?.configuredAccountId == account.id
+                                    && state?.activationGeneration == activationGeneration
+                            }
                         )
+                    guard policyAuthority?.authorizes() ?? true else { return nil }
                     guard refreshed.phase == requiredPhase,
                           refreshed.configuredAccountId == account.id,
                           refreshed.activationGeneration == activationGeneration else {
@@ -1724,6 +1792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     accountManager.publishActivationState(refreshed)
                 } catch {
+                    guard policyAuthority?.authorizes() ?? true else { return nil }
                     await enterActivationManualReview(
                         targetAccountId: account.id,
                         detail: .runtimeEvidencePersistFailed
@@ -1742,7 +1811,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             return permit
         case .denied(let detail, let discovered, let acknowledged):
-            guard requiredPhase != .confirmed else {
+            guard requiredPhase != .confirmed,
+                  policyAuthority?.authorizes() ?? true else {
                 return nil
             }
             do {
@@ -1755,6 +1825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 )
                 accountManager.publishActivationState(degraded)
             } catch {
+                guard policyAuthority?.authorizes() ?? true else { return nil }
                 await enterActivationManualReview(
                     targetAccountId: account.id,
                     detail: .runtimeEvidencePersistFailed
@@ -3558,9 +3629,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func startRateLimitResetRedemption(
         account: CodexAccount,
         bank: RateLimitResetBank,
-        reason: RateLimitResetRedemptionReason
+        reason: RateLimitResetRedemptionReason,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
     ) {
-        guard !isExiting else {
+        guard !isExiting,
+              policyAuthority?.authorizes() ?? true else {
             recordManualRateLimitResetError(
                 "CodexSwitch is shutting down",
                 for: account.id,
@@ -3620,8 +3693,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ))
 
         rateLimitResetRedemptionTask = Task { @MainActor [weak self] in
-            guard let self, !self.isExiting else { return }
-            guard let activationState = await self.activationStateForRequest(),
+            guard let self else { return }
+            guard !self.isExiting,
+                  policyAuthority?.authorizes() ?? true else {
+                self.rateLimitResetUnresolvedProviderAccountIds.remove(providerAccountId)
+                self.rateLimitResetOperationProviderAccountId = nil
+                self.rateLimitResetRedemptionTask = nil
+                return
+            }
+            guard let activationState = await self.activationStateForRequest(
+                policyAuthority: policyAuthority
+            ),
+                  policyAuthority?.authorizes() ?? true,
                   Self.rateLimitResetActivationStateAllows(
                       activationState,
                       reason: reason
@@ -3665,7 +3748,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 accountId: account.id,
                 activationGeneration: activationState.activationGeneration
             ) { [weak self] lease in
-                guard let self, !self.isExiting else { return false }
+                guard let self,
+                      !self.isExiting,
+                      policyAuthority?.authorizes() ?? true else {
+                    return false
+                }
                 return await self.performRateLimitResetRedemption(
                     account: account,
                     configured: configured,
@@ -3674,7 +3761,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     requiredActivationPhase: activationState.phase,
                     service: service,
                     submissionTracker: submissionTracker,
-                    lease: lease
+                    lease: lease,
+                    policyAuthority: policyAuthority
                 )
             }
             if shouldResumeSwap == nil {
@@ -3742,7 +3830,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         requiredActivationPhase: AccountActivationPhase,
         service: RateLimitResetService,
         submissionTracker: RateLimitResetSubmissionTracker,
-        lease: AccountMutationLease
+        lease: AccountMutationLease,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
     ) async -> Bool {
         let accountId = account.id
         guard account.hasCompleteRuntimeCredentials,
@@ -3761,7 +3850,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 authorizedBank: bank,
                 reason: reason,
                 requiredActivationPhase: requiredActivationPhase,
-                lease: lease
+                lease: lease,
+                policyAuthority: policyAuthority
             ) else {
                 recordManualRateLimitResetError(
                     "Account eligibility changed before the reset was submitted",
@@ -3783,7 +3873,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         reason: reason,
                         requiredActivationPhase: requiredActivationPhase,
                         lease: lease,
-                        attempt: attempt
+                        attempt: attempt,
+                        policyAuthority: policyAuthority
                     )
                 },
                 submissionWillStart: { attempt in
@@ -3894,10 +3985,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         authorizedBank initialAuthorizedBank: RateLimitResetBank,
         reason: RateLimitResetRedemptionReason,
         requiredActivationPhase: AccountActivationPhase,
-        lease: AccountMutationLease
+        lease: AccountMutationLease,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
     ) async -> (account: CodexAccount, bank: RateLimitResetBank)? {
         let activationGeneration = lease.purpose.activationGeneration
-        guard await accountMutationTransaction.owns(lease),
+        guard policyAuthority?.authorizes() ?? true,
+              await accountMutationTransaction.owns(lease),
+              policyAuthority?.authorizes() ?? true,
               accountManager.activationState?.phase == requiredActivationPhase,
               accountManager.activationState.map({
                   Self.rateLimitResetActivationStateAllows($0, reason: reason)
@@ -3911,6 +4005,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let unresolvedAttempt = try await rateLimitResetService.unresolvedAttempt(
                 for: account.accountId
             )
+            guard policyAuthority?.authorizes() ?? true else { return nil }
             rateLimitResetSubmissionTracker.reconcile(
                 providerAccountId: account.accountId,
                 unresolvedAttempt: unresolvedAttempt
@@ -3922,6 +4017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return nil
             }
             let quota = try await quotaPoller.fetchQuota(for: account)
+            guard policyAuthority?.authorizes() ?? true else { return nil }
             accountManager.updateQuota(
                 for: account.id,
                 snapshot: quota.snapshot,
@@ -3931,6 +4027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 for: account,
                 force: true
             )
+            guard policyAuthority?.authorizes() ?? true else { return nil }
             let now = Date()
             let observation = observeRateLimitResetBank(
                 for: account,
@@ -3983,23 +4080,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 await requireFreshLocalRuntimePermit(
                     for: configuredAccount,
                     activationGeneration: activationGeneration,
-                    requiredPhase: requiredActivationPhase
+                    requiredPhase: requiredActivationPhase,
+                    policyAuthority: policyAuthority
                 )
             }
-            guard initialAuthorizedBank.isFresh(
+            guard policyAuthority?.authorizes() ?? true,
+                  initialAuthorizedBank.isFresh(
                 at: now,
                 maxAge: Self.rateLimitResetDecisionFreshnessInterval
             ),
-            !orchestrationPlan.requiresRuntimeAuthorization || runtimePermit != nil,
-            await durableConfiguredFilesMatch(configuredAccount),
-            try await rateLimitResetService.unresolvedAttempt(for: account.accountId) == nil,
-            await accountMutationTransaction.owns(lease),
-            accountManager.activationState?.phase == requiredActivationPhase,
-            accountManager.activationState.map({
-                Self.rateLimitResetActivationStateAllows($0, reason: reason)
-            }) == true,
-            accountManager.activationState?.configuredAccountId == configuredAccount.id,
-            accountManager.activationState?.activationGeneration == activationGeneration else {
+                  !orchestrationPlan.requiresRuntimeAuthorization || runtimePermit != nil else {
+                return nil
+            }
+            guard await durableConfiguredFilesMatch(configuredAccount),
+                  policyAuthority?.authorizes() ?? true,
+                  try await rateLimitResetService.unresolvedAttempt(
+                      for: account.accountId
+                  ) == nil,
+                  policyAuthority?.authorizes() ?? true,
+                  await accountMutationTransaction.owns(lease),
+                  policyAuthority?.authorizes() ?? true,
+                  accountManager.activationState?.phase == requiredActivationPhase,
+                  accountManager.activationState.map({
+                      Self.rateLimitResetActivationStateAllows($0, reason: reason)
+                  }) == true,
+                  accountManager.activationState?.configuredAccountId == configuredAccount.id,
+                  accountManager.activationState?.activationGeneration == activationGeneration else {
                 return nil
             }
             return (refreshedAccount, initialAuthorizedBank)
@@ -4018,13 +4124,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         reason: RateLimitResetRedemptionReason,
         requiredActivationPhase: AccountActivationPhase,
         lease: AccountMutationLease,
-        attempt: RateLimitResetAttempt
+        attempt: RateLimitResetAttempt,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
     ) async -> RateLimitResetSubmissionPermit? {
-        guard !isExiting else { return nil }
+        guard !isExiting,
+              policyAuthority?.authorizes() ?? true else {
+            return nil
+        }
         let activationGeneration = lease.purpose.activationGeneration
         let refreshedBank: RateLimitResetBank
         do {
             let quota = try await quotaPoller.fetchQuota(for: account)
+            guard policyAuthority?.authorizes() ?? true else { return nil }
             accountManager.updateQuota(
                 for: account.id,
                 snapshot: quota.snapshot,
@@ -4034,6 +4145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 for: account,
                 force: true
             )
+            guard policyAuthority?.authorizes() ?? true else { return nil }
         } catch {
             return nil
         }
@@ -4052,7 +4164,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             await requireFreshLocalRuntimePermit(
                 for: configuredAccount,
                 activationGeneration: activationGeneration,
-                requiredPhase: requiredActivationPhase
+                requiredPhase: requiredActivationPhase,
+                policyAuthority: policyAuthority
             )
         }
         guard !orchestrationPlan.requiresRuntimeAuthorization || runtimePermit != nil else {
@@ -4106,6 +4219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } ?? true
 
         guard !isExiting,
+              policyAuthority?.authorizes() ?? true,
               externalRateLimitResetHoldStateIsReadable,
               !Self.rateLimitResetRedemptionIsBlocked(
                   until: externalRateLimitResetRedemptionBlockedUntil[account.id],
@@ -4376,25 +4490,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func checkAndSwapIfNeeded(
         trigger: AccountAutomaticPolicyTrigger = .routine
     ) {
-        guard !isExiting, automaticPolicyGateTask == nil else { return }
+        guard !isExiting,
+              automaticPolicyGateTask == nil,
+              automaticPolicyLeaseState.current == nil else {
+            return
+        }
         let now = Date()
         guard pendingSwapTargetAccountId == nil,
               swapConvergenceTask == nil else {
             return
         }
         guard let configured = accountManager.configuredAccount else { return }
+        guard let lease = automaticPolicyLeaseState.begin(
+            at: now,
+            uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            timeout: Self.automaticPolicyGateTimeout
+        ) else { return }
         automaticPolicyGateTask = Task { @MainActor [weak self] in
-            guard let self, !self.isExiting else { return }
-            defer { self.automaticPolicyGateTask = nil }
+            guard let self else {
+                lease.authority.revoke()
+                return
+            }
+            defer {
+                self.finishAutomaticPolicyEvaluation(
+                    lease,
+                    trigger: trigger,
+                    cancelled: Task.isCancelled || self.isExiting
+                )
+            }
+            guard !self.isExiting else { return }
+            guard self.automaticPolicyEvaluationIsCurrent(lease) else { return }
             let resetJournalIsReadable = await self.ensureRateLimitResetJournalStateIsReadable()
-            guard Self.rateLimitResetJournalAllowsAutomaticRouting(
+            guard self.automaticPolicyEvaluationIsCurrent(lease),
+                  Self.rateLimitResetJournalAllowsAutomaticRouting(
                 isReadable: resetJournalIsReadable
             ) else {
                 return
             }
-            guard let activationState = await self.activationStateForRequest(at: now),
+            guard let activationState = await self.activationStateForRequest(
+                at: now,
+                policyAuthority: lease.authority
+            ),
+                  self.automaticPolicyEvaluationIsCurrent(lease),
                   activationState.phase == .confirmed else {
-                if !self.isExiting {
+                if self.automaticPolicyEvaluationIsCurrent(lease) {
                     self.retryActivationConvergenceIfDue(at: now)
                 }
                 return
@@ -4403,9 +4542,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let permit = await self.requireFreshLocalRuntimePermit(
                 for: configured,
                 activationGeneration: activationGeneration,
-                requiredPhase: .confirmed
+                requiredPhase: .confirmed,
+                policyAuthority: lease.authority
             ),
-            !self.isExiting,
+            self.automaticPolicyEvaluationIsCurrent(lease),
             AccountAutomaticPolicyGate.authorizes(
                 trigger: trigger,
                 configuredAccountId: self.accountManager.configuredAccount?.id,
@@ -4415,26 +4555,131 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ) else {
                 return
             }
-            self.checkAndSwapWithFreshRuntimePermit(permit, trigger: trigger)
+            self.checkAndSwapWithFreshRuntimePermit(
+                permit,
+                trigger: trigger,
+                policyLease: lease
+            )
+        }
+        startAutomaticPolicyWatchdog(for: lease, trigger: trigger)
+    }
+
+    private func automaticPolicyEvaluationIsCurrent(
+        _ lease: AccountAutomaticPolicyLease
+    ) -> Bool {
+        !Task.isCancelled
+            && !isExiting
+            && automaticPolicyLeaseState.authorizes(
+                lease,
+                uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+            )
+    }
+
+    private func finishAutomaticPolicyEvaluation(
+        _ lease: AccountAutomaticPolicyLease,
+        trigger: AccountAutomaticPolicyTrigger,
+        cancelled: Bool
+    ) {
+        if cancelled {
+            guard automaticPolicyLeaseState.cancel(lease) else { return }
+            automaticPolicyGateWatchdogTask?.cancel()
+            automaticPolicyGateWatchdogTask = nil
+            automaticPolicyGateTask = nil
+            return
+        }
+        let finished = automaticPolicyLeaseState.finish(
+            lease,
+            uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+        )
+        guard finished != .stale else { return }
+        automaticPolicyGateWatchdogTask?.cancel()
+        automaticPolicyGateWatchdogTask = nil
+        automaticPolicyGateTask = nil
+        if finished == .expired {
+            recordAutomaticPolicyTimeout(lease, trigger: trigger)
+        }
+    }
+
+    private func startAutomaticPolicyWatchdog(
+        for lease: AccountAutomaticPolicyLease,
+        trigger: AccountAutomaticPolicyTrigger
+    ) {
+        automaticPolicyGateWatchdogTask?.cancel()
+        automaticPolicyGateWatchdogTask = Task { @MainActor [weak self] in
+            while true {
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now < lease.deadlineUptimeNanoseconds else { break }
+                let remaining = TimeInterval(
+                    lease.deadlineUptimeNanoseconds - now
+                ) / 1_000_000_000
+                do {
+                    try await Task.sleep(for: .seconds(remaining))
+                } catch {
+                    return
+                }
+            }
+            guard let self,
+                  !self.isExiting,
+                  self.automaticPolicyLeaseState.expire(
+                    lease,
+                    uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+                  ) else {
+                return
+            }
+            self.automaticPolicyGateTask?.cancel()
+            self.automaticPolicyGateTask = nil
+            self.automaticPolicyGateWatchdogTask = nil
+            self.recordAutomaticPolicyTimeout(lease, trigger: trigger)
+        }
+    }
+
+    private func recordAutomaticPolicyTimeout(
+        _ lease: AccountAutomaticPolicyLease,
+        trigger: AccountAutomaticPolicyTrigger
+    ) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsedMilliseconds = now >= lease.startedAtUptimeNanoseconds
+            ? (now - lease.startedAtUptimeNanoseconds) / 1_000_000
+            : 0
+        SwapLog.append(.debug(
+            "AUTOMATIC_POLICY_GATE_TIMEOUT generation=\(lease.generation.uuidString) trigger=\(Self.automaticPolicyTriggerDescription(trigger)) elapsed_ms=\(elapsedMilliseconds)"
+        ))
+    }
+
+    nonisolated private static func automaticPolicyTriggerDescription(
+        _ trigger: AccountAutomaticPolicyTrigger
+    ) -> String {
+        switch trigger {
+        case .routine:
+            return "routine"
+        case .usageUnavailable(let accountId):
+            return "usage_unavailable:\(accountId.uuidString)"
+        case .tokenInvalidated(let accountId):
+            return "token_invalidated:\(accountId.uuidString)"
         }
     }
 
     private func checkAndSwapWithFreshRuntimePermit(
         _ permit: AccountActivationRuntimePermit,
-        trigger: AccountAutomaticPolicyTrigger
+        trigger: AccountAutomaticPolicyTrigger,
+        policyLease: AccountAutomaticPolicyLease
     ) {
-        guard !isExiting else { return }
         let now = Date()
-        guard AccountAutomaticPolicyGate.authorizes(
-            trigger: trigger,
-            configuredAccountId: accountManager.configuredAccount?.id,
-            state: accountManager.activationState,
+        guard automaticPolicyEffectIsAuthorized(
             permit: permit,
+            trigger: trigger,
+            policyLease: policyLease,
             at: now
         ) else {
             return
         }
         restoreExternalRateLimitResetHolds(at: now)
+        guard automaticPolicyEffectIsAuthorized(
+            permit: permit,
+            trigger: trigger,
+            policyLease: policyLease,
+            at: Date()
+        ) else { return }
         guard let active = accountManager.configuredAccount else { return }
         switch trigger {
         case .routine:
@@ -4458,7 +4703,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     from: active,
                     to: upgrade,
                     reason: .usageUnavailable,
-                    automaticPermit: permit
+                    automaticPermit: permit,
+                    automaticPolicyLease: policyLease
                 )
                 return
             }
@@ -4472,7 +4718,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 from: active,
                 to: best,
                 reason: .usageUnavailable,
-                automaticPermit: permit
+                automaticPermit: permit,
+                automaticPolicyLease: policyLease
             )
             return
         case .tokenInvalidated(let accountId):
@@ -4487,7 +4734,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 from: active,
                 to: best,
                 reason: .tokenInvalidated,
-                automaticPermit: permit
+                automaticPermit: permit,
+                automaticPolicyLease: policyLease
             )
             return
         }
@@ -4546,10 +4794,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 now: now
             ),
                let account = accountManager.accounts.first(where: { $0.id == selection.accountId }) {
+                guard automaticPolicyEffectIsAuthorized(
+                    permit: permit,
+                    trigger: trigger,
+                    policyLease: policyLease,
+                    at: Date()
+                ) else { return }
                 startRateLimitResetRedemption(
                     account: account,
                     bank: selection.bank,
-                    reason: selection.reason
+                    reason: selection.reason,
+                    policyAuthority: policyLease.authority
                 )
                 return
             }
@@ -4570,6 +4825,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                    at: now,
                    requiresDecisionEvidence: true
                ) {
+                guard automaticPolicyEffectIsAuthorized(
+                    permit: permit,
+                    trigger: trigger,
+                    policyLease: policyLease,
+                    at: Date()
+                ) else { return }
                 scheduleRateLimitResetRefresh(
                     for: active.id,
                     checkSwapAfter: true
@@ -4594,7 +4855,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 from: active,
                 to: upgrade,
                 reason: .higherPlanAvailable,
-                automaticPermit: permit
+                automaticPermit: permit,
+                automaticPolicyLease: policyLease
             )
             return
         }
@@ -4617,6 +4879,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             from: accountManager.accounts,
             now: now
         ) else {
+            guard automaticPolicyEffectIsAuthorized(
+                permit: permit,
+                trigger: trigger,
+                policyLease: policyLease,
+                at: Date()
+            ) else { return }
             if exhaustedPoolAlertGate.shouldNotifyNoCandidate() {
                 NotificationManager.notifyAllExhausted(
                     nextReset: SwapEngine.earliestUsableReset(
@@ -4636,8 +4904,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             from: active,
             to: best,
             reason: .quotaExhausted,
-            automaticPermit: permit
+            automaticPermit: permit,
+            automaticPolicyLease: policyLease
         )
+    }
+
+    private func automaticPolicyEffectIsAuthorized(
+        permit: AccountActivationRuntimePermit,
+        trigger: AccountAutomaticPolicyTrigger,
+        policyLease: AccountAutomaticPolicyLease,
+        at date: Date
+    ) -> Bool {
+        automaticPolicyEvaluationIsCurrent(policyLease)
+            && policyLease.authority.authorizes()
+            && AccountAutomaticPolicyGate.authorizes(
+                trigger: trigger,
+                configuredAccountId: accountManager.configuredAccount?.id,
+                state: accountManager.activationState,
+                permit: permit,
+                at: date
+            )
     }
 
     private func withPreparedActiveCredentialMutation(
@@ -4645,9 +4931,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         expectedConfiguredAccountId: UUID?,
         source: String,
         isManual: Bool,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil,
         operation: @escaping @MainActor @Sendable (PreparedAccountActivation) async -> Bool
     ) async -> Bool {
-        guard !isExiting else { return false }
+        guard !isExiting,
+              policyAuthority?.authorizes() ?? true else {
+            return false
+        }
         if pendingSwapTargetAccountId != nil || swapConvergenceTask != nil {
             accountManager.publishActivationNotice(
                 "Mac activation is already converging; retry after it completes"
@@ -4660,14 +4950,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             targetAccountId: targetAccountId,
             activationGeneration: activationGeneration
         ) { [weak self] lease in
-            guard let self else { return ScopedAccountActivationResult.blocked }
+            guard let self,
+                  policyAuthority?.authorizes() ?? true else {
+                return ScopedAccountActivationResult.blocked
+            }
             switch await self.prepareActiveCredentialMutation(
                 targetAccountId: targetAccountId,
                 expectedConfiguredAccountId: expectedConfiguredAccountId,
                 source: source,
                 isManual: isManual,
                 activationGeneration: activationGeneration,
-                lease: lease
+                lease: lease,
+                policyAuthority: policyAuthority
             ) {
             case .prepared(let prepared):
                 return .completed(await operation(prepared))
@@ -4704,9 +4998,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         source: String,
         isManual: Bool,
         activationGeneration: UUID,
-        lease: AccountMutationLease
+        lease: AccountMutationLease,
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil
     ) async -> AccountActivationPreparationResult {
         guard !isExiting,
+              policyAuthority?.authorizes() ?? true,
               accountManager.configuredAccount?.id == expectedConfiguredAccountId,
               await accountMutationTransaction.owns(lease) else {
             accountManager.publishActivationNotice(
@@ -4723,11 +5019,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 kind: requestKind,
                 requestedActivationGeneration: activationGeneration,
                 authorizeEffect: { [accountMutationTransaction] _ in
-                    accountMutationTransaction.leaseAuthorizes(
-                        lease,
-                        targetAccountId: targetAccountId,
-                        activationGeneration: activationGeneration
-                    )
+                    (policyAuthority?.authorizes() ?? true)
+                        && accountMutationTransaction.leaseAuthorizes(
+                            lease,
+                            targetAccountId: targetAccountId,
+                            activationGeneration: activationGeneration
+                        )
                 }
             )
             let preparing: AccountActivationState
@@ -4798,7 +5095,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         from: CodexAccount,
         to: CodexAccount,
         reason: SwapEvent.SwapReason,
-        automaticPermit: AccountActivationRuntimePermit? = nil
+        automaticPermit: AccountActivationRuntimePermit? = nil,
+        automaticPolicyLease: AccountAutomaticPolicyLease? = nil
     ) {
         guard !isExiting else { return }
         let isManual: Bool
@@ -4807,6 +5105,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             isManual = true
         default:
             isManual = false
+        }
+        if !isManual {
+            guard let automaticPolicyLease,
+                  automaticPolicyEvaluationIsCurrent(automaticPolicyLease),
+                  automaticPolicyLease.authority.authorizes() else {
+                return
+            }
         }
         guard accountManager.activationState != nil else {
             accountManager.publishActivationNotice(
@@ -4829,6 +5134,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self, !self.isExiting else { return }
             if !isManual {
                 guard let automaticPermit,
+                      let automaticPolicyLease,
+                      automaticPolicyLease.authority.authorizes(),
                       automaticPermit.targetAccountId == from.id,
                       automaticPermit.authorizes(
                           state: self.accountManager.activationState,
@@ -4842,7 +5149,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 targetAccountId: to.id,
                 expectedConfiguredAccountId: from.id,
                 source: "swap",
-                isManual: isManual
+                isManual: isManual,
+                policyAuthority: isManual ? nil : automaticPolicyLease?.authority
             ) { [weak self] prepared in
                 guard let self else { return false }
                 return await self.executeSwapTransaction(
@@ -5350,7 +5658,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
             switch desktopReload {
             case .reloaded(let method, _, _):
-                SwapLog.append(.desktopExternalReloadSuccess(method: "json-rpc:\(method)"))
+                if method == DesktopRuntimeReloadClient.existingAcknowledgementMethod {
+                    SwapLog.append(.debug(
+                        "DESKTOP_EXTERNAL_RELOAD_REUSED_ACK target=\(to.email)"
+                    ))
+                } else {
+                    SwapLog.append(.desktopExternalReloadSuccess(method: "json-rpc:\(method)"))
+                }
             case .noDesktopRuntime:
                 SwapLog.append(.debug(
                     "DESKTOP_JSON_RPC_DIAGNOSTIC result=runtime_unavailable"
@@ -6425,6 +6739,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Self.requestOwnedMutationTaskCancellation(swapConvergenceTask)
         automaticPolicyGateTask?.cancel()
         automaticPolicyGateTask = nil
+        automaticPolicyGateWatchdogTask?.cancel()
+        automaticPolicyGateWatchdogTask = nil
+        automaticPolicyLeaseState.cancel()
         retryExhaustedTopologyCheckTask?.cancel()
         retryExhaustedTopologyCheckTask = nil
         automaticCodexUpdateTask?.cancel()

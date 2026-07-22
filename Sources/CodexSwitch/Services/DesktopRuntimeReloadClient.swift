@@ -75,11 +75,18 @@ struct DesktopRuntimeReloadDependencies: Sendable {
         CodexDesktopRuntimeSocketBinding,
         UInt32
     ) -> Bool
+    let alreadyAcknowledgedRuntimePIDs: @Sendable (
+        CodexRuntimeDiscoverySnapshot,
+        String,
+        String,
+        UInt32
+    ) -> Set<Int32>
     let strictReload: @Sendable (
         CodexRuntimeDiscoverySnapshot,
         [CodexDesktopRuntimeSocketBinding],
         CodexReloadAdmission,
-        UInt32
+        UInt32,
+        @Sendable () -> Bool
     ) -> CodexReloadSummary
 }
 
@@ -123,6 +130,7 @@ struct DesktopRuntimeReloadClient: Sendable {
     nonisolated static let reloadMethods = ["account/login/start"]
     nonisolated static let verificationMethod = "account/read"
     nonisolated static let initializationID = 0
+    nonisolated static let existingAcknowledgementMethod = "existing-current-ack"
 
     init(
         timeoutSeconds: TimeInterval = 5,
@@ -182,8 +190,15 @@ struct DesktopRuntimeReloadClient: Sendable {
         return .noSupportedMethod(probedMethods: probedMethods)
     }
 
-    func reloadAuth(account: CodexAccount) async -> DesktopReloadResult {
-        guard Self.canonicalAccountIDBytes(account.accountId) != nil else {
+    func reloadAuth(
+        account: CodexAccount,
+        authorizeEffect: @escaping @Sendable () -> Bool = { true }
+    ) async -> DesktopReloadResult {
+        guard authorizeEffect(),
+              Self.canonicalAccountIDBytes(account.accountId) != nil,
+              let targetTokenFingerprint = SwapEngine.completeTokenFingerprint(
+                  for: account
+              ) else {
             return .failed("target account ID is invalid")
         }
 
@@ -201,30 +216,99 @@ struct DesktopRuntimeReloadClient: Sendable {
             )
         }
         defer { context.admission.release() }
+        guard authorizeEffect() else {
+            return .failed(
+                "desktop reload authorization expired",
+                discoveredRuntimeCount: context.discovery.targets.count,
+                acknowledgedRuntimeCount: 0
+            )
+        }
+
+        let discoveredPIDs = Set(
+            context.discovery.targets.map { $0.process.identity.pid }
+        )
+        let reusableAcknowledgedPIDs = dependencies.alreadyAcknowledgedRuntimePIDs(
+            context.discovery,
+            account.accountId,
+            targetTokenFingerprint,
+            context.requiredOwnerUID
+        ).intersection(discoveredPIDs)
+        var acknowledgedPIDs = reusableAcknowledgedPIDs
+        let pendingSocketBindings = context.socketBindings.filter {
+            !reusableAcknowledgedPIDs.contains($0.target.process.identity.pid)
+        }
+        if !reusableAcknowledgedPIDs.isEmpty {
+            desktopReloadLogger.info(
+                "DESKTOP_RELOAD_REUSED_ACK runtimes=\(reusableAcknowledgedPIDs.count, privacy: .public)"
+            )
+        }
+        guard authorizeEffect() else {
+            return .failed(
+                "desktop reload authorization expired",
+                discoveredRuntimeCount: context.discovery.targets.count,
+                acknowledgedRuntimeCount: acknowledgedPIDs.count
+            )
+        }
+        if pendingSocketBindings.isEmpty {
+            return .reloaded(
+                method: Self.existingAcknowledgementMethod,
+                discoveredRuntimeCount: context.discovery.targets.count,
+                acknowledgedRuntimeCount: reusableAcknowledgedPIDs.count
+            )
+        }
 
         let method = Self.reloadMethods[0]
-        var jsonRPCResult: DesktopReloadResult = .reloaded(method: method)
-        for socketBinding in context.socketBindings {
+        for socketBinding in pendingSocketBindings {
+            guard authorizeEffect() else {
+                return .failed(
+                    "desktop reload authorization expired",
+                    discoveredRuntimeCount: context.discovery.targets.count,
+                    acknowledgedRuntimeCount: acknowledgedPIDs.count
+                )
+            }
             let request = Self.reloadRequest(account: account, method: method, id: 1)
             let event = await sendJSONRPCRequest(
                 request,
                 socketBinding: socketBinding,
                 requiredOwnerUID: context.requiredOwnerUID
             )
+            guard authorizeEffect() else {
+                return .failed(
+                    "desktop reload authorization expired",
+                    discoveredRuntimeCount: context.discovery.targets.count,
+                    acknowledgedRuntimeCount: acknowledgedPIDs.count
+                )
+            }
             let loginClassification = Self.classifyRPCEvent(event, expectedID: 1)
             if let failure = Self.reloadFailure(from: loginClassification) {
-                jsonRPCResult = failure
-                break
+                return failure.preservingRuntimeCounts(
+                    discovered: context.discovery.targets.count,
+                    acknowledged: acknowledgedPIDs.count
+                )
             }
 
             let verificationMethod = Self.verificationMethod
             desktopReloadLogger.info("DESKTOP_RELOAD_VERIFY method=\(verificationMethod, privacy: .public)")
+            guard authorizeEffect() else {
+                return .failed(
+                    "desktop reload authorization expired",
+                    discoveredRuntimeCount: context.discovery.targets.count,
+                    acknowledgedRuntimeCount: acknowledgedPIDs.count
+                )
+            }
             let verificationRequest = Self.probeRequest(method: verificationMethod, id: 2)
             let verificationEvent = await sendJSONRPCRequest(
                 verificationRequest,
                 socketBinding: socketBinding,
                 requiredOwnerUID: context.requiredOwnerUID
             )
+            guard authorizeEffect() else {
+                return .failed(
+                    "desktop reload authorization expired",
+                    discoveredRuntimeCount: context.discovery.targets.count,
+                    acknowledgedRuntimeCount: acknowledgedPIDs.count
+                )
+            }
             let verification = Self.classifyVerificationResponse(
                 verificationEvent,
                 targetEmail: account.email,
@@ -234,37 +318,46 @@ struct DesktopRuntimeReloadClient: Sendable {
                 expectedID: 2
             )
             guard case .reloaded = verification else {
-                jsonRPCResult = verification
-                break
+                return verification.preservingRuntimeCounts(
+                    discovered: context.discovery.targets.count,
+                    acknowledged: acknowledgedPIDs.count
+                )
             }
-        }
+            guard authorizeEffect() else {
+                return .failed(
+                    "desktop reload authorization expired",
+                    discoveredRuntimeCount: context.discovery.targets.count,
+                    acknowledgedRuntimeCount: acknowledgedPIDs.count
+                )
+            }
 
-        guard case .reloaded = jsonRPCResult else {
-            return jsonRPCResult.preservingRuntimeCounts(
-                discovered: context.discovery.targets.count,
-                acknowledged: 0
+            let strictSummary = dependencies.strictReload(
+                CodexRuntimeDiscoverySnapshot(
+                    targets: [socketBinding.target],
+                    isComplete: true
+                ),
+                [socketBinding],
+                context.admission,
+                context.requiredOwnerUID,
+                authorizeEffect
             )
-        }
-
-        let strictSummary = dependencies.strictReload(
-            context.discovery,
-            context.socketBindings,
-            context.admission,
-            context.requiredOwnerUID
-        )
-        guard strictSummary.outcome == .allDiscoveredRuntimesAcknowledged else {
-            return .failed(
-                "strict desktop reload incomplete acknowledged="
-                    + "\(strictSummary.acknowledgedRuntimeCount)/"
-                    + "\(strictSummary.discoveredRuntimeCount)",
-                discoveredRuntimeCount: strictSummary.discoveredRuntimeCount,
-                acknowledgedRuntimeCount: strictSummary.acknowledgedRuntimeCount
-            )
+            if strictSummary.acknowledgedRuntimeCount == 1 {
+                acknowledgedPIDs.insert(socketBinding.target.process.identity.pid)
+            }
+            guard strictSummary.outcome == .allDiscoveredRuntimesAcknowledged else {
+                return .failed(
+                    "strict desktop reload incomplete acknowledged="
+                        + "\(strictSummary.acknowledgedRuntimeCount)/"
+                        + "\(strictSummary.discoveredRuntimeCount)",
+                    discoveredRuntimeCount: context.discovery.targets.count,
+                    acknowledgedRuntimeCount: acknowledgedPIDs.count
+                )
+            }
         }
         return .reloaded(
             method: method,
-            discoveredRuntimeCount: strictSummary.discoveredRuntimeCount,
-            acknowledgedRuntimeCount: strictSummary.acknowledgedRuntimeCount
+            discoveredRuntimeCount: context.discovery.targets.count,
+            acknowledgedRuntimeCount: acknowledgedPIDs.count
         )
     }
 
@@ -638,7 +731,24 @@ struct DesktopRuntimeReloadClient: Sendable {
                     requiredOwnerUID: requiredOwnerUID
                 )
             },
-            strictReload: { discovery, socketBindings, admission, requiredOwnerUID in
+            alreadyAcknowledgedRuntimePIDs: {
+                discovery,
+                expectedAccountID,
+                expectedTokenFingerprint,
+                requiredOwnerUID in
+                SwapEngine.alreadyAcknowledgedRuntimePIDs(
+                    discovery,
+                    expectedAccountID: expectedAccountID,
+                    expectedCompleteTokenFingerprint: expectedTokenFingerprint,
+                    requiredOwnerUID: requiredOwnerUID
+                )
+            },
+            strictReload: {
+                discovery,
+                socketBindings,
+                admission,
+                requiredOwnerUID,
+                authorizeEffect in
                 let portsByPID = Dictionary(
                     uniqueKeysWithValues: socketBindings.map {
                         ($0.target.process.identity.pid, $0.port)
@@ -648,6 +758,7 @@ struct DesktopRuntimeReloadClient: Sendable {
                     admittedDiscoverySnapshot: discovery,
                     admission: admission,
                     requiredOwnerUID: requiredOwnerUID,
+                    authorizeEffect: authorizeEffect,
                     firstAcknowledgementBootstrap: { binding in
                         guard let port = portsByPID[binding.processIdentity.pid] else {
                             return false

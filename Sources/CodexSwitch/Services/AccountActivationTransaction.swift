@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 enum AccountActivationCommitFailureStage: Equatable, Sendable {
@@ -32,6 +33,137 @@ enum AccountAutomaticPolicyTrigger: Equatable, Sendable {
         case .usageUnavailable(let accountId), .tokenInvalidated(let accountId):
             accountId
         }
+    }
+}
+
+final class AccountAutomaticPolicyAuthority: @unchecked Sendable {
+    let generation: UUID
+    let deadlineUptimeNanoseconds: UInt64
+
+    private let lock = NSLock()
+    private var revoked = false
+
+    init(generation: UUID, deadlineUptimeNanoseconds: UInt64) {
+        self.generation = generation
+        self.deadlineUptimeNanoseconds = deadlineUptimeNanoseconds
+    }
+
+    func authorizes(
+        uptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !revoked && uptimeNanoseconds < deadlineUptimeNanoseconds
+    }
+
+    func revoke() {
+        lock.lock()
+        revoked = true
+        lock.unlock()
+    }
+}
+
+struct AccountAutomaticPolicyLease: Equatable, Sendable {
+    let generation: UUID
+    let startedAt: Date
+    let startedAtUptimeNanoseconds: UInt64
+    let deadlineUptimeNanoseconds: UInt64
+    let authority: AccountAutomaticPolicyAuthority
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.generation == rhs.generation
+            && lhs.startedAt == rhs.startedAt
+            && lhs.startedAtUptimeNanoseconds == rhs.startedAtUptimeNanoseconds
+            && lhs.deadlineUptimeNanoseconds == rhs.deadlineUptimeNanoseconds
+    }
+}
+
+enum AccountAutomaticPolicyLeaseFinish: Equatable, Sendable {
+    case completed
+    case expired
+    case stale
+}
+
+struct AccountAutomaticPolicyLeaseState: Equatable, Sendable {
+    private(set) var current: AccountAutomaticPolicyLease?
+
+    mutating func begin(
+        at date: Date,
+        uptimeNanoseconds: UInt64,
+        timeout: TimeInterval
+    ) -> AccountAutomaticPolicyLease? {
+        guard current == nil else { return nil }
+        let boundedTimeout = timeout.isFinite ? max(0, timeout) : 0
+        let maximumTimeout = TimeInterval(UInt64.max / 1_000_000_000)
+        let timeoutNanoseconds = boundedTimeout >= maximumTimeout
+            ? UInt64.max
+            : UInt64(boundedTimeout * 1_000_000_000)
+        let deadline = uptimeNanoseconds.addingReportingOverflow(timeoutNanoseconds)
+        let generation = UUID()
+        let deadlineUptimeNanoseconds = deadline.overflow
+            ? UInt64.max
+            : deadline.partialValue
+        let lease = AccountAutomaticPolicyLease(
+            generation: generation,
+            startedAt: date,
+            startedAtUptimeNanoseconds: uptimeNanoseconds,
+            deadlineUptimeNanoseconds: deadlineUptimeNanoseconds,
+            authority: AccountAutomaticPolicyAuthority(
+                generation: generation,
+                deadlineUptimeNanoseconds: deadlineUptimeNanoseconds
+            )
+        )
+        current = lease
+        return lease
+    }
+
+    func authorizes(
+        _ lease: AccountAutomaticPolicyLease,
+        uptimeNanoseconds: UInt64
+    ) -> Bool {
+        current?.generation == lease.generation
+            && lease.authority.authorizes(uptimeNanoseconds: uptimeNanoseconds)
+    }
+
+    @discardableResult
+    mutating func finish(
+        _ lease: AccountAutomaticPolicyLease,
+        uptimeNanoseconds: UInt64
+    ) -> AccountAutomaticPolicyLeaseFinish {
+        guard current?.generation == lease.generation else { return .stale }
+        current = nil
+        guard uptimeNanoseconds < lease.deadlineUptimeNanoseconds else {
+            lease.authority.revoke()
+            return .expired
+        }
+        return .completed
+    }
+
+    @discardableResult
+    mutating func expire(
+        _ lease: AccountAutomaticPolicyLease,
+        uptimeNanoseconds: UInt64
+    ) -> Bool {
+        guard current?.generation == lease.generation,
+              uptimeNanoseconds >= lease.deadlineUptimeNanoseconds else {
+            return false
+        }
+        current = nil
+        lease.authority.revoke()
+        return true
+    }
+
+    mutating func cancel() {
+        current?.authority.revoke()
+        current = nil
+    }
+
+    @discardableResult
+    mutating func cancel(_ lease: AccountAutomaticPolicyLease) -> Bool {
+        guard current?.generation == lease.generation else { return false }
+        current = nil
+        lease.authority.revoke()
+        return true
     }
 }
 

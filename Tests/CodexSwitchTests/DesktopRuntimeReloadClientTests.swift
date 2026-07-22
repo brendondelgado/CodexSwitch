@@ -157,17 +157,184 @@ struct DesktopRuntimeReloadClientTests {
         #expect(verificationParams?["refreshToken"] == false)
     }
 
-    @Test("Strict reload failure preserves discovered and acknowledged runtime counts")
+    @Test("Current desktop ACK is reused without another JSON-RPC notification")
+    func currentAcknowledgementSuppressesRepeatedDesktopReload() async {
+        let strictReloadCalls = LockedFlag()
+        let account = makeAccount()
+        let expectedFingerprint = SwapEngine.completeTokenFingerprint(for: account)
+        let (client, sender) = makeClient(
+            responses: [],
+            alreadyAcknowledgedRuntimePIDs: { discovery, accountID, fingerprint, _ in
+                #expect(accountID == "acct_123")
+                #expect(fingerprint == expectedFingerprint)
+                return Set(discovery.targets.map { $0.process.identity.pid })
+            },
+            strictReload: { _, _, _, _, _ in
+                strictReloadCalls.setTrue()
+                return Self.successfulStrictSummary
+            }
+        )
+
+        let result = await client.reloadAuth(account: account)
+        let requests = await sender.recordedRequests()
+
+        #expect(result == .reloaded(
+            method: DesktopRuntimeReloadClient.existingAcknowledgementMethod,
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
+        #expect(requests.isEmpty)
+        #expect(!strictReloadCalls.value)
+    }
+
+    @Test("Only desktop runtimes without a target-account ACK are notified")
+    func partialAcknowledgementReloadsOnlyMissingRuntime() async throws {
+        let strictSocketPorts = LockedTestState<[UInt16]>([])
+        let (client, sender) = makeClient(
+            responses: [
+                .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+                .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
+            ],
+            runtimePIDs: [42, 43],
+            alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in [42] },
+            strictReload: { discovery, socketBindings, _, _, _ in
+                strictSocketPorts.update { ports in
+                    ports = socketBindings.map(\.port)
+                }
+                return CodexReloadSummary(
+                    discoveredRuntimeCount: discovery.targets.count,
+                    acknowledgedRuntimeCount: discovery.targets.count
+                )
+            }
+        )
+
+        let result = await client.reloadAuth(account: makeAccount())
+        let requests = await sender.recordedRequests()
+
+        #expect(result == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 2,
+            acknowledgedRuntimeCount: 2
+        ))
+        try #require(requests.count == 2)
+        #expect(requests.allSatisfy { $0.port == 9_224 })
+        #expect(strictSocketPorts.read() == [9_224])
+    }
+
+    @Test("A later desktop failure does not reload an already converged runtime")
+    func laterFailureRetriesOnlyTheMissingRuntime() async throws {
+        let acknowledgedPIDs = LockedTestState<Set<Int32>>([])
+        let strictReloadedPIDs = LockedTestState<[Int32]>([])
+        let (firstClient, firstSender) = makeClient(
+            responses: [
+                .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+                .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
+                .string(#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"reload refused"}}"#),
+            ],
+            runtimePIDs: [42, 43],
+            alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in
+                acknowledgedPIDs.read()
+            },
+            strictReload: { discovery, _, _, _, _ in
+                let pids = discovery.targets.map { $0.process.identity.pid }
+                strictReloadedPIDs.update { $0.append(contentsOf: pids) }
+                acknowledgedPIDs.update { $0.formUnion(pids) }
+                return CodexReloadSummary(
+                    discoveredRuntimeCount: pids.count,
+                    acknowledgedRuntimeCount: pids.count
+                )
+            }
+        )
+
+        let firstResult = await firstClient.reloadAuth(account: makeAccount())
+        let firstRequests = await firstSender.recordedRequests()
+
+        #expect(firstResult == .failed(
+            "reload refused",
+            discoveredRuntimeCount: 2,
+            acknowledgedRuntimeCount: 1
+        ))
+        #expect(firstRequests.map(\.port) == [9_223, 9_223, 9_224])
+        #expect(acknowledgedPIDs.read() == [42])
+
+        let (retryClient, retrySender) = makeClient(
+            responses: [
+                .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+                .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
+            ],
+            runtimePIDs: [42, 43],
+            alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in
+                acknowledgedPIDs.read()
+            },
+            strictReload: { discovery, _, _, _, _ in
+                let pids = discovery.targets.map { $0.process.identity.pid }
+                strictReloadedPIDs.update { $0.append(contentsOf: pids) }
+                acknowledgedPIDs.update { $0.formUnion(pids) }
+                return CodexReloadSummary(
+                    discoveredRuntimeCount: pids.count,
+                    acknowledgedRuntimeCount: pids.count
+                )
+            }
+        )
+
+        let retryResult = await retryClient.reloadAuth(account: makeAccount())
+        let retryRequests = await retrySender.recordedRequests()
+
+        #expect(retryResult == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 2,
+            acknowledgedRuntimeCount: 2
+        ))
+        #expect(retryRequests.map(\.port) == [9_224, 9_224])
+        #expect(strictReloadedPIDs.read() == [42, 43])
+    }
+
+    @Test("Expired authorization stops desktop reload before its next effect")
+    func authorizationExpiryStopsDesktopReload() async throws {
+        let authorized = LockedTestState(true)
+        let strictReloadCalls = LockedFlag()
+        let (client, sender) = makeClient(
+            responses: [
+                .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            ],
+            requestDidSend: { requestCount in
+                if requestCount == 1 {
+                    authorized.update { $0 = false }
+                }
+            },
+            strictReload: { _, _, _, _, _ in
+                strictReloadCalls.setTrue()
+                return Self.successfulStrictSummary
+            }
+        )
+
+        let result = await client.reloadAuth(
+            account: makeAccount(),
+            authorizeEffect: { authorized.read() }
+        )
+        let requests = await sender.recordedRequests()
+
+        #expect(result == .failed(
+            "desktop reload authorization expired",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
+        try #require(requests.count == 1)
+        #expect(requestMethod(in: requests[0].payload) == "account/login/start")
+        #expect(!strictReloadCalls.value)
+    }
+
+    @Test("Strict reload failure preserves full discovery and per-runtime ACK counts")
     func strictReloadFailurePreservesPartialCounts() async {
         let (client, _) = makeClient(
             responses: [
                 .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
                 .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
             ],
-            strictReload: { _, _, _, _ in
+            strictReload: { _, _, _, _, _ in
                 CodexReloadSummary(
-                    discoveredRuntimeCount: 3,
-                    acknowledgedRuntimeCount: 2
+                    discoveredRuntimeCount: 1,
+                    acknowledgedRuntimeCount: 0
                 )
             }
         )
@@ -175,9 +342,9 @@ struct DesktopRuntimeReloadClientTests {
         let result = await client.reloadAuth(account: makeAccount())
 
         #expect(result == .failed(
-            "strict desktop reload incomplete acknowledged=2/3",
-            discoveredRuntimeCount: 3,
-            acknowledgedRuntimeCount: 2
+            "strict desktop reload incomplete acknowledged=0/1",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
         ))
     }
 
@@ -279,7 +446,7 @@ struct DesktopRuntimeReloadClientTests {
         let strictCalls = LockedTestState(0)
         let (client, sender) = makeClient(
             responses: [],
-            strictReload: { _, _, _, _ in
+            strictReload: { _, _, _, _, _ in
                 strictCalls.update { $0 += 1 }
                 return Self.successfulStrictSummary
             }
@@ -507,7 +674,7 @@ struct DesktopRuntimeReloadClientTests {
                     runtimeTargetIsCurrent: { _, _ in true }
                 )
             },
-            strictReload: { _, _, _, _ in
+            strictReload: { _, _, _, _, _ in
                 strictCalls.update { $0 += 1 }
                 return Self.successfulStrictSummary
             }
@@ -558,7 +725,7 @@ struct DesktopRuntimeReloadClientTests {
         let (firstClient, _) = makeClient(
             responses: responses,
             gate: gate,
-            strictReload: { _, _, _, _ in
+            strictReload: { _, _, _, _, _ in
                 firstEnteredACKWait.signal()
                 releaseFirstACKWait.wait()
                 return Self.successfulStrictSummary
@@ -712,16 +879,24 @@ struct DesktopRuntimeReloadClientTests {
         missingSocketBindingPIDs: Set<Int32> = [],
         gate: CodexReloadAttemptGate = CodexReloadAttemptGate(),
         runtimeDiscoveryDidRun: (@Sendable () -> Void)? = nil,
+        requestDidSend: (@Sendable (Int) -> Void)? = nil,
         socketBindingIsCurrent: @escaping @Sendable (
             CodexDesktopRuntimeSocketBinding,
             UInt32
         ) -> Bool = { _, _ in true },
+        alreadyAcknowledgedRuntimePIDs: @escaping @Sendable (
+            CodexRuntimeDiscoverySnapshot,
+            String,
+            String,
+            UInt32
+        ) -> Set<Int32> = { _, _, _, _ in [] },
         strictReload: @escaping @Sendable (
             CodexRuntimeDiscoverySnapshot,
             [CodexDesktopRuntimeSocketBinding],
             CodexReloadAdmission,
-            UInt32
-        ) -> CodexReloadSummary = { _, _, _, _ in
+            UInt32,
+            @Sendable () -> Bool
+        ) -> CodexReloadSummary = { _, _, _, _, _ in
             DesktopRuntimeReloadClientTests.successfulStrictSummary
         }
     ) -> (DesktopRuntimeReloadClient, StubDesktopRuntimeRequestSender) {
@@ -730,7 +905,10 @@ struct DesktopRuntimeReloadClientTests {
             index, target in
             (target.process.identity.pid, UInt16(9_223 + index))
         })
-        let sender = StubDesktopRuntimeRequestSender(responses: responses)
+        let sender = StubDesktopRuntimeRequestSender(
+            responses: responses,
+            requestDidSend: requestDidSend
+        )
         let client = DesktopRuntimeReloadClient(
             requestSender: { payload, port in
                 await sender.send(payload: payload, port: port)
@@ -760,6 +938,7 @@ struct DesktopRuntimeReloadClientTests {
                     return CodexDesktopRuntimeSocketBinding(target: target, port: port)
                 },
                 socketBindingIsCurrent: socketBindingIsCurrent,
+                alreadyAcknowledgedRuntimePIDs: alreadyAcknowledgedRuntimePIDs,
                 strictReload: strictReload
             )
         )
@@ -810,13 +989,19 @@ private struct CapturedDesktopRuntimeRequest: Sendable {
 private actor StubDesktopRuntimeRequestSender {
     private var responses: [DesktopRuntimeWebSocketEvent]
     private var requests: [CapturedDesktopRuntimeRequest] = []
+    private let requestDidSend: (@Sendable (Int) -> Void)?
 
-    init(responses: [DesktopRuntimeWebSocketEvent]) {
+    init(
+        responses: [DesktopRuntimeWebSocketEvent],
+        requestDidSend: (@Sendable (Int) -> Void)? = nil
+    ) {
         self.responses = responses
+        self.requestDidSend = requestDidSend
     }
 
     func send(payload: String, port: UInt16) -> DesktopRuntimeWebSocketEvent {
         requests.append(CapturedDesktopRuntimeRequest(payload: payload, port: port))
+        requestDidSend?(requests.count)
         guard !responses.isEmpty else {
             return .failure("unexpected request")
         }

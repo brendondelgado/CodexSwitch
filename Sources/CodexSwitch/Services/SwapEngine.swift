@@ -183,6 +183,11 @@ struct CodexReloadAcknowledgement: Codable, Equatable, Sendable {
     }
 }
 
+struct CodexReloadCapabilityReceipt: Codable, Equatable, Sendable {
+    let acknowledgement: CodexReloadAcknowledgement
+    let recordedAtUnixMilliseconds: Int64
+}
+
 enum CodexPGrepDiscoveryResult: Equatable, Sendable {
     case noMatches
     case snapshot(CodexPGrepProcessSnapshot)
@@ -260,8 +265,13 @@ struct CodexSecureFileSnapshot: Equatable, Sendable {
 
 struct CodexReloadExecutionResult: Equatable, Sendable {
     let discoverySnapshot: CodexRuntimeDiscoverySnapshot
-    let acknowledgedPIDs: Set<Int32>
+    let newlyAcknowledgedPIDs: Set<Int32>
+    let reusedAcknowledgedPIDs: Set<Int32>
     let operationFailed: Bool
+
+    var acknowledgedPIDs: Set<Int32> {
+        newlyAcknowledgedPIDs.union(reusedAcknowledgedPIDs)
+    }
 }
 
 private enum CodexReloadRequestPersistenceError: Error {
@@ -364,6 +374,7 @@ enum SwapEngine {
     private static let maximumReloadArtifactBytes = 65_536
     static let maximumReloadAcknowledgementAge: TimeInterval = 5 * 60
     static let maximumReloadAcknowledgementAgeMilliseconds: Int64 = 5 * 60 * 1_000
+    static let maximumReloadCapabilityAgeMilliseconds: Int64 = 30 * 24 * 60 * 60 * 1_000
     private static let resetTieFiveHourTolerance = 2.0
     private static let resetTieWeeklyTolerance = 5.0
     nonisolated static let reloadAttemptGate = CodexReloadAttemptGate()
@@ -705,7 +716,16 @@ enum SwapEngine {
     ]
 
     @discardableResult
-    static func signalCodexReload() -> CodexReloadSummary {
+    static func signalCodexReload(
+        authorizeEffect: @Sendable () -> Bool = { true }
+    ) -> CodexReloadSummary {
+        guard authorizeEffect() else {
+            return CodexReloadSummary(
+                discoveredRuntimeCount: 0,
+                acknowledgedRuntimeCount: 0,
+                operationFailed: true
+            )
+        }
         let hasVerifiedSighupMarker = Self.hasVerifiedSighupMarker()
         if !hasVerifiedSighupMarker {
             logger.info("SIGHUP not verified by installed codex binary — skipping")
@@ -751,13 +771,20 @@ enum SwapEngine {
                 makeReloadBinding(for: target)
             },
             hotSwapSupport: { binding in
+                guard authorizeEffect() else { return false }
                 let hasStartupAcknowledgement = startupAcknowledgement(
                     matching: binding,
                     homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
                     now: Date()
                 ) != nil
+                let hasPriorRuntimeCapability = !hasStartupAcknowledgement
+                    && ensurePriorRuntimeCapabilityReceipt(
+                        matching: binding,
+                        homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
+                        now: Date()
+                    )
                 var managedRuntimeBootstrapAuthorized = false
-                if !hasStartupAcknowledgement {
+                if !hasStartupAcknowledgement && !hasPriorRuntimeCapability {
                     let verification: Result<
                         CodexManagedRuntimeTrust.VerifiedRoute,
                         CodexManagedRuntimeTrust.Failure
@@ -794,7 +821,8 @@ enum SwapEngine {
                 let supported = cliReloadCapabilityIsAuthorized(
                     binding: binding,
                     hasStartupAcknowledgement: hasStartupAcknowledgement,
-                    managedRuntimeBootstrapAuthorized: managedRuntimeBootstrapAuthorized
+                    managedRuntimeBootstrapAuthorized: managedRuntimeBootstrapAuthorized,
+                    priorRuntimeCapabilityAuthorized: hasPriorRuntimeCapability
                 )
                 if !supported {
                     SwapLog.append(.sighupSkipped(
@@ -803,9 +831,16 @@ enum SwapEngine {
                 }
                 return supported
             },
+            alreadyAcknowledged: { binding in
+                startupAcknowledgement(
+                    matching: binding,
+                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
+                    now: Date()
+                ) != nil
+            },
             bindingIsCurrent: { reloadBindingIsCurrent($0) },
-            persistRequest: { persistReloadRequest($0) },
-            signal: { pid in kill(pid, SIGHUP) == 0 },
+            persistRequest: { authorizeEffect() && persistReloadRequest($0) },
+            signal: { pid in authorizeEffect() && kill(pid, SIGHUP) == 0 },
             awaitAcknowledgements: waitForHotSwapAcknowledgements,
             gate: reloadAttemptGate
         )
@@ -814,7 +849,10 @@ enum SwapEngine {
             logger.info("No codex CLI processes found to signal")
             SwapLog.append(.sighupSkipped(reason: "no codex processes found"))
         }
-        for pid in execution.acknowledgedPIDs {
+        for pid in execution.reusedAcknowledgedPIDs {
+            SwapLog.append(.debug("CLI_RELOAD_REUSED_ACK pid=\(pid)"))
+        }
+        for pid in execution.newlyAcknowledgedPIDs {
             logger.info("SIGHUP → pid \(pid) acknowledged")
             SwapLog.append(.sighupSent(pid: pid, startedAt: ""))
         }
@@ -828,10 +866,15 @@ enum SwapEngine {
     nonisolated static func cliReloadCapabilityIsAuthorized(
         binding: CodexReloadBinding,
         hasStartupAcknowledgement: Bool,
-        managedRuntimeBootstrapAuthorized: Bool
+        managedRuntimeBootstrapAuthorized: Bool,
+        priorRuntimeCapabilityAuthorized: Bool = false
     ) -> Bool {
         binding.runtimeKind == .localInteractiveCLI
-            && (hasStartupAcknowledgement || managedRuntimeBootstrapAuthorized)
+            && (
+                hasStartupAcknowledgement
+                    || managedRuntimeBootstrapAuthorized
+                    || priorRuntimeCapabilityAuthorized
+            )
     }
 
     nonisolated static func codexReloadSummary(
@@ -905,13 +948,23 @@ enum SwapEngine {
                 }
                 return supported
             },
+            alreadyAcknowledged: { binding in
+                startupAcknowledgement(
+                    matching: binding,
+                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
+                    now: Date()
+                ) != nil
+            },
             bindingIsCurrent: { reloadBindingIsCurrent($0) },
             persistRequest: { persistReloadRequest($0) },
             signal: { pid in kill(pid, SIGHUP) == 0 },
             awaitAcknowledgements: waitForHotSwapAcknowledgements,
             gate: reloadAttemptGate
         )
-        for pid in execution.acknowledgedPIDs {
+        for pid in execution.reusedAcknowledgedPIDs {
+            SwapLog.append(.debug("DESKTOP_RELOAD_REUSED_ACK pid=\(pid)"))
+        }
+        for pid in execution.newlyAcknowledgedPIDs {
             logger.info("Desktop app-server SIGHUP → pid \(pid) acknowledged")
             SwapLog.append(.sighupSent(pid: pid, startedAt: "desktop-app-server"))
         }
@@ -926,6 +979,7 @@ enum SwapEngine {
         admittedDiscoverySnapshot discoverySnapshot: CodexRuntimeDiscoverySnapshot,
         admission: CodexReloadAdmission,
         requiredOwnerUID: UInt32,
+        authorizeEffect: @Sendable () -> Bool = { true },
         firstAcknowledgementBootstrap: @Sendable (CodexReloadBinding) -> Bool = { _ in false }
     ) -> CodexReloadSummary {
         let targetPIDs = Set(discoverySnapshot.targets.map { $0.process.identity.pid })
@@ -948,6 +1002,7 @@ enum SwapEngine {
             candidateIsEligible: { _ in hasVerifiedSighupMarker },
             makeBinding: { target in makeReloadBinding(for: target) },
             hotSwapSupport: { binding in
+                guard authorizeEffect() else { return false }
                 let hasStartupAcknowledgement = startupAcknowledgement(
                     matching: binding,
                     homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
@@ -966,12 +1021,22 @@ enum SwapEngine {
                 }
                 return supported
             },
+            alreadyAcknowledged: { binding in
+                startupAcknowledgement(
+                    matching: binding,
+                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
+                    now: Date()
+                ) != nil
+            },
             bindingIsCurrent: { reloadBindingIsCurrent($0) },
-            persistRequest: { persistReloadRequest($0) },
-            signal: { pid in kill(pid, SIGHUP) == 0 },
+            persistRequest: { authorizeEffect() && persistReloadRequest($0) },
+            signal: { pid in authorizeEffect() && kill(pid, SIGHUP) == 0 },
             awaitAcknowledgements: waitForHotSwapAcknowledgements
         )
-        for pid in execution.acknowledgedPIDs {
+        for pid in execution.reusedAcknowledgedPIDs {
+            SwapLog.append(.debug("DESKTOP_RELOAD_REUSED_ACK pid=\(pid)"))
+        }
+        for pid in execution.newlyAcknowledgedPIDs {
             logger.info("Desktop app-server SIGHUP → pid \(pid) acknowledged")
             SwapLog.append(.sighupSent(pid: pid, startedAt: "desktop-app-server"))
         }
@@ -1235,6 +1300,7 @@ enum SwapEngine {
         candidateIsEligible: (CodexRuntimeTarget) -> Bool,
         makeBinding: (CodexRuntimeTarget) -> CodexReloadBinding?,
         hotSwapSupport: (CodexReloadBinding) -> Bool,
+        alreadyAcknowledged: (CodexReloadBinding) -> Bool = { _ in false },
         bindingIsCurrent: (CodexReloadBinding) -> Bool,
         persistRequest: (CodexReloadBinding) -> Bool,
         signal: (Int32) -> Bool,
@@ -1247,7 +1313,8 @@ enum SwapEngine {
                     targets: [],
                     isComplete: false
                 ),
-                acknowledgedPIDs: [],
+                newlyAcknowledgedPIDs: [],
+                reusedAcknowledgedPIDs: [],
                 operationFailed: true
             )
         }
@@ -1261,6 +1328,7 @@ enum SwapEngine {
             candidateIsEligible: candidateIsEligible,
             makeBinding: makeBinding,
             hotSwapSupport: hotSwapSupport,
+            alreadyAcknowledged: alreadyAcknowledged,
             bindingIsCurrent: bindingIsCurrent,
             persistRequest: persistRequest,
             signal: signal,
@@ -1275,6 +1343,7 @@ enum SwapEngine {
         candidateIsEligible: (CodexRuntimeTarget) -> Bool,
         makeBinding: (CodexRuntimeTarget) -> CodexReloadBinding?,
         hotSwapSupport: (CodexReloadBinding) -> Bool,
+        alreadyAcknowledged: (CodexReloadBinding) -> Bool = { _ in false },
         bindingIsCurrent: (CodexReloadBinding) -> Bool,
         persistRequest: (CodexReloadBinding) -> Bool,
         signal: (Int32) -> Bool,
@@ -1286,7 +1355,8 @@ enum SwapEngine {
                     targets: [],
                     isComplete: false
                 ),
-                acknowledgedPIDs: [],
+                newlyAcknowledgedPIDs: [],
+                reusedAcknowledgedPIDs: [],
                 operationFailed: true
             )
         }
@@ -1297,7 +1367,8 @@ enum SwapEngine {
               targetPIDs.isSubset(of: preliminaryPIDs) else {
             return CodexReloadExecutionResult(
                 discoverySnapshot: discoverySnapshot,
-                acknowledgedPIDs: [],
+                newlyAcknowledgedPIDs: [],
+                reusedAcknowledgedPIDs: [],
                 operationFailed: true
             )
         }
@@ -1305,19 +1376,22 @@ enum SwapEngine {
         guard discoverySnapshot.isComplete else {
             return CodexReloadExecutionResult(
                 discoverySnapshot: discoverySnapshot,
-                acknowledgedPIDs: [],
+                newlyAcknowledgedPIDs: [],
+                reusedAcknowledgedPIDs: [],
                 operationFailed: true
             )
         }
         guard !discoverySnapshot.targets.isEmpty else {
             return CodexReloadExecutionResult(
                 discoverySnapshot: discoverySnapshot,
-                acknowledgedPIDs: [],
+                newlyAcknowledgedPIDs: [],
+                reusedAcknowledgedPIDs: [],
                 operationFailed: false
             )
         }
 
         var pendingBindings: [CodexReloadBinding] = []
+        var reusedAcknowledgedPIDs: Set<Int32> = []
         var requestNonces: Set<String> = []
         var operationFailed = false
 
@@ -1332,9 +1406,18 @@ enum SwapEngine {
                   !binding.requestNonce.isEmpty,
                   requestNonces.insert(binding.requestNonce).inserted,
                   hotSwapSupport(binding),
-                  bindingIsCurrent(binding),
-                  persistRequest(binding)
+                  bindingIsCurrent(binding)
             else {
+                operationFailed = true
+                continue
+            }
+
+            if alreadyAcknowledged(binding) {
+                reusedAcknowledgedPIDs.insert(expectedIdentity.pid)
+                continue
+            }
+
+            guard persistRequest(binding) else {
                 operationFailed = true
                 continue
             }
@@ -1347,16 +1430,17 @@ enum SwapEngine {
             pendingBindings.append(binding)
         }
 
-        let acknowledgedPIDs = pendingBindings.isEmpty
+        let newlyAcknowledgedPIDs = pendingBindings.isEmpty
             ? []
             : awaitAcknowledgements(pendingBindings)
                 .intersection(pendingBindings.map { $0.processIdentity.pid })
-        if acknowledgedPIDs.count != pendingBindings.count {
+        if newlyAcknowledgedPIDs.count != pendingBindings.count {
             operationFailed = true
         }
         return CodexReloadExecutionResult(
             discoverySnapshot: discoverySnapshot,
-            acknowledgedPIDs: acknowledgedPIDs,
+            newlyAcknowledgedPIDs: newlyAcknowledgedPIDs,
+            reusedAcknowledgedPIDs: reusedAcknowledgedPIDs,
             operationFailed: operationFailed
         )
     }
@@ -1663,6 +1747,146 @@ enum SwapEngine {
         return CodexLocalRuntimeEvidenceSnapshot(runtimes: runtimes, isComplete: true)
     }
 
+    nonisolated static func runtimeDiscoveryIsAlreadyAcknowledged(
+        _ discoverySnapshot: CodexRuntimeDiscoverySnapshot,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        requiredOwnerUID: UInt32 = UInt32(getuid()),
+        maximumArtifactAgeMilliseconds: Int64 = maximumReloadAcknowledgementAgeMilliseconds
+    ) -> Bool {
+        guard !discoverySnapshot.targets.isEmpty else { return false }
+        let evidence = localRuntimeEvidenceSnapshot(
+            discoverySnapshot: discoverySnapshot,
+            observationProvider: { target in
+                runtimeObservation(
+                    for: target,
+                    homeDirectory: homeDirectory,
+                    requiredOwnerUID: requiredOwnerUID
+                )
+            },
+            startupAcknowledgementProvider: { observation in
+                let candidateBinding = CodexReloadBinding(
+                    processIdentity: observation.target.process.identity,
+                    kernelExecutableIdentity: observation.target.process.kernelExecutableIdentity,
+                    runtimeKind: observation.target.runtimeKind,
+                    authFileIdentity: observation.authFileIdentity,
+                    requestNonce: "observation-only",
+                    issuedAtUnixMilliseconds: 0
+                )
+                return startupAcknowledgement(
+                    matching: candidateBinding,
+                    homeDirectory: homeDirectory,
+                    now: Date(),
+                    maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds
+                )
+            },
+            observationIsCurrent: { observation in
+                runtimeObservationIsCurrent(
+                    observation,
+                    requiredOwnerUID: requiredOwnerUID,
+                    identityProvider: signalProcessIdentity,
+                    argumentProvider: processArguments,
+                    kernelExecutableIdentityProvider: kernelExecutableIdentity,
+                    authFileIdentityProvider: { path, ownerUID in
+                        authFileIdentity(
+                            at: URL(fileURLWithPath: path),
+                            requiredOwnerUID: ownerUID
+                        )
+                    }
+                )
+            }
+        )
+        return evidence.isComplete
+            && evidence.runtimes.count == discoverySnapshot.targets.count
+    }
+
+    nonisolated static func alreadyAcknowledgedRuntimePIDs(
+        _ discoverySnapshot: CodexRuntimeDiscoverySnapshot,
+        expectedAccountID: String,
+        expectedCompleteTokenFingerprint: String,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        requiredOwnerUID: UInt32 = UInt32(getuid()),
+        maximumArtifactAgeMilliseconds: Int64 = maximumReloadAcknowledgementAgeMilliseconds
+    ) -> Set<Int32> {
+        alreadyAcknowledgedRuntimePIDs(
+            discoverySnapshot,
+            expectedAccountID: expectedAccountID,
+            expectedCompleteTokenFingerprint: expectedCompleteTokenFingerprint,
+            observationProvider: { target in
+                runtimeObservation(
+                    for: target,
+                    homeDirectory: homeDirectory,
+                    requiredOwnerUID: requiredOwnerUID
+                )
+            },
+            startupAcknowledgementProvider: { observation in
+                let candidateBinding = CodexReloadBinding(
+                    processIdentity: observation.target.process.identity,
+                    kernelExecutableIdentity: observation.target.process.kernelExecutableIdentity,
+                    runtimeKind: observation.target.runtimeKind,
+                    authFileIdentity: observation.authFileIdentity,
+                    requestNonce: "observation-only",
+                    issuedAtUnixMilliseconds: 0
+                )
+                return startupAcknowledgement(
+                    matching: candidateBinding,
+                    homeDirectory: homeDirectory,
+                    now: Date(),
+                    maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds
+                )
+            },
+            observationIsCurrent: { observation in
+                runtimeObservationIsCurrent(
+                    observation,
+                    requiredOwnerUID: requiredOwnerUID,
+                    identityProvider: signalProcessIdentity,
+                    argumentProvider: processArguments,
+                    kernelExecutableIdentityProvider: kernelExecutableIdentity,
+                    authFileIdentityProvider: { path, ownerUID in
+                        authFileIdentity(
+                            at: URL(fileURLWithPath: path),
+                            requiredOwnerUID: ownerUID
+                        )
+                    }
+                )
+            }
+        )
+    }
+
+    nonisolated static func alreadyAcknowledgedRuntimePIDs(
+        _ discoverySnapshot: CodexRuntimeDiscoverySnapshot,
+        expectedAccountID: String,
+        expectedCompleteTokenFingerprint: String,
+        observationProvider: (CodexRuntimeTarget) -> CodexRuntimeObservation?,
+        startupAcknowledgementProvider: (CodexRuntimeObservation) -> CodexReloadAcknowledgement?,
+        observationIsCurrent: (CodexRuntimeObservation) -> Bool
+    ) -> Set<Int32> {
+        guard discoverySnapshot.isComplete,
+              accountIDBytesIfCanonical(expectedAccountID) != nil,
+              isSHA256Hex(expectedCompleteTokenFingerprint) else {
+            return []
+        }
+
+        var acknowledgedPIDs: Set<Int32> = []
+        for target in discoverySnapshot.targets {
+            guard let observation = observationProvider(target),
+                  observation.target == target,
+                  observation.authFileIdentity.accountID == expectedAccountID,
+                  observation.authFileIdentity.completeTokenFingerprint
+                    == expectedCompleteTokenFingerprint,
+                  observationIsCurrent(observation),
+                  let acknowledgement = startupAcknowledgementProvider(observation),
+                  acknowledgementSupportsPassiveRuntimeEvidence(
+                      acknowledgement,
+                      observation: observation
+                  ),
+                  observationIsCurrent(observation) else {
+                continue
+            }
+            acknowledgedPIDs.insert(target.process.identity.pid)
+        }
+        return acknowledgedPIDs
+    }
+
     nonisolated static func runtimeObservation(
         for target: CodexRuntimeTarget,
         homeDirectory: URL,
@@ -1801,7 +2025,8 @@ enum SwapEngine {
     nonisolated static func startupAcknowledgement(
         matching currentBinding: CodexReloadBinding,
         homeDirectory: URL,
-        now: Date
+        now: Date,
+        maximumArtifactAgeMilliseconds: Int64 = maximumReloadAcknowledgementAgeMilliseconds
     ) -> CodexReloadAcknowledgement? {
         guard reloadBindingIsCurrent(currentBinding),
               let request = secureFileSnapshot(
@@ -1826,12 +2051,257 @@ enum SwapEngine {
                 acknowledgement: acknowledgement,
                 currentBinding: currentBinding,
                 expectedBinding: nil,
-                nowUnixMilliseconds: nowMilliseconds
+                nowUnixMilliseconds: nowMilliseconds,
+                maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds
               ),
               reloadBindingIsCurrent(currentBinding) else {
             return nil
         }
         return validated
+    }
+
+    nonisolated static func priorRuntimeCapabilityAcknowledgement(
+        matching currentBinding: CodexReloadBinding,
+        homeDirectory: URL,
+        now: Date,
+        maximumArtifactAgeMilliseconds: Int64 = maximumReloadCapabilityAgeMilliseconds,
+        bindingIsCurrent: (CodexReloadBinding) -> Bool = {
+            reloadBindingIsCurrent($0)
+        }
+    ) -> CodexReloadAcknowledgement? {
+        guard bindingIsCurrent(currentBinding),
+              let request = secureFileSnapshot(
+                at: reloadRequestURL(
+                    homeDirectory: homeDirectory,
+                    pid: currentBinding.processIdentity.pid
+                ).path,
+                maximumBytes: maximumReloadArtifactBytes,
+                requiredOwnerUID: currentBinding.processIdentity.ownerUID
+              ),
+              let acknowledgement = secureFileSnapshot(
+                at: reloadAcknowledgementURL(
+                    homeDirectory: homeDirectory,
+                    pid: currentBinding.processIdentity.pid
+                ).path,
+                maximumBytes: maximumReloadArtifactBytes,
+                requiredOwnerUID: currentBinding.processIdentity.ownerUID
+              ),
+              let nowMilliseconds = unixMilliseconds(now),
+              let validated = validatedReloadAcknowledgement(
+                request: request,
+                acknowledgement: acknowledgement,
+                currentBinding: currentBinding,
+                expectedBinding: nil,
+                nowUnixMilliseconds: nowMilliseconds,
+                maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds,
+                requireCurrentAuthFileIdentity: false
+              ),
+              bindingIsCurrent(currentBinding) else {
+            return nil
+        }
+        return validated
+    }
+
+    nonisolated static func ensurePriorRuntimeCapabilityReceipt(
+        matching currentBinding: CodexReloadBinding,
+        homeDirectory: URL,
+        now: Date,
+        maximumArtifactAgeMilliseconds: Int64 = maximumReloadCapabilityAgeMilliseconds,
+        bindingIsCurrent: (CodexReloadBinding) -> Bool = {
+            reloadBindingIsCurrent($0)
+        }
+    ) -> Bool {
+        let receiptAcknowledgement = runtimeCapabilityReceiptAcknowledgement(
+            matching: currentBinding,
+            homeDirectory: homeDirectory,
+            now: now,
+            maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds,
+            bindingIsCurrent: bindingIsCurrent
+        )
+        let currentAcknowledgement = priorRuntimeCapabilityAcknowledgement(
+            matching: currentBinding,
+            homeDirectory: homeDirectory,
+            now: now,
+            maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds,
+            bindingIsCurrent: bindingIsCurrent
+        )
+
+        guard let currentAcknowledgement else {
+            return receiptAcknowledgement != nil
+        }
+        if let receiptAcknowledgement,
+           !reloadAcknowledgement(
+               currentAcknowledgement,
+               isNewerThan: receiptAcknowledgement
+           ) {
+            return true
+        }
+        return persistRuntimeCapabilityReceipt(
+            currentAcknowledgement,
+            currentBinding: currentBinding,
+            homeDirectory: homeDirectory,
+            now: now,
+            bindingIsCurrent: bindingIsCurrent
+        )
+    }
+
+    nonisolated private static func reloadAcknowledgement(
+        _ candidate: CodexReloadAcknowledgement,
+        isNewerThan existing: CodexReloadAcknowledgement
+    ) -> Bool {
+        if candidate.acknowledgedAtUnixMilliseconds
+            != existing.acknowledgedAtUnixMilliseconds {
+            return candidate.acknowledgedAtUnixMilliseconds
+                > existing.acknowledgedAtUnixMilliseconds
+        }
+        return candidate.binding.issuedAtUnixMilliseconds
+            > existing.binding.issuedAtUnixMilliseconds
+    }
+
+    nonisolated static func runtimeCapabilityReceiptAcknowledgement(
+        matching currentBinding: CodexReloadBinding,
+        homeDirectory: URL,
+        now: Date,
+        maximumArtifactAgeMilliseconds: Int64 = maximumReloadCapabilityAgeMilliseconds,
+        maximumFutureSkewMilliseconds: Int64 = 30_000,
+        bindingIsCurrent: (CodexReloadBinding) -> Bool = {
+            reloadBindingIsCurrent($0)
+        }
+    ) -> CodexReloadAcknowledgement? {
+        guard maximumArtifactAgeMilliseconds >= 0,
+              maximumFutureSkewMilliseconds >= 0,
+              bindingIsCurrent(currentBinding),
+              let snapshot = secureFileSnapshot(
+                at: reloadCapabilityReceiptURL(
+                    homeDirectory: homeDirectory,
+                    pid: currentBinding.processIdentity.pid
+                ).path,
+                maximumBytes: maximumReloadArtifactBytes,
+                requiredOwnerUID: currentBinding.processIdentity.ownerUID
+              ),
+              let receipt = try? JSONDecoder().decode(
+                CodexReloadCapabilityReceipt.self,
+                from: snapshot.data
+              ),
+              bindingHasSameRuntimeCapability(
+                receipt.acknowledgement.binding,
+                currentBinding
+              ),
+              bindingIsStructurallyValid(receipt.acknowledgement.binding),
+              receipt.acknowledgement.loadedTokenFingerprint
+                == receipt.acknowledgement.binding.authFileIdentity.completeTokenFingerprint,
+              receipt.acknowledgement.activeTokenFingerprint
+                == receipt.acknowledgement.loadedTokenFingerprint,
+              acknowledgementShapeIsValid(receipt.acknowledgement),
+              let nowMilliseconds = unixMilliseconds(now),
+              let processStartedAt = processStartUnixMilliseconds(
+                receipt.acknowledgement.binding.processIdentity
+              ) else {
+            return nil
+        }
+
+        let issuedAt = receipt.acknowledgement.binding.issuedAtUnixMilliseconds
+        let acknowledgedAt = receipt.acknowledgement.acknowledgedAtUnixMilliseconds
+        let recordedAt = receipt.recordedAtUnixMilliseconds
+        let oldestAccepted = subtractingWithoutOverflow(
+            nowMilliseconds,
+            maximumArtifactAgeMilliseconds
+        )
+        let newestAccepted = addingWithoutOverflow(
+            nowMilliseconds,
+            maximumFutureSkewMilliseconds
+        )
+        let processStartLowerBound = subtractingWithoutOverflow(
+            processStartedAt,
+            maximumFutureSkewMilliseconds
+        )
+        let issueLowerBound = subtractingWithoutOverflow(
+            issuedAt,
+            maximumFutureSkewMilliseconds
+        )
+        let recordedLowerBound = subtractingWithoutOverflow(
+            recordedAt,
+            maximumFutureSkewMilliseconds
+        )
+        guard issuedAt >= processStartLowerBound,
+              acknowledgedAt >= issuedAt,
+              recordedAt >= acknowledgedAt,
+              snapshot.modifiedAtUnixMilliseconds >= issueLowerBound,
+              snapshot.modifiedAtUnixMilliseconds >= recordedLowerBound,
+              [
+                issuedAt,
+                acknowledgedAt,
+                recordedAt,
+                snapshot.modifiedAtUnixMilliseconds,
+              ].allSatisfy({ $0 >= oldestAccepted && $0 <= newestAccepted }),
+              bindingIsCurrent(currentBinding) else {
+            return nil
+        }
+        return receipt.acknowledgement
+    }
+
+    nonisolated static func persistRuntimeCapabilityReceipt(
+        _ acknowledgement: CodexReloadAcknowledgement,
+        currentBinding: CodexReloadBinding,
+        homeDirectory: URL,
+        now: Date,
+        bindingIsCurrent: (CodexReloadBinding) -> Bool = {
+            reloadBindingIsCurrent($0)
+        }
+    ) -> Bool {
+        guard bindingHasSameRuntimeCapability(
+            acknowledgement.binding,
+            currentBinding
+        ), acknowledgementShapeIsValid(acknowledgement),
+        acknowledgement.loadedTokenFingerprint
+            == acknowledgement.binding.authFileIdentity.completeTokenFingerprint,
+        acknowledgement.activeTokenFingerprint == acknowledgement.loadedTokenFingerprint,
+        let recordedAt = unixMilliseconds(now),
+        recordedAt >= acknowledgement.acknowledgedAtUnixMilliseconds else {
+            return false
+        }
+
+        let receipt = CodexReloadCapabilityReceipt(
+            acknowledgement: acknowledgement,
+            recordedAtUnixMilliseconds: recordedAt
+        )
+        let receiptURL = reloadCapabilityReceiptURL(
+            homeDirectory: homeDirectory,
+            pid: currentBinding.processIdentity.pid
+        )
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(receipt)
+            guard data.count <= maximumReloadArtifactBytes else { return false }
+            let transaction = SecureAtomicFileTransaction(
+                path: receiptURL.path,
+                subject: "hot-swap capability receipt"
+            )
+            try transaction.withExclusiveLock { file in
+                let current = try file.read()
+                guard bindingIsCurrent(currentBinding) else {
+                    throw CodexReloadRequestPersistenceError.bindingDrift
+                }
+                let committed = try file.replace(
+                    data,
+                    expectedGeneration: current.generation
+                )
+                guard committed.bytes == data,
+                      try JSONDecoder().decode(
+                        CodexReloadCapabilityReceipt.self,
+                        from: committed.bytes ?? Data()
+                      ) == receipt else {
+                    throw SecureAtomicFileError.readbackMismatch(path: receiptURL.path)
+                }
+            }
+            return bindingIsCurrent(currentBinding)
+        } catch {
+            logger.error(
+                "Failed to persist hot-swap capability receipt for pid \(currentBinding.processIdentity.pid): \(error.localizedDescription)"
+            )
+            return false
+        }
     }
 
     nonisolated static func responseAcknowledgement(
@@ -1877,7 +2347,8 @@ enum SwapEngine {
         expectedBinding: CodexReloadBinding?,
         nowUnixMilliseconds: Int64,
         maximumArtifactAgeMilliseconds: Int64 = maximumReloadAcknowledgementAgeMilliseconds,
-        maximumFutureSkewMilliseconds: Int64 = 30_000
+        maximumFutureSkewMilliseconds: Int64 = 30_000,
+        requireCurrentAuthFileIdentity: Bool = true
     ) -> CodexReloadAcknowledgement? {
         guard maximumArtifactAgeMilliseconds >= 0,
               maximumFutureSkewMilliseconds >= 0,
@@ -1891,7 +2362,14 @@ enum SwapEngine {
               ),
               requestArtifact.binding == ack.binding,
               expectedBinding.map({ requestArtifact.binding == $0 }) ?? true,
-              bindingHasSameRuntimeAuthority(requestArtifact.binding, currentBinding),
+              (
+                requireCurrentAuthFileIdentity
+                    ? bindingHasSameRuntimeAuthority(requestArtifact.binding, currentBinding)
+                    : bindingHasSameRuntimeCapability(
+                        requestArtifact.binding,
+                        currentBinding
+                    )
+              ),
               bindingIsStructurallyValid(requestArtifact.binding),
               ack.loadedTokenFingerprint
                 == requestArtifact.binding.authFileIdentity.completeTokenFingerprint,
@@ -1950,11 +2428,20 @@ enum SwapEngine {
         _ lhs: CodexReloadBinding,
         _ rhs: CodexReloadBinding
     ) -> Bool {
+        bindingHasSameRuntimeCapability(lhs, rhs)
+            && lhs.authFileIdentity == rhs.authFileIdentity
+    }
+
+    nonisolated static func bindingHasSameRuntimeCapability(
+        _ lhs: CodexReloadBinding,
+        _ rhs: CodexReloadBinding
+    ) -> Bool {
         lhs.contractVersion == rhs.contractVersion
             && lhs.processIdentity == rhs.processIdentity
             && lhs.kernelExecutableIdentity == rhs.kernelExecutableIdentity
             && lhs.runtimeKind == rhs.runtimeKind
-            && lhs.authFileIdentity == rhs.authFileIdentity
+            && lhs.authFileIdentity.canonicalPath == rhs.authFileIdentity.canonicalPath
+            && lhs.authFileIdentity.device == rhs.authFileIdentity.device
     }
 
     nonisolated static func bindingMatchesObservation(
@@ -2094,6 +2581,16 @@ enum SwapEngine {
             .appendingPathComponent("\(pid).json")
     }
 
+    private nonisolated static func reloadCapabilityReceiptURL(
+        homeDirectory: URL,
+        pid: Int32
+    ) -> URL {
+        homeDirectory
+            .appendingPathComponent(".codexswitch", isDirectory: true)
+            .appendingPathComponent("hotswap-capability", isDirectory: true)
+            .appendingPathComponent("\(pid).json")
+    }
+
     nonisolated static func authFileIdentity(
         at url: URL,
         requiredOwnerUID: UInt32
@@ -2118,16 +2615,14 @@ enum SwapEngine {
             return nil
         }
 
-        var fingerprintInput = Data()
-        for value in tokenValues + [authFile.tokens.accountId] {
-            let bytes = Data(value.utf8)
-            var length = UInt64(bytes.count).bigEndian
-            withUnsafeBytes(of: &length) { fingerprintInput.append(contentsOf: $0) }
-            fingerprintInput.append(bytes)
+        guard let fingerprint = completeTokenFingerprint(
+            idToken: authFile.tokens.idToken,
+            accessToken: authFile.tokens.accessToken,
+            refreshToken: authFile.tokens.refreshToken,
+            accountID: authFile.tokens.accountId
+        ) else {
+            return nil
         }
-        let fingerprint = SHA256.hash(data: fingerprintInput)
-            .map { String(format: "%02x", $0) }
-            .joined()
         return CodexAuthFileIdentity(
             canonicalPath: snapshot.canonicalPath,
             device: snapshot.device,
@@ -2135,6 +2630,42 @@ enum SwapEngine {
             accountID: authFile.tokens.accountId,
             completeTokenFingerprint: fingerprint
         )
+    }
+
+    nonisolated static func completeTokenFingerprint(
+        for account: CodexAccount
+    ) -> String? {
+        completeTokenFingerprint(
+            idToken: account.idToken,
+            accessToken: account.accessToken,
+            refreshToken: account.refreshToken,
+            accountID: account.accountId
+        )
+    }
+
+    nonisolated static func completeTokenFingerprint(
+        idToken: String,
+        accessToken: String,
+        refreshToken: String,
+        accountID: String
+    ) -> String? {
+        let tokenValues = [idToken, accessToken, refreshToken]
+        guard tokenValues.allSatisfy({
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }), accountIDBytesIfCanonical(accountID) != nil else {
+            return nil
+        }
+
+        var fingerprintInput = Data()
+        for value in tokenValues + [accountID] {
+            let bytes = Data(value.utf8)
+            var length = UInt64(bytes.count).bigEndian
+            withUnsafeBytes(of: &length) { fingerprintInput.append(contentsOf: $0) }
+            fingerprintInput.append(bytes)
+        }
+        return SHA256.hash(data: fingerprintInput)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     nonisolated static func secureFileSnapshot(

@@ -5,6 +5,73 @@ import Testing
 
 @Suite("Secure atomic file transaction")
 struct SecureAtomicFileTransactionTests {
+    @Test("Contended lock times out without mutation and later recovers")
+    func contendedLockIsBoundedAndRecoverable() throws {
+        let url = makeSecureTestFileURL(
+            prefix: "codexswitch-lock-timeout",
+            fileName: "state.json"
+        )
+        let directory = url.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let initial = Data("initial".utf8)
+        let replacement = Data("replacement".utf8)
+        let transaction = SecureAtomicFileTransaction(
+            path: url.path,
+            lockAcquisitionTimeout: 0.05,
+            lockRetryInterval: 0.005
+        )
+        try transaction.withExclusiveLock { lockedFile in
+            _ = try lockedFile.replace(
+                initial,
+                expectedGeneration: try lockedFile.read().generation
+            )
+        }
+
+        let lockPath = directory.appendingPathComponent("state.json.lock").path
+        let heldDescriptor = Darwin.open(lockPath, O_RDWR | O_CLOEXEC)
+        guard heldDescriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer {
+            _ = flock(heldDescriptor, LOCK_UN)
+            Darwin.close(heldDescriptor)
+        }
+        guard flock(heldDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        do {
+            try transaction.withExclusiveLock { lockedFile in
+                _ = try lockedFile.replace(
+                    replacement,
+                    expectedGeneration: try lockedFile.read().generation
+                )
+            }
+            Issue.record("Expected bounded lock timeout")
+        } catch let error as SecureAtomicFileError {
+            guard case .lockTimedOut(let path, let timeout) = error else {
+                Issue.record("Unexpected error: \(error)")
+                return
+            }
+            #expect(path == lockPath)
+            #expect(timeout == 0.05)
+        }
+        #expect(startedAt.duration(to: clock.now) < .milliseconds(500))
+        #expect(try Data(contentsOf: url) == initial)
+
+        _ = flock(heldDescriptor, LOCK_UN)
+        try transaction.withExclusiveLock { lockedFile in
+            _ = try lockedFile.replace(
+                replacement,
+                expectedGeneration: try lockedFile.read().generation
+            )
+        }
+        #expect(try Data(contentsOf: url) == replacement)
+    }
+
     @Test("Auth commit uses a unique temporary and proves the complete token set")
     func authCommitIsDurableAndExact() throws {
         let url = makeSecureTestFileURL(prefix: "codexswitch-auth", fileName: "auth.json")
