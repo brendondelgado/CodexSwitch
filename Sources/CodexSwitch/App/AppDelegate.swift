@@ -211,7 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let quotaPoller = QuotaPoller()
     private let rateLimitResetService = RateLimitResetService()
     private let rateLimitResetSubmissionTracker = RateLimitResetSubmissionTracker()
-    private let externalRateLimitResetHoldStore = ExternalRateLimitResetHoldStore()
+    private let externalRateLimitResetHoldStore = ExternalRateLimitResetHoldPersistence()
     private let tokenSavingsStore = CodexTokenSavingsStore()
     private let weeklyPrimer = WeeklyPrimer()
     private let subscriptionInfoFetcher = SubscriptionInfoFetcher()
@@ -438,7 +438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             await loadAccounts()
             await desktopBridgeInstallation.value
             await recoverManualReviewActivationOnLaunch()
-            restoreExternalRateLimitResetHolds()
+            await restoreExternalRateLimitResetHolds()
 
             // Prune old diagnostic logs (>7 days)
             SwapLog.pruneOldLogs()
@@ -1333,15 +1333,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func enterActivationManualReview(
         targetAccountId: UUID?,
-        detail: AccountActivationDetail
+        detail: AccountActivationDetail,
+        authorizeEffect: @escaping AccountActivationCoordinator.StateEffectAuthorization = {
+            _ in true
+        }
     ) async {
         do {
             let state = try await accountActivationCoordinator.markManualReview(
                 targetAccountId: targetAccountId,
-                detail: detail
+                detail: detail,
+                authorizeEffect: authorizeEffect
             )
             accountManager.publishActivationState(state)
+        } catch AccountActivationCoordinatorError.authorizationRevoked {
+            SwapLog.append(.debug(
+                "ACTIVATION_MANUAL_REVIEW_SKIPPED detail=\(detail.rawValue) reason=authorization_revoked"
+            ))
         } catch {
+            guard authorizeEffect(accountManager.activationState) else {
+                SwapLog.append(.debug(
+                    "ACTIVATION_MANUAL_REVIEW_SKIPPED detail=\(detail.rawValue) reason=authorization_revoked_after_failure"
+                ))
+                return
+            }
             accountManager.publishActivationState(.manualReview(
                 targetAccountId: targetAccountId,
                 detail: detail,
@@ -2618,7 +2632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         let email = self?.accountManager.accounts.first(where: { $0.id == id })?.email
                         self?.accountManager.updateQuota(for: id, snapshot: snapshot, planType: planType)
                         let now = Date()
-                        self?.clearExternalRateLimitResetHoldIfQuotaRecovered(
+                        await self?.clearExternalRateLimitResetHoldIfQuotaRecovered(
                             for: id,
                             snapshot: snapshot,
                             at: now
@@ -3218,10 +3232,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         preferenceEnabled && externalHoldStateIsReadable
     }
 
-    private func restoreExternalRateLimitResetHolds(at now: Date = Date()) {
+    private func restoreExternalRateLimitResetHolds(at now: Date = Date()) async {
         let activeHolds: [String: ExternalRateLimitResetHoldStore.Hold]
         do {
-            activeHolds = try externalRateLimitResetHoldStore.activeHolds(at: now)
+            activeHolds = try await externalRateLimitResetHoldStore.activeHolds(at: now)
         } catch {
             markExternalRateLimitResetHoldStateUnavailable(
                 error,
@@ -3262,13 +3276,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         for accountId: UUID,
         snapshot: QuotaSnapshot,
         at now: Date
-    ) {
+    ) async {
         guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else {
             return
         }
         let hold: ExternalRateLimitResetHoldStore.Hold?
         do {
-            hold = try externalRateLimitResetHoldStore.clearIfQuotaRecovered(
+            hold = try await externalRateLimitResetHoldStore.clearIfQuotaRecovered(
                 providerAccountId: account.accountId,
                 snapshot: snapshot,
                 at: now
@@ -3282,7 +3296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         guard let hold else { return }
         externalRateLimitResetRedemptionBlockedUntil[accountId] = nil
-        restoreExternalRateLimitResetHolds(at: now)
+        await restoreExternalRateLimitResetHolds(at: now)
         SwapLog.append(.debug(
             "RESET_EXTERNAL_REDEMPTION_HOLD_CLEARED account=\(account.email) blocked_until=\(Int(hold.blockedUntil.timeIntervalSince1970)) quota_fetched=\(Int(snapshot.fetchedAt.timeIntervalSince1970)) reason=quota_recovered"
         ))
@@ -3322,7 +3336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         refreshedBank: RateLimitResetBank,
         source: String,
         at now: Date
-    ) -> RateLimitResetInventoryObservation {
+    ) async -> RateLimitResetInventoryObservation {
         let transition = rateLimitResetSubmissionTracker.classify(
             previousBank: previousBank,
             refreshedBank: refreshedBank,
@@ -3335,7 +3349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 Self.externalRateLimitResetRedemptionCooldown
             )
             do {
-                let persistedHold = try externalRateLimitResetHoldStore.record(
+                let persistedHold = try await externalRateLimitResetHoldStore.record(
                     providerAccountId: account.accountId,
                     observedAt: now,
                     blockedUntil: proposedHoldUntil
@@ -3349,7 +3363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 externalHoldUntil = proposedHoldUntil
             }
             externalRateLimitResetRedemptionBlockedUntil[account.id] = externalHoldUntil
-            restoreExternalRateLimitResetHolds(at: now)
+            await restoreExternalRateLimitResetHolds(at: now)
             SwapLog.append(.debug(
                 "RESET_EXTERNAL_REDEMPTION_OBSERVED account=\(account.email) previous_available=\(previousBank?.availableCount ?? 0) available=\(refreshedBank.availableCount) source=\(source) automatic_redemption=suppressed cooldown_seconds=\(Int(Self.externalRateLimitResetRedemptionCooldown)) blocked_until=\(Int((externalHoldUntil ?? proposedHoldUntil).timeIntervalSince1970)) quota_refresh=required"
             ))
@@ -3440,7 +3454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     unresolvedAttempt: unresolvedAttempt
                 )
                 let observedAt = Date()
-                let observation = self.observeRateLimitResetBank(
+                let observation = await self.observeRateLimitResetBank(
                     for: account,
                     previousBank: previous,
                     refreshedBank: bank,
@@ -3481,7 +3495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                 snapshot: quota.snapshot,
                                 planType: quota.planType
                             )
-                            self.clearExternalRateLimitResetHoldIfQuotaRecovered(
+                            await self.clearExternalRateLimitResetHoldIfQuotaRecovered(
                                 for: accountId,
                                 snapshot: quota.snapshot,
                                 at: Date()
@@ -3530,14 +3544,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let accountId = account.id
         guard let providerAccountId = account.normalizedProviderAccountId else { return false }
         let quotaAccount = accountManager.accounts.first(where: { $0.id == accountId }) ?? account
-        let observation = suppliedObservation ?? observeRateLimitResetBank(
-            for: account,
-            previousBank: accountManager.accounts.first(where: { $0.id == accountId })?
-                .rateLimitResetBank,
-            refreshedBank: bank,
-            source: source,
-            at: Date()
-        )
+        let observation: RateLimitResetInventoryObservation
+        if let suppliedObservation {
+            observation = suppliedObservation
+        } else {
+            observation = await observeRateLimitResetBank(
+                for: account,
+                previousBank: accountManager.accounts.first(where: { $0.id == accountId })?
+                    .rateLimitResetBank,
+                refreshedBank: bank,
+                source: source,
+                at: Date()
+            )
+        }
         do {
             let quota = try await quotaPoller.fetchQuota(for: quotaAccount)
             accountManager.updateQuota(
@@ -3546,7 +3565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 planType: quota.planType
             )
             if !observation.transition.observedExternalRedemption {
-                clearExternalRateLimitResetHoldIfQuotaRecovered(
+                await clearExternalRateLimitResetHoldIfQuotaRecovered(
                     for: accountId,
                     snapshot: quota.snapshot,
                     at: Date()
@@ -4029,7 +4048,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             guard policyAuthority?.authorizes() ?? true else { return nil }
             let now = Date()
-            let observation = observeRateLimitResetBank(
+            let observation = await observeRateLimitResetBank(
                 for: account,
                 previousBank: initialAuthorizedBank,
                 refreshedBank: refreshedBank,
@@ -4150,7 +4169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return nil
         }
         let now = Date()
-        let observation = observeRateLimitResetBank(
+        let observation = await observeRateLimitResetBank(
             for: account,
             previousBank: authorizedBank,
             refreshedBank: refreshedBank,
@@ -4555,7 +4574,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ) else {
                 return
             }
-            self.checkAndSwapWithFreshRuntimePermit(
+            await self.checkAndSwapWithFreshRuntimePermit(
                 permit,
                 trigger: trigger,
                 policyLease: lease
@@ -4663,7 +4682,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         _ permit: AccountActivationRuntimePermit,
         trigger: AccountAutomaticPolicyTrigger,
         policyLease: AccountAutomaticPolicyLease
-    ) {
+    ) async {
         let now = Date()
         guard automaticPolicyEffectIsAuthorized(
             permit: permit,
@@ -4673,7 +4692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ) else {
             return
         }
-        restoreExternalRateLimitResetHolds(at: now)
+        await restoreExternalRateLimitResetHolds(at: now)
         guard automaticPolicyEffectIsAuthorized(
             permit: permit,
             trigger: trigger,
@@ -5075,10 +5094,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 lease: lease
             ))
         } catch {
+            let recoveryAuthorization: AccountActivationCoordinator.StateEffectAuthorization = {
+                [accountMutationTransaction] _ in
+                (policyAuthority?.authorizes() ?? true)
+                    && accountMutationTransaction.leaseAuthorizes(
+                        lease,
+                        targetAccountId: targetAccountId,
+                        activationGeneration: activationGeneration
+                    )
+            }
+            let authorizationIsCurrent = recoveryAuthorization(nil)
+            guard Self.activationPreparationFailureRequiresManualReview(
+                error,
+                authorizationIsCurrent: authorizationIsCurrent
+            ) else {
+                accountManager.publishActivationNotice(
+                    "Mac activation authorization expired; no changes were made"
+                )
+                SwapLog.append(.debug(
+                    "ACTIVATION_CREDENTIAL_MUTATION_BLOCKED target=\(targetAccountId.uuidString) source=\(source) reason=authorization_revoked"
+                ))
+                return .blocked
+            }
             if await accountMutationTransaction.owns(lease) {
                 await enterActivationManualReview(
                     targetAccountId: targetAccountId,
-                    detail: .prepareFailed
+                    detail: .prepareFailed,
+                    authorizeEffect: recoveryAuthorization
                 )
             }
             accountManager.publishActivationNotice(
@@ -5089,6 +5131,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ))
             return .blocked
         }
+    }
+
+    nonisolated static func activationPreparationFailureRequiresManualReview(
+        _ error: Error,
+        authorizationIsCurrent: Bool
+    ) -> Bool {
+        guard authorizationIsCurrent else { return false }
+        return (error as? AccountActivationCoordinatorError) != .authorizationRevoked
     }
 
     private func executeSwap(
@@ -6412,7 +6462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                 snapshot: quotaResult.snapshot,
                                 planType: quotaResult.planType
                             )
-                            clearExternalRateLimitResetHoldIfQuotaRecovered(
+                            await clearExternalRateLimitResetHoldIfQuotaRecovered(
                                 for: refreshedId,
                                 snapshot: quotaResult.snapshot,
                                 at: Date()

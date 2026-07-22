@@ -1,6 +1,7 @@
 import Foundation
 
 enum AccountActivationCoordinatorError: Error, Equatable, LocalizedError {
+    case authorizationRevoked
     case corruptJournal(String)
     case invalidTransition(String)
     case journalTooLarge(Int)
@@ -8,6 +9,8 @@ enum AccountActivationCoordinatorError: Error, Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .authorizationRevoked:
+            "Mac activation authorization expired before journal persistence"
         case .corruptJournal(let reason):
             "Mac activation journal is corrupt: \(reason)"
         case .invalidTransition(let reason):
@@ -169,9 +172,7 @@ actor AccountActivationCoordinator {
 
             if proposed != current, let proposed {
                 guard authorizeEffect(current) else {
-                    throw AccountActivationCoordinatorError.invalidTransition(
-                        "activation owner was revoked before preparing persistence"
-                    )
+                    throw AccountActivationCoordinatorError.authorizationRevoked
                 }
                 try Self.validate(proposed)
                 let data = try Self.encode(proposed)
@@ -502,9 +503,10 @@ actor AccountActivationCoordinator {
     func markManualReview(
         targetAccountId: UUID?,
         detail: AccountActivationDetail,
+        authorizeEffect: StateEffectAuthorization = { _ in true },
         at date: Date = Date()
     ) throws -> AccountActivationState {
-        try transition { current in
+        try transition(authorizeEffect: authorizeEffect) { current in
             .manualReview(
                 targetAccountId: targetAccountId ?? current?.configuredAccountId,
                 detail: detail,
@@ -534,9 +536,7 @@ actor AccountActivationCoordinator {
             let current = try Self.decode(currentSnapshot.bytes)
             let proposed = try makeState(current)
             guard authorizeEffect(current) else {
-                throw AccountActivationCoordinatorError.invalidTransition(
-                    "activation owner was revoked before journal persistence"
-                )
+                throw AccountActivationCoordinatorError.authorizationRevoked
             }
             try Self.validate(proposed)
             let data = try Self.encode(proposed)

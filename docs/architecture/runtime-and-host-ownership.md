@@ -276,6 +276,11 @@ and acknowledgement wait inside the evaluator retains its narrower deadline.
 Timeouts are logged with the trigger and lease generation so a silent stuck
 percentage cannot disable future swaps.
 
+The external reset-hold store is owned by a dedicated actor. Main-actor policy
+evaluation awaits that actor and then rechecks its revocable authority before
+continuing, so bounded file-lock contention cannot freeze the menu-bar UI or
+prevent the independent policy watchdog from expiring stale work.
+
 Runtime renewal carries the revocable callback into the desktop JSON-RPC and
 CLI signal transactions. Each login request, verification request, request-file
 commit, strict reload, and signal rechecks it at the effect boundary; expiry
@@ -291,6 +296,10 @@ transition is the handoff point, after which the activation generation and
 mutation lease own the bounded transaction. Cancellation revokes the policy
 authority immediately. A queued task that reaches the handoff after cancellation
 or deadline expiry therefore changes no account, auth, or activation file.
+Authorization loss is a typed cancellation outcome, not a journal failure: it
+must not persist or publish `ManualReview`. Any genuine automatic preparation
+failure may enter `ManualReview` only while the same policy authority and typed
+mutation lease are still current inside the coordinator's persistence lock.
 
 Proof captured before an `await` cannot authorize a later mutation. After every
 preparatory suspension point, and again immediately before the first credential

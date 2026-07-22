@@ -217,3 +217,41 @@ struct ExternalRateLimitResetHoldStore {
         return holds.count != previousCount
     }
 }
+
+actor ExternalRateLimitResetHoldPersistence {
+    private let store: ExternalRateLimitResetHoldStore
+
+    init() {
+        store = ExternalRateLimitResetHoldStore()
+    }
+
+    func activeHolds(
+        at now: Date
+    ) throws -> [String: ExternalRateLimitResetHoldStore.Hold] {
+        try store.activeHolds(at: now)
+    }
+
+    func record(
+        providerAccountId: String,
+        observedAt: Date,
+        blockedUntil: Date
+    ) throws -> ExternalRateLimitResetHoldStore.Hold? {
+        try store.record(
+            providerAccountId: providerAccountId,
+            observedAt: observedAt,
+            blockedUntil: blockedUntil
+        )
+    }
+
+    func clearIfQuotaRecovered(
+        providerAccountId: String,
+        snapshot: QuotaSnapshot,
+        at now: Date
+    ) throws -> ExternalRateLimitResetHoldStore.Hold? {
+        try store.clearIfQuotaRecovered(
+            providerAccountId: providerAccountId,
+            snapshot: snapshot,
+            at: now
+        )
+    }
+}

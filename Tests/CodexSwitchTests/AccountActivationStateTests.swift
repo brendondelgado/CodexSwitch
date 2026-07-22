@@ -99,6 +99,53 @@ struct AccountActivationStateTests {
         #expect(try await AccountActivationCoordinator(url: url).load() == bootstrapped)
     }
 
+    @Test("Authorization revoked under the journal lock preserves prior state")
+    func revokedPreparationPreservesJournal() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let configuredTarget = UUID()
+        let requestedTarget = UUID()
+        let seed = AccountActivationCoordinator(url: url)
+        let initial = try await seed.bootstrapCommittedDegraded(
+            targetAccountId: configuredTarget,
+            detail: .launchRuntimeEvidenceExpired
+        )
+        let initialBytes = try Data(contentsOf: url)
+        let authorization = ActivationAuthorizationFlag(true)
+        let entered = AsyncStream.makeStream(of: Void.self)
+        let release = DispatchSemaphore(value: 0)
+        let coordinator = AccountActivationCoordinator(
+            url: url,
+            transactionTestHooks: .init(afterLock: {
+                entered.continuation.yield()
+                release.wait()
+            })
+        )
+
+        let operation = Task { () -> AccountActivationCoordinatorError? in
+            do {
+                _ = try await coordinator.beginAuthorizedCredentialMutation(
+                    targetAccountId: requestedTarget,
+                    kind: .automatic,
+                    authorizeEffect: { _ in authorization.value }
+                )
+                return nil
+            } catch let error as AccountActivationCoordinatorError {
+                return error
+            } catch {
+                return .invalidTransition(error.localizedDescription)
+            }
+        }
+
+        _ = await nextElement(from: entered.stream)
+        authorization.set(false)
+        release.signal()
+
+        #expect(await operation.value == .authorizationRevoked)
+        #expect(try Data(contentsOf: url) == initialBytes)
+        #expect(try await seed.load() == initial)
+    }
+
     @Test("Barrier blocks automatic requests but permits explicit operator recovery")
     func barrierPolicyPermitsOperatorRecovery() async throws {
         let url = temporaryJournalURL()
@@ -740,5 +787,22 @@ struct AccountActivationStateTests {
             prefix: "codexswitch-account-activation",
             fileName: "account-activation.json"
         )
+    }
+}
+
+private final class ActivationAuthorizationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool
+
+    init(_ value: Bool) {
+        stored = value
+    }
+
+    var value: Bool {
+        lock.withLock { stored }
+    }
+
+    func set(_ value: Bool) {
+        lock.withLock { stored = value }
     }
 }

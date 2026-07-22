@@ -458,53 +458,58 @@ struct AccountActivationTransactionTests {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let started: UInt64 = 1_000_000_000
         var state = AccountAutomaticPolicyLeaseState()
-        let first = try #require(state.begin(
+        let firstCandidate = state.begin(
             at: now,
             uptimeNanoseconds: started,
             timeout: 30
-        ))
-        #expect(state.begin(
+        )
+        let first = try #require(firstCandidate)
+        let overlapping = state.begin(
             at: now,
             uptimeNanoseconds: started,
             timeout: 30
-        ) == nil)
+        )
+        #expect(overlapping == nil)
 
         #expect(state.authorizes(
             first,
             uptimeNanoseconds: started + 29_000_000_000
         ))
-        #expect(!state.expire(
+        let didExpireEarly = state.expire(
             first,
             uptimeNanoseconds: started + 29_000_000_000
-        ))
-        #expect(state.expire(
+        )
+        #expect(!didExpireEarly)
+        let didExpire = state.expire(
             first,
             uptimeNanoseconds: started + 30_000_000_000
-        ))
+        )
+        #expect(didExpire)
         #expect(!first.authority.authorizes(
             uptimeNanoseconds: started + 29_000_000_000
         ))
 
-        let replacement = try #require(
-            state.begin(
-                at: now.addingTimeInterval(-3_600),
-                uptimeNanoseconds: started + 31_000_000_000,
-                timeout: 30
-            )
+        let replacementCandidate = state.begin(
+            at: now.addingTimeInterval(-3_600),
+            uptimeNanoseconds: started + 31_000_000_000,
+            timeout: 30
         )
-        #expect(state.finish(
+        let replacement = try #require(replacementCandidate)
+        let staleFinish = state.finish(
             first,
             uptimeNanoseconds: started + 32_000_000_000
-        ) == .stale)
+        )
+        #expect(staleFinish == .stale)
         #expect(state.current == replacement)
         #expect(state.authorizes(
             replacement,
             uptimeNanoseconds: started + 32_000_000_000
         ))
-        #expect(state.finish(
+        let replacementFinish = state.finish(
             replacement,
             uptimeNanoseconds: started + 32_000_000_000
-        ) == .completed)
+        )
+        #expect(replacementFinish == .completed)
         #expect(state.current == nil)
         #expect(replacement.authority.authorizes(
             uptimeNanoseconds: started + 33_000_000_000
@@ -513,25 +518,29 @@ struct AccountActivationTransactionTests {
             uptimeNanoseconds: started + 61_000_000_000
         ))
 
-        let late = try #require(state.begin(
+        let lateCandidate = state.begin(
             at: now,
             uptimeNanoseconds: started + 70_000_000_000,
             timeout: 1
-        ))
-        #expect(state.finish(
+        )
+        let late = try #require(lateCandidate)
+        let lateFinish = state.finish(
             late,
             uptimeNanoseconds: started + 71_000_000_000
-        ) == .expired)
+        )
+        #expect(lateFinish == .expired)
         #expect(!late.authority.authorizes(
             uptimeNanoseconds: started + 70_500_000_000
         ))
 
-        let cancelled = try #require(state.begin(
+        let cancelledCandidate = state.begin(
             at: now,
             uptimeNanoseconds: started + 80_000_000_000,
             timeout: 30
-        ))
-        #expect(state.cancel(cancelled))
+        )
+        let cancelled = try #require(cancelledCandidate)
+        let didCancel = state.cancel(cancelled)
+        #expect(didCancel)
         #expect(state.current == nil)
         #expect(!cancelled.authority.authorizes(
             uptimeNanoseconds: started + 81_000_000_000

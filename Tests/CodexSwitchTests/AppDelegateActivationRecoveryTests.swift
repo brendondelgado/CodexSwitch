@@ -4,6 +4,22 @@ import Testing
 
 @Suite("AppDelegate activation recovery")
 struct AppDelegateActivationRecoveryTests {
+    @Test("Revoked preparation failures cannot enter manual review")
+    func revokedPreparationFailureSkipsManualReview() {
+        #expect(!AppDelegate.activationPreparationFailureRequiresManualReview(
+            AccountActivationCoordinatorError.authorizationRevoked,
+            authorizationIsCurrent: true
+        ))
+        #expect(!AppDelegate.activationPreparationFailureRequiresManualReview(
+            AccountActivationCoordinatorError.readbackMismatch,
+            authorizationIsCurrent: false
+        ))
+        #expect(AppDelegate.activationPreparationFailureRequiresManualReview(
+            AccountActivationCoordinatorError.readbackMismatch,
+            authorizationIsCurrent: true
+        ))
+    }
+
     @Test("Desktop update relaunch requires a successful or current patch")
     func desktopUpdateRelaunchRequiresSuccessfulOrCurrentPatch() {
         #expect(AppDelegate.desktopPatchRetryDisposition(

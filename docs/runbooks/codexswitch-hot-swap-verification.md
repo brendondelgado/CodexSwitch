@@ -818,12 +818,19 @@ Before claiming hot-swap is fixed or ready:
 - [ ] Cancelling an automatic-policy evaluation revokes its authority before a
   queued swap can persist `Preparing`; normal completion may hand off only before
   the original monotonic deadline and only through the typed mutation lease.
+- [ ] Suspend an automatic preparation after it owns the journal lock, revoke
+  its policy authority, and release it. The prior journal bytes and published
+  activation state remain unchanged; no `Preparing` or `ManualReview` state is
+  written by the stale task.
 - [ ] Expiring authorization after a desktop login response suppresses the
   verification RPC and strict SIGHUP; CLI request persistence and signal delivery
   perform the same per-effect authorization check.
 - [ ] Holding the account-store lock past its acquisition deadline produces a
   distinct lock-timeout result, leaves protected bytes unchanged, and permits a
   later transaction after the holder releases the lock.
+- [ ] Holding the external reset-hold store lock does not block the main actor;
+  the automatic-policy watchdog still expires on its monotonic deadline, and
+  the resumed policy path rechecks authority before any later effect.
 - [ ] After desktop and current CLI ACKs succeed but one historical CLI remains
   unacknowledged, a same-target retry reuses the two current ACKs and sends no
   second desktop JSON-RPC notification or SIGHUP to either current runtime.
