@@ -693,6 +693,102 @@ struct DesktopRuntimeReloadClientTests {
         #expect(strictCalls.read() == 0)
     }
 
+    @Test("Mixed app-server topology admits only the loopback WebSocket desktop runtime")
+    func mixedTopologyAdmitsOnlyLoopbackWebSocketDesktopRuntime() async throws {
+        let webSocketPID: Int32 = 42
+        let stdioPID: Int32 = 43
+        let webSocketProcess = runtimeTarget(pid: webSocketPID).process
+        let stdioProcess = runtimeTarget(pid: stdioPID).process
+        let processesByPID = [
+            webSocketPID: webSocketProcess,
+            stdioPID: stdioProcess,
+        ]
+        let argumentsByPID = [
+            webSocketPID: [
+                webSocketProcess.identity.executablePath,
+                "app-server",
+                "--listen",
+                "ws://127.0.0.1:9223",
+            ],
+            stdioPID: [
+                stdioProcess.identity.executablePath,
+                "app-server",
+                "--listen",
+                "stdio://",
+            ],
+        ]
+        let bindingTargetPIDs = LockedTestState<[Int32]>([])
+        let strictTargetPIDs = LockedTestState<[Int32]>([])
+        let strictBindingPorts = LockedTestState<[UInt16]>([])
+        let sender = StubDesktopRuntimeRequestSender(responses: [
+            .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+            .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
+        ])
+        let client = DesktopRuntimeReloadClient(
+            requestSender: { payload, port in
+                await sender.send(payload: payload, port: port)
+            },
+            dependencies: DesktopRuntimeReloadDependencies(
+                requiredOwnerUID: 501,
+                gate: CodexReloadAttemptGate(),
+                preliminaryDiscovery: {
+                    .snapshot(CodexPGrepProcessSnapshot(
+                        pids: [webSocketPID, stdioPID],
+                        isComplete: true
+                    ))
+                },
+                runtimeDiscovery: { discoveryResult, requiredOwnerUID in
+                    SwapEngine.runtimeDiscoverySnapshot(
+                        from: discoveryResult,
+                        runtimeKind: .externalAppServer,
+                        requiredOwnerUID: requiredOwnerUID,
+                        identityProvider: { processesByPID[$0]?.identity },
+                        argumentProvider: { argumentsByPID[$0] },
+                        kernelExecutableIdentityProvider: {
+                            processesByPID[$0]?.kernelExecutableIdentity
+                        }
+                    )
+                },
+                socketBinding: { target in
+                    let pid = target.process.identity.pid
+                    bindingTargetPIDs.update { $0.append(pid) }
+                    guard pid == webSocketPID else { return nil }
+                    return CodexDesktopRuntimeSocketBinding(target: target, port: 9223)
+                },
+                socketBindingIsCurrent: { binding, requiredOwnerUID in
+                    binding.target.process.identity.pid == webSocketPID
+                        && binding.port == 9223
+                        && requiredOwnerUID == 501
+                },
+                alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in [] },
+                strictReload: { discovery, socketBindings, _, _, _ in
+                    strictTargetPIDs.update {
+                        $0 = discovery.targets.map { $0.process.identity.pid }
+                    }
+                    strictBindingPorts.update { $0 = socketBindings.map(\.port) }
+                    return CodexReloadSummary(
+                        discoveredRuntimeCount: discovery.targets.count,
+                        acknowledgedRuntimeCount: discovery.targets.count
+                    )
+                }
+            )
+        )
+
+        let result = await client.reloadAuth(account: makeAccount())
+        let requests = await sender.recordedRequests()
+
+        #expect(result == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
+        #expect(bindingTargetPIDs.read() == [webSocketPID])
+        #expect(strictTargetPIDs.read() == [webSocketPID])
+        #expect(strictBindingPorts.read() == [9223])
+        try #require(requests.count == 2)
+        #expect(requests.map(\.port) == [9223, 9223])
+    }
+
     @Test("Pre-admission failure preserves all discovered runtime counts")
     func preAdmissionFailurePreservesDiscoveredCounts() async {
         let (client, sender) = makeClient(

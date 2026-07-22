@@ -161,6 +161,52 @@ struct AccountActivationStateTests {
         #expect(try await seed.load() == initial)
     }
 
+    @Test("Manual review authorization revoked under the journal lock preserves prior state")
+    func revokedManualReviewPreservesJournal() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let target = UUID()
+        let seed = AccountActivationCoordinator(url: url)
+        let initial = try await seed.bootstrapCommittedDegraded(
+            targetAccountId: target,
+            detail: .launchRuntimeEvidenceExpired
+        )
+        let initialBytes = try Data(contentsOf: url)
+        let authorization = ActivationAuthorizationFlag(true)
+        let entered = AsyncStream.makeStream(of: Void.self)
+        let release = DispatchSemaphore(value: 0)
+        let coordinator = AccountActivationCoordinator(
+            url: url,
+            transactionTestHooks: .init(afterLock: {
+                entered.continuation.yield()
+                release.wait()
+            })
+        )
+
+        let operation = Task { () -> AccountActivationCoordinatorError? in
+            do {
+                _ = try await coordinator.markManualReview(
+                    targetAccountId: target,
+                    detail: .prepareFailed,
+                    authorizeEffect: { _ in authorization.value }
+                )
+                return nil
+            } catch let error as AccountActivationCoordinatorError {
+                return error
+            } catch {
+                return .invalidTransition(error.localizedDescription)
+            }
+        }
+
+        _ = await nextElement(from: entered.stream)
+        authorization.set(false)
+        release.signal()
+
+        #expect(await operation.value == .authorizationRevoked)
+        #expect(try Data(contentsOf: url) == initialBytes)
+        #expect(try await seed.load() == initial)
+    }
+
     @Test("Barrier blocks automatic requests but permits explicit operator recovery")
     func barrierPolicyPermitsOperatorRecovery() async throws {
         let url = temporaryJournalURL()
