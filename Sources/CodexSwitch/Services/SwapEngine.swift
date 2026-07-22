@@ -1215,10 +1215,44 @@ enum SwapEngine {
             })
         case .externalAppServer:
             return runtimeArguments.contains("app-server")
+                && !runtimeArguments.contains("--remote-control")
+                && hasExplicitLoopbackWebSocketListener(process.arguments)
                 && DesktopRuntimeDiagnostics.classifyAppServerPath(executablePath) == .desktopAppServer
         case .headlessRemoteControlAppServer:
             return false
         }
+    }
+
+    nonisolated static func hasExplicitLoopbackWebSocketListener(
+        _ arguments: [String]
+    ) -> Bool {
+        var listenerValues: [String] = []
+
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--listen" {
+                guard arguments.indices.contains(index + 1) else { return false }
+                listenerValues.append(arguments[index + 1])
+                index += 2
+                continue
+            }
+            if argument.hasPrefix("--listen=") {
+                listenerValues.append(String(argument.dropFirst("--listen=".count)))
+            }
+            index += 1
+        }
+
+        guard listenerValues.count == 1,
+              let components = URLComponents(string: listenerValues[0]),
+              components.scheme?.lowercased() == "ws",
+              let host = components.host?.lowercased(),
+              ["127.0.0.1", "localhost", "::1"].contains(host),
+              let port = components.port,
+              port > 0 else {
+            return false
+        }
+        return true
     }
 
     nonisolated static func runtimeTargetIsCurrent(

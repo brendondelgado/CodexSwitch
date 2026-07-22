@@ -378,7 +378,10 @@ struct SwapEngineTests {
         let defaultArguments: [String]
         switch runtimeKind {
         case .externalAppServer:
-            defaultArguments = ["codex", "app-server", "--analytics-default-enabled"]
+            defaultArguments = [
+                "codex", "app-server", "--analytics-default-enabled", "--listen",
+                "ws://127.0.0.1:9223",
+            ]
         case .headlessRemoteControlAppServer:
             defaultArguments = [
                 "codex", "app-server", "--remote-control", "--listen",
@@ -1018,7 +1021,23 @@ struct SwapEngineTests {
         let appServer = CodexIdentityBoundProcess(
             identity: managedIdentity,
             kernelExecutableIdentity: managedKernelIdentity,
-            arguments: ["stale-argv-zero", "app-server"]
+            arguments: [
+                "stale-argv-zero", "app-server", "--listen",
+                "ws://127.0.0.1:9223",
+            ]
+        )
+        let stdioAppServer = CodexIdentityBoundProcess(
+            identity: managedIdentity,
+            kernelExecutableIdentity: managedKernelIdentity,
+            arguments: ["stale-argv-zero", "app-server", "--listen", "stdio://"]
+        )
+        let remoteControlAppServer = CodexIdentityBoundProcess(
+            identity: managedIdentity,
+            kernelExecutableIdentity: managedKernelIdentity,
+            arguments: [
+                "stale-argv-zero", "app-server", "--remote-control", "--listen",
+                "ws://127.0.0.1:8390",
+            ]
         )
         let vendorIdentity = signalIdentity(pid: 42, executablePath: "/opt/homebrew/bin/codex")
         let vendorAppServer = CodexIdentityBoundProcess(
@@ -1032,7 +1051,71 @@ struct SwapEngineTests {
         #expect(!SwapEngine.processMatchesRuntime(remote, runtimeKind: .localInteractiveCLI))
         #expect(!SwapEngine.processMatchesRuntime(appServer, runtimeKind: .localInteractiveCLI))
         #expect(SwapEngine.processMatchesRuntime(appServer, runtimeKind: .externalAppServer))
+        #expect(!SwapEngine.processMatchesRuntime(stdioAppServer, runtimeKind: .externalAppServer))
+        #expect(!SwapEngine.processMatchesRuntime(remoteControlAppServer, runtimeKind: .externalAppServer))
         #expect(!SwapEngine.processMatchesRuntime(vendorAppServer, runtimeKind: .externalAppServer))
+    }
+
+    @Test("Desktop app-server listener classification is explicit and loopback-only")
+    func desktopAppServerListenerClassificationIsExplicitAndLoopbackOnly() {
+        #expect(SwapEngine.hasExplicitLoopbackWebSocketListener([
+            "codex", "app-server", "--listen=ws://localhost:9223",
+        ]))
+        #expect(SwapEngine.hasExplicitLoopbackWebSocketListener([
+            "codex", "app-server", "--listen", "ws://[::1]:9223",
+        ]))
+        #expect(!SwapEngine.hasExplicitLoopbackWebSocketListener([
+            "codex", "app-server", "--listen", "stdio://",
+        ]))
+        #expect(!SwapEngine.hasExplicitLoopbackWebSocketListener([
+            "codex", "app-server", "--listen", "ws://0.0.0.0:9223",
+        ]))
+        #expect(!SwapEngine.hasExplicitLoopbackWebSocketListener([
+            "codex", "app-server", "--listen", "ws://127.0.0.1:9223",
+            "--listen", "stdio://",
+        ]))
+    }
+
+    @Test("Desktop discovery ignores a concurrent managed stdio app-server")
+    func desktopDiscoveryIgnoresConcurrentManagedStdioAppServer() {
+        let socketPID: Int32 = 41
+        let stdioPID: Int32 = 42
+        let identities = [
+            socketPID: signalIdentity(pid: socketPID),
+            stdioPID: signalIdentity(pid: stdioPID),
+        ]
+        let discovery = SwapEngine.runtimeDiscoverySnapshot(
+            from: CodexPGrepProcessSnapshot(
+                pids: [socketPID, stdioPID],
+                isComplete: true
+            ),
+            runtimeKind: .externalAppServer,
+            requiredOwnerUID: 501,
+            identityProvider: { identities[$0] },
+            argumentProvider: { pid in
+                switch pid {
+                case socketPID:
+                    return [
+                        "codex", "app-server", "--listen",
+                        "ws://127.0.0.1:9223",
+                    ]
+                case stdioPID:
+                    return ["codex", "app-server", "--listen", "stdio://"]
+                default:
+                    return nil
+                }
+            },
+            kernelExecutableIdentityProvider: { pid in
+                guard let identity = identities[pid] else { return nil }
+                return self.kernelIdentity(
+                    path: identity.executablePath,
+                    inode: 10_000 + UInt64(pid)
+                )
+            }
+        )
+
+        #expect(discovery.isComplete)
+        #expect(discovery.targets.map { $0.process.identity.pid } == [socketPID])
     }
 
     @Test("Identity-bound argv capture requires owner and matching identities")
@@ -1371,7 +1454,7 @@ struct SwapEngineTests {
             let identity = signalIdentity(pid: pid)
             let arguments = runtimeKind == .localInteractiveCLI
                 ? ["codex", "resume", "thread-41"]
-                : ["codex", "app-server"]
+                : ["codex", "app-server", "--listen", "ws://127.0.0.1:9223"]
             let discovery = SwapEngine.runtimeDiscoverySnapshot(
                 from: processSnapshot,
                 runtimeKind: runtimeKind,

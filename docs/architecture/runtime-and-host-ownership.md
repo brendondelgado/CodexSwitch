@@ -404,6 +404,13 @@ Supported reload mechanisms are ordered by runtime capability:
 2. Verified Codex CLI/app-server SIGHUP implementation with request/ack evidence.
 3. Explicit operator restart when the running version lacks a safe reload contract.
 
+On macOS, an `external-app-server` desktop target must declare an explicit
+loopback WebSocket listener in its current arguments and own that listening TCP
+socket. A `codex app-server --listen stdio://` process belongs to its invoking
+host harness; it is not a desktop credential owner and must not enter desktop
+reload discovery. Path classification alone is insufficient because managed
+Codex binaries can serve both transports from the same executable.
+
 On Linux, both account-bearing app-server modes are reload targets: the
 repository-owned WebSocket service and the built-in SSH remote daemon listening
 on `unix://`. A `codex app-server proxy` process only transports a client to an
