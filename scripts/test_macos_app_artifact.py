@@ -293,7 +293,7 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
             self.assertIn("toc:", document)
             self.assertIn("cross_dependencies:", document)
             self.assertIn("version_control:", document)
-            self.assertIn("last_updated: 2026-07-20", document)
+            self.assertIn("last_updated: 2026-07-22", document)
         self.assertIn("## App Artifact Boundary", architecture)
         self.assertIn("codexswitch-macos-app-artifact-v1", architecture)
         self.assertIn("## App Installation", architecture)
