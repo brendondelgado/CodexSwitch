@@ -163,6 +163,43 @@ fn patch_app_server_frontend_write_ack_source(
     Ok(())
 }
 
+fn patch_timestamped_server_notification_visibility(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    const PRIVATE_HELPER: &str =
+        "fn timestamped_server_notification(notification: ServerNotification) -> OutgoingMessage {";
+    const CRATE_VISIBLE_HELPER: &str =
+        "pub(crate) fn timestamped_server_notification(notification: ServerNotification) -> OutgoingMessage {";
+
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if content.contains(CRATE_VISIBLE_HELPER) {
+        return Ok(true);
+    }
+
+    let helper_count = content.matches(PRIVATE_HELPER).count();
+    if helper_count == 1 {
+        let updated = content.replacen(PRIVATE_HELPER, CRATE_VISIBLE_HELPER, 1);
+        fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+        return Ok(true);
+    }
+    if helper_count > 1 {
+        bail!(
+            "timestamped app-server notification helper is ambiguous in {}",
+            path.display()
+        );
+    }
+    if content.contains("ServerNotificationEnvelope") {
+        bail!(
+            "app-server notification envelope shape changed in {}; refusing an unverified patch",
+            path.display()
+        );
+    }
+    Ok(false)
+}
+
 fn patch_in_process_account_updated_delivery_source(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());

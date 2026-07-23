@@ -27,10 +27,16 @@ fn patch_codex_source(source_dir: &Path) -> Result<()> {
     patch_workspace_dependency_if_present(&login_manifest, "libc")?;
     patch_lockfile_dependency_if_present(&lockfile, "codex-login", "libc")?;
     patch_auth_manager_source(&auth_manager)?;
+    let uses_timestamped_server_notifications =
+        patch_timestamped_server_notification_visibility(&app_server_outgoing)?;
     patch_app_server_frontend_write_ack_source(&app_server_outgoing, &app_server_transport)?;
     patch_in_process_account_updated_delivery_source(&in_process_app_server)?;
     patch_client_websocket_source(&client)?;
-    patch_app_server_reload_template(&app_server, &in_process_app_server)?;
+    patch_app_server_reload_template(
+        &app_server,
+        &in_process_app_server,
+        uses_timestamped_server_notifications,
+    )?;
     patch_turn_rotation_templates(&turn)?;
     remove_foreground_tui_sighup_handler(&tui)?;
     Ok(())

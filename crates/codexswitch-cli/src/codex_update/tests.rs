@@ -2032,6 +2032,115 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
     }
 
     #[test]
+    fn app_server_notification_template_supports_legacy_and_timestamped_transports() -> Result<()> {
+        let desktop =
+            "crate::outgoing_message::OutgoingMessage::AppServerNotification(ServerNotification::AccountUpdated(value))";
+        let local =
+            "OutgoingMessage::AppServerNotification(ServerNotification::AccountUpdated(value))";
+
+        assert_eq!(
+            adapt_account_updated_notification_template(desktop, false)?,
+            desktop
+        );
+        let timestamped_desktop =
+            adapt_account_updated_notification_template(desktop, true)?;
+        assert!(timestamped_desktop.contains(
+            "crate::outgoing_message::timestamped_server_notification("
+        ));
+        assert!(!timestamped_desktop.contains("AppServerNotification("));
+
+        let timestamped_local = adapt_account_updated_notification_template(local, true)?;
+        assert!(timestamped_local.contains(
+            "crate::outgoing_message::timestamped_server_notification("
+        ));
+        assert!(!timestamped_local.contains("AppServerNotification("));
+        Ok(())
+    }
+
+    #[test]
+    fn app_server_reload_templates_use_the_timestamped_helper_when_available() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_server = temp.path().join("lib.rs");
+        let in_process = temp.path().join("in_process.rs");
+        fs::write(
+            &app_server,
+            r#"async fn run() {
+    let processor_handle = tokio::spawn({
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+    });
+}
+"#,
+        )?;
+        fs::write(
+            &in_process,
+            r#"async fn run(args: InProcessStartArgs) {
+    let auth_manager =
+            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)
+                .await;
+}
+"#,
+        )?;
+
+        patch_app_server_reload_template(&app_server, &in_process, true)?;
+
+        for path in [&app_server, &in_process] {
+            let patched = fs::read_to_string(path)?;
+            assert!(patched.contains(
+                "crate::outgoing_message::timestamped_server_notification("
+            ));
+            assert!(!patched.contains("OutgoingMessage::AppServerNotification("));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn timestamped_notification_helper_is_promoted_idempotently() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let outgoing = temp.path().join("outgoing_message.rs");
+        fs::write(
+            &outgoing,
+            r#"use codex_app_server_protocol::ServerNotificationEnvelope;
+
+fn timestamped_server_notification(notification: ServerNotification) -> OutgoingMessage {
+    OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+        notification,
+        emitted_at_ms: Some(1),
+    })
+}
+"#,
+        )?;
+
+        assert!(patch_timestamped_server_notification_visibility(&outgoing)?);
+        assert!(patch_timestamped_server_notification_visibility(&outgoing)?);
+        let patched = fs::read_to_string(outgoing)?;
+        assert_eq!(
+            patched
+                .matches("pub(crate) fn timestamped_server_notification")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_notification_envelope_shape_fails_before_build() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let outgoing = temp.path().join("outgoing_message.rs");
+        fs::write(
+            &outgoing,
+            "use codex_app_server_protocol::ServerNotificationEnvelope;\n",
+        )?;
+
+        let error = patch_timestamped_server_notification_visibility(&outgoing)
+            .expect_err("unknown envelope shape must fail closed");
+        assert!(error
+            .to_string()
+            .contains("notification envelope shape changed"));
+        Ok(())
+    }
+
+    #[test]
     fn stable_source_tags_refuse_alpha_versions() {
         assert_eq!(stable_source_tag("0.128.0").unwrap(), "rust-v0.128.0");
         assert!(stable_source_tag("0.129.0-alpha.1").is_err());

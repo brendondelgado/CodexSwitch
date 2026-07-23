@@ -1,5 +1,62 @@
-fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -> Result<()> {
-    patch_file_after_any(
+fn adapt_account_updated_notification_template(
+    insertion: &str,
+    uses_timestamped_server_notifications: bool,
+) -> Result<String> {
+    if !uses_timestamped_server_notifications {
+        return Ok(insertion.to_owned());
+    }
+
+    let adapted = insertion
+        .replace(
+            "crate::outgoing_message::OutgoingMessage::AppServerNotification(",
+            "crate::outgoing_message::timestamped_server_notification(",
+        )
+        .replace(
+            "OutgoingMessage::AppServerNotification(",
+            "crate::outgoing_message::timestamped_server_notification(",
+        );
+    if adapted == insertion {
+        bail!("account/updated notification template has no recognized transport wrapper");
+    }
+    Ok(adapted)
+}
+
+fn patch_file_after_any_notification_aware(
+    path: &Path,
+    needles: &[&str],
+    insertion: &str,
+    marker: &str,
+    uses_timestamped_server_notifications: bool,
+) -> Result<()> {
+    let insertion = adapt_account_updated_notification_template(
+        insertion,
+        uses_timestamped_server_notifications,
+    )?;
+    patch_file_after_any(path, needles, &insertion, marker)
+}
+
+fn patch_file_after_notification_aware(
+    path: &Path,
+    needle: &str,
+    insertion: &str,
+    marker: &str,
+    uses_timestamped_server_notifications: bool,
+) -> Result<()> {
+    patch_file_after_any_notification_aware(
+        path,
+        &[needle],
+        insertion,
+        marker,
+        uses_timestamped_server_notifications,
+    )
+}
+
+fn patch_app_server_reload_template(
+    path: &Path,
+    in_process_app_server: &Path,
+    uses_timestamped_server_notifications: bool,
+) -> Result<()> {
+    patch_file_after_any_notification_aware(
         path,
         &[
             "let processor_handle = tokio::spawn({\n        let auth_manager =\n            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;",
@@ -417,9 +474,10 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
         }
 "#,
         "CodexSwitch account/updated frontend write acknowledged after auth reload",
+        uses_timestamped_server_notifications,
     )?;
     if in_process_app_server.exists() {
-        patch_file_after(
+        patch_file_after_notification_aware(
             &in_process_app_server,
             "let auth_manager =\n            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n                .await;",
             r#"
@@ -752,6 +810,7 @@ fn patch_app_server_reload_template(path: &Path, in_process_app_server: &Path) -
         }
 "#,
             "codexswitch-hotswap-cli-contract-v3",
+            uses_timestamped_server_notifications,
         )?;
     }
     Ok(())

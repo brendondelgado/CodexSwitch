@@ -101,6 +101,12 @@ changes are part of the hashed source patch. The release build still uses
 `--locked`, and post-build provenance revalidates the same complete patch hash.
 Injected-method idempotence markers must identify the target implementation,
 not only a method name that can legitimately appear on multiple auth types.
+The app-server notification transport shape is also a versioned source-patch
+contract. When upstream exposes its timestamped notification-envelope helper,
+the patch driver makes only that helper crate-visible and uses it for both
+injected `account/updated` sends. Older bare-notification variants remain
+supported; an envelope-bearing source without the known helper fails closed
+before the release compile begins.
 
 ## Trust Bootstrap
 
