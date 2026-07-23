@@ -4189,6 +4189,9 @@ mod tests {
     #[test]
     #[ignore = "fixture child launched explicitly by the kernel executable identity test"]
     fn process_executable_identity_fixture_waits() {
+        if let Some(ready_path) = std::env::var_os("CODEXSWITCH_PROCESS_IDENTITY_FIXTURE_READY") {
+            fs::write(ready_path, b"ready").expect("failed to publish fixture readiness");
+        }
         thread::sleep(Duration::from_secs(30));
     }
 
@@ -4207,6 +4210,7 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let runtime = dir.path().join("codex");
+        let fixture_ready = dir.path().join("fixture-ready");
         let test_executable = std::env::current_exe().context("test executable is unavailable")?;
         fs::copy(test_executable, &runtime)?;
         let mut child = ChildGuard(
@@ -4220,18 +4224,25 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                .env("CODEXSWITCH_PROCESS_IDENTITY_FIXTURE_READY", &fixture_ready)
                 .spawn()?,
         );
         let pid = i32::try_from(child.0.id()).context("child PID does not fit i32")?;
-        let mut process = None;
-        for _ in 0..100 {
-            process = read_linux_process_identity(pid);
-            if process.is_some() {
+        let fixture_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if fixture_ready.exists() {
                 break;
+            }
+            if let Some(status) = child.0.try_wait()? {
+                bail!("process identity fixture exited before readiness: {status}");
+            }
+            if Instant::now() >= fixture_deadline {
+                bail!("process identity fixture did not become ready before its deadline");
             }
             thread::sleep(Duration::from_millis(10));
         }
-        let process = process.context("failed to observe child process identity")?;
+        let process = read_linux_process_identity(pid)
+            .context("failed to observe ready child process identity")?;
         let original_metadata = fs::metadata(&runtime)?;
         let original = open_kernel_process_executable_once(&process, BINARY_MARKER_SCAN_MAX_BYTES)?;
         assert_eq!(
