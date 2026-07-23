@@ -315,7 +315,12 @@ all hashes, thin arm64 identities, and code signatures before it executes the
 artifact control plane. That control plane performs one updater-lease-held,
 journaled three-binary activation and route publication transaction. It does
 not signal, restart, or quit the currently running Codex process; exit and
-resume once after activation to enter the new runtime.
+resume once after activation to enter the new runtime. The menu app's explicit
+`Update Now` action then kickstarts only the launchd-owned
+`com.codexswitch.desktop-app-server-9223` job and requires its PID to change
+before reporting success. A direct installer invocation must perform that exact
+bridge kickstart separately. Neither path may restart ChatGPT or an interactive
+CLI.
 
 ## Platform Gates
 

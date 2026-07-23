@@ -266,6 +266,15 @@ member check would replace `PATH` before the final launcher smoke test.
 The running CLI process is not signalled or replaced in memory. After successful
 activation, one explicit exit and resume starts the new executable set.
 
+The menu app's explicit `Update Now` workflow has one additional host-lifecycle
+responsibility after the activation transaction commits: it must use
+`launchctl kickstart -k` on only
+`com.codexswitch.desktop-app-server-9223` and observe a new positive launchd PID
+before reporting the update complete. It never restarts ChatGPT or an
+interactive CLI. Direct repository-installer invocations remain operator-owned
+and must restart that exact bridge separately before claiming live desktop
+convergence.
+
 ## App Installation
 
 `scripts/install-macos-app-artifact.sh <directory>` is the only app-sidecar

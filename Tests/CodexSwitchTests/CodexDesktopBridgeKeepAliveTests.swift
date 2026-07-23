@@ -44,6 +44,64 @@ struct CodexDesktopBridgeKeepAliveTests {
         )
     }
 
+    @Test("Bridge restart targets only the managed job and proves PID replacement")
+    func bridgeRestartRequiresNewManagedPID() {
+        var observedArguments: [String] = []
+        var observedTimeout: TimeInterval?
+        var pids: [Int32?] = [41, 41, nil, 42]
+        var pauses = 0
+
+        let result = CodexDesktopBridgeKeepAlive.restartLoadedBridge(
+            pidProvider: {
+                pids.isEmpty ? nil : pids.removeFirst()
+            },
+            run: { executableURL, arguments, timeout in
+                #expect(executableURL.path == "/bin/launchctl")
+                observedArguments = arguments
+                observedTimeout = timeout
+                return ProcessRunResult(
+                    terminationStatus: 0,
+                    stdout: Data(),
+                    stderr: Data(),
+                    timedOut: false
+                )
+            },
+            pause: { _ in pauses += 1 }
+        )
+
+        #expect(result.success)
+        #expect(result.attempted)
+        #expect(observedArguments == [
+            "kickstart",
+            "-k",
+            "gui/\(getuid())/com.codexswitch.desktop-app-server-9223",
+        ])
+        #expect(observedTimeout == 5)
+        #expect(pauses == 2)
+    }
+
+    @Test("Bridge restart fails closed when launchd does not own a live bridge")
+    func bridgeRestartRequiresLoadedJob() {
+        var invoked = false
+        let result = CodexDesktopBridgeKeepAlive.restartLoadedBridge(
+            pidProvider: { nil },
+            run: { _, _, _ in
+                invoked = true
+                return ProcessRunResult(
+                    terminationStatus: 0,
+                    stdout: Data(),
+                    stderr: Data(),
+                    timedOut: false
+                )
+            },
+            pause: { _ in }
+        )
+
+        #expect(!result.success)
+        #expect(!result.attempted)
+        #expect(!invoked)
+    }
+
     @Test("First ACK bootstrap is limited to the exact managed bridge")
     func firstAcknowledgementBootstrapRequiresExactManagedIdentity() {
         let home = FileManager.default.homeDirectoryForCurrentUser

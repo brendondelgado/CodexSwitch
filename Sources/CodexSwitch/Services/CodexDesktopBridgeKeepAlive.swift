@@ -7,6 +7,12 @@ enum CodexDesktopBridgeKeepAlive {
     static let websocketURL = "ws://127.0.0.1:9223"
     private static let maximumBridgeFileBytes: Int64 = 64 * 1024
 
+    struct BridgeRestartResult: Sendable, Equatable {
+        let attempted: Bool
+        let success: Bool
+        let message: String
+    }
+
     static func installIfNeeded() {
         do {
             let paths = supportPaths()
@@ -85,6 +91,80 @@ enum CodexDesktopBridgeKeepAlive {
                 "DESKTOP_BRIDGE_INSTALL_FAILED error=\(error.localizedDescription)"
             ))
         }
+    }
+
+    static func restartLoadedBridge(
+        pidProvider: () -> Int32? = {
+            CodexDesktopBridgeKeepAlive.managedLaunchAgentPID()
+        },
+        run: (URL, [String], TimeInterval) -> ProcessRunResult = {
+            executableURL, arguments, timeout in
+            ProcessRunner.run(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: timeout
+            )
+        },
+        pause: (TimeInterval) -> Void = { interval in
+            Thread.sleep(forTimeInterval: interval)
+        }
+    ) -> BridgeRestartResult {
+        guard let previousPID = pidProvider() else {
+            let message = "The managed desktop bridge is not loaded"
+            SwapLog.append(.debug("DESKTOP_BRIDGE_RESTART_FAILED reason=not_loaded"))
+            return BridgeRestartResult(
+                attempted: false,
+                success: false,
+                message: message
+            )
+        }
+
+        let target = "\(launchDomain())/\(label)"
+        let result = run(
+            URL(fileURLWithPath: "/bin/launchctl"),
+            ["kickstart", "-k", target],
+            5
+        )
+        guard !result.timedOut, result.terminationStatus == 0 else {
+            let detail = result.stderrString
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = detail.isEmpty
+                ? "launchctl could not restart the managed desktop bridge"
+                : "launchctl could not restart the managed desktop bridge: \(detail)"
+            SwapLog.append(.debug(
+                "DESKTOP_BRIDGE_RESTART_FAILED reason=kickstart previous_pid=\(previousPID)"
+            ))
+            return BridgeRestartResult(
+                attempted: true,
+                success: false,
+                message: message
+            )
+        }
+
+        for attempt in 0..<50 {
+            if let currentPID = pidProvider(), currentPID != previousPID {
+                SwapLog.append(.debug(
+                    "DESKTOP_BRIDGE_RESTARTED previous_pid=\(previousPID) pid=\(currentPID)"
+                ))
+                return BridgeRestartResult(
+                    attempted: true,
+                    success: true,
+                    message: "Restarted the managed desktop bridge"
+                )
+            }
+            if attempt < 49 {
+                pause(0.1)
+            }
+        }
+
+        SwapLog.append(.debug(
+            "DESKTOP_BRIDGE_RESTART_FAILED reason=pid_unchanged previous_pid=\(previousPID)"
+        ))
+        return BridgeRestartResult(
+            attempted: true,
+            success: false,
+            message: "The managed desktop bridge did not publish a new launchd PID"
+        )
     }
 
     static func bridgeScript(launcherPath: String) -> String {

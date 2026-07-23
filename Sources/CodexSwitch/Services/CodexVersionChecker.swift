@@ -180,7 +180,12 @@ final class CodexVersionChecker {
         forkRebuilding = false
 
         Task.detached {
-            let result = Self.performExplicitUpdate()
+            let result = Self.completeExplicitUpdate(
+                Self.performExplicitUpdate(),
+                restartDesktopBridge: {
+                    CodexDesktopBridgeKeepAlive.restartLoadedBridge()
+                }
+            )
             let installed = result.outcome.installedVersion ?? Self._getInstalledVersion()
             let latest = Self.nonEmptyString(result.installationReport?.latestStableVersion)
                 ?? Self.nonEmptyString(result.preparationReport?.latestStableVersion)
@@ -490,6 +495,34 @@ final class CodexVersionChecker {
                 launcherRepair: launcherRepair,
                 installedHotSwapVersion: verifiedVersion
             )
+        )
+    }
+
+    nonisolated static func completeExplicitUpdate(
+        _ result: CodexExplicitUpdateResult,
+        restartDesktopBridge: () -> CodexDesktopBridgeKeepAlive.BridgeRestartResult
+    ) -> CodexExplicitUpdateResult {
+        guard result.outcome.success else { return result }
+
+        let bridge = restartDesktopBridge()
+        let outcome: CodexUpdateOutcome
+        if bridge.success {
+            outcome = CodexUpdateOutcome(
+                success: true,
+                installedVersion: result.outcome.installedVersion,
+                message: "\(result.outcome.message). \(bridge.message)"
+            )
+        } else {
+            outcome = CodexUpdateOutcome(
+                success: false,
+                installedVersion: result.outcome.installedVersion,
+                message: "\(result.outcome.message), but desktop activation is incomplete: \(bridge.message)"
+            )
+        }
+        return CodexExplicitUpdateResult(
+            preparationReport: result.preparationReport,
+            installationReport: result.installationReport,
+            outcome: outcome
         )
     }
 

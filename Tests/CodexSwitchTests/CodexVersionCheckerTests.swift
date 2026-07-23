@@ -478,6 +478,74 @@ struct CodexVersionCheckerTests {
         #expect(result.outcome.success)
     }
 
+    @Test("Explicit Update reports complete only after the desktop bridge restarts")
+    func explicitUpdateRequiresDesktopBridgeRestart() {
+        let installed = CodexVersionChecker.CodexExplicitUpdateResult(
+            preparationReport: nil,
+            installationReport: nil,
+            outcome: CodexVersionChecker.CodexUpdateOutcome(
+                success: true,
+                installedVersion: "0.145.0",
+                message: "Installed and verified Codex hot-swap runtime v0.145.0"
+            )
+        )
+        var restartCalls = 0
+        let completed = CodexVersionChecker.completeExplicitUpdate(
+            installed,
+            restartDesktopBridge: {
+                restartCalls += 1
+                return CodexDesktopBridgeKeepAlive.BridgeRestartResult(
+                    attempted: true,
+                    success: true,
+                    message: "Restarted the managed desktop bridge"
+                )
+            }
+        )
+
+        #expect(restartCalls == 1)
+        #expect(completed.outcome.success)
+        #expect(completed.outcome.installedVersion == "0.145.0")
+        #expect(completed.outcome.message.contains("Restarted the managed desktop bridge"))
+
+        let incomplete = CodexVersionChecker.completeExplicitUpdate(
+            installed,
+            restartDesktopBridge: {
+                CodexDesktopBridgeKeepAlive.BridgeRestartResult(
+                    attempted: true,
+                    success: false,
+                    message: "The managed desktop bridge did not publish a new launchd PID"
+                )
+            }
+        )
+        #expect(!incomplete.outcome.success)
+        #expect(incomplete.outcome.installedVersion == "0.145.0")
+        #expect(incomplete.outcome.message.contains("desktop activation is incomplete"))
+
+        restartCalls = 0
+        let failedInstall = CodexVersionChecker.CodexExplicitUpdateResult(
+            preparationReport: nil,
+            installationReport: nil,
+            outcome: CodexVersionChecker.CodexUpdateOutcome(
+                success: false,
+                installedVersion: nil,
+                message: "installation failed"
+            )
+        )
+        let unchanged = CodexVersionChecker.completeExplicitUpdate(
+            failedInstall,
+            restartDesktopBridge: {
+                restartCalls += 1
+                return CodexDesktopBridgeKeepAlive.BridgeRestartResult(
+                    attempted: true,
+                    success: true,
+                    message: "must not run"
+                )
+            }
+        )
+        #expect(restartCalls == 0)
+        #expect(unchanged.outcome == failedInstall.outcome)
+    }
+
     @Test("Automatic update scheduling throttles checks and backs off failures")
     func automaticUpdateSchedulingHonorsCadenceAndFailureBackoff() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
