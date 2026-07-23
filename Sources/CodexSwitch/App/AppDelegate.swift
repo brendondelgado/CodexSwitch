@@ -4558,14 +4558,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return
             }
             let activationGeneration = activationState.activationGeneration
-            guard let permit = await self.requireFreshLocalRuntimePermit(
-                for: configured,
-                activationGeneration: activationGeneration,
-                requiredPhase: .confirmed,
-                policyAuthority: lease.authority
-            ),
-            self.automaticPolicyEvaluationIsCurrent(lease),
-            AccountAutomaticPolicyGate.authorizes(
+            await self.restoreExternalRateLimitResetHolds(at: now)
+            guard self.automaticPolicyEvaluationIsCurrent(lease),
+                  self.accountManager.configuredAccount?.id == configured.id else {
+                return
+            }
+            self.performRoutineAutomaticPolicyHousekeeping(
+                trigger: trigger,
+                active: configured,
+                now: now
+            )
+            let mutationDemand = self.automaticPolicyMutationDemand(
+                trigger: trigger,
+                active: configured,
+                now: now
+            )
+            let trustedUsageIsHealthy = Self.trustedUsageIsHealthy(
+                trigger: trigger,
+                active: configured,
+                now: now
+            )
+            let permit = await AccountAutomaticPolicyMutationGate
+                .requestRuntimeAuthorizationIfNeeded(
+                trigger: trigger,
+                configuredAccountId: configured.id,
+                trustedUsageIsHealthy: trustedUsageIsHealthy,
+                demand: mutationDemand,
+                request: {
+                    await self.requireFreshLocalRuntimePermit(
+                        for: configured,
+                        activationGeneration: activationGeneration,
+                        requiredPhase: .confirmed,
+                        policyAuthority: lease.authority
+                    )
+                }
+            )
+            guard let permit else {
+                self.reportExhaustedPoolWithoutRuntimeRenewalIfNeeded(
+                    trigger: trigger,
+                    active: configured,
+                    demand: mutationDemand,
+                    now: now
+                )
+                return
+            }
+            guard self.automaticPolicyEvaluationIsCurrent(lease),
+                  AccountAutomaticPolicyGate.authorizes(
                 trigger: trigger,
                 configuredAccountId: self.accountManager.configuredAccount?.id,
                 state: self.accountManager.activationState,
@@ -4678,6 +4716,174 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    private func performRoutineAutomaticPolicyHousekeeping(
+        trigger: AccountAutomaticPolicyTrigger,
+        active: CodexAccount,
+        now: Date
+    ) {
+        guard case .routine = trigger else { return }
+        let decision = AccountAutomaticPolicyRoutineHousekeepingDecision.evaluate(
+            activeAccountId: active.id,
+            activeNeedsRelief: active.needsQuotaRelief(at: now),
+            manualOverrideAccountId: manualOverrideAccountId,
+            recoveryUntil: rateLimitResetRecoveryUntil[active.id],
+            now: now
+        )
+        if decision.clearExpiredRecovery {
+            rateLimitResetRecoveryUntil[active.id] = nil
+        }
+        if decision.clearManualOverride {
+            clearManualOverride()
+        }
+        if decision.markPoolRecovered {
+            exhaustedPoolAlertGate.markRecovered()
+        }
+    }
+
+    private func automaticPolicyMutationDemand(
+        trigger: AccountAutomaticPolicyTrigger,
+        active: CodexAccount,
+        now: Date
+    ) -> AccountAutomaticPolicyMutationDemand {
+        switch trigger {
+        case .usageUnavailable(let accountId):
+            guard active.id == accountId else { return .none }
+            return AccountAutomaticPolicyMutationDemand(
+                hasResetRedemption: false,
+                needsResetInventoryRefresh: false,
+                hasPlanUpgrade: SwapEngine.selectPlanUpgradeCandidate(
+                    active: active,
+                    from: accountManager.accounts,
+                    now: now
+                ) != nil,
+                hasAccountSwap: SwapEngine.selectAutoSwapCandidate(
+                    from: accountManager.accounts,
+                    now: now
+                ) != nil
+            )
+        case .tokenInvalidated(let accountId):
+            guard active.id == accountId else { return .none }
+            return AccountAutomaticPolicyMutationDemand(
+                hasResetRedemption: false,
+                needsResetInventoryRefresh: false,
+                hasPlanUpgrade: false,
+                hasAccountSwap: SwapEngine.selectAutoSwapCandidate(
+                    from: accountManager.accounts,
+                    now: now
+                ) != nil
+            )
+        case .routine:
+            guard rateLimitResetOperationProviderAccountId == nil,
+                  rateLimitResetDecisionPending.isEmpty else {
+                return .none
+            }
+
+            let activeNeedsRelief = active.needsQuotaRelief(at: now)
+            let manualOverrideActive = SwapEngine.shouldHonorManualOverride(
+                activeAccountId: active.id,
+                manualOverrideAccountId: manualOverrideAccountId,
+                activeNeedsRelief: activeNeedsRelief
+            )
+            var hasResetRedemption = false
+            var needsResetInventoryRefresh = false
+            if automaticRateLimitResetRedemptionEnabled {
+                hasResetRedemption = RateLimitResetPolicy.selectRedemptionCandidate(
+                    from: accountManager.accounts,
+                    excluding: automaticRateLimitResetExcludedAccountIds(at: now),
+                    now: now
+                ) != nil
+
+                let activeRedemptionBlocked = Self.rateLimitResetRedemptionIsBlocked(
+                    until: rateLimitResetRedemptionBlockedUntil[active.id],
+                    at: now
+                ) || Self.rateLimitResetRedemptionIsBlocked(
+                    until: externalRateLimitResetRedemptionBlockedUntil[active.id],
+                    at: now
+                )
+                let activeInventoryBlocked = rateLimitResetInventoryRetryAfter[active.id]
+                    .map { $0 > now } ?? false
+                needsResetInventoryRefresh = activeNeedsRelief
+                    && !activeRedemptionBlocked
+                    && !activeInventoryBlocked
+                    && !Self.rateLimitResetBankIsFresh(
+                        active.rateLimitResetBank,
+                        at: now,
+                        requiresDecisionEvidence: true
+                    )
+            }
+
+            let resetSwapExclusions = activeManualRateLimitResetSwapExclusions(at: now)
+            let hasPlanUpgrade = !manualOverrideActive
+                && SwapEngine.selectPlanUpgradeCandidate(
+                    active: active,
+                    from: accountManager.accounts,
+                    excluding: resetSwapExclusions,
+                    now: now
+                ) != nil
+            let hasAccountSwap = active.realQuotaSnapshot != nil
+                && activeNeedsRelief
+                && SwapEngine.selectAutoSwapCandidate(
+                    from: accountManager.accounts,
+                    now: now
+                ) != nil
+            return AccountAutomaticPolicyMutationDemand(
+                hasResetRedemption: hasResetRedemption,
+                needsResetInventoryRefresh: needsResetInventoryRefresh,
+                hasPlanUpgrade: hasPlanUpgrade,
+                hasAccountSwap: hasAccountSwap
+            )
+        }
+    }
+
+    nonisolated private static func trustedUsageIsHealthy(
+        trigger: AccountAutomaticPolicyTrigger,
+        active: CodexAccount,
+        now: Date
+    ) -> Bool {
+        guard case .usageUnavailable(let accountId) = trigger,
+              active.id == accountId,
+              let snapshot = active.realQuotaSnapshot else {
+            return false
+        }
+        return active.isQuotaImmediatelyUsable(at: now)
+            && snapshot.isImmediatelyUsable
+    }
+
+    private func reportExhaustedPoolWithoutRuntimeRenewalIfNeeded(
+        trigger: AccountAutomaticPolicyTrigger,
+        active: CodexAccount,
+        demand: AccountAutomaticPolicyMutationDemand,
+        now: Date
+    ) {
+        guard case .routine = trigger,
+              !demand.hasActionableMutation,
+              rateLimitResetOperationProviderAccountId == nil,
+              rateLimitResetDecisionPending.isEmpty,
+              active.realQuotaSnapshot != nil,
+              active.needsQuotaRelief(at: now),
+              SwapEngine.selectAutoSwapCandidate(
+                  from: accountManager.accounts,
+                  now: now
+              ) == nil else {
+            return
+        }
+        if exhaustedPoolAlertGate.shouldNotifyNoCandidate() {
+            NotificationManager.notifyAllExhausted(
+                nextReset: SwapEngine.earliestUsableReset(
+                    from: accountManager.accounts,
+                    now: now
+                )
+            )
+            SwapLog.append(.debug(
+                "AUTO_SWAP_NO_READY_CANDIDATE active=\(active.email) notified=true runtime_renewal=false"
+            ))
+        } else {
+            SwapLog.append(.debug(
+                "AUTO_SWAP_NO_READY_CANDIDATE active=\(active.email) notified=false runtime_renewal=false"
+            ))
+        }
+    }
+
     private func checkAndSwapWithFreshRuntimePermit(
         _ permit: AccountActivationRuntimePermit,
         trigger: AccountAutomaticPolicyTrigger,
@@ -4692,13 +4898,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ) else {
             return
         }
-        await restoreExternalRateLimitResetHolds(at: now)
-        guard automaticPolicyEffectIsAuthorized(
-            permit: permit,
-            trigger: trigger,
-            policyLease: policyLease,
-            at: Date()
-        ) else { return }
         guard let active = accountManager.configuredAccount else { return }
         switch trigger {
         case .routine:
@@ -4758,11 +4957,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             return
         }
-        if let recoveryUntil = rateLimitResetRecoveryUntil[active.id] {
-            if recoveryUntil <= now {
-                rateLimitResetRecoveryUntil[active.id] = nil
-            }
-        }
         guard rateLimitResetOperationProviderAccountId == nil,
               rateLimitResetDecisionPending.isEmpty else {
             return
@@ -4770,12 +4964,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         let activeSnapshot = active.realQuotaSnapshot
         let activeNeedsRelief = active.needsQuotaRelief(at: now)
-        if manualOverrideAccountId != nil, manualOverrideAccountId != active.id {
-            clearManualOverride()
-        }
-        if manualOverrideAccountId == active.id, activeNeedsRelief {
-            clearManualOverride()
-        }
 
         let manualOverrideActive = SwapEngine.shouldHonorManualOverride(
             activeAccountId: active.id,
@@ -4784,28 +4972,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
 
         if automaticRateLimitResetRedemptionEnabled {
-            let excludedAccountIds = Set(accountManager.accounts.compactMap { account -> UUID? in
-                let redemptionBlocked = Self.rateLimitResetRedemptionIsBlocked(
-                    until: rateLimitResetRedemptionBlockedUntil[account.id],
-                    at: now
-                )
-                let externalRedemptionBlocked = Self.rateLimitResetRedemptionIsBlocked(
-                    until: externalRateLimitResetRedemptionBlockedUntil[account.id],
-                    at: now
-                )
-                let inventoryBlocked = rateLimitResetInventoryRetryAfter[account.id].map { $0 > now } ?? false
-                let recovering = rateLimitResetRecoveryUntil[account.id].map { $0 > now } ?? false
-                return redemptionBlocked
-                    || externalRedemptionBlocked
-                    || inventoryBlocked
-                    || recovering
-                    || rateLimitResetDecisionPending.contains(account.id)
-                    || (account.normalizedProviderAccountId.map {
-                        rateLimitResetUnresolvedProviderAccountIds.contains($0)
-                    } ?? true)
-                    ? account.id
-                    : nil
-            })
+            let excludedAccountIds = automaticRateLimitResetExcludedAccountIds(at: now)
 
             if let selection = RateLimitResetPolicy.selectRedemptionCandidate(
                 from: accountManager.accounts,
@@ -4926,6 +5093,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             automaticPermit: permit,
             automaticPolicyLease: policyLease
         )
+    }
+
+    private func automaticRateLimitResetExcludedAccountIds(
+        at now: Date
+    ) -> Set<UUID> {
+        Set(accountManager.accounts.compactMap { account -> UUID? in
+            let redemptionBlocked = Self.rateLimitResetRedemptionIsBlocked(
+                until: rateLimitResetRedemptionBlockedUntil[account.id],
+                at: now
+            )
+            let externalRedemptionBlocked = Self.rateLimitResetRedemptionIsBlocked(
+                until: externalRateLimitResetRedemptionBlockedUntil[account.id],
+                at: now
+            )
+            let inventoryBlocked = rateLimitResetInventoryRetryAfter[account.id]
+                .map { $0 > now } ?? false
+            let recovering = rateLimitResetRecoveryUntil[account.id]
+                .map { $0 > now } ?? false
+            return redemptionBlocked
+                || externalRedemptionBlocked
+                || inventoryBlocked
+                || recovering
+                || rateLimitResetDecisionPending.contains(account.id)
+                || (account.normalizedProviderAccountId.map {
+                    rateLimitResetUnresolvedProviderAccountIds.contains($0)
+                } ?? true)
+                ? account.id
+                : nil
+        })
     }
 
     private func automaticPolicyEffectIsAuthorized(

@@ -55,7 +55,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-22
+  last_updated: 2026-07-23
 ---
 
 # Runtime And Host Ownership
@@ -502,6 +502,15 @@ acknowledgement. An explicit activation or rotation creates that first
 acknowledgement; observation and daemon polling never signal a runtime merely
 to renew readiness. Until an explicit convergence attempt succeeds, the
 runtime is not ready.
+
+The automatic policy loop must finish a side-effect-free actionability preflight
+before requesting fresh runtime authorization. A routine tick with no reset
+redemption, reset-inventory refresh, plan upgrade, or account-swap candidate
+exits before desktop JSON-RPC, SIGHUP, or CLI reload. Reporting an exhausted
+pool with no ready candidate does not require runtime renewal. This keeps the
+ten-second evidence lease from becoming a ten-second desktop auth loop. The
+same no-op path still clears expired recovery state and stale manual overrides,
+and marks a healthy pool recovered.
 
 Remote presentation is a timestamped observation, not durable truth. A failed
 probe, a durable activation barrier, a missing acknowledgement, or freshness

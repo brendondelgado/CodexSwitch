@@ -36,6 +36,87 @@ enum AccountAutomaticPolicyTrigger: Equatable, Sendable {
     }
 }
 
+struct AccountAutomaticPolicyMutationDemand: Equatable, Sendable {
+    let hasResetRedemption: Bool
+    let needsResetInventoryRefresh: Bool
+    let hasPlanUpgrade: Bool
+    let hasAccountSwap: Bool
+
+    static let none = AccountAutomaticPolicyMutationDemand(
+        hasResetRedemption: false,
+        needsResetInventoryRefresh: false,
+        hasPlanUpgrade: false,
+        hasAccountSwap: false
+    )
+
+    var hasActionableMutation: Bool {
+        hasResetRedemption
+            || needsResetInventoryRefresh
+            || hasPlanUpgrade
+            || hasAccountSwap
+    }
+}
+
+struct AccountAutomaticPolicyRoutineHousekeepingDecision: Equatable, Sendable {
+    let clearExpiredRecovery: Bool
+    let clearManualOverride: Bool
+    let markPoolRecovered: Bool
+
+    static func evaluate(
+        activeAccountId: UUID,
+        activeNeedsRelief: Bool,
+        manualOverrideAccountId: UUID?,
+        recoveryUntil: Date?,
+        now: Date
+    ) -> AccountAutomaticPolicyRoutineHousekeepingDecision {
+        AccountAutomaticPolicyRoutineHousekeepingDecision(
+            clearExpiredRecovery: recoveryUntil.map { $0 <= now } ?? false,
+            clearManualOverride: manualOverrideAccountId.map {
+                $0 != activeAccountId || activeNeedsRelief
+            } ?? false,
+            markPoolRecovered: !activeNeedsRelief
+        )
+    }
+}
+
+enum AccountAutomaticPolicyMutationGate {
+    static func requiresRuntimeAuthorization(
+        trigger: AccountAutomaticPolicyTrigger,
+        configuredAccountId: UUID?,
+        trustedUsageIsHealthy: Bool,
+        demand: AccountAutomaticPolicyMutationDemand
+    ) -> Bool {
+        guard let configuredAccountId,
+              trigger.requestedAccountId.map({ $0 == configuredAccountId }) ?? true,
+              demand.hasActionableMutation else {
+            return false
+        }
+        if case .usageUnavailable = trigger, trustedUsageIsHealthy {
+            return false
+        }
+        return true
+    }
+
+    @MainActor
+    static func requestRuntimeAuthorizationIfNeeded(
+        trigger: AccountAutomaticPolicyTrigger,
+        configuredAccountId: UUID?,
+        trustedUsageIsHealthy: Bool,
+        demand: AccountAutomaticPolicyMutationDemand,
+        request: @MainActor () async -> AccountActivationRuntimePermit?
+    ) async -> AccountActivationRuntimePermit? {
+        guard requiresRuntimeAuthorization(
+            trigger: trigger,
+            configuredAccountId: configuredAccountId,
+            trustedUsageIsHealthy: trustedUsageIsHealthy,
+            demand: demand
+        ) else {
+            return nil
+        }
+        return await request()
+    }
+}
+
 final class AccountAutomaticPolicyAuthority: @unchecked Sendable {
     let generation: UUID
     let deadlineUptimeNanoseconds: UInt64

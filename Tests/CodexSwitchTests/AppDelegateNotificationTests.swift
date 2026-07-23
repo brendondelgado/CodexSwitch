@@ -192,6 +192,45 @@ struct AppDelegateNotificationTests {
         #expect(!timerBody.contains("scheduleConfigMaintenanceIfNeeded"))
     }
 
+    @Test("Routine policy proves actionable work before runtime renewal")
+    func automaticPolicyPreflightsMutationBeforeRuntimePermit() throws {
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/App/AppDelegate.swift",
+            encoding: .utf8
+        )
+        let functionStart = try #require(
+            source.range(of: "private func checkAndSwapIfNeeded")
+        )
+        let functionEnd = try #require(
+            source.range(
+                of: "private func automaticPolicyEvaluationIsCurrent",
+                range: functionStart.upperBound..<source.endIndex
+            )
+        )
+        let functionBody = String(
+            source[functionStart.lowerBound..<functionEnd.lowerBound]
+        )
+        let housekeeping = try #require(
+            functionBody.range(
+                of: "performRoutineAutomaticPolicyHousekeeping"
+            )
+        )
+        let mutationBoundary = try #require(
+            functionBody.range(
+                of: "requestRuntimeAuthorizationIfNeeded"
+            )
+        )
+        let runtimePermit = try #require(
+            functionBody.range(of: "requireFreshLocalRuntimePermit")
+        )
+
+        #expect(housekeeping.lowerBound < mutationBoundary.lowerBound)
+        #expect(mutationBoundary.lowerBound < runtimePermit.lowerBound)
+        #expect(functionBody.contains(
+            "reportExhaustedPoolWithoutRuntimeRenewalIfNeeded"
+        ))
+    }
+
     @Test("AppDelegate contains no Hermes integration")
     func appDelegateContainsNoHermesIntegration() throws {
         let source = try String(

@@ -453,6 +453,115 @@ struct AccountActivationTransactionTests {
         ))
     }
 
+    @Test("Routine policy does not renew runtimes without an actionable mutation")
+    @MainActor
+    func automaticMutationDemandGatesRuntimeAuthorization() async {
+        let accountId = UUID()
+
+        #expect(!AccountAutomaticPolicyMutationGate.requiresRuntimeAuthorization(
+            trigger: .routine,
+            configuredAccountId: accountId,
+            trustedUsageIsHealthy: false,
+            demand: .none
+        ))
+        #expect(AccountAutomaticPolicyMutationGate.requiresRuntimeAuthorization(
+            trigger: .routine,
+            configuredAccountId: accountId,
+            trustedUsageIsHealthy: false,
+            demand: AccountAutomaticPolicyMutationDemand(
+                hasResetRedemption: false,
+                needsResetInventoryRefresh: false,
+                hasPlanUpgrade: false,
+                hasAccountSwap: true
+            )
+        ))
+        #expect(!AccountAutomaticPolicyMutationGate.requiresRuntimeAuthorization(
+            trigger: .usageUnavailable(accountId: accountId),
+            configuredAccountId: accountId,
+            trustedUsageIsHealthy: true,
+            demand: AccountAutomaticPolicyMutationDemand(
+                hasResetRedemption: false,
+                needsResetInventoryRefresh: false,
+                hasPlanUpgrade: false,
+                hasAccountSwap: true
+            )
+        ))
+        #expect(!AccountAutomaticPolicyMutationGate.requiresRuntimeAuthorization(
+            trigger: .tokenInvalidated(accountId: UUID()),
+            configuredAccountId: accountId,
+            trustedUsageIsHealthy: false,
+            demand: AccountAutomaticPolicyMutationDemand(
+                hasResetRedemption: false,
+                needsResetInventoryRefresh: false,
+                hasPlanUpgrade: false,
+                hasAccountSwap: true
+            )
+        ))
+
+        var runtimeAuthorizationRequests = 0
+        let noActionPermit = await AccountAutomaticPolicyMutationGate
+            .requestRuntimeAuthorizationIfNeeded(
+                trigger: .routine,
+                configuredAccountId: accountId,
+                trustedUsageIsHealthy: false,
+                demand: .none,
+                request: {
+                    runtimeAuthorizationRequests += 1
+                    return nil
+                }
+            )
+        #expect(noActionPermit == nil)
+        #expect(runtimeAuthorizationRequests == 0)
+
+        _ = await AccountAutomaticPolicyMutationGate
+            .requestRuntimeAuthorizationIfNeeded(
+                trigger: .routine,
+                configuredAccountId: accountId,
+                trustedUsageIsHealthy: false,
+                demand: AccountAutomaticPolicyMutationDemand(
+                    hasResetRedemption: false,
+                    needsResetInventoryRefresh: false,
+                    hasPlanUpgrade: true,
+                    hasAccountSwap: false
+                ),
+                request: {
+                    runtimeAuthorizationRequests += 1
+                    return nil
+                }
+            )
+        #expect(runtimeAuthorizationRequests == 1)
+    }
+
+    @Test("Routine no-op housekeeping survives the runtime preflight")
+    func automaticRoutineHousekeepingDecisionIsIndependent() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let activeAccountId = UUID()
+        let otherAccountId = UUID()
+
+        #expect(AccountAutomaticPolicyRoutineHousekeepingDecision.evaluate(
+            activeAccountId: activeAccountId,
+            activeNeedsRelief: false,
+            manualOverrideAccountId: otherAccountId,
+            recoveryUntil: now.addingTimeInterval(-1),
+            now: now
+        ) == AccountAutomaticPolicyRoutineHousekeepingDecision(
+            clearExpiredRecovery: true,
+            clearManualOverride: true,
+            markPoolRecovered: true
+        ))
+        #expect(AccountAutomaticPolicyRoutineHousekeepingDecision.evaluate(
+            activeAccountId: activeAccountId,
+            activeNeedsRelief: true,
+            manualOverrideAccountId: activeAccountId,
+            recoveryUntil: now.addingTimeInterval(60),
+            now: now
+        ) == AccountAutomaticPolicyRoutineHousekeepingDecision(
+            clearExpiredRecovery: false,
+            clearManualOverride: true,
+            markPoolRecovered: false
+        ))
+    }
+
     @Test("Automatic policy lease expires and stale completion cannot clear replacement")
     func automaticPolicyLeaseIsGenerationOwned() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
