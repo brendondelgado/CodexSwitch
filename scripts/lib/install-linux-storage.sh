@@ -583,6 +583,7 @@ CodexSwitch Linux deployment dry run
   release:             $RELEASES_DIR/<package-version>-$TARGET_SHA
   current link:        $CURRENT_LINK
   public CLI:          $BIN_DIR/codexswitch-cli -> $CURRENT_LINK/codexswitch-cli
+  public Codex:        $BIN_DIR/codex -> $CURRENT_LINK/patched-codex/codex
   runtime input:       $CODEX_RUNTIME_DIR
   activate:            $ACTIVATE
 

@@ -160,6 +160,476 @@ validate_public_cli_contract() {
   fail "public CLI must permanently resolve through $expected"
 }
 
+public_codex_release_identity() {
+  python3 - \
+    "$CURRENT_LINK/release-manifest.tsv" \
+    "$CURRENT_LINK/patched-codex/codex" \
+    "$CURRENT_LINK/patched-codex/codex-code-mode-host" \
+    "$STATE_FILE_MAX_BYTES" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+manifest_path, codex_path, helper_path, limit_text = sys.argv[1:]
+limit = int(limit_text)
+
+
+def identity(metadata):
+    return ":".join(
+        str(value)
+        for value in (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            metadata.st_uid,
+            metadata.st_mode,
+        )
+    )
+
+
+def open_owned_regular(path, *, executable=False):
+    before = os.lstat(path)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or (executable and not before.st_mode & 0o111)
+    ):
+        raise SystemExit(1)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    opened = os.fstat(descriptor)
+    if identity(opened) != identity(before):
+        os.close(descriptor)
+        raise SystemExit(1)
+    return descriptor, opened
+
+
+manifest_descriptor, manifest_metadata = open_owned_regular(manifest_path)
+try:
+    if manifest_metadata.st_size > limit:
+        raise SystemExit(1)
+    digest = hashlib.sha256()
+    remaining = limit + 1
+    while remaining:
+        chunk = os.read(manifest_descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if remaining == 0 or identity(os.fstat(manifest_descriptor)) != identity(manifest_metadata):
+        raise SystemExit(1)
+finally:
+    os.close(manifest_descriptor)
+
+runtime_identities = []
+for path in (codex_path, helper_path):
+    descriptor, metadata = open_owned_regular(path, executable=True)
+    try:
+        runtime_identities.append(identity(metadata))
+    finally:
+        os.close(descriptor)
+
+print("\t".join((digest.hexdigest(), *runtime_identities)))
+PY
+}
+
+public_codex_launcher_contents() {
+  local quoted_current=""
+  local quoted_lock=""
+  local quoted_public_launcher=""
+  local quoted_manifest_sha256=""
+  local quoted_codex_identity=""
+  local quoted_helper_identity=""
+  local release_identity="${1:-}"
+  local manifest_sha256=""
+  local codex_identity=""
+  local helper_identity=""
+
+  if [[ -z "$release_identity" ]]; then
+    release_identity="$(public_codex_release_identity)" || return 1
+  fi
+  IFS=$'\t' read -r manifest_sha256 codex_identity helper_identity <<< "$release_identity"
+  [[ "$manifest_sha256" =~ ^[0-9a-f]{64}$ && -n "$codex_identity" && -n "$helper_identity" ]] || return 1
+  printf -v quoted_current '%q' "$CURRENT_LINK"
+  printf -v quoted_lock '%q' "$RUNTIME_START_INSTALL_GUARD"
+  printf -v quoted_public_launcher '%q' "$BIN_DIR/codex"
+  printf -v quoted_manifest_sha256 '%q' "$manifest_sha256"
+  printf -v quoted_codex_identity '%q' "$codex_identity"
+  printf -v quoted_helper_identity '%q' "$helper_identity"
+  cat <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CODEXSWITCH_LAUNCHER_FORMAT=codexswitch-current-launcher-v1
+CURRENT_ROOT=$quoted_current
+RUNTIME_INSTALL_LOCK=$quoted_lock
+PUBLIC_LAUNCHER=$quoted_public_launcher
+EXPECTED_MANIFEST_SHA256=$quoted_manifest_sha256
+EXPECTED_CODEX_IDENTITY=$quoted_codex_identity
+EXPECTED_HELPER_IDENTITY=$quoted_helper_identity
+INSTALL_ROOT="\${CURRENT_ROOT%/current}"
+PATCHED_CODEX="\$CURRENT_ROOT/patched-codex/codex"
+PATCHED_HELPER="\$CURRENT_ROOT/patched-codex/codex-code-mode-host"
+
+exec 9>>"\$RUNTIME_INSTALL_LOCK"
+/usr/bin/flock --shared 9
+
+ACTIVE_LAUNCHER_GENERATION="\$(/usr/bin/python3 - "\$PUBLIC_LAUNCHER" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path = sys.argv[1]
+try:
+    before = os.lstat(path)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_size > 65536
+    ):
+        raise SystemExit(1)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ):
+            raise SystemExit(1)
+        data = os.read(descriptor, 65537)
+        if len(data) > 65536 or os.read(descriptor, 1):
+            raise SystemExit(1)
+    finally:
+        os.close(descriptor)
+    matches = re.findall(
+        rb"^EXPECTED_MANIFEST_SHA256=([0-9a-f]{64})$",
+        data,
+        re.MULTILINE,
+    )
+    if len(matches) != 1:
+        raise SystemExit(1)
+    print(matches[0].decode("ascii"))
+except OSError:
+    raise SystemExit(1)
+PY
+)" || {
+  echo "codex: active CodexSwitch launcher could not be verified" >&2
+  exit 1
+}
+if [[ "\$ACTIVE_LAUNCHER_GENERATION" != "\$EXPECTED_MANIFEST_SHA256" ]]; then
+  exec "\$PUBLIC_LAUNCHER" "\$@"
+fi
+
+CURRENT_TARGET="\$(readlink "\$CURRENT_ROOT")"
+case "\$CURRENT_TARGET" in
+  releases/*) ;;
+  *)
+    echo "codex: current CodexSwitch release pointer is invalid" >&2
+    exit 1
+    ;;
+esac
+RELEASE_ID="\${CURRENT_TARGET#releases/}"
+if [[ -z "\$RELEASE_ID" || "\$RELEASE_ID" == */* || "\$RELEASE_ID" == *..* ]]; then
+  echo "codex: current CodexSwitch release identity is invalid" >&2
+  exit 1
+fi
+RELEASE_ROOT="\$INSTALL_ROOT/\$CURRENT_TARGET"
+RELEASE_MANIFEST="\$RELEASE_ROOT/release-manifest.tsv"
+if [[ "\$(readlink -f "\$CURRENT_ROOT")" != "\$RELEASE_ROOT" ]] ||
+   [[ ! -f "\$RELEASE_MANIFEST" || -L "\$RELEASE_MANIFEST" ]] ||
+   ! grep -Fxq \$'format\tcodexswitch-release-v3' "\$RELEASE_MANIFEST" ||
+   ! grep -Fxq \$'codex_marker_contract\tcodexswitch-hotswap-full-v3' "\$RELEASE_MANIFEST"; then
+  echo "codex: current CodexSwitch release provenance is invalid" >&2
+  exit 1
+fi
+if [[ ! -f "\$PATCHED_CODEX" || -L "\$PATCHED_CODEX" || ! -x "\$PATCHED_CODEX" ]] ||
+   [[ ! -f "\$PATCHED_HELPER" || -L "\$PATCHED_HELPER" || ! -x "\$PATCHED_HELPER" ]]; then
+  echo "codex: current CodexSwitch runtime is incomplete at \$CURRENT_ROOT" >&2
+  exit 1
+fi
+
+/usr/bin/python3 - \
+  "\$RELEASE_MANIFEST" \
+  "\$PATCHED_CODEX" \
+  "\$PATCHED_HELPER" \
+  "\$EXPECTED_MANIFEST_SHA256" \
+  "\$EXPECTED_CODEX_IDENTITY" \
+  "\$EXPECTED_HELPER_IDENTITY" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+manifest_path, codex_path, helper_path, manifest_sha256, codex_identity, helper_identity = sys.argv[1:]
+
+
+def identity(metadata):
+    return ":".join(
+        str(value)
+        for value in (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            metadata.st_uid,
+            metadata.st_mode,
+        )
+    )
+
+
+def fail(message):
+    raise SystemExit(f"codex: {message}")
+
+
+def open_owned_regular(path, *, executable=False):
+    try:
+        before = os.lstat(path)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or (executable and not before.st_mode & 0o111)
+        ):
+            fail("current CodexSwitch release contains an invalid runtime file")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+    except OSError:
+        fail("current CodexSwitch release could not be verified")
+    if identity(opened) != identity(before):
+        os.close(descriptor)
+        fail("current CodexSwitch release changed during verification")
+    return descriptor, opened
+
+
+manifest_descriptor, manifest_metadata = open_owned_regular(manifest_path)
+try:
+    if manifest_metadata.st_size > 1024 * 1024:
+        fail("current CodexSwitch release manifest exceeds its size bound")
+    digest = hashlib.sha256()
+    remaining = 1024 * 1024 + 1
+    while remaining:
+        chunk = os.read(manifest_descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if remaining == 0 or identity(os.fstat(manifest_descriptor)) != identity(manifest_metadata):
+        fail("current CodexSwitch release manifest changed during verification")
+    if digest.hexdigest() != manifest_sha256:
+        fail("current CodexSwitch release manifest does not match the activated release")
+finally:
+    os.close(manifest_descriptor)
+
+for path, expected in ((codex_path, codex_identity), (helper_path, helper_identity)):
+    descriptor, metadata = open_owned_regular(path, executable=True)
+    try:
+        if identity(metadata) != expected:
+            fail("current CodexSwitch runtime does not match the activated release")
+    finally:
+        os.close(descriptor)
+PY
+
+exec "\$PATCHED_CODEX" "\$@"
+EOF
+}
+
+public_codex_launcher_metadata() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+metadata = Path(sys.argv[1]).lstat()
+if (
+    stat.S_ISLNK(metadata.st_mode)
+    or not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != os.geteuid()
+):
+    raise SystemExit(1)
+print(f"{metadata.st_size}\t{stat.S_IMODE(metadata.st_mode):o}")
+PY
+}
+
+public_codex_launcher_is_current() {
+  local public_codex="$BIN_DIR/codex"
+  local expected=""
+  local metadata=""
+  local mode=""
+  local size=""
+
+  [[ -f "$public_codex" && ! -L "$public_codex" && -O "$public_codex" && -x "$public_codex" ]] || return 1
+  metadata="$(public_codex_launcher_metadata "$public_codex")" || return 1
+  IFS=$'\t' read -r size mode <<< "$metadata"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -le 65536 ]] || return 1
+  [[ "$mode" == "555" ]] || return 1
+  expected="$(public_codex_launcher_contents)" || return 1
+  [[ "$(cat "$public_codex")" == "$expected" ]]
+}
+
+generated_public_codex_launcher_is_managed() {
+  local public_codex="$BIN_DIR/codex"
+  local expected=""
+  local metadata=""
+  local mode=""
+  local size=""
+
+  [[ -f "$public_codex" && ! -L "$public_codex" && -O "$public_codex" && -x "$public_codex" ]] || return 1
+  metadata="$(public_codex_launcher_metadata "$public_codex")" || return 1
+  IFS=$'\t' read -r size mode <<< "$metadata"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -le 65536 ]] || return 1
+  [[ "$mode" == "555" ]] || return 1
+  expected="$(public_codex_launcher_contents)" || return 1
+  python3 - "$public_codex" "$expected" <<'PY'
+import re
+import sys
+
+path, expected = sys.argv[1:]
+dynamic = {
+    "EXPECTED_MANIFEST_SHA256": re.compile(r"[0-9a-f]{64}"),
+    "EXPECTED_CODEX_IDENTITY": re.compile(r"[0-9]+(?::[0-9]+){6}"),
+    "EXPECTED_HELPER_IDENTITY": re.compile(r"[0-9]+(?::[0-9]+){6}"),
+}
+
+
+def normalize(source):
+    counts = {key: 0 for key in dynamic}
+    normalized = []
+    for line in source.splitlines():
+        key, separator, value = line.partition("=")
+        if key in dynamic:
+            if separator != "=" or not dynamic[key].fullmatch(value):
+                raise SystemExit(1)
+            counts[key] += 1
+            line = f"{key}=<activated-release>"
+        normalized.append(line)
+    if any(count != 1 for count in counts.values()):
+        raise SystemExit(1)
+    return normalized
+
+
+with open(path, encoding="utf-8") as source:
+    installed = source.read()
+if installed.splitlines().count(
+    "CODEXSWITCH_LAUNCHER_FORMAT=codexswitch-current-launcher-v1"
+) != 1:
+    raise SystemExit(1)
+raise SystemExit(0 if normalize(installed) == normalize(expected) else 1)
+PY
+}
+
+legacy_public_codex_launcher_is_managed() {
+  local public_codex="$BIN_DIR/codex"
+  local metadata=""
+  local mode=""
+  local target=""
+  local size=""
+
+  if [[ -L "$public_codex" ]]; then
+    target="$(readlink "$public_codex")"
+    [[ "$target" == "$INSTALL_ROOT/patched-codex/codex" ||
+       "$target" == "$CURRENT_LINK/patched-codex/codex" ||
+       "$target" == "$CURRENT_LINK/codex" ]]
+    return
+  fi
+  [[ -f "$public_codex" && -O "$public_codex" && -x "$public_codex" ]] || return 1
+  metadata="$(public_codex_launcher_metadata "$public_codex")" || return 1
+  IFS=$'\t' read -r size mode <<< "$metadata"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -le 65536 ]] || return 1
+  python3 - \
+    "$public_codex" \
+    "$INSTALL_ROOT/patched-codex/codex" \
+    "$CURRENT_LINK/patched-codex/codex" <<'PY'
+import sys
+
+path, legacy_target, current_target = sys.argv[1:]
+with open(path, encoding="utf-8") as source:
+    lines = [line.strip() for line in source]
+
+assignments = {
+    f"PATCHED_CODEX='{legacy_target}'",
+    f'PATCHED_CODEX="{legacy_target}"',
+    f"PATCHED_CODEX='{current_target}'",
+    f'PATCHED_CODEX="{current_target}"',
+}
+raise SystemExit(
+    0
+    if lines[:1] == ["#!/usr/bin/env bash"]
+    and sum(line in assignments for line in lines) == 1
+    and lines.count('exec "$PATCHED_CODEX" "$@"') == 1
+    and sum("run codexswitch-cli install-prepared-codex" in line for line in lines) == 1
+    else 1
+)
+PY
+}
+
+validate_public_codex_launcher_pre_activation() {
+  local public_codex="$BIN_DIR/codex"
+
+  PUBLIC_CODEX_LAUNCHER_PREVALIDATED=0
+  if [[ ! -e "$public_codex" && ! -L "$public_codex" ]]; then
+    PUBLIC_CODEX_LAUNCHER_PREVALIDATED=1
+    return
+  fi
+  if public_codex_launcher_is_current ||
+     generated_public_codex_launcher_is_managed ||
+     legacy_public_codex_launcher_is_managed; then
+    PUBLIC_CODEX_LAUNCHER_PREVALIDATED=1
+    return
+  fi
+  fail "public Codex launcher is not a recognized CodexSwitch route: $public_codex"
+}
+
+install_public_codex_launcher() {
+  local public_codex="$BIN_DIR/codex"
+  local temporary="$BIN_DIR/.codex.tmp.$$"
+  local release_identity=""
+  local verified_identity=""
+
+  [[ "$PUBLIC_CODEX_LAUNCHER_PREVALIDATED" == "1" ]] ||
+    fail "public Codex launcher publication lacks its pre-activation validation"
+  public_codex_launcher_is_current && return
+  [[ ! -e "$temporary" && ! -L "$temporary" ]] || fail "public Codex launcher staging path already exists: $temporary"
+  release_identity="$(public_codex_release_identity)" ||
+    fail "failed to snapshot the activated Codex runtime"
+  if ! public_codex_launcher_contents "$release_identity" > "$temporary"; then
+    rm -f -- "$temporary"
+    fail "failed to generate the public Codex launcher"
+  fi
+  if ! (validate_release "$(canonicalize_path "$CURRENT_LINK")"); then
+    rm -f -- "$temporary"
+    fail "activated Codex runtime failed launcher publication validation"
+  fi
+  verified_identity="$(public_codex_release_identity)" || {
+    rm -f -- "$temporary"
+    fail "failed to verify the activated Codex runtime identity"
+  }
+  if [[ "$verified_identity" != "$release_identity" ]]; then
+    rm -f -- "$temporary"
+    fail "activated Codex runtime changed during launcher publication"
+  fi
+  chmod 0555 "$temporary"
+  python3 - "$temporary" <<'PY' || fail "failed to persist the public Codex launcher"
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+  mv -Tf -- "$temporary" "$public_codex"
+  fsync_directory "$BIN_DIR"
+  public_codex_launcher_is_current || fail "public Codex launcher readback failed: $public_codex"
+}
+
 observe_import_activation_barrier() {
   local mode="$1"
   local expected_identity="${2:-}"
@@ -320,6 +790,7 @@ activate_release() {
     old_previous="$previous_target"
   fi
   validate_public_cli_contract
+  validate_public_codex_launcher_pre_activation
   [[ -z "$previous_target" ]] || validate_release "$INSTALL_ROOT/$previous_target"
   if [[ -L "$public_cli" ]]; then
     old_public="$(readlink "$public_cli")"
@@ -434,7 +905,10 @@ commit_activation_transaction() {
   [[ "$RUNTIME_GUARDS_HELD" == "1" ]] || fail "activation commit lost its runtime guards"
   update_activation_journal_phase committed
   complete_systemd_transaction
+  inject_fault after_commit_before_codex_launcher
+  install_public_codex_launcher
   remove_activation_journal
   ACTIVATION_TRANSACTION_ACTIVE=0
   release_runtime_guards
+  public_codex_launcher_is_current || fail "public Codex launcher does not follow the current release"
 }

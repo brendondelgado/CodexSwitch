@@ -854,6 +854,16 @@ actor boundary on every supported Swift 6 toolchain.
   Session and log bytes remain on the VPS: the Mac receives only bounded
   per-model aggregate counts and non-secret provenance fields.
 - Releases are immutable directories with source Git SHA, build version, and build epoch.
+- `$HOME/.local/bin/codex` is a release-neutral CodexSwitch launcher. It
+  acquires the shared runtime/install lock, verifies that `current` names a
+  managed release with the full hot-swap marker manifest, the activation-bound
+  manifest digest, and the exact executable runtime file identities, then
+  executes `current/patched-codex/codex`. Launcher publication brackets a full
+  release hash validation with identical runtime snapshots, proving those
+  identities describe the validated bytes. It must never pin the legacy
+  mutable `patched-codex` directory or one immutable release path. First-time
+  launcher publication is post-commit: a failed activation cannot leave a new
+  launcher pointing through a rolled-back or absent `current` link.
 - Build and preparation use bounded memory and storage away from live runtime paths.
 - Activation occurs only through the deployment runbook after readiness and idle checks.
 
@@ -871,6 +881,10 @@ actor boundary on every supported Swift 6 toolchain.
 - Automatic thread healing is retired; repair is an explicit lease-backed operation.
 - Tunnel ownership is verified before termination or replacement.
 - Connection loss does not authorize app-server restart if health and ownership are unknown.
+- ChatGPT's SSH version probe, daemon bootstrap, and `app-server proxy` command
+  all resolve `codex` through the release-neutral public launcher. A successful
+  release activation therefore advances the built-in SSH daemon and the
+  port-8390 service to the same `current` runtime.
 
 ## Status And Repair
 

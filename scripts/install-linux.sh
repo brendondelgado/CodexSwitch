@@ -94,6 +94,7 @@ ACTIVATION_LOCK_HELD=0
 ACTIVATION_LOCK_TOKEN=""
 ACTIVATION_TRANSACTION_ACTIVE=0
 RUNTIME_GUARDS_HELD=0
+PUBLIC_CODEX_LAUNCHER_PREVALIDATED=0
 TEST_START_GUARD_HELD=0
 TEST_DAEMON_GUARD_HELD=0
 BUILD_LOCK_HELD=0
@@ -199,7 +200,8 @@ cat <<EOF
 Release manifest:
   $RELEASE_DIR/release-manifest.tsv
 
-Current and public CLI pointers were changed only when CODEXSWITCH_ACTIVATE=1.
+Current, public CLI, and public Codex routes were changed only when
+CODEXSWITCH_ACTIVATE=1.
 No service was stopped or restarted. Enablement and post-commit starts require
 their separate explicit flags.
 EOF

@@ -168,6 +168,14 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         self.assertIn("Alias|Also|DefaultInstance|Sockets|Service|Unit", text)
         self.assertIn('atomic_symlink "$new_target" "$CURRENT_LINK"', text)
         self.assertIn('$CURRENT_LINK/codexswitch-cli', text)
+        self.assertIn('PATCHED_CODEX="\\$CURRENT_ROOT/patched-codex/codex"', text)
+        self.assertIn("/usr/bin/flock --shared 9", text)
+        self.assertIn('exec "\\$PUBLIC_LAUNCHER" "\\$@"', text)
+        self.assertIn("codexswitch-current-launcher-v1", text)
+        self.assertIn("EXPECTED_MANIFEST_SHA256=", text)
+        self.assertIn("EXPECTED_CODEX_IDENTITY=", text)
+        self.assertIn('validate_release "$(canonicalize_path "$CURRENT_LINK")"', text)
+        self.assertIn("install_public_codex_launcher", text)
         self.assertIn("systemctl --user daemon-reload", text)
         self.assertIn("systemctl --user show", text)
         self.assertIn("codexswitch-activation-lock-v1", text)
@@ -2176,6 +2184,8 @@ PY
         self.bin_dir.mkdir(parents=True)
         public_cli = self.bin_dir / "codexswitch-cli"
         public_cli.write_text("legacy-public-cli\n")
+        public_codex = self.bin_dir / "codex"
+        public_codex.write_text("legacy-public-codex\n")
         service_snapshot = {
             path.relative_to(self.service_dir): path.read_bytes()
             for path in self.service_dir.rglob("*")
@@ -2219,6 +2229,8 @@ PY
         self.assertFalse((self.install_root / "previous").exists())
         self.assertFalse(public_cli.is_symlink())
         self.assertEqual(public_cli.read_text(), "legacy-public-cli\n")
+        self.assertFalse(public_codex.is_symlink())
+        self.assertEqual(public_codex.read_text(), "legacy-public-codex\n")
         self.assertEqual(
             service_snapshot,
             {
@@ -2600,6 +2612,7 @@ PY
         release = self._release(self.first_sha)
         expected_target = f"releases/{PACKAGE_VERSION}-{self.first_sha}"
         public_cli = self.bin_dir / "codexswitch-cli"
+        public_codex = self.bin_dir / "codex"
 
         self.assertEqual(os.readlink(self.install_root / "current"), expected_target)
         self.assertFalse((self.install_root / "previous").exists())
@@ -2608,6 +2621,83 @@ PY
             str(self.install_root.resolve() / "current" / "codexswitch-cli"),
         )
         self.assertEqual(public_cli.resolve(), (release / "codexswitch-cli").resolve())
+        self.assertTrue(public_codex.is_file())
+        self.assertFalse(public_codex.is_symlink())
+        self.assertEqual(stat.S_IMODE(public_codex.stat().st_mode), 0o555)
+        launcher = public_codex.read_text()
+        self.assertIn(
+            f"CURRENT_ROOT={self.install_root.resolve()}/current",
+            launcher,
+        )
+        self.assertIn('CURRENT_TARGET="$(readlink "$CURRENT_ROOT")"', launcher)
+        self.assertIn("codexswitch-hotswap-full-v3", launcher)
+        self.assertIn('PATCHED_CODEX="$CURRENT_ROOT/patched-codex/codex"', launcher)
+        self.assertIn("/usr/bin/flock --shared 9", launcher)
+        self.assertIn(
+            "CODEXSWITCH_LAUNCHER_FORMAT=codexswitch-current-launcher-v1",
+            launcher,
+        )
+        self.assertIn("EXPECTED_MANIFEST_SHA256=", launcher)
+        self.assertIn("EXPECTED_CODEX_IDENTITY=", launcher)
+        self.assertIn("EXPECTED_HELPER_IDENTITY=", launcher)
+        self.assertNotIn(
+            f"{self.install_root.resolve()}/patched-codex/codex",
+            launcher,
+        )
+        portable_launcher = self.root / "codex-launcher-fixture"
+        write_executable(
+            portable_launcher,
+            launcher.replace("/usr/bin/flock", str(self.fake_bin / "flock")),
+        )
+        version = subprocess.run(
+            [str(portable_launcher), "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        self.assertEqual(version.stdout.strip(), f"codex-cli {CODEX_VERSION}")
+        release_manifest = release / "release-manifest.tsv"
+        original_manifest = release_manifest.read_bytes()
+        manifest_mode = stat.S_IMODE(release_manifest.stat().st_mode)
+        release_manifest.chmod(manifest_mode | stat.S_IWUSR)
+        release_manifest.write_bytes(original_manifest + b"\n")
+        release_manifest.chmod(manifest_mode)
+        rejected = subprocess.run(
+            [str(portable_launcher), "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "manifest does not match the activated release",
+            rejected.stderr,
+        )
+        release_manifest.chmod(manifest_mode | stat.S_IWUSR)
+        release_manifest.write_bytes(original_manifest)
+        release_manifest.chmod(manifest_mode)
+
+        codex_runtime = release / "patched-codex" / "codex"
+        original_runtime = codex_runtime.read_bytes()
+        original_mode = stat.S_IMODE(codex_runtime.stat().st_mode)
+        codex_runtime.chmod(original_mode | stat.S_IWUSR)
+        codex_runtime.write_bytes(original_runtime + b"\n")
+        codex_runtime.chmod(original_mode)
+        rejected = subprocess.run(
+            [str(portable_launcher), "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "runtime does not match the activated release",
+            rejected.stderr,
+        )
+        codex_runtime.chmod(original_mode | stat.S_IWUSR)
+        codex_runtime.write_bytes(original_runtime)
+        codex_runtime.chmod(original_mode)
         app_unit = self.service_dir / "signul-codex-app-server.service"
         self.assertIn("current/patched-codex/codex", app_unit.read_text())
         dropin = self.service_dir / "signul-codex-app-server.service.d"
@@ -2673,6 +2763,117 @@ PY
         )
         self.assertNotIn("systemctl\t--user restart", log)
         self.assertNotIn("systemctl\t--user enable", log)
+
+    def test_activation_migrates_only_the_known_legacy_codex_launcher(self):
+        self._stage()
+        self.bin_dir.mkdir(parents=True)
+        public_codex = self.bin_dir / "codex"
+        legacy_runtime = self.install_root / "patched-codex" / "codex"
+        write_executable(
+            public_codex,
+            f"""
+            #!/usr/bin/env bash
+            PATCHED_CODEX='{legacy_runtime}'
+            echo "run codexswitch-cli install-prepared-codex" >&2
+            exec "$PATCHED_CODEX" "$@"
+            """,
+        )
+
+        self._activate()
+
+        self.assertFalse(public_codex.is_symlink())
+        self.assertNotIn(str(legacy_runtime), public_codex.read_text())
+        self.assertIn(
+            'PATCHED_CODEX="$CURRENT_ROOT/patched-codex/codex"',
+            public_codex.read_text(),
+        )
+
+        public_codex.chmod(0o755)
+        public_codex.write_text("#!/bin/sh\necho unrelated\n")
+        result = self._activate(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "public Codex launcher is not a recognized CodexSwitch route",
+            result.stderr,
+        )
+        self.assertEqual(public_codex.read_text(), "#!/bin/sh\necho unrelated\n")
+
+        write_executable(
+            public_codex,
+            f"""
+            #!/usr/bin/env bash
+            echo "PATCHED_CODEX='{legacy_runtime}'"
+            echo "run codexswitch-cli install-prepared-codex"
+            echo 'exec "$PATCHED_CODEX" "$@"'
+            """,
+        )
+        result = self._activate(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "public Codex launcher is not a recognized CodexSwitch route",
+            result.stderr,
+        )
+
+    def test_committed_activation_repairs_a_stale_generated_codex_launcher(self):
+        self._stage()
+        self._activate()
+        public_codex = self.bin_dir / "codex"
+        first_launcher = public_codex.read_bytes()
+        stale_launcher = self.root / "stale-codex-launcher"
+
+        second_sha = self._commit_main_release(2)
+        self._stage(second_sha)
+        result = self._activate(
+            second_sha,
+            {
+                "CODEXSWITCH_TEST_MODE": "1",
+                "CODEXSWITCH_TEST_FAULT_POINT": "after_commit_before_codex_launcher",
+                "CODEXSWITCH_TEST_FAULT_MODE": "crash",
+            },
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            os.readlink(self.install_root / "current"),
+            f"releases/{PACKAGE_VERSION}-{second_sha}",
+        )
+        self.assertEqual(public_codex.read_bytes(), first_launcher)
+        self.assertTrue((self.install_root / ".activation-transaction.tsv").is_file())
+
+        self._activate(second_sha)
+
+        self.assertNotEqual(public_codex.read_bytes(), first_launcher)
+        self.assertFalse((self.install_root / ".activation-transaction.tsv").exists())
+        self.assertIn(
+            "CODEXSWITCH_LAUNCHER_FORMAT=codexswitch-current-launcher-v1",
+            public_codex.read_text(),
+        )
+        portable_current = self.root / "current-codex-launcher"
+        write_executable(
+            portable_current,
+            public_codex.read_text().replace(
+                "/usr/bin/flock",
+                str(self.fake_bin / "flock"),
+            ),
+        )
+        stale_contents = first_launcher.decode().replace(
+            "/usr/bin/flock",
+            str(self.fake_bin / "flock"),
+        )
+        stale_contents = stale_contents.replace(
+            f"PUBLIC_LAUNCHER={public_codex}",
+            f"PUBLIC_LAUNCHER={portable_current}",
+        )
+        write_executable(stale_launcher, stale_contents)
+        version = subprocess.run(
+            [str(stale_launcher), "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        self.assertEqual(version.stdout.strip(), f"codex-cli {CODEX_VERSION}")
 
     def test_unowned_abandoned_transaction_is_preserved_for_manual_review(self):
         self._stage()
@@ -3378,6 +3579,7 @@ PY
         self._activate()
         first_target = f"releases/{PACKAGE_VERSION}-{self.first_sha}"
         public_cli = self.bin_dir / "codexswitch-cli"
+        public_codex = self.bin_dir / "codex"
 
         second_sha = self._commit_main_release(2)
         self._stage(second_sha)
@@ -3392,6 +3594,10 @@ PY
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(os.readlink(self.install_root / "current"), first_target)
         self.assertEqual(public_cli.resolve(), (self._release(self.first_sha) / "codexswitch-cli").resolve())
+        self.assertIn(
+            f"CURRENT_ROOT={self.install_root.resolve()}/current",
+            public_codex.read_text(),
+        )
         self.assertFalse((self.install_root / "previous").exists())
         self.assertFalse((self.install_root / ".activation-transaction.tsv").exists())
         self.assertFalse((self.install_root / ".activation.lock").exists())
@@ -3418,6 +3624,10 @@ PY
         )
         self.assertEqual(os.readlink(self.install_root / "previous"), first_target)
         self.assertEqual(public_cli.resolve(), (self._release(second_sha) / "codexswitch-cli").resolve())
+        self.assertIn(
+            'PATCHED_CODEX="$CURRENT_ROOT/patched-codex/codex"',
+            public_codex.read_text(),
+        )
         self.assertEqual(
             os.readlink(public_cli),
             str(self.install_root.resolve() / "current" / "codexswitch-cli"),
@@ -3457,6 +3667,7 @@ PY
         self.assertFalse((self.install_root / "current").exists())
         self.assertFalse((self.install_root / "previous").exists())
         self.assertFalse((self.bin_dir / "codexswitch-cli").exists())
+        self.assertFalse((self.bin_dir / "codex").exists())
         self.assertFalse((self.install_root / ".activation-transaction.tsv").exists())
 
         self._activate()
@@ -3480,6 +3691,10 @@ PY
         self.assertEqual(
             (self.bin_dir / "codexswitch-cli").resolve(),
             (self._release(second_sha) / "codexswitch-cli").resolve(),
+        )
+        self.assertIn(
+            'PATCHED_CODEX="$CURRENT_ROOT/patched-codex/codex"',
+            (self.bin_dir / "codex").read_text(),
         )
         self.assertFalse((self.install_root / ".activation-transaction.tsv").exists())
 

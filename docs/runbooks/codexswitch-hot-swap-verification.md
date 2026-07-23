@@ -71,7 +71,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-22
+  last_updated: 2026-07-23
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -337,7 +337,7 @@ CodexSwitch must evaluate these independently:
 - **Mac remote client:** a `codex --remote` process on the Mac is a transport client, not the account-bearing app-server. It must not be treated as the VPS hot-swap target.
 - **Linux VPS app-server:** the app-server process is the primary account-bearing runtime for KittyLitter/remote sessions and must acknowledge reload.
 - **Remote SSH proxy:** `codex app-server proxy` is a transport bridge, not the account-bearing runtime, so it is excluded from SIGHUP targeting. After promoting a new VPS binary, reconnect the desktop's remote SSH transport so the proxy adopts the new protocol and model catalog; validate auth against the long-running remote-control app-server.
-- **Linux patched CLI:** `/home/signul/.local/share/codexswitch/patched-codex/codex ...` is a native Codex runtime even when launched with arguments such as `--yolo`. Detection must inspect the executable token, not only exact command-line suffixes. The app-server detector must also accept `app-server --remote-control --listen ws://...`; otherwise the VPS can write `auth.json` but report `signaled 0 Codex hot-swap process(es)`.
+- **Linux patched CLI:** `/home/signul/.local/share/codexswitch/current/patched-codex/codex ...` is a native Codex runtime even when launched with arguments such as `--yolo`. Detection must inspect the executable token, not only exact command-line suffixes. The app-server detector must also accept `app-server --remote-control --listen ws://...`; otherwise the VPS can write `auth.json` but report `signaled 0 Codex hot-swap process(es)`.
 - **Background ACK repair:** the daemon may repair missing ACKs for live interactive CLI sessions. Discovery attempts are capped at one per 60 seconds even when no ACK is missing; a healthy no-work result must advance the cadence clock. It must not repeatedly signal an app-server that has not proven live reload support, because a supervised WebSocket app-server can exit on `SIGHUP` and enter a disconnecting restart loop.
 - **Barrier failure:** when the daemon tick rejects a durable activation barrier, the production loop must skip its background ACK repair for that iteration. Test the outer loop decision, not only the inner tick.
 - **Desktop RPC deadlines:** WebSocket send/receive timeouts must use a monotonic dispatch deadline rather than a cooperative Swift sleep. Executor saturation or a non-cooperative URLSession operation must not postpone cancellation or hold a swap transaction open past its bounded deadline.
@@ -816,6 +816,11 @@ Before claiming hot-swap is fixed or ready:
 
 - [ ] `codexswitch-cli auth-diagnostics` shows active account hash equals `auth.json` hash.
 - [ ] `codexswitch-cli doctor` reports live runtimes as verified, not merely patched.
+- [ ] On the VPS, `codex --version` matches
+  `current/patched-codex/codex --version`, and the public launcher contains the
+  `current/patched-codex` route rather than the legacy mutable
+  `codexswitch/patched-codex` route. Replacing either runtime executable or
+  changing the release manifest must make that launcher fail closed.
 - [ ] A deliberately suspended automatic-policy fixture expires its lease at 30
   seconds, logs `AUTOMATIC_POLICY_GATE_TIMEOUT`, and permits the next monitor
   evaluation; completion of the stale fixture cannot clear or authorize the
