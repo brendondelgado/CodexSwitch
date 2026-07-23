@@ -863,7 +863,9 @@ actor boundary on every supported Swift 6 toolchain.
   identities describe the validated bytes. It must never pin the legacy
   mutable `patched-codex` directory or one immutable release path. First-time
   launcher publication is post-commit: a failed activation cannot leave a new
-  launcher pointing through a rolled-back or absent `current` link.
+  launcher pointing through a rolled-back or absent `current` link. The one
+  accepted legacy pointer is an absolute link to a direct child of the managed
+  `releases` directory; the next activation normalizes it to the relative form.
 - Build and preparation use bounded memory and storage away from live runtime paths.
 - Activation occurs only through the deployment runbook after readiness and idle checks.
 

@@ -2820,6 +2820,25 @@ PY
         public_codex = self.bin_dir / "codex"
         first_launcher = public_codex.read_bytes()
         stale_launcher = self.root / "stale-codex-launcher"
+        current_link = self.install_root / "current"
+        current_link.unlink()
+        current_link.symlink_to(self._release(self.first_sha).resolve())
+        absolute_pointer_launcher = self.root / "absolute-pointer-codex-launcher"
+        write_executable(
+            absolute_pointer_launcher,
+            first_launcher.decode().replace(
+                "/usr/bin/flock",
+                str(self.fake_bin / "flock"),
+            ),
+        )
+        version = subprocess.run(
+            [str(absolute_pointer_launcher), "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        self.assertEqual(version.stdout.strip(), f"codex-cli {CODEX_VERSION}")
 
         second_sha = self._commit_main_release(2)
         self._stage(second_sha)

@@ -600,12 +600,17 @@ managed_release_from_link() {
   [[ -L "$link" ]] || fail "$label path is not a symlink: $link"
   target="$(readlink "$link")"
   case "$target" in
-    releases/*) ;;
+    releases/*)
+      release_id="${target#releases/}"
+      ;;
+    "$RELEASES_DIR"/*)
+      release_id="${target#"$RELEASES_DIR"/}"
+      target="releases/$release_id"
+      ;;
     *) fail "$label symlink has an unmanaged target: $target" ;;
   esac
-  release_id="${target#releases/}"
   [[ -n "$release_id" && "$release_id" != */* && "$release_id" != *..* ]] || fail "$label symlink target is unsafe: $target"
-  release_dir="$INSTALL_ROOT/$target"
+  release_dir="$RELEASES_DIR/$release_id"
   validate_release "$release_dir"
   printf '%s\n' "$target"
 }

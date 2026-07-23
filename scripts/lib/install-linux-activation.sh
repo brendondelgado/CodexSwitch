@@ -327,18 +327,22 @@ fi
 
 CURRENT_TARGET="\$(readlink "\$CURRENT_ROOT")"
 case "\$CURRENT_TARGET" in
-  releases/*) ;;
+  releases/*)
+    RELEASE_ID="\${CURRENT_TARGET#releases/}"
+    ;;
+  "\$INSTALL_ROOT"/releases/*)
+    RELEASE_ID="\${CURRENT_TARGET#"\$INSTALL_ROOT/releases/"}"
+    ;;
   *)
     echo "codex: current CodexSwitch release pointer is invalid" >&2
     exit 1
     ;;
 esac
-RELEASE_ID="\${CURRENT_TARGET#releases/}"
 if [[ -z "\$RELEASE_ID" || "\$RELEASE_ID" == */* || "\$RELEASE_ID" == *..* ]]; then
   echo "codex: current CodexSwitch release identity is invalid" >&2
   exit 1
 fi
-RELEASE_ROOT="\$INSTALL_ROOT/\$CURRENT_TARGET"
+RELEASE_ROOT="\$INSTALL_ROOT/releases/\$RELEASE_ID"
 RELEASE_MANIFEST="\$RELEASE_ROOT/release-manifest.tsv"
 if [[ "\$(readlink -f "\$CURRENT_ROOT")" != "\$RELEASE_ROOT" ]] ||
    [[ ! -f "\$RELEASE_MANIFEST" || -L "\$RELEASE_MANIFEST" ]] ||
