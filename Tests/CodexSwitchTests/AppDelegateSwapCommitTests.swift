@@ -163,7 +163,7 @@ struct AppDelegateSwapCommitTests {
             .allowsLaunchSameTargetRecovery)
     }
 
-    @Test("Runtime topology recovery is one-shot and fully managed")
+    @Test("Runtime topology recovery captures a baseline before a managed change")
     func topologyRecoveryRequiresManagedChangedTopology() {
         let target = UUID()
         let exhausted = AccountActivationState.manualReview(
@@ -172,25 +172,60 @@ struct AppDelegateSwapCommitTests {
             retryAttempt: 4,
             at: Date()
         )
+        let unmanaged = CodexLocalCLIRuntimeTopology(
+            runtimes: [],
+            allRuntimesUseManagedRoute: false
+        )
+        let managed = CodexLocalCLIRuntimeTopology(
+            runtimes: [],
+            allRuntimesUseManagedRoute: true
+        )
+        let unmanagedBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
+            targetAccountId: target,
+            activationGeneration: exhausted.activationGeneration,
+            topology: unmanaged
+        )
+        let managedBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
+            targetAccountId: target,
+            activationGeneration: exhausted.activationGeneration,
+            topology: managed
+        )
+        let staleBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
+            targetAccountId: target,
+            activationGeneration: UUID(),
+            topology: unmanaged
+        )
 
-        #expect(AppDelegate.retryExhaustedTopologyRecoveryTarget(
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
             state: exhausted,
             configuredAccountId: target,
-            topologyIsFullyManaged: true,
-            topologyChanged: true
-        ) == target)
-        #expect(AppDelegate.retryExhaustedTopologyRecoveryTarget(
+            topology: managed,
+            baseline: nil
+        ) == .captureBaseline(managedBaseline))
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
             state: exhausted,
             configuredAccountId: target,
-            topologyIsFullyManaged: false,
-            topologyChanged: true
-        ) == nil)
-        #expect(AppDelegate.retryExhaustedTopologyRecoveryTarget(
+            topology: managed,
+            baseline: managedBaseline
+        ) == .wait)
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
             state: exhausted,
             configuredAccountId: target,
-            topologyIsFullyManaged: true,
-            topologyChanged: false
-        ) == nil)
+            topology: managed,
+            baseline: staleBaseline
+        ) == .captureBaseline(managedBaseline))
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
+            state: exhausted,
+            configuredAccountId: target,
+            topology: managed,
+            baseline: unmanagedBaseline
+        ) == .recover(target, managedBaseline))
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
+            state: exhausted,
+            configuredAccountId: target,
+            topology: unmanaged,
+            baseline: managedBaseline
+        ) == .wait)
     }
 
     @Test("Launch waits for bridge installation before retry recovery")

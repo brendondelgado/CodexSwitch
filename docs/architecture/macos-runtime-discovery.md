@@ -237,7 +237,10 @@ the same-target retry budget once for each newly observed topology only after
 every discovered CLI resolves to the current managed runtime. A stable failing
 topology never creates an unbounded retry loop. App launch alone is not a
 topology change: retry-exhausted manual review survives relaunch without a
-desktop JSON-RPC send.
+desktop JSON-RPC send. The first passive observation after entering or
+reloading that manual-review state establishes a non-mutating topology
+baseline scoped to that activation generation and target. Only a later distinct
+fully managed topology may authorize recovery.
 
 Desktop JSON-RPC mutation participates in that same admitted operation. PID
 admission is acquired before typed runtime or listening-port discovery. Each

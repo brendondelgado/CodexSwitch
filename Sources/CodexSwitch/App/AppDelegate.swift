@@ -310,7 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var automaticPolicyLeaseState = AccountAutomaticPolicyLeaseState()
     private var retryExhaustedTopologyCheckTask: Task<Void, Never>?
     private var lastRetryExhaustedTopologyCheckAt: Date?
-    private var lastAttemptedRetryExhaustedTopology: CodexLocalCLIRuntimeTopology?
+    private var retryExhaustedTopologyBaseline: RetryExhaustedTopologyBaseline?
     private var isExiting = false
     private var terminationFlushTask: Task<Void, Never>?
     private var terminationFlushCompleted = false
@@ -5807,27 +5807,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                   !self.isExiting,
                   self.pendingSwapTargetAccountId == nil,
                   self.swapConvergenceTask == nil,
-                  let topology,
-                  let targetAccountId = Self.retryExhaustedTopologyRecoveryTarget(
-                      state: self.accountManager.activationState,
-                      configuredAccountId: self.accountManager.configuredAccount?.id,
-                      topologyIsFullyManaged: topology.allRuntimesUseManagedRoute,
-                      topologyChanged:
-                          topology != self.lastAttemptedRetryExhaustedTopology
-                  ),
-                  let target = self.accountManager.accounts.first(where: {
-                      $0.id == targetAccountId
-                  }) else {
+                  let topology else {
                 return
             }
-            self.lastAttemptedRetryExhaustedTopology = topology
-            SwapLog.append(.debug(
-                "ACTIVATION_TOPOLOGY_RECOVERY_STARTED target=\(target.email) runtimes=\(topology.runtimes.count)"
-            ))
-            await self.startSameTargetRuntimeRetry(
-                to: target,
-                source: "runtime_topology_recovery"
+
+            let decision = Self.retryExhaustedTopologyDecision(
+                state: self.accountManager.activationState,
+                configuredAccountId: self.accountManager.configuredAccount?.id,
+                topology: topology,
+                baseline: self.retryExhaustedTopologyBaseline
             )
+            switch decision {
+            case .captureBaseline(let baseline):
+                self.retryExhaustedTopologyBaseline = baseline
+                SwapLog.append(.debug(
+                    "ACTIVATION_TOPOLOGY_BASELINE_CAPTURED runtimes=\(baseline.topology.runtimes.count)"
+                ))
+                return
+            case .wait:
+                return
+            case .recover(let targetAccountId, let baseline):
+                guard let target = self.accountManager.accounts.first(where: {
+                    $0.id == targetAccountId
+                }) else {
+                    return
+                }
+                self.retryExhaustedTopologyBaseline = baseline
+                SwapLog.append(.debug(
+                    "ACTIVATION_TOPOLOGY_RECOVERY_STARTED target=\(target.email) runtimes=\(baseline.topology.runtimes.count)"
+                ))
+                await self.startSameTargetRuntimeRetry(
+                    to: target,
+                    source: "runtime_topology_recovery"
+                )
+            }
         }
     }
 
@@ -5860,22 +5873,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return observedTargetAccountId
     }
 
-    nonisolated static func retryExhaustedTopologyRecoveryTarget(
+    struct RetryExhaustedTopologyBaseline: Equatable {
+        let targetAccountId: UUID
+        let activationGeneration: UUID
+        let topology: CodexLocalCLIRuntimeTopology
+    }
+
+    enum RetryExhaustedTopologyDecision: Equatable {
+        case captureBaseline(RetryExhaustedTopologyBaseline)
+        case wait
+        case recover(UUID, RetryExhaustedTopologyBaseline)
+    }
+
+    nonisolated static func retryExhaustedTopologyDecision(
         state: AccountActivationState?,
         configuredAccountId: UUID?,
-        topologyIsFullyManaged: Bool,
-        topologyChanged: Bool
-    ) -> UUID? {
-        guard topologyIsFullyManaged,
-              topologyChanged,
-              let state,
+        topology: CodexLocalCLIRuntimeTopology,
+        baseline: CodexLocalCLIRuntimeTopology?
+    ) -> RetryExhaustedTopologyDecision {
+        guard let state,
               state.phase == .manualReview,
               state.detail == .automaticRetryLimitReached,
               let targetAccountId = state.configuredAccountId,
               targetAccountId == configuredAccountId else {
-            return nil
+            return .wait
         }
-        return targetAccountId
+        let observed = RetryExhaustedTopologyBaseline(
+            targetAccountId: targetAccountId,
+            activationGeneration: state.activationGeneration,
+            topology: topology
+        )
+        guard let baseline,
+              baseline.targetAccountId == targetAccountId,
+              baseline.activationGeneration == state.activationGeneration else {
+            return .captureBaseline(observed)
+        }
+        guard topology != baseline.topology,
+              topology.allRuntimesUseManagedRoute else {
+            return .wait
+        }
+        return .recover(targetAccountId, observed)
     }
 
     private func beginSameTargetRuntimeRetry(to target: CodexAccount, source: String) {

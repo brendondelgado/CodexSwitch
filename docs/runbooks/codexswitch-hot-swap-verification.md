@@ -869,7 +869,8 @@ Before claiming hot-swap is fixed or ready:
   `automatic_retry_limit_reached` journal without resetting its retry budget or
   sending desktop JSON-RPC. Only an explicit manual retry, verified external
   auth recovery, or a newly observed fully managed runtime topology may re-arm
-  convergence.
+  convergence. The topology watcher's first post-launch observation only
+  captures its baseline and performs no mutation.
 - [ ] Each live target has a fresh `.codexswitch/hotswap-ack/<pid>.json` acknowledgement.
 - [ ] Desktop discovery admits only an explicit loopback WebSocket app-server
   that owns its listening TCP socket. A concurrent managed
