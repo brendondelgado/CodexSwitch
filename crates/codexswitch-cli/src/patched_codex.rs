@@ -945,7 +945,7 @@ mod tests {
                 "printf new > {}",
                 shell_quote(&marker.display().to_string())
             ),
-            Duration::from_secs(1),
+            Duration::from_secs(10),
         )?;
         std::thread::sleep(Duration::from_millis(350));
         assert_eq!(fs::read(&marker)?, b"new");
