@@ -115,7 +115,7 @@ struct AppDelegateSwapCommitTests {
         #expect(source.contains("ACTIVATION_FILE_COMMIT_FAILURE_RECOVERED"))
     }
 
-    @Test("Launch recovery is limited to a configured recoverable target")
+    @Test("Launch recovery preserves exhausted retries and requires a durable target")
     func launchRecoveryRequiresExactRecoverableTarget() {
         let target = UUID()
         let other = UUID()
@@ -140,13 +140,13 @@ struct AppDelegateSwapCommitTests {
         #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
             state: exhausted,
             configuredAccountId: target
-        ) == target)
+        ) == nil)
         #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
             state: durableReadback,
             configuredAccountId: target
         ) == target)
         #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
-            state: exhausted,
+            state: durableReadback,
             configuredAccountId: other
         ) == nil)
         #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
@@ -157,6 +157,10 @@ struct AppDelegateSwapCommitTests {
             state: nil,
             configuredAccountId: target
         ) == nil)
+        #expect(!AccountActivationDetail.automaticRetryLimitReached
+            .allowsLaunchSameTargetRecovery)
+        #expect(AccountActivationDetail.durableConfigurationChanged
+            .allowsLaunchSameTargetRecovery)
     }
 
     @Test("Runtime topology recovery is one-shot and fully managed")

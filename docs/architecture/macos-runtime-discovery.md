@@ -235,7 +235,9 @@ When retry exhaustion is caused by a historical CLI, CodexSwitch observes the
 exact local CLI topology off the main actor at a throttled cadence. It may reset
 the same-target retry budget once for each newly observed topology only after
 every discovered CLI resolves to the current managed runtime. A stable failing
-topology never creates an unbounded retry loop.
+topology never creates an unbounded retry loop. App launch alone is not a
+topology change: retry-exhausted manual review survives relaunch without a
+desktop JSON-RPC send.
 
 Desktop JSON-RPC mutation participates in that same admitted operation. PID
 admission is acquired before typed runtime or listening-port discovery. Each

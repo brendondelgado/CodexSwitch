@@ -5837,7 +5837,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     ) -> UUID? {
         guard let state,
               state.phase == .manualReview,
-              state.detail?.allowsManualSameTargetRetry == true,
+              state.detail?.allowsLaunchSameTargetRecovery == true,
               let targetAccountId = state.configuredAccountId,
               targetAccountId == configuredAccountId else {
             return nil
@@ -5868,13 +5868,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     ) -> UUID? {
         guard topologyIsFullyManaged,
               topologyChanged,
-              state?.detail == .automaticRetryLimitReached else {
+              let state,
+              state.phase == .manualReview,
+              state.detail == .automaticRetryLimitReached,
+              let targetAccountId = state.configuredAccountId,
+              targetAccountId == configuredAccountId else {
             return nil
         }
-        return manualReviewLaunchRecoveryTarget(
-            state: state,
-            configuredAccountId: configuredAccountId
-        )
+        return targetAccountId
     }
 
     private func beginSameTargetRuntimeRetry(to target: CodexAccount, source: String) {

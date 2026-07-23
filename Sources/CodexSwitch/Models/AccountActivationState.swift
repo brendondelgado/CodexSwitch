@@ -46,6 +46,10 @@ enum AccountActivationDetail: String, Codable, Equatable, Sendable {
         self == .automaticRetryLimitReached
     }
 
+    var allowsLaunchSameTargetRecovery: Bool {
+        self == .durableConfigurationChanged
+    }
+
     var allowsVerifiedExternalAuthRecovery: Bool {
         switch self {
         case .externalAuthAbsent, .externalAuthInvalid, .externalAuthUnreadable:

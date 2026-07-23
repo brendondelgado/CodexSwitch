@@ -865,9 +865,11 @@ Before claiming hot-swap is fixed or ready:
   CLI forwarding wrapper must not block this desktop-only bootstrap.
 - [ ] The Swift managed-launcher fixture uses real tab bytes and contains no
   literal `\t` indentation sequences, matching the Rust-generated launcher.
-- [ ] Relaunching CodexSwitch recovers a same-target
-  `automatic_retry_limit_reached` journal once, after bridge installation,
-  without changing the configured account or credential files.
+- [ ] Relaunching or reinstalling CodexSwitch preserves a same-target
+  `automatic_retry_limit_reached` journal without resetting its retry budget or
+  sending desktop JSON-RPC. Only an explicit manual retry, verified external
+  auth recovery, or a newly observed fully managed runtime topology may re-arm
+  convergence.
 - [ ] Each live target has a fresh `.codexswitch/hotswap-ack/<pid>.json` acknowledgement.
 - [ ] Desktop discovery admits only an explicit loopback WebSocket app-server
   that owns its listening TCP socket. A concurrent managed

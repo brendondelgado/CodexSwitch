@@ -632,10 +632,12 @@ After that process exits, a throttled topology-change check may re-arm the
 exhausted same-target convergence once without relaunching CodexSwitch. The
 check is observational; the subsequent mutation path still performs full route,
 hash, vnode, request, signal, and ACK verification.
-After the bridge installation task completes, app launch may reset only a
-same-target `automatic_retry_limit_reached` journal and make one bounded
-convergence attempt. This recovery does not change the configured account or
-credentials, and all later automatic retry limits remain in force.
+App launch must preserve a same-target `automatic_retry_limit_reached` journal
+as durable manual review. Relaunching CodexSwitch, reinstalling the menu app, or
+finishing bridge installation is not new runtime evidence and must not reset the
+retry budget or send desktop JSON-RPC. Only an explicit manual retry, verified
+external-auth recovery, or a newly observed fully managed runtime topology may
+re-arm convergence; an unchanged failing topology remains paused.
 The VPS daemon may hold the account-store lock only for a bounded read,
 generation revalidation, journal transition, or atomic commit. Provider quota
 requests, reset-inventory requests, token refresh, process discovery, signals,
