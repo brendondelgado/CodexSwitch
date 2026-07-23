@@ -1,0 +1,44 @@
+Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
+  s_70c8e194852bb5::t_d4e810f05c6a10 42,202,586-591,595-605
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_db4fd440a9d248 172-178,195-201
+  s_70c8e194852bb5::t_b0cf5324075549 202
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_db8c5eb6abf833 789,794-798,826,849,854-859,883-892
+  s_70c8e194852bb5::t_7a447491b5f959 827
+  s_70c8e194852bb5::t_40e8b020f56421 893-894
+Tests/CodexSwitchTests/CodexVersionCheckerTests.swift
+  s_70c8e194852bb5::t_7a447491b5f959 767-778
+Tests/CodexSwitchTests/CodexDesktopBridgeKeepAliveTests.swift
+  s_70c8e194852bb5::t_7a447491b5f959 36-136
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_3f8501d586e73f 1212-1242
+Sources/CodexSwitch/Services/CodexVersionChecker.swift
+  s_70c8e194852bb5::t_a0a963022aec60 44-58,934-950,965,968-974,991-996,1029-1034
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_db4fd440a9d248 381-387
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_db4fd440a9d248 674-677
+Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
+  s_70c8e194852bb5::t_def2d9f0fb9c3a 163,167,179,315,323
+  s_70c8e194852bb5::t_064cfbc08a5b00 1,8-10,150-162,164-166,168-178,180-229,284-314,316-322,324-376
+  s_70c8e194852bb5::t_15672d740f50b0 377
+Tests/CodexSwitchTests/DesktopRuntimeReloadClientTests.swift
+  s_70c8e194852bb5::t_f4fc2ddf41a068 234,419,448,598,601
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "09b8a47b69f5ab74f95db26aed671fc0315fd2c5",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

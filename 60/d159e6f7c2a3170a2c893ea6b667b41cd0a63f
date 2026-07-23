@@ -1,0 +1,23 @@
+scripts/test_macos_runtime_artifact.py
+  s_70c8e194852bb5::t_b8f5db4816e3a1 335-348
+docs/architecture/macos-runtime-artifact.md
+  s_70c8e194852bb5::t_b8f5db4816e3a1 248-250
+scripts/install-macos-cli-artifact.sh
+  s_70c8e194852bb5::t_b8f5db4816e3a1 176-178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "60d159e6f7c2a3170a2c893ea6b667b41cd0a63f",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

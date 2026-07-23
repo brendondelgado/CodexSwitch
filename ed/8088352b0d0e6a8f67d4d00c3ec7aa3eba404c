@@ -1,0 +1,28 @@
+Sources/CodexSwitch/Services/AccountActivationRuntimeEvidence.swift
+  s_70c8e194852bb5::t_c2799e2e46b589 98-99,123-125
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_c2799e2e46b589 91-95,97-101,103-117,119-123,125-129
+  s_70c8e194852bb5::t_747bbdb7729a6b 90,96,102,118,124
+crates/codexswitch-cli/src/activation.rs
+  s_70c8e194852bb5::t_b1b2eec8bea493 2493-2496,2894-2896,2976,3015-3017,3093-3095,3164-3166,3231-3233,3277-3279,3519-3522,3563-3566,3604-3607,3822-3824,3942-3944,3946-3949,3984-3986,4023-4025,4051-4053
+crates/codexswitch-cli/src/daemon.rs
+  s_70c8e194852bb5::t_eb685a544f1275 1156-1159,1668-1671,1790,1897,1949,1989-2004,2059-2061
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_3260b2a209200f 1194-1198,2029-2032,2178-2184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ed8088352b0d0e6a8f67d4d00c3ec7aa3eba404c",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

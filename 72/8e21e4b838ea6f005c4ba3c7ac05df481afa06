@@ -1,0 +1,53 @@
+Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
+  s_70c8e194852bb5::t_029588e4bd307a 32
+  s_70c8e194852bb5::t_74030aa175311b 31
+Tests/CodexSwitchTests/CodexPatchingTests.swift
+  s_70c8e194852bb5::t_029588e4bd307a 207
+  s_70c8e194852bb5::t_21d63b4aa5b5f1 203-206,208-215
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_57cef5ca052840 73,111-116,702
+  s_70c8e194852bb5::t_029588e4bd307a 703
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_cca964088087d1 39,49-50,57,336-344,646-650
+  s_70c8e194852bb5::t_c649f7a08bac8b 651-652
+  s_70c8e194852bb5::t_029588e4bd307a 653-655
+  s_70c8e194852bb5::t_55b8797858fdbb 656
+scripts/test_patch_asar.py
+  s_70c8e194852bb5::t_21d63b4aa5b5f1 733,753,755-756,759,775,777-778,781-785,794-824
+  s_70c8e194852bb5::t_08feb60f4dc192 826-849
+  s_70c8e194852bb5::t_cdb8d6f2730a2e 935
+  s_70c8e194852bb5::t_fb974344dae461 934,949,963-968,985-1031
+  s_70c8e194852bb5::t_13f9eed4e2d2b3 825
+  s_70c8e194852bb5::t_dbf539a3d55d08 1032
+docs/runbooks/codex-vps-thread-tools-mcp.md
+  s_70c8e194852bb5::t_f4f91f1485726e 19,138-141
+scripts/patch-asar.py
+  s_70c8e194852bb5::t_6035bff0b2c8a0 96-98
+  s_70c8e194852bb5::t_c556edd2c8a953 1275-1328,1586
+  s_70c8e194852bb5::t_cdb8d6f2730a2e 2146,2296-2298
+  s_70c8e194852bb5::t_fcd7a022aa9d21 2112-2145,2147-2154,2168-2169,2184,2233,2278
+  s_70c8e194852bb5::t_43f86f1e4f2d34 88,1356,1427,1431-1440,1442,1448-1450,1452-1465,1470-1472,1502,1506-1519,1587
+  s_70c8e194852bb5::t_275e2f97d51ab0 1394
+  s_70c8e194852bb5::t_74030aa175311b 3418
+  s_70c8e194852bb5::t_2a289fa5308ce8 1467,1652
+  s_70c8e194852bb5::t_fafd32efab07d6 1520
+Sources/CodexSwitch/Services/DesktopPatchManager.swift
+  s_70c8e194852bb5::t_029588e4bd307a 312
+  s_70c8e194852bb5::t_74030aa175311b 311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "728e21e4b838ea6f005c4ba3c7ac05df481afa06",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

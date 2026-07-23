@@ -1,0 +1,26 @@
+scripts/patch-asar.py
+  s_70c8e194852bb5::t_073253750c6d33 681-715,717,725-727,768-786,798-799,804-818,821
+  s_70c8e194852bb5::t_4a19e2ed3a4735 85-90
+scripts/test_patch_asar.py
+  s_70c8e194852bb5::t_3fc6ce4d6b3828 478-555
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_b07aa8a9a0ead0 792
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_b07aa8a9a0ead0 773-780
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b4073daf81dbb84a70799de68a3ab13ff6c6528e",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

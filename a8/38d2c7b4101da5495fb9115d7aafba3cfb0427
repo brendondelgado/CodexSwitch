@@ -1,0 +1,30 @@
+Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
+  s_70c8e194852bb5::t_c5f41285cd3e12 155-157
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_e9308360876d2c 676-678
+Tests/CodexSwitchTests/CodexVersionCheckerTests.swift
+  s_70c8e194852bb5::t_c5f41285cd3e12 738-744,762-766,783
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_e9308360876d2c 175-181,206-210
+  s_70c8e194852bb5::t_af13d3375585ba 211
+Sources/CodexSwitch/Services/CodexVersionChecker.swift
+  s_70c8e194852bb5::t_c5f41285cd3e12 960-969,971,978
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_e9308360876d2c 384-389
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a838d2c7b4101da5495fb9115d7aafba3cfb0427",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
+  s_70c8e194852bb5::t_253e6503510dd6 592
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "96ff4cddb238763a04d7c29825a9865a0b0650ba",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_322aa5bf925de4 10,24,86-97
+  s_70c8e194852bb5::t_6382ee77e2be2e 98
+crates/codexswitch-cli/src/readiness.rs
+  s_70c8e194852bb5::t_5b184b5d998504 372,393
+crates/codexswitch-cli/src/daemon.rs
+  s_70c8e194852bb5::t_ab6784e3f54a76 486-501,509-510
+  s_70c8e194852bb5::t_94a54b27a5cb16 2138-2255
+  s_70c8e194852bb5::t_f87cfccf6f7997 838,840-841,848-861,867-891
+  s_70c8e194852bb5::t_ed0c969ece77b2 892-893
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_5b184b5d998504 3,18,119
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_322aa5bf925de4 569-577,669-671
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ce7f219515b47b057ebabbfa3218dca74717a650",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,28 @@
+crates/codexswitch-cli/src/daemon.rs
+  s_70c8e194852bb5::t_27a72df58d630e 1676,1784,1891
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_e9c85b0628e50e 4500
+crates/codexswitch-cli/src/activation.rs
+  s_70c8e194852bb5::t_0c7727f89797f2 1208-1252,1283-1284,1503,1506-1507,1766,1770-1783
+  s_70c8e194852bb5::t_9e7a84886ee495 930,1367-1368,2945-3005
+  s_70c8e194852bb5::t_3342644b087b13 1369-1388
+  s_70c8e194852bb5::t_19fe8f815467ee 1504-1505
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_64b00355afe178 2671,2956,3002,3073,3110,3564,3583,3621,3736,4426
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "8ffc221b835406185e8c0129042ac51f9985190a",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
