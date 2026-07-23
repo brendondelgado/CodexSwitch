@@ -5889,7 +5889,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         state: AccountActivationState?,
         configuredAccountId: UUID?,
         topology: CodexLocalCLIRuntimeTopology,
-        baseline: CodexLocalCLIRuntimeTopology?
+        baseline: RetryExhaustedTopologyBaseline?
     ) -> RetryExhaustedTopologyDecision {
         guard let state,
               state.phase == .manualReview,
