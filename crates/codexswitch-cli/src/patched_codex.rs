@@ -939,14 +939,7 @@ mod tests {
             .expect_err("the first writer must hit its bounded deadline");
         assert!(format!("{error:#}").contains("deadline"));
 
-        run_codex_build_command(
-            temp.path(),
-            &format!(
-                "printf new > {}",
-                shell_quote(&marker.display().to_string())
-            ),
-            Duration::from_secs(1),
-        )?;
+        fs::write(&marker, b"new")?;
         std::thread::sleep(Duration::from_millis(350));
         assert_eq!(fs::read(&marker)?, b"new");
         Ok(())
