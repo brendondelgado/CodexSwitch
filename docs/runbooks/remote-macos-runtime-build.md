@@ -28,7 +28,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-20
+  last_updated: 2026-07-22
 ---
 
 # Remote macOS Runtime Build
@@ -57,7 +57,8 @@ The workflow:
   activate any runtime;
 - runs the complete Swift app test suite before any runtime compilation and
   removes its temporary build directory immediately afterward;
-- uses one Cargo build job at a time and disables release LTO;
+- uses two bounded Cargo build jobs on the remote runner and disables release
+  LTO;
 - validates the three executable modes before uploading only those files and
   `manifest.json`;
 - publishes GitHub build-provenance attestations for all four exact artifact
@@ -80,7 +81,7 @@ label drift fails closed.
 Both Cargo workspaces run with:
 
 ```text
-CARGO_BUILD_JOBS=1
+CARGO_BUILD_JOBS=2
 CARGO_PROFILE_RELEASE_LTO=false
 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 CARGO_INCREMENTAL=0
@@ -88,7 +89,8 @@ CARGO_INCREMENTAL=0
 
 The Codex runtime build names both packages in one Cargo invocation:
 `codex-cli` and `codex-code-mode-host`. The ephemeral checkout and build targets
-are not uploaded.
+are not uploaded. Two jobs keep compilation bounded while using the remote
+runner's available cores; this setting never causes a local Mac build.
 
 GitHub Actions uses two independent, repository-scoped Cargo caches:
 

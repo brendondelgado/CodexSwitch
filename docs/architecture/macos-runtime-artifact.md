@@ -28,7 +28,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-20
+  last_updated: 2026-07-22
 ---
 
 # macOS Runtime Artifact
@@ -72,9 +72,10 @@ silently authorizing the other.
 The native artifact workflow must compile and run the complete Swift app test
 suite before building any release executable. It also runs the Python patcher,
 bundle-builder, and artifact-installer contract suites before preparing release
-dependencies. Compilation uses one job, and
-test execution is explicitly non-parallel because the suite exercises shared
-process state, subprocess admission, signal delivery, and updater leases.
+dependencies. Release compilation uses two bounded Cargo jobs on the remote
+native runner. Test execution remains explicitly non-parallel because the suite
+exercises shared process state, subprocess admission, signal delivery, and
+updater leases.
 Swift Testing executes tests concurrently by default; limiting SwiftPM build
 jobs alone does not serialize those tests.
 

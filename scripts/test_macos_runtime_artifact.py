@@ -98,6 +98,11 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         )
         self.assertIn('rm -rf -- .build "$test_tmp"', swift_gate)
 
+    def test_workflow_uses_two_bounded_remote_cargo_jobs(self) -> None:
+        workflow = WORKFLOW.read_text()
+        self.assertIn('CARGO_BUILD_JOBS: "2"', workflow)
+        self.assertIn('--jobs "$CARGO_BUILD_JOBS"', workflow)
+
     def test_workflow_keeps_download_cache_free_of_compiled_targets(self) -> None:
         workflow = WORKFLOW.read_text()
         restore = workflow.index("Restore remote Cargo downloads")

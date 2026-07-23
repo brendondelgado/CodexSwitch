@@ -36,7 +36,7 @@ jobs:
     env:
       UPSTREAM_REPO_URL: https://github.com/openai/codex.git
       TARGET_TRIPLE: aarch64-apple-darwin
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "2"
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       CARGO_INCREMENTAL: "0"
