@@ -1,0 +1,29 @@
+Tests/CodexSwitchTests/AppDelegateSwapCommitTests.swift
+  s_70c8e194852bb5::t_937404096586e7 183-192,204,209,221-222,227
+  s_70c8e194852bb5::t_e0ca88847a4774 193-197,211,214-216
+  s_70c8e194852bb5::t_2749647284ae71 166,175-182,199,202-203,205,208,210,217-220,223-226,228
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_6bd105206e1f74 872-873
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_6bd105206e1f74 240-241
+  s_70c8e194852bb5::t_9c8f8b152763df 242-243
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_937404096586e7 313,5821-5822,5824,5829,5835,5837,5876-5881,5883,5885,5901-5911,5915
+  s_70c8e194852bb5::t_2749647284ae71 5810,5813-5818,5820,5823,5825-5828,5830-5834,5836,5838-5843,5882,5884,5886-5888,5891-5894,5899,5912-5914
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "baaf8c64218b7143026ed1a9e6ceed5bddf4c4a0",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
