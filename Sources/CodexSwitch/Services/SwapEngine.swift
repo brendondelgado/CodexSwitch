@@ -2974,7 +2974,7 @@ enum SwapEngine {
         return canonicalAbsolutePath(path)
     }
 
-    private nonisolated static func kernelExecutableIdentity(
+    nonisolated static func kernelExecutableIdentity(
         pid: Int32
     ) -> CodexKernelExecutableIdentity? {
         guard let processExecutablePath = executablePath(for: pid) else { return nil }
@@ -3072,7 +3072,7 @@ enum SwapEngine {
         return current.ownerUID == requiredOwnerUID && current == expected
     }
 
-    private nonisolated static func signalProcessIdentity(
+    nonisolated static func signalProcessIdentity(
         pid: Int32
     ) -> CodexSignalProcessIdentity? {
         guard pid > 0 else { return nil }

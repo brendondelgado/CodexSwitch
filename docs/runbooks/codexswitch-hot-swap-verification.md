@@ -1,4 +1,6 @@
 ---
+title: CodexSwitch hot-swap verification
+description: Operator checks for authenticated account rotation, desktop updates, and runtime convergence on the Mac and VPS.
 toc:
   - CodexSwitch Hot-Swap Verification Runbook
   - Why This Exists
@@ -71,7 +73,8 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-23
+  status: canonical
+  last_updated: 2026-07-24
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -416,10 +419,10 @@ does not terminate a live CLI or desktop app-server. Those sessions remain
 explicitly restart-required until they relaunch on the verified runtime.
 
 The unified app's native Sparkle feed remains the source of truth for desktop
-versions. CodexSwitch's fallback updater must accept both `ChatGPT.app` and
-legacy `Codex.app` archive layouts, install to the current product name, verify
-the stock OpenAI signature, and let the normal patch monitor reapply desktop
-compatibility only after the app has quit.
+versions. CodexSwitch's updater accepts both `ChatGPT.app` and legacy
+`Codex.app` archive layouts, installs to the current product name, verifies the
+stock OpenAI signature, and reapplies desktop compatibility only after the app
+has quit.
 
 Every new desktop build is a compatibility fixture before it is an install
 candidate. Run `scripts/patch-asar.py` against the exact downloaded bundle in a
@@ -546,11 +549,47 @@ Successful installation clears both preparation and install failure records.
 
 ## Desktop Update Ownership
 
-Automatic desktop patch or update activation must defer while a detached
-app-server is running because the process may own live remote work. A deliberate
-operator repair may stop that service only after PID, user, executable path, and
-process start time are revalidated immediately before `SIGTERM`. Broad
-`pkill -f` matching is prohibited.
+CodexSwitch owns ChatGPT desktop update checks while it is running. The
+Settings action and the periodic scheduler must call the same
+`CodexDesktopUpdateCoordinator`; a UI-only downloader or direct Sparkle install
+path is forbidden.
+
+For an official appcast release, verify its immutable payload authenticators
+before extraction:
+
+1. The Sparkle Ed25519 signature must validate against CodexSwitch's pinned OpenAI
+   production public key.
+2. If a SHA-256 digest is declared, it must also match the retained archive.
+3. The extracted stock app must pass strict OpenAI bundle trust and exact
+   appcast version checks before it becomes authoritative.
+
+When the UI says an update is staged, either quit ChatGPT normally or use
+Install Update. The button requests a normal quit and enters the same
+termination transaction; it is not a force-quit or a second installer. Confirm
+the log sequence is `DESKTOP_UPDATE_INSTALLED`, `DESKTOP_PATCH_RETRY ...
+completed` (or `not_needed` for an already-compatible build), and
+`DESKTOP_UPDATE_RELAUNCH`.
+Do not report completion merely because the stock bundle version changed.
+After relaunch, verify every required ASAR marker, strict bundle signing, the
+bundled CLI hot-swap capability, and one fresh acknowledged auth reload. Do not
+reuse an acknowledgement created before the app replacement.
+The durable activation record must name the exact destination path, short
+version, and bundle build. It must remain set through a patch or relaunch
+failure and clear only after that exact installed bundle passes the complete
+readiness proof and every discovered desktop runtime acknowledges a fresh auth
+reload.
+
+Automatic desktop patch or update activation must defer while an app-server
+loaded from the installed ChatGPT bundle is running. An independent
+CodexSwitch-prepared app-server, including the shared listener on port 9223,
+does not own bytes under the destination bundle and must remain running. A
+process launched through a symlink is classified by its kernel-resolved
+executable path, not the argv spelling reported by `pgrep`. A live PID whose
+executable identity cannot be resolved makes activation unavailable and
+therefore blocks replacement. A
+deliberate operator repair may stop a destination-owning service only after PID,
+user, executable path, and process start time are revalidated immediately
+before `SIGTERM`. Broad `pkill -f` matching is prohibited.
 
 Re-signing the unified app for local compatibility changes its signing team, so
 Sparkle's privileged installer can reject an otherwise valid update. CodexSwitch
@@ -563,10 +602,17 @@ signed:
    without quitting a live ChatGPT session.
 3. Verify the staged app's bundle identity, version, and stock OpenAI signature
    before marking it ready.
-4. Install only after the ChatGPT host and account-bearing app-server have exited.
+4. Install only after the ChatGPT host and any app-server loaded from that
+   installed bundle have exited.
 5. Apply and verify the compatibility patch before relaunching the updated app.
 6. Watch the Applications directory so an external replacement triggers an
    immediate compatibility check rather than waiting for a periodic timer.
+
+If Settings reports that App Management permission is required, open Privacy &
+Security from the provided button, enable CodexSwitch, then use Retry. The retry
+may clear CodexSwitch's one-hour permission backoff, but it must not bypass
+official archive authentication, runtime ownership checks, strict code signing,
+or patch-marker verification.
 
 While CodexSwitch owns this path, it must disable Sparkle's automatic checks for
 the locally signed bundle so Sparkle does not repeatedly download an archive its

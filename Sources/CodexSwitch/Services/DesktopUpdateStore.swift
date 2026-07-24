@@ -1428,7 +1428,7 @@ enum CodexDesktopUpdateStorage {
     static let maximumEntriesPerArtifact = 50_000
     static let maximumRetainedArtifactCount = 2
     static let maximumRetainedArtifactBytes: UInt64 = 2 * 1024 * 1024 * 1024
-    static let maximumManifestBytes = 64 * 1024
+    static let maximumManifestBytes = 16 * 1024 * 1024
     static let maximumRejectedReleaseCount = 8
     static let validationSealRecheckInterval: TimeInterval = 6 * 60 * 60
     static let rollbackFormatVersion = 2
@@ -2027,9 +2027,12 @@ enum CodexDesktopUpdateStorage {
         isCancelled: () -> Bool = { Task.isCancelled }
     ) throws {
         if isCancelled() { throw CancellationError() }
-        guard let archiveSHA256 = release.archiveSHA256?.lowercased(),
-              archiveSHA256.count == 64,
-              archiveSHA256.allSatisfy(\.isHexDigit) else {
+        let archiveSHA256 = DesktopArchiveAuthentication.normalizedSHA256(
+            release.archiveSHA256
+        )
+        let archiveEdSignature = DesktopArchiveAuthentication
+            .normalizedEd25519Signature(release.archiveEdSignature)
+        guard archiveSHA256 != nil || archiveEdSignature != nil else {
             return
         }
         var records = loadRejectedReleases(in: root, fileManager: fileManager)
@@ -2040,6 +2043,7 @@ enum CodexDesktopUpdateStorage {
                 bundleVersion: release.bundleVersion,
                 downloadURL: release.downloadURL,
                 archiveSHA256: archiveSHA256,
+                archiveEdSignature: archiveEdSignature,
                 reasonClass: reasonClass,
                 rejectedAt: now
             )
@@ -2462,6 +2466,7 @@ enum CodexDesktopUpdateStorage {
             generationIdentifier: update.generationIdentifier,
             validationSeal: seal,
             archiveSHA256: update.archiveSHA256,
+            archiveEdSignature: update.archiveEdSignature,
             archiveLength: update.archiveLength
         )
     }

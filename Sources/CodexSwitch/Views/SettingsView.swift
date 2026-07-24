@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import ServiceManagement
 import os
@@ -18,8 +19,15 @@ struct SettingsView: View {
 
     var accounts: [CodexAccount] = []
     var onRemoveAllAccounts: (() -> Void)?
+    @ObservedObject var desktopUpdateCoordinator: CodexDesktopUpdateCoordinator
+    var onInstallDesktopUpdate: (() -> Void)?
+    var onRetryDesktopPatch: ((
+        @escaping @MainActor @Sendable (DesktopPatchAttemptOutcome) -> Void
+    ) -> Void)?
 
     @State private var showingRemoveConfirmation = false
+    @State private var appManagementPermissionRequired = false
+    @State private var desktopPatchRetryInProgress = false
     @State private var versionChecker = CodexVersionChecker()
     @State private var linuxPassphrase = ""
     @State private var linuxPassphraseConfirmation = ""
@@ -154,10 +162,126 @@ struct SettingsView: View {
             }
 
             Section("Desktop App") {
-                Toggle("Automatically repair Codex.app patch", isOn: $desktopAutomaticPatchingEnabled)
-                Text("On by default because desktop hot-swap depends on it. CodexSwitch only patches after Codex.app is quit and verifies plugin signatures before reporting ready.")
-                    .font(.caption)
+                HStack {
+                    Text("Installed")
+                    Spacer()
+                    Text(
+                        desktopUpdateCoordinator.presentation.installedVersion
+                            ?? "Not found"
+                    )
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Latest")
+                    Spacer()
+                    Text(
+                        desktopUpdateCoordinator.presentation.latestVersion
+                            ?? "Not checked"
+                    )
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
+
+                if let staged = desktopUpdateCoordinator.presentation.stagedVersion {
+                    HStack {
+                        Text("Staged")
+                        Spacer()
+                        Text(staged)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(
+                                desktopUpdateCoordinator.presentation.phase == .staged
+                                    ? .orange
+                                    : .secondary
+                            )
+                    }
+                }
+
+                HStack {
+                    Button {
+                        desktopUpdateCoordinator.prepareLatestUpdateNow()
+                    } label: {
+                        if desktopUpdateCoordinator.presentation.phase == .checking {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Checking...")
+                        } else {
+                            Label(
+                                "Check & Prepare Update",
+                                systemImage: "arrow.down.circle"
+                            )
+                        }
+                    }
+                    .disabled(desktopUpdateCoordinator.presentation.isBusy)
+
+                    if desktopUpdateCoordinator.presentation.phase == .staged {
+                        Button {
+                            onInstallDesktopUpdate?()
+                        } label: {
+                            Label("Install Update", systemImage: "arrow.down.app")
+                        }
+                        .disabled(desktopUpdateCoordinator.presentation.isBusy)
+                    }
+                }
+
+                Text(desktopUpdateCoordinator.presentation.message)
+                    .font(.caption)
+                    .foregroundStyle(desktopUpdateStatusColor)
+
+                if let lastChecked = desktopUpdateCoordinator.presentation.lastCheckedAt {
+                    Text(
+                        "Last checked: "
+                            + Self.lastCheckedFormatter.string(from: lastChecked)
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                }
+
+                if appManagementPermissionRequired {
+                    Label(
+                        "App Management permission required",
+                        systemImage: "lock.trianglebadge.exclamationmark"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+
+                    HStack {
+                        Button {
+                            openPrivacyAndSecurity()
+                        } label: {
+                            Label("Open Privacy & Security", systemImage: "gear")
+                        }
+
+                        Button {
+                            guard let onRetryDesktopPatch else { return }
+                            desktopPatchRetryInProgress = true
+                            onRetryDesktopPatch { outcome in
+                                desktopPatchRetryInProgress = false
+                                switch outcome {
+                                case .completed, .notNeeded:
+                                    appManagementPermissionRequired = false
+                                default:
+                                    appManagementPermissionRequired = true
+                                }
+                            }
+                        } label: {
+                            if desktopPatchRetryInProgress {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Retrying...")
+                            } else {
+                                Label("Retry", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(desktopPatchRetryInProgress)
+                    }
+                }
+
+                Toggle(
+                    "Automatically restore hot swapping after updates",
+                    isOn: $desktopAutomaticPatchingEnabled
+                )
             }
 
             Section("Linux Devbox") {
@@ -264,6 +388,25 @@ struct SettingsView: View {
         .frame(width: 420, height: 640)
         .onAppear {
             versionChecker.checkVersions()
+            appManagementPermissionRequired =
+                DesktopPatchManager.appManagementPermissionRequired
+        }
+        .onChange(of: desktopUpdateCoordinator.presentation) {
+            appManagementPermissionRequired =
+                DesktopPatchManager.appManagementPermissionRequired
+        }
+    }
+
+    private var desktopUpdateStatusColor: Color {
+        switch desktopUpdateCoordinator.presentation.phase {
+        case .current:
+            return .green
+        case .staged, .waitingForQuit, .installing, .deferred:
+            return .orange
+        case .failed:
+            return .red
+        case .idle, .checking:
+            return .secondary
         }
     }
 
@@ -278,6 +421,15 @@ struct SettingsView: View {
             launchAtLogin = !enabled
             logger.error("Launch at login toggle failed: \(error.localizedDescription)")
         }
+    }
+
+    private func openPrivacyAndSecurity() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"
+        ) else {
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 
     private func exportLinuxBundle() {

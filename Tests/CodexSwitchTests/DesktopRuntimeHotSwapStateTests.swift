@@ -139,20 +139,30 @@ struct DesktopRuntimeHotSwapStateTests {
         )
     }
 
-    @Test("Desktop safe-quit blocks every classified account-bearing app-server")
-    func desktopSafeQuitBlocksClassifiedAppServers() {
-        let processLines = [
+    @Test("Desktop safe-quit blocks only app-servers loaded from the installed bundle")
+    func desktopSafeQuitBlocksInstalledBundleAppServers() {
+        let blockingProcessLines = [
             "100 /Applications/ChatGPT.app/Contents/Resources/codex app-server --analytics-default-enabled",
             "101 /Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+        ]
+        let independentProcessLines = [
             "102 /Users/me/.local/share/codexswitch/prepared-codex/0.144.1/codex -c features.code_mode_host=true app-server --analytics-default-enabled",
             "103 /Users/me/.local/share/codexswitch/patched-codex/codex app-server --analytics-default-enabled",
             "104 /Users/me/Developer/codex/codex-rs/target/fork-release/codex app-server --analytics-default-enabled",
             "105 /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex app-server --analytics-default-enabled",
         ]
 
-        for processLine in processLines {
+        for processLine in blockingProcessLines {
             #expect(
                 DesktopPatchManager.desktopSafeQuitIsBlocked(
+                    runningHostBundleIdentifiers: [],
+                    appServerProcessListOutput: processLine
+                )
+            )
+        }
+        for processLine in independentProcessLines {
+            #expect(
+                !DesktopPatchManager.desktopSafeQuitIsBlocked(
                     runningHostBundleIdentifiers: [],
                     appServerProcessListOutput: processLine
                 )

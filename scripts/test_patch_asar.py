@@ -302,6 +302,27 @@ CHATGPT_5628_STATSIG_CONTENT = CHATGPT_5440_STATSIG_CONTENT.replace(
     1,
 )
 
+CHATGPT_5828_STATSIG_CONTENT = (
+    "function embeddedStatsigNoise(e){Other.StableID.get(e)}"
+    "function currentStatsigNamespace(e){gtu.StableID.get(e);"
+    "gtu.StatsigSession.get(e);gtu.StatsigMetadataProvider.add({})}"
+    + CHATGPT_5628_STATSIG_CONTENT.replace(
+        "StableIDs.StableID",
+        "gtu.StableID",
+        1,
+    ).replace(
+        "children:d}=e,f={mutationFn:async e=>{",
+        "children:d}=e,m=async e=>{",
+        1,
+    ).replace(
+        "catch(e){throw e}},retry:retryBootstrap,onError:reportBootstrapError};"
+        "let{data:",
+        "catch(e){throw e}};let f={mutationFn:m,retry:retryBootstrap,"
+        "onError:reportBootstrapError};let{data:",
+        1,
+    )
+)
+
 CODEX_5042_MODEL_PICKER_CONTENT = (
     "function DM(e){if(!e.trimStart().toLowerCase().startsWith(`gpt`))return e;"
     "return e}"
@@ -320,6 +341,14 @@ CODEX_5059_MODEL_AVAILABILITY_CONTENT = (
     "useHiddenModels:o}){let s=[],c=null,l=o&&e!==`amazonBedrock`;"
     "return a.forEach(n=>{if(l?t.has(n.model):!n.hidden){let a={...n};"
     "s.push(a),n.isDefault&&(c=a)}}),{models:s,defaultModel:c}}"
+)
+
+CHATGPT_5828_MODEL_AVAILABILITY_CONTENT = (
+    "function Jv({additionalAvailableModels:p,authMethod:e,availableModels:t,"
+    "defaultModel:n,enabledReasoningEfforts:r,includeUltraReasoningEffort:i,"
+    "models:a,useHiddenModels:o}){let s=[],c=null,l=o&&e!==`amazonBedrock`;"
+    "return a.forEach(n=>{if(p?.has(n.model)===!0||(l?t.has(n.model):!n.hidden)){"
+    "let a={...n};s.push(a),n.isDefault&&(c=a)}}),{models:s,defaultModel:c}}"
 )
 
 CODEX_5059_MAX_EFFORT_CONTENT = (
@@ -498,6 +527,42 @@ CODEX_4753_WEAKMAP_AUTH_CONTENT = (
     "function Xde(e){return e??p9()}"
     "var m9,h9,g9,_9,v9=e((()=>{m9=Fe(),h9=n(S(),1),g9=2e3,_9=new WeakMap}));"
     "export{f9 as i};"
+)
+
+CHATGPT_5828_WEAKMAP_AUTH_CONTENT = (
+    "function unrelatedAuthObserver(q){let z=t=>{consume(t)};"
+    "return q.addAuthStatusCallback(z)}"
+    "function KGr(e,t){let n=(0,eKr.c)(13),"
+    "{isCopilotApiAvailable:r,useCopilotAuthIfAvailable:i,"
+    "shouldUseWindowsStartupAuthTimeout:a,onLogout:o}=t,"
+    "[s,c]=(0,tKr.useState)(e!=null),[l,u]=(0,tKr.useState)(null),d,f;"
+    "p=()=>{if(e==null)return;let t=!1,n=!1,s=!1,l=null,d=null,"
+    "f=()=>{let a=s?Promise.resolve(l):XGr(e);"
+    "Promise.all([YGr(e),a]).then(e=>{let[a,o]=e,f=s?l:o;"
+    "if(n=!0,d!=null&&clearTimeout(d),!t){if(c(!1),s&&l==null){u(ZGr());return}"
+    "u($Gr(a,{isCopilotApiAvailable:r,"
+    "isPersonalAccessTokenAuth:f===`personalAccessToken`,"
+    "useCopilotAuthIfAvailable:i}))}}).catch(()=>{n=!0,"
+    "d!=null&&clearTimeout(d),t||(c(!1),u(JGr))})};"
+    "a&&(d=setTimeout(()=>{t||n||(c(!1),u(qGr))},nKr));"
+    "let p=e=>{s=!0,l=e.authMethod,"
+    "u(t=>e.authMethod==null&&t?.authMethod!=null?(o?.(),ZGr()):"
+    "t==null?e.authMethod==null?t:{...ZGr(),authMethod:e.authMethod}:"
+    "{...t,authMethod:e.authMethod??null}),e.authMethod!=null&&f()};"
+    "return e.addAuthStatusCallback(p),f(),()=>{t=!0,"
+    "d!=null&&clearTimeout(d),e.removeAuthStatusCallback(p)}}}"
+    "function YGr(e){let t=rKr.get(e);if(t!=null)return t;"
+    "let n=e.getAccount().finally(()=>{rKr.delete(e)});return rKr.set(e,n),n}"
+    "function XGr(e){let t=iKr.get(e);if(t!=null)return t;"
+    "let n=e.getAuthMethod().finally(()=>{iKr.delete(e)});"
+    "return iKr.set(e,n),n}"
+    "function ZGr(){return{openAIAuth:null,authMethod:null,requiresAuth:!0,email:null}}"
+    "function $Gr(e,t){return{authMethod:e.account?.type}}"
+    "function JGr(e){return e??ZGr()}"
+    "function qGr(e){return e??ZGr()}"
+    "var eKr,tKr,nKr,rKr,iKr,aKr=e((()=>{"
+    "eKr=c(),tKr=r(o(),1),nKr=2e3,rKr=new WeakMap,iKr=new WeakMap}));"
+    "export{KGr as i};"
 )
 
 
@@ -1163,6 +1228,45 @@ class PatchAsarTests(unittest.TestCase):
                 patched,
             )
             self.assertIn("export{f9 as i};", patched)
+
+    def test_apply_patch_supports_chatgpt_5828_auth_shape_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CHATGPT_5828_WEAKMAP_AUTH_CONTENT)
+
+            self.assertTrue(patch_asar.apply_patch(target))
+
+            patched = target.read_text()
+            self.assertTrue(patch_asar.current_auth_patch_present(patched))
+            self.assertEqual(patched.count(patch_asar.AUTH_CACHE_PATCH_MARKER), 1)
+            self.assertEqual(patched.count(patch_asar.AUTH_TRANSITION_PATCH_MARKER), 1)
+            self.assertEqual(patched.count(patch_asar.AUTH_SINGLE_FLIGHT_PATCH_MARKER), 1)
+            self.assertIn(
+                "Promise.all([_codexSwitchReadAccount(e,()=>e.getAccount()),a])",
+                patched,
+            )
+            self.assertIn(
+                "let p=e=>{_csAuthEpoch++;let _csEventEpoch=_csAuthEpoch;"
+                "s=!0,l=e.authMethod,u(",
+                patched,
+            )
+            self.assertIn(
+                "u(t=>_codexSwitchResolveAuthState(t,$Gr(a,{"
+                "isCopilotApiAvailable:r,"
+                "isPersonalAccessTokenAuth:f===`personalAccessToken`,"
+                "useCopilotAuthIfAvailable:i}),o,"
+                "_csReadEpoch===_csAuthEpoch,_csConfirmLogout))",
+                patched,
+            )
+            self.assertIn(
+                "}),_invalidateAccountQueries(e),e.authMethod==null?(",
+                patched,
+            )
+            self.assertIn("_csLogoutTimer=setTimeout", patched)
+            self.assertNotIn("e.authMethod!=null&&f()", patched)
+
+            self.assertTrue(patch_asar.apply_patch(target))
+            self.assertEqual(target.read_text(), patched)
 
     def test_apply_patch_adds_module_single_flight_to_direct_account_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1978,6 +2082,24 @@ replay().catch(error=>{console.error(error.stack);process.exit(1)});
                 patched,
             )
 
+    def test_apply_statsig_fail_open_patch_ignores_embedded_sdk_namespaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CHATGPT_5828_STATSIG_CONTENT)
+
+            self.assertTrue(patch_asar.apply_statsig_fail_open_patch(target))
+            patched = target.read_text()
+
+            self.assertTrue(patch_asar.has_statsig_fail_open_patch(patched))
+            self.assertIn(
+                "r=gtu.StableID.get(e.statsigClientKey)",
+                patched,
+            )
+            self.assertNotIn(
+                "r=Other.StableID.get(e.statsigClientKey)",
+                patched,
+            )
+
     def test_apply_statsig_fail_open_patch_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "app-main-current.js"
@@ -2045,6 +2167,22 @@ replay().catch(error=>{console.error(error.stack);process.exit(1)});
             )
             self.assertTrue(patch_asar.apply_model_availability_fallback_patch(target))
             self.assertEqual(target.read_text(), first)
+
+    def test_model_availability_fallback_preserves_additional_model_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial-HASH.js"
+            target.write_text(CHATGPT_5828_MODEL_AVAILABILITY_CONTENT)
+
+            self.assertTrue(patch_asar.apply_model_availability_fallback_patch(target))
+            patched = target.read_text()
+
+            self.assertIn(
+                "p?.has(n.model)===!0||(l?/*"
+                + patch_asar.MODEL_AVAILABILITY_FALLBACK_MARKER
+                + "*/(t.has(n.model)||n.model.startsWith(`gpt-5.6-`)):"
+                "!n.hidden)",
+                patched,
+            )
 
     def test_gpt56_max_effort_patch_preserves_server_advertised_max(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2368,6 +2506,11 @@ replay().catch(error=>{console.error(error.stack);process.exit(1)});
 
         states["statsig_fail_open"] = True
         states["native_updater"] = False
+
+        self.assertFalse(patch_asar.required_desktop_patches_present(**states))
+
+        states["native_updater"] = True
+        states["remote_recents"] = False
 
         self.assertFalse(patch_asar.required_desktop_patches_present(**states))
 
@@ -3062,6 +3205,39 @@ replay().catch(error=>{console.error(error.stack);process.exit(1)});
                 patch_asar.computer_use_plugin_signing_targets(app),
                 [sky_client_app, computer_use_app],
             )
+
+    def test_current_cua_node_computer_use_apps_remain_openai_signed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = (Path(tmp) / "ChatGPT.app").resolve()
+            computer_use_app = (
+                app
+                / "Contents/Resources/cua_node/lib/node_modules/@oai/sky/"
+                "Codex Computer Use.app"
+            )
+            sky_client_app = (
+                computer_use_app
+                / "Contents/SharedSupport/SkyComputerUseClient.app"
+            )
+            installer_app = (
+                computer_use_app
+                / "Contents/SharedSupport/Codex Computer Use Installer.app"
+            )
+            sky_client_app.mkdir(parents=True)
+            installer_app.mkdir(parents=True)
+
+            self.assertEqual(
+                patch_asar.computer_use_plugin_signing_targets(app),
+                [sky_client_app, computer_use_app],
+            )
+            targets = patch_asar.list_codesign_targets(app)
+            self.assertFalse(
+                any(
+                    target == computer_use_app
+                    or computer_use_app in target.parents
+                    for target in targets
+                )
+            )
+            self.assertEqual(targets[-1], app)
 
     def test_computer_use_plugin_repair_not_needed_for_official_openai_signature(self):
         with tempfile.TemporaryDirectory() as tmp:

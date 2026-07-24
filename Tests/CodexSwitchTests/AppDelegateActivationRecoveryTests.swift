@@ -25,13 +25,28 @@ struct AppDelegateActivationRecoveryTests {
         #expect(AppDelegate.desktopPatchRetryDisposition(
             after: .completed,
             hasRemainingAttempts: false,
-            relaunchAfterCompletion: true
+            relaunchAfterCompletion: true,
+            activationReady: true
         ) == .relaunch)
         #expect(AppDelegate.desktopPatchRetryDisposition(
             after: .notNeeded,
             hasRemainingAttempts: false,
-            relaunchAfterCompletion: true
+            relaunchAfterCompletion: true,
+            activationReady: true
         ) == .relaunch)
+
+        #expect(AppDelegate.desktopPatchRetryDisposition(
+            after: .completed,
+            hasRemainingAttempts: true,
+            relaunchAfterCompletion: true,
+            activationReady: false
+        ) == .retry)
+        #expect(AppDelegate.desktopPatchRetryDisposition(
+            after: .notNeeded,
+            hasRemainingAttempts: false,
+            relaunchAfterCompletion: true,
+            activationReady: false
+        ) == .stop)
 
         for outcome in [
             DesktopPatchAttemptOutcome.disabled,
@@ -41,25 +56,115 @@ struct AppDelegateActivationRecoveryTests {
             #expect(AppDelegate.desktopPatchRetryDisposition(
                 after: outcome,
                 hasRemainingAttempts: true,
-                relaunchAfterCompletion: true
+                relaunchAfterCompletion: true,
+                activationReady: false
             ) == .stop)
         }
 
         #expect(AppDelegate.desktopPatchRetryDisposition(
             after: .failed(1),
             hasRemainingAttempts: true,
-            relaunchAfterCompletion: true
+            relaunchAfterCompletion: true,
+            activationReady: false
         ) == .retry)
         #expect(AppDelegate.desktopPatchRetryDisposition(
             after: .failed(1),
             hasRemainingAttempts: false,
-            relaunchAfterCompletion: true
+            relaunchAfterCompletion: true,
+            activationReady: false
         ) == .stop)
         #expect(
             AppDelegate.desktopUpdateRelaunchArguments(
                 appPath: "/Applications/ChatGPT.app"
             ) == ["-g", "/Applications/ChatGPT.app"]
         )
+    }
+
+    @MainActor
+    @Test("Repeated permission denial survives the activation eligibility tick")
+    func repeatedPermissionDeniedReachesTerminalPublication() {
+        let retryDelays = DesktopPatchManager.postQuitPatchRetryDelaysSeconds
+        let attemptTimes = retryDelays.reduce(into: [TimeInterval]()) { times, delay in
+            times.append((times.last ?? 0) + delay)
+        }
+        #expect(attemptTimes == [1, 4, 12, 32, 77])
+
+        var lifecycle = AppDelegateDesktopPatchRetryLifecycle()
+        let activeIdentifier = UUID()
+        let beganActiveBurst = lifecycle.begin(identifier: activeIdentifier)
+        #expect(beganActiveBurst)
+
+        for index in 0..<(retryDelays.count - 1) {
+            #expect(AppDelegate.desktopPatchRetryDisposition(
+                after: .permissionDenied,
+                hasRemainingAttempts: true,
+                relaunchAfterCompletion: true,
+                activationReady: false
+            ) == .retry)
+            #expect(attemptTimes[index] < 60)
+        }
+
+        let replacementIdentifier = UUID()
+        let beganReplacementBurst = lifecycle.begin(identifier: replacementIdentifier)
+        #expect(!beganReplacementBurst)
+        #expect(lifecycle.activeIdentifier == activeIdentifier)
+        #expect(attemptTimes.last == 77)
+
+        let terminalDisposition = AppDelegate.desktopPatchRetryDisposition(
+            after: .permissionDenied,
+            hasRemainingAttempts: false,
+            relaunchAfterCompletion: true,
+            activationReady: false
+        )
+        #expect(terminalDisposition == .stop)
+
+        let coordinator = CodexDesktopUpdateCoordinator(
+            nativeUpdateOwnershipProvider: { nil }
+        )
+        if terminalDisposition == .stop {
+            coordinator.desktopActivationFinished(
+                success: false,
+                message: "Update installed, but hot-swap repair failed (permission_denied)."
+            )
+            let finishedActiveBurst = lifecycle.finish(identifier: activeIdentifier)
+            #expect(finishedActiveBurst)
+        }
+
+        #expect(!lifecycle.isActive)
+        #expect(coordinator.presentation.phase == .failed)
+        #expect(!coordinator.presentation.isBusy)
+    }
+
+    @Test("Desktop update activation requires every discovered runtime acknowledgement")
+    func desktopUpdateActivationRequiresCompleteRuntimeAcknowledgement() {
+        #expect(AppDelegate.desktopReloadConfirmsActivation(
+            .reloaded(
+                method: "account/login/start",
+                discoveredRuntimeCount: 1,
+                acknowledgedRuntimeCount: 1
+            )
+        ))
+        #expect(!AppDelegate.desktopReloadConfirmsActivation(
+            .reloaded(
+                method: "account/login/start",
+                discoveredRuntimeCount: 0,
+                acknowledgedRuntimeCount: 0
+            )
+        ))
+        #expect(!AppDelegate.desktopReloadConfirmsActivation(
+            .reloaded(
+                method: "account/login/start",
+                discoveredRuntimeCount: 2,
+                acknowledgedRuntimeCount: 1
+            )
+        ))
+        #expect(!AppDelegate.desktopReloadConfirmsActivation(
+            .failed(
+                "runtime unavailable",
+                discoveredRuntimeCount: 1,
+                acknowledgedRuntimeCount: 0
+            )
+        ))
     }
 
     @Test("Durable inspection separates unavailable reads from verified mismatch")

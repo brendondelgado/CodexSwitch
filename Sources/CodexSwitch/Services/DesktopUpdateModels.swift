@@ -1,5 +1,98 @@
 import Foundation
 
+struct CodexDesktopUpdateActivationTarget: Codable, Equatable, Sendable {
+    let shortVersion: String
+    let bundleVersion: String
+    let appPath: String
+}
+
+enum CodexDesktopUpdateActivationIntent {
+    static let defaultsKey = "desktopUpdateActivationPending"
+    static let targetDefaultsKey = "desktopUpdateActivationTarget.v1"
+
+    static func markPending(
+        target: CodexDesktopUpdateActivationTarget,
+        defaults: UserDefaults = .standard
+    ) {
+        guard let encoded = try? JSONEncoder().encode(target) else { return }
+        defaults.set(encoded, forKey: targetDefaultsKey)
+        defaults.set(true, forKey: defaultsKey)
+        defaults.synchronize()
+    }
+
+    static func clear(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: targetDefaultsKey)
+        defaults.set(false, forKey: defaultsKey)
+        defaults.synchronize()
+    }
+
+    static func isPending(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: defaultsKey)
+    }
+
+    static func pendingTarget(
+        defaults: UserDefaults = .standard
+    ) -> CodexDesktopUpdateActivationTarget? {
+        guard defaults.bool(forKey: defaultsKey),
+              let data = defaults.data(forKey: targetDefaultsKey) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(
+            CodexDesktopUpdateActivationTarget.self,
+            from: data
+        )
+    }
+}
+
+enum DesktopArchiveAuthentication {
+    static func normalizedSHA256(_ value: String?) -> String? {
+        guard let value,
+              value.count == 64,
+              value.allSatisfy(\.isHexDigit) else {
+            return nil
+        }
+        return value.lowercased()
+    }
+
+    static func normalizedEd25519Signature(_ value: String?) -> String? {
+        guard let value,
+              let decoded = Data(base64Encoded: value),
+              decoded.count == 64 else {
+            return nil
+        }
+        return decoded.base64EncodedString()
+    }
+
+    static func hasSupportedAuthenticator(
+        sha256: String?,
+        ed25519Signature: String?
+    ) -> Bool {
+        normalizedSHA256(sha256) != nil
+            || normalizedEd25519Signature(ed25519Signature) != nil
+    }
+
+    static func hasTrustedSignature(_ ed25519Signature: String?) -> Bool {
+        normalizedEd25519Signature(ed25519Signature) != nil
+    }
+
+    static func payloadsMatch(
+        lhsSHA256: String?,
+        lhsEd25519Signature: String?,
+        rhsSHA256: String?,
+        rhsEd25519Signature: String?
+    ) -> Bool {
+        if let lhs = normalizedSHA256(lhsSHA256),
+           let rhs = normalizedSHA256(rhsSHA256) {
+            return lhs == rhs
+        }
+        if let lhs = normalizedEd25519Signature(lhsEd25519Signature),
+           let rhs = normalizedEd25519Signature(rhsEd25519Signature) {
+            return lhs == rhs
+        }
+        return false
+    }
+}
+
 struct CodexDesktopAppRelease: Codable, Equatable, Sendable {
     let shortVersion: String
     let bundleVersion: String
@@ -56,6 +149,7 @@ struct CodexDesktopStagedUpdate: Codable, Equatable, Sendable {
     let generationIdentifier: String?
     let validationSeal: CodexDesktopStagedValidationSeal?
     let archiveSHA256: String?
+    let archiveEdSignature: String?
     let archiveLength: Int64?
 
     init(
@@ -67,6 +161,7 @@ struct CodexDesktopStagedUpdate: Codable, Equatable, Sendable {
         generationIdentifier: String? = nil,
         validationSeal: CodexDesktopStagedValidationSeal? = nil,
         archiveSHA256: String? = nil,
+        archiveEdSignature: String? = nil,
         archiveLength: Int64? = nil
     ) {
         self.shortVersion = shortVersion
@@ -77,6 +172,7 @@ struct CodexDesktopStagedUpdate: Codable, Equatable, Sendable {
         self.generationIdentifier = generationIdentifier
         self.validationSeal = validationSeal
         self.archiveSHA256 = archiveSHA256
+        self.archiveEdSignature = archiveEdSignature
         self.archiveLength = archiveLength
     }
 
@@ -86,6 +182,7 @@ struct CodexDesktopStagedUpdate: Codable, Equatable, Sendable {
             bundleVersion: bundleVersion,
             downloadURL: downloadURL,
             archiveSHA256: archiveSHA256,
+            archiveEdSignature: archiveEdSignature,
             archiveLength: archiveLength
         )
     }
@@ -93,17 +190,23 @@ struct CodexDesktopStagedUpdate: Codable, Equatable, Sendable {
     func matches(_ release: CodexDesktopAppRelease) -> Bool {
         guard shortVersion == release.shortVersion,
               bundleVersion == release.bundleVersion else { return false }
-        switch (archiveSHA256, release.archiveSHA256) {
-        case (.some(let stagedDigest), .some(let releaseDigest)):
-            guard stagedDigest.caseInsensitiveCompare(releaseDigest) == .orderedSame else {
-                return false
-            }
-        case (.none, .none):
+        if !DesktopArchiveAuthentication.payloadsMatch(
+            lhsSHA256: archiveSHA256,
+            lhsEd25519Signature: archiveEdSignature,
+            rhsSHA256: release.archiveSHA256,
+            rhsEd25519Signature: release.archiveEdSignature
+        ) {
             // Legacy unpinned test/migration data has no immutable payload
             // identity, so it may only reuse the exact original URL.
-            guard downloadURL == release.downloadURL else { return false }
-        default:
-            return false
+            guard !DesktopArchiveAuthentication.hasSupportedAuthenticator(
+                sha256: archiveSHA256,
+                ed25519Signature: archiveEdSignature
+            ), !DesktopArchiveAuthentication.hasSupportedAuthenticator(
+                sha256: release.archiveSHA256,
+                ed25519Signature: release.archiveEdSignature
+            ), downloadURL == release.downloadURL else {
+                return false
+            }
         }
         if let archiveLength {
             guard archiveLength == release.archiveLength else { return false }
@@ -219,11 +322,46 @@ enum CodexDesktopDownloadedGenerationPreparationResult: Equatable, Sendable {
 }
 
 enum CodexDesktopUpdatePreparationResult: Sendable {
-    case upToDate(String)
+    case upToDate(installedVersion: String, latestVersion: String)
     case alreadyStaged(CodexDesktopStagedUpdate)
     case staged(CodexDesktopStagedUpdate)
     case deferred(String)
     case failed(String)
+}
+
+struct CodexDesktopUpdatePresentation: Equatable, Sendable {
+    enum Phase: Equatable, Sendable {
+        case idle
+        case checking
+        case current
+        case staged
+        case waitingForQuit
+        case installing
+        case deferred
+        case failed
+    }
+
+    let phase: Phase
+    let installedVersion: String?
+    let latestVersion: String?
+    let stagedVersion: String?
+    let message: String
+    let lastCheckedAt: Date?
+
+    var isBusy: Bool {
+        phase == .checking || phase == .waitingForQuit || phase == .installing
+    }
+
+    static func idle(installedVersion: String?) -> Self {
+        Self(
+            phase: .idle,
+            installedVersion: installedVersion,
+            latestVersion: nil,
+            stagedVersion: nil,
+            message: "Not checked yet",
+            lastCheckedAt: nil
+        )
+    }
 }
 
 enum CodexDesktopStagedInstallResult: Sendable {
@@ -359,18 +497,18 @@ struct DesktopRejectedReleaseFingerprint: Codable, Equatable, Sendable {
     let bundleVersion: String
     let downloadURL: URL
     let archiveSHA256: String?
+    let archiveEdSignature: String?
     let reasonClass: DesktopRejectedReleaseReasonClass
     let rejectedAt: Date
 
     func matches(_ release: CodexDesktopAppRelease) -> Bool {
-        guard let recordedDigest = archiveSHA256?.lowercased(),
-              let releaseDigest = release.archiveSHA256?.lowercased(),
-              recordedDigest.count == 64,
-              releaseDigest.count == 64 else {
-            return false
-        }
         return bundleVersion == release.bundleVersion
-            && recordedDigest == releaseDigest
+            && DesktopArchiveAuthentication.payloadsMatch(
+                lhsSHA256: archiveSHA256,
+                lhsEd25519Signature: archiveEdSignature,
+                rhsSHA256: release.archiveSHA256,
+                rhsEd25519Signature: release.archiveEdSignature
+            )
     }
 }
 

@@ -5,7 +5,7 @@ enum DesktopUpdateBoundedRetentionFS {
     static func entryNames(in root: URL, maximumEntries: Int) throws -> [String] {
         guard maximumEntries > 0 else { return [] }
         let rootDescriptor = open(
-            root.standardizedFileURL.path,
+            CodexDesktopPathSecurity.lexicallyStandardized(root).path,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
         )
         guard rootDescriptor >= 0 else {
@@ -39,7 +39,7 @@ enum DesktopUpdateBoundedRetentionFS {
 
     static func identity(of url: URL) -> DesktopInstallPathIdentity? {
         var info = stat()
-        guard lstat(url.standardizedFileURL.path, &info) == 0,
+        guard lstat(CodexDesktopPathSecurity.lexicallyStandardized(url).path, &info) == 0,
               (info.st_mode & S_IFMT) == S_IFDIR else { return nil }
         return identity(info)
     }
@@ -54,7 +54,7 @@ enum DesktopUpdateBoundedRetentionFS {
             throw retentionError("Retention removal request was invalid")
         }
         let rootDescriptor = open(
-            root.standardizedFileURL.path,
+            CodexDesktopPathSecurity.lexicallyStandardized(root).path,
             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
         )
         guard rootDescriptor >= 0 else {

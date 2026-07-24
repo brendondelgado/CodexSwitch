@@ -135,6 +135,7 @@ struct DesktopUpdaterProcessRunner: Sendable {
         outputLimit: Int = defaultOutputLimit,
         environment: [String: String]? = nil,
         currentDirectoryURL: URL? = nil,
+        standardInput: FileHandle? = nil,
         isCancelled: () -> Bool = { Task.isCancelled }
     ) -> CodexDesktopTrustCommandResult {
         if isCancelled() {
@@ -149,6 +150,7 @@ struct DesktopUpdaterProcessRunner: Sendable {
         process.arguments = arguments
         process.environment = environment
         process.currentDirectoryURL = currentDirectoryURL
+        process.standardInput = standardInput
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -230,12 +232,14 @@ struct DesktopUpdaterProcessRunner: Sendable {
         executableURL: URL,
         arguments: [String],
         timeout: TimeInterval,
+        standardInput: FileHandle? = nil,
         isCancelled: () -> Bool = { Task.isCancelled }
     ) throws -> String {
         let result = run(
             executableURL: executableURL,
             arguments: arguments,
             timeout: timeout,
+            standardInput: standardInput,
             isCancelled: isCancelled
         )
         if result.cancelled { throw CancellationError() }

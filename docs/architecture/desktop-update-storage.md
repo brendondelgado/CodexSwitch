@@ -28,38 +28,40 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/DesktopUpdateRetention.swift
   - ../../Sources/CodexSwitch/Services/DesktopUpdateRuntimeGate.swift
   - ../../Sources/CodexSwitch/Services/DesktopUpdateScheduler.swift
+  - ../../Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
+  - ../../Sources/CodexSwitch/Services/DesktopUpdateRuntimeBindingVerifier.swift
   - ../../Tests/CodexSwitchTests/CodexDesktopAppUpdaterTests.swift
 version_control:
   branch: main
-  status: implemented_focused_verification
-  last_updated: 2026-07-16
+  status: canonical
+  last_updated: 2026-07-24
 ---
 
 # Desktop Update Storage
 
 ## Implementation Status
 
-The behavior below is the required storage and activation contract. Automatic
-checks may fetch appcast metadata, download a pinned payload, validate it, and
-publish a staged generation while ChatGPT is running. They do not replace the
-installed bundle. Automatic installation is entered only from a proven desktop
-app-termination boundary and still fails closed if either the host or its
-account-bearing app-server is active or cannot be classified. An explicit
-manual install request is also allowed and uses the same gate and transaction.
+This contract is implemented by the production updater and Settings UI.
+Automatic checks may fetch appcast metadata, download a pinned payload, validate
+it, and publish a staged generation while ChatGPT is running. They do not
+replace the installed bundle. Automatic installation begins only at a proven
+desktop host-termination boundary. The manual Settings action requests a normal
+ChatGPT quit, then enters the same fail-closed install, patch, verify, and
+background-relaunch transaction.
 
-This remediation is repository-only. Swift parsing, Swift 6 semantic
-typechecking, and deterministic descriptor, durability, symlink, and recovery
-ABA harnesses pass. The filtered SwiftPM test command currently stops before
-test execution because the local toolchain cannot load the unrelated
-`SwiftUIMacros.StateMacro` plugin. No application binary is built or installed,
-and no network download, `/Applications` mutation, or live update-store
-mutation is performed.
+The deployed updater accepts OpenAI's current archive layout, authenticates the
+official appcast payload, validates contained relative archive links, supports
+the current Electron bundle seal size, and distinguishes an app-bundle runtime
+from an independent CodexSwitch-prepared app-server. Focused updater, archive,
+runtime, patcher, and activation tests cover these boundaries.
 
 ## Scope
 
-This document defines storage ownership for ChatGPT desktop updates prepared by
-CodexSwitch on macOS. Repository work and update checks never install, remove,
-or replace the running ChatGPT application.
+This document defines storage ownership for ChatGPT desktop updates prepared and
+installed by CodexSwitch on macOS. Checks and staging never replace a running
+ChatGPT application. Installation owns `/Applications/ChatGPT.app` only after
+the desktop host has stopped and every runtime loaded from that destination
+bundle is absent.
 
 ## Component Boundaries
 
@@ -133,22 +135,42 @@ Appcast response bodies are streamed under a 1 MiB hard limit. The client
 rejects redirects whose final URL differs from the configured HTTPS appcast
 URL. Archive responses are streamed into a newly created, no-follow regular
 file under a 3 GiB hard limit, retained file identity, and an exact final-URL
-check. Before download, the release must contain a valid `sparkle:sha256` or
-`sha256` archive pin; before extraction, the streamed archive digest and any
-declared length must match it. A Sparkle Ed25519 signature is parsed as metadata
-but is not accepted as a substitute without a separately pinned public key.
+check. Before download, the release must contain a valid
+`sparkle:edSignature`; an optional `sparkle:sha256`/`sha256` digest is additional
+corroboration, never a substitute for the vendor signature. Sparkle signatures
+are verified over an authenticated private snapshot with Ed25519 and the OpenAI
+production public key pinned in CodexSwitch. The downloader creates that
+snapshot as an independent APFS clone, opens it read-only, removes its directory
+entry, removes every write bit, and applies the user-immutable flag before any
+archive parser or extractor receives it. Source and snapshot identity plus
+mutation guards must remain stable across cloning. The pin must equal the
+`SUPublicEDKey` distributed in the official ChatGPT bundle; an appcast cannot
+replace it. When a digest is present, it must also match. Any declared length
+must match. Verification reads only the private snapshot descriptor rather than
+reopening a mutable path, and the signature is retained as the immutable staged
+and rejection-ledger identity. A future OpenAI signing key rotation fails
+closed until a reviewed CodexSwitch release updates the pin.
 The complete ZIP record graph is then preflighted with limits of 200,000 entries,
 8 GiB expanded bytes, 64 MiB central-directory bytes, and a 500:1 per-entry
 compression ratio. Every central record is cross-checked with its local header,
 including raw and decoded names, encoding and general-purpose flags, method,
 CRC, compressed and expanded sizes, and offset. Encryption, ZIP64, data
 descriptors, overlapping records, duplicate or case/Unicode/normalization
-collisions, file-directory prefix conflicts, absolute paths, traversal, archive
-symbolic links or special files, nonempty directory payloads, and expansion
-beyond those limits are rejected before extraction starts. Extraction consumes
-only an updater-private immutable copy whose retained no-follow identity and
-streaming digest are checked before and after extraction; the mutable download
-pathname is never accepted as extraction authority.
+collisions, file-directory prefix conflicts, absolute paths, traversal, special
+files, nonempty directory payloads, and expansion beyond those limits are
+rejected before extraction starts. The official old-Unix `0x5855` extra field
+is accepted only in its exact local and central forms with matching timestamp
+bytes. Alternate-name, Unicode-path, UID/GID, or other semantic extra fields
+are rejected so `ditto` cannot select a namespace the preflight did not inspect.
+The sorted local records must cover every byte before the central directory
+exactly, with no unreferenced prefix, gap, or overlap that another ZIP parser
+could interpret differently. Stored UTF-8 symbolic links are accepted
+only when every target is relative, remains within the archive root, resolves
+to an archive entry, has no cycle, and has no archived descendant beneath the
+link. Extraction passes a duplicate of the authenticated private snapshot
+descriptor to `ditto` on standard input. Its identity and streaming digest are
+checked before and after extraction; the mutable download pathname is never
+reopened or accepted as extraction authority.
 
 ## Validation Lifecycle
 
@@ -158,8 +180,10 @@ regular files, and only contained relative symbolic links; absolute links,
 escaping or dangling link chains, hard-link ambiguity, cycles, and special files
 are rejected. Each entry seals path and type, mode, owner and group, flags,
 bounded extended attributes, extended ACL semantics, link target when present,
-and a streaming SHA-256 digest for regular-file content. Device and inode bind
-the retained live entry while the seal is computed; they are not folded into the
+and a streaming SHA-256 digest for regular-file content. The serialized seal is
+bounded at 16 MiB, which safely covers the current Electron bundle's roughly
+10,550 entries without allowing unbounded metadata. Device and inode bind the
+retained live entry while the seal is computed; they are not folded into the
 portable copy digest because a verified rollback copy necessarily has new
 inodes. Before and after metadata plus two identical descriptor-rooted captures
 prove that every retained entry stayed unchanged. Legacy format-2 partial seals
@@ -282,15 +306,62 @@ Staging never changes `/Applications/ChatGPT.app`. A periodic or launch check
 may download and stage while the desktop is live, but it never installs as a
 polling side effect. Automatic installation begins only after the coordinator
 observes a desktop app-termination boundary. Explicit manual installation is
-also allowed. Both paths wait for the desktop host and its account-bearing
-app-server to stop and check that condition again immediately before any
-destination mutation; if either runtime has restarted or probe evidence is
-truncated, successful-but-ambiguous, or unavailable, the valid staged
-generation remains authoritative for a later safe boundary.
+also allowed. Both paths wait for the desktop host and every app-server
+executable loaded from the installed app bundle to stop, then check that
+condition again immediately before destination mutation. An independent
+CodexSwitch-prepared app-server is not loaded from the destination bundle, does
+not block replacement, and is never terminated by the updater. If a
+destination-owning runtime has restarted or probe evidence is truncated,
+successful-but-ambiguous, or unavailable, the valid staged generation remains
+authoritative for a later safe boundary. Runtime ownership is classified from
+the kernel-resolved executable path for each live PID, not from mutable argv
+text or a symlink used to launch the process.
 
-The updater never calls `NSRunningApplication.terminate`. Stock restoration and
-update installation both return a waiting/deferred result while either runtime
-is externally observed as active, with no destination mutation or quit request.
+The updater itself never calls `NSRunningApplication.terminate`. The Settings
+controller may request a normal quit of the desktop host after an explicit
+Install action. Stock restoration and update installation still return a
+waiting/deferred result while a destination-owning runtime is externally
+observed as active, with no destination mutation or force-quit.
+
+The Settings UI exposes the same coordinator rather than a second updater. It
+reports installed, latest, and staged builds. Check and Prepare downloads,
+authenticates, extracts, and validates the latest official stock release.
+Install Update requests a normal host quit and then uses the existing
+termination transaction; it never force-quits or bypasses the runtime gate. A
+committed update is never relaunched directly: CodexSwitch first applies the
+current ASAR and bundled-CLI compatibility patch, verifies the required patch
+markers and the re-signed bundle, and only then relaunches ChatGPT. Patch
+failure leaves ChatGPT stopped and reports a repair failure instead of
+launching a stock build that cannot hot swap.
+
+macOS may deny mutation inside `/Applications` until CodexSwitch has App
+Management permission. Settings exposes that state, opens Privacy & Security,
+and provides an explicit retry that clears only CodexSwitch's permission and
+attempt backoff markers. The retry does not weaken signing, runtime, archive, or
+installation validation.
+
+The activation intent is persisted before patch restoration starts and binds
+the exact destination path, short version, and bundle build. A targetless
+legacy intent or a different installed build cannot satisfy it. The intent is
+cleared only after that exact installed bundle independently passes the
+complete patch marker set, strict code-sign validation, bundled runtime
+readiness, a stable relaunch, and a fresh same-account auth reload acknowledged
+by every discovered desktop runtime. At least one acknowledged app-server
+endpoint must also have an established loopback connection from a running
+process whose kernel executable identity belongs to the exact installed target
+bundle. The verifier matches the complete client/server TCP tuple against
+`ESTABLISHED` sockets owned by both processes, proves the acknowledged runtime
+still owns the listener, and sandwiches the socket inspection between exact
+owner, start-time, executable-path, argument, and executable-vnode identity
+checks. This binding permits an independent CodexSwitch-prepared app-server
+while preventing a listener handoff, PID reuse, or an unrelated prepared or
+developer server from satisfying activation before the updated ChatGPT host is
+connected. A reusable
+acknowledgement from before the app replacement is not activation evidence. An
+interruption resumes that activation on the next CodexSwitch launch or the next
+ChatGPT termination boundary. OpenAI's legacy plugin path and the current
+`cua_node` Computer Use path are both recognized without re-signing either
+preserved helper.
 
 The destination replacement uses a prepared incoming bundle on the destination
 volume and an atomic same-directory swap (`renameatx_np` with `RENAME_SWAP`) when
@@ -449,16 +520,16 @@ bounds; stock restore through pending/reassessment/rejection; malformed cache,
 ledger, and journal behavior; exact trust command and Security identity stage
 ordering; continuous subprocess output and surviving descendants; and bounded
 retention name and cursor behavior. The focused test source includes
-deterministic temporary-root cases for the resumed transaction slice, including
+deterministic temporary-root cases for the transaction slice, including
 real child-process lease collisions during download, publication, installation,
 and recovery, repeated payload reuse, URL rotation and corrected payloads,
 committed cleanup retry through production updater/coordinator entry points,
-runtime-gated recovery, and bounded retention. No behavioral pass or live
-runtime claim is made until focused tests execute in a later resource-safe pass.
+runtime-gated recovery, and bounded retention.
 
 Trust-stage cases are injected pipeline tests, not end-to-end system tests. They
 prove stage ordering and classification through strict verification,
 Gatekeeper assessment, and exact OpenAI identity evidence; they do not execute
 the host Security.framework or Gatekeeper services. HTTP/cache cases exercise
 the production client logic with injected transport and temporary filesystem
-state. Live integration evidence remains intentionally absent.
+state. Live activation additionally requires installed-version, patch-marker,
+strict-signing, relaunch, and process-stability evidence.

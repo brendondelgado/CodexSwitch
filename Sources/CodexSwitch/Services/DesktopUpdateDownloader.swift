@@ -138,7 +138,12 @@ struct DesktopUpdateDownloader: @unchecked Sendable {
     let processRunner: DesktopUpdaterProcessRunner
     let transport: any DesktopArchiveHTTPTransport
     let availableCapacity: @Sendable () throws -> Int64
-    let extractArchive: (URL, URL, () -> Bool) throws -> Void
+    let extractArchive: (
+        DesktopPinnedRegularFile,
+        URL,
+        () -> Bool
+    ) throws -> Void
+    let trustedArchivePublicKey: Data?
 
     init(
         updateRoot: URL,
@@ -147,9 +152,16 @@ struct DesktopUpdateDownloader: @unchecked Sendable {
         processRunner: DesktopUpdaterProcessRunner = DesktopUpdaterProcessRunner(),
         transport: any DesktopArchiveHTTPTransport = URLSessionDesktopArchiveTransport(),
         availableCapacity: (@Sendable () throws -> Int64)? = nil,
-        extractArchive: ((URL, URL, () -> Bool) throws -> Void)? = nil
+        extractArchive: ((
+            DesktopPinnedRegularFile,
+            URL,
+            () -> Bool
+        ) throws -> Void)? = nil,
+        trustedArchivePublicKey: Data? = Data(
+            base64Encoded: DesktopArchiveAuthenticator.openAIProductionPublicKeyBase64
+        )
     ) {
-        let updateRoot = updateRoot.standardizedFileURL
+        let updateRoot = CodexDesktopPathSecurity.lexicallyStandardized(updateRoot)
         self.updateRoot = updateRoot
         self.temporaryRoot = CodexDesktopPathSecurity.lexicallyStandardized(
             temporaryRoot ?? CodexDesktopPathSecurity.canonicalSystemTemporaryDirectory()
@@ -157,16 +169,19 @@ struct DesktopUpdateDownloader: @unchecked Sendable {
         self.fileManager = fileManager
         self.processRunner = processRunner
         self.transport = transport
+        self.trustedArchivePublicKey = trustedArchivePublicKey
         self.availableCapacity = availableCapacity ?? {
             try updateRoot.resourceValues(
                 forKeys: [.volumeAvailableCapacityForImportantUsageKey]
             ).volumeAvailableCapacityForImportantUsage ?? 0
         }
         self.extractArchive = extractArchive ?? { archive, destination, isCancelled in
+            let input = try archive.standardInputHandle()
             _ = try processRunner.runChecked(
                 executableURL: URL(fileURLWithPath: "/usr/bin/ditto"),
-                arguments: ["-x", "-k", archive.path, destination.path],
+                arguments: ["-x", "-k", "-", destination.path],
                 timeout: 300,
+                standardInput: input,
                 isCancelled: isCancelled
             )
         }
@@ -182,13 +197,17 @@ struct DesktopUpdateDownloader: @unchecked Sendable {
               release.downloadURL.host == "persistent.oaistatic.com" else {
             throw Self.downloaderError("The official appcast returned an unexpected download host")
         }
-        guard let archiveDigest = release.archiveSHA256,
-              archiveDigest.count == 64,
-              archiveDigest.allSatisfy(\.isHexDigit),
+        guard DesktopArchiveAuthentication.hasTrustedSignature(
+                  release.archiveEdSignature
+              ),
+              (release.archiveSHA256 == nil
+                  || DesktopArchiveAuthentication.normalizedSHA256(
+                      release.archiveSHA256
+                  ) != nil),
               release.archiveLength.map({ $0 >= 0 && $0 <= Self.maximumArchiveBytes })
                 ?? true else {
             throw DesktopDefinitiveReleaseRejection(
-                reason: "The appcast did not provide a supported bounded archive digest",
+                reason: "The appcast did not provide a signed bounded archive",
                 reasonClass: .releaseMetadata
             )
         }
@@ -244,17 +263,50 @@ struct DesktopUpdateDownloader: @unchecked Sendable {
             expectedIdentity: response.fileIdentity,
             maximumBytes: Self.maximumArchiveBytes
         )
+        guard let archiveMutationGuard = DesktopRetainedFileMutationGuard(
+            descriptor: retainedArchive.descriptor
+        ) else {
+            throw Self.downloaderError(
+                "Could not watch the downloaded desktop archive for changes"
+            )
+        }
         try lifetime?.enter(.archiveVerification, isCancelled: isCancelled)
-        try DesktopArchiveAuthenticator.verify(
+        let authenticatedArchive = try DesktopPinnedRegularFile.privateSnapshot(
+            copying: retainedArchive,
+            in: archiveDirectory,
+            maximumBytes: Self.maximumArchiveBytes,
+            isCancelled: isCancelled
+        )
+        guard let authenticatedArchiveMutationGuard =
+                DesktopRetainedFileMutationGuard(
+                    descriptor: authenticatedArchive.descriptor
+                ),
+              !archiveMutationGuard.observedMutation(),
+              retainedArchive.verifyPathIdentity(),
+              authenticatedArchive.verifyPathIdentity() else {
+            throw Self.downloaderError(
+                "Could not freeze the downloaded desktop archive"
+            )
+        }
+        let authentication = try DesktopArchiveAuthenticator.verify(
             release: release,
-            archive: retainedArchive,
+            archive: authenticatedArchive,
+            trustedEd25519PublicKey: trustedArchivePublicKey,
             isCancelled: isCancelled
         )
         if isCancelled() { throw CancellationError() }
         _ = try DesktopZIPArchivePreflight.validate(
-            archive: retainedArchive,
+            archive: authenticatedArchive,
             isCancelled: isCancelled
         )
+        guard !archiveMutationGuard.observedMutation(),
+              !authenticatedArchiveMutationGuard.observedMutation(),
+              retainedArchive.verifyPathIdentity(),
+              authenticatedArchive.verifyPathIdentity() else {
+            throw Self.downloaderError(
+                "Desktop archive changed while it was being authenticated"
+            )
+        }
         if isCancelled() { throw CancellationError() }
         let extractedRoot = workDirectory.appendingPathComponent("extract", isDirectory: true)
         if isCancelled() { throw CancellationError() }
@@ -263,13 +315,22 @@ struct DesktopUpdateDownloader: @unchecked Sendable {
             isCancelled: isCancelled
         )
         guard let archiveGuard = DesktopBundleTreeMutationGuard(appURL: archiveDirectory),
-              retainedArchive.verifyPathIdentity() else {
+              retainedArchive.verifyPathIdentity(),
+              authenticatedArchive.verifyPathIdentity() else {
             throw Self.downloaderError("Desktop archive identity changed before extraction")
         }
         if isCancelled() { throw CancellationError() }
-        try extractArchive(archive, extractedRoot, isCancelled)
+        try extractArchive(authenticatedArchive, extractedRoot, isCancelled)
         if isCancelled() { throw CancellationError() }
-        guard retainedArchive.verifyPathIdentity(), !archiveGuard.observedMutation() else {
+        let postExtractionDigest = try authenticatedArchive.sha256(
+            isCancelled: isCancelled
+        )
+        guard authenticatedArchive.verifyPathIdentity(),
+              retainedArchive.verifyPathIdentity(),
+              !archiveGuard.observedMutation(),
+              !archiveMutationGuard.observedMutation(),
+              !authenticatedArchiveMutationGuard.observedMutation(),
+              postExtractionDigest == authentication.contentSHA256 else {
             throw Self.downloaderError("Desktop archive changed during extraction")
         }
         guard let extractedApp = Self.findDesktopApp(
@@ -317,8 +378,9 @@ struct DesktopUpdateDownloader: @unchecked Sendable {
                     .path,
                 stagedAt: now,
                 generationIdentifier: generationIdentifier,
-                archiveSHA256: release.archiveSHA256,
-                archiveLength: release.archiveLength
+                archiveSHA256: authentication.contentSHA256,
+                archiveEdSignature: authentication.ed25519Signature,
+                archiveLength: authentication.byteCount
             )
         }
     }

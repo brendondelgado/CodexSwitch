@@ -14,7 +14,8 @@ enum DesktopReloadResult: Sendable, Equatable {
     case reloaded(
         method: String,
         discoveredRuntimeCount: Int = 0,
-        acknowledgedRuntimeCount: Int = 0
+        acknowledgedRuntimeCount: Int = 0,
+        acknowledgedRuntimeBindings: [CodexDesktopRuntimeSocketBinding] = []
     )
     case noDesktopRuntime
     case unsupported(
@@ -32,11 +33,12 @@ enum DesktopReloadResult: Sendable, Equatable {
         acknowledged: Int
     ) -> DesktopReloadResult {
         switch self {
-        case .reloaded(let method, _, _):
+        case .reloaded(let method, _, _, let acknowledgedRuntimeBindings):
             return .reloaded(
                 method: method,
                 discoveredRuntimeCount: discovered,
-                acknowledgedRuntimeCount: acknowledged
+                acknowledgedRuntimeCount: acknowledged,
+                acknowledgedRuntimeBindings: acknowledgedRuntimeBindings
             )
         case .noDesktopRuntime:
             return .noDesktopRuntime
@@ -192,6 +194,8 @@ struct DesktopRuntimeReloadClient: Sendable {
 
     func reloadAuth(
         account: CodexAccount,
+        reuseExistingAcknowledgement: Bool = true,
+        includeAcknowledgedRuntimeBindings: Bool = false,
         authorizeEffect: @escaping @Sendable () -> Bool = { true }
     ) async -> DesktopReloadResult {
         guard authorizeEffect(),
@@ -227,12 +231,14 @@ struct DesktopRuntimeReloadClient: Sendable {
         let discoveredPIDs = Set(
             context.discovery.targets.map { $0.process.identity.pid }
         )
-        let reusableAcknowledgedPIDs = dependencies.alreadyAcknowledgedRuntimePIDs(
-            context.discovery,
-            account.accountId,
-            targetTokenFingerprint,
-            context.requiredOwnerUID
-        ).intersection(discoveredPIDs)
+        let reusableAcknowledgedPIDs = reuseExistingAcknowledgement
+            ? dependencies.alreadyAcknowledgedRuntimePIDs(
+                context.discovery,
+                account.accountId,
+                targetTokenFingerprint,
+                context.requiredOwnerUID
+            ).intersection(discoveredPIDs)
+            : []
         var acknowledgedPIDs = reusableAcknowledgedPIDs
         let pendingSocketBindings = context.socketBindings.filter {
             !reusableAcknowledgedPIDs.contains($0.target.process.identity.pid)
@@ -253,7 +259,14 @@ struct DesktopRuntimeReloadClient: Sendable {
             return .reloaded(
                 method: Self.existingAcknowledgementMethod,
                 discoveredRuntimeCount: context.discovery.targets.count,
-                acknowledgedRuntimeCount: reusableAcknowledgedPIDs.count
+                acknowledgedRuntimeCount: reusableAcknowledgedPIDs.count,
+                acknowledgedRuntimeBindings: includeAcknowledgedRuntimeBindings
+                    ? context.socketBindings.filter {
+                        reusableAcknowledgedPIDs.contains(
+                            $0.target.process.identity.pid
+                        )
+                    }
+                    : []
             )
         }
 
@@ -357,7 +370,12 @@ struct DesktopRuntimeReloadClient: Sendable {
         return .reloaded(
             method: method,
             discoveredRuntimeCount: context.discovery.targets.count,
-            acknowledgedRuntimeCount: acknowledgedPIDs.count
+            acknowledgedRuntimeCount: acknowledgedPIDs.count,
+            acknowledgedRuntimeBindings: includeAcknowledgedRuntimeBindings
+                ? context.socketBindings.filter {
+                    acknowledgedPIDs.contains($0.target.process.identity.pid)
+                }
+                : []
         )
     }
 

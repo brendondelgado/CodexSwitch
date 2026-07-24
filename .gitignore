@@ -6,5 +6,6 @@ DerivedData/
 .DS_Store
 build/
 target/
+node_modules/
 __pycache__/
 *.pyc

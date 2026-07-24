@@ -65,6 +65,8 @@ private actor ArchiveTransportFake: DesktopArchiveHTTPTransport {
     func downloads() -> Int { requestCount }
 }
 
+private struct SnapshotExtractionStop: Error {}
+
 private final class DesktopUpdateCompletionFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var completed = false
@@ -329,7 +331,7 @@ private actor EpochDesktopUpdateExecutor: CodexDesktopUpdateExecuting {
     func prepareLatestUpdate(
         epoch: DesktopUpdateRunEpoch
     ) async -> CodexDesktopUpdatePreparationResult {
-        .upToDate("test")
+        .upToDate(installedVersion: "test", latestVersion: "test")
     }
 
     func installStagedUpdateIfReady(
@@ -384,7 +386,10 @@ private actor CleanupRetryDesktopUpdateExecutor: CodexDesktopUpdateExecuting {
         epoch: DesktopUpdateRunEpoch
     ) async -> CodexDesktopUpdatePreparationResult {
         prepareCount += 1
-        return .upToDate("test")
+        return .upToDate(
+            installedVersion: "installed-version",
+            latestVersion: "latest-version"
+        )
     }
 
     func installStagedUpdateIfReady(
@@ -421,6 +426,45 @@ private actor CleanupRetryDesktopUpdateExecutor: CodexDesktopUpdateExecuting {
         completedCleanups: Int
     ) {
         (prepareCount, recoveryCallCount, completedCleanupCount)
+    }
+}
+
+private actor StagedDesktopUpdateExecutor: CodexDesktopUpdateExecuting {
+    private var prepareCount = 0
+
+    func performStartupMaintenance(
+        temporaryRoot: URL,
+        now: Date,
+        epoch: DesktopUpdateRunEpoch
+    ) async -> CodexDesktopStartupMaintenanceReport {
+        .empty
+    }
+
+    func prepareLatestUpdate(
+        epoch: DesktopUpdateRunEpoch
+    ) async -> CodexDesktopUpdatePreparationResult {
+        prepareCount += 1
+        return .alreadyStaged(
+            CodexDesktopStagedUpdate(
+                shortVersion: "26.721.31836",
+                bundleVersion: "5828",
+                downloadURL: URL(
+                    string: "https://persistent.oaistatic.com/codex-app-prod/ChatGPT.zip"
+                )!,
+                appPath: "/tmp/ChatGPT.app",
+                stagedAt: Date(timeIntervalSince1970: 1)
+            )
+        )
+    }
+
+    func installStagedUpdateIfReady(
+        epoch: DesktopUpdateRunEpoch
+    ) async -> CodexDesktopStagedInstallResult {
+        .failed("Unexpected staged installation")
+    }
+
+    func preparations() -> Int {
+        prepareCount
     }
 }
 
@@ -1656,6 +1700,63 @@ struct CodexDesktopAppUpdaterTests {
         }
     }
 
+    @Test("Extraction receives the authenticated private archive snapshot")
+    func extractionUsesAuthenticatedPrivateSnapshot() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archiveBytes = makeZIPArchive(entries: [
+            ZIPTestEntry.regular("ChatGPT.app/Contents/payload"),
+        ])
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let downloadURL = URL(
+            string: "https://persistent.oaistatic.com/codex-app-prod/snapshot.zip"
+        )!
+        let transport = ArchiveTransportFake(
+            bytes: archiveBytes,
+            finalURL: downloadURL
+        )
+        var receivedPrivateSnapshot = false
+        let downloader = DesktopUpdateDownloader(
+            updateRoot: root.appendingPathComponent("updates", isDirectory: true),
+            temporaryRoot: root.appendingPathComponent("temporary", isDirectory: true),
+            transport: transport,
+            availableCapacity: { 20 * 1024 * 1024 * 1024 },
+            extractArchive: { archive, _, _ in
+                var info = stat()
+                let extractionBytes = try archive.read(
+                    offset: 0,
+                    count: archiveBytes.count
+                )
+                receivedPrivateSnapshot =
+                    archive.isPrivateSnapshot
+                    && fstat(archive.descriptor, &info) == 0
+                    && info.st_nlink == 0
+                    && (info.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0
+                    && (info.st_flags & UInt32(UF_IMMUTABLE)) != 0
+                    && (fcntl(archive.descriptor, F_GETFL) & O_ACCMODE) == O_RDONLY
+                    && extractionBytes == archiveBytes
+                throw SnapshotExtractionStop()
+            },
+            trustedArchivePublicKey: signingKey.publicKey.rawRepresentation
+        )
+        let release = CodexDesktopAppRelease(
+            shortVersion: "26.721.31836",
+            bundleVersion: "5828",
+            downloadURL: downloadURL,
+            archiveSHA256: sha256(archiveBytes),
+            archiveEdSignature: try signingKey.signature(
+                for: archiveBytes
+            ).base64EncodedString(),
+            archiveLength: Int64(archiveBytes.count)
+        )
+
+        await #expect(throws: SnapshotExtractionStop.self) {
+            _ = try await downloader.downloadGeneration(release)
+        }
+        #expect(receivedPrivateSnapshot)
+        #expect(await transport.downloads() == 1)
+    }
+
     @Test("Unsafe ZIP entries are rejected before archive extraction")
     func unsafeArchivesAreRejectedBeforeExtraction() async throws {
         let fixtures: [(String, Data)] = [
@@ -1697,6 +1798,7 @@ struct CodexDesktopAppUpdaterTests {
         for (name, archiveBytes) in fixtures {
             let root = temporaryDirectory()
             defer { try? FileManager.default.removeItem(at: root) }
+            let signingKey = Curve25519.Signing.PrivateKey()
             let downloadURL = URL(
                 string: "https://persistent.oaistatic.com/codex-app-prod/\(name).zip"
             )!
@@ -1707,13 +1809,17 @@ struct CodexDesktopAppUpdaterTests {
                 temporaryRoot: root.appendingPathComponent("temporary", isDirectory: true),
                 transport: transport,
                 availableCapacity: { 20 * 1024 * 1024 * 1024 },
-                extractArchive: { _, _, _ in extractionCount += 1 }
+                extractArchive: { _, _, _ in extractionCount += 1 },
+                trustedArchivePublicKey: signingKey.publicKey.rawRepresentation
             )
             let release = CodexDesktopAppRelease(
                 shortVersion: "26.707.62119",
                 bundleVersion: "5211",
                 downloadURL: downloadURL,
                 archiveSHA256: sha256(archiveBytes),
+                archiveEdSignature: try signingKey.signature(
+                    for: archiveBytes
+                ).base64EncodedString(),
                 archiveLength: Int64(archiveBytes.count)
             )
 
@@ -1722,6 +1828,236 @@ struct CodexDesktopAppUpdaterTests {
             }
             #expect(extractionCount == 0)
             #expect(await transport.downloads() == 1)
+        }
+    }
+
+    @Test("Official-shaped contained ZIP symbolic links pass archive preflight")
+    func containedArchiveSymlinksPassPreflight() throws {
+        let entries = [
+            ZIPTestEntry.directory("ChatGPT.app/"),
+            ZIPTestEntry.directory("ChatGPT.app/Contents/"),
+            ZIPTestEntry.directory("ChatGPT.app/Contents/Frameworks/"),
+            ZIPTestEntry.directory(
+                "ChatGPT.app/Contents/Frameworks/Sparkle.framework/"
+            ),
+            ZIPTestEntry.directory(
+                "ChatGPT.app/Contents/Frameworks/Sparkle.framework/Versions/"
+            ),
+            ZIPTestEntry.directory(
+                "ChatGPT.app/Contents/Frameworks/Sparkle.framework/Versions/B/"
+            ),
+            ZIPTestEntry.directory(
+                "ChatGPT.app/Contents/Frameworks/Sparkle.framework/Versions/B/Resources/"
+            ),
+            ZIPTestEntry.symlink(
+                "ChatGPT.app/Contents/Frameworks/Sparkle.framework/Versions/Current",
+                target: "B"
+            ),
+            ZIPTestEntry.symlink(
+                "ChatGPT.app/Contents/Frameworks/Sparkle.framework/Resources",
+                target: "Versions/Current/Resources"
+            ),
+            ZIPTestEntry.directory(
+                "ChatGPT.app/Contents/Resources/cua_node/lib/node_modules/.bin/"
+            ),
+            ZIPTestEntry.regular(
+                "ChatGPT.app/Contents/Resources/cua_node/lib/node_modules/playwright/cli.js"
+            ),
+            ZIPTestEntry.symlink(
+                "ChatGPT.app/Contents/Resources/cua_node/lib/node_modules/.bin/playwright",
+                target: "../playwright/cli.js"
+            ),
+        ]
+
+        let summary = try validateZIPArchive(makeZIPArchive(entries: entries))
+
+        #expect(summary.entryCount == entries.count)
+    }
+
+    @Test("Official old-Unix extra fields match across ZIP headers")
+    func officialOldUnixExtraFieldsPassPreflight() throws {
+        let timestamps = Data([
+            0x53, 0x7c, 0x60, 0x6a,
+            0x17, 0xae, 0x4d, 0x6a,
+        ])
+        var entry = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/Resources/payload"
+        )
+        entry.centralExtra = zipExtraField(
+            identifier: 0x5855,
+            payload: timestamps
+        )
+        entry.localExtra = zipExtraField(
+            identifier: 0x5855,
+            payload: timestamps + Data([0xf5, 0x01, 0x14, 0x00])
+        )
+
+        let summary = try validateZIPArchive(
+            makeZIPArchive(entries: [entry])
+        )
+
+        #expect(summary.entryCount == 1)
+    }
+
+    @Test("Semantic and mismatched ZIP extra fields fail preflight")
+    func unsupportedOrMismatchedExtraFieldsFailPreflight() throws {
+        let unicodePathPayload =
+            Data([1, 0, 0, 0, 0])
+            + Data("ChatGPT.app/alternate".utf8)
+        let asiUnixTypePayload = Data(repeating: 0, count: 14)
+        var unicodePath = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/unicode"
+        )
+        unicodePath.localExtra = zipExtraField(
+            identifier: 0x7075,
+            payload: unicodePathPayload
+        )
+        unicodePath.centralExtra = unicodePath.localExtra
+
+        var alternateType = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/type"
+        )
+        alternateType.localExtra = zipExtraField(
+            identifier: 0x756e,
+            payload: asiUnixTypePayload
+        )
+        alternateType.centralExtra = alternateType.localExtra
+
+        let centralTimestamps = Data(repeating: 0x11, count: 8)
+        var mismatchedOldUnix = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/timestamps"
+        )
+        mismatchedOldUnix.centralExtra = zipExtraField(
+            identifier: 0x5855,
+            payload: centralTimestamps
+        )
+        mismatchedOldUnix.localExtra = zipExtraField(
+            identifier: 0x5855,
+            payload: Data(repeating: 0x22, count: 8)
+                + Data(repeating: 0, count: 4)
+        )
+
+        var centralOnlyOldUnix = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/central-only"
+        )
+        centralOnlyOldUnix.centralExtra = zipExtraField(
+            identifier: 0x5855,
+            payload: centralTimestamps
+        )
+
+        for fixture in [
+            unicodePath,
+            alternateType,
+            mismatchedOldUnix,
+            centralOnlyOldUnix,
+        ] {
+            #expect(throws: (any Error).self) {
+                _ = try validateZIPArchive(
+                    makeZIPArchive(entries: [fixture])
+                )
+            }
+        }
+    }
+
+    @Test("Escaping cyclic nested and special ZIP entries fail archive preflight")
+    func unsafeArchiveSymlinkGraphsFailPreflight() throws {
+        let fixtures = [
+            [
+                ZIPTestEntry.directory("ChatGPT.app/"),
+                ZIPTestEntry.symlink(
+                    "ChatGPT.app/absolute",
+                    target: "/private/tmp/escaped"
+                ),
+            ],
+            [
+                ZIPTestEntry.directory("ChatGPT.app/"),
+                ZIPTestEntry.symlink(
+                    "ChatGPT.app/escaped",
+                    target: "../../escaped"
+                ),
+            ],
+            [
+                ZIPTestEntry.directory("ChatGPT.app/"),
+                ZIPTestEntry.symlink("ChatGPT.app/a", target: "b"),
+                ZIPTestEntry.symlink("ChatGPT.app/b", target: "a"),
+            ],
+            [
+                ZIPTestEntry.directory("ChatGPT.app/"),
+                ZIPTestEntry.directory("ChatGPT.app/loop/"),
+                ZIPTestEntry.symlink("ChatGPT.app/loop/self", target: "."),
+            ],
+            [
+                ZIPTestEntry.directory("ChatGPT.app/"),
+                ZIPTestEntry.directory("ChatGPT.app/real/"),
+                ZIPTestEntry.symlink("ChatGPT.app/linked", target: "real"),
+                ZIPTestEntry.regular("ChatGPT.app/linked/payload"),
+            ],
+            [
+                ZIPTestEntry.directory("ChatGPT.app/"),
+                ZIPTestEntry(
+                    path: "ChatGPT.app/fifo",
+                    compressedBytes: 0,
+                    expandedBytes: 0,
+                    unixMode: UInt32(S_IFIFO | 0o600),
+                    compressionMethod: 0,
+                    payload: Data()
+                ),
+            ],
+        ]
+
+        for fixture in fixtures {
+            #expect(throws: (any Error).self) {
+                _ = try validateZIPArchive(makeZIPArchive(entries: fixture))
+            }
+        }
+    }
+
+    @Test("Local header mismatches collisions and overlapping records fail preflight")
+    func hostileArchiveRecordGraphsFailPreflight() throws {
+        var mismatchedLocalPath = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/safe"
+        )
+        mismatchedLocalPath.localPath = "../outside-the-app"
+
+        var overlappingRecord = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/second"
+        )
+        overlappingRecord.localOffsetOverride = 0
+
+        var dataDescriptor = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/descriptor"
+        )
+        dataDescriptor.localFlags = 0x0808
+        dataDescriptor.centralFlags = 0x0808
+
+        var crcMismatch = ZIPTestEntry.regular(
+            "ChatGPT.app/Contents/crc"
+        )
+        crcMismatch.localCRC32 = 1
+        crcMismatch.centralCRC32 = 2
+
+        let fixtures = [
+            [mismatchedLocalPath],
+            [
+                ZIPTestEntry.regular("ChatGPT.app/Contents/first"),
+                overlappingRecord,
+            ],
+            [
+                ZIPTestEntry.regular("ChatGPT.app/Contents/Case"),
+                ZIPTestEntry.regular("ChatGPT.app/Contents/case"),
+            ],
+            [
+                ZIPTestEntry.regular("ChatGPT.app/Contents"),
+                ZIPTestEntry.regular("ChatGPT.app/Contents/child"),
+            ],
+            [dataDescriptor],
+            [crcMismatch],
+        ]
+
+        for fixture in fixtures {
+            #expect(throws: (any Error).self) {
+                _ = try validateZIPArchive(makeZIPArchive(entries: fixture))
+            }
         }
     }
 
@@ -2756,6 +3092,9 @@ struct CodexDesktopAppUpdaterTests {
             if await executor.counts().prepared >= 1 { break }
             await Task.yield()
         }
+        #expect(coordinator.presentation.installedVersion == "installed-version")
+        #expect(coordinator.presentation.latestVersion == "latest-version")
+        #expect(coordinator.presentation.stagedVersion == nil)
 
         var installed = false
         var completion: CodexDesktopInstallationTransactionCompletion?
@@ -2771,13 +3110,57 @@ struct CodexDesktopAppUpdaterTests {
         #expect(completion?.committed == true)
         #expect(completion?.cleanupPending == true)
         #expect(await executor.counts().completedCleanups == 0)
+        #expect(coordinator.presentation.installedVersion == "26.707.62119 (5211)")
+        #expect(coordinator.presentation.latestVersion == "26.707.62119 (5211)")
+        #expect(coordinator.presentation.stagedVersion == nil)
 
+        coordinator.desktopActivationFinished(
+            success: true,
+            message: "ChatGPT update and hot-swap activation verified."
+        )
+        for _ in 0..<10 {
+            await Task.yield()
+        }
         coordinator.checkNow(reason: "cleanup-retry")
         for _ in 0..<1_000 {
             if await executor.counts().completedCleanups == 1 { break }
             await Task.yield()
         }
         #expect(await executor.counts().completedCleanups == 1)
+    }
+
+    @MainActor
+    @Test("Periodic checks cannot overwrite a manual install waiting state")
+    func periodicCheckPreservesManualInstallState() async {
+        let executor = StagedDesktopUpdateExecutor()
+        let coordinator = CodexDesktopUpdateCoordinator(
+            temporaryRoot: temporaryDirectory(),
+            executor: executor,
+            nativeUpdateOwnershipProvider: { nil }
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+
+        for _ in 0..<1_000 {
+            if coordinator.presentation.phase == .staged { break }
+            await Task.yield()
+        }
+        #expect(coordinator.presentation.phase == .staged)
+        #expect(await executor.preparations() == 1)
+
+        coordinator.manualInstallRequested(waitingForDesktopQuit: true)
+        var result: CodexDesktopUpdatePreparationResult?
+        coordinator.checkNow(reason: "periodic") {
+            result = $0
+        }
+
+        guard case .some(.deferred(let message)) = result else {
+            Issue.record("Periodic check should defer during manual activation")
+            return
+        }
+        #expect(message == "Desktop update activation is already in progress")
+        #expect(coordinator.presentation.phase == .waitingForQuit)
+        #expect(await executor.preparations() == 1)
     }
 
     @Test("Run epoch permits reentrant validation from cancellation probes")
@@ -2856,7 +3239,17 @@ struct CodexDesktopAppUpdaterTests {
             DesktopUpdateRuntimeGate.classify(
                 host: absent,
                 appServer: appServerExecutable
-            ) == .running
+            ) == .unavailable
+        )
+
+        let preparedAppServer = CodexDesktopTrustCommandResult(
+            terminationStatus: 1
+        )
+        #expect(
+            DesktopUpdateRuntimeGate.classify(
+                host: absent,
+                appServer: preparedAppServer
+            ) == .ready
         )
 
         let ambiguousSuccess = CodexDesktopTrustCommandResult(
@@ -2894,6 +3287,50 @@ struct CodexDesktopAppUpdaterTests {
         )
         #expect(
             DesktopUpdateRuntimeGate.classify(host: timeout, appServer: absent) == .unavailable
+        )
+    }
+
+    @Test("Runtime activation gate trusts kernel executable identity instead of argv")
+    func runtimeActivationGateUsesKernelExecutableIdentity() {
+        let absent = CodexDesktopTrustCommandResult(terminationStatus: 1)
+        let installedThroughAlias = CodexDesktopTrustCommandResult(
+            terminationStatus: 0,
+            standardOutput: "42 /private/tmp/chatgpt-alias app-server"
+        )
+        #expect(
+            DesktopUpdateRuntimeGate.classify(
+                host: absent,
+                appServer: installedThroughAlias,
+                processExecutablePath: { pid in
+                    pid == 42
+                        ? "/Applications/ChatGPT.app/Contents/Resources/codex"
+                        : nil
+                }
+            ) == .running
+        )
+
+        let independentPreparedServer = CodexDesktopTrustCommandResult(
+            terminationStatus: 0,
+            standardOutput: "43 /Applications/ChatGPT.app/Contents/Resources/codex app-server"
+        )
+        #expect(
+            DesktopUpdateRuntimeGate.classify(
+                host: absent,
+                appServer: independentPreparedServer,
+                processExecutablePath: { pid in
+                    pid == 43
+                        ? "/Users/me/.local/share/codexswitch/prepared-codex/0.145.0/codex"
+                        : nil
+                }
+            ) == .ready
+        )
+
+        #expect(
+            DesktopUpdateRuntimeGate.classify(
+                host: absent,
+                appServer: independentPreparedServer,
+                processExecutablePath: { _ in nil }
+            ) == .unavailable
         )
     }
 
@@ -3160,6 +3597,9 @@ struct CodexDesktopAppUpdaterTests {
             root: root,
             allowedDestinations: [destination]
         )
+        var activationMarks = 0
+        var activationClears = 0
+        var activationTarget: CodexDesktopUpdateActivationTarget?
 
         let result = await CodexDesktopAppUpdater.performStagedInstallHoldingLifetime(
             installScope.lifetime,
@@ -3170,17 +3610,33 @@ struct CodexDesktopAppUpdaterTests {
             desktopRuntimeRunning: { false },
             validateOfficialBundle: { _, _, _, isCancelled in
                 isCancelled() ? .cancelled : .valid
-            }
+            },
+            activationWillInstall: { target in
+                activationMarks += 1
+                activationTarget = target
+            },
+            activationDidNotCommit: { activationClears += 1 }
         )
         _ = await installScope.owner.finish(installScope.lifetime)
 
         guard case .installed(_, _, let transaction, let cleanupPending) = result else {
-            Issue.record("Committed cleanup failure must remain an updater install success")
+            Issue.record(
+                "Committed cleanup failure must remain an updater install success; received \(String(describing: result))"
+            )
             return
         }
         #expect(transaction.committed)
         #expect(transaction.cleanupPending)
         #expect(cleanupPending)
+        #expect(activationMarks == 1)
+        #expect(activationClears == 0)
+        #expect(
+            activationTarget == CodexDesktopUpdateActivationTarget(
+                shortVersion: "26.707.62119",
+                bundleVersion: "5211",
+                appPath: destination.path
+            )
+        )
         #expect(try readMarker(from: destination) == "new")
         #expect(CodexDesktopUpdateStorage.loadAuthoritativeUpdate(in: root) == nil)
         #expect(
@@ -3455,6 +3911,49 @@ struct CodexDesktopAppUpdaterTests {
             )
         )
         #expect(changed.files != initial.files)
+    }
+
+    @Test("A production-sized desktop seal fits the bounded manifest")
+    func productionSizedSealFitsManifestBound() throws {
+        let contentSHA256 = String(repeating: "a", count: 64)
+        let files = [
+            CodexDesktopStagedFileSeal(
+                relativePath: ".",
+                byteCount: 0,
+                modificationDate: Date(timeIntervalSince1970: 1),
+                contentSHA256: contentSHA256,
+                posixPermissions: 0o755
+            ),
+        ] + (1..<10_550).map {
+            CodexDesktopStagedFileSeal(
+                relativePath: "Contents/Resources/module-\($0)/package-file.js",
+                byteCount: 1_024,
+                modificationDate: Date(timeIntervalSince1970: 1),
+                contentSHA256: contentSHA256,
+                posixPermissions: 0o644
+            )
+        }
+        let staged = CodexDesktopStagedUpdate(
+            shortVersion: "26.721.31836",
+            bundleVersion: "5828",
+            downloadURL: URL(
+                string: "https://persistent.oaistatic.com/codex-app-prod/ChatGPT.zip"
+            )!,
+            appPath: "/private/tmp/generation/ChatGPT.app",
+            stagedAt: Date(timeIntervalSince1970: 1),
+            generationIdentifier: UUID().uuidString,
+            validationSeal: CodexDesktopStagedValidationSeal(
+                formatVersion: DesktopBundleTreeIntegrity.sealFormatVersion,
+                validatedAt: Date(timeIntervalSince1970: 1),
+                files: files
+            )
+        )
+
+        let encoded = try JSONEncoder().encode(staged)
+
+        #expect(encoded.count > 64 * 1024)
+        #expect(encoded.count <= CodexDesktopUpdateStorage.maximumManifestBytes)
+        #expect(CodexDesktopUpdateStorage.maximumManifestBytes == 16 * 1024 * 1024)
     }
 
     @Test("Security path normalization preserves the non-symlink private namespace")
@@ -3926,6 +4425,61 @@ struct CodexDesktopAppUpdaterTests {
         try #require(!child.isRunning)
         #expect(child.terminationStatus == 0)
         #expect(try readMarker(from: destination) == "new")
+    }
+
+    @Test("A pre-commit runtime race clears the durable activation intent")
+    func updaterClearsActivationIntentWhenInstallDoesNotCommit() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destination = root.appendingPathComponent("ChatGPT.app", isDirectory: true)
+        try writeFakeApp(
+            at: destination,
+            bundleVersion: "5103",
+            shortVersion: "26.707.5103",
+            marker: "old"
+        )
+        _ = try writeFakeStagedUpdate(
+            in: root,
+            bundleVersion: "5211",
+            legacyLayout: false,
+            includeSeal: true,
+            marker: "new"
+        )
+        let scope = try await makeTestOperationScope(
+            root: root,
+            allowedDestinations: [destination]
+        )
+        let installer = DesktopBundleInstaller(
+            transactionRoot: root,
+            allowedDestinations: [destination]
+        )
+        var runtimeProbeCount = 0
+        var activationMarks = 0
+        var activationClears = 0
+
+        let result = await CodexDesktopAppUpdater.performStagedInstallHoldingLifetime(
+            scope.lifetime,
+            updateRoot: root,
+            stateMachine: scope.stateMachine,
+            locateInstalled: { CodexDesktopAppLocator.locate(appPath: destination.path) },
+            installer: installer,
+            desktopRuntimeRunning: {
+                runtimeProbeCount += 1
+                return runtimeProbeCount >= 3
+            },
+            validateOfficialBundle: { _, _, _, _ in .valid },
+            activationWillInstall: { _ in activationMarks += 1 },
+            activationDidNotCommit: { activationClears += 1 }
+        )
+        _ = await scope.owner.finish(scope.lifetime)
+
+        guard case .waitingForDesktopQuit = result else {
+            Issue.record("A runtime launch before commit must defer installation")
+            return
+        }
+        #expect(activationMarks == 1)
+        #expect(activationClears == 1)
+        #expect(try readMarker(from: destination) == "old")
     }
 
     @Test("Installer lease child process helper")
@@ -5136,33 +5690,96 @@ struct CodexDesktopAppUpdaterTests {
         let compressedBytes: UInt32
         let expandedBytes: UInt32
         let unixMode: UInt32
+        var compressionMethod: UInt16 = 8
+        var payload = Data([0])
+        var localPath: String?
+        var localOffsetOverride: UInt32?
+        var localFlags: UInt16 = 0x0800
+        var centralFlags: UInt16 = 0x0800
+        var localCRC32: UInt32 = 0
+        var centralCRC32: UInt32 = 0
+        var localExtra = Data()
+        var centralExtra = Data()
+
+        static func directory(_ path: String) -> Self {
+            Self(
+                path: path,
+                compressedBytes: 0,
+                expandedBytes: 0,
+                unixMode: UInt32(S_IFDIR | 0o755),
+                compressionMethod: 0,
+                payload: Data()
+            )
+        }
+
+        static func regular(_ path: String) -> Self {
+            Self(
+                path: path,
+                compressedBytes: 1,
+                expandedBytes: 1,
+                unixMode: UInt32(S_IFREG | 0o644),
+                compressionMethod: 0,
+                payload: Data([0])
+            )
+        }
+
+        static func symlink(_ path: String, target: String) -> Self {
+            let payload = Data(target.utf8)
+            return Self(
+                path: path,
+                compressedBytes: UInt32(payload.count),
+                expandedBytes: UInt32(payload.count),
+                unixMode: UInt32(S_IFLNK | 0o755),
+                compressionMethod: 0,
+                payload: payload
+            )
+        }
     }
 
     private func makeZIPArchive(entries: [ZIPTestEntry]) -> Data {
+        var local = Data()
         var central = Data()
         for entry in entries {
             let name = Data(entry.path.utf8)
+            let localName = Data((entry.localPath ?? entry.path).utf8)
+            let localOffset = UInt32(local.count)
+            appendUInt32(0x04034b50, to: &local)
+            appendUInt16(20, to: &local)
+            appendUInt16(entry.localFlags, to: &local)
+            appendUInt16(entry.compressionMethod, to: &local)
+            appendUInt16(0, to: &local)
+            appendUInt16(0, to: &local)
+            appendUInt32(entry.localCRC32, to: &local)
+            appendUInt32(entry.compressedBytes, to: &local)
+            appendUInt32(entry.expandedBytes, to: &local)
+            appendUInt16(UInt16(localName.count), to: &local)
+            appendUInt16(UInt16(entry.localExtra.count), to: &local)
+            local.append(localName)
+            local.append(entry.localExtra)
+            local.append(entry.payload)
+
             appendUInt32(0x02014b50, to: &central)
             appendUInt16(0x0314, to: &central)
             appendUInt16(20, to: &central)
-            appendUInt16(0x0800, to: &central)
-            appendUInt16(8, to: &central)
+            appendUInt16(entry.centralFlags, to: &central)
+            appendUInt16(entry.compressionMethod, to: &central)
             appendUInt16(0, to: &central)
             appendUInt16(0, to: &central)
-            appendUInt32(0, to: &central)
+            appendUInt32(entry.centralCRC32, to: &central)
             appendUInt32(entry.compressedBytes, to: &central)
             appendUInt32(entry.expandedBytes, to: &central)
             appendUInt16(UInt16(name.count), to: &central)
-            appendUInt16(0, to: &central)
+            appendUInt16(UInt16(entry.centralExtra.count), to: &central)
             appendUInt16(0, to: &central)
             appendUInt16(0, to: &central)
             appendUInt16(0, to: &central)
             appendUInt32(entry.unixMode << 16, to: &central)
-            appendUInt32(0, to: &central)
+            appendUInt32(entry.localOffsetOverride ?? localOffset, to: &central)
             central.append(name)
+            central.append(entry.centralExtra)
         }
 
-        var archive = Data([0])
+        var archive = local
         let centralOffset = UInt32(archive.count)
         archive.append(central)
         appendUInt32(0x06054b50, to: &archive)
@@ -5176,6 +5793,21 @@ struct CodexDesktopAppUpdaterTests {
         return archive
     }
 
+    private func validateZIPArchive(
+        _ archiveBytes: Data
+    ) throws -> DesktopZIPArchivePreflight.Summary {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let archiveURL = root.appendingPathComponent("ChatGPT.app.zip")
+        try archiveBytes.write(to: archiveURL)
+        let archive = try DesktopPinnedRegularFile(
+            url: archiveURL,
+            maximumBytes: DesktopUpdateDownloader.maximumArchiveBytes
+        )
+        return try DesktopZIPArchivePreflight.validate(archive: archive)
+    }
+
     private func appendUInt16(_ value: UInt16, to data: inout Data) {
         data.append(UInt8(value & 0xff))
         data.append(UInt8((value >> 8) & 0xff))
@@ -5186,6 +5818,17 @@ struct CodexDesktopAppUpdaterTests {
         data.append(UInt8((value >> 8) & 0xff))
         data.append(UInt8((value >> 16) & 0xff))
         data.append(UInt8((value >> 24) & 0xff))
+    }
+
+    private func zipExtraField(
+        identifier: UInt16,
+        payload: Data
+    ) -> Data {
+        var field = Data()
+        appendUInt16(identifier, to: &field)
+        appendUInt16(UInt16(payload.count), to: &field)
+        field.append(payload)
+        return field
     }
 
     private func sha256(_ data: Data) -> String {

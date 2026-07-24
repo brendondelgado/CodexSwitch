@@ -29,7 +29,7 @@ struct DesktopUpdateStagingService: @unchecked Sendable {
     let fileManager: FileManager
 
     init(root: URL, fileManager: FileManager = .default) {
-        self.root = root.standardizedFileURL
+        self.root = CodexDesktopPathSecurity.lexicallyStandardized(root)
         self.fileManager = fileManager
     }
 
@@ -131,7 +131,10 @@ struct DesktopUpdateStagingService: @unchecked Sendable {
             ) else {
                 return .deferred("Desktop update check was cancelled")
             }
-            return .upToDate(installedVersionLabel)
+            return .upToDate(
+                installedVersion: installedVersionLabel,
+                latestVersion: release.versionLabel
+            )
         }
 
         if CodexDesktopUpdateStorage.isRejectedRelease(

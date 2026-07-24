@@ -35,7 +35,7 @@ enum AccountActivationConvergenceEvaluator {
         }
 
         switch desktopReload {
-        case .reloaded(_, let discovered, let acknowledged):
+        case .reloaded(_, let discovered, let acknowledged, _):
             desktopCounts = (discovered, acknowledged)
             if discovered <= 0 || acknowledged != discovered {
                 divergenceDetails.append(

@@ -190,7 +190,9 @@ final class DesktopUpdateMutationAuthority: @unchecked Sendable {
     ) {
         self.operationIdentifier = operationIdentifier
         self.epoch = epoch
-        self.allowedRoots = allowedRoots.map(\.standardizedFileURL)
+        self.allowedRoots = allowedRoots.map {
+            CodexDesktopPathSecurity.lexicallyStandardized($0)
+        }
         self.allowedExactPaths = allowedExactPaths
     }
 
@@ -199,7 +201,7 @@ final class DesktopUpdateMutationAuthority: @unchecked Sendable {
     }
 
     func permits(_ path: URL) -> Bool {
-        authorizes(path.standardizedFileURL)
+        authorizes(CodexDesktopPathSecurity.lexicallyStandardized(path))
     }
 
     func withMutation<Result>(
@@ -209,7 +211,7 @@ final class DesktopUpdateMutationAuthority: @unchecked Sendable {
     ) throws -> Result {
         try epoch.withPublication(isCancelled: isCancelled) {
             for path in paths {
-                guard authorizes(path.standardizedFileURL) else {
+                guard authorizes(CodexDesktopPathSecurity.lexicallyStandardized(path)) else {
                     throw DesktopUpdateOwnershipError.unauthorizedPath(path.path)
                 }
             }
@@ -227,7 +229,7 @@ final class DesktopUpdateMutationAuthority: @unchecked Sendable {
         _ body: () throws -> Result
     ) throws -> Result {
         guard expectedOperationIdentifier == operationIdentifier,
-              authorizes(path.standardizedFileURL) else {
+              authorizes(CodexDesktopPathSecurity.lexicallyStandardized(path)) else {
             throw DesktopUpdateOwnershipError.unauthorizedPath(path.path)
         }
         return try body()
@@ -308,7 +310,9 @@ actor DesktopUpdateOperationOwner {
         self.stateMachine = stateMachine
         self.leaseURL = CodexDesktopPathSecurity.lexicallyStandardized(leaseURL)
         self.updateRoot = CodexDesktopPathSecurity.lexicallyStandardized(updateRoot)
-        self.allowedDestinations = Set(allowedDestinations.map { $0.standardizedFileURL.path })
+        self.allowedDestinations = Set(allowedDestinations.map {
+            CodexDesktopPathSecurity.lexicallyStandardized($0).path
+        })
     }
 
     func acquire(

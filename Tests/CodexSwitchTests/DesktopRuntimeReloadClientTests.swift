@@ -187,6 +187,40 @@ struct DesktopRuntimeReloadClientTests {
         #expect(!strictReloadCalls.value)
     }
 
+    @Test("Desktop activation can require a fresh acknowledged reload")
+    func desktopActivationBypassesReusableAcknowledgement() async throws {
+        let strictReloadCalls = LockedFlag()
+        let (client, sender) = makeClient(
+            responses: [
+                .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+                .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
+            ],
+            alreadyAcknowledgedRuntimePIDs: { discovery, _, _, _ in
+                Set(discovery.targets.map { $0.process.identity.pid })
+            },
+            strictReload: { _, _, _, _, _ in
+                strictReloadCalls.setTrue()
+                return Self.successfulStrictSummary
+            }
+        )
+
+        let result = await client.reloadAuth(
+            account: makeAccount(),
+            reuseExistingAcknowledgement: false
+        )
+        let requests = await sender.recordedRequests()
+
+        #expect(result == .reloaded(
+            method: "account/login/start",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
+        try #require(requests.count == 2)
+        #expect(requestMethod(in: requests[0].payload) == "account/login/start")
+        #expect(requestMethod(in: requests[1].payload) == "account/read")
+        #expect(strictReloadCalls.value)
+    }
+
     @Test("Only desktop runtimes without a target-account ACK are notified")
     func partialAcknowledgementReloadsOnlyMissingRuntime() async throws {
         let strictSocketPorts = LockedTestState<[UInt16]>([])

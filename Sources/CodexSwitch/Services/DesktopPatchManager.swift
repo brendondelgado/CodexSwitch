@@ -125,6 +125,13 @@ private final class DesktopPatchStatusCache: @unchecked Sendable {
             cachedAt = Date()
         }
     }
+
+    func clear() {
+        lock.withLock {
+            cachedStatus = nil
+            cachedAt = nil
+        }
+    }
 }
 
 private enum DesktopPatchLeaseAcquisition {
@@ -292,12 +299,10 @@ enum DesktopPatchManager {
     private nonisolated static var bundledCLIPath: String {
         "\(codexAppPath)/Contents/Resources/codex"
     }
-    private nonisolated static var computerUsePluginAppPath: String {
-        "\(codexAppPath)/Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"
-    }
-    private nonisolated static var skyComputerUseClientAppPath: String {
-        "\(computerUsePluginAppPath)/Contents/SharedSupport/SkyComputerUseClient.app"
-    }
+    private nonisolated static let computerUsePluginRelativePaths = [
+        "Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app",
+        "Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app",
+    ]
     private nonisolated static let stockVendorCLIPath =
         "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex"
     private nonisolated static let lastPatchAttemptPath =
@@ -341,6 +346,17 @@ enum DesktopPatchManager {
             return true
         }
         return value
+    }
+
+    nonisolated static var appManagementPermissionRequired: Bool {
+        permissionDeniedBackoffActive()
+    }
+
+    nonisolated static func prepareForAppManagementPermissionRetry() {
+        clearPermissionDenied()
+        clearPatchAttempt()
+        statusCache.clear()
+        SwapLog.append(.debug("DESKTOP_PATCH_PERMISSION_RETRY_REQUESTED"))
     }
 
     nonisolated static func registerDefaults() {
@@ -484,7 +500,16 @@ enum DesktopPatchManager {
         ignorePermissionDeniedBackoff: Bool = false
     ) -> DesktopPatchAttemptOutcome {
         let status = currentStatus(maxAge: 0)
-        guard !status.desktopIntegrationInstalled else { return .notNeeded }
+        let bundleStrictlyValid = !status.desktopIntegrationInstalled
+            || CodexDesktopAppLocator.bundleIsValid(appPath: codexAppPath)
+        guard repairRequired(
+            desktopIntegrationInstalled: status.desktopIntegrationInstalled,
+            bundleStrictlyValid: bundleStrictlyValid
+        ) else {
+            clearPermissionDenied()
+            clearPatchAttempt()
+            return .notNeeded
+        }
         appendPatchLog("desktop patch needed: running=\(status.isCodexAppRunning) automatic=\(automaticPatchingEnabled)")
         SwapLog.append(.debug("DESKTOP_PATCH_NEEDED running=\(status.isCodexAppRunning) automatic=\(automaticPatchingEnabled)"))
         guard automaticPatchingEnabled else {
@@ -587,6 +612,13 @@ enum DesktopPatchManager {
             break
         }
         return outcome
+    }
+
+    nonisolated static func repairRequired(
+        desktopIntegrationInstalled: Bool,
+        bundleStrictlyValid: Bool
+    ) -> Bool {
+        !desktopIntegrationInstalled || !bundleStrictlyValid
     }
 
     nonisolated static func withDesktopPatchMutationLease(
@@ -791,8 +823,8 @@ enum DesktopPatchManager {
     }
 
     nonisolated static func bundledComputerUsePluginSignatureCompatible() -> Bool {
-        let pluginPaths = [skyComputerUseClientAppPath, computerUsePluginAppPath]
-        guard pluginPaths.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
+        let pluginPaths = computerUsePluginSigningPaths(appPath: codexAppPath)
+        guard !pluginPaths.isEmpty else {
             return false
         }
 
@@ -801,6 +833,24 @@ enum DesktopPatchManager {
             pluginTeams: pluginPaths.map { codeSignatureTeamIdentifier(at: $0) },
             pluginEntitlements: pluginPaths.map { codeSignatureEntitlements(at: $0) }
         )
+    }
+
+    nonisolated static func computerUsePluginSigningPaths(appPath: String) -> [String] {
+        var signingPaths: [String] = []
+        for relativePath in computerUsePluginRelativePaths {
+            let pluginPath = (appPath as NSString).appendingPathComponent(relativePath)
+            let clientPath = (pluginPath as NSString)
+                .appendingPathComponent("Contents/SharedSupport/SkyComputerUseClient.app")
+            let pluginExists = FileManager.default.fileExists(atPath: pluginPath)
+            let clientExists = FileManager.default.fileExists(atPath: clientPath)
+            guard pluginExists == clientExists else {
+                return []
+            }
+            if pluginExists {
+                signingPaths.append(contentsOf: [clientPath, pluginPath])
+            }
+        }
+        return signingPaths
     }
 
     nonisolated static func officialCodexAppSignatureCompatible() -> Bool {
@@ -1040,33 +1090,7 @@ enum DesktopPatchManager {
     }
 
     nonisolated static func isCodexDesktopRuntimeRunning() -> Bool {
-        let runningHostBundleIdentifiers = desktopHostBundleIdentifiers.filter { bundleIdentifier in
-            NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
-                .contains { !$0.isTerminated }
-        }
-        if desktopSafeQuitIsBlocked(
-            runningHostBundleIdentifiers: runningHostBundleIdentifiers,
-            appServerProcessListOutput: ""
-        ) {
-            return true
-        }
-
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-fl", "codex.*app-server"],
-            timeout: 2
-        )
-        if result.timedOut || (result.terminationStatus != 0 && result.terminationStatus != 1) {
-            return true
-        }
-        guard result.terminationStatus == 0 else {
-            return false
-        }
-
-        return desktopSafeQuitIsBlocked(
-            runningHostBundleIdentifiers: [],
-            appServerProcessListOutput: result.stdoutString
-        )
+        DesktopUpdateRuntimeGate().readiness() != .ready
     }
 
     nonisolated static func desktopSafeQuitIsBlocked(
@@ -1079,9 +1103,13 @@ enum DesktopPatchManager {
         }) {
             return true
         }
-        return !DesktopRuntimeDiagnostics.parseAppServerProcesses(
+        return DesktopRuntimeDiagnostics.parseAppServerProcesses(
             fromPGrepOutput: appServerProcessListOutput
-        ).isEmpty
+        ).contains { process in
+            let value = (process.executablePath ?? process.commandLine).lowercased()
+            return value.contains("/applications/chatgpt.app/contents/")
+                || value.contains("/applications/codex.app/contents/")
+        }
     }
 
     private nonisolated static func appServerPIDs() -> [Int32] {

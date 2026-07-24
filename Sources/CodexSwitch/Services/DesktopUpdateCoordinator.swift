@@ -1,3 +1,4 @@
+import Combine
 import Darwin
 import Foundation
 
@@ -304,7 +305,7 @@ actor CodexDesktopUpdateBackgroundExecutor: CodexDesktopUpdateExecuting {
 }
 
 @MainActor
-final class CodexDesktopUpdateCoordinator {
+final class CodexDesktopUpdateCoordinator: ObservableObject {
     nonisolated static let checkInterval: TimeInterval = 60
 
     private enum LoggedPreparationState: Equatable {
@@ -337,6 +338,8 @@ final class CodexDesktopUpdateCoordinator {
     private var isRunning = false
     private var runEpoch: UInt64 = 0
     private var runToken: DesktopUpdateRunEpoch?
+    private var checkPublicationGeneration: UInt64 = 0
+    @Published private(set) var presentation: CodexDesktopUpdatePresentation
 
     init(
         temporaryRoot: URL? = nil,
@@ -346,6 +349,9 @@ final class CodexDesktopUpdateCoordinator {
             CodexDesktopAppUpdater.assumeNativeUpdateOwnership()
         }
     ) {
+        presentation = .idle(
+            installedVersion: CodexDesktopAppLocator.locate()?.versionLabel
+        )
         self.temporaryRoot = temporaryRoot
             ?? CodexDesktopPathSecurity.canonicalSystemTemporaryDirectory()
         self.currentDate = currentDate
@@ -363,6 +369,9 @@ final class CodexDesktopUpdateCoordinator {
         loggedPreparationState = nil
         loggedRecoveryState = nil
         loggedRecoveryFailure = nil
+        presentation = .idle(
+            installedVersion: CodexDesktopAppLocator.locate()?.versionLabel
+        )
         startInitialMaintenanceAndCheck()
         timer = Timer.scheduledTimer(withTimeInterval: Self.checkInterval, repeats: true) {
             [weak self] _ in
@@ -374,6 +383,7 @@ final class CodexDesktopUpdateCoordinator {
         runToken?.invalidate()
         runEpoch &+= 1
         isRunning = false
+        checkPublicationGeneration &+= 1
         timer?.invalidate()
         timer = nil
         checkTask?.task.cancel()
@@ -413,38 +423,83 @@ final class CodexDesktopUpdateCoordinator {
         maintenanceTask = OwnedTask(epoch: epoch, identifier: identifier, task: task)
     }
 
-    func checkNow(reason: String) {
-        guard isRunning, let runToken else { return }
-        guard checkTask == nil else { return }
+    func checkNow(
+        reason: String,
+        ignoringBackoff: Bool = false,
+        completion: ((CodexDesktopUpdatePreparationResult) -> Void)? = nil
+    ) {
+        guard isRunning, let runToken else {
+            completion?(.deferred("Desktop update coordinator is not running"))
+            return
+        }
+        guard checkTask == nil else {
+            completion?(.deferred("A desktop update check is already running"))
+            return
+        }
+        guard installTask == nil,
+              presentation.phase != .waitingForQuit,
+              presentation.phase != .installing else {
+            completion?(.deferred("Desktop update activation is already in progress"))
+            return
+        }
+        if reason != "periodic" {
+            presentation = CodexDesktopUpdatePresentation(
+                phase: .checking,
+                installedVersion: CodexDesktopAppLocator.locate()?.versionLabel,
+                latestVersion: presentation.latestVersion,
+                stagedVersion: presentation.stagedVersion,
+                message: "Checking the official ChatGPT release...",
+                lastCheckedAt: presentation.lastCheckedAt
+            )
+        }
         let epoch = runEpoch
         let identifier = UUID()
+        let publicationGeneration = checkPublicationGeneration
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.clearCheckTask(epoch: epoch, identifier: identifier) }
             await Task.yield()
-            guard !Task.isCancelled, self.ownsRun(epoch) else { return }
+            guard !Task.isCancelled,
+                  self.ownsRun(epoch),
+                  self.checkPublicationGeneration == publicationGeneration else {
+                return
+            }
             await self.recoverCommittedCleanup(epoch: epoch, runToken: runToken)
-            guard !Task.isCancelled, self.ownsRun(epoch) else { return }
+            guard !Task.isCancelled,
+                  self.ownsRun(epoch),
+                  self.checkPublicationGeneration == publicationGeneration else {
+                return
+            }
             let now = self.currentDate()
-            guard self.checkBackoff.permitsAttempt(at: now) else {
+            guard ignoringBackoff || self.checkBackoff.permitsAttempt(at: now) else {
                 if reason != "periodic" {
                     let remaining = max(
                         0,
                         self.checkBackoff.retryNotBefore?.timeIntervalSince(now) ?? 0
                     )
+                    let result = CodexDesktopUpdatePreparationResult.deferred(
+                        "Retry available in \(Int(remaining.rounded(.up))) seconds"
+                    )
+                    self.publishPreparation(result, checkedAt: now)
                     SwapLog.append(
                         .debug(
                             "DESKTOP_UPDATE_CHECK_BACKOFF reason=\(reason) "
                                 + "remaining_seconds=\(Int(remaining.rounded(.up)))"
                         )
                     )
+                    completion?(result)
                 }
                 return
             }
             let result = await self.executor.prepareLatestUpdate(epoch: runToken)
-            guard !Task.isCancelled, self.ownsRun(epoch) else { return }
+            guard !Task.isCancelled,
+                  self.ownsRun(epoch),
+                  self.checkPublicationGeneration == publicationGeneration else {
+                return
+            }
+            self.publishPreparation(result, checkedAt: self.currentDate())
             switch result {
-            case .upToDate(let version):
+            case .upToDate(let version, _):
                 self.checkBackoff.recordSuccess()
                 self.logPreparationStateIfChanged(
                     .current(version),
@@ -480,8 +535,53 @@ final class CodexDesktopUpdateCoordinator {
                         + "retry_seconds=\(Int(retryDelay)) message=\(message)"
                 )
             }
+            completion?(result)
         }
         checkTask = OwnedTask(epoch: epoch, identifier: identifier, task: task)
+    }
+
+    func prepareLatestUpdateNow() {
+        checkNow(reason: "settings", ignoringBackoff: true)
+    }
+
+    func manualInstallRequested(waitingForDesktopQuit: Bool) {
+        guard presentation.phase == .staged else { return }
+        _ = arbitrateCheckForActivation()
+        presentation = CodexDesktopUpdatePresentation(
+            phase: waitingForDesktopQuit ? .waitingForQuit : .installing,
+            installedVersion: CodexDesktopAppLocator.locate()?.versionLabel,
+            latestVersion: presentation.latestVersion,
+            stagedVersion: presentation.stagedVersion,
+            message: waitingForDesktopQuit
+                ? "Waiting for ChatGPT to quit..."
+                : "Installing update...",
+            lastCheckedAt: presentation.lastCheckedAt
+        )
+    }
+
+    func desktopActivationFinished(success: Bool, message: String) {
+        _ = arbitrateCheckForActivation()
+        let installedVersion = CodexDesktopAppLocator.locate()?.versionLabel
+        presentation = CodexDesktopUpdatePresentation(
+            phase: success ? .current : .failed,
+            installedVersion: installedVersion,
+            latestVersion: installedVersion ?? presentation.latestVersion,
+            stagedVersion: nil,
+            message: message,
+            lastCheckedAt: presentation.lastCheckedAt
+        )
+    }
+
+    func desktopActivationDeferred(_ message: String) {
+        _ = arbitrateCheckForActivation()
+        presentation = CodexDesktopUpdatePresentation(
+            phase: .deferred,
+            installedVersion: CodexDesktopAppLocator.locate()?.versionLabel,
+            latestVersion: presentation.latestVersion,
+            stagedVersion: presentation.stagedVersion,
+            message: message,
+            lastCheckedAt: presentation.lastCheckedAt
+        )
     }
 
     func applicationsDirectoryDidChange(
@@ -515,12 +615,17 @@ final class CodexDesktopUpdateCoordinator {
         ) -> Void
     ) {
         guard isRunning, installTask == nil, let runToken else { return }
+        let checkBarrier = arbitrateCheckForActivation()
         let epoch = runEpoch
         let identifier = UUID()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.clearInstallTask(epoch: epoch, identifier: identifier) }
             await Task.yield()
+            guard !Task.isCancelled, self.ownsRun(epoch) else { return }
+            if let checkBarrier {
+                await checkBarrier.value
+            }
             guard !Task.isCancelled, self.ownsRun(epoch) else { return }
             await self.recoverCommittedCleanup(epoch: epoch, runToken: runToken)
             guard !Task.isCancelled, self.ownsRun(epoch) else { return }
@@ -540,6 +645,16 @@ final class CodexDesktopUpdateCoordinator {
                     return
                 case .waitingForDesktopQuit(let update):
                     let remaining = CodexDesktopInstallRetryPolicy.maximumAttempts - attempt - 1
+                    self.presentation = CodexDesktopUpdatePresentation(
+                        phase: remaining == 0 ? .staged : .waitingForQuit,
+                        installedVersion: CodexDesktopAppLocator.locate()?.versionLabel,
+                        latestVersion: update.release.versionLabel,
+                        stagedVersion: update.release.versionLabel,
+                        message: remaining == 0
+                            ? "ChatGPT is still running. Quit it, then install the update."
+                            : "Waiting for ChatGPT to quit...",
+                        lastCheckedAt: self.presentation.lastCheckedAt
+                    )
                     SwapLog.append(
                         .debug(
                             "DESKTOP_UPDATE_WAITING version=\(update.bundleVersion) "
@@ -552,14 +667,38 @@ final class CodexDesktopUpdateCoordinator {
                         return
                     }
                 case .deferred(let message):
+                    self.presentation = CodexDesktopUpdatePresentation(
+                        phase: .deferred,
+                        installedVersion: CodexDesktopAppLocator.locate()?.versionLabel,
+                        latestVersion: self.presentation.latestVersion,
+                        stagedVersion: self.presentation.stagedVersion,
+                        message: message,
+                        lastCheckedAt: self.presentation.lastCheckedAt
+                    )
                     SwapLog.append(.debug("DESKTOP_UPDATE_INSTALL_DEFERRED message=\(message)"))
                     completion(false, nil)
                     return
                 case .discarded(let message):
+                    self.presentation = CodexDesktopUpdatePresentation(
+                        phase: .failed,
+                        installedVersion: CodexDesktopAppLocator.locate()?.versionLabel,
+                        latestVersion: self.presentation.latestVersion,
+                        stagedVersion: nil,
+                        message: message,
+                        lastCheckedAt: self.presentation.lastCheckedAt
+                    )
                     SwapLog.append(.debug("DESKTOP_UPDATE_DISCARDED message=\(message)"))
                     completion(false, nil)
                     return
                 case .installed(let path, let release, let transaction, let cleanupPending):
+                    self.presentation = CodexDesktopUpdatePresentation(
+                        phase: .installing,
+                        installedVersion: release.versionLabel,
+                        latestVersion: release.versionLabel,
+                        stagedVersion: nil,
+                        message: "Update installed. Restoring hot-swap compatibility...",
+                        lastCheckedAt: self.presentation.lastCheckedAt
+                    )
                     SwapLog.append(
                         .debug(
                             "DESKTOP_UPDATE_INSTALLED version=\(release.versionLabel) path=\(path) "
@@ -569,6 +708,14 @@ final class CodexDesktopUpdateCoordinator {
                     completion(true, transaction)
                     return
                 case .failed(let message):
+                    self.presentation = CodexDesktopUpdatePresentation(
+                        phase: .failed,
+                        installedVersion: CodexDesktopAppLocator.locate()?.versionLabel,
+                        latestVersion: self.presentation.latestVersion,
+                        stagedVersion: self.presentation.stagedVersion,
+                        message: message,
+                        lastCheckedAt: self.presentation.lastCheckedAt
+                    )
                     SwapLog.append(.debug("DESKTOP_UPDATE_INSTALL_FAILED message=\(message)"))
                     completion(false, nil)
                     return
@@ -612,6 +759,13 @@ final class CodexDesktopUpdateCoordinator {
         isRunning && runEpoch == epoch && runToken?.isCurrent() == true
     }
 
+    private func arbitrateCheckForActivation() -> Task<Void, Never>? {
+        checkPublicationGeneration &+= 1
+        guard let checkTask else { return nil }
+        checkTask.task.cancel()
+        return checkTask.task
+    }
+
     private func clearCheckTask(epoch: UInt64, identifier: UUID) {
         guard checkTask?.epoch == epoch, checkTask?.identifier == identifier else { return }
         checkTask = nil
@@ -641,6 +795,65 @@ final class CodexDesktopUpdateCoordinator {
         guard loggedPreparationState != state else { return }
         loggedPreparationState = state
         SwapLog.append(.debug(message))
+    }
+
+    private func publishPreparation(
+        _ result: CodexDesktopUpdatePreparationResult,
+        checkedAt: Date
+    ) {
+        let installedVersion = CodexDesktopAppLocator.locate()?.versionLabel
+        switch result {
+        case .upToDate(let installedVersion, let latestVersion):
+            if CodexDesktopUpdateActivationIntent.isPending() {
+                let preservingFailure = presentation.phase == .failed
+                presentation = CodexDesktopUpdatePresentation(
+                    phase: preservingFailure ? .failed : .deferred,
+                    installedVersion: installedVersion,
+                    latestVersion: latestVersion,
+                    stagedVersion: nil,
+                    message: preservingFailure
+                        ? presentation.message
+                        : "ChatGPT updated; hot-swap activation is still pending.",
+                    lastCheckedAt: checkedAt
+                )
+                return
+            }
+            presentation = CodexDesktopUpdatePresentation(
+                phase: .current,
+                installedVersion: installedVersion,
+                latestVersion: latestVersion,
+                stagedVersion: nil,
+                message: "ChatGPT is up to date.",
+                lastCheckedAt: checkedAt
+            )
+        case .alreadyStaged(let update), .staged(let update):
+            presentation = CodexDesktopUpdatePresentation(
+                phase: .staged,
+                installedVersion: installedVersion,
+                latestVersion: update.release.versionLabel,
+                stagedVersion: update.release.versionLabel,
+                message: "Update ready. Quit ChatGPT to install, patch, and reopen it.",
+                lastCheckedAt: checkedAt
+            )
+        case .deferred(let message):
+            presentation = CodexDesktopUpdatePresentation(
+                phase: .deferred,
+                installedVersion: installedVersion,
+                latestVersion: presentation.latestVersion,
+                stagedVersion: presentation.stagedVersion,
+                message: message,
+                lastCheckedAt: checkedAt
+            )
+        case .failed(let message):
+            presentation = CodexDesktopUpdatePresentation(
+                phase: .failed,
+                installedVersion: installedVersion,
+                latestVersion: presentation.latestVersion,
+                stagedVersion: presentation.stagedVersion,
+                message: message,
+                lastCheckedAt: checkedAt
+            )
+        }
     }
 
     private func logMaintenance(_ report: CodexDesktopStartupMaintenanceReport) {

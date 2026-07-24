@@ -71,6 +71,13 @@ BUNDLED_CLI_PATH = APP_RESOURCES / "codex"
 COMPUTER_USE_PLUGIN_APP_RELATIVE = Path(
     "Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"
 )
+COMPUTER_USE_CUA_NODE_APP_RELATIVE = Path(
+    "Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app"
+)
+COMPUTER_USE_APP_RELATIVES = (
+    COMPUTER_USE_PLUGIN_APP_RELATIVE,
+    COMPUTER_USE_CUA_NODE_APP_RELATIVE,
+)
 SKY_COMPUTER_USE_CLIENT_APP_RELATIVE = (
     COMPUTER_USE_PLUGIN_APP_RELATIVE
     / "Contents/SharedSupport/SkyComputerUseClient.app"
@@ -1533,17 +1540,28 @@ def current_auth_transition_patch_present(content: str) -> bool:
 def auth_status_callback_event(content: str) -> str | None:
     """Return the event parameter for the one registered auth callback."""
     events: list[str] = []
+    invalidating_events: list[str] = []
     for match in re.finditer(
         r'let\s+(?P<callback>[A-Za-z_$][\w$]*)='
         r'(?P<event>[A-Za-z_$][\w$]*)=>\{',
         content,
     ):
         callback = match.group("callback")
-        if re.search(
+        registration = re.search(
             rf'\.addAuthStatusCallback\({re.escape(callback)}\)',
-            content,
-        ):
-            events.append(match.group("event"))
+            content[match.end():],
+        )
+        if registration is None:
+            continue
+        event = match.group("event")
+        events.append(event)
+        callback_body = content[
+            match.end():match.end() + min(registration.start(), 5_000)
+        ]
+        if f"{PATCH_MARKER}(" in callback_body:
+            invalidating_events.append(event)
+    if len(invalidating_events) == 1:
+        return invalidating_events[0]
     return events[0] if len(events) == 1 else None
 
 
@@ -1804,17 +1822,32 @@ def renderer_account_read_wrapper(content: str) -> dict[str, object] | None:
         r'(?P<read_helper>[A-Za-z_$][\w$]*)'
         r'\((?P<helper_connection>[A-Za-z_$][\w$]*)\)))'
     )
-    raw_matches = list(re.finditer(prefix + read + r'(?=\.then\()', content))
-    wrapped_matches = list(
-        re.finditer(
-            prefix
-            + re.escape(AUTH_SINGLE_FLIGHT_HELPER)
-            + r'\((?P<flight_connection>[A-Za-z_$][\w$]*),\(\)=>'
-            + read
-            + r'\)(?=\.then\()',
-            content,
-        )
+    direct_suffix = r'(?=\.then\()'
+    promise_all_preamble = (
+        r'let [A-Za-z_$][\w$]*=[^;{}]{1,200};'
+        r'Promise\.all\(\['
     )
+    promise_all_suffix = r'(?=,)'
+    raw_matches = [
+        *re.finditer(prefix + read + direct_suffix, content),
+        *re.finditer(
+            prefix + promise_all_preamble + read + promise_all_suffix,
+            content,
+        ),
+    ]
+    wrapped_read = (
+        re.escape(AUTH_SINGLE_FLIGHT_HELPER)
+        + r'\((?P<flight_connection>[A-Za-z_$][\w$]*),\(\)=>'
+        + read
+        + r'\)'
+    )
+    wrapped_matches = [
+        *re.finditer(prefix + wrapped_read + direct_suffix, content),
+        *re.finditer(
+            prefix + promise_all_preamble + wrapped_read + promise_all_suffix,
+            content,
+        ),
+    ]
     if len(raw_matches) + len(wrapped_matches) != 1:
         return None
 
@@ -1944,6 +1977,7 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
         r'(?P<next>[A-Za-z_$][\w$]*\('
         r'[A-Za-z_$][\w$]*,\{'
         r'isCopilotApiAvailable:[A-Za-z_$][\w$]*,'
+        r'(?:[A-Za-z_$][\w$]*:[^,{}]{1,120},){0,4}'
         r'useCopilotAuthIfAvailable:[A-Za-z_$][\w$]*'
         r'\}\))\)'
     )
@@ -1953,6 +1987,7 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
         r'(?P<next>[A-Za-z_$][\w$]*\('
         r'[A-Za-z_$][\w$]*,\{'
         r'isCopilotApiAvailable:[A-Za-z_$][\w$]*,'
+        r'(?:[A-Za-z_$][\w$]*:[^,{}]{1,120},){0,4}'
         r'useCopilotAuthIfAvailable:[A-Za-z_$][\w$]*'
         r'\}\)),'
         r'(?P<logout>[A-Za-z_$][\w$]*)\)\)'
@@ -1977,6 +2012,8 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
 
     callback_head_re = re.compile(
         rf'let (?P<callback>[A-Za-z_$][\w$]*)={re.escape(event)}=>\{{'
+        rf'(?P<prefix>(?:(?:[A-Za-z_$][\w$]*)='
+        rf'(?:!0|{re.escape(event)}\.authMethod),){{0,4}})'
         rf'{re.escape(setter)}\('
     )
     callback_heads = list(callback_head_re.finditer(content))
@@ -1988,6 +2025,7 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
     local_re = re.compile(
         r'let (?P<cancel>[A-Za-z_$][\w$]*)=!1,'
         r'(?P<done>[A-Za-z_$][\w$]*)=!1,'
+        r'(?P<extra>(?:(?:[A-Za-z_$][\w$]*)=(?:!1|null),){0,4})'
         r'(?P<startup>[A-Za-z_$][\w$]*)=null,'
         rf'{re.escape(wrapper)}=\(\)=>\{{'
     )
@@ -2012,6 +2050,7 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
     patched = local_re.sub(
         lambda match: (
             f'let {match.group("cancel")}=!1,{match.group("done")}=!1,'
+            f'{match.group("extra")}'
             f'{match.group("startup")}=null,_csAuthEpoch=0,'
             f'_csLogoutTimer=null,{wrapper}=('
             '_csReadEpoch=_csAuthEpoch,_csConfirmLogout=!1)=>{'
@@ -2045,6 +2084,7 @@ def apply_renderer_auth_transition_patch(content: str) -> str | None:
         lambda match: (
             f'let {match.group("callback")}={event}=>{{'
             '_csAuthEpoch++;let _csEventEpoch=_csAuthEpoch;'
+            f'{match.group("prefix")}'
             f'{setter}('
         ),
         patched,
@@ -2287,6 +2327,11 @@ def apply_weakmap_use_auth_patch(file_path: Path, content: str | None = None) ->
         r'\}\),([A-Za-z_$][\w$]*)\(\)\};return\s*'
         r'([A-Za-z_$][\w$]*)\.addAuthStatusCallback\('
     )
+    conditional_callback_tail_re = re.compile(
+        r'\}\),([A-Za-z_$][\w$]*)\.authMethod!=null&&'
+        r'([A-Za-z_$][\w$]*)\(\)\};return\s*'
+        r'([A-Za-z_$][\w$]*)\.addAuthStatusCallback\('
+    )
     patched_callback_re = re.compile(
         rf'\}}\),{PATCH_MARKER}\(\),([A-Za-z_$][\w$]*)\(\)\}};return\s*'
         r'([A-Za-z_$][\w$]*)\.addAuthStatusCallback\('
@@ -2297,6 +2342,15 @@ def apply_weakmap_use_auth_patch(file_path: Path, content: str | None = None) ->
             patched,
             count=1,
         )
+        if callback_count == 0:
+            patched, callback_count = conditional_callback_tail_re.subn(
+                lambda match: (
+                    f'}}),{PATCH_MARKER}(),{match.group(2)}()}};return '
+                    f'{match.group(3)}.addAuthStatusCallback('
+                ),
+                patched,
+                count=1,
+            )
         if callback_count != 1:
             print("ERROR: Cannot find WeakMap auth status callback refresh tail")
             idx = patched.find("addAuthStatusCallback")
@@ -3368,6 +3422,14 @@ def apply_statsig_fail_open_patch(file_path: Path) -> bool:
     stable_id_namespaces = set(
         re.findall(r"([A-Za-z_$][\w$]*)\.StableID\.get\(", content)
     )
+    if len(stable_id_namespaces) > 1:
+        session_namespaces = set(
+            re.findall(r"([A-Za-z_$][\w$]*)\.StatsigSession\.", content)
+        )
+        metadata_namespaces = set(
+            re.findall(r"([A-Za-z_$][\w$]*)\.StatsigMetadataProvider\.", content)
+        )
+        stable_id_namespaces &= session_namespaces & metadata_namespaces
     fallback_re = re.compile(
         r"(?P<prefix>\(0,(?P<jsx>[A-Za-z_$][\w$]*)\.jsxs\)\()"
         r"(?P<fallback>[A-Za-z_$][\w$]*)"
@@ -3395,10 +3457,25 @@ def apply_statsig_fail_open_patch(file_path: Path) -> bool:
         print(f"ERROR: Could not isolate post-login provider in {file_path.name}")
         return False
     component_prefix = content[component_start:fallback_match.start()]
+    memoized_mutations = set(
+        re.findall(r"mutationFn:([A-Za-z_$][\w$]*)", component_prefix)
+    )
+    has_linked_mutation = (
+        "mutationFn:async" in component_prefix
+        or (
+            len(memoized_mutations) == 1
+            and re.search(
+                rf"\b{re.escape(next(iter(memoized_mutations)))}=async\b",
+                component_prefix,
+            )
+            is not None
+        )
+    )
     if (
-        "mutationFn:async" not in component_prefix
+        not has_linked_mutation
         or "status:" not in component_prefix
         or f"function {fallback_component}(" not in content
+        or not (component_start <= client_matches[0].start() < fallback_match.start())
     ):
         print(f"ERROR: Statsig failed-bootstrap branch is ambiguous in {file_path.name}")
         return False
@@ -3599,16 +3676,25 @@ def apply_model_availability_fallback_patch(file_path: Path) -> bool:
     if MODEL_AVAILABILITY_FALLBACK_MARKER in content:
         return True
 
-    pattern = re.compile(
+    legacy_pattern = re.compile(
         r"if\((?P<gate>[A-Za-z_$][\w$]*)\?"
         r"(?P<allowlist>[A-Za-z_$][\w$]*)\.has\("
         r"(?P<entry>[A-Za-z_$][\w$]*)\.model\):!"
         r"(?P=entry)\.hidden\)\{"
     )
-    match = pattern.search(content)
-    if not match:
+    additional_pattern = re.compile(
+        r"if\((?P<additional>[A-Za-z_$][\w$]*)\?\.has\("
+        r"(?P<entry>[A-Za-z_$][\w$]*)\.model\)===!0\|\|\("
+        r"(?P<gate>[A-Za-z_$][\w$]*)\?"
+        r"(?P<allowlist>[A-Za-z_$][\w$]*)\.has\("
+        r"(?P=entry)\.model\):!(?P=entry)\.hidden\)\)\{"
+    )
+    legacy_matches = list(legacy_pattern.finditer(content))
+    additional_matches = list(additional_pattern.finditer(content))
+    if len(legacy_matches) + len(additional_matches) != 1:
         print(f"ERROR: Could not find model availability filter in {file_path.name}")
         return False
+    match = additional_matches[0] if additional_matches else legacy_matches[0]
 
     context = content[max(0, match.start() - 500) : match.start()]
     if "availableModels:" not in context or "useHiddenModels:" not in context:
@@ -3618,13 +3704,23 @@ def apply_model_availability_fallback_patch(file_path: Path) -> bool:
     gate = match.group("gate")
     allowlist = match.group("allowlist")
     entry = match.group("entry")
-    replacement = (
-        f"if({gate}?/*{MODEL_AVAILABILITY_FALLBACK_MARKER}*/"
+    gated_allowlist = (
+        f"{gate}?/*{MODEL_AVAILABILITY_FALLBACK_MARKER}*/"
         f"({allowlist}.has({entry}.model)||"
-        f"{entry}.model.startsWith(`gpt-5.6-`)):!{entry}.hidden){{"
+        f"{entry}.model.startsWith(`gpt-5.6-`)):!{entry}.hidden"
     )
+    if additional_matches:
+        additional = match.group("additional")
+        replacement = (
+            f"if({additional}?.has({entry}.model)===!0||"
+            f"({gated_allowlist})){{"
+        )
+        pattern = additional_pattern
+    else:
+        replacement = f"if({gated_allowlist}){{"
+        pattern = legacy_pattern
     patched, count = pattern.subn(replacement, content, count=1)
-    if count != 1 or MODEL_AVAILABILITY_FALLBACK_MARKER not in patched:
+    if count != 1 or patched.count(MODEL_AVAILABILITY_FALLBACK_MARKER) != 1:
         print(f"ERROR: Failed to apply model availability fallback in {file_path.name}")
         return False
 
@@ -4047,9 +4143,25 @@ def codesign_entitlements_text(path: Path) -> str:
 
 def computer_use_plugin_signing_targets(app_path: Path) -> list[Path]:
     app_path = app_path.resolve()
-    sky_client_app = app_path / SKY_COMPUTER_USE_CLIENT_APP_RELATIVE
-    computer_use_app = app_path / COMPUTER_USE_PLUGIN_APP_RELATIVE
-    return [path for path in (sky_client_app, computer_use_app) if path.exists()]
+    targets: list[Path] = []
+    for computer_use_app in computer_use_plugin_roots(app_path):
+        sky_client_app = (
+            computer_use_app
+            / "Contents/SharedSupport/SkyComputerUseClient.app"
+        )
+        if sky_client_app.exists():
+            targets.append(sky_client_app)
+        targets.append(computer_use_app)
+    return targets
+
+
+def computer_use_plugin_roots(app_path: Path) -> list[Path]:
+    app_path = app_path.resolve()
+    return [
+        app_path / relative
+        for relative in COMPUTER_USE_APP_RELATIVES
+        if (app_path / relative).exists()
+    ]
 
 
 def spctl_assessment(path: Path) -> str:
@@ -4153,8 +4265,11 @@ def bundled_cli_preserves_computer_use_parent_requirement() -> bool:
 
 
 def computer_use_plugin_signature_preserved(app_path: Path) -> bool:
+    roots = computer_use_plugin_roots(app_path)
+    if not roots:
+        return True
     targets = computer_use_plugin_signing_targets(app_path)
-    if len(targets) != 2:
+    if len(targets) != 2 * len(roots):
         return False
     plugin_teams = [codesign_team_identifier(target) for target in targets]
     if any(team != OPENAI_TEAM_ID for team in plugin_teams):
@@ -4452,6 +4567,17 @@ def _is_asar_unpacked_resource(path: Path, app_path: Path) -> bool:
     return relative.parts[:3] == ("Contents", "Resources", "app.asar.unpacked")
 
 
+def _is_protected_computer_use_code(path: Path, app_path: Path) -> bool:
+    resolved = path.resolve()
+    for root in computer_use_plugin_roots(app_path):
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _is_macho_file(path: Path) -> bool:
     try:
         with path.open("rb") as handle:
@@ -4475,6 +4601,8 @@ def list_codesign_targets(app_path: Path) -> list[Path]:
         if _is_asar_unpacked_resource(path, app_path):
             continue
         if _is_bundled_plugin_code(path, app_path):
+            continue
+        if _is_protected_computer_use_code(path, app_path):
             continue
         if (
             path == app_path / "Contents/Resources/codex"
@@ -4569,7 +4697,8 @@ def main():
         sys.exit(2)
     remote_recents_file = find_remote_recents_file(assets_dir)
     if not remote_recents_file:
-        print("WARNING: Could not find remote recents JS file -- skipping optional remote sidebar refresh patch")
+        print("WARNING: Could not find remote recents JS file -- app structure may have changed")
+        sys.exit(2)
     recent_threads_state_db_file = find_recent_threads_state_db_file(assets_dir)
     if not recent_threads_state_db_file:
         print("WARNING: Could not find indexed recent-thread JS file -- app structure may have changed")
@@ -4596,8 +4725,7 @@ def main():
         sys.exit(2)
     print(f"Found auth file: {auth_file.name}")
     print(f"Found fast-mode file: {fast_mode_file.name}")
-    if remote_recents_file:
-        print(f"Found remote recents file: {remote_recents_file.name}")
+    print(f"Found remote recents file: {remote_recents_file.name}")
     print(f"Found indexed recent-thread file: {recent_threads_state_db_file.name}")
     print(f"Found post-login Statsig file: {statsig_bootstrap_file.name}")
     print(f"Found model picker file: {model_label_file.name}")
@@ -4637,7 +4765,7 @@ def main():
     native_updater_already_patched = native_updater_patch_present(native_updater_files)
     all_required_patches_present = required_desktop_patches_present(
         auth=auth_already_patched,
-        remote_recents=remote_recents_file is None or remote_recents_already_patched,
+        remote_recents=remote_recents_already_patched,
         recent_threads_state_db=recent_threads_state_db_already_patched,
         statsig_fail_open=statsig_fail_open_already_patched,
         fast=fast_already_patched,
@@ -4693,7 +4821,7 @@ def main():
         if not apply_required_fast_mode_patch(fast_mode_file):
             print("ERROR: Required Fast Mode fallback patch failed")
             sys.exit(1)
-    if remote_recents_file and not remote_recents_already_patched:
+    if not remote_recents_already_patched:
         if not apply_remote_recents_refresh_patch(remote_recents_file):
             print("ERROR: Remote sidebar refresh patch failed")
             sys.exit(1)
@@ -4732,6 +4860,32 @@ def main():
         if not apply_native_updater_disable_patch(native_updater_files):
             print("ERROR: Native updater ownership patch failed")
             sys.exit(1)
+    if not required_desktop_patches_present(
+        auth=current_auth_patch_present(auth_file.read_text()),
+        remote_recents=has_remote_recents_refresh_patch(remote_recents_file.read_text()),
+        recent_threads_state_db=has_recent_threads_state_db_patch(
+            recent_threads_state_db_file.read_text()
+        ),
+        statsig_fail_open=has_statsig_fail_open_patch(statsig_bootstrap_file.read_text()),
+        fast=FAST_FALLBACK_MARKER in fast_mode_file.read_text(),
+        model_label=MODEL_LABEL_FALLBACK_MARKER in model_label_file.read_text(),
+        model_availability=(
+            MODEL_AVAILABILITY_FALLBACK_MARKER in model_filter_file.read_text()
+        ),
+        selected_model_label=(
+            SELECTED_MODEL_LABEL_FALLBACK_MARKER in model_label_file.read_text()
+        ),
+        gpt56_max_effort=(
+            has_gpt56_max_effort_filter_patch(model_filter_file.read_text())
+            and has_gpt56_max_effort_preset_patch(model_label_file.read_text())
+        ),
+        remote_model_refresh=(
+            REMOTE_MODEL_REFRESH_MARKER in remote_model_refresh_file.read_text()
+        ),
+        native_updater=native_updater_patch_present(native_updater_files),
+    ):
+        print("ERROR: Required desktop compatibility patch verification failed")
+        sys.exit(1)
     # ---- Repack ----
     print("Repacking app.asar (with --unpack for native modules)...")
     repacked_asar = workdir / "repacked.asar"

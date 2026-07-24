@@ -110,6 +110,58 @@ struct DesktopStatusTests {
         )
     }
 
+    @Test("Computer Use signing paths support the current and legacy bundle layouts")
+    func computerUseSigningPathsSupportBothLayouts() throws {
+        let root = makeSecureTestFileURL(
+            prefix: "codexswitch-computer-use-layout",
+            fileName: "ChatGPT.app"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+        }
+
+        let currentPlugin = root.appendingPathComponent(
+            "Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app"
+        )
+        let currentClient = currentPlugin.appendingPathComponent(
+            "Contents/SharedSupport/SkyComputerUseClient.app"
+        )
+        try FileManager.default.createDirectory(
+            at: currentClient,
+            withIntermediateDirectories: true
+        )
+        #expect(
+            DesktopPatchManager.computerUsePluginSigningPaths(appPath: root.path)
+                == [currentClient.path, currentPlugin.path]
+        )
+
+        let legacyPlugin = root.appendingPathComponent(
+            "Contents/Resources/plugins/openai-bundled/plugins/computer-use/Codex Computer Use.app"
+        )
+        let legacyClient = legacyPlugin.appendingPathComponent(
+            "Contents/SharedSupport/SkyComputerUseClient.app"
+        )
+        try FileManager.default.createDirectory(
+            at: legacyClient,
+            withIntermediateDirectories: true
+        )
+        #expect(
+            DesktopPatchManager.computerUsePluginSigningPaths(appPath: root.path)
+                == [
+                    currentClient.path,
+                    currentPlugin.path,
+                    legacyClient.path,
+                    legacyPlugin.path,
+                ]
+        )
+
+        try FileManager.default.removeItem(at: currentClient)
+        #expect(
+            DesktopPatchManager.computerUsePluginSigningPaths(appPath: root.path)
+                .isEmpty
+        )
+    }
+
 
     @Test("Auth shell patch with preserved Computer Use signatures is desktop-ready")
     func authShellPatchWithPreservedComputerUseSignaturesIsDesktopReady() {
@@ -437,6 +489,34 @@ struct DesktopStatusTests {
         )
     }
 
+    @Test("Desktop update termination observer recognizes current and legacy hosts")
+    func desktopUpdateTerminationObserverRecognizesManagedHosts() {
+        #expect(
+            AppDelegate.isManagedDesktopApplication(
+                bundleIdentifier: "com.openai.codex",
+                bundlePath: nil
+            )
+        )
+        #expect(
+            AppDelegate.isManagedDesktopApplication(
+                bundleIdentifier: "com.openai.chat",
+                bundlePath: nil
+            )
+        )
+        #expect(
+            AppDelegate.isManagedDesktopApplication(
+                bundleIdentifier: nil,
+                bundlePath: "/Applications/ChatGPT.app"
+            )
+        )
+        #expect(
+            !AppDelegate.isManagedDesktopApplication(
+                bundleIdentifier: "com.example.unrelated",
+                bundlePath: "/Applications/Unrelated.app"
+            )
+        )
+    }
+
     @Test("Desktop patch lease serializes local and cross-process attempts")
     func desktopPatchLeaseSerializesAttempts() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -630,6 +710,28 @@ struct DesktopStatusTests {
 
         try Data(completeMarkers.joined(separator: " ").utf8).write(to: file)
         #expect(DesktopPatchManager.authPatchMarkersPresent(at: file.path))
+    }
+
+    @Test("A marker-complete but strict-invalid desktop bundle is repaired")
+    func strictBundleValidityParticipatesInRepairDecision() {
+        #expect(
+            !DesktopPatchManager.repairRequired(
+                desktopIntegrationInstalled: true,
+                bundleStrictlyValid: true
+            )
+        )
+        #expect(
+            DesktopPatchManager.repairRequired(
+                desktopIntegrationInstalled: true,
+                bundleStrictlyValid: false
+            )
+        )
+        #expect(
+            DesktopPatchManager.repairRequired(
+                desktopIntegrationInstalled: false,
+                bundleStrictlyValid: true
+            )
+        )
     }
 
     private func writeCodexInfoPlist(shortVersion: String, bundleVersion: String, to url: URL) throws {

@@ -30,6 +30,38 @@ enum AppDelegateDesktopPatchRetryDisposition: Equatable, Sendable {
     case relaunch
 }
 
+struct AppDelegateDesktopPatchRetryLifecycle: Equatable, Sendable {
+    private(set) var activeIdentifier: UUID?
+
+    var isActive: Bool {
+        activeIdentifier != nil
+    }
+
+    mutating func begin(identifier: UUID) -> Bool {
+        guard activeIdentifier == nil else { return false }
+        activeIdentifier = identifier
+        return true
+    }
+
+    @discardableResult
+    mutating func finish(identifier: UUID) -> Bool {
+        guard activeIdentifier == identifier else { return false }
+        activeIdentifier = nil
+        return true
+    }
+
+    mutating func cancel() {
+        activeIdentifier = nil
+    }
+}
+
+enum AppDelegateDesktopUpdateActivationObservation: Equatable, Sendable {
+    case updateInProgress
+    case runningReady
+    case runningUnready
+    case stopped
+}
+
 enum AppDelegateDurableConfigurationStatus: Equatable, Sendable {
     case matches
     case mismatch
@@ -301,6 +333,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var codexAppTerminationTask: Task<Void, Never>?
     private var codexAppTerminationTaskIdentifier: UUID?
     private var desktopPatchRetryTask: Task<Void, Never>?
+    private var desktopPatchRetryLifecycle = AppDelegateDesktopPatchRetryLifecycle()
+    private var desktopUpdateActivationProbeTask: Task<Void, Never>?
+    private var desktopUpdateActivationProbeTaskIdentifier: UUID?
+    private var lastDesktopUpdateActivationResumeAt: Date?
     private var handledDesktopUpdateTransactionIdentifiers: Set<UInt64> = []
     private var swapGeneration: UInt64 = 0
     private var pendingSwapTargetAccountId: UUID?
@@ -420,7 +456,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self?.handleDesktopApplicationsDirectoryChange(disposition)
             }
         }
-
         NSApp.setActivationPolicy(.accessory)
         NotificationManager.requestPermission()
 
@@ -476,6 +511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         self?.updatePopoverContent()
                     }
                     self?.scheduleDesktopPatchCheckIfNeeded()
+                    self?.resumePendingDesktopUpdateActivationIfNeeded()
                 }
             }
         }
@@ -814,6 +850,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         _ transaction: CodexDesktopInstallationTransactionCompletion
     ) {
         guard transaction.committed else {
+            if transaction.kind == .stagedUpdate {
+                CodexDesktopUpdateActivationIntent.clear()
+            }
             SwapLog.append(
                 .debug("DESKTOP_UPDATE_TRANSACTION_ROLLED_BACK transaction=\(transaction.identifier)")
             )
@@ -842,48 +881,153 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         reason: String,
         relaunchAfterCompletion: Bool = false
     ) {
-        desktopPatchRetryTask?.cancel()
-        desktopPatchRetryTask = Task.detached {
+        let identifier = UUID()
+        guard desktopPatchRetryLifecycle.begin(identifier: identifier) else {
+            SwapLog.append(
+                .debug(
+                    "DESKTOP_PATCH_RETRY_COALESCED reason=\(reason) "
+                        + "active=\(desktopPatchRetryLifecycle.activeIdentifier?.uuidString ?? "unknown")"
+                )
+            )
+            return
+        }
+        let activationAccount = relaunchAfterCompletion
+            ? accountManager.configuredAccount
+            : nil
+        let publishActivationResult: @MainActor @Sendable (
+            Bool,
+            String
+        ) -> Void = { [weak self] success, message in
+            self?.desktopUpdateCoordinator.desktopActivationFinished(
+                success: success,
+                message: message
+            )
+        }
+        let finishRetryBurst: @MainActor @Sendable (UUID) -> Void = {
+            [weak self] identifier in
+            self?.finishDesktopPatchRetryBurst(identifier: identifier)
+        }
+        let performRetryBurst: @Sendable () async -> Void = {
             let retryDelays = DesktopPatchManager.postQuitPatchRetryDelaysSeconds
             for (index, delaySeconds) in retryDelays.enumerated() {
                 let nanoseconds = UInt64(delaySeconds * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: nanoseconds)
                 guard !Task.isCancelled else { return }
 
+                if let operation = await CodexDesktopAppUpdater.currentOperation(),
+                   operation == .recovering
+                    || operation == .installingStagedUpdate
+                    || operation == .restoringStock {
+                    SwapLog.append(
+                        .debug(
+                            "DESKTOP_PATCH_RETRY_DEFERRED reason=\(reason) "
+                                + "updater_operation=\(operation.rawValue)"
+                        )
+                    )
+                    continue
+                }
                 let outcome = DesktopPatchManager.checkAndPatchIfPossible(
                     ignoreCooldown: true,
                     ignorePermissionDeniedBackoff: true
                 )
+                guard !Task.isCancelled else { return }
                 SwapLog.append(
                     .debug(
                         "DESKTOP_PATCH_RETRY reason=\(reason) delay_seconds=\(Int(delaySeconds)) outcome=\(outcome.logValue)"
                     )
                 )
+                let verifiedInstall = relaunchAfterCompletion
+                    ? Self.desktopUpdateActivationReadyInstall()
+                    : nil
+                let activationReady = verifiedInstall != nil
                 switch Self.desktopPatchRetryDisposition(
                     after: outcome,
                     hasRemainingAttempts: index + 1 < retryDelays.count,
-                    relaunchAfterCompletion: relaunchAfterCompletion
+                    relaunchAfterCompletion: relaunchAfterCompletion,
+                    activationReady: activationReady
                 ) {
                 case .retry:
                     continue
                 case .stop:
+                    if relaunchAfterCompletion, !activationReady {
+                        SwapLog.append(
+                            .debug(
+                                "DESKTOP_UPDATE_ACTIVATION_DEFERRED reason=\(reason) "
+                                    + "outcome=\(outcome.logValue)"
+                            )
+                        )
+                        await publishActivationResult(
+                            false,
+                            "Update installed, but hot-swap repair failed "
+                                + "(\(outcome.logValue))."
+                        )
+                    }
                     return
                 case .relaunch:
-                    Self.relaunchDesktopAppAfterUpdate()
-                    return
+                    guard !Task.isCancelled, let verifiedInstall else { return }
+                    if Self.relaunchDesktopAppAfterUpdate(
+                        verifiedInstall: verifiedInstall,
+                        isCancelled: { Task.isCancelled }
+                    ) {
+                        if let activationAccount,
+                           await Self.confirmDesktopUpdateHotSwap(
+                               verifiedInstall: verifiedInstall,
+                               account: activationAccount
+                           ) {
+                            CodexDesktopUpdateActivationIntent.clear()
+                            await publishActivationResult(
+                                true,
+                                "ChatGPT is updated and hot swapping is ready."
+                            )
+                            return
+                        }
+                        SwapLog.append(
+                            .debug(
+                                "DESKTOP_UPDATE_ACTIVATION_PENDING "
+                                    + "waiting_for=acknowledged_auth_reload"
+                            )
+                        )
+                    }
+                    guard index + 1 < retryDelays.count else {
+                        await publishActivationResult(
+                            false,
+                            "ChatGPT updated, but live hot-swap confirmation failed."
+                        )
+                        return
+                    }
                 }
             }
+            if relaunchAfterCompletion {
+                await publishActivationResult(
+                    false,
+                    "ChatGPT updated, but activation is still pending."
+                )
+            }
         }
+        desktopPatchRetryTask = Task.detached {
+            await performRetryBurst()
+            await finishRetryBurst(identifier)
+        }
+    }
+
+    private func finishDesktopPatchRetryBurst(identifier: UUID) {
+        guard desktopPatchRetryLifecycle.finish(identifier: identifier) else { return }
+        desktopPatchRetryTask = nil
     }
 
     nonisolated static func desktopPatchRetryDisposition(
         after outcome: DesktopPatchAttemptOutcome,
         hasRemainingAttempts: Bool,
-        relaunchAfterCompletion: Bool
+        relaunchAfterCompletion: Bool,
+        activationReady: Bool
     ) -> AppDelegateDesktopPatchRetryDisposition {
+        if relaunchAfterCompletion, activationReady {
+            return .relaunch
+        }
         switch outcome {
         case .completed, .notNeeded:
-            return relaunchAfterCompletion ? .relaunch : .stop
+            guard relaunchAfterCompletion else { return .stop }
+            return hasRemainingAttempts ? .retry : .stop
         default:
             guard !outcome.shouldStopPostQuitRetry, hasRemainingAttempts else {
                 return .stop
@@ -896,8 +1040,150 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ["-g", appPath]
     }
 
-    nonisolated private static func relaunchDesktopAppAfterUpdate() {
-        guard let appPath = CodexDesktopAppLocator.locate()?.appPath else { return }
+    nonisolated static func desktopUpdateActivationReadyInstall(
+        target: CodexDesktopUpdateActivationTarget? =
+            CodexDesktopUpdateActivationIntent.pendingTarget()
+    )
+        -> CodexDesktopAppInstall?
+    {
+        guard let target,
+              let install = CodexDesktopAppLocator.locate(),
+              install.appPath == target.appPath,
+              install.shortVersion == target.shortVersion,
+              install.bundleVersion == target.bundleVersion,
+              CodexDesktopAppLocator.patchMarkerPresent(install: install),
+              CodexDesktopAppLocator.bundleIsValid(appPath: install.appPath) else {
+            return nil
+        }
+        guard DesktopPatchManager.currentStatus(maxAge: 0).desktopIntegrationInstalled else {
+            return nil
+        }
+        return install
+    }
+
+    nonisolated static func desktopUpdateActivationReady() -> Bool {
+        desktopUpdateActivationReadyInstall() != nil
+    }
+
+    nonisolated static func desktopUpdateActivationObservation(
+        account: CodexAccount?
+    ) async
+        -> AppDelegateDesktopUpdateActivationObservation
+    {
+        if let operation = await CodexDesktopAppUpdater.currentOperation(),
+           operation == .recovering
+            || operation == .installingStagedUpdate
+            || operation == .restoringStock {
+            return .updateInProgress
+        }
+        guard DesktopPatchManager.isCodexDesktopRuntimeRunning() else {
+            return .stopped
+        }
+        guard let install = desktopUpdateActivationReadyInstall(),
+              desktopHostIsRunning(at: install.appPath) else {
+            return .runningUnready
+        }
+        guard let account,
+              await confirmDesktopUpdateHotSwap(
+                  verifiedInstall: install,
+                  account: account
+              ) else {
+            return .runningUnready
+        }
+        return .runningReady
+    }
+
+    nonisolated static func desktopReloadConfirmsActivation(
+        _ result: DesktopReloadResult
+    ) -> Bool {
+        guard case .reloaded(
+            _,
+            let discoveredRuntimeCount,
+            let acknowledgedRuntimeCount,
+            _
+        ) = result else {
+            return false
+        }
+        return discoveredRuntimeCount > 0
+            && acknowledgedRuntimeCount == discoveredRuntimeCount
+    }
+
+    nonisolated private static func confirmDesktopUpdateHotSwap(
+        verifiedInstall: CodexDesktopAppInstall,
+        account: CodexAccount
+    ) async -> Bool {
+        let reloadResult = await DesktopRuntimeReloadClient().reloadAuth(
+            account: account,
+            reuseExistingAcknowledgement: false,
+            includeAcknowledgedRuntimeBindings: true
+        )
+        guard desktopReloadConfirmsActivation(reloadResult),
+              DesktopUpdateRuntimeBindingVerifier.acknowledgesInstalledHost(
+                  result: reloadResult,
+                  appPath: verifiedInstall.appPath,
+                  hostProcesses: desktopHostProcesses(
+                      at: verifiedInstall.appPath
+                  )
+              ) else {
+            SwapLog.append(
+                .debug(
+                    "DESKTOP_UPDATE_AUTH_RELOAD_UNCONFIRMED "
+                        + "result=\(String(describing: reloadResult))"
+                )
+            )
+            return false
+        }
+        guard desktopUpdateActivationReadyInstall() == verifiedInstall,
+              desktopHostIsRunning(at: verifiedInstall.appPath),
+              DesktopPatchManager.runtimeHotSwapState() == .ready else {
+            SwapLog.append(
+                .debug(
+                    "DESKTOP_UPDATE_AUTH_RELOAD_STALE path=\(verifiedInstall.appPath)"
+                )
+            )
+            return false
+        }
+        SwapLog.append(
+            .debug(
+                "DESKTOP_UPDATE_AUTH_RELOAD_CONFIRMED path=\(verifiedInstall.appPath)"
+            )
+        )
+        return true
+    }
+
+    nonisolated private static func desktopHostIsRunning(at appPath: String) -> Bool {
+        !desktopHostProcesses(at: appPath).isEmpty
+    }
+
+    nonisolated private static func desktopHostProcesses(
+        at appPath: String
+    ) -> [DesktopUpdateHostProcess] {
+        return DesktopPatchManager.desktopHostBundleIdentifiers.flatMap { bundleIdentifier in
+            NSRunningApplication.runningApplications(
+                withBundleIdentifier: bundleIdentifier
+            ).compactMap { application in
+                guard !application.isTerminated,
+                      application.bundleURL?.path == appPath,
+                      application.executableURL != nil,
+                      let processIdentity = SwapEngine.signalProcessIdentity(
+                          pid: application.processIdentifier
+                      ) else {
+                    return nil
+                }
+                return DesktopUpdateHostProcess(
+                    processIdentity: processIdentity
+                )
+            }
+        }
+    }
+
+    nonisolated private static func relaunchDesktopAppAfterUpdate(
+        verifiedInstall: CodexDesktopAppInstall,
+        isCancelled: () -> Bool
+    ) -> Bool {
+        guard !isCancelled() else { return false }
+        guard desktopUpdateActivationReadyInstall() == verifiedInstall else { return false }
+        let appPath = verifiedInstall.appPath
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/open"),
             arguments: desktopUpdateRelaunchArguments(appPath: appPath),
@@ -908,6 +1194,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "DESKTOP_UPDATE_RELAUNCH path=\(appPath) status=\(result.terminationStatus) timed_out=\(result.timedOut)"
             )
         )
+        guard !result.timedOut, result.terminationStatus == 0 else { return false }
+
+        let deadline = Date().addingTimeInterval(10)
+        var continuouslyRunningSince: Date?
+        while Date() < deadline {
+            if isCancelled() { return false }
+            let running = desktopHostIsRunning(at: appPath)
+            if running {
+                let now = Date()
+                continuouslyRunningSince = continuouslyRunningSince ?? now
+                if let continuouslyRunningSince,
+                   now.timeIntervalSince(continuouslyRunningSince) >= 2 {
+                    guard desktopUpdateActivationReadyInstall() == verifiedInstall else {
+                        SwapLog.append(
+                            .debug(
+                                "DESKTOP_UPDATE_RELAUNCH_IDENTITY_CHANGED path=\(appPath)"
+                            )
+                        )
+                        return false
+                    }
+                    SwapLog.append(.debug("DESKTOP_UPDATE_RELAUNCH_CONFIRMED path=\(appPath)"))
+                    return true
+                }
+            } else {
+                continuouslyRunningSince = nil
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        SwapLog.append(.debug("DESKTOP_UPDATE_RELAUNCH_UNCONFIRMED path=\(appPath)"))
+        return false
+    }
+
+    private func resumePendingDesktopUpdateActivationIfNeeded(force: Bool = false) {
+        guard CodexDesktopUpdateActivationIntent.isPending() else { return }
+        guard desktopUpdateActivationProbeTask == nil else { return }
+        guard CodexDesktopUpdateActivationIntent.pendingTarget() != nil else {
+            CodexDesktopUpdateActivationIntent.clear()
+            desktopUpdateCoordinator.desktopActivationFinished(
+                success: false,
+                message: "Desktop update activation target was missing; update not confirmed."
+            )
+            SwapLog.append(
+                .debug("DESKTOP_UPDATE_ACTIVATION_REJECTED reason=missing_target")
+            )
+            return
+        }
+        let now = Date()
+        if !force,
+           let lastDesktopUpdateActivationResumeAt,
+           now.timeIntervalSince(lastDesktopUpdateActivationResumeAt) < 60 {
+            return
+        }
+        lastDesktopUpdateActivationResumeAt = now
+        let activationAccount = accountManager.configuredAccount
+        let identifier = UUID()
+        desktopUpdateActivationProbeTaskIdentifier = identifier
+        let finish: @MainActor @Sendable (
+            AppDelegateDesktopUpdateActivationObservation,
+            UUID
+        ) -> Void = { [weak self] observation, identifier in
+            self?.finishPendingDesktopUpdateActivationProbe(
+                observation,
+                identifier: identifier
+            )
+        }
+        desktopUpdateActivationProbeTask = Task.detached(priority: .utility) {
+            let observation = await Self.desktopUpdateActivationObservation(
+                account: activationAccount
+            )
+            guard !Task.isCancelled else { return }
+            await finish(observation, identifier)
+        }
+    }
+
+    private func finishPendingDesktopUpdateActivationProbe(
+        _ observation: AppDelegateDesktopUpdateActivationObservation,
+        identifier: UUID
+    ) {
+        guard desktopUpdateActivationProbeTaskIdentifier == identifier else { return }
+        desktopUpdateActivationProbeTask = nil
+        desktopUpdateActivationProbeTaskIdentifier = nil
+        guard !isExiting, CodexDesktopUpdateActivationIntent.isPending() else { return }
+
+        switch observation {
+        case .updateInProgress:
+            SwapLog.append(
+                .debug("DESKTOP_UPDATE_ACTIVATION_PENDING waiting_for=updater_operation")
+            )
+        case .runningReady:
+            CodexDesktopUpdateActivationIntent.clear()
+            desktopUpdateCoordinator.desktopActivationFinished(
+                success: true,
+                message: "ChatGPT is updated and hot swapping is ready."
+            )
+            SwapLog.append(.debug("DESKTOP_UPDATE_ACTIVATION_CONFIRMED existing_runtime=true"))
+        case .runningUnready:
+            desktopUpdateCoordinator.desktopActivationDeferred(
+                "ChatGPT updated; waiting for live hot-swap confirmation."
+            )
+            SwapLog.append(
+                .debug(
+                    "DESKTOP_UPDATE_ACTIVATION_PENDING "
+                        + "waiting_for=acknowledged_auth_reload"
+                )
+            )
+        case .stopped:
+            scheduleDesktopPatchRetryBurst(
+                reason: "desktop_update_activation_resume",
+                relaunchAfterCompletion: true
+            )
+        }
     }
 
     private func scheduleCodexBrowserSessionRepairIfNeeded(force: Bool = false) {
@@ -991,8 +1388,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func handleCodexAppDidTerminate(bundleIdentifier: String?, bundlePath: String?) {
-        guard bundleIdentifier == "com.openai.codex"
-            || CodexDesktopAppLocator.defaultAppPaths.contains(bundlePath ?? "") else {
+        guard Self.isManagedDesktopApplication(
+            bundleIdentifier: bundleIdentifier,
+            bundlePath: bundlePath
+        ) else {
             return
         }
 
@@ -1024,15 +1423,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .notNeeded:
                 break
             }
-            self.desktopUpdateCoordinator.desktopAppDidTerminate { [weak self] installedUpdate, transaction in
-                guard let self else { return }
-                if let transaction {
-                    self.handleDesktopUpdateTransactionCompletion(transaction)
-                } else {
-                    self.scheduleDesktopPatchRetryBurst(
-                        reason: installedUpdate ? "desktop_update_installed" : "codex_app_terminated"
-                    )
-                }
+            self.installPreparedDesktopUpdate(
+                fallbackPatchReason: "codex_app_terminated"
+            )
+        }
+    }
+
+    nonisolated static func isManagedDesktopApplication(
+        bundleIdentifier: String?,
+        bundlePath: String?
+    ) -> Bool {
+        if let bundleIdentifier,
+           DesktopPatchManager.desktopHostBundleIdentifiers.contains(bundleIdentifier) {
+            return true
+        }
+        guard let bundlePath else { return false }
+        return CodexDesktopAppLocator.defaultAppPaths.contains(bundlePath)
+    }
+
+    private func requestDesktopUpdateInstallationFromSettings() {
+        var runningHostsByPID: [pid_t: NSRunningApplication] = [:]
+        let managedBundlePaths = Set(CodexDesktopAppLocator.defaultAppPaths)
+        for bundleIdentifier in DesktopPatchManager.desktopHostBundleIdentifiers {
+            for application in NSRunningApplication.runningApplications(
+                withBundleIdentifier: bundleIdentifier
+            ) where !application.isTerminated
+                && application.bundleURL.map({ managedBundlePaths.contains($0.path) }) == true {
+                runningHostsByPID[application.processIdentifier] = application
+            }
+        }
+
+        let runningHosts = Array(runningHostsByPID.values)
+        desktopUpdateCoordinator.manualInstallRequested(
+            waitingForDesktopQuit: !runningHosts.isEmpty
+        )
+        guard !runningHosts.isEmpty else {
+            SwapLog.append(.debug("DESKTOP_UPDATE_MANUAL_INSTALL host=not_running"))
+            installPreparedDesktopUpdate(
+                fallbackPatchReason: "settings_manual_desktop_update"
+            )
+            return
+        }
+
+        for application in runningHosts {
+            let accepted = application.terminate()
+            SwapLog.append(
+                .debug(
+                    "DESKTOP_UPDATE_MANUAL_QUIT_REQUEST "
+                        + "pid=\(application.processIdentifier) accepted=\(accepted)"
+                )
+            )
+        }
+    }
+
+    private func retryDesktopPatchFromSettings(
+        completion: @escaping @MainActor @Sendable (
+            DesktopPatchAttemptOutcome
+        ) -> Void
+    ) {
+        DesktopPatchManager.prepareForAppManagementPermissionRetry()
+        Task.detached(priority: .userInitiated) {
+            let outcome = DesktopPatchManager.checkAndPatchIfPossible(
+                ignoreCooldown: true,
+                ignorePermissionDeniedBackoff: true
+            )
+            await completion(outcome)
+        }
+    }
+
+    private func installPreparedDesktopUpdate(fallbackPatchReason: String) {
+        desktopUpdateCoordinator.desktopAppDidTerminate {
+            [weak self] installedUpdate, transaction in
+            guard let self else { return }
+            if let transaction {
+                self.handleDesktopUpdateTransactionCompletion(transaction)
+            } else {
+                let activationPending = CodexDesktopUpdateActivationIntent.isPending()
+                self.scheduleDesktopPatchRetryBurst(
+                    reason: installedUpdate
+                        ? "desktop_update_installed"
+                        : fallbackPatchReason,
+                    relaunchAfterCompletion: activationPending
+                )
             }
         }
     }
@@ -5903,7 +6375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
 
             switch desktopReload {
-            case .reloaded(let method, _, _):
+            case .reloaded(let method, _, _, _):
                 if method == DesktopRuntimeReloadClient.existingAcknowledgementMethod {
                     SwapLog.append(.debug(
                         "DESKTOP_EXTERNAL_RELOAD_REUSED_ACK target=\(to.email)"
@@ -7018,6 +7490,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         codexAppTerminationTaskIdentifier = nil
         desktopPatchRetryTask?.cancel()
         desktopPatchRetryTask = nil
+        desktopPatchRetryLifecycle.cancel()
+        desktopUpdateActivationProbeTask?.cancel()
+        desktopUpdateActivationProbeTask = nil
+        desktopUpdateActivationProbeTaskIdentifier = nil
         linuxDevboxCredentialSyncRetryTask?.cancel()
         linuxDevboxCredentialSyncRetryTask = nil
         Self.requestOwnedMutationTaskCancellation(swapConvergenceTask)
@@ -7105,7 +7581,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if settingsWindow == nil {
             let settingsView = SettingsView(
                 accounts: accountManager.accounts,
-                onRemoveAllAccounts: { [weak self] in self?.removeAllAccounts() }
+                onRemoveAllAccounts: { [weak self] in self?.removeAllAccounts() },
+                desktopUpdateCoordinator: desktopUpdateCoordinator,
+                onInstallDesktopUpdate: { [weak self] in
+                    self?.requestDesktopUpdateInstallationFromSettings()
+                },
+                onRetryDesktopPatch: { [weak self] completion in
+                    self?.retryDesktopPatchFromSettings(completion: completion)
+                }
             )
             let hostingController = NSHostingController(rootView: settingsView)
             let window = NSWindow(contentViewController: hostingController)

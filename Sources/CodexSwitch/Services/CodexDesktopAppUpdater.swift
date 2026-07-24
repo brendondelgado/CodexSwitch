@@ -21,6 +21,36 @@ enum DesktopStockRestoreSafety {
     }
 }
 
+struct DesktopPatchedBundleValidationEvidence: Equatable, Sendable {
+    let bundleVersionMatches: Bool
+    let shortVersionMatches: Bool
+    let patchMarkersComplete: Bool
+    let strictSignatureValid: Bool
+    let signatureStatus: CodexDesktopAppSignatureStatus
+
+    var isInstallable: Bool {
+        bundleVersionMatches
+            && shortVersionMatches
+            && patchMarkersComplete
+            && strictSignatureValid
+            && signatureStatus == .nonOpenAISigned
+    }
+}
+
+enum DesktopInstallableBundleValidationDecision {
+    static func decide(
+        officialValidation: CodexDesktopBundleValidationResult,
+        patchedBundle: DesktopPatchedBundleValidationEvidence?
+    ) -> CodexDesktopBundleValidationResult {
+        switch officialValidation {
+        case .valid, .cancelled:
+            return officialValidation
+        case .invalid, .unavailable:
+            return patchedBundle?.isInstallable == true ? .valid : officialValidation
+        }
+    }
+}
+
 enum CodexDesktopAppUpdater {
     private static let stateMachine = CodexDesktopUpdateStateMachine()
     private static let appcastURL = URL(
@@ -70,6 +100,10 @@ enum CodexDesktopAppUpdater {
 
     static func transactionState() async -> CodexDesktopInstallationTransactionState {
         await stateMachine.transactionState()
+    }
+
+    static func currentOperation() async -> CodexDesktopUpdateOperation? {
+        await stateMachine.currentOperation()
     }
 
     static func applicationsDirectoryChangeDisposition() async
@@ -157,15 +191,7 @@ enum CodexDesktopAppUpdater {
                     lifetime: lifetime,
                     installer: makeInstaller(),
                     desktopRuntimeRunning: desktopRuntimeIsRunning,
-                    validateOfficialBundle: { candidate, bundleVersion, shortVersion,
-                            isCancelled in
-                        trustValidator.validate(
-                            appURL: candidate,
-                            expectedBundleVersion: bundleVersion,
-                            expectedShortVersion: shortVersion,
-                            isCancelled: isCancelled
-                        )
-                    }
+                    validateOfficialBundle: validateInstallableBundle
                 )
             )
         } catch {
@@ -178,8 +204,8 @@ enum CodexDesktopAppUpdater {
     static func performInstallRecoveryHoldingLifetime(
         lifetime: DesktopUpdateOperationLifetime,
         installer: DesktopBundleInstaller,
-        desktopRuntimeRunning: () -> Bool,
-        validateOfficialBundle: (
+        desktopRuntimeRunning runtimeIsRunning: () -> Bool,
+        validateOfficialBundle validateInstallableBundle: (
             URL,
             String,
             String,
@@ -189,9 +215,9 @@ enum CodexDesktopAppUpdater {
         try lifetime.enter(.recovery)
         return try installer.recover(
             lifetime: lifetime,
-            desktopRuntimeRunning: desktopRuntimeRunning,
+            desktopRuntimeRunning: runtimeIsRunning,
             isCancelled: { operationIsCancelled(lifetime) },
-            validate: validateOfficialBundle
+            validate: validateInstallableBundle
         )
     }
 
@@ -290,6 +316,13 @@ enum CodexDesktopAppUpdater {
                     expectedShortVersion: shortVersion,
                     isCancelled: isCancelled
                 )
+            },
+            validateInstallableBundle: validateInstallableBundle,
+            activationWillInstall: { target in
+                CodexDesktopUpdateActivationIntent.markPending(target: target)
+            },
+            activationDidNotCommit: {
+                CodexDesktopUpdateActivationIntent.clear()
             }
         )
     }
@@ -300,13 +333,16 @@ enum CodexDesktopAppUpdater {
         stateMachine: CodexDesktopUpdateStateMachine,
         locateInstalled: () -> CodexDesktopAppInstall?,
         installer: DesktopBundleInstaller,
-        desktopRuntimeRunning: () -> Bool,
+        desktopRuntimeRunning runtimeIsRunning: () -> Bool,
         validateOfficialBundle: (
             URL,
             String,
             String,
             () -> Bool
-        ) -> CodexDesktopBundleValidationResult
+        ) -> CodexDesktopBundleValidationResult,
+        validateInstallableBundle: DesktopBundleValidator? = nil,
+        activationWillInstall: (CodexDesktopUpdateActivationTarget) -> Void = { _ in },
+        activationDidNotCommit: () -> Void = {}
     ) async -> CodexDesktopStagedInstallResult {
         do {
             try lifetime.enter(.discovery)
@@ -323,7 +359,7 @@ enum CodexDesktopAppUpdater {
         switch installDecision(
             stagedBundleVersion: staged.bundleVersion,
             installedBundleVersion: installed?.bundleVersion,
-            desktopRuntimeRunning: desktopRuntimeIsRunning()
+            desktopRuntimeRunning: runtimeIsRunning()
         ) {
         case .waitForDesktopQuit:
             return .waitingForDesktopQuit(staged)
@@ -400,7 +436,7 @@ enum CodexDesktopAppUpdater {
             return .deferred("Staged desktop installation was cancelled")
         }
 
-        guard !desktopRuntimeIsRunning() else {
+        guard !runtimeIsRunning() else {
             return .waitingForDesktopQuit(staged)
         }
         if operationIsCancelled(lifetime) {
@@ -418,29 +454,52 @@ enum CodexDesktopAppUpdater {
         ) else {
             return .deferred("Desktop install transaction bookkeeping is inconsistent")
         }
+        let destinationPath = installed?.appPath
+            ?? installationPath(for: URL(fileURLWithPath: staged.appPath))
+        activationWillInstall(
+            CodexDesktopUpdateActivationTarget(
+                shortVersion: staged.shortVersion,
+                bundleVersion: staged.bundleVersion,
+                appPath: destinationPath
+            )
+        )
         if operationIsCancelled(lifetime) {
             _ = await stateMachine.finishInstallationTransaction(
                 identifier: transactionIdentifier,
                 permit: lifetime.permit,
                 committed: false
             )
+            activationDidNotCommit()
             return .deferred("Staged desktop installation was cancelled")
         }
 
-        let destinationPath = installed?.appPath
-            ?? installationPath(for: URL(fileURLWithPath: staged.appPath))
         do {
-            let installResult = try installer.install(
-                lifetime: lifetime,
-                sourceApp: URL(fileURLWithPath: staged.appPath),
-                destination: URL(fileURLWithPath: destinationPath),
-                expectedBundleVersion: staged.bundleVersion,
-                expectedShortVersion: staged.shortVersion,
-                kind: .stagedUpdate,
-                desktopRuntimeRunning: desktopRuntimeIsRunning,
-                isCancelled: { operationIsCancelled(lifetime) },
-                validate: validateOfficialBundle
-            )
+            let installResult: DesktopBundleInstallResult
+            if let validateInstallableBundle {
+                installResult = try installer.install(
+                    lifetime: lifetime,
+                    sourceApp: URL(fileURLWithPath: staged.appPath),
+                    destination: URL(fileURLWithPath: destinationPath),
+                    expectedBundleVersion: staged.bundleVersion,
+                    expectedShortVersion: staged.shortVersion,
+                    kind: .stagedUpdate,
+                    desktopRuntimeRunning: runtimeIsRunning,
+                    isCancelled: { operationIsCancelled(lifetime) },
+                    validate: validateInstallableBundle
+                )
+            } else {
+                installResult = try installer.install(
+                    lifetime: lifetime,
+                    sourceApp: URL(fileURLWithPath: staged.appPath),
+                    destination: URL(fileURLWithPath: destinationPath),
+                    expectedBundleVersion: staged.bundleVersion,
+                    expectedShortVersion: staged.shortVersion,
+                    kind: .stagedUpdate,
+                    desktopRuntimeRunning: runtimeIsRunning,
+                    isCancelled: { operationIsCancelled(lifetime) },
+                    validate: validateOfficialBundle
+                )
+            }
             switch installResult {
             case .busy:
                 _ = await finish(
@@ -450,6 +509,7 @@ enum CodexDesktopAppUpdater {
                     kind: .stagedUpdate,
                     stateMachine: stateMachine
                 )
+                activationDidNotCommit()
                 return .deferred("Another desktop install process holds the updater lease")
             case .runtimeRunning:
                 _ = await finish(
@@ -459,6 +519,7 @@ enum CodexDesktopAppUpdater {
                     kind: .stagedUpdate,
                     stateMachine: stateMachine
                 )
+                activationDidNotCommit()
                 return .waitingForDesktopQuit(staged)
             case .cancelledBeforeCommit:
                 _ = await finish(
@@ -468,6 +529,7 @@ enum CodexDesktopAppUpdater {
                     kind: .stagedUpdate,
                     stateMachine: stateMachine
                 )
+                activationDidNotCommit()
                 return .deferred("Staged desktop installation was cancelled before commit")
             case .installed(_, let cleanupPending):
                 let completion = await finish(
@@ -500,6 +562,7 @@ enum CodexDesktopAppUpdater {
                 kind: .stagedUpdate,
                 stateMachine: stateMachine
             )
+            activationDidNotCommit()
             return .failed(error.localizedDescription)
         }
     }
@@ -583,14 +646,7 @@ enum CodexDesktopAppUpdater {
                     kind: .stockRestore,
                     desktopRuntimeRunning: desktopRuntimeIsRunning,
                     isCancelled: { operationIsCancelled(lifetime) },
-                    validate: { candidate, bundleVersion, shortVersion, isCancelled in
-                        trustValidator.validate(
-                            appURL: candidate,
-                            expectedBundleVersion: bundleVersion,
-                            expectedShortVersion: shortVersion,
-                            isCancelled: isCancelled
-                        )
-                    }
+                    validate: validateInstallableBundle
                 )
                 switch installResult {
                 case .installed(_, let cleanupPending):
@@ -668,6 +724,81 @@ enum CodexDesktopAppUpdater {
             expectedBundleVersion: expectedBundleVersion,
             expectedShortVersion: expectedShortVersion,
             isCancelled: { Task.isCancelled }
+        )
+    }
+
+    private static func validateInstallableBundle(
+        _ appURL: URL,
+        _ expectedBundleVersion: String,
+        _ expectedShortVersion: String,
+        _ isCancelled: () -> Bool
+    ) -> CodexDesktopBundleValidationResult {
+        let officialValidation = trustValidator.validate(
+            appURL: appURL,
+            expectedBundleVersion: expectedBundleVersion,
+            expectedShortVersion: expectedShortVersion,
+            isCancelled: isCancelled
+        )
+        if isCancelled() || officialValidation == .cancelled { return .cancelled }
+        guard officialValidation != .valid else { return .valid }
+
+        let sealDate = Date(timeIntervalSince1970: 0)
+        guard let mutationGuard = DesktopBundleTreeMutationGuard(appURL: appURL),
+              let baselineSeal = DesktopBundleTreeIntegrity.makeSeal(
+                  appURL: appURL,
+                  validatedAt: sealDate,
+                  isCancelled: isCancelled
+              ),
+              let install = CodexDesktopAppLocator.locate(appPath: appURL.path) else {
+            return isCancelled()
+                ? .cancelled
+                : DesktopInstallableBundleValidationDecision.decide(
+                    officialValidation: officialValidation,
+                    patchedBundle: nil
+                )
+        }
+        if isCancelled() { return .cancelled }
+
+        let bundleVersionMatches = install.bundleVersion == expectedBundleVersion
+        let shortVersionMatches = install.shortVersion == expectedShortVersion
+        let patchMarkersComplete = bundleVersionMatches
+            && shortVersionMatches
+            && CodexDesktopAppLocator.patchMarkerPresent(install: install)
+        if isCancelled() { return .cancelled }
+        let strictSignatureValid = patchMarkersComplete
+            && CodexDesktopAppLocator.bundleIsValid(appPath: appURL.path)
+        if isCancelled() { return .cancelled }
+        let signatureStatus = strictSignatureValid
+            ? CodexDesktopAppLocator.signatureStatus(appPath: appURL.path)
+            : .unreadable
+        if isCancelled() { return .cancelled }
+
+        let evidence = DesktopPatchedBundleValidationEvidence(
+            bundleVersionMatches: bundleVersionMatches,
+            shortVersionMatches: shortVersionMatches,
+            patchMarkersComplete: patchMarkersComplete,
+            strictSignatureValid: strictSignatureValid,
+            signatureStatus: signatureStatus
+        )
+        guard evidence.isInstallable,
+              !mutationGuard.observedMutation(),
+              let finalSeal = DesktopBundleTreeIntegrity.makeSeal(
+                  appURL: appURL,
+                  validatedAt: sealDate,
+                  isCancelled: isCancelled
+              ),
+              finalSeal == baselineSeal else {
+            return isCancelled()
+                ? .cancelled
+                : DesktopInstallableBundleValidationDecision.decide(
+                    officialValidation: officialValidation,
+                    patchedBundle: nil
+                )
+        }
+        if isCancelled() { return .cancelled }
+        return DesktopInstallableBundleValidationDecision.decide(
+            officialValidation: officialValidation,
+            patchedBundle: evidence
         )
     }
 

@@ -19,8 +19,15 @@ enum CodexDesktopAppcastParser {
             return nil
         }
         let archiveSHA256 = attributes["sparkle:sha256"] ?? attributes["sha256"]
-        if let archiveSHA256,
-           !isValidSHA256(archiveSHA256) {
+        if archiveSHA256 != nil,
+           DesktopArchiveAuthentication.normalizedSHA256(archiveSHA256) == nil {
+            return nil
+        }
+        let archiveEdSignature = attributes["sparkle:edSignature"]
+        if archiveEdSignature != nil,
+           DesktopArchiveAuthentication.normalizedEd25519Signature(
+               archiveEdSignature
+           ) == nil {
             return nil
         }
         let archiveLength = attributes["length"].flatMap(Int64.init)
@@ -29,14 +36,13 @@ enum CodexDesktopAppcastParser {
             shortVersion: shortVersion,
             bundleVersion: bundleVersion,
             downloadURL: downloadURL,
-            archiveSHA256: archiveSHA256?.lowercased(),
-            archiveEdSignature: attributes["sparkle:edSignature"],
+            archiveSHA256: DesktopArchiveAuthentication.normalizedSHA256(
+                archiveSHA256
+            ),
+            archiveEdSignature: DesktopArchiveAuthentication
+                .normalizedEd25519Signature(archiveEdSignature),
             archiveLength: archiveLength
         )
-    }
-
-    private static func isValidSHA256(_ value: String) -> Bool {
-        value.count == 64 && value.allSatisfy { $0.isHexDigit }
     }
 
     private static func firstTagBlock(named tagName: String, in xml: String) -> String? {
