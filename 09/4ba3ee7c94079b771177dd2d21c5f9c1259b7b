@@ -1,0 +1,24 @@
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_0b820c12bfe55f 1118-1122,3687-3699
+  s_70c8e194852bb5::t_c0c5f7074d0a44 3700
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_0b820c12bfe55f 508-510
+scripts/lib/install-linux-systemd-policy.sh
+  s_70c8e194852bb5::t_0b820c12bfe55f 778-783
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "094ba3ee7c94079b771177dd2d21c5f9c1259b7b",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
