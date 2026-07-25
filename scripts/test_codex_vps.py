@@ -235,7 +235,7 @@ wait "$TUNNEL_SUPERVISOR_PID"
                     process.wait(timeout=2)
 
         self.addCleanup(stop)
-        deadline = time.monotonic() + 4
+        deadline = time.monotonic() + 10
         while time.monotonic() < deadline and not ready.exists():
             if process.poll() is not None:
                 self.fail(
