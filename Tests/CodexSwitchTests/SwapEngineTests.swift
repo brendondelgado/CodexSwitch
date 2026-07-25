@@ -1399,10 +1399,13 @@ struct SwapEngineTests {
         #expect(failed.outcome == .restartRequiredOrFailed)
     }
 
-    @Test("Desktop first ACK bootstrap never authorizes CLI or an untrusted bridge")
+    @Test("Desktop first ACK bootstrap authorizes only the managed bridge")
     func desktopFirstAcknowledgementBootstrapIsNarrow() {
         let desktopBinding = reloadBinding(
             target: runtimeTarget(pid: 41, runtimeKind: .externalAppServer)
+        )
+        let managedDesktopBinding = reloadBinding(
+            target: runtimeTarget(pid: 43, runtimeKind: .managedDesktopBridge)
         )
         let cliBinding = reloadBinding(
             target: runtimeTarget(pid: 42, runtimeKind: .localInteractiveCLI)
@@ -1413,8 +1416,13 @@ struct SwapEngineTests {
             hasStartupAcknowledgement: true,
             firstAcknowledgementBootstrapAuthorized: false
         ))
-        #expect(SwapEngine.desktopReloadCapabilityIsAuthorized(
+        #expect(!SwapEngine.desktopReloadCapabilityIsAuthorized(
             binding: desktopBinding,
+            hasStartupAcknowledgement: false,
+            firstAcknowledgementBootstrapAuthorized: true
+        ))
+        #expect(SwapEngine.desktopReloadCapabilityIsAuthorized(
+            binding: managedDesktopBinding,
             hasStartupAcknowledgement: false,
             firstAcknowledgementBootstrapAuthorized: true
         ))
