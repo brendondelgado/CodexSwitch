@@ -507,6 +507,15 @@ Activation also clears pre-existing enablement links for the two target units;
 only the explicit enable flags may recreate them after the exact payload has
 verified.
 
+Two adjacent operational services are explicitly outside this installer's
+ownership: `codexswitch-files-sshd.service` provides SecureDrop transport, and
+`signul-codex-app-server-tailscale-proxy.service` provides the separately
+operated Tailscale listener. Their exact unit files and matching
+`default.target.wants/` links are preserved byte-for-byte and are never adopted,
+removed, enabled, disabled, started, or stopped by runtime activation. This
+name allowlist is deliberately closed; every other CodexSwitch- or
+Codex-app-server-named entry remains a conflict.
+
 Aliases or relationship artifacts using any unit type or dependency directory
 are part of the conflict surface. CodexSwitch-named `.socket`, `.path`, timer,
 target, service alias, `.wants`, `.requires`, `.upholds`, or other relationship

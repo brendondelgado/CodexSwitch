@@ -3584,6 +3584,37 @@ PY
             (self.install_root / ".activation-transaction.tsv").exists()
         )
 
+    def test_adjacent_operational_units_are_preserved(self):
+        self._stage()
+        self.service_dir.mkdir(exist_ok=True)
+        secure_drop = self.service_dir / "codexswitch-files-sshd.service"
+        tailscale_proxy = (
+            self.service_dir
+            / "signul-codex-app-server-tailscale-proxy.service"
+        )
+        secure_drop.write_text(
+            "[Service]\nExecStart=/usr/sbin/sshd -D -f %h/.config/codexswitch/sshd_config\n"
+        )
+        tailscale_proxy.write_text(
+            "[Service]\nExecStart=/usr/bin/socat TCP-LISTEN:8390 TCP:127.0.0.1:8390\n"
+        )
+        wants = self.service_dir / "default.target.wants"
+        wants.mkdir()
+        secure_drop_link = wants / secure_drop.name
+        tailscale_proxy_link = wants / tailscale_proxy.name
+        secure_drop_link.symlink_to(f"../{secure_drop.name}")
+        tailscale_proxy_link.symlink_to(f"../{tailscale_proxy.name}")
+        expected_secure_drop = secure_drop.read_bytes()
+        expected_tailscale_proxy = tailscale_proxy.read_bytes()
+
+        result = self._activate(check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        self.assertEqual(secure_drop.read_bytes(), expected_secure_drop)
+        self.assertEqual(tailscale_proxy.read_bytes(), expected_tailscale_proxy)
+        self.assertEqual(os.readlink(secure_drop_link), f"../{secure_drop.name}")
+        self.assertEqual(os.readlink(tailscale_proxy_link), f"../{tailscale_proxy.name}")
+
     def test_effective_systemd_state_is_exact_and_repository_sourced(self):
         self._stage()
 

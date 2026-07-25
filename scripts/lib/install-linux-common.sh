@@ -45,6 +45,24 @@ systemd_entry_is_managed() {
   return 1
 }
 
+preserved_adjacent_systemd_entries() {
+  printf '%s\n' \
+    "codexswitch-files-sshd.service" \
+    "signul-codex-app-server-tailscale-proxy.service" \
+    "default.target.wants/codexswitch-files-sshd.service" \
+    "default.target.wants/signul-codex-app-server-tailscale-proxy.service"
+}
+
+systemd_entry_is_preserved_adjacent() {
+  local wanted="$1"
+  local entry=""
+
+  while IFS= read -r entry; do
+    [[ "$entry" != "$wanted" ]] || return 0
+  done < <(preserved_adjacent_systemd_entries)
+  return 1
+}
+
 legacy_systemd_units() {
   printf '%s\n' \
     "codexswitch-knowledge-sync.service" \

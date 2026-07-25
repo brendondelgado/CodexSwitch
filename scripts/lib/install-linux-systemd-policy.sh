@@ -519,6 +519,11 @@ validate_systemd_preconditions() {
     [[ -e "$candidate" || -L "$candidate" ]] || continue
     candidate_name="$(basename "$candidate")"
     systemd_entry_is_managed "$candidate_name" && continue
+    if systemd_entry_is_preserved_adjacent "$candidate_name"; then
+      [[ -f "$candidate" && ! -L "$candidate" ]] || \
+        fail "preserved adjacent systemd unit is linked or special: $candidate"
+      continue
+    fi
     case "$candidate_name" in
       codexswitch*|*codex*app-server*|signul-codex*)
         fail "unexpected conflicting CodexSwitch unit file: $candidate_name"
@@ -539,6 +544,11 @@ validate_systemd_preconditions() {
       case "$candidate_name" in
         codexswitch*|*codex*app-server*|signul-codex*)
           candidate_relative="${candidate#"$SERVICE_DIR/"}"
+          if systemd_entry_is_preserved_adjacent "$candidate_relative"; then
+            [[ -L "$candidate" && "$(readlink "$candidate")" == "../$candidate_name" ]] || \
+              fail "preserved adjacent systemd enablement is invalid: $candidate"
+            continue
+          fi
           if ! systemd_entry_is_managed "$candidate_relative"; then
             case "$(basename "$enablement_dir")" in
               *.wants|*.requires) fail "unexpected conflicting CodexSwitch enablement artifact: $candidate" ;;
@@ -588,7 +598,9 @@ validate_exact_systemd_filesystem_state() {
   fi
   verify_runtime_guard_identities || fail "runtime guard path identity changed before activation commit"
   verify_systemd_start_barriers
-  python3 - "$SERVICE_DIR" "$ENABLE_DAEMON" "$ENABLE_APP_SERVER" "$SCAN_MAX_ENTRIES" <<'PY'
+  python3 - \
+    "$SERVICE_DIR" "$ENABLE_DAEMON" "$ENABLE_APP_SERVER" "$SCAN_MAX_ENTRIES" \
+    "$(preserved_adjacent_systemd_entries)" <<'PY'
 import os
 import stat
 import sys
@@ -598,6 +610,7 @@ root = Path(sys.argv[1])
 enable_daemon = sys.argv[2] == "1"
 enable_app = sys.argv[3] == "1"
 max_entries = int(sys.argv[4])
+preserved = {value for value in sys.argv[5].splitlines() if value}
 expected_files = {
     "codexswitch.service",
     "codexswitch.service.d/10-maintenance-resources.conf",
@@ -632,6 +645,10 @@ with os.scandir(root) as entries:
         metadata = entry.stat(follow_symlinks=False)
         if entry.name.startswith(".codexswitch-activation."):
             continue
+        if entry.name in preserved:
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise SystemExit(f"preserved adjacent systemd unit is linked or special: {top}")
+            continue
         if entry.name in {"codexswitch.service", "signul-codex-app-server.service"}:
             if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise SystemExit(f"managed systemd unit is linked or special: {top}")
@@ -665,6 +682,12 @@ with os.scandir(root) as entries:
                         continue
                     relative = f"{entry.name}/{child.name}"
                     child_metadata = child.stat(follow_symlinks=False)
+                    if relative in preserved:
+                        if not stat.S_ISLNK(child_metadata.st_mode):
+                            raise SystemExit(f"preserved adjacent systemd relationship is not linked: {child.path}")
+                        if os.readlink(child.path) != f"../{child.name}":
+                            raise SystemExit(f"invalid preserved adjacent systemd relationship target: {child.path}")
+                        continue
                     if relative not in expected_links or not stat.S_ISLNK(child_metadata.st_mode):
                         raise SystemExit(f"unexpected effective systemd relationship: {child.path}")
                     if os.readlink(child.path) != f"../{child.name}":
