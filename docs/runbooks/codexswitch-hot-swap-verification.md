@@ -309,6 +309,14 @@ deployment active. Interactive imports retain live convergence by default.
 
 ## Mac Activation Barrier Recovery
 
+A journal-free launch with a known `auth.json` target must not change the
+in-memory configured account before the activation transaction starts. Reproduce
+recovery with account A selected in `accounts.json` and account B's complete
+tokens in `auth.json`: `Preparing` must name B, the account-store conditional
+write must compare against A, and the committed store must select B. There must
+be no `ACCOUNTS_PERSIST_DISCARDED ... credential_or_selection_changed` caused by
+CodexSwitch's own preselection.
+
 A short runtime-evidence lease expiring is not itself an activation failure.
 Observe at least two lease-expiry intervals after a successful desktop swap and
 verify that CodexSwitch performs read-only evidence refreshes without another

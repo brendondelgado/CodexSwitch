@@ -1837,7 +1837,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         let previousConfigured = accountManager.configuredAccount
-        let recovery = accountManager.restoreConfiguredAccount(
+        let recovery = Self.journalFreeBootstrapRecovery(
+            accounts: accountManager.accounts,
             observedProviderAccountId: observedAccount?.accountId
         )
         if recovery == .ambiguous {
@@ -1847,7 +1848,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             return
         }
-        guard var target = accountManager.configuredAccount else {
+        guard case .recovered(let targetAccountId) = recovery,
+              var target = accountManager.accounts.first(where: {
+                  $0.id == targetAccountId
+              }) else {
             accountManager.publishActivationState(nil)
             return
         }
@@ -1871,6 +1875,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let durableAccounts = try await accountPersistence.loadAll()
             if Self.accountStoreMatches(account: target, accounts: durableAccounts),
                Self.authFileMatches(account: target, atPath: Self.codexAuthPath) {
+                guard accountManager.adoptVerifiedExternalHandoff(
+                    durableAccounts,
+                    targetAccountId: target.id
+                ) else {
+                    await enterActivationManualReview(
+                        targetAccountId: target.id,
+                        detail: .configuredFilesInconsistent
+                    )
+                    return
+                }
                 let state = try await accountActivationCoordinator.bootstrapCommittedDegraded(
                     targetAccountId: target.id,
                     detail: .launchRuntimeEvidenceExpired
@@ -1881,7 +1895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
             _ = await withPreparedActiveCredentialMutation(
                 targetAccountId: target.id,
-                expectedConfiguredAccountId: accountManager.configuredAccount?.id,
+                expectedConfiguredAccountId: previousConfigured?.id,
                 source: "launch-activation-bootstrap",
                 requestKind: .automatic
             ) { [weak self] prepared in
@@ -1890,7 +1904,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     from: previousConfigured ?? target,
                     to: target,
                     reason: .manual,
-                    mutationRoute: .externalAuthObservation,
+                    mutationRoute: Self.journalFreeBootstrapMutationRoute(
+                        previousConfiguredAccountId: previousConfigured?.id
+                    ),
                     persistenceContext: "launch-activation-bootstrap",
                     authAlreadyConfigured: true,
                     swapStart: Date(),
@@ -1908,6 +1924,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "ACTIVATION_BOOTSTRAP_FAILED target=\(target.id.uuidString) error=\(error.localizedDescription)"
             ))
         }
+    }
+
+    nonisolated static func journalFreeBootstrapRecovery(
+        accounts: [CodexAccount],
+        observedProviderAccountId: String?
+    ) -> ConfiguredAccountRecovery {
+        AccountActivationRecoveryCoordinator.configuredAccountRecovery(
+            accounts: accounts,
+            observedProviderAccountId: observedProviderAccountId
+        )
+    }
+
+    nonisolated static func journalFreeBootstrapMutationRoute(
+        previousConfiguredAccountId: UUID?
+    ) -> AccountCredentialMutationRoute {
+        previousConfiguredAccountId == nil ? .firstActivation : .externalAuthObservation
     }
 
     private func enterActivationManualReview(

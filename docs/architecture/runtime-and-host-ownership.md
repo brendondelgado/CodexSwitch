@@ -114,6 +114,14 @@ observe -> choose -> lock -> revalidate -> commit auth/store
        -> readback -> reload verified targets -> acknowledge -> publish
 ```
 
+Startup target discovery is read-only. When `auth.json` names a different known
+account than the durable account-store selection, CodexSwitch must retain the
+durable selection as the compare-and-swap authority until `Preparing` is
+journaled and the activation transaction commits the new selection. It must not
+preselect the observed account in memory or in user defaults before that
+transaction. A journal-free first activation uses the same rule with an
+explicit no-configured-account authority.
+
 The auth commit includes access token, refresh token, identity token when present, provider account identity, and required metadata. Sending only a new access token can appear successful until the next refresh and is prohibited.
 
 `auth.json` uses the same Swift secure-file transaction as the account store: descriptor-anchored no-follow traversal, a same-directory exclusive lock, generation recheck, unique `O_EXCL` temporary file forced to mode `0600`, complete write, file and directory `fsync`, atomic rename, and exact-byte no-follow readback. Lock acquisition is nonblocking and bounded; contention returns a distinct timeout without reading, writing, deleting, or bypassing the protected file. The readback must decode to the complete intended token set before reload begins.

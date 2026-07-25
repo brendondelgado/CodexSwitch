@@ -4,6 +4,42 @@ import Testing
 
 @Suite("AppDelegate activation recovery")
 struct AppDelegateActivationRecoveryTests {
+    @Test("Journal-free bootstrap discovers auth target without preselecting it")
+    func journalFreeBootstrapDiscoveryIsReadOnly() {
+        let sourceId = UUID()
+        let targetId = UUID()
+        let source = CodexAccount(
+            id: sourceId,
+            email: "source@example.com",
+            accessToken: "source-access",
+            refreshToken: "source-refresh",
+            idToken: "source-id",
+            accountId: "source-provider",
+            isActive: true
+        )
+        let target = CodexAccount(
+            id: targetId,
+            email: "target@example.com",
+            accessToken: "target-access",
+            refreshToken: "target-refresh",
+            idToken: "target-id",
+            accountId: "target-provider"
+        )
+        let accounts = [source, target]
+
+        #expect(AppDelegate.journalFreeBootstrapRecovery(
+            accounts: accounts,
+            observedProviderAccountId: target.accountId
+        ) == .recovered(targetId))
+        #expect(accounts.filter(\.isActive).map(\.id) == [sourceId])
+        #expect(AppDelegate.journalFreeBootstrapMutationRoute(
+            previousConfiguredAccountId: sourceId
+        ) == .externalAuthObservation)
+        #expect(AppDelegate.journalFreeBootstrapMutationRoute(
+            previousConfiguredAccountId: nil
+        ) == .firstActivation)
+    }
+
     @Test("Revoked preparation failures cannot enter manual review")
     func revokedPreparationFailureSkipsManualReview() {
         #expect(!AppDelegate.activationPreparationFailureRequiresManualReview(

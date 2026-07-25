@@ -298,24 +298,6 @@ final class AccountManager {
         return LinuxDevboxAccountApplyResult(stateChanged: stateChanged)
     }
 
-    /// Restore only the configured selection after loading from storage.
-    /// Credential persistence and runtime convergence are owned by AppDelegate's activation transaction.
-    @discardableResult
-    func restoreConfiguredAccount(
-        observedProviderAccountId: String?
-    ) -> ConfiguredAccountRecovery {
-        let recovery = AccountActivationRecoveryCoordinator.configuredAccountRecovery(
-            accounts: accounts,
-            observedProviderAccountId: observedProviderAccountId
-        )
-        if case .recovered(let accountId) = recovery {
-            setConfiguredAccount(accountId)
-        } else {
-            clearConfiguredAccount()
-        }
-        return recovery
-    }
-
     /// One-shot startup hydration. It cannot overwrite an already configured in-memory store.
     @discardableResult
     func restorePersistedAccounts(_ persistedAccounts: [CodexAccount]) -> Bool {

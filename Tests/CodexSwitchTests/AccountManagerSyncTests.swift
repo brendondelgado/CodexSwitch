@@ -381,8 +381,8 @@ struct AccountManagerSyncTests {
         #expect(manager.linuxDevboxAccountStates.first?.runtimeUnusableReason == "token_expired")
     }
 
-    @Test("Restore prefers auth.json over stale stored preference")
-    @MainActor func restorePrefersAuthJsonOverStaleStoredPreference() async {
+    @Test("Recovery discovers auth.json target without changing configured state")
+    @MainActor func recoveryDiscoversAuthTargetWithoutMutation() async {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
 
@@ -392,14 +392,18 @@ struct AccountManagerSyncTests {
         manager.addAccount(target)
         defaults.set(current.id.uuidString, forKey: "activeAccountId")
 
-        manager.restoreConfiguredAccount(observedProviderAccountId: target.accountId)
+        let recovery = AccountActivationRecoveryCoordinator.configuredAccountRecovery(
+            accounts: manager.accounts,
+            observedProviderAccountId: target.accountId
+        )
 
-        #expect(manager.configuredAccount?.id == target.id)
-        #expect(defaults.string(forKey: "activeAccountId") == target.id.uuidString)
+        #expect(recovery == .recovered(target.id))
+        #expect(manager.configuredAccount == nil)
+        #expect(defaults.string(forKey: "activeAccountId") == current.id.uuidString)
     }
 
-    @Test("Restore ignores stale defaults when no durable configured record exists")
-    @MainActor func restoreRejectsStaleStoredPreference() async {
+    @Test("Recovery ignores stale defaults when no durable configured record exists")
+    @MainActor func recoveryRejectsStaleStoredPreference() async {
         let defaults = isolatedDefaults()
         let current = CodexAccount(email: "current@test.com", accessToken: "t1", refreshToken: "r1", idToken: "i1", accountId: "acc-current")
         let manager = AccountManager(userDefaults: defaults)
@@ -407,15 +411,18 @@ struct AccountManagerSyncTests {
         manager.addAccount(current)
         defaults.set(current.id.uuidString, forKey: "activeAccountId")
 
-        let recovery = manager.restoreConfiguredAccount(observedProviderAccountId: nil)
+        let recovery = AccountActivationRecoveryCoordinator.configuredAccountRecovery(
+            accounts: manager.accounts,
+            observedProviderAccountId: nil
+        )
 
         #expect(recovery == .ambiguous)
         #expect(manager.configuredAccount == nil)
-        #expect(defaults.string(forKey: "activeAccountId") == nil)
+        #expect(defaults.string(forKey: "activeAccountId") == current.id.uuidString)
     }
 
-    @Test("Restore preserves the durable selected account without writing auth")
-    @MainActor func restorePreservesDurableSelection() async {
+    @Test("Recovery reports the durable selection without rewriting defaults")
+    @MainActor func recoveryReportsDurableSelectionWithoutMutation() async {
         let defaults = isolatedDefaults()
         let original = CodexAccount(
             email: "original@test.com",
@@ -436,16 +443,19 @@ struct AccountManagerSyncTests {
         #expect(manager.restorePersistedAccounts([original, fallback]))
         defaults.set(fallback.id.uuidString, forKey: "activeAccountId")
 
-        let recovery = manager.restoreConfiguredAccount(observedProviderAccountId: nil)
+        let recovery = AccountActivationRecoveryCoordinator.configuredAccountRecovery(
+            accounts: manager.accounts,
+            observedProviderAccountId: nil
+        )
 
         #expect(recovery == .recovered(original.id))
         #expect(manager.configuredAccount?.id == original.id)
-        #expect(defaults.string(forKey: "activeAccountId") == original.id.uuidString)
+        #expect(defaults.string(forKey: "activeAccountId") == fallback.id.uuidString)
         #expect(manager.pollingErrors[fallback.id] == nil)
     }
 
-    @Test("Restart recovery fails closed when durable selection is ambiguous")
-    @MainActor func restoreRejectsMultipleDurableSelections() {
+    @Test("Recovery fails closed without rewriting an ambiguous durable selection")
+    @MainActor func recoveryRejectsMultipleDurableSelections() {
         let defaults = isolatedDefaults()
         let first = CodexAccount(
             email: "first@test.com",
@@ -466,10 +476,13 @@ struct AccountManagerSyncTests {
         let manager = AccountManager(userDefaults: defaults)
         #expect(manager.restorePersistedAccounts([first, second]))
 
-        let recovery = manager.restoreConfiguredAccount(observedProviderAccountId: nil)
+        let recovery = AccountActivationRecoveryCoordinator.configuredAccountRecovery(
+            accounts: manager.accounts,
+            observedProviderAccountId: nil
+        )
 
         #expect(recovery == .ambiguous)
-        #expect(manager.configuredAccount == nil)
+        #expect(manager.accounts.filter(\.isActive).map(\.id) == [first.id, second.id])
     }
 
     @Test("Quota updates record fetch time as last refreshed")
