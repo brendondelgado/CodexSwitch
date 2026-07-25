@@ -1115,7 +1115,11 @@ CLI
               unit=$3
               wants="$service_dir/default.target.wants"
               mkdir -p "$wants"
-              ln -sfn "../$unit" "$wants/$unit"
+              if [ "${FAKE_SYSTEMD_ABSOLUTE_ENABLEMENT:-0}" = 1 ]; then
+                ln -sfn "$service_dir/$unit" "$wants/$unit"
+              else
+                ln -sfn "../$unit" "$wants/$unit"
+              fi
               should_fail enable "$unit" && exit 43
               exit 0
             fi
@@ -3679,6 +3683,20 @@ PY
         self.assertIn("effective systemd dependency mismatch", property_result.stderr)
         self.assertIn("property=Upholds", property_result.stderr)
         self.assertFalse((self.install_root / "current").exists())
+
+        absolute_enablement = self._activate(
+            extra_env={
+                "CODEXSWITCH_APPROVE_SYSTEMD_CONFLICTS": "1",
+                "CODEXSWITCH_ENABLE_DAEMON": "1",
+                "CODEXSWITCH_ENABLE_APP_SERVER": "1",
+                "FAKE_SYSTEMD_ABSOLUTE_ENABLEMENT": "1",
+            },
+            check=False,
+        )
+        self.assertEqual(absolute_enablement.returncode, 0, absolute_enablement.stderr)
+        for unit in ("codexswitch.service", "signul-codex-app-server.service"):
+            link = self.service_dir / "default.target.wants" / unit
+            self.assertEqual(os.readlink(link), str(self.service_dir / unit))
 
     def test_fault_injection_preserves_non_tearing_public_resolution(self):
         self._stage()

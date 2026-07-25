@@ -505,7 +505,9 @@ links beneath `default.target.wants/` and `timers.target.wants/`. Their exact
 prior symlink targets or absence are journaled and restored on rollback.
 Activation also clears pre-existing enablement links for the two target units;
 only the explicit enable flags may recreate them after the exact payload has
-verified.
+verified. Post-enable verification accepts the exact relative target
+`../<unit>` and the canonical absolute target beneath the owned user-systemd
+directory because supported `systemctl enable` versions emit either form.
 
 Two adjacent operational services are explicitly outside this installer's
 ownership: `codexswitch-files-sshd.service` provides SecureDrop transport, and

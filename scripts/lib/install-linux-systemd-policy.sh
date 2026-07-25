@@ -775,7 +775,12 @@ with os.scandir(root) as entries:
                         continue
                     if relative not in expected_links or not stat.S_ISLNK(child_metadata.st_mode):
                         raise SystemExit(f"unexpected effective systemd relationship: {child.path}")
-                    if os.readlink(child.path) != f"../{child.name}":
+                    target = os.readlink(child.path)
+                    valid_targets = {
+                        f"../{child.name}",
+                        str(root / child.name),
+                    }
+                    if target not in valid_targets:
                         raise SystemExit(f"invalid effective systemd relationship target: {child.path}")
                     seen_links.add(relative)
             continue
