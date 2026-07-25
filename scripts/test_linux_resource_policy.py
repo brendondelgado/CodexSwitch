@@ -2527,7 +2527,7 @@ PY
 
         current = self.install_root / "current"
         current.unlink()
-        current.symlink_to(current_release.resolve())
+        current.symlink_to(self.fixture_repo.resolve())
         result = self._stage(third_sha, check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("current symlink has an unmanaged target", result.stderr)
