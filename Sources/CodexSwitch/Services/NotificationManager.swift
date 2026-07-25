@@ -96,10 +96,12 @@ final class IncidentNotificationDedupeCoordinator: @unchecked Sendable {
     private let stateQueue: DispatchQueue
     private let stateQueueKey = DispatchSpecificKey<UInt8>()
     private let defaultsKey: String
+    private let legacyDefaultsKeys: [String]
     private var inFlightSubmissions: [UUID: Submission] = [:]
 
-    init(defaultsKey: String) {
+    init(defaultsKey: String, legacyDefaultsKeys: [String] = []) {
         self.defaultsKey = defaultsKey
+        self.legacyDefaultsKeys = legacyDefaultsKeys
         stateQueue = DispatchQueue(label: "com.codexswitch.notification-incident.\(defaultsKey)")
         stateQueue.setSpecific(key: stateQueueKey, value: 1)
     }
@@ -107,12 +109,16 @@ final class IncidentNotificationDedupeCoordinator: @unchecked Sendable {
     @discardableResult
     func enqueue(
         request: UNNotificationRequest,
-        dedupeKey _: String,
+        dedupeKey: String,
         userDefaults: UserDefaults,
         removeAfterCancellation: @escaping Remove,
         using enqueue: @escaping Enqueue
     ) -> Bool {
         withState {
+            migrateLegacyClaimIfNeeded(
+                dedupeKey: dedupeKey,
+                userDefaults: userDefaults
+            )
             guard userDefaults.string(forKey: defaultsKey) == nil else {
                 return false
             }
@@ -141,6 +147,9 @@ final class IncidentNotificationDedupeCoordinator: @unchecked Sendable {
     ) {
         withState {
             userDefaults.removeObject(forKey: defaultsKey)
+            for legacyKey in legacyDefaultsKeys {
+                userDefaults.removeObject(forKey: legacyKey)
+            }
             remove()
         }
     }
@@ -165,6 +174,27 @@ final class IncidentNotificationDedupeCoordinator: @unchecked Sendable {
         }
         return stateQueue.sync(execute: operation)
     }
+
+    private func migrateLegacyClaimIfNeeded(
+        dedupeKey: String,
+        userDefaults: UserDefaults
+    ) {
+        guard userDefaults.string(forKey: defaultsKey) == nil else {
+            for legacyKey in legacyDefaultsKeys {
+                userDefaults.removeObject(forKey: legacyKey)
+            }
+            return
+        }
+        let hasLegacyClaim = legacyDefaultsKeys.contains { legacyKey in
+            (userDefaults.stringArray(forKey: legacyKey) ?? []).contains(dedupeKey)
+        }
+        for legacyKey in legacyDefaultsKeys {
+            userDefaults.removeObject(forKey: legacyKey)
+        }
+        if hasLegacyClaim {
+            userDefaults.set(UUID().uuidString, forKey: defaultsKey)
+        }
+    }
 }
 
 enum NotificationManager {
@@ -175,6 +205,8 @@ enum NotificationManager {
     private static let maximumResetExpirationNotificationDedupeKeys = 256
     private static let linuxDevboxReadinessIncidentDefaultsKey =
         "linuxDevboxReadinessNotificationIncidentGeneration.v1"
+    private static let legacyLinuxDevboxReadinessIncidentDefaultsKey =
+        "linuxDevboxReadinessNotificationIncidentKeys.v1"
     private static let legacyLinuxDevboxReadinessNotificationPrefix =
         "linux-devbox-readiness-"
     static let linuxDevboxReadinessNotificationIdentifier =
@@ -186,7 +218,8 @@ enum NotificationManager {
         )
     private static let linuxDevboxReadinessNotificationCoordinator =
         IncidentNotificationDedupeCoordinator(
-            defaultsKey: linuxDevboxReadinessIncidentDefaultsKey
+            defaultsKey: linuxDevboxReadinessIncidentDefaultsKey,
+            legacyDefaultsKeys: [legacyLinuxDevboxReadinessIncidentDefaultsKey]
         )
 
     private static var isEnabled: Bool {

@@ -629,6 +629,62 @@ struct AppDelegateNotificationTests {
         #expect(identifier == "linux-devbox-readiness-active-incident")
     }
 
+    @Test("VPS readiness notification migrates the preceding persisted latch")
+    func linuxDevboxReadinessNotificationMigratesLegacyClaim() {
+        let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaultsKey = "linux-readiness-generation.\(UUID().uuidString)"
+        let legacyKey = "linux-readiness-legacy.\(UUID().uuidString)"
+        let coordinator = IncidentNotificationDedupeCoordinator(
+            defaultsKey: defaultsKey,
+            legacyDefaultsKeys: [legacyKey]
+        )
+        let enqueueHarness = ResetNotificationEnqueueHarness()
+        let removalHarness = NotificationRemovalHarness()
+        let identifier = NotificationManager.linuxDevboxReadinessNotificationIdentifier
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: UNMutableNotificationContent(),
+            trigger: nil
+        )
+        let enqueue: IncidentNotificationDedupeCoordinator.Enqueue = {
+            request, completion in
+            enqueueHarness.enqueue(request, completion: completion)
+        }
+        let remove: IncidentNotificationDedupeCoordinator.Remove = {
+            removalHarness.remove()
+        }
+        defaults.set([identifier], forKey: legacyKey)
+
+        #expect(!coordinator.enqueue(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            removeAfterCancellation: remove,
+            using: enqueue
+        ))
+        #expect(enqueueHarness.count() == 0)
+        #expect(defaults.string(forKey: defaultsKey) != nil)
+        #expect(defaults.object(forKey: legacyKey) == nil)
+
+        coordinator.resolve(
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            using: remove
+        )
+        #expect(defaults.string(forKey: defaultsKey) == nil)
+        #expect(coordinator.enqueue(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            removeAfterCancellation: remove,
+            using: enqueue
+        ))
+        #expect(enqueueHarness.count() == 1)
+    }
+
     @Test("VPS readiness resolution survives relaunch before enqueue completion")
     func linuxDevboxReadinessResolutionRepeatsCleanupAfterRelaunch() {
         let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
@@ -746,7 +802,7 @@ struct AppDelegateNotificationTests {
         let replacementGeneration = defaults.string(forKey: defaultsKey)
         #expect(replacementGeneration != nil)
 
-        enqueueHarness.complete(at: 0, error: nil)
+        enqueueHarness.complete(at: 0, error: NSError(domain: "stale", code: 1))
         #expect(removalHarness.count() == 1)
         #expect(enqueueHarness.count() == 2)
         enqueueHarness.complete(at: 1, error: nil)
@@ -820,6 +876,7 @@ struct AppDelegateNotificationTests {
         let enqueueHarness = ResetNotificationEnqueueHarness()
         let removalHarness = BlockingNotificationRemovalHarness()
         let resolutionFinished = DispatchSemaphore(value: 0)
+        let replacementStarted = DispatchSemaphore(value: 0)
         let replacementFinished = DispatchSemaphore(value: 0)
         let replacementResult = BoolResultHarness()
         let identifier = NotificationManager.linuxDevboxReadinessNotificationIdentifier
@@ -855,6 +912,7 @@ struct AppDelegateNotificationTests {
         #expect(removalHarness.count() == 1)
         #expect(enqueueHarness.count() == 1)
         DispatchQueue.global().async {
+            replacementStarted.signal()
             replacementResult.set(coordinator.enqueue(
                 request: request,
                 dedupeKey: identifier,
@@ -864,6 +922,7 @@ struct AppDelegateNotificationTests {
             ))
             replacementFinished.signal()
         }
+        #expect(replacementStarted.wait(timeout: .now() + 2) == .success)
         #expect(replacementFinished.wait(timeout: .now() + 0.1) == .timedOut)
         #expect(enqueueHarness.count() == 1)
 
