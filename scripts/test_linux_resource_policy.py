@@ -252,6 +252,62 @@ class LinuxDeploymentContractTests(unittest.TestCase):
                 "unknown\tprocess-exact-managed-argv-replaced-inode:42",
             )
 
+    def test_python_observer_skips_unreadable_exe_only_for_unrelated_argv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            proc_root = root / "proc"
+            process = proc_root / "42"
+            codex_home = root / "codex-home"
+            runtime = root / "runtime" / "codex"
+            process.mkdir(parents=True)
+            runtime.parent.mkdir(parents=True)
+            codex_home.mkdir()
+            runtime.write_bytes(b"reviewed runtime")
+            (process / "stat").write_text(
+                f"42 (sd-pam) {' '.join(['1'] * 20)}\n"
+            )
+            (process / "cmdline").write_bytes(b"(sd-pam)\0")
+            (process / "exe").symlink_to("exe")
+            command = [
+                sys.executable,
+                str(INSTALLER_LIB / "observe-managed-daemon.py"),
+                str(proc_root),
+                str(codex_home),
+                str(runtime),
+                str(codex_home / "app-server-daemon/app-server.pid.lock"),
+                "0",
+                "2",
+                "100",
+                str(1024 * 1024),
+            ]
+
+            unrelated = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            self.assertEqual(
+                unrelated.stdout.strip(),
+                "inactive\tartifacts-and-processes-inactive",
+            )
+
+            (process / "cmdline").write_bytes(
+                os.fsencode(runtime) + b"\0app-server\0--listen\0unix://\0"
+            )
+            managed = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            self.assertEqual(
+                managed.stdout.strip(),
+                "unknown\tprocess-exe:42:OSError",
+            )
+
     def test_python_daemon_observer_allows_only_explicit_idle_first_install(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

@@ -344,7 +344,13 @@ runtime/install guard command. Exit 4/not-found, `failed`, command error,
 timeout, malformed output, unloaded or drifted fragments, and drifted
 `ExecStart` are unknown. Daemon probes bind the PID start identity, process
 device/inode, canonical executable path, and exact argv to the managed runtime;
-a hardlink alias, spoofed argv, PID reuse, or identity change is unknown. The
+a hardlink alias, spoofed argv, PID reuse, or identity change is unknown.
+The owner-only scan rejects a process as unrelated before inspecting its
+executable only when `argv[0]` does not name the exact managed runtime. This
+keeps unrelated same-user processes such as `sd-pam` from blocking activation
+when Linux intentionally denies their `/proc/<pid>/exe` lookup, while any
+process that claims the managed runtime path still requires complete executable
+and argument proof and fails closed on an unreadable identity. The
 PID, socket, and reservation artifacts must all be absent or positively
 inactive. A missing installed executable, malformed or unreadable artifact,
 failed probe, or incomplete scan is unknown rather than inactive. The updater

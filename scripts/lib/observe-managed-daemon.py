@@ -124,9 +124,9 @@ def exact_process(pid: int):
         result("unknown", f"process-argv-missing:{pid}")
     argv = [value for value in command_line.split(b"\0") if value]
     expected = [os.fsencode(runtime), b"app-server", b"--listen", b"unix://"]
+    if not argv or argv[0] != expected[0]:
+        return "unrelated"
     if runtime_metadata is None:
-        if not argv or argv[0] != expected[0]:
-            return "unrelated"
         if argv != expected:
             result("unknown", f"process-managed-path-argv-drift:{pid}")
         start_after = process_start_ticks(pid)
