@@ -505,6 +505,7 @@ validate_systemd_preconditions() {
   local candidate=""
   local candidate_name=""
   local candidate_relative=""
+  local candidate_target=""
   local enablement_dir=""
   local dropin_dir=""
   local expected=""
@@ -545,7 +546,11 @@ validate_systemd_preconditions() {
         codexswitch*|*codex*app-server*|signul-codex*)
           candidate_relative="${candidate#"$SERVICE_DIR/"}"
           if systemd_entry_is_preserved_adjacent "$candidate_relative"; then
-            [[ -L "$candidate" && "$(readlink "$candidate")" == "../$candidate_name" ]] || \
+            candidate_target="$(readlink "$candidate" 2>/dev/null || true)"
+            [[ -L "$candidate" && (
+              "$candidate_target" == "../$candidate_name"
+                || "$candidate_target" == "$SERVICE_DIR/$candidate_name"
+            ) ]] || \
               fail "preserved adjacent systemd enablement is invalid: $candidate"
             continue
           fi
@@ -685,7 +690,12 @@ with os.scandir(root) as entries:
                     if relative in preserved:
                         if not stat.S_ISLNK(child_metadata.st_mode):
                             raise SystemExit(f"preserved adjacent systemd relationship is not linked: {child.path}")
-                        if os.readlink(child.path) != f"../{child.name}":
+                        target = os.readlink(child.path)
+                        valid_targets = {
+                            f"../{child.name}",
+                            str(root / child.name),
+                        }
+                        if target not in valid_targets:
                             raise SystemExit(f"invalid preserved adjacent systemd relationship target: {child.path}")
                         continue
                     if relative not in expected_links or not stat.S_ISLNK(child_metadata.st_mode):

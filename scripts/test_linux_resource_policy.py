@@ -3602,8 +3602,8 @@ PY
         wants.mkdir()
         secure_drop_link = wants / secure_drop.name
         tailscale_proxy_link = wants / tailscale_proxy.name
-        secure_drop_link.symlink_to(f"../{secure_drop.name}")
-        tailscale_proxy_link.symlink_to(f"../{tailscale_proxy.name}")
+        secure_drop_link.symlink_to(secure_drop)
+        tailscale_proxy_link.symlink_to(tailscale_proxy)
         expected_secure_drop = secure_drop.read_bytes()
         expected_tailscale_proxy = tailscale_proxy.read_bytes()
 
@@ -3612,8 +3612,8 @@ PY
 
         self.assertEqual(secure_drop.read_bytes(), expected_secure_drop)
         self.assertEqual(tailscale_proxy.read_bytes(), expected_tailscale_proxy)
-        self.assertEqual(os.readlink(secure_drop_link), f"../{secure_drop.name}")
-        self.assertEqual(os.readlink(tailscale_proxy_link), f"../{tailscale_proxy.name}")
+        self.assertEqual(os.readlink(secure_drop_link), str(secure_drop))
+        self.assertEqual(os.readlink(tailscale_proxy_link), str(tailscale_proxy))
 
     def test_effective_systemd_state_is_exact_and_repository_sourced(self):
         self._stage()
