@@ -10,6 +10,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/build-fork.yml"
+HOT_SWAP_CONTRACT = ROOT / ".github/workflows/hot-swap-contract.yml"
 INSTALLER = ROOT / "scripts/install-macos-cli-artifact.sh"
 BUILD_RS = ROOT / "crates/codexswitch-cli/build.rs"
 ACTIVATION = ROOT / "crates/codexswitch-cli/src/codex_update/macos_activation.rs"
@@ -103,6 +104,13 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         self.assertIn('CARGO_BUILD_JOBS: "2"', workflow)
         self.assertIn('--jobs "$CARGO_BUILD_JOBS"', workflow)
 
+    def test_hot_swap_contract_runs_macos_runtime_workflow_assertions(self) -> None:
+        workflow = HOT_SWAP_CONTRACT.read_text()
+        self.assertIn(
+            "python3 scripts/test_macos_runtime_artifact.py",
+            workflow,
+        )
+
     def test_workflow_keeps_download_cache_free_of_compiled_targets(self) -> None:
         workflow = WORKFLOW.read_text()
         restore = workflow.index("Restore remote Cargo downloads")
@@ -148,7 +156,11 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
 
         normalize_block = workflow[normalize:abi]
         self.assertIn(
-            'date -u -r "$SOURCE_DATE_EPOCH"',
+            "UPSTREAM_SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}",
+            normalize_block,
+        )
+        self.assertIn(
+            'date -u -r "$UPSTREAM_SOURCE_DATE_EPOCH"',
             normalize_block,
         )
         self.assertIn("export TZ=UTC", normalize_block)
@@ -161,16 +173,50 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
 
         restore_block = workflow[restore:build]
         target_key = (
-            "macos-runtime-target-v2-${{ runner.arch }}-"
+            "macos-runtime-target-v3-${{ runner.arch }}-"
             "${{ steps.target_cache_abi.outputs.sha256 }}-"
             "${{ steps.upstream.outputs.sha }}-"
-            "${{ steps.patches.outputs.sha256 }}-"
-            "${{ steps.provenance.outputs.source_sha }}"
+            "${{ steps.patches.outputs.sha256 }}"
         )
         self.assertIn("${{ runner.temp }}/codex-target/", restore_block)
         self.assertIn(target_key, restore_block)
+        self.assertNotIn("${{ steps.provenance.outputs.source_sha }}", restore_block)
         self.assertNotIn("restore-keys:", restore_block)
         self.assertIn("continue-on-error: true", restore_block)
+
+    def test_workflow_separates_control_and_upstream_source_epochs(self) -> None:
+        workflow = WORKFLOW.read_text()
+        checkout = workflow.index("Check out the exact upstream Codex tag")
+        patches = workflow.index("Apply the dispatched v3 source patches")
+        checkout_block = workflow[checkout:patches]
+        control = workflow.index("Build the CodexSwitch control plane")
+        patch_driver = workflow.index("Compile the exact-commit source patch driver")
+        control_block = workflow[control:patch_driver]
+        upstream_build = workflow.index("Build the patched Codex runtime pair")
+        revalidation = workflow.index("Revalidate both source trees after compilation")
+        upstream_build_block = workflow[upstream_build:revalidation]
+
+        self.assertIn(
+            'upstream_epoch="$(git -C "$UPSTREAM_SOURCE_DIR" show -s '
+            '--format=%ct "$actual_upstream_sha")"',
+            checkout_block,
+        )
+        self.assertIn('"$upstream_epoch" == "0"', checkout_block)
+        self.assertIn("printf 'epoch=%s\\n' \"$upstream_epoch\"", checkout_block)
+        self.assertIn(
+            'expected_provenance="git ${CODEXSWITCH_SOURCE_SHA}, built '
+            '${SOURCE_DATE_EPOCH}"',
+            control_block,
+        )
+        self.assertIn(
+            "SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}",
+            upstream_build_block,
+        )
+        self.assertEqual(
+            workflow.count("${{ steps.upstream.outputs.epoch }}"),
+            3,
+        )
+        self.assertIn('--argjson buildEpoch "$SOURCE_DATE_EPOCH"', workflow)
 
     def test_workflow_target_cache_abi_binds_effective_build_inputs(self) -> None:
         workflow = WORKFLOW.read_text()
@@ -190,6 +236,14 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
             "UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}",
             abi_block,
         )
+        self.assertIn(
+            "UPSTREAM_SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}",
+            abi_block,
+        )
+        self.assertIn(
+            "format=codexswitch-upstream-target-cache-abi-v3",
+            abi_block,
+        )
         for command in (
             "rustc -Vv",
             "cargo -V",
@@ -204,8 +258,8 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
             "TARGET_TRIPLE",
             "UPSTREAM_SHA",
             "PATCH_SHA256",
-            "CODEXSWITCH_SOURCE_SHA",
-            "SOURCE_DATE_EPOCH",
+            "UPSTREAM_SOURCE_DATE_EPOCH",
+            "upstreamSourceDateEpoch",
             "--locked --release --target",
             "CARGO_BUILD_JOBS",
             "CARGO_PROFILE_RELEASE_LTO",
@@ -213,6 +267,11 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
             "CARGO_INCREMENTAL",
         ):
             self.assertIn(value, abi_block)
+        self.assertNotIn("codexSwitchSha", abi_block)
+        self.assertNotIn(
+            'printf \'sourceDateEpoch=%s\\n\' "$SOURCE_DATE_EPOCH"',
+            abi_block,
+        )
         self.assertIn('shasum -a 256 "$abi_input"', abi_block)
 
     def test_workflow_saves_target_only_after_all_release_evidence(self) -> None:
@@ -242,13 +301,13 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         self.assertIn("continue-on-error: true", save_block)
         self.assertIn("${{ runner.temp }}/codex-target/", save_block)
         target_key = (
-            "macos-runtime-target-v2-${{ runner.arch }}-"
+            "macos-runtime-target-v3-${{ runner.arch }}-"
             "${{ steps.target_cache_abi.outputs.sha256 }}-"
             "${{ steps.upstream.outputs.sha }}-"
-            "${{ steps.patches.outputs.sha256 }}-"
-            "${{ steps.provenance.outputs.source_sha }}"
+            "${{ steps.patches.outputs.sha256 }}"
         )
         self.assertIn(target_key, save_block)
+        self.assertNotIn("${{ steps.provenance.outputs.source_sha }}", save_block)
         self.assertEqual(workflow.count(target_key), 2)
         self.assertNotIn("restore-keys:", save_block)
         pre_save_target_deletions = [

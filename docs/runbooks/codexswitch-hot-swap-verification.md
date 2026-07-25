@@ -568,13 +568,26 @@ Every CodexSwitch connection sends `initialize` before `account/login/start`
 or `account/read`. Current app-server replies may omit `jsonrpc: "2.0"`, so the
 response is valid when it has the expected `id` and exactly one
 `result`/`error` outcome. An explicit different JSON-RPC version is invalid.
+For an explicit activation, the initialized `account/read` verification socket
+must remain open while the version-3 request is written, SIGHUP is delivered,
+and the matching ACK is collected. The socket closes only after that strict
+reload attempt returns. Closing it between `account/read` and SIGHUP creates a
+connection-removal race and is a failed transaction design even if the account
+RPC itself succeeded.
 
 Do not report success from the bridge connection alone. The activation journal
 must become `confirmed`, and the matching `hotswap-ack/<pid>.json` must prove
-the runtime reload under `managed-desktop-bridge`. If ChatGPT is connected, the
-ACK must prove completed frontend delivery. If the repository-managed bridge is
-dormant, only the exact all-zero counter shape is valid; an
+the runtime reload under `managed-desktop-bridge`. If ChatGPT is connected and
+eligible for `account/updated`, the ACK must include its completed transport
+write. A normal explicit activation also
+proves delivery to CodexSwitch's retained verification connection when ChatGPT
+is closed. If a separate bootstrap path reaches a genuinely dormant
+repository-managed bridge with no initialized control connection, only the
+exact all-zero counter shape is valid; an
 `external-app-server` ACK, missing counters, or a listener on another port fails.
+The retained control write alone proves backend convergence and outbound
+transport, not ChatGPT renderer consumption; retain the installed renderer
+patch and behavioral checks before presenting the renderer itself as current.
 
 ## CLI Update Storage Safety
 
@@ -1033,6 +1046,10 @@ Before claiming hot-swap is fixed or ready:
   the Swift app and Rust CLI bind it to the current activation. With any
   initialized, skipped, eligible, or rejected desktop frontend, the idle shape
   is rejected and completed frontend delivery remains mandatory.
+- [ ] A normal explicit desktop activation retains its initialized
+  verification WebSocket until strict reload returns. The SIGHUP ACK proves a
+  completed `account/updated` write to that connection before the socket closes,
+  including when ChatGPT itself is closed.
 - [ ] The Swift managed-launcher fixture uses real tab bytes and contains no
   literal `\t` indentation sequences, matching the Rust-generated launcher.
 - [ ] Relaunching or reinstalling CodexSwitch preserves a same-target
@@ -1091,6 +1108,9 @@ Every future hot-swap change must include tests for:
   `9223` can classify as `managed-desktop-bridge` and accept an exact all-zero
   idle ACK; missing or mixed counters, another port, and a self-claimed kind
   fail. Any initialized frontend restores the completed-delivery requirement.
+- The desktop activation client invokes strict reload before releasing its
+  initialized verification connection; regression tests assert the ordering so
+  a refactor cannot reintroduce the close-before-SIGHUP race.
 - `headless-remote-control-app-server` keeps its broader idle behavior only
   after positive topology and capability classification. Rejected-before-
   eligibility historical connections may be excluded from its live writer

@@ -157,6 +157,33 @@ struct DesktopRuntimeReloadClientTests {
         #expect(verificationParams?["refreshToken"] == false)
     }
 
+    @Test("Strict reload completes before the verification connection is released")
+    func strictReloadRunsInsideVerificationConnectionLifetime() {
+        let connectionIsOpen = LockedTestState(true)
+        let strictReloadRan = LockedFlag()
+        let event = DesktopRuntimeWebSocketEvent.string(
+            #"{"id":2,"result":{"account":{"type":"chatgpt"}}}"#
+        )
+
+        let result = DesktopRuntimeReloadClient.completeConnectedRequest(
+            event: event,
+            whileConnected: { receivedEvent in
+                #expect(connectionIsOpen.read())
+                #expect(receivedEvent == event)
+                strictReloadRan.setTrue()
+                return Self.successfulStrictSummary
+            },
+            release: {
+                connectionIsOpen.update { $0 = false }
+            }
+        )
+
+        #expect(result.event == event)
+        #expect(result.strictReloadSummary == Self.successfulStrictSummary)
+        #expect(strictReloadRan.value)
+        #expect(!connectionIsOpen.read())
+    }
+
     @Test("Current desktop ACK is reused without another JSON-RPC notification")
     func currentAcknowledgementSuppressesRepeatedDesktopReload() async {
         let strictReloadCalls = LockedFlag()
@@ -355,6 +382,52 @@ struct DesktopRuntimeReloadClientTests {
         ))
         try #require(requests.count == 1)
         #expect(requestMethod(in: requests[0].payload) == "account/login/start")
+        #expect(!strictReloadCalls.value)
+    }
+
+    @Test("Authorization is rechecked after verification and immediately before strict reload")
+    func authorizationExpiryAtStrictReloadBoundaryStopsSignal() async throws {
+        let authorization = LockedTestState(
+            (verificationResponseReady: false, postVerificationChecks: 0)
+        )
+        let strictReloadCalls = LockedFlag()
+        let (client, sender) = makeClient(
+            responses: [
+                .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
+                .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
+            ],
+            requestDidSend: { requestCount in
+                guard requestCount == 2 else { return }
+                authorization.update {
+                    $0.verificationResponseReady = true
+                }
+            },
+            strictReload: { _, _, _, _, _ in
+                strictReloadCalls.setTrue()
+                return Self.successfulStrictSummary
+            }
+        )
+
+        let result = await client.reloadAuth(
+            account: makeAccount(),
+            authorizeEffect: {
+                var isAuthorized = true
+                authorization.update { state in
+                    guard state.verificationResponseReady else { return }
+                    state.postVerificationChecks += 1
+                    isAuthorized = state.postVerificationChecks == 1
+                }
+                return isAuthorized
+            }
+        )
+
+        #expect(result == .failed(
+            "desktop reload authorization expired",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0
+        ))
+        #expect(await sender.recordedRequests().count == 2)
+        #expect(authorization.read().postVerificationChecks >= 2)
         #expect(!strictReloadCalls.value)
     }
 

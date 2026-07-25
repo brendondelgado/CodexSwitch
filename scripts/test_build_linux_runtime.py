@@ -69,9 +69,39 @@ class LinuxRuntimeWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("diff --binary --full-index --no-ext-diff HEAD", self.workflow)
         self.assertIn("Normalize patched upstream source mtimes", self.workflow)
+        checkout = self.block(
+            "Check out the exact peeled upstream Codex tag",
+            "Apply the exact-commit source patches",
+        )
+        self.assertIn(
+            'upstream_epoch="$(git -C "$UPSTREAM_SOURCE_DIR" show -s '
+            '--format=%ct "$peeled_upstream_sha")"',
+            checkout,
+        )
+        self.assertIn('"$upstream_epoch" == "0"', checkout)
+        self.assertIn("printf 'epoch=%s\\n' \"$upstream_epoch\"", checkout)
+
+        normalize = self.block(
+            "Normalize patched upstream source mtimes",
+            "Derive exact upstream target cache ABI",
+        )
+        self.assertIn(
+            "UPSTREAM_SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}",
+            normalize,
+        )
+        self.assertIn('--date="@$UPSTREAM_SOURCE_DATE_EPOCH"', normalize)
+
         abi = self.block(
             "Derive exact upstream target cache ABI",
             "Restore exact upstream Cargo target cache",
+        )
+        self.assertIn(
+            "format=codexswitch-linux-upstream-target-cache-abi-v2",
+            abi,
+        )
+        self.assertIn(
+            "UPSTREAM_SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}",
+            abi,
         )
         for value in (
             "rustc -Vv",
@@ -83,11 +113,89 @@ class LinuxRuntimeWorkflowContractTests(unittest.TestCase):
             "TARGET_TRIPLE",
             "UPSTREAM_SHA",
             "PATCH_SHA256",
-            "CODEXSWITCH_SOURCE_SHA",
-            "SOURCE_DATE_EPOCH",
+            "UPSTREAM_SOURCE_DATE_EPOCH",
+            "upstreamSourceDateEpoch",
             "CARGO_BUILD_JOBS",
         ):
             self.assertIn(value, abi)
+        self.assertNotIn("codexSwitchSha", abi)
+        self.assertNotIn(
+            'printf \'sourceDateEpoch=%s\\n\' "$SOURCE_DATE_EPOCH"',
+            abi,
+        )
+
+        upstream_build = self.block(
+            "Build the patched Codex runtime pair",
+            "Revalidate both source trees after compilation",
+        )
+        self.assertIn(
+            "SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}",
+            upstream_build,
+        )
+        self.assertEqual(
+            self.workflow.count("${{ steps.upstream.outputs.epoch }}"),
+            3,
+        )
+        self.assertIn('--argjson buildEpoch "$SOURCE_DATE_EPOCH"', self.workflow)
+
+    def test_target_cache_restore_is_exact_and_save_is_validation_gated(self) -> None:
+        target_key = (
+            "linux-runtime-target-v2-${{ runner.arch }}-"
+            "${{ steps.target_cache_abi.outputs.sha256 }}-"
+            "${{ steps.upstream.outputs.sha }}-"
+            "${{ steps.patches.outputs.sha256 }}"
+        )
+        restore = self.block(
+            "Restore exact upstream Cargo target cache",
+            "Build the patched Codex runtime pair",
+        )
+        self.assertIn("continue-on-error: true", restore)
+        self.assertIn("${{ runner.temp }}/codex-linux-target/", restore)
+        self.assertIn(target_key, restore)
+        self.assertNotIn("${{ steps.provenance.outputs.source_sha }}", restore)
+        self.assertNotIn("restore-keys:", restore)
+
+        source_validation = self.workflow.index(
+            "Revalidate both source trees after compilation"
+        )
+        binary_validation = self.workflow.index(
+            "Validate Linux architecture and runtime contracts"
+        )
+        manifest = self.workflow.index(
+            "Generate and verify the canonical SHA-256 manifest"
+        )
+        attestation = self.workflow.index(
+            "Attest all exact Linux runtime artifact members"
+        )
+        upload = self.workflow.index(
+            "Upload only the verified four-file Linux runtime artifact"
+        )
+        evidence = self.workflow.index("Record build evidence")
+        target_save = self.workflow.index(
+            "Save verified upstream Cargo target cache"
+        )
+        target_cleanup = self.workflow.index(
+            "Remove ephemeral upstream Cargo target"
+        )
+        self.assertLess(source_validation, binary_validation)
+        self.assertLess(binary_validation, manifest)
+        self.assertLess(manifest, attestation)
+        self.assertLess(attestation, upload)
+        self.assertLess(upload, evidence)
+        self.assertLess(evidence, target_save)
+        self.assertLess(target_save, target_cleanup)
+
+        save = self.workflow[target_save:target_cleanup]
+        self.assertIn(
+            "if: ${{ success() && steps.upstream_target_cache.outputs.cache-hit != 'true' }}",
+            save,
+        )
+        self.assertIn("continue-on-error: true", save)
+        self.assertIn("${{ runner.temp }}/codex-linux-target/", save)
+        self.assertIn(target_key, save)
+        self.assertNotIn("${{ steps.provenance.outputs.source_sha }}", save)
+        self.assertNotIn("restore-keys:", save)
+        self.assertEqual(self.workflow.count(target_key), 2)
 
     def test_validates_elf_version_install_commands_and_current_markers(self) -> None:
         validation = self.block(

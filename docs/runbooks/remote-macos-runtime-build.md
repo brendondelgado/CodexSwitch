@@ -22,13 +22,14 @@ cross_dependencies:
   - ../../scripts/build-app.sh
   - ../../scripts/install-macos-app-artifact.sh
   - ../../scripts/test_macos_app_artifact.py
+  - ../../scripts/test_macos_runtime_artifact.py
   - ../architecture/macos-runtime-artifact.md
   - ../architecture/macos-cli-launcher.md
   - ../architecture/runtime-and-host-ownership.md
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-22
+  last_updated: 2026-07-25
 ---
 
 # Remote macOS Runtime Build
@@ -100,19 +101,27 @@ GitHub Actions uses two independent, repository-scoped Cargo caches:
   may still seed this cache because it contains downloads rather than compiled
   release output.
 - An exact-only upstream target cache may restore `UPSTREAM_TARGET_DIR` only
-  when its complete v2 key matches. The key binds the runner architecture,
+  when its complete v3 key matches. The key binds the runner architecture,
   effective upstream Rust and Cargo versions, macOS and Xcode versions, SDK
   version and path, Clang version, target triple, upstream SHA, patched-source
-  SHA-256, CodexSwitch SHA, build epoch, release profile, job count, codegen-unit
-  count, LTO setting, and incremental setting. It has no fallback restore key.
-  The control-plane target remains uncached.
+  SHA-256, the verified upstream commit epoch, release profile, job count,
+  codegen-unit count, LTO setting, and incremental setting. It intentionally
+  excludes the CodexSwitch SHA and CodexSwitch commit epoch because they do not
+  affect the patched-upstream Cargo build. The exact key has no trailing
+  CodexSwitch source SHA and no fallback restore key. The control-plane target
+  remains uncached.
 
-After patching and hashing the exact upstream source, the workflow normalizes
-every tracked upstream file mtime to `SOURCE_DATE_EPOCH` without following
-symlinks. This makes Cargo's mtime-based freshness inputs stable for one exact
-cache identity; it does not mean Cargo broadly revalidates every cached object
-against source content. Never broaden the compiled-target key or add fallback
-restore keys while mtime normalization is active.
+The workflow keeps the two source epochs separate. The verified CodexSwitch
+commit epoch remains `SOURCE_DATE_EPOCH` for the control-plane build, manifest,
+and provenance evidence. After the upstream tag and commit are verified, the
+workflow derives a nonzero upstream commit epoch from that exact commit. It uses
+the upstream epoch only to normalize tracked patched-upstream file mtimes,
+record the upstream target-cache ABI, and set `SOURCE_DATE_EPOCH` for the
+patched-upstream Cargo build. This makes Cargo's mtime-based freshness inputs
+stable for one exact upstream cache identity; it does not mean Cargo broadly
+revalidates every cached object against source content. Never broaden the
+compiled-target key or add fallback restore keys while mtime normalization is
+active.
 
 The workflow can create the exact upstream target cache only after source and
 binary validation, manifest verification, attestation, artifact upload, and

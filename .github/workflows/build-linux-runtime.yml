@@ -292,10 +292,17 @@ jobs:
             exit 1
           fi
 
+          upstream_epoch="$(git -C "$UPSTREAM_SOURCE_DIR" show -s --format=%ct "$peeled_upstream_sha")"
+          if [[ ! "$upstream_epoch" =~ ^[0-9]+$ ]] || [[ "$upstream_epoch" == "0" ]]; then
+            echo "::error::verified upstream commit has an invalid source epoch"
+            exit 1
+          fi
+
           {
             printf 'tag=%s\n' "$upstream_tag"
             printf 'tag_object_sha=%s\n' "$tag_object_sha"
             printf 'sha=%s\n' "$peeled_upstream_sha"
+            printf 'epoch=%s\n' "$upstream_epoch"
           } >> "$GITHUB_OUTPUT"
 
       - name: Apply the exact-commit source patches
@@ -333,11 +340,12 @@ jobs:
       - name: Normalize patched upstream source mtimes
         env:
           EXPECTED_PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+          UPSTREAM_SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
         run: |
           set -euo pipefail
           (
             cd "$UPSTREAM_SOURCE_DIR"
-            git ls-files -z | xargs -0 touch -h --date="@$SOURCE_DATE_EPOCH" --
+            git ls-files -z | xargs -0 touch -h --date="@$UPSTREAM_SOURCE_DATE_EPOCH" --
           )
 
           observed_patch_sha256="$(
@@ -357,11 +365,12 @@ jobs:
         env:
           PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          UPSTREAM_SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
         run: |
           set -euo pipefail
           abi_input="$RUNNER_TEMP/linux-upstream-target-cache-abi.txt"
           {
-            printf 'format=codexswitch-linux-upstream-target-cache-abi-v1\n'
+            printf 'format=codexswitch-linux-upstream-target-cache-abi-v2\n'
             printf 'runnerImage=ubuntu-24.04\n'
             printf 'runnerArch=%s\n' "$(uname -m)"
             printf 'rustcVv<<EOF\n'
@@ -388,8 +397,7 @@ jobs:
             printf 'targetTriple=%s\n' "$TARGET_TRIPLE"
             printf 'upstreamSha=%s\n' "$UPSTREAM_SHA"
             printf 'patchSha256=%s\n' "$PATCH_SHA256"
-            printf 'codexSwitchSha=%s\n' "$CODEXSWITCH_SOURCE_SHA"
-            printf 'sourceDateEpoch=%s\n' "$SOURCE_DATE_EPOCH"
+            printf 'upstreamSourceDateEpoch=%s\n' "$UPSTREAM_SOURCE_DATE_EPOCH"
             printf 'cargoFlags=--locked --release --target %s\n' "$TARGET_TRIPLE"
             printf 'cargoPackages=codex-cli,codex-code-mode-host\n'
             printf 'CARGO_BUILD_JOBS=%s\n' "$CARGO_BUILD_JOBS"
@@ -412,10 +420,12 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/codex-linux-target/
-          key: linux-runtime-target-v1-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}-${{ steps.provenance.outputs.source_sha }}
+          key: linux-runtime-target-v2-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}
 
       - name: Build the patched Codex runtime pair
         working-directory: ${{ runner.temp }}/codex-linux-upstream/codex-rs
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
         run: |
           set -euo pipefail
           df -h .
@@ -790,7 +800,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/codex-linux-target/
-          key: linux-runtime-target-v1-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}-${{ steps.provenance.outputs.source_sha }}
+          key: linux-runtime-target-v2-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}
 
       - name: Remove ephemeral upstream Cargo target
         if: ${{ always() }}

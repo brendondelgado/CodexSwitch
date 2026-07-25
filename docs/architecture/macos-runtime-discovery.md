@@ -156,6 +156,14 @@ The bridge contract is:
    counters, mixed values, or any nonzero value are not an exact all-zero idle
    ACK. This shape does not claim that ChatGPT was notified. The bridge never
    weakens process, socket-owner, auth file, or token-fingerprint validation.
+7. During an explicit account activation, CodexSwitch keeps the initialized
+   `account/read` verification WebSocket open until the strict SIGHUP
+   request/ACK operation finishes. That control connection is an eligible
+   frontend writer and must complete the `account/updated` transport write.
+   Closing it after verification but before SIGHUP is forbidden because the
+   app-server may still account for the initialized connection while its writer
+   is already gone, producing a timing-dependent rejected or incomplete
+   delivery. The socket is closed only after the ACK attempt completes.
 
 ## Artifact Validation
 
@@ -329,6 +337,16 @@ App-server ACK accounting is exact:
 must equal `initializedFrontendCount`, and `frontendWriteCount` must equal the
 eligible count. Initialized frontends that are intentionally skipped remain
 part of the total and do not invalidate an otherwise complete delivery proof.
+The desktop activation client keeps its verified control connection live
+through SIGHUP, so a normal explicit managed-bridge reload proves positive
+delivery even when the ChatGPT renderer is not connected. The exact all-zero
+managed-bridge shape remains a bootstrap contract for a truly dormant listener;
+it is not a workaround for closing the control socket too early.
+That control write proves backend convergence and a working outbound transport;
+it does not by itself prove that a separate ChatGPT renderer consumed the
+notification or refreshed its UI. Renderer-current status still requires the
+renderer to remain an eligible writer plus the desktop compatibility evidence
+defined by the installed-app contract.
 An ordinary `external-app-server`, including a VPS target reached through SSH
 or a Unix socket, always requires positive completed frontend delivery and may
 not use an idle-listener shape. Only the identity-bound repository-managed
@@ -361,7 +379,10 @@ token-fingerprint drift, mutually matching nonce replay, canonical executable
 path/device/inode drift, argv/runtime-kind drift immediately before signaling
 and during evidence acceptance, auth same-content inode replacement, aggregate
 ACK deadlines, socket-owner/port reuse, locked-write drift, and identity changes
-during capability proof. Runtime-kind tests prove that only the
+during capability proof. Desktop transaction tests prove that the shared
+connection-completion path invokes strict reload before its transport-release
+callback. The installed canary confirms the same ordering with the real
+URLSession WebSocket. Runtime-kind tests prove that only the
 identity-verified repository-managed loopback listener on port `9223` can use a
 `managed-desktop-bridge` exact all-zero idle ACK, that missing or mixed counters
 fail, that ordinary `external-app-server` targets including VPS SSH/Unix

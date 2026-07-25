@@ -23,8 +23,10 @@ toc:
   - Verification
   - Rollback
 cross_dependencies:
+  - ../../.github/workflows/build-linux-runtime.yml
   - ../../scripts/install-linux.sh
   - ../../scripts/stage-linux-runtime-artifact.sh
+  - ../../scripts/test_build_linux_runtime.py
   - ../../scripts/verify_linux_runtime_artifact.py
   - ../../scripts/lib/observe-managed-systemd.py
   - ../../scripts/lib/observe-managed-daemon.py
@@ -68,7 +70,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-21
+  last_updated: 2026-07-25
 ---
 
 # Linux Repository Deployment
@@ -147,6 +149,25 @@ codexswitch-cli <package-version> (git <full-40-character-sha>, built <commit-ep
 Any `unknown`, `dirty`, version, SHA, or epoch mismatch rejects publication.
 Cargo uses one job, positive niceness, idle IO scheduling, and a
 `CARGO_TARGET_DIR` below the canonical build root.
+
+The remote Linux runtime artifact workflow keeps control-plane provenance
+separate from patched-upstream cache identity. The verified CodexSwitch commit
+epoch remains `SOURCE_DATE_EPOCH` for the `codexswitch-cli` build, manifest, and
+recorded provenance. After the workflow verifies the peeled upstream tag
+commit, it derives a nonzero epoch from that exact upstream commit and uses it
+only for patched-upstream mtime normalization, the upstream target-cache ABI,
+and the patched-upstream Cargo build.
+
+The repository-scoped compiled-target cache uses the exact-only v2 key. Its ABI
+binds the Linux runner and native toolchain, target triple, upstream SHA,
+patched-source SHA-256, verified upstream commit epoch, Cargo flags and package
+set, and release-profile settings. It excludes the CodexSwitch SHA and
+CodexSwitch commit epoch, and the exact key has no trailing CodexSwitch source
+SHA or fallback restore prefix. The control-plane target is never cached.
+Restore is exact-only, and a missed target cache is saved only after source and
+binary validation, manifest verification, attestation, artifact upload, and
+build-evidence recording all succeed. Cache restore or save transport failure
+is non-fatal and never relaxes artifact validation.
 
 ## Path And Storage Bounds
 

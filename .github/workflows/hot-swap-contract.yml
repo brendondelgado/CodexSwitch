@@ -58,6 +58,7 @@ jobs:
           python3 scripts/test_build_app.py
           python3 scripts/test_build_linux_runtime.py
           python3 scripts/test_linux_runtime_artifact.py
+          python3 scripts/test_macos_runtime_artifact.py
 
       - name: Run full Swift contract suite
         shell: bash

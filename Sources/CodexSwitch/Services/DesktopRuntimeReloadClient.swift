@@ -115,6 +115,19 @@ private enum DesktopRuntimeSocketError: Error {
     case responseLimitExceeded
 }
 
+struct DesktopRuntimeConnectedRequestResult: Sendable {
+    let event: DesktopRuntimeWebSocketEvent
+    let strictReloadSummary: CodexReloadSummary?
+
+    init(
+        event: DesktopRuntimeWebSocketEvent,
+        strictReloadSummary: CodexReloadSummary? = nil
+    ) {
+        self.event = event
+        self.strictReloadSummary = strictReloadSummary
+    }
+}
+
 struct DesktopRuntimeReloadClient: Sendable {
     private let timeoutSeconds: TimeInterval
     private let requestSender: (@Sendable (String, UInt16) async -> DesktopRuntimeWebSocketEvent)?
@@ -310,10 +323,33 @@ struct DesktopRuntimeReloadClient: Sendable {
                 )
             }
             let verificationRequest = Self.probeRequest(method: verificationMethod, id: 2)
-            let verificationEvent = await sendJSONRPCRequest(
+            let connectedVerification = await sendJSONRPCRequest(
                 verificationRequest,
                 socketBinding: socketBinding,
-                requiredOwnerUID: context.requiredOwnerUID
+                requiredOwnerUID: context.requiredOwnerUID,
+                whileConnected: { event in
+                    guard authorizeEffect() else { return nil }
+                    let verification = Self.classifyVerificationResponse(
+                        event,
+                        targetEmail: account.email,
+                        targetAccountID: account.accountId,
+                        targetPlanType: account.planType,
+                        reloadMethod: method,
+                        expectedID: 2
+                    )
+                    guard case .reloaded = verification else { return nil }
+                    guard authorizeEffect() else { return nil }
+                    return dependencies.strictReload(
+                        CodexRuntimeDiscoverySnapshot(
+                            targets: [socketBinding.target],
+                            isComplete: true
+                        ),
+                        [socketBinding],
+                        context.admission,
+                        context.requiredOwnerUID,
+                        authorizeEffect
+                    )
+                }
             )
             guard authorizeEffect() else {
                 return .failed(
@@ -323,7 +359,7 @@ struct DesktopRuntimeReloadClient: Sendable {
                 )
             }
             let verification = Self.classifyVerificationResponse(
-                verificationEvent,
+                connectedVerification.event,
                 targetEmail: account.email,
                 targetAccountID: account.accountId,
                 targetPlanType: account.planType,
@@ -336,24 +372,13 @@ struct DesktopRuntimeReloadClient: Sendable {
                     acknowledged: acknowledgedPIDs.count
                 )
             }
-            guard authorizeEffect() else {
+            guard let strictSummary = connectedVerification.strictReloadSummary else {
                 return .failed(
-                    "desktop reload authorization expired",
+                    "strict desktop reload did not run while verification connection was open",
                     discoveredRuntimeCount: context.discovery.targets.count,
                     acknowledgedRuntimeCount: acknowledgedPIDs.count
                 )
             }
-
-            let strictSummary = dependencies.strictReload(
-                CodexRuntimeDiscoverySnapshot(
-                    targets: [socketBinding.target],
-                    isComplete: true
-                ),
-                [socketBinding],
-                context.admission,
-                context.requiredOwnerUID,
-                authorizeEffect
-            )
             if strictSummary.acknowledgedRuntimeCount == 1 {
                 acknowledgedPIDs.insert(socketBinding.target.process.identity.pid)
             }
@@ -943,9 +968,26 @@ struct DesktopRuntimeReloadClient: Sendable {
         socketBinding: CodexDesktopRuntimeSocketBinding,
         requiredOwnerUID: UInt32
     ) async -> DesktopRuntimeWebSocketEvent {
+        let result = await sendJSONRPCRequest(
+            request,
+            socketBinding: socketBinding,
+            requiredOwnerUID: requiredOwnerUID,
+            whileConnected: nil
+        )
+        return result.event
+    }
+
+    private func sendJSONRPCRequest(
+        _ request: [String: Any],
+        socketBinding: CodexDesktopRuntimeSocketBinding,
+        requiredOwnerUID: UInt32,
+        whileConnected: (@Sendable (DesktopRuntimeWebSocketEvent) -> CodexReloadSummary?)?
+    ) async -> DesktopRuntimeConnectedRequestResult {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: request),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
-            return .failure("failed to serialize json-rpc request")
+            return DesktopRuntimeConnectedRequestResult(
+                event: .failure("failed to serialize json-rpc request")
+            )
         }
         let requestID = request["id"] as? Int
 
@@ -954,9 +996,16 @@ struct DesktopRuntimeReloadClient: Sendable {
                 socketBinding,
                 requiredOwnerUID
             ) else {
-                return .failure("desktop runtime binding drift")
+                return DesktopRuntimeConnectedRequestResult(
+                    event: .failure("desktop runtime binding drift")
+                )
             }
-            return await requestSender(jsonString, socketBinding.port)
+            let event = await requestSender(jsonString, socketBinding.port)
+            return Self.completeConnectedRequest(
+                event: event,
+                whileConnected: whileConnected,
+                release: {}
+            )
         }
 
         let url = URL(string: "ws://127.0.0.1:\(socketBinding.port)")!
@@ -1018,24 +1067,49 @@ struct DesktopRuntimeReloadClient: Sendable {
                     )
                 }
             )
-            wsTask.cancel(with: .normalClosure, reason: nil)
-            return Self.webSocketEvent(from: response)
+            return Self.completeConnectedRequest(
+                event: Self.webSocketEvent(from: response),
+                whileConnected: whileConnected,
+                release: {
+                    wsTask.cancel(with: .normalClosure, reason: nil)
+                }
+            )
         } catch DesktopRuntimeSocketError.bindingDrift {
             wsTask.cancel(with: .goingAway, reason: nil)
-            return .failure("desktop runtime binding drift")
+            return DesktopRuntimeConnectedRequestResult(
+                event: .failure("desktop runtime binding drift")
+            )
         } catch DesktopRuntimeSocketError.initializationFailed(let reason) {
             wsTask.cancel(with: .goingAway, reason: nil)
-            return .failure("desktop initialize failed: \(reason)")
+            return DesktopRuntimeConnectedRequestResult(
+                event: .failure("desktop initialize failed: \(reason)")
+            )
         } catch DesktopRuntimeSocketError.responseLimitExceeded {
             wsTask.cancel(with: .goingAway, reason: nil)
-            return .failure("desktop response limit exceeded")
+            return DesktopRuntimeConnectedRequestResult(
+                event: .failure("desktop response limit exceeded")
+            )
         } catch is CancellationError {
             wsTask.cancel(with: .goingAway, reason: nil)
-            return .timeout
+            return DesktopRuntimeConnectedRequestResult(event: .timeout)
         } catch {
             wsTask.cancel(with: .goingAway, reason: nil)
-            return .failure(error.localizedDescription)
+            return DesktopRuntimeConnectedRequestResult(
+                event: .failure(error.localizedDescription)
+            )
         }
+    }
+
+    nonisolated static func completeConnectedRequest(
+        event: DesktopRuntimeWebSocketEvent,
+        whileConnected: (@Sendable (DesktopRuntimeWebSocketEvent) -> CodexReloadSummary?)?,
+        release: @Sendable () -> Void
+    ) -> DesktopRuntimeConnectedRequestResult {
+        defer { release() }
+        return DesktopRuntimeConnectedRequestResult(
+            event: event,
+            strictReloadSummary: whileConnected?(event)
+        )
     }
 
     private nonisolated static func receiveResponse(

@@ -501,6 +501,22 @@ Supported reload mechanisms are ordered by runtime capability:
 2. Verified Codex CLI/app-server SIGHUP implementation with request/ack evidence.
 3. Explicit operator restart when the running version lacks a safe reload contract.
 
+The desktop path composes mechanisms 1 and 2 as one connection-scoped
+transaction. After the complete token set is accepted and `account/read`
+verifies the target identity, CodexSwitch retains that initialized WebSocket
+while it writes the version-3 request, signals SIGHUP, and waits for the bound
+ACK. The app-server must complete `account/updated` on that retained writer
+before the transaction releases the socket. A JSON-RPC success followed by
+closing the socket and only then signalling is not convergence: it races
+connection removal against frontend accounting and can fail intermittently as
+either a rejected writer or an incomplete write.
+The retained control writer proves backend auth convergence and outbound
+transport completion. It is not renderer-consumption evidence. When ChatGPT is
+connected, renderer-current presentation additionally depends on that renderer
+remaining eligible for `account/updated` and on the installed desktop
+compatibility contract; a control-only write cannot claim that the renderer
+processed or displayed the new account.
+
 Runtime kind is an authorization contract derived from verified process and
 listener topology, never a label trusted from the acknowledgement. On macOS,
 only the repository-managed bridge may classify as
@@ -717,6 +733,11 @@ dormant bridge with exactly zero initialized frontends may instead prove only
 that its backend auth cache is current for the next frontend connection; every
 required frontend counter must be present and exactly zero. Missing counters or
 nonzero skipped, eligible, or rejected counts cannot use that idle shape.
+The normal explicit desktop activation retains its initialized verification
+connection through strict reload, so it follows the completed-write branch even
+when ChatGPT itself is closed. The dormant exact-zero branch is reserved for
+bootstrap flows that genuinely have no initialized connection; it does not
+permit the activation client to close its control connection before signalling.
 The current managed local CLI may establish its first ACK under the same
 artifact and running-vnode proof, using the CLI-specific v3 acknowledgement
 shape. Exact-name preliminary discovery prevents unrelated command lines from
@@ -909,7 +930,9 @@ actor boundary on every supported Swift 6 toolchain.
 - Every fresh desktop bridge connection completes the app-server `initialize`
   handshake before account mutation or verification. Current app-server
   responses may omit the optional `jsonrpc` member; identity verification and
-  the strict SIGHUP acknowledgement remain mandatory.
+  the strict SIGHUP acknowledgement remain mandatory. The account-verification
+  connection stays open through that acknowledgement so the activation proves
+  a completed frontend write before releasing its transport.
 - Provider quota is shared, but runtime ownership is host-specific. Every account
   card presents simultaneous `Mac Configured`, `Mac Runtime`, and `VPS Runtime`
   fields, including when the configured and runtime-current Mac identities are

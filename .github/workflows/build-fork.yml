@@ -250,8 +250,17 @@ jobs:
             exit 1
           fi
 
-          printf 'tag=%s\n' "$upstream_tag" >> "$GITHUB_OUTPUT"
-          printf 'sha=%s\n' "$actual_upstream_sha" >> "$GITHUB_OUTPUT"
+          upstream_epoch="$(git -C "$UPSTREAM_SOURCE_DIR" show -s --format=%ct "$actual_upstream_sha")"
+          if [[ ! "$upstream_epoch" =~ ^[0-9]+$ ]] || [[ "$upstream_epoch" == "0" ]]; then
+            echo "::error::verified upstream commit has an invalid source epoch"
+            exit 1
+          fi
+
+          {
+            printf 'tag=%s\n' "$upstream_tag"
+            printf 'sha=%s\n' "$actual_upstream_sha"
+            printf 'epoch=%s\n' "$upstream_epoch"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Apply the dispatched v3 source patches
         id: patches
@@ -283,10 +292,11 @@ jobs:
       - name: Normalize patched upstream source mtimes
         env:
           EXPECTED_PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+          UPSTREAM_SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
         run: |
           set -euo pipefail
           export TZ=UTC
-          source_stamp="$(date -u -r "$SOURCE_DATE_EPOCH" '+%Y%m%d%H%M.%S')"
+          source_stamp="$(date -u -r "$UPSTREAM_SOURCE_DATE_EPOCH" '+%Y%m%d%H%M.%S')"
           if [[ ! "$source_stamp" =~ ^[0-9]{12}\.[0-9]{2}$ ]]; then
             echo "::error::failed to derive the deterministic upstream source timestamp"
             exit 1
@@ -313,12 +323,13 @@ jobs:
         env:
           PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          UPSTREAM_SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
         run: |
           set -euo pipefail
           export LC_ALL=C
           abi_input="$RUNNER_TEMP/upstream-target-cache-abi.txt"
           {
-            printf 'format=codexswitch-upstream-target-cache-abi-v2\n'
+            printf 'format=codexswitch-upstream-target-cache-abi-v3\n'
             printf 'runnerArch=%s\n' "$(uname -m)"
             printf 'rustcVv<<EOF\n'
             rustc -Vv
@@ -340,8 +351,7 @@ jobs:
             printf 'targetTriple=%s\n' "$TARGET_TRIPLE"
             printf 'upstreamSha=%s\n' "$UPSTREAM_SHA"
             printf 'patchSha256=%s\n' "$PATCH_SHA256"
-            printf 'codexSwitchSha=%s\n' "$CODEXSWITCH_SOURCE_SHA"
-            printf 'sourceDateEpoch=%s\n' "$SOURCE_DATE_EPOCH"
+            printf 'upstreamSourceDateEpoch=%s\n' "$UPSTREAM_SOURCE_DATE_EPOCH"
             printf 'cargoFlags=--locked --release --target %s\n' "$TARGET_TRIPLE"
             printf 'cargoPackages=codex-cli,codex-code-mode-host\n'
             printf 'CARGO_BUILD_JOBS=%s\n' "$CARGO_BUILD_JOBS"
@@ -364,10 +374,12 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/codex-target/
-          key: macos-runtime-target-v2-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}-${{ steps.provenance.outputs.source_sha }}
+          key: macos-runtime-target-v3-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}
 
       - name: Build the patched Codex runtime pair
         working-directory: ${{ runner.temp }}/codex-upstream/codex-rs
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
         run: |
           set -euo pipefail
           df -h .
@@ -704,7 +716,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/codex-target/
-          key: macos-runtime-target-v2-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}-${{ steps.provenance.outputs.source_sha }}
+          key: macos-runtime-target-v3-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}
 
       - name: Remove ephemeral upstream Cargo target
         if: ${{ always() }}
