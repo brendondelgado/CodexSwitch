@@ -409,8 +409,18 @@ fn patch_app_server_reload_template(
                         );
                         continue;
                     }
-                    let idle_listener_ready = eligible_frontend_count == 0
-                        && expected_runtime_kind == "headless-remote-control-app-server";
+                    let idle_listener_ready = match expected_runtime_kind {
+                        "headless-remote-control-app-server" => {
+                            eligible_frontend_count == 0
+                        }
+                        "external-app-server" => {
+                            initialized_frontend_count == 0
+                                && skipped_frontend_count == 0
+                                && eligible_frontend_count == 0
+                                && rejected_frontend_count == 0
+                        }
+                        _ => false,
+                    };
                     if idle_listener_ready {
                         tracing::info!(
                             "CodexSwitch idle app-server auth reload acknowledged without an eligible frontend writer"

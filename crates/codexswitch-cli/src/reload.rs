@@ -1987,11 +1987,12 @@ fn hot_swap_ack_matches_request(
         && ack.loaded_token_fingerprint == expected_fingerprint
         && ack.active_token_fingerprint == expected_fingerprint
         && match runtime_kind {
-            HotSwapRuntimeKind::ExternalAppServer => {
-                external_app_server_ack_is_verified(ack, false)
-            }
+            HotSwapRuntimeKind::ExternalAppServer => external_app_server_ack_is_verified(
+                ack,
+                AppServerIdlePolicy::ZeroInitializedFrontends,
+            ),
             HotSwapRuntimeKind::HeadlessRemoteControlAppServer => {
-                external_app_server_ack_is_verified(ack, true)
+                external_app_server_ack_is_verified(ack, AppServerIdlePolicy::NoEligibleFrontends)
             }
             HotSwapRuntimeKind::LocalInteractiveCli => {
                 !ack.frontend_notified
@@ -2006,7 +2007,13 @@ fn hot_swap_ack_matches_request(
         }
 }
 
-fn external_app_server_ack_is_verified(ack: &HotSwapAck, allow_idle_listener: bool) -> bool {
+#[derive(Clone, Copy)]
+enum AppServerIdlePolicy {
+    ZeroInitializedFrontends,
+    NoEligibleFrontends,
+}
+
+fn external_app_server_ack_is_verified(ack: &HotSwapAck, idle_policy: AppServerIdlePolicy) -> bool {
     let (Some(initialized), Some(skipped), Some(eligible), Some(rejected)) = (
         ack.initialized_frontend_count,
         ack.skipped_frontend_count,
@@ -2023,11 +2030,16 @@ fn external_app_server_ack_is_verified(ack: &HotSwapAck, allow_idle_listener: bo
         && ack.frontend_notified
         && eligible > 0
         && ack.frontend_write_count == eligible;
-    let idle_listener = allow_idle_listener
-        && ack.idle_listener_ready
+    let idle_counts_are_allowed = match idle_policy {
+        AppServerIdlePolicy::ZeroInitializedFrontends => {
+            initialized == 0 && skipped == 0 && eligible == 0 && rejected == 0
+        }
+        AppServerIdlePolicy::NoEligibleFrontends => eligible == 0,
+    };
+    let idle_listener = ack.idle_listener_ready
         && !ack.frontend_notified
         && ack.frontend_write_count == 0
-        && eligible == 0;
+        && idle_counts_are_allowed;
 
     counts_are_consistent && !ack.reconnect_ready && (delivered_to_frontend || idle_listener)
 }
@@ -3783,11 +3795,31 @@ mod tests {
         strict_idle.eligible_frontend_count = Some(0);
         strict_idle.rejected_frontend_count = Some(0);
         strict_idle.idle_listener_ready = true;
-        assert!(!hot_swap_ack_matches_request(
+        assert!(hot_swap_ack_matches_request(
             &strict_idle,
             &strict_request,
             HotSwapRuntimeKind::ExternalAppServer,
             strict_idle.acknowledged_at_unix_milliseconds,
+        ));
+
+        let mut strict_skipped = strict_idle.clone();
+        strict_skipped.initialized_frontend_count = Some(1);
+        strict_skipped.skipped_frontend_count = Some(1);
+        assert!(!hot_swap_ack_matches_request(
+            &strict_skipped,
+            &strict_request,
+            HotSwapRuntimeKind::ExternalAppServer,
+            strict_skipped.acknowledged_at_unix_milliseconds,
+        ));
+
+        let mut strict_rejected = strict_idle;
+        strict_rejected.initialized_frontend_count = Some(1);
+        strict_rejected.rejected_frontend_count = Some(1);
+        assert!(!hot_swap_ack_matches_request(
+            &strict_rejected,
+            &strict_request,
+            HotSwapRuntimeKind::ExternalAppServer,
+            strict_rejected.acknowledged_at_unix_milliseconds,
         ));
         Ok(())
     }

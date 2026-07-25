@@ -56,7 +56,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-24
+  last_updated: 2026-07-25
 ---
 
 # Runtime And Host Ownership
@@ -705,8 +705,11 @@ managed-launcher route embedded in the bridge script, expected runtime and
 helper hashes, and the running executable vnode. The local and Homebrew CLI
 forwarding wrappers remain part of CLI route verification, not desktop bridge
 authorization. This narrow bootstrap is not status evidence: activation remains
-degraded until the runtime returns the normal identity-bound ACK and proves at
-least one completed desktop frontend write.
+degraded until the runtime returns the normal identity-bound ACK. An active
+desktop frontend requires a completed `account/updated` write. A dormant bridge
+with exactly zero initialized frontends may instead prove only that its backend
+auth cache is current for the next frontend connection; nonzero skipped,
+eligible, or rejected counts cannot use that idle shape.
 The current managed local CLI may establish its first ACK under the same
 artifact and running-vnode proof, using the CLI-specific v3 acknowledgement
 shape. Exact-name preliminary discovery prevents unrelated command lines from

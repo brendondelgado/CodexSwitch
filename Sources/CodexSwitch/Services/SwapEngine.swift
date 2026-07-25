@@ -2514,12 +2514,12 @@ enum SwapEngine {
         case .externalAppServer:
             return externalAppServerAcknowledgementIsValid(
                 acknowledgement,
-                allowIdleListener: false
+                idlePolicy: .zeroInitializedFrontends
             )
         case .headlessRemoteControlAppServer:
             return externalAppServerAcknowledgementIsValid(
                 acknowledgement,
-                allowIdleListener: true
+                idlePolicy: .noEligibleFrontends
             )
         case .localInteractiveCLI:
             return !acknowledgement.frontendNotified
@@ -2534,9 +2534,14 @@ enum SwapEngine {
         }
     }
 
+    private enum AppServerIdlePolicy {
+        case zeroInitializedFrontends
+        case noEligibleFrontends
+    }
+
     private nonisolated static func externalAppServerAcknowledgementIsValid(
         _ acknowledgement: CodexReloadAcknowledgement,
-        allowIdleListener: Bool
+        idlePolicy: AppServerIdlePolicy
     ) -> Bool {
         guard let initialized = acknowledgement.initializedFrontendCount,
               let skipped = acknowledgement.skippedFrontendCount,
@@ -2561,11 +2566,16 @@ enum SwapEngine {
             && acknowledgement.frontendNotified
             && eligible > 0
             && acknowledgement.frontendWriteCount == eligible
-        let idleListener = allowIdleListener
-            && acknowledgement.idleListenerReady == true
+        let idleCountsAreAllowed = switch idlePolicy {
+        case .zeroInitializedFrontends:
+            initialized == 0 && skipped == 0 && eligible == 0 && rejected == 0
+        case .noEligibleFrontends:
+            eligible == 0
+        }
+        let idleListener = acknowledgement.idleListenerReady == true
             && !acknowledgement.frontendNotified
             && acknowledgement.frontendWriteCount == 0
-            && eligible == 0
+            && idleCountsAreAllowed
         return acknowledgement.reconnectReady != true
             && (deliveredToFrontend || idleListener)
     }

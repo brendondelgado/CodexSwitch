@@ -1985,7 +1985,56 @@ struct SwapEngineTests {
             currentBinding: strictBinding,
             expectedBinding: strictBinding,
             nowUnixMilliseconds: now
-        ) == nil)
+        ) != nil)
+
+        for initializedDesktop in [
+            CodexReloadAcknowledgement(
+                binding: strictBinding,
+                acknowledgedAtUnixMilliseconds: 1_500_100,
+                loadedTokenFingerprint:
+                    strictBinding.authFileIdentity.completeTokenFingerprint,
+                activeTokenFingerprint:
+                    strictBinding.authFileIdentity.completeTokenFingerprint,
+                frontendNotified: false,
+                frontendWriteCount: 0,
+                authGeneration: 7,
+                reconnectReady: nil,
+                initializedFrontendCount: 1,
+                skippedFrontendCount: 1,
+                eligibleFrontendCount: 0,
+                rejectedFrontendCount: 0,
+                idleListenerReady: true
+            ),
+            CodexReloadAcknowledgement(
+                binding: strictBinding,
+                acknowledgedAtUnixMilliseconds: 1_500_100,
+                loadedTokenFingerprint:
+                    strictBinding.authFileIdentity.completeTokenFingerprint,
+                activeTokenFingerprint:
+                    strictBinding.authFileIdentity.completeTokenFingerprint,
+                frontendNotified: false,
+                frontendWriteCount: 0,
+                authGeneration: 7,
+                reconnectReady: nil,
+                initializedFrontendCount: 1,
+                skippedFrontendCount: 0,
+                eligibleFrontendCount: 0,
+                rejectedFrontendCount: 1,
+                idleListenerReady: true
+            ),
+        ] {
+            let initializedArtifacts = artifactSnapshots(
+                binding: strictBinding,
+                acknowledgement: initializedDesktop
+            )
+            #expect(SwapEngine.validatedReloadAcknowledgement(
+                request: initializedArtifacts.0,
+                acknowledgement: initializedArtifacts.1,
+                currentBinding: strictBinding,
+                expectedBinding: strictBinding,
+                nowUnixMilliseconds: now
+            ) == nil)
+        }
     }
 
     @Test("Reload artifacts reject stale and future authority")

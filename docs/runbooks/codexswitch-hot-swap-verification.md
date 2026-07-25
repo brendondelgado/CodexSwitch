@@ -145,7 +145,14 @@ auth manager; it does not claim a currently connected client was notified. Once
 any writer accepts the notification, the idle shape is forbidden and every
 eligible writer must complete the transport write. An accepted-but-undelivered
 writer, timeout, partial write set, or failed proof channel remains degraded.
-The strict `external-app-server` kind never accepts the idle shape.
+The desktop `external-app-server` contract accepts the idle-listener shape only
+when `initializedFrontendCount`, `skippedFrontendCount`,
+`eligibleFrontendCount`, `rejectedFrontendCount`, and `frontendWriteCount` are
+all exactly zero. That shape proves a dormant listener's backend auth cache for
+the next connection and does not claim that ChatGPT was notified. If any
+frontend is initialized, even one that is skipped or rejects enqueue, the
+desktop contract remains strict and requires completed writes for every
+eligible frontend.
 
 A local interactive CLI embeds an in-process app-server but has no desktop
 renderer writer. Its `local-interactive-cli` acknowledgement may complete after
@@ -1003,6 +1010,11 @@ Before claiming hot-swap is fixed or ready:
   files, their embedded exact managed route, expected runtime/helper hashes,
   listener owner, and running executable vnode all agree. A stale independent
   CLI forwarding wrapper must not block this desktop-only bootstrap.
+- [ ] With ChatGPT closed and zero initialized bridge frontends, a swap accepts
+  only the exact all-zero idle-listener ACK and both the Swift app and Rust CLI
+  bind it to the current activation. With any initialized, skipped, eligible,
+  or rejected desktop frontend, the idle shape is rejected and completed
+  frontend delivery remains mandatory.
 - [ ] The Swift managed-launcher fixture uses real tab bytes and contains no
   literal `\t` indentation sequences, matching the Rust-generated launcher.
 - [ ] Relaunching or reinstalling CodexSwitch preserves a same-target

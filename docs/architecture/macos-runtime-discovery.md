@@ -26,7 +26,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical
-  last_updated: 2026-07-24
+  last_updated: 2026-07-25
 ---
 
 # macOS Runtime Discovery
@@ -127,9 +127,15 @@ The bridge contract is:
 5. App-server responses may use either the legacy JSON-RPC envelope with
    `jsonrpc: "2.0"` or the current envelope containing only `id` plus
    `result`/`error`. An explicit non-2.0 `jsonrpc` value remains invalid.
-6. A successful account RPC is still followed by the strict version-3 SIGHUP
-   request/ACK proof. The bridge does not weaken process, socket-owner, auth
-   file, or token-fingerprint validation.
+6. A successful account RPC is still followed by the version-3 SIGHUP
+   request/ACK proof. When at least one initialized frontend exists, the bridge
+   remains strict and every eligible frontend must complete the
+   `account/updated` transport write. When the launchd-kept bridge has exactly
+   zero initialized frontends, it may instead acknowledge that its backend auth
+   cache is current and that a future frontend will initialize against that
+   cache. This zero-frontend shape does not claim that ChatGPT was notified.
+   The bridge never weakens process, socket-owner, auth file, or
+   token-fingerprint validation.
 
 ## Artifact Validation
 
@@ -201,9 +207,12 @@ The managed `9223` bootstrap closes the otherwise circular first-start
 dependency: a newly launched app-server cannot have an identity-bound ACK until
 it has received its first identity-bound request. Bootstrap is mutation-path
 only, applies to the exact launchd-owned bridge PID and socket, and still
-requires the normal post-signal ACK with matching auth fingerprints and a
-completed frontend write. It never makes readiness green by itself and does not
-authorize arbitrary app-servers or local interactive CLI processes.
+requires the normal post-signal ACK with matching auth fingerprints. If an
+initialized frontend exists, the ACK also requires every eligible frontend
+write. If the initialized count is exactly zero, the ACK must instead carry the
+explicit zero-count idle-listener shape. It never makes readiness green by
+itself and does not authorize arbitrary app-servers or local interactive CLI
+processes.
 
 Desktop bootstrap derives its runtime route from the fixed managed-launcher path
 inside the byte-verified bridge script. Requiring agreement from unrelated CLI
@@ -295,6 +304,12 @@ Strict and headless external app-server ACK accounting is exact:
 must equal `initializedFrontendCount`, and `frontendWriteCount` must equal the
 eligible count. Initialized frontends that are intentionally skipped remain
 part of the total and do not invalidate an otherwise complete delivery proof.
+An `external-app-server` may use the idle-listener shape only when all four
+frontend counts and `frontendWriteCount` are exactly zero. This proves a
+dormant listener's backend auth cache for its next connection; any initialized,
+skipped, eligible, or rejected frontend makes that shape invalid and restores
+the completed-write requirement. A `headless-remote-control-app-server` keeps
+its broader idle-listener policy because it has no desktop renderer contract.
 Interactive CLI ACKs carry no frontend accounting values. Canonical serializers
 omit all four keys; decoders also treat explicit JSON `null` as no value for
 backward-compatible parsing.
