@@ -2602,6 +2602,31 @@ fn timestamped_server_notification(notification: ServerNotification) -> Outgoing
         assert!(metadata.unresolved_failure.is_none());
         assert_eq!(metadata.error, None);
 
+        let mut current = automatic_update_test_state(UpdateStatus::Failed, now);
+        current.installed_version = Some("0.145.0".to_string());
+        current.installed_artifact_manifest_sha256 = Some("a".repeat(64));
+        current.error = Some("registry transport failed".to_string());
+        record_unresolved_failure(&mut current, UpdateFailureKind::Metadata, now, None, None);
+
+        apply_successful_metadata_check(
+            &mut current,
+            "0.145.0",
+            Some("0.145.0".to_string()),
+            false,
+            false,
+            false,
+            UpdateStatus::Failed,
+            now + ChronoDuration::minutes(1),
+        );
+
+        assert_eq!(current.status, UpdateStatus::Installed);
+        assert!(current.unresolved_failure.is_none());
+        assert_eq!(current.error, None);
+        assert_eq!(
+            current.installed_artifact_manifest_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
         let mut activation = automatic_update_test_state(UpdateStatus::Failed, now);
         activation.error = Some("activation acknowledgement failed".to_string());
         record_unresolved_failure(

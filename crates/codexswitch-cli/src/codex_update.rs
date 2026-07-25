@@ -289,16 +289,17 @@ fn apply_successful_metadata_check(
     state.last_checked_at = Some(now);
     state.latest_stable_version = Some(latest.to_string());
     observe_installed_version(state, installed_version);
-    if version_is_stable(latest)
+    let resolved_metadata_failure = version_is_stable(latest)
         && state
             .unresolved_failure
             .as_ref()
-            .is_some_and(|failure| failure.kind == UpdateFailureKind::Metadata)
-    {
+            .is_some_and(|failure| failure.kind == UpdateFailureKind::Metadata);
+    if resolved_metadata_failure {
         clear_unresolved_failure(state);
         state.error = None;
     }
     let preserve_same_version_observation = state.installed_version.as_deref() == Some(latest)
+        && !resolved_metadata_failure
         && same_version_observation_must_preserve_failure(state, latest, &status_before_check);
     if !preserve_same_version_observation {
         if has_prepare_failure_for_version(state, latest)
