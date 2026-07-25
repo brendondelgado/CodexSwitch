@@ -1,0 +1,51 @@
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_0cd75674ffc649 504-512,519,736-740,933-935
+  s_70c8e194852bb5::t_f67b69c38e3615 513-518
+.github/workflows/build-linux-runtime.yml
+  s_70c8e194852bb5::t_cb235d2516b360 295-300,305,343,348,368,373,400,423,427-428,803
+.github/workflows/build-fork.yml
+  s_70c8e194852bb5::t_31f41f503ade70 259-263
+  s_70c8e194852bb5::t_cb235d2516b360 253-258,295,299,326,332,354,377,381-382,719
+docs/runbooks/remote-macos-runtime-build.md
+  s_70c8e194852bb5::t_192fb7ca17135c 25,32,104,107-124
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_192fb7ca17135c 26,29,73,153-170
+  s_70c8e194852bb5::t_6fd1ebc6e7e520 171
+.github/workflows/hot-swap-contract.yml
+  s_70c8e194852bb5::t_cb235d2516b360 61
+scripts/test_build_linux_runtime.py
+  s_70c8e194852bb5::t_dd9eabbb0d9860 72-93,98-105,116-117,121-198
+Tests/CodexSwitchTests/DesktopRuntimeReloadClientTests.swift
+  s_70c8e194852bb5::t_4cc729c5b0c3b3 388-433
+  s_70c8e194852bb5::t_7101abc6476986 160-186
+scripts/test_macos_runtime_artifact.py
+  s_70c8e194852bb5::t_dd9eabbb0d9860 13,107-113,159-163,176,179,183,187-220,239-246,261-262,270-274,304,307,310
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_0cd75674ffc649 159-166,340-344
+  s_70c8e194852bb5::t_f67b69c38e3615 345-349
+  s_70c8e194852bb5::t_8a83b682d32a08 382-385
+Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
+  s_70c8e194852bb5::t_5d809cfe550fe8 121-128,989,1000,1080,1085,1090,1094,1098
+  s_70c8e194852bb5::t_8a83b682d32a08 341
+  s_70c8e194852bb5::t_7101abc6476986 118-120,129-130,326,329-340,342-352,362,375,377,971-985,988,990,999,1001,1003-1008,1070-1076,1079,1081,1084,1086,1089,1091,1097,1099,1103-1113
+  s_70c8e194852bb5::t_0791da0322a644 1114
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_f67b69c38e3615 580-582,588-590
+  s_70c8e194852bb5::t_0cd75674ffc649 571-576,583-586,1049-1052,1111-1113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "45e1216c3f0196869b722d3efd71491fa9dcf04b",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
