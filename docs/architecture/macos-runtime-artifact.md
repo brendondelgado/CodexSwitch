@@ -264,13 +264,16 @@ Later metadata and status observations preserve that committed identity when
 the installed version is unchanged. A changed installed-version observation or
 reconciliation of a source-built prepared runtime clears it, so neither routine
 polling nor stale provenance can rewrite the truth.
-When a successful stable-channel check resolves a typed metadata-only failure,
-the stale transient `failed` status from before that check has no remaining
-authority. This is also true when the installed version already equals the
-latest version: reconciliation must return to `installed`, preserve the
-matching installed artifact identity, and must not synthesize a new metadata
-failure without an error message. Preparation, installation, and activation
-failures remain durable until their own stronger recovery contracts succeed.
+When a successful stable-channel check resolves a typed, observation-only
+metadata failure, the stale transient `failed` status from before that check has
+no remaining authority. This is also true when the installed version already
+equals the latest version: reconciliation must return to `installed`, preserve
+the matching installed artifact identity, and must not synthesize a new
+metadata failure without an error message. A metadata failure carrying
+preparation markers, installation markers, or an installation transaction is
+not observation-only and remains durable. Preparation, installation, and
+activation failures remain durable until their own stronger recovery contracts
+succeed.
 The repository installer preserves its original `PATH` through artifact and
 route validation. In zsh, the special `path` array must never be reused as a
 scalar variable anywhere in the installer because even an earlier artifact

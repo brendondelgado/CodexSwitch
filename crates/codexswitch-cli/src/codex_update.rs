@@ -289,17 +289,14 @@ fn apply_successful_metadata_check(
     state.last_checked_at = Some(now);
     state.latest_stable_version = Some(latest.to_string());
     observe_installed_version(state, installed_version);
-    let resolved_metadata_failure = version_is_stable(latest)
-        && state
-            .unresolved_failure
-            .as_ref()
-            .is_some_and(|failure| failure.kind == UpdateFailureKind::Metadata);
-    if resolved_metadata_failure {
+    let resolved_observation_only_metadata_failure =
+        version_is_stable(latest) && metadata_failure_is_observation_only(state);
+    if resolved_observation_only_metadata_failure {
         clear_unresolved_failure(state);
         state.error = None;
     }
     let preserve_same_version_observation = state.installed_version.as_deref() == Some(latest)
-        && !resolved_metadata_failure
+        && !resolved_observation_only_metadata_failure
         && same_version_observation_must_preserve_failure(state, latest, &status_before_check);
     if !preserve_same_version_observation {
         if has_prepare_failure_for_version(state, latest)
@@ -1317,6 +1314,23 @@ fn restore_unresolved_failure(state: &mut CodexUpdateState) -> bool {
 
 fn clear_unresolved_failure(state: &mut CodexUpdateState) {
     state.unresolved_failure = None;
+}
+
+fn metadata_failure_is_observation_only(state: &CodexUpdateState) -> bool {
+    state.unresolved_failure.as_ref().is_some_and(|failure| {
+        failure.kind == UpdateFailureKind::Metadata
+            && failure.version.is_none()
+            && failure.transaction_id.is_none()
+            && failure.failed_prepare_version.is_none()
+            && failure.prepare_retry_not_before.is_none()
+            && failure.failed_install_version.is_none()
+            && failure.install_retry_not_before.is_none()
+            && state.failed_prepare_version.is_none()
+            && state.prepare_retry_not_before.is_none()
+            && state.failed_install_version.is_none()
+            && state.install_retry_not_before.is_none()
+            && state.install_transaction.is_none()
+    })
 }
 
 fn resolve_prepare_failure_for_version(state: &mut CodexUpdateState, version: &str) {

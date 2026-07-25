@@ -2627,6 +2627,55 @@ fn timestamped_server_notification(notification: ServerNotification) -> Outgoing
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
 
+        let mut interrupted = automatic_update_test_state(UpdateStatus::Installing, now);
+        interrupted.installed_version = Some("0.145.0".to_string());
+        interrupted.prepared_version = Some("0.145.0".to_string());
+        interrupted.install_transaction = Some(InstallTransactionState {
+            id: "tx-interrupted".to_string(),
+            version: "0.145.0".to_string(),
+            phase: InstallTransactionStatePhase::Interruptible,
+        });
+        apply_metadata_failure(
+            &mut interrupted,
+            "registry transport failed".to_string(),
+            now + ChronoDuration::minutes(1),
+        );
+
+        apply_successful_metadata_check(
+            &mut interrupted,
+            "0.145.0",
+            Some("0.145.0".to_string()),
+            false,
+            false,
+            false,
+            UpdateStatus::Failed,
+            now + ChronoDuration::minutes(2),
+        );
+
+        assert_eq!(interrupted.status, UpdateStatus::Failed);
+        assert_eq!(
+            interrupted.error.as_deref(),
+            Some("registry transport failed")
+        );
+        assert_eq!(
+            interrupted
+                .unresolved_failure
+                .as_ref()
+                .map(|failure| failure.kind),
+            Some(UpdateFailureKind::Metadata)
+        );
+        assert_eq!(
+            interrupted
+                .install_transaction
+                .as_ref()
+                .map(|transaction| transaction.id.as_str()),
+            Some("tx-interrupted")
+        );
+        assert_eq!(
+            interrupted.prepared_version.as_deref(),
+            Some("0.145.0")
+        );
+
         let mut activation = automatic_update_test_state(UpdateStatus::Failed, now);
         activation.error = Some("activation acknowledgement failed".to_string());
         record_unresolved_failure(
