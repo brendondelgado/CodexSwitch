@@ -1,7 +1,7 @@
 import Foundation
 import UserNotifications
 
-private final class RateLimitResetNotificationDefaultsReference: @unchecked Sendable {
+private final class NotificationDefaultsReference: @unchecked Sendable {
     let value: UserDefaults
 
     init(_ value: UserDefaults) {
@@ -9,16 +9,18 @@ private final class RateLimitResetNotificationDefaultsReference: @unchecked Send
     }
 }
 
-final class RateLimitResetNotificationDedupeCoordinator: @unchecked Sendable {
+final class NotificationDedupeCoordinator: @unchecked Sendable {
     typealias Enqueue = @Sendable (
         UNNotificationRequest,
         @escaping @Sendable (Error?) -> Void
     ) -> Void
+    typealias Remove = @Sendable () -> Void
 
     private let lock = NSLock()
     private let defaultsKey: String
     private let maximumPersistedKeys: Int
     private var inFlightKeys = Set<String>()
+    private var cancelledInFlightKeys = Set<String>()
 
     init(defaultsKey: String, maximumPersistedKeys: Int) {
         self.defaultsKey = defaultsKey
@@ -30,6 +32,7 @@ final class RateLimitResetNotificationDedupeCoordinator: @unchecked Sendable {
         request: UNNotificationRequest,
         dedupeKey: String,
         userDefaults: UserDefaults,
+        removeAfterCancellation: Remove? = nil,
         using enqueue: @escaping Enqueue
     ) -> Bool {
         lock.lock()
@@ -42,26 +45,60 @@ final class RateLimitResetNotificationDedupeCoordinator: @unchecked Sendable {
         inFlightKeys.insert(dedupeKey)
         lock.unlock()
 
-        let defaultsReference = RateLimitResetNotificationDefaultsReference(userDefaults)
+        let defaultsReference = NotificationDefaultsReference(userDefaults)
         enqueue(request) { [weak self] error in
             self?.complete(
                 dedupeKey: dedupeKey,
                 error: error,
-                userDefaults: defaultsReference.value
+                userDefaults: defaultsReference.value,
+                removeAfterCancellation: removeAfterCancellation
             )
         }
         return true
     }
 
+    func resolve(
+        dedupeKey: String,
+        userDefaults: UserDefaults,
+        using remove: Remove
+    ) {
+        lock.lock()
+        let remainingKeys = (userDefaults.stringArray(forKey: defaultsKey) ?? [])
+            .filter { $0 != dedupeKey }
+        if remainingKeys.isEmpty {
+            userDefaults.removeObject(forKey: defaultsKey)
+        } else {
+            userDefaults.set(remainingKeys, forKey: defaultsKey)
+        }
+        if inFlightKeys.contains(dedupeKey) {
+            cancelledInFlightKeys.insert(dedupeKey)
+        }
+        lock.unlock()
+        remove()
+    }
+
     private func complete(
         dedupeKey: String,
         error: Error?,
-        userDefaults: UserDefaults
+        userDefaults: UserDefaults,
+        removeAfterCancellation: Remove?
     ) {
         lock.lock()
-        defer { lock.unlock() }
-        inFlightKeys.remove(dedupeKey)
-        guard error == nil else { return }
+        guard inFlightKeys.remove(dedupeKey) != nil else {
+            lock.unlock()
+            return
+        }
+        if cancelledInFlightKeys.remove(dedupeKey) != nil {
+            lock.unlock()
+            if error == nil {
+                removeAfterCancellation?()
+            }
+            return
+        }
+        guard error == nil else {
+            lock.unlock()
+            return
+        }
 
         var orderedKeys: [String] = []
         var knownKeys = Set<String>()
@@ -69,12 +106,16 @@ final class RateLimitResetNotificationDedupeCoordinator: @unchecked Sendable {
             where knownKeys.insert(key).inserted {
             orderedKeys.append(key)
         }
-        guard knownKeys.insert(dedupeKey).inserted else { return }
+        guard knownKeys.insert(dedupeKey).inserted else {
+            lock.unlock()
+            return
+        }
         orderedKeys.append(dedupeKey)
         if orderedKeys.count > maximumPersistedKeys {
             orderedKeys.removeFirst(orderedKeys.count - maximumPersistedKeys)
         }
         userDefaults.set(orderedKeys, forKey: defaultsKey)
+        lock.unlock()
     }
 }
 
@@ -85,13 +126,18 @@ enum NotificationManager {
         "resetExpirationNotificationDedupeKeys.v1"
     private static let maximumResetExpirationNotificationDedupeKeys = 256
     private static let linuxDevboxReadinessIncidentDefaultsKey =
-        "linuxDevboxReadinessNotificationIncidentActive.v1"
+        "linuxDevboxReadinessNotificationIncidentKeys.v1"
     static let linuxDevboxReadinessNotificationIdentifier =
         "linux-devbox-readiness-active-incident"
     private static let resetExpirationNotificationCoordinator =
-        RateLimitResetNotificationDedupeCoordinator(
+        NotificationDedupeCoordinator(
             defaultsKey: resetExpirationNotificationDedupeDefaultsKey,
             maximumPersistedKeys: maximumResetExpirationNotificationDedupeKeys
+        )
+    private static let linuxDevboxReadinessNotificationCoordinator =
+        NotificationDedupeCoordinator(
+            defaultsKey: linuxDevboxReadinessIncidentDefaultsKey,
+            maximumPersistedKeys: 1
         )
 
     private static var isEnabled: Bool {
@@ -313,8 +359,8 @@ enum NotificationManager {
         request: UNNotificationRequest,
         dedupeKey: String,
         userDefaults: UserDefaults,
-        coordinator: RateLimitResetNotificationDedupeCoordinator? = nil,
-        enqueue: @escaping RateLimitResetNotificationDedupeCoordinator.Enqueue
+        coordinator: NotificationDedupeCoordinator? = nil,
+        enqueue: @escaping NotificationDedupeCoordinator.Enqueue
     ) -> Bool {
         (coordinator ?? resetExpirationNotificationCoordinator).enqueue(
             request: request,
@@ -337,7 +383,6 @@ enum NotificationManager {
 
     static func notifyLinuxDevboxReadinessIssue(summary: String) {
         guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
-        guard claimLinuxDevboxReadinessNotificationIncident() else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: Linux Devbox Not Ready"
         content.body = summary
@@ -348,28 +393,28 @@ enum NotificationManager {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request)
-    }
-
-    @discardableResult
-    static func claimLinuxDevboxReadinessNotificationIncident(
-        userDefaults: UserDefaults = .standard
-    ) -> Bool {
-        guard !userDefaults.bool(forKey: linuxDevboxReadinessIncidentDefaultsKey) else {
-            return false
+        linuxDevboxReadinessNotificationCoordinator.enqueue(
+            request: request,
+            dedupeKey: linuxDevboxReadinessNotificationIdentifier,
+            userDefaults: .standard,
+            removeAfterCancellation: removeLinuxDevboxReadinessNotification
+        ) { request, completion in
+            UNUserNotificationCenter.current().add(
+                request,
+                withCompletionHandler: completion
+            )
         }
-        userDefaults.set(true, forKey: linuxDevboxReadinessIncidentDefaultsKey)
-        return true
-    }
-
-    static func clearLinuxDevboxReadinessNotificationIncident(
-        userDefaults: UserDefaults = .standard
-    ) {
-        userDefaults.removeObject(forKey: linuxDevboxReadinessIncidentDefaultsKey)
     }
 
     static func resolveLinuxDevboxReadinessIssue() {
-        clearLinuxDevboxReadinessNotificationIncident()
+        linuxDevboxReadinessNotificationCoordinator.resolve(
+            dedupeKey: linuxDevboxReadinessNotificationIdentifier,
+            userDefaults: .standard,
+            using: removeLinuxDevboxReadinessNotification
+        )
+    }
+
+    private static func removeLinuxDevboxReadinessNotification() {
         guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
         let identifiers = [linuxDevboxReadinessNotificationIdentifier]
