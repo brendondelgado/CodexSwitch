@@ -26,7 +26,8 @@ struct DesktopRuntimeHotSwapStateTests {
     private func runtimeEvidence(
         pid: Int32 = 42,
         observationKind: HotSwapRuntimeKind = .externalAppServer,
-        acknowledgementKind: HotSwapRuntimeKind = .externalAppServer
+        acknowledgementKind: HotSwapRuntimeKind = .externalAppServer,
+        idleListenerReady: Bool = false
     ) -> CodexLocalRuntimeEvidence {
         let identity = CodexSignalProcessIdentity(
             pid: pid,
@@ -72,14 +73,15 @@ struct DesktopRuntimeHotSwapStateTests {
                 acknowledgedAtUnixMilliseconds: 1_500_100,
                 loadedTokenFingerprint: auth.completeTokenFingerprint,
                 activeTokenFingerprint: auth.completeTokenFingerprint,
-                frontendNotified: !isCLI,
-                frontendWriteCount: isCLI ? 0 : 1,
+                frontendNotified: !isCLI && !idleListenerReady,
+                frontendWriteCount: isCLI || idleListenerReady ? 0 : 1,
                 authGeneration: isCLI ? 1 : nil,
                 reconnectReady: isCLI ? true : nil,
-                initializedFrontendCount: isCLI ? nil : 2,
-                skippedFrontendCount: isCLI ? nil : 1,
-                eligibleFrontendCount: isCLI ? nil : 1,
-                rejectedFrontendCount: isCLI ? nil : 0
+                initializedFrontendCount: isCLI ? nil : (idleListenerReady ? 0 : 2),
+                skippedFrontendCount: isCLI ? nil : (idleListenerReady ? 0 : 1),
+                eligibleFrontendCount: isCLI ? nil : (idleListenerReady ? 0 : 1),
+                rejectedFrontendCount: isCLI ? nil : 0,
+                idleListenerReady: idleListenerReady
             )
         )
     }
@@ -125,6 +127,15 @@ struct DesktopRuntimeHotSwapStateTests {
             isComplete: true
         )
         #expect(DesktopPatchManager.runtimeHotSwapState(from: wrongKind) == .unknown)
+
+        let dormantBackend = CodexLocalRuntimeEvidenceSnapshot(
+            runtimes: [runtimeEvidence(idleListenerReady: true)],
+            isComplete: true
+        )
+        #expect(
+            DesktopPatchManager.runtimeHotSwapState(from: dormantBackend)
+                == .unknown
+        )
     }
 
     @Test("Desktop safe-quit blocks unified and legacy bundle-ID hosts")

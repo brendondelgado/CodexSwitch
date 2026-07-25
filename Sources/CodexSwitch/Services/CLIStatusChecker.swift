@@ -240,7 +240,11 @@ enum CLIStatusChecker {
         }
 
         // Check WebSocket port first
-        if let port = DesktopAppConnector.discoverPort() {
+        if let port = DesktopAppConnector.discoverPort(),
+           desktopPortRepresentsConnectedHost(
+               port: port,
+               desktopHostIsRunning: patchStatus.isCodexAppRunning
+           ) {
             let hotSwapReady = runtimeState == .ready
             let patchMessage = hotSwapReady
                 ? "Desktop app-server hot-swap ready."
@@ -285,6 +289,13 @@ enum CLIStatusChecker {
             patchInstalled: patchStatus.desktopIntegrationInstalled,
             patchMessage: patchMessage
         )
+    }
+
+    nonisolated static func desktopPortRepresentsConnectedHost(
+        port: UInt16?,
+        desktopHostIsRunning: Bool
+    ) -> Bool {
+        port != nil && desktopHostIsRunning
     }
 
     nonisolated static func codexCLIRuntimeEvidenceIsHotSwapReady(

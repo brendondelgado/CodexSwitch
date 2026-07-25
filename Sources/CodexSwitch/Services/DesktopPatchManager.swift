@@ -668,6 +668,7 @@ enum DesktopPatchManager {
         guard evidence.isComplete, !evidence.runtimes.isEmpty else { return .unknown }
         return evidence.runtimes.allSatisfy { runtime in
             runtime.observation.target.runtimeKind == .externalAppServer
+                && runtime.startupAcknowledgement.idleListenerReady != true
                 && SwapEngine.bindingMatchesObservation(
                     runtime.startupAcknowledgement.binding,
                     runtime.observation

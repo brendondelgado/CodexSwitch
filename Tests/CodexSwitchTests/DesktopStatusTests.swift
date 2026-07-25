@@ -4,6 +4,22 @@ import Testing
 
 @Suite("Desktop app status")
 struct DesktopStatusTests {
+    @Test("Managed bridge port alone does not imply a connected desktop host")
+    func bridgePortRequiresDesktopHost() {
+        #expect(!CLIStatusChecker.desktopPortRepresentsConnectedHost(
+            port: 9_223,
+            desktopHostIsRunning: false
+        ))
+        #expect(!CLIStatusChecker.desktopPortRepresentsConnectedHost(
+            port: nil,
+            desktopHostIsRunning: true
+        ))
+        #expect(CLIStatusChecker.desktopPortRepresentsConnectedHost(
+            port: 9_223,
+            desktopHostIsRunning: true
+        ))
+    }
+
     @Test("Running patched desktop app without live hot-swap asks for restart")
     func patchedDesktopAppRequiresRestart() {
         let status = DesktopAppStatus(

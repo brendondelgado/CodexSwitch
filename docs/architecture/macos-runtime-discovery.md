@@ -295,6 +295,11 @@ runtime is `unknown`; only a non-empty, complete snapshot is `ready`. Ordinary
 readiness is read-only: it performs no artifact deletion, filesystem mutation,
 or PID liveness probe. Retention, if introduced, must be an explicit
 binding-aware maintenance operation serialized under the same PID admission.
+An exact zero-frontend idle ACK is valid activation evidence for the dormant
+backend but is not active desktop readiness. Status remains non-ready until a
+later ACK proves delivery to an initialized frontend. Likewise, the managed
+bridge's listening port alone never means the ChatGPT host is running or
+connected.
 
 Desktop `account/read` JSON-RPC verification is diagnostic and cannot replace
 the identity-bound request/ACK proof. A `.reloaded` result requires at least one
