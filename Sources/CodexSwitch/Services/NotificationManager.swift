@@ -86,194 +86,84 @@ final class IncidentNotificationDedupeCoordinator: @unchecked Sendable {
     typealias Enqueue = NotificationDedupeCoordinator.Enqueue
     typealias Remove = @Sendable () -> Void
 
-    private struct Submission: @unchecked Sendable {
+    private struct Submission: Sendable {
         let id = UUID()
-        let request: UNNotificationRequest
-        let dedupeKey: String
+        let generation: String
         let defaults: NotificationDefaultsReference
         let remove: Remove
-        let enqueue: Enqueue
     }
 
-    private enum State {
-        case submitting(Submission)
-        case cancelling(Submission, replacement: Submission?)
-        case cleaning(replacement: Submission?)
-    }
-
-    private let lock = NSLock()
+    private let stateQueue: DispatchQueue
+    private let stateQueueKey = DispatchSpecificKey<UInt8>()
     private let defaultsKey: String
-    private let maximumPersistedKeys: Int
-    private var states: [String: State] = [:]
+    private var inFlightSubmissions: [UUID: Submission] = [:]
 
-    init(defaultsKey: String, maximumPersistedKeys: Int) {
+    init(defaultsKey: String) {
         self.defaultsKey = defaultsKey
-        self.maximumPersistedKeys = maximumPersistedKeys
+        stateQueue = DispatchQueue(label: "com.codexswitch.notification-incident.\(defaultsKey)")
+        stateQueue.setSpecific(key: stateQueueKey, value: 1)
     }
 
     @discardableResult
     func enqueue(
         request: UNNotificationRequest,
-        dedupeKey: String,
+        dedupeKey _: String,
         userDefaults: UserDefaults,
         removeAfterCancellation: @escaping Remove,
         using enqueue: @escaping Enqueue
     ) -> Bool {
-        let submission = Submission(
-            request: request,
-            dedupeKey: dedupeKey,
-            defaults: NotificationDefaultsReference(userDefaults),
-            remove: removeAfterCancellation,
-            enqueue: enqueue
-        )
-        var shouldSubmit = false
+        withState {
+            guard userDefaults.string(forKey: defaultsKey) == nil else {
+                return false
+            }
 
-        lock.lock()
-        let persistedKeys = Set(userDefaults.stringArray(forKey: defaultsKey) ?? [])
-        switch states[dedupeKey] {
-        case .submitting:
-            lock.unlock()
-            return false
-        case .cancelling(let active, let replacement):
-            guard replacement == nil, !persistedKeys.contains(dedupeKey) else {
-                lock.unlock()
-                return false
+            let generation = UUID().uuidString
+            let submission = Submission(
+                generation: generation,
+                defaults: NotificationDefaultsReference(userDefaults),
+                remove: removeAfterCancellation
+            )
+            userDefaults.set(generation, forKey: defaultsKey)
+            inFlightSubmissions[submission.id] = submission
+            enqueue(request) { [weak self] error in
+                self?.withState {
+                    self?.complete(submission, error: error)
+                }
             }
-            persistClaim(dedupeKey, userDefaults: userDefaults)
-            states[dedupeKey] = .cancelling(active, replacement: submission)
-        case .cleaning(let replacement):
-            guard replacement == nil, !persistedKeys.contains(dedupeKey) else {
-                lock.unlock()
-                return false
-            }
-            persistClaim(dedupeKey, userDefaults: userDefaults)
-            states[dedupeKey] = .cleaning(replacement: submission)
-        case nil:
-            guard !persistedKeys.contains(dedupeKey) else {
-                lock.unlock()
-                return false
-            }
-            persistClaim(dedupeKey, userDefaults: userDefaults)
-            states[dedupeKey] = .submitting(submission)
-            shouldSubmit = true
+            return true
         }
-        lock.unlock()
-
-        if shouldSubmit {
-            submit(submission)
-        }
-        return true
     }
 
     func resolve(
-        dedupeKey: String,
+        dedupeKey _: String,
         userDefaults: UserDefaults,
         using remove: @escaping Remove
     ) {
-        var shouldRemove = false
-
-        lock.lock()
-        let hadPersistedClaim = (userDefaults.stringArray(forKey: defaultsKey) ?? [])
-            .contains(dedupeKey)
-        clearClaim(dedupeKey, userDefaults: userDefaults)
-        switch states[dedupeKey] {
-        case .submitting(let active):
-            states[dedupeKey] = .cancelling(active, replacement: nil)
-        case .cancelling(let active, _):
-            states[dedupeKey] = .cancelling(active, replacement: nil)
-        case .cleaning:
-            states[dedupeKey] = .cleaning(replacement: nil)
-        case nil where hadPersistedClaim:
-            states[dedupeKey] = .cleaning(replacement: nil)
-            shouldRemove = true
-        case nil:
-            break
-        }
-        lock.unlock()
-
-        if shouldRemove {
+        withState {
+            userDefaults.removeObject(forKey: defaultsKey)
             remove()
-            finishCleanup(dedupeKey: dedupeKey)
-        }
-    }
-
-    private func submit(_ submission: Submission) {
-        submission.enqueue(submission.request) { [weak self] error in
-            self?.complete(submission, error: error)
         }
     }
 
     private func complete(_ submission: Submission, error: Error?) {
-        var shouldClean = false
-
-        lock.lock()
-        switch states[submission.dedupeKey] {
-        case .submitting(let active) where active.id == submission.id:
-            if error != nil {
-                clearClaim(
-                    submission.dedupeKey,
-                    userDefaults: submission.defaults.value
-                )
-            }
-            states[submission.dedupeKey] = nil
-        case .cancelling(let active, let replacement)
-            where active.id == submission.id:
-            states[submission.dedupeKey] = .cleaning(replacement: replacement)
-            shouldClean = true
-        default:
-            break
+        guard inFlightSubmissions.removeValue(forKey: submission.id) != nil else {
+            return
         }
-        lock.unlock()
-
-        if shouldClean {
+        let currentGeneration = submission.defaults.value.string(forKey: defaultsKey)
+        if error != nil {
+            if currentGeneration == submission.generation {
+                submission.defaults.value.removeObject(forKey: defaultsKey)
+            }
+        } else if currentGeneration == nil {
             submission.remove()
-            finishCleanup(dedupeKey: submission.dedupeKey)
         }
     }
 
-    private func finishCleanup(dedupeKey: String) {
-        var replacement: Submission?
-
-        lock.lock()
-        if case .cleaning(let queued) = states[dedupeKey] {
-            replacement = queued
-            if let queued {
-                states[dedupeKey] = .submitting(queued)
-            } else {
-                states[dedupeKey] = nil
-            }
+    private func withState<T>(_ operation: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: stateQueueKey) != nil {
+            return operation()
         }
-        lock.unlock()
-
-        if let replacement {
-            submit(replacement)
-        }
-    }
-
-    private func persistClaim(_ dedupeKey: String, userDefaults: UserDefaults) {
-        var orderedKeys: [String] = []
-        var knownKeys = Set<String>()
-        for key in userDefaults.stringArray(forKey: defaultsKey) ?? []
-            where knownKeys.insert(key).inserted {
-            orderedKeys.append(key)
-        }
-        if knownKeys.insert(dedupeKey).inserted {
-            orderedKeys.append(dedupeKey)
-        }
-        if orderedKeys.count > maximumPersistedKeys {
-            orderedKeys.removeFirst(orderedKeys.count - maximumPersistedKeys)
-        }
-        userDefaults.set(orderedKeys, forKey: defaultsKey)
-    }
-
-    private func clearClaim(_ dedupeKey: String, userDefaults: UserDefaults) {
-        let remainingKeys = (userDefaults.stringArray(forKey: defaultsKey) ?? [])
-            .filter { $0 != dedupeKey }
-        if remainingKeys.isEmpty {
-            userDefaults.removeObject(forKey: defaultsKey)
-        } else {
-            userDefaults.set(remainingKeys, forKey: defaultsKey)
-        }
+        return stateQueue.sync(execute: operation)
     }
 }
 
@@ -284,7 +174,7 @@ enum NotificationManager {
         "resetExpirationNotificationDedupeKeys.v1"
     private static let maximumResetExpirationNotificationDedupeKeys = 256
     private static let linuxDevboxReadinessIncidentDefaultsKey =
-        "linuxDevboxReadinessNotificationIncidentKeys.v1"
+        "linuxDevboxReadinessNotificationIncidentGeneration.v1"
     private static let legacyLinuxDevboxReadinessNotificationPrefix =
         "linux-devbox-readiness-"
     static let linuxDevboxReadinessNotificationIdentifier =
@@ -296,8 +186,7 @@ enum NotificationManager {
         )
     private static let linuxDevboxReadinessNotificationCoordinator =
         IncidentNotificationDedupeCoordinator(
-            defaultsKey: linuxDevboxReadinessIncidentDefaultsKey,
-            maximumPersistedKeys: 1
+            defaultsKey: linuxDevboxReadinessIncidentDefaultsKey
         )
 
     private static var isEnabled: Bool {
@@ -584,13 +473,15 @@ enum NotificationManager {
             let legacyIdentifiers = requests.map(\.identifier).filter(
                 isLegacyLinuxDevboxReadinessNotification
             )
-            center.removePendingNotificationRequests(withIdentifiers: legacyIdentifiers)
+            UNUserNotificationCenter.current()
+                .removePendingNotificationRequests(withIdentifiers: legacyIdentifiers)
         }
         center.getDeliveredNotifications { notifications in
             let legacyIdentifiers = notifications.map(\.request.identifier).filter(
                 isLegacyLinuxDevboxReadinessNotification
             )
-            center.removeDeliveredNotifications(withIdentifiers: legacyIdentifiers)
+            UNUserNotificationCenter.current()
+                .removeDeliveredNotifications(withIdentifiers: legacyIdentifiers)
         }
     }
 
