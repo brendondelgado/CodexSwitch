@@ -47,17 +47,22 @@ actor AccountActivationCoordinator {
 
     let url: URL
     nonisolated private let transaction: SecureAtomicFileTransaction
+    private let crossProcessLeaseURL: URL
     private let baseRetryInterval: TimeInterval
     private let maximumRetryInterval: TimeInterval
 
     init(
         url: URL = AccountActivationCoordinator.defaultURL,
+        crossProcessLeaseURL: URL? = nil,
         baseRetryInterval: TimeInterval = 30,
         maximumRetryInterval: TimeInterval = 5 * 60,
         transactionTestHooks: SecureAtomicFileTransaction.TestHooks = .init()
     ) {
         let boundedBaseRetryInterval = max(1, baseRetryInterval)
         self.url = url
+        self.crossProcessLeaseURL = crossProcessLeaseURL
+            ?? url.deletingLastPathComponent()
+                .appendingPathComponent("accounts.runtime-activation.lock")
         self.baseRetryInterval = boundedBaseRetryInterval
         self.maximumRetryInterval = max(boundedBaseRetryInterval, maximumRetryInterval)
         self.transaction = SecureAtomicFileTransaction(
@@ -123,6 +128,24 @@ actor AccountActivationCoordinator {
         requestedActivationGeneration: UUID? = nil,
         authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
         at date: Date = Date()
+    ) throws -> AccountActivationCredentialMutationDecision {
+        try withRuntimeLease {
+            try beginAuthorizedCredentialMutationUnderRuntimeLease(
+                targetAccountId: targetAccountId,
+                kind: kind,
+                requestedActivationGeneration: requestedActivationGeneration,
+                authorizeEffect: authorizeEffect,
+                at: date
+            )
+        }
+    }
+
+    private func beginAuthorizedCredentialMutationUnderRuntimeLease(
+        targetAccountId: UUID,
+        kind: AccountActivationRequestKind,
+        requestedActivationGeneration: UUID?,
+        authorizeEffect: @escaping StateEffectAuthorization,
+        at date: Date
     ) throws -> AccountActivationCredentialMutationDecision {
         try transaction.withExclusiveLock { lockedFile in
             let snapshot = try lockedFile.read()
@@ -392,6 +415,59 @@ actor AccountActivationCoordinator {
     }
 
     @discardableResult
+    func adoptVerifiedExternalHandoff(
+        targetAccountId: UUID,
+        expectedState: AccountActivationState,
+        newActivationGeneration: UUID = UUID(),
+        authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
+        at date: Date = Date()
+    ) throws -> AccountActivationState {
+        try transition(authorizeEffect: authorizeEffect) { current in
+            guard let current,
+                  current == expectedState,
+                  current.phase == .confirmed || current.phase == .committedDegraded else {
+                throw AccountActivationCoordinatorError.invalidTransition(
+                    "external handoff cannot replace an active activation barrier"
+                )
+            }
+            return .committedDegraded(
+                targetAccountId: targetAccountId,
+                detail: .externalAuthObserved,
+                activationGeneration: newActivationGeneration,
+                retryAttempt: 0,
+                nextRetryAt: date,
+                at: date
+            )
+        }
+    }
+
+    @discardableResult
+    func failVerifiedExternalHandoff(
+        targetAccountId: UUID,
+        expectedActivationGeneration: UUID,
+        authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
+        at date: Date = Date()
+    ) throws -> AccountActivationState {
+        try transition(authorizeEffect: authorizeEffect) { current in
+            guard let current,
+                  current.phase == .committedDegraded,
+                  current.configuredAccountId == targetAccountId,
+                  current.activationGeneration == expectedActivationGeneration,
+                  current.detail == .externalAuthObserved else {
+                throw AccountActivationCoordinatorError.invalidTransition(
+                    "external handoff failure does not match the adopted generation"
+                )
+            }
+            return .manualReview(
+                targetAccountId: targetAccountId,
+                detail: .configuredFilesInconsistent,
+                activationGeneration: expectedActivationGeneration,
+                at: date
+            )
+        }
+    }
+
+    @discardableResult
     func markConfirmed(
         targetAccountId: UUID,
         expectedActivationGeneration: UUID,
@@ -529,6 +605,38 @@ actor AccountActivationCoordinator {
 
     private func transition(
         authorizeEffect: StateEffectAuthorization = { _ in true },
+        _ makeState: (AccountActivationState?) throws -> AccountActivationState
+    ) throws -> AccountActivationState {
+        try withRuntimeLease {
+            try transitionUnderRuntimeLease(
+                authorizeEffect: authorizeEffect,
+                makeState
+            )
+        }
+    }
+
+    private func withRuntimeLease<Value>(
+        _ operation: () throws -> Value
+    ) throws -> Value {
+        if AccountActivationCrossProcessLeaseContext.holds(crossProcessLeaseURL) {
+            return try operation()
+        }
+        guard let crossProcessLease =
+                AccountActivationCrossProcessLease.acquireForAccountMutation(
+                    at: crossProcessLeaseURL
+                ) else {
+            throw AccountActivationCoordinatorError.authorizationRevoked
+        }
+        defer { crossProcessLease.release() }
+        return try AccountActivationCrossProcessLeaseContext.$heldLease.withValue(
+            crossProcessLease
+        ) {
+            try operation()
+        }
+    }
+
+    private func transitionUnderRuntimeLease(
+        authorizeEffect: StateEffectAuthorization,
         _ makeState: (AccountActivationState?) throws -> AccountActivationState
     ) throws -> AccountActivationState {
         try transaction.withExclusiveLock { lockedFile in

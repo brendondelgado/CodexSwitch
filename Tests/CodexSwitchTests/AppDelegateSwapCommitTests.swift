@@ -453,6 +453,12 @@ struct AppDelegateSwapCommitTests {
         defer { try? FileManager.default.removeItem(at: root) }
 
         try SwapEngine.writeAuthFile(for: account, path: url.path)
+        let observation = AccountImporter.observeCurrentAccount(from: url.path)
+        guard case .valid(let observed) = observation else {
+            Issue.record("Expected a valid auth observation, got \(String(describing: observation))")
+            return
+        }
+        #expect(AppDelegate.credentialsMatch(account, observed))
         #expect(AppDelegate.authFileMatches(account: account, atPath: url.path))
 
         var mismatch = account
@@ -460,13 +466,57 @@ struct AppDelegateSwapCommitTests {
         #expect(!AppDelegate.authFileMatches(account: mismatch, atPath: url.path))
     }
 
-    private func makeAccount() -> CodexAccount {
+    @Test("External handoff rejects an auth-only target change")
+    func externalHandoffRequiresTargetSelectedInStore() {
+        let source = makeAccount(
+            email: "source@example.com",
+            accountId: "source-account",
+            isActive: true
+        )
+        let target = makeAccount(
+            email: "target@example.com",
+            accountId: "target-account"
+        )
+
+        #expect(AppDelegate.verifiedExternalHandoffTarget(
+            accounts: [source, target],
+            authObservation: .valid(target)
+        ) == nil)
+
+        var inactiveSource = source
+        inactiveSource.isActive = false
+        var activeTarget = target
+        activeTarget.isActive = true
+        #expect(AppDelegate.verifiedExternalHandoffTarget(
+            accounts: [inactiveSource, activeTarget],
+            authObservation: .valid(target)
+        )?.id == target.id)
+
+        var mismatchedTarget = activeTarget
+        mismatchedTarget.refreshToken = "unobserved-refresh-token"
+        #expect(AppDelegate.verifiedExternalHandoffTarget(
+            accounts: [inactiveSource, mismatchedTarget],
+            authObservation: .valid(target)
+        ) == nil)
+
+        #expect(AppDelegate.verifiedExternalHandoffTarget(
+            accounts: [source, activeTarget],
+            authObservation: .valid(target)
+        ) == nil)
+    }
+
+    private func makeAccount(
+        email: String = "swap-contract@example.com",
+        accountId: String = "account-id",
+        isActive: Bool = false
+    ) -> CodexAccount {
         CodexAccount(
-            email: "swap-contract@example.com",
+            email: email,
             accessToken: "access-token",
             refreshToken: "refresh-token",
             idToken: "id-token",
-            accountId: "account-id"
+            accountId: accountId,
+            isActive: isActive
         )
     }
 }

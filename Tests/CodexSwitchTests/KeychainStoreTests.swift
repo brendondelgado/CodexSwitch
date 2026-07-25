@@ -1062,6 +1062,44 @@ struct KeychainStoreTests {
         #expect(deletionRecorder.count == 0)
     }
 
+    @Test("Legacy migration waits for the shared runtime activation lease")
+    func legacyMigrationRespectsRuntimeActivationLease() throws {
+        let path = makeStorePath()
+        let account = activeAccount(accountId: "legacy-runtime-lease")
+        let legacyData = try JSONEncoder().encode([account])
+        let deletionRecorder = LegacyDeletionRecorder()
+        let store = KeychainStore(
+            service: "CodexSwitch-Test-\(UUID().uuidString)",
+            storePath: path,
+            testHooks: .init(legacyCredentials: .init(
+                data: legacyData,
+                delete: {
+                    deletionRecorder.recordDeletion(fileWasMissing: fileIsMissing(at: path))
+                }
+            ))
+        )
+        let leaseURL = URL(fileURLWithPath: path)
+            .deletingLastPathComponent()
+            .appendingPathComponent("accounts.runtime-activation.lock")
+        let held = try #require(
+            try AccountActivationCrossProcessLease.acquire(at: leaseURL)
+        )
+
+        do {
+            _ = try store.loadAll()
+            Issue.record("Expected competing runtime lease to block legacy migration")
+        } catch let error as KeychainError {
+            #expect(error == .runtimeActivationLeaseUnavailable(path: leaseURL.path))
+        }
+        #expect(fileIsMissing(at: path))
+        #expect(deletionRecorder.count == 0)
+
+        held.release()
+        #expect(try store.loadAll().map(\.accountId) == ["legacy-runtime-lease"])
+        #expect(FileManager.default.fileExists(atPath: path))
+        #expect(deletionRecorder.observations == [false])
+    }
+
     @Test("Failed migration readback preserves legacy credentials")
     func failedMigrationReadbackDoesNotDeleteLegacyCredentials() throws {
         let path = makeStorePath()
@@ -1515,6 +1553,132 @@ struct KeychainStoreTests {
             .filter { $0.hasPrefix(".accounts.json.tmp-") }
         #expect(temporaryNames == [decoyName])
         #expect(try Data(contentsOf: URL(fileURLWithPath: decoyPath)) == sentinel)
+    }
+
+    @Test("Telemetry merge cannot overwrite credentials or active selection")
+    func telemetryMergePreservesCredentialOwnership() throws {
+        let path = makeStorePath()
+        let store = KeychainStore(
+            service: "CodexSwitch-Test-\(UUID().uuidString)",
+            storePath: path
+        )
+        var source = activeAccount(accountId: "source")
+        var target = activeAccount(accountId: "target")
+        target.isActive = false
+        let staleSwiftSnapshot = [source, target]
+
+        source.isActive = false
+        target.isActive = true
+        let cliSnapshot = [source, target]
+        try store.saveAll(cliSnapshot)
+
+        switch try store.saveTelemetry(staleSwiftSnapshot) {
+        case .persisted:
+            Issue.record("Stale telemetry must not restore the prior active account")
+        case .discardedCredentialDrift(let durable):
+            #expect(durable.filter(\.isActive).map(\.accountId) == ["target"])
+        }
+        #expect(try store.loadAll().filter(\.isActive).map(\.accountId) == ["target"])
+
+        var currentTelemetry = try store.loadAll()
+        let targetIndex = try #require(currentTelemetry.firstIndex(where: {
+            $0.accountId == "target"
+        }))
+        currentTelemetry[targetIndex].planType = "pro"
+        currentTelemetry[targetIndex].email = "stale-email@example.com"
+        switch try store.saveTelemetry(currentTelemetry) {
+        case .persisted(let persisted):
+            let persistedTarget = try #require(persisted.first(where: {
+                $0.accountId == "target"
+            }))
+            #expect(persistedTarget.planType == "pro")
+            #expect(persistedTarget.email == "target@example.com")
+            #expect(persistedTarget.isActive)
+        case .discardedCredentialDrift:
+            Issue.record("Matching credentials should admit telemetry-only fields")
+        }
+    }
+
+    @Test("Conditional mutation cannot overwrite a newer active selection")
+    func conditionalMutationPreservesCredentialAuthority() throws {
+        let path = makeStorePath()
+        let store = KeychainStore(
+            service: "CodexSwitch-Test-\(UUID().uuidString)",
+            storePath: path
+        )
+        var source = activeAccount(accountId: "source")
+        var target = activeAccount(accountId: "target")
+        target.isActive = false
+        let staleAuthority = [source, target]
+
+        source.isActive = false
+        target.isActive = true
+        let cliSnapshot = [source, target]
+        try store.saveAll(cliSnapshot)
+
+        var staleMutation = staleAuthority
+        staleMutation[1].accessToken = "refreshed-target"
+        switch try store.saveAll(
+            staleMutation,
+            ifCredentialAuthorityMatches: staleAuthority
+        ) {
+        case .persisted:
+            Issue.record("Stale mutation must not restore the prior active account")
+        case .discardedCredentialDrift(let durable):
+            #expect(durable.filter(\.isActive).map(\.accountId) == ["target"])
+        }
+        #expect(try store.loadAll().filter(\.isActive).map(\.accountId) == ["target"])
+
+        var currentMutation = cliSnapshot
+        currentMutation[0].accessToken = "refreshed-source"
+        switch try store.saveAll(
+            currentMutation,
+            ifCredentialAuthorityMatches: cliSnapshot
+        ) {
+        case .persisted(let persisted):
+            #expect(persisted[0].accessToken == "refreshed-source")
+            #expect(persisted.filter(\.isActive).map(\.accountId) == ["target"])
+        case .discardedCredentialDrift:
+            Issue.record("Current credential authority should permit the mutation")
+        }
+    }
+
+    @Test("Conditional deletion cannot erase a newer active selection")
+    func conditionalDeletionPreservesCredentialAuthority() throws {
+        let path = makeStorePath()
+        let store = KeychainStore(
+            service: "CodexSwitch-Test-\(UUID().uuidString)",
+            storePath: path
+        )
+        var source = activeAccount(accountId: "source")
+        var target = activeAccount(accountId: "target")
+        target.isActive = false
+        let staleAuthority = [source, target]
+
+        source.isActive = false
+        target.isActive = true
+        let currentAuthority = [source, target]
+        try store.saveAll(currentAuthority)
+
+        switch try store.deleteAll(
+            ifCredentialAuthorityMatches: staleAuthority
+        ) {
+        case .persisted:
+            Issue.record("Stale deletion must not erase a newer active account")
+        case .discardedCredentialDrift(let durable):
+            #expect(durable.filter(\.isActive).map(\.accountId) == ["target"])
+        }
+        #expect(try store.loadAll().filter(\.isActive).map(\.accountId) == ["target"])
+
+        switch try store.deleteAll(
+            ifCredentialAuthorityMatches: currentAuthority
+        ) {
+        case .persisted(let persisted):
+            #expect(persisted.isEmpty)
+        case .discardedCredentialDrift:
+            Issue.record("Current credential authority should permit deletion")
+        }
+        #expect(fileIsMissing(at: path))
     }
 
     @Test("Deletion readback rejects a recreated store")

@@ -3,17 +3,22 @@ import Foundation
 enum AccountMutationPurpose: Equatable, Sendable {
     case activation(targetAccountId: UUID, activationGeneration: UUID)
     case resetRedemption(accountId: UUID, activationGeneration: UUID)
+    case accountStoreDeletion(accountId: UUID, mutationGeneration: UUID)
 
     var accountId: UUID {
         switch self {
-        case .activation(let accountId, _), .resetRedemption(let accountId, _):
+        case .activation(let accountId, _),
+             .resetRedemption(let accountId, _),
+             .accountStoreDeletion(let accountId, _):
             accountId
         }
     }
 
     var activationGeneration: UUID {
         switch self {
-        case .activation(_, let generation), .resetRedemption(_, let generation):
+        case .activation(_, let generation),
+             .resetRedemption(_, let generation),
+             .accountStoreDeletion(_, let generation):
             generation
         }
     }

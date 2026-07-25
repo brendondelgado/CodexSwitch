@@ -2840,8 +2840,7 @@ enum SwapEngine {
               !components.contains(where: { $0 == "." || $0 == ".." }) else {
             return nil
         }
-        let canonical = NSString(string: expanded).standardizingPath
-        return canonical.hasPrefix("/") ? canonical : nil
+        return "/" + components.joined(separator: "/")
     }
 
     private nonisolated static func isSHA256Hex(_ value: String) -> Bool {

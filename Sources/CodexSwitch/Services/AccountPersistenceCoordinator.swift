@@ -13,7 +13,14 @@ enum AccountPersistenceCoordinatorError: Error, Equatable {
 actor AccountPersistenceCoordinator {
     typealias Load = @Sendable () throws -> [CodexAccount]
     typealias Save = @Sendable ([CodexAccount]) throws -> Void
+    typealias SaveConditional =
+        @Sendable ([CodexAccount], [CodexAccount]) throws
+            -> AccountTelemetryPersistenceOutcome
+    typealias SaveTelemetry =
+        @Sendable ([CodexAccount]) throws -> AccountTelemetryPersistenceOutcome
     typealias DeleteAll = @Sendable () throws -> Void
+    typealias DeleteAllConditional =
+        @Sendable ([CodexAccount]) throws -> AccountTelemetryPersistenceOutcome
     typealias Now = @Sendable () -> Date
 
     static let telemetryMinimumWriteInterval: TimeInterval = 60
@@ -35,7 +42,10 @@ actor AccountPersistenceCoordinator {
 
     private let loadOperation: Load
     private let saveOperation: Save
+    private let saveConditionalOperation: SaveConditional
+    private let saveTelemetryOperation: SaveTelemetry
     private let deleteAllOperation: DeleteAll
+    private let deleteAllConditionalOperation: DeleteAllConditional
     private let telemetryDelay: Duration
     private let now: Now
     private var latestRevision: UInt64 = 0
@@ -53,7 +63,14 @@ actor AccountPersistenceCoordinator {
     ) {
         self.loadOperation = { try store.loadAll() }
         self.saveOperation = { try store.saveAll($0) }
+        self.saveConditionalOperation = {
+            try store.saveAll($0, ifCredentialAuthorityMatches: $1)
+        }
+        self.saveTelemetryOperation = { try store.saveTelemetry($0) }
         self.deleteAllOperation = { try store.deleteAll() }
+        self.deleteAllConditionalOperation = {
+            try store.deleteAll(ifCredentialAuthorityMatches: $0)
+        }
         self.telemetryDelay = telemetryDelay
         self.now = now
     }
@@ -63,17 +80,45 @@ actor AccountPersistenceCoordinator {
         now: @escaping Now = { Date() },
         load: @escaping Load,
         save: @escaping Save,
+        saveConditional: SaveConditional? = nil,
+        saveTelemetry: SaveTelemetry? = nil,
+        deleteAllConditional: DeleteAllConditional? = nil,
         deleteAll: @escaping DeleteAll
     ) {
         self.loadOperation = load
         self.saveOperation = save
+        self.saveConditionalOperation = saveConditional ?? { accounts, _ in
+            try save(accounts)
+            return .persisted(accounts)
+        }
+        self.saveTelemetryOperation = saveTelemetry ?? { accounts in
+            try save(accounts)
+            return .persisted(accounts)
+        }
         self.deleteAllOperation = deleteAll
+        self.deleteAllConditionalOperation = deleteAllConditional ?? { _ in
+            try deleteAll()
+            return .persisted([])
+        }
         self.telemetryDelay = telemetryDelay
         self.now = now
     }
 
     func loadAll() throws -> [CodexAccount] {
         let accounts = try loadOperation()
+        recordSuccessfulPersistence(of: accounts, at: now(), isTelemetry: false)
+        return accounts
+    }
+
+    func adoptExternalSnapshot(revision: UInt64) throws -> [CodexAccount] {
+        guard revision >= latestRevision else {
+            throw AccountPersistenceCoordinatorError.authorizationLost
+        }
+        let accounts = try loadOperation()
+        latestRevision = revision
+        telemetryFlushTask?.cancel()
+        telemetryFlushTask = nil
+        pendingTelemetry = nil
         recordSuccessfulPersistence(of: accounts, at: now(), isTelemetry: false)
         return accounts
     }
@@ -108,6 +153,37 @@ actor AccountPersistenceCoordinator {
         recordSuccessfulPersistence(of: accounts, at: now(), isTelemetry: false)
     }
 
+    func persistDurably(
+        _ accounts: [CodexAccount],
+        ifCredentialAuthorityMatches expectedAccounts: [CodexAccount],
+        revision: UInt64,
+        authorizeEffect: @Sendable () -> Bool = { true }
+    ) throws -> AccountTelemetryPersistenceOutcome {
+        guard authorizeEffect() else {
+            throw AccountPersistenceCoordinatorError.authorizationLost
+        }
+        guard revision >= latestRevision else {
+            return .discardedCredentialDrift(try loadOperation())
+        }
+        latestRevision = revision
+        telemetryFlushTask?.cancel()
+        telemetryFlushTask = nil
+        if let pendingTelemetry, pendingTelemetry.revision <= revision {
+            self.pendingTelemetry = nil
+        }
+        guard authorizeEffect() else {
+            throw AccountPersistenceCoordinatorError.authorizationLost
+        }
+        let outcome = try saveConditionalOperation(accounts, expectedAccounts)
+        switch outcome {
+        case .persisted(let persisted):
+            recordSuccessfulPersistence(of: persisted, at: now(), isTelemetry: false)
+        case .discardedCredentialDrift(let durable):
+            recordSuccessfulPersistence(of: durable, at: now(), isTelemetry: false)
+        }
+        return outcome
+    }
+
     func deleteAllDurably(revision: UInt64) throws {
         guard revision >= latestRevision else { return }
         latestRevision = revision
@@ -116,6 +192,27 @@ actor AccountPersistenceCoordinator {
         pendingTelemetry = nil
         try deleteAllOperation()
         recordSuccessfulPersistence(of: [], at: now(), isTelemetry: false)
+    }
+
+    func deleteAllDurably(
+        ifCredentialAuthorityMatches expectedAccounts: [CodexAccount],
+        revision: UInt64
+    ) throws -> AccountTelemetryPersistenceOutcome {
+        guard revision >= latestRevision else {
+            return .discardedCredentialDrift(try loadOperation())
+        }
+        latestRevision = revision
+        telemetryFlushTask?.cancel()
+        telemetryFlushTask = nil
+        pendingTelemetry = nil
+        let outcome = try deleteAllConditionalOperation(expectedAccounts)
+        switch outcome {
+        case .persisted:
+            recordSuccessfulPersistence(of: [], at: now(), isTelemetry: false)
+        case .discardedCredentialDrift(let durable):
+            recordSuccessfulPersistence(of: durable, at: now(), isTelemetry: false)
+        }
+        return outcome
     }
 
     func queueTelemetry(_ accounts: [CodexAccount], revision: UInt64) {
@@ -153,6 +250,22 @@ actor AccountPersistenceCoordinator {
             scheduleTelemetryFlushIfNeeded()
             throw error
         }
+    }
+
+    func persistTelemetrySnapshot(
+        _ accounts: [CodexAccount],
+        revision: UInt64
+    ) throws -> Bool {
+        guard revision >= latestRevision else { return false }
+        latestRevision = revision
+        telemetryFlushTask?.cancel()
+        telemetryFlushTask = nil
+        pendingTelemetry = nil
+        return try persistTelemetryAccounts(
+            accounts,
+            at: now(),
+            context: "termination-flush"
+        )
     }
 
     private func scheduleTelemetryFlushIfNeeded() {
@@ -226,19 +339,33 @@ actor AccountPersistenceCoordinator {
 
         pendingTelemetry = nil
         do {
-            try saveOperation(pending.accounts)
-            recordSuccessfulPersistence(
-                of: pending.accounts,
+            return try persistTelemetryAccounts(
+                pending.accounts,
                 at: date,
-                isTelemetry: true
+                context: "telemetry-coalesced mode=\(writeKind.rawValue) revision=\(pending.revision) updates=\(pending.updateCount)"
             )
-            SwapLog.append(.debug(
-                "ACCOUNTS_PERSISTED context=telemetry-coalesced mode=\(writeKind.rawValue) revision=\(pending.revision) updates=\(pending.updateCount)"
-            ))
-            return true
         } catch {
             pendingTelemetry = pending
             throw error
+        }
+    }
+
+    private func persistTelemetryAccounts(
+        _ accounts: [CodexAccount],
+        at date: Date,
+        context: String
+    ) throws -> Bool {
+        switch try saveTelemetryOperation(accounts) {
+        case .persisted(let persisted):
+            recordSuccessfulPersistence(of: persisted, at: date, isTelemetry: true)
+            SwapLog.append(.debug("ACCOUNTS_PERSISTED context=\(context)"))
+            return true
+        case .discardedCredentialDrift(let durable):
+            recordSuccessfulPersistence(of: durable, at: date, isTelemetry: false)
+            SwapLog.append(.debug(
+                "ACCOUNTS_TELEMETRY_DISCARDED context=\(context) reason=credential_or_selection_changed"
+            ))
+            return false
         }
     }
 

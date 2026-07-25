@@ -674,6 +674,100 @@ struct AccountPersistenceCoordinatorTests {
         #expect(recorder.savedAccountIds() == [["durable"]])
     }
 
+    @Test("External adoption cancels stale telemetry without rewriting the store")
+    func externalAdoptionCancelsQueuedTelemetry() async throws {
+        let recorder = PersistenceRecorder()
+        let externalSnapshot = [account(id: "cli-target")]
+        let coordinator = AccountPersistenceCoordinator(
+            telemetryDelay: .seconds(60),
+            load: { externalSnapshot },
+            save: { recorder.record($0) },
+            deleteAll: {}
+        )
+
+        await coordinator.queueTelemetry([account(id: "stale-swift")], revision: 1)
+        let adopted = try await coordinator.adoptExternalSnapshot(revision: 2)
+        try await coordinator.flushTelemetry()
+
+        #expect(adopted.map(\.accountId) == ["cli-target"])
+        #expect(recorder.savedAccountIds().isEmpty)
+        await #expect(throws: AccountPersistenceCoordinatorError.authorizationLost) {
+            try await coordinator.adoptExternalSnapshot(revision: 1)
+        }
+    }
+
+    @Test("Credential drift discards periodic and termination telemetry")
+    func credentialDriftDiscardsEveryTelemetryWrite() async throws {
+        let recorder = PersistenceRecorder()
+        let durable = [account(id: "cli-target")]
+        let coordinator = AccountPersistenceCoordinator(
+            telemetryDelay: .seconds(60),
+            load: { durable },
+            save: { recorder.record($0) },
+            saveTelemetry: { _ in .discardedCredentialDrift(durable) },
+            deleteAll: {}
+        )
+
+        await coordinator.queueTelemetry([account(id: "stale-periodic")], revision: 1)
+        try await coordinator.flushTelemetry()
+        #expect(try await coordinator.persistTelemetrySnapshot(
+            [account(id: "stale-termination")],
+            revision: 2
+        ) == false)
+        #expect(recorder.savedAccountIds().isEmpty)
+    }
+
+    @Test("Credential drift discards a stale whole-store mutation")
+    func credentialDriftDiscardsDurableMutation() async throws {
+        let recorder = PersistenceRecorder()
+        let durable = [account(id: "cli-target")]
+        let coordinator = AccountPersistenceCoordinator(
+            load: { durable },
+            save: { recorder.record($0) },
+            saveConditional: { _, _ in .discardedCredentialDrift(durable) },
+            deleteAll: {}
+        )
+
+        let outcome = try await coordinator.persistDurably(
+            [account(id: "stale-swift")],
+            ifCredentialAuthorityMatches: [account(id: "old-target")],
+            revision: 1
+        )
+        switch outcome {
+        case .persisted:
+            Issue.record("Credential drift must reject a stale durable mutation")
+        case .discardedCredentialDrift(let observed):
+            #expect(observed.map(\.accountId) == ["cli-target"])
+        }
+        #expect(recorder.savedAccountIds().isEmpty)
+    }
+
+    @Test("Credential drift discards a stale whole-store deletion")
+    func credentialDriftDiscardsDurableDeletion() async throws {
+        let durable = [account(id: "cli-target")]
+        let coordinator = AccountPersistenceCoordinator(
+            load: { durable },
+            save: { _ in },
+            deleteAllConditional: { _ in
+                .discardedCredentialDrift(durable)
+            },
+            deleteAll: {
+                Issue.record("Conditional deletion must not use the unconditional path")
+            }
+        )
+
+        let outcome = try await coordinator.deleteAllDurably(
+            ifCredentialAuthorityMatches: [account(id: "old-target")],
+            revision: 1
+        )
+        switch outcome {
+        case .persisted:
+            Issue.record("Credential drift must reject a stale deletion")
+        case .discardedCredentialDrift(let observed):
+            #expect(observed.map(\.accountId) == ["cli-target"])
+        }
+    }
+
     @Test("Failed telemetry flush remains retryable")
     func failedFlushCanRetry() async throws {
         let recorder = PersistenceRecorder(failFirstSave: true)

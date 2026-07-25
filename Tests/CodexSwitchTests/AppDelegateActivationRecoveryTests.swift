@@ -312,4 +312,133 @@ struct AppDelegateActivationRecoveryTests {
         #expect(AccountAuthObservationFailure.readFailed.isRetryableObservationFailure)
         #expect(!AccountAuthObservationFailure.malformed.isRetryableObservationFailure)
     }
+
+    @Test("Deferred external handoffs remain retryable after launch")
+    func externalHandoffFollowUpIsDurable() {
+        let original = UUID()
+        let target = UUID()
+        let date = Date(timeIntervalSince1970: 1_800_100_200)
+        let oldState = AccountActivationState.committedDegraded(
+            targetAccountId: original,
+            detail: .runtimeConfirmationPending,
+            activationGeneration: UUID(),
+            retryAttempt: 0,
+            nextRetryAt: date,
+            at: date
+        )
+        #expect(AppDelegate.externalHandoffFollowUp(
+            state: oldState,
+            configuredAccountId: target,
+            observedTargetAccountId: target
+        ) == .adopt)
+
+        let adoptedState = AccountActivationState.committedDegraded(
+            targetAccountId: target,
+            detail: .externalAuthObserved,
+            activationGeneration: UUID(),
+            retryAttempt: 0,
+            nextRetryAt: date,
+            at: date
+        )
+        #expect(AppDelegate.externalHandoffFollowUp(
+            state: adoptedState,
+            configuredAccountId: target,
+            observedTargetAccountId: target
+        ) == .retryRuntime)
+        #expect(AppDelegate.externalHandoffFollowUp(
+            state: adoptedState,
+            configuredAccountId: original,
+            observedTargetAccountId: target
+        ) == .none)
+    }
+
+    @Test("Final handoff revalidation preserves transient observations")
+    func finalHandoffObservationClassifiesTransientReads() {
+        #expect(AppDelegate.externalHandoffFinalObservationIsTransient(
+            .invalid(.ancestorChanged)
+        ))
+        #expect(AppDelegate.externalHandoffFinalObservationIsTransient(
+            .invalid(.changedDuringRead)
+        ))
+        #expect(AppDelegate.externalHandoffFinalObservationIsTransient(
+            .unreadable(.readFailed)
+        ))
+        #expect(!AppDelegate.externalHandoffFinalObservationIsTransient(
+            .invalid(.malformed)
+        ))
+        #expect(!AppDelegate.externalHandoffFinalObservationIsTransient(.absent))
+    }
+
+    @Test("Final handoff store revalidation retries only concurrency failures")
+    func finalHandoffStoreErrorClassificationIsNarrow() {
+        #expect(AppDelegate.externalHandoffFinalStoreErrorIsTransient(
+            AccountPersistenceCoordinatorError.authorizationLost
+        ))
+        #expect(AppDelegate.externalHandoffFinalStoreErrorIsTransient(
+            KeychainError.lockTimedOut(path: "/tmp/accounts.lock", timeout: 1)
+        ))
+        #expect(AppDelegate.externalHandoffFinalStoreErrorIsTransient(
+            KeychainError.staleGeneration(expected: "old", actual: "new")
+        ))
+        #expect(!AppDelegate.externalHandoffFinalStoreErrorIsTransient(
+            KeychainError.invalidActiveAccountCount(2)
+        ))
+        #expect(!AppDelegate.externalHandoffFinalStoreErrorIsTransient(
+            KeychainError.unsafePath(path: "/tmp/accounts.json", reason: "linked")
+        ))
+        #expect(!AppDelegate.externalHandoffFinalStoreErrorIsTransient(
+            KeychainError.readbackMismatch(path: "/tmp/accounts.json")
+        ))
+    }
+
+    @Test("Launch adopts only a fully matching external handoff")
+    func launchExternalHandoffTargetIsExact() {
+        let originalId = UUID()
+        let targetId = UUID()
+        let original = CodexAccount(
+            id: originalId,
+            email: "original@example.com",
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            idToken: "old-id",
+            accountId: "old-provider"
+        )
+        let target = CodexAccount(
+            id: targetId,
+            email: "target@example.com",
+            accessToken: "new-access",
+            refreshToken: "new-refresh",
+            idToken: "new-id",
+            accountId: "new-provider",
+            isActive: true
+        )
+
+        #expect(AppDelegate.verifiedExternalHandoffTarget(
+            accounts: [original, target],
+            authObservation: .valid(target)
+        )?.id == targetId)
+
+        var tokenMismatch = target
+        tokenMismatch.refreshToken = "different-refresh"
+        #expect(AppDelegate.verifiedExternalHandoffTarget(
+            accounts: [original, target],
+            authObservation: .valid(tokenMismatch)
+        ) == nil)
+
+        var sourceActive = original
+        sourceActive.isActive = true
+        var targetInactive = target
+        targetInactive.isActive = false
+        #expect(AppDelegate.verifiedExternalHandoffTarget(
+            accounts: [sourceActive, targetInactive],
+            authObservation: .valid(target)
+        ) == nil)
+
+        var alsoActive = original
+        alsoActive.isActive = true
+        #expect(AppDelegate.verifiedExternalHandoffTarget(
+            accounts: [alsoActive, target],
+            authObservation: .valid(target)
+        ) == nil)
+    }
 }

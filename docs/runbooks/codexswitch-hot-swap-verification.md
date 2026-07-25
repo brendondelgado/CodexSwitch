@@ -48,6 +48,7 @@ cross_dependencies:
   - Sources/CodexSwitch/Services/DesktopAppConnector.swift
   - Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
   - Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
+  - Sources/CodexSwitch/Services/AccountActivationCrossProcessLease.swift
   - Sources/CodexSwitch/App/AppDelegate.swift
   - Sources/CodexSwitch/Models/AccountManager.swift
   - Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
@@ -220,6 +221,62 @@ from a running Codex turn, require all of the following in one attempt:
 4. An injected turn parses the CLI's structured result, proves the same auth
    path and fingerprint, and performs an independent verified reload of its
    `AuthManager` before retrying.
+
+When the Mac menu app remains running during a Rust CLI swap, also verify the
+Swift handoff:
+
+1. `accounts.json` and `auth.json` select the same known provider account with
+   the same complete token set.
+2. The Swift activation journal advances to that account in a fresh activation
+   generation.
+3. The menu-bar configured highlight and runtime-current state both name that
+   account only after fresh runtime convergence.
+4. The Codex/ChatGPT PID is unchanged and the log does not repeat
+   `ACTIVATION_CREDENTIAL_MUTATION_BLOCKED ... source=external-auth`.
+
+The handoff may only adopt a store already switched by the Rust CLI. It must not
+rewrite either credential file, rewrite a mismatched store, clear a
+manual-review barrier, or treat durable file agreement as an ACK. Verify that a
+queued Swift telemetry flush cannot restore the prior active account after
+adoption and that no Swift account-store write occurs during the adoption
+barrier. A stale periodic or termination snapshot must log
+`ACCOUNTS_TELEMETRY_DISCARDED` and leave the CLI-selected credentials and active
+flag unchanged. Repeat the check with an inactive token refresh or
+reauthentication that began before the CLI swap; its conditional whole-store
+commit must log `ACCOUNTS_PERSIST_DISCARDED` and preserve the CLI-selected
+account.
+
+If the matching Rust activation journal is `Prepared` or a fresh `FileOnly`,
+Swift must log `ACTIVATION_EXTERNAL_HANDOFF_DEFERRED` and send no competing
+reload request. On the next reconciliation tick after Rust reaches `Confirmed`
+or `CommittedDegraded`, Swift may adopt the snapshot and perform its own
+state-bound convergence. A newly imported provider account must follow this
+same path without first appearing in stale Swift memory.
+
+During every Rust or Swift commit-plus-reload transaction,
+`~/.codexswitch/accounts.runtime-activation.lock` must have one exclusive owner.
+Hold a test lease and verify both writers fail closed before writing a request;
+release it and verify the operation becomes immediately eligible. A
+`CommittedDegraded` or aged `FileOnly` journal is not exclusive ownership
+evidence by itself.
+
+Hold that lease while Swift observes absent or invalid external auth and verify
+the activation journal bytes do not change to `ManualReview`. Release the lease
+and verify the same transition succeeds. Repeat with a missing `accounts.json`
+and legacy Keychain fixture: contention must prevent both migration and legacy
+item deletion, while a later uncontended load performs one durable migration.
+
+The same lease and credential-authority comparison apply to **Remove All
+Accounts**. If an activation wins the race first, deletion must be discarded
+without clearing the in-memory account list; if deletion owns the lease first,
+activation must wait or fail closed until the deletion transaction releases it.
+
+If launch defers a handoff, leave the app running without changing either
+credential file. The next five-second observation must retry adoption even
+though account and token values are unchanged. Inject a retryable final read
+failure after the Swift journal transition and verify it logs
+`ACTIVATION_EXTERNAL_HANDOFF_DEFERRED`, remains `CommittedDegraded`, and retries
+instead of entering `ManualReview`.
 
 The injected turn must derive its current start identity from the operating
 system, then match a fresh local-interactive-runtime ACK to the still-present,
@@ -878,6 +935,14 @@ Before claiming hot-swap is fixed or ready:
   its policy authority, and release it. The prior journal bytes and published
   activation state remain unchanged; no `Preparing` or `ManualReview` state is
   written by the stale task.
+- [ ] Hold `accounts.runtime-activation.lock` from a second owner and attempt a
+  standalone Swift journal transition. It fails with unchanged journal bytes;
+  an enclosing Swift activation transaction may still transition through its
+  task-local lease proof without reacquiring or releasing the outer lease.
+- [ ] With `accounts.json` absent and legacy Keychain credentials present, hold
+  the sibling runtime-activation lease and verify `loadAll()` neither creates
+  the store nor deletes legacy credentials. Release it and verify one
+  readback-proven migration.
 - [ ] Expiring authorization after a desktop login response suppresses the
   verification RPC and strict SIGHUP; CLI request persistence and signal delivery
   perform the same per-effect authorization check.

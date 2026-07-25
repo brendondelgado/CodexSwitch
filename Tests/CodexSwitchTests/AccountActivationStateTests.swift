@@ -743,6 +743,87 @@ struct AccountActivationStateTests {
         #expect(try Data(contentsOf: url) == beforeRejectedRecovery)
     }
 
+    @Test("Verified durable handoff is state-bound and failures enter exact-target review")
+    func verifiedDurableHandoffIsStateBound() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let original = UUID()
+        let target = UUID()
+        let now = Date(timeIntervalSince1970: 1_800_001_700)
+        let coordinator = AccountActivationCoordinator(url: url)
+
+        _ = try await coordinator.beginPreparing(
+            targetAccountId: original,
+            kind: .automatic,
+            at: now
+        )
+        _ = try await coordinator.markCommittedDegraded(
+            targetAccountId: original,
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1,
+            detail: .runtimeConfirmationPending,
+            at: now
+        )
+        let confirmed = try await confirm(
+            coordinator,
+            targetAccountId: original,
+            runtimeCount: 1,
+            at: now
+        )
+
+        let staleExpectedState = AccountActivationState.committedDegraded(
+            targetAccountId: original,
+            detail: .runtimeEvidenceExpired,
+            activationGeneration: UUID(),
+            retryAttempt: 0,
+            nextRetryAt: now,
+            at: now
+        )
+        let beforeStaleAttempt = try Data(contentsOf: url)
+        await #expect(throws: AccountActivationCoordinatorError.self) {
+            try await coordinator.adoptVerifiedExternalHandoff(
+                targetAccountId: target,
+                expectedState: staleExpectedState,
+                at: now.addingTimeInterval(1)
+            )
+        }
+        #expect(try Data(contentsOf: url) == beforeStaleAttempt)
+
+        let generation = UUID()
+        let adopted = try await coordinator.adoptVerifiedExternalHandoff(
+            targetAccountId: target,
+            expectedState: confirmed,
+            newActivationGeneration: generation,
+            at: now.addingTimeInterval(1)
+        )
+
+        #expect(adopted.phase == .committedDegraded)
+        #expect(adopted.configuredAccountId == target)
+        #expect(adopted.activationGeneration == generation)
+        #expect(adopted.detail == .externalAuthObserved)
+        #expect(adopted.automaticRetryTarget(at: now.addingTimeInterval(1)) == target)
+
+        let failed = try await coordinator.failVerifiedExternalHandoff(
+            targetAccountId: target,
+            expectedActivationGeneration: generation
+        )
+        #expect(failed.phase == .manualReview)
+        #expect(failed.configuredAccountId == target)
+        #expect(failed.activationGeneration == generation)
+        #expect(failed.detail == .configuredFilesInconsistent)
+        #expect(try await coordinator.load() == failed)
+
+        let beforeReviewAttempt = try Data(contentsOf: url)
+        await #expect(throws: AccountActivationCoordinatorError.self) {
+            try await coordinator.adoptVerifiedExternalHandoff(
+                targetAccountId: target,
+                expectedState: failed,
+                at: now.addingTimeInterval(3)
+            )
+        }
+        #expect(try Data(contentsOf: url) == beforeReviewAttempt)
+    }
+
     @Test("Automatic requests preserve expired confirmation without arming reload")
     func expiredEvidenceFailsClosedWithoutAutomaticDemotion() async throws {
         let url = temporaryJournalURL()

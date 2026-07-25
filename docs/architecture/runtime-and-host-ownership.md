@@ -22,6 +22,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Models/AccountManager.swift
   - ../../Sources/CodexSwitch/Services/AccountImporter.swift
   - ../../Sources/CodexSwitch/Services/AccountActivationCoordinator.swift
+  - ../../Sources/CodexSwitch/Services/AccountActivationCrossProcessLease.swift
   - ../../Sources/CodexSwitch/Services/AccountActivationConvergence.swift
   - ../../Sources/CodexSwitch/Services/AccountActivationCredentialCommitter.swift
   - ../../Sources/CodexSwitch/Services/AccountActivationRuntimeEvidence.swift
@@ -55,7 +56,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-23
+  last_updated: 2026-07-24
 ---
 
 # Runtime And Host Ownership
@@ -170,6 +171,83 @@ read, and ordinary content changes inside an opened ancestor directory as
 retryable observation failures, not proof that configured credentials are
 invalid. Ancestor validation binds device, inode, owner, group, mode, and the
 opened path; mutable directory size and timestamps are not identity evidence.
+After lexical validation, descriptor traversal preserves the caller's absolute
+path spelling. Foundation URL standardization must not rewrite a safe
+`/private/tmp/...` path through the `/tmp` symlink before `O_NOFOLLOW`
+validation. The same lexical-path rule applies to hot-swap auth evidence and
+capability receipts so their canonical path remains bound to the descriptor
+walk that actually authorized it.
+An external account handoff is a distinct activation request, not an automatic
+policy decision. It may adopt a known target only when the descriptor-anchored
+`accounts.json` read and `auth.json` read independently select that same target
+and contain the same complete access, refresh, and identity token set. The
+handoff path never rewrites either credential file. An `auth.json`-only change
+remains a separate external-auth transaction and cannot claim that a Rust CLI
+handoff already committed. After a verified Rust CLI commit, the Swift
+coordinator enters a fresh activation generation and requires normal runtime
+convergence; file agreement alone never produces `Confirmed`.
+
+An external handoff may replace an expired `Confirmed` lease or escape a
+`CommittedDegraded` record in the same narrow ways as an explicit operator
+selection. It cannot replace `Preparing` or escape a `ManualReview` hard
+barrier. The transition is bound to the complete prior journal state, then
+CodexSwitch rereads both shared files before publishing the new configured
+account. Failed deterministic final revalidation may move only that exact
+adopted generation to target-specific `ManualReview`; it never republishes
+source confirmation or overwrites a newer journal transition. A lock timeout,
+concurrent replacement, or other retryable final read leaves the adopted
+generation retryable and is rechecked on the next five-second reconciliation
+tick. Adopting the fresh durable snapshot also invalidates any queued Swift
+telemetry snapshot.
+
+All Swift telemetry writes use an account-store-locked telemetry merge. The
+merge preserves durable account membership, local and provider identities,
+email, complete token material, and the active selection. If any credential or
+selection changed since the telemetry snapshot was captured, the entire stale
+snapshot is discarded. This rule also applies to the termination flush, so an
+old in-memory selection cannot overwrite a Rust commit before or during handoff
+detection. Swift account-store writes remain suppressed for the in-process
+adoption barrier; after the barrier opens, subsequent telemetry is captured
+from the adopted snapshot.
+
+Every non-telemetry Swift account-store commit is also conditional on the exact
+credential authority from which the operation started: account membership,
+local and provider identities, complete token sets, and the active selection.
+The check and commit occur under the account-store lock. A token refresh,
+reauthentication, or account import that finishes after a Rust selection
+therefore discards its stale whole-store mutation instead of restoring the
+prior active account. Explicit account-store deletion follows the same rule:
+it holds the shared mutation lease and deletes only when the durable credential
+authority still matches the snapshot presented to the user.
+
+Rust and Swift share the exclusive
+`~/.codexswitch/accounts.runtime-activation.lock` lease for the complete
+credential commit and unlocked runtime-convergence transaction. Before
+beginning Swift runtime convergence, CodexSwitch also reads the matching Rust
+`accounts.activation.json` record. `Prepared` and fresh `FileOnly` records defer
+to the next reconciliation tick. `Confirmed` and `CommittedDegraded` may be
+adopted only while Swift owns the shared lease; a stale `FileOnly` record may be
+recovered under that same lease after the bounded grace interval. Matching
+`ManualReview` and `RolledBack` records remain blocked. The shared lease, not a
+timestamp by itself, prevents Rust and Swift from replacing the same per-PID
+request with different nonces.
+
+The Swift activation journal enforces this lease centrally. Every durable
+journal transition either inherits task-local proof from an enclosing Swift
+credential transaction or acquires the same nonblocking cross-process lease
+itself; it never relies only on a call-site convention. A competing Rust owner
+therefore makes external-auth `ManualReview`, runtime-evidence demotion, and
+all other Swift journal writes fail closed without changing durable bytes.
+Task-local proof binds the exact lease path and live held descriptor. Detached
+work does not inherit it, and an inherited child-task value becomes invalid as
+soon as the enclosing transaction releases the descriptor.
+
+Legacy Keychain migration is also a credential-authority mutation. A read of an
+existing `accounts.json` remains read-only, while a missing store may be
+populated from legacy credentials only under the sibling
+`accounts.runtime-activation.lock` lease. Contention leaves both the missing
+store and legacy Keychain item unchanged for a later retry.
+
 If a prior deterministic external-auth failure already produced `ManualReview`,
 a later descriptor-anchored valid read may recover only when it identifies the
 same configured account and the durable account store and complete auth token
@@ -577,6 +655,18 @@ turn a file-converged activation into `ManualReview`: when exactly one active
 store record still names the journal target and `auth.json` exactly matches that
 record's complete current token set, the coordinator advances the journal to
 that current fingerprint and retries verified runtime convergence.
+
+After a Rust CLI activation commits both shared credential files, the running
+Swift menu app observes the new `auth.json` identity and adopts the already
+selected `accounts.json` target through the external-handoff path above. The
+Swift app must not require its short-lived evidence lease for the previous
+target to remain current, and it must not keep presenting the previous account
+while the shared files select the new one. It does not rewrite the Rust-owned
+store generation during adoption. It still independently proves the new runtime
+ACK before updating its activation journal and runtime-current UI.
+An account newly imported by the Rust CLI is eligible for this same adoption;
+the stale Swift in-memory account list is not used as the authority for deciding
+whether the provider identity is known.
 
 Legacy `ManualReview` records created solely by the former degraded-token-set
 mismatch are eligible for the same repair only when their version, rotation

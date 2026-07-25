@@ -82,9 +82,8 @@ enum AccountImporter {
         guard rawPathIsSafe(filePath) else {
             return .invalid(.unsafeAncestor)
         }
-        let standardized = URL(fileURLWithPath: filePath).standardizedFileURL.path
-        let components = standardized.split(separator: "/", omittingEmptySubsequences: true)
-        guard standardized.hasPrefix("/"),
+        let components = filePath.split(separator: "/", omittingEmptySubsequences: true)
+        guard filePath.hasPrefix("/"),
               !components.isEmpty,
               !components.contains("."),
               !components.contains("..") else {

@@ -5102,7 +5102,7 @@ struct CodexDesktopAppUpdaterTests {
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let pidURL = root.appendingPathComponent("pid")
-        var cancellationPolls = 0
+        var cancellationPollsAfterChildStart = 0
 
         let result = DesktopUpdaterProcessRunner().run(
             executableURL: URL(fileURLWithPath: "/bin/sh"),
@@ -5113,8 +5113,11 @@ struct CodexDesktopAppUpdaterTests {
             timeout: 10,
             outputLimit: 1_024,
             isCancelled: {
-                cancellationPolls += 1
-                return cancellationPolls >= 5
+                guard FileManager.default.fileExists(atPath: pidURL.path) else {
+                    return false
+                }
+                cancellationPollsAfterChildStart += 1
+                return cancellationPollsAfterChildStart >= 2
             }
         )
 

@@ -415,9 +415,14 @@ struct AccountActivationOperationProof: Equatable, Sendable {
 
 struct AccountActivationTransaction: Sendable {
     private let leases: AccountMutationLeaseCoordinator
+    private let crossProcessLeaseURL: URL
 
-    init(leases: AccountMutationLeaseCoordinator = AccountMutationLeaseCoordinator()) {
+    init(
+        leases: AccountMutationLeaseCoordinator = AccountMutationLeaseCoordinator(),
+        crossProcessLeaseURL: URL = AccountActivationCrossProcessLease.defaultURL
+    ) {
         self.leases = leases
+        self.crossProcessLeaseURL = crossProcessLeaseURL
     }
 
     func withActivationLease<Value: Sendable>(
@@ -425,13 +430,24 @@ struct AccountActivationTransaction: Sendable {
         activationGeneration: UUID,
         operation: @MainActor @Sendable (AccountMutationLease) async throws -> Value
     ) async rethrows -> Value? {
-        try await leases.withLease(
-            .activation(
-                targetAccountId: targetAccountId,
-                activationGeneration: activationGeneration
-            ),
-            operation: operation
-        )
+        guard let crossProcessLease =
+                AccountActivationCrossProcessLease.acquireForAccountMutation(
+                    at: crossProcessLeaseURL
+                ) else {
+            return nil
+        }
+        defer { crossProcessLease.release() }
+        return try await AccountActivationCrossProcessLeaseContext.$heldLease.withValue(
+            crossProcessLease
+        ) {
+            try await leases.withLease(
+                .activation(
+                    targetAccountId: targetAccountId,
+                    activationGeneration: activationGeneration
+                ),
+                operation: operation
+            )
+        }
     }
 
     func withResetLease<Value: Sendable>(
@@ -439,13 +455,49 @@ struct AccountActivationTransaction: Sendable {
         activationGeneration: UUID,
         operation: @MainActor @Sendable (AccountMutationLease) async throws -> Value
     ) async rethrows -> Value? {
-        try await leases.withLease(
-            .resetRedemption(
-                accountId: accountId,
-                activationGeneration: activationGeneration
-            ),
-            operation: operation
-        )
+        guard let crossProcessLease =
+                AccountActivationCrossProcessLease.acquireForAccountMutation(
+                    at: crossProcessLeaseURL
+                ) else {
+            return nil
+        }
+        defer { crossProcessLease.release() }
+        return try await AccountActivationCrossProcessLeaseContext.$heldLease.withValue(
+            crossProcessLease
+        ) {
+            try await leases.withLease(
+                .resetRedemption(
+                    accountId: accountId,
+                    activationGeneration: activationGeneration
+                ),
+                operation: operation
+            )
+        }
+    }
+
+    func withAccountStoreDeletionLease<Value: Sendable>(
+        accountId: UUID,
+        mutationGeneration: UUID,
+        operation: @MainActor @Sendable (AccountMutationLease) async throws -> Value
+    ) async rethrows -> Value? {
+        guard let crossProcessLease =
+                AccountActivationCrossProcessLease.acquireForAccountMutation(
+                    at: crossProcessLeaseURL
+                ) else {
+            return nil
+        }
+        defer { crossProcessLease.release() }
+        return try await AccountActivationCrossProcessLeaseContext.$heldLease.withValue(
+            crossProcessLease
+        ) {
+            try await leases.withLease(
+                .accountStoreDeletion(
+                    accountId: accountId,
+                    mutationGeneration: mutationGeneration
+                ),
+                operation: operation
+            )
+        }
     }
 
     func owns(_ lease: AccountMutationLease) async -> Bool {

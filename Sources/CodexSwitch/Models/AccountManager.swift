@@ -324,6 +324,20 @@ final class AccountManager {
         return true
     }
 
+    @discardableResult
+    func adoptVerifiedExternalHandoff(
+        _ persistedAccounts: [CodexAccount],
+        targetAccountId: UUID
+    ) -> Bool {
+        guard persistedAccounts.filter(\.isActive).map(\.id) == [targetAccountId],
+              persistedAccounts.contains(where: { $0.id == targetAccountId }) else {
+            return false
+        }
+        accounts = persistedAccounts
+        userDefaults.set(targetAccountId.uuidString, forKey: "activeAccountId")
+        return true
+    }
+
     /// Inserts a new identity only. Existing identities, including the configured one, are immutable here.
     @discardableResult
     func addAccount(_ account: CodexAccount) -> Bool {

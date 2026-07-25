@@ -7,12 +7,16 @@ use crate::account_store::{
 };
 #[cfg(test)]
 use crate::account_store::{load_accounts, save_accounts};
+#[cfg(test)]
+use crate::activation::activate_with;
 use crate::activation::{
-    activate_with, activate_with_unlocked_reload, commit_accounts_with_provider_io_activation,
+    acquire_runtime_activation_lease, activate_with_under_runtime_lease,
+    activate_with_unlocked_reload_under_runtime_lease,
+    commit_accounts_with_provider_io_activation_under_runtime_lease,
     preflight_provider_io_activation, read_activation_record,
-    reconcile_activation_barrier_unlocked, validate_provider_io_activation,
+    reconcile_activation_barrier_unlocked_under_runtime_lease, validate_provider_io_activation,
     validate_provider_io_activation_locked, ActivationContext, ActivationOutcome, ActivationState,
-    ProviderIoActivationGuard,
+    ProviderIoActivationGuard, RuntimeActivationLease,
 };
 use crate::auth::auth_file_matches_account;
 #[cfg(test)]
@@ -115,6 +119,7 @@ fn load_store_snapshot(store_path: &Path) -> Result<AccountStoreSnapshot> {
 }
 
 fn commit_daemon_accounts(
+    runtime_lease: &RuntimeActivationLease,
     store_path: &Path,
     auth_path: &Path,
     generation: &mut AccountStoreGeneration,
@@ -122,7 +127,8 @@ fn commit_daemon_accounts(
     activation_guard: &ProviderIoActivationGuard,
 ) -> Result<()> {
     let store_lock = lock_account_store(store_path)?;
-    commit_accounts_with_provider_io_activation(
+    commit_accounts_with_provider_io_activation_under_runtime_lease(
+        runtime_lease,
         &store_lock,
         generation,
         accounts,
@@ -266,9 +272,14 @@ where
         consume_reset: consume_reset_fn,
         reload: reload_fn,
     } = dependencies;
-    if let Some(outcome) =
-        reconcile_activation_barrier_unlocked(store_path, auth_path, true, &reload_fn)?
-    {
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        true,
+        &reload_fn,
+    )? {
         if let Some(tick) = pending_activation_tick(&outcome, base_interval) {
             if outcome.state == ActivationState::CommittedDegraded {
                 if let Err(error) = refresh_quota_observations_during_activation_barrier(
@@ -459,7 +470,8 @@ where
                     },
                     |accounts: &mut [CodexAccount], reset_account_index: usize| {
                         let target_id = accounts[reset_account_index].id;
-                        activate_with(
+                        activate_with_under_runtime_lease(
+                            &runtime_lease,
                             ActivationContext {
                                 store_lock: &store_lock,
                                 generation: &mut generation,
@@ -488,7 +500,8 @@ where
                     let activation = if activation.is_confirmed() {
                         activation
                     } else {
-                        reconcile_activation_barrier_unlocked(
+                        reconcile_activation_barrier_unlocked_under_runtime_lease(
+                            &runtime_lease,
                             store_path,
                             auth_path,
                             true,
@@ -541,6 +554,7 @@ where
     let Some(target) = rotation_target else {
         if force_swap || active_is_blocked {
             commit_daemon_accounts(
+                &runtime_lease,
                 store_path,
                 auth_path,
                 &mut generation,
@@ -566,7 +580,8 @@ where
                     });
             if requires_runtime_convergence {
                 let target_id = accounts[active_index].id;
-                let activation = activate_with_unlocked_reload(
+                let activation = activate_with_unlocked_reload_under_runtime_lease(
+                    &runtime_lease,
                     store_path,
                     auth_path,
                     &mut generation,
@@ -581,6 +596,7 @@ where
                 require_confirmed_activation(activation)?;
             } else {
                 commit_daemon_accounts(
+                    &runtime_lease,
                     store_path,
                     auth_path,
                     &mut generation,
@@ -590,6 +606,7 @@ where
             }
         } else {
             commit_daemon_accounts(
+                &runtime_lease,
                 store_path,
                 auth_path,
                 &mut generation,
@@ -612,6 +629,7 @@ where
     }
     if target.account_id == active_id {
         commit_daemon_accounts(
+            &runtime_lease,
             store_path,
             auth_path,
             &mut generation,
@@ -625,6 +643,7 @@ where
     }
     if quota_availability_at(&target, Utc::now()) != QuotaAvailability::Usable {
         commit_daemon_accounts(
+            &runtime_lease,
             store_path,
             auth_path,
             &mut generation,
@@ -636,7 +655,8 @@ where
 
     validate_provider_io_activation(store_path, auth_path, &activation_guard)
         .context("daemon activation changed before rotation")?;
-    let activation = activate_with_unlocked_reload(
+    let activation = activate_with_unlocked_reload_under_runtime_lease(
+        &runtime_lease,
         store_path,
         auth_path,
         &mut generation,
@@ -1215,6 +1235,16 @@ mod tests {
                 "failed to release callback probe lock: {}",
                 std::io::Error::last_os_error()
             );
+        }
+        Ok(())
+    }
+
+    fn assert_runtime_activation_lease_busy(store_path: &Path) -> Result<()> {
+        let error = acquire_runtime_activation_lease(store_path)
+            .err()
+            .context("runtime-activation lease was unexpectedly acquirable")?;
+        if !format!("{error:#}").contains("runtime activation is busy") {
+            bail!("runtime-activation contention returned an unclear error: {error:#}");
         }
         Ok(())
     }
@@ -2823,6 +2853,7 @@ mod tests {
         let quota_store_path = store_path.clone();
         let bank_store_path = store_path.clone();
         let consume_store_path = store_path.clone();
+        let reload_store_path = store_path.clone();
         let tick = run_once_report_with_resets(
             DaemonTickContext {
                 store_path: &store_path,
@@ -2833,6 +2864,7 @@ mod tests {
             DaemonTickDependencies::new(
                 move |account| {
                     assert_store_lock_available(&quota_store_path)?;
+                    assert_runtime_activation_lease_busy(&quota_store_path)?;
                     let mut result = ready_fetch(account)?;
                     if account.email == "active@example.com" {
                         let mut calls = active_fetches_for_closure.lock().unwrap();
@@ -2853,19 +2885,24 @@ mod tests {
                 |_| Ok(()),
                 move |_account| {
                     assert_store_lock_available(&bank_store_path)?;
+                    assert_runtime_activation_lease_busy(&bank_store_path)?;
                     let mut calls = bank_fetches_for_closure.lock().unwrap();
                     *calls += 1;
                     Ok(reset_bank(u32::from(*calls == 1), Utc::now()))
                 },
                 move |_account, _bank, _request_id| {
                     assert_store_lock_available(&consume_store_path)?;
+                    assert_runtime_activation_lease_busy(&consume_store_path)?;
                     *consume_calls_for_closure.lock().unwrap() += 1;
                     Ok(ConsumeResult {
                         code: crate::rate_limit_resets::ConsumeCode::Reset,
                         credit_id: None,
                     })
                 },
-                |_| Ok(verified_reload_summary()),
+                move |_| {
+                    assert_runtime_activation_lease_busy(&reload_store_path)?;
+                    Ok(verified_reload_summary())
+                },
             ),
         )?;
 
@@ -2887,6 +2924,8 @@ mod tests {
                 .map(|bank| bank.available_count),
             Some(0)
         );
+        let successor = acquire_runtime_activation_lease(&store_path)?;
+        drop(successor);
         Ok(())
     }
 

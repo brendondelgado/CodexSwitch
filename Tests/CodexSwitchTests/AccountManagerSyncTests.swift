@@ -842,6 +842,55 @@ struct AccountManagerSyncTests {
         #expect(manager.accounts.last?.isActive == false)
     }
 
+    @Test("Verified external handoff replaces memory only for one exact active target")
+    @MainActor func verifiedExternalHandoffAdoptsExactSnapshot() {
+        let defaults = isolatedDefaults()
+        let manager = AccountManager(userDefaults: defaults)
+        var source = CodexAccount(
+            email: "source@example.com",
+            accessToken: "source-access",
+            refreshToken: "source-refresh",
+            idToken: "source-id",
+            accountId: "source-provider",
+            isActive: true
+        )
+        var target = CodexAccount(
+            email: "target@example.com",
+            accessToken: "target-access",
+            refreshToken: "target-refresh",
+            idToken: "target-id",
+            accountId: "target-provider"
+        )
+        manager.accounts = [source, target]
+        defaults.set(source.id.uuidString, forKey: "activeAccountId")
+
+        source.isActive = false
+        target.isActive = true
+        let externalSnapshot = [source, target]
+        #expect(manager.adoptVerifiedExternalHandoff(
+            externalSnapshot,
+            targetAccountId: target.id
+        ))
+        #expect(manager.accounts.map(\.id) == externalSnapshot.map(\.id))
+        #expect(manager.accounts.map(\.accountId) == externalSnapshot.map(\.accountId))
+        #expect(manager.accounts.map(\.accessToken) == externalSnapshot.map(\.accessToken))
+        #expect(manager.accounts.map(\.isActive) == [false, true])
+        #expect(manager.configuredAccount?.id == target.id)
+        #expect(defaults.string(forKey: "activeAccountId") == target.id.uuidString)
+
+        var invalidSource = source
+        invalidSource.isActive = true
+        let beforeRejectedIds = manager.accounts.map(\.id)
+        let beforeRejectedActiveFlags = manager.accounts.map(\.isActive)
+        #expect(!manager.adoptVerifiedExternalHandoff(
+            [invalidSource, target],
+            targetAccountId: target.id
+        ))
+        #expect(manager.accounts.map(\.id) == beforeRejectedIds)
+        #expect(manager.accounts.map(\.isActive) == beforeRejectedActiveFlags)
+        #expect(defaults.string(forKey: "activeAccountId") == target.id.uuidString)
+    }
+
     private func isolatedDefaults() -> UserDefaults {
         let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

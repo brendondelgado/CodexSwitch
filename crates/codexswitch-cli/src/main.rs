@@ -24,11 +24,17 @@ use account_store::{
 };
 #[cfg(test)]
 use account_store::{commit_accounts, save_accounts};
+#[cfg(test)]
+use activation::activate_with;
 use activation::{
-    activate_with, activate_with_unlocked_reload, commit_accounts_with_provider_io_activation,
-    preflight_provider_io_activation, reconcile_activation_barrier_unlocked, replace_accounts_with,
-    resolve_manual_review_activation_unlocked, validate_provider_io_activation,
-    validate_provider_io_activation_locked, ActivationContext, ActivationOutcome, ActivationState,
+    acquire_runtime_activation_lease, activate_with_under_runtime_lease,
+    activate_with_unlocked_reload, activate_with_unlocked_reload_under_runtime_lease,
+    commit_accounts_with_provider_io_activation_under_runtime_lease,
+    preflight_provider_io_activation, reconcile_activation_barrier_unlocked,
+    reconcile_activation_barrier_unlocked_under_runtime_lease,
+    replace_accounts_with_under_runtime_lease, resolve_manual_review_activation_unlocked,
+    validate_provider_io_activation, validate_provider_io_activation_locked, ActivationContext,
+    ActivationOutcome, ActivationState, RuntimeActivationLease,
 };
 use anyhow::{bail, Context, Result};
 use auth::default_auth_path;
@@ -49,6 +55,7 @@ use reload::{
 use ring::digest::{digest, Context as DigestContext, SHA256};
 use serde::Serialize;
 use serde_json::Value;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -365,9 +372,14 @@ fn replace_import_accounts_with_unlocked_reload<R>(
 where
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
-    if let Some(outcome) =
-        reconcile_activation_barrier_unlocked(store_path, auth_path, reload_enabled, reload)?
-    {
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        reload_enabled,
+        reload,
+    )? {
         require_confirmed_activation(outcome)
             .context("import is blocked by unresolved prior runtime convergence")?;
     }
@@ -383,7 +395,8 @@ where
         let account_count = replacement_accounts.len();
         let mut generation = snapshot.generation;
         let mut stored_accounts = snapshot.accounts;
-        let outcome = replace_accounts_with(
+        let outcome = replace_accounts_with_under_runtime_lease(
+            &runtime_lease,
             &store_lock,
             &mut generation,
             &mut stored_accounts,
@@ -398,8 +411,14 @@ where
     if !reload_enabled || !prepared.is_file_only() {
         return Ok((account_count, prepared));
     }
-    let outcome = reconcile_activation_barrier_unlocked(store_path, auth_path, true, reload)?
-        .context("import activation disappeared before runtime convergence")?;
+    let outcome = reconcile_activation_barrier_unlocked_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        true,
+        reload,
+    )?
+    .context("import activation disappeared before runtime convergence")?;
     Ok((account_count, outcome))
 }
 
@@ -993,6 +1012,7 @@ where
     B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
     C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
 {
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
     let snapshot = preflight_provider_io_activation(store_path, auth_path)
         .context("targeted reset activation preflight failed")?;
     let activation_guard = snapshot.guard;
@@ -1028,7 +1048,8 @@ where
                 "account store changed during targeted reset observation; retry from fresh state"
             );
         }
-        commit_accounts_with_provider_io_activation(
+        commit_accounts_with_provider_io_activation_under_runtime_lease(
+            &runtime_lease,
             &store_lock,
             &mut generation,
             &accounts,
@@ -1049,7 +1070,8 @@ where
         Ok(bank) => bank,
         Err(error) => {
             let email = accounts[target_index].email.clone();
-            commit_accounts_with_provider_io_activation(
+            commit_accounts_with_provider_io_activation_under_runtime_lease(
+                &runtime_lease,
                 &store_lock,
                 &mut generation,
                 &accounts,
@@ -1116,7 +1138,8 @@ where
         .unwrap_or(previous_banked_resets);
     let remaining_percent = real_quota_snapshot(&accounts[target_index])
         .and_then(QuotaSnapshot::minimum_remaining_percent);
-    commit_accounts_with_provider_io_activation(
+    commit_accounts_with_provider_io_activation_under_runtime_lease(
+        &runtime_lease,
         &store_lock,
         &mut generation,
         &accounts,
@@ -1376,7 +1399,11 @@ where
     C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
-    rotate_now_with_resets_and_barrier_loader(context, dependencies, |store_lock| store_lock.load())
+    rotate_now_with_resets_and_barrier_loader(
+        context,
+        dependencies,
+        |store_lock, _runtime_lease| store_lock.load(),
+    )
 }
 
 fn rotate_now_with_resets_and_barrier_loader<F, B, C, R, L>(
@@ -1389,7 +1416,10 @@ where
     B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
     C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
     R: Fn(&Path) -> Result<ReloadSummary>,
-    L: Fn(&account_store::AccountStoreLock) -> Result<account_store::AccountStoreSnapshot>,
+    L: Fn(
+        &account_store::AccountStoreLock,
+        &RuntimeActivationLease,
+    ) -> Result<account_store::AccountStoreSnapshot>,
 {
     let RotateNowContext {
         store_path,
@@ -1409,15 +1439,20 @@ where
     if receipt_nonce.is_some() && !reload_processes {
         bail!("receipt-bound rotation requires live runtime reload");
     }
-    if let Some(outcome) =
-        reconcile_activation_barrier_unlocked(store_path, auth_path, reload_processes, &reload_fn)?
-    {
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        reload_processes,
+        &reload_fn,
+    )? {
         // This outcome belongs to an activation that predated the current
         // command. Offline mode may create FileOnly for the new request, but it
         // must never waive runtime convergence of an older barrier.
         require_confirmed_activation(outcome)?;
         let store_lock = lock_account_store(store_path)?;
-        let _ = load_after_barrier(&store_lock)?;
+        let _ = load_after_barrier(&store_lock, &runtime_lease)?;
     }
     let snapshot = preflight_provider_io_activation(store_path, auth_path)
         .context("rotate-now provider-I/O activation preflight failed")?;
@@ -1506,7 +1541,8 @@ where
             )?;
             let prepared_activation = if let Some(index) = outcome.completion {
                 let target_id = accounts[index].id;
-                Some(activate_with(
+                Some(activate_with_under_runtime_lease(
+                    &runtime_lease,
                     ActivationContext {
                         store_lock: &store_lock,
                         generation: &mut generation,
@@ -1526,7 +1562,8 @@ where
             Ok((outcome, prepared_activation)) => {
                 if let Some(prepared_activation) = prepared_activation {
                     let activation = if reload_processes {
-                        reconcile_activation_barrier_unlocked(
+                        reconcile_activation_barrier_unlocked_under_runtime_lease(
+                            &runtime_lease,
                             store_path,
                             auth_path,
                             true,
@@ -1619,7 +1656,8 @@ where
         if store_lock.load()?.generation != generation {
             bail!("account store changed before rotate-now fallback commit");
         }
-        commit_accounts_with_provider_io_activation(
+        commit_accounts_with_provider_io_activation_under_runtime_lease(
+            &runtime_lease,
             &store_lock,
             &mut generation,
             &accounts,
@@ -1633,7 +1671,8 @@ where
 
     validate_provider_io_activation(store_path, auth_path, &activation_guard)
         .context("rotate-now activation changed before rotation")?;
-    let activation = activate_with_unlocked_reload(
+    let activation = activate_with_unlocked_reload_under_runtime_lease(
+        &runtime_lease,
         store_path,
         auth_path,
         &mut generation,
@@ -1717,6 +1756,7 @@ where
     F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
     B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
 {
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
     let snapshot = preflight_provider_io_activation(store_path, auth_path)
         .context("poll activation preflight failed")?;
     let activation_guard = snapshot.guard;
@@ -1767,7 +1807,8 @@ where
     }
 
     let store_lock = lock_account_store(store_path)?;
-    commit_accounts_with_provider_io_activation(
+    commit_accounts_with_provider_io_activation_under_runtime_lease(
+        &runtime_lease,
         &store_lock,
         &mut generation,
         &accounts,
@@ -2468,6 +2509,16 @@ mod tests {
         Ok(())
     }
 
+    fn assert_runtime_activation_lease_busy(store_path: &Path) -> Result<()> {
+        let error = acquire_runtime_activation_lease(store_path)
+            .err()
+            .context("runtime-activation lease was unexpectedly acquirable")?;
+        if !format!("{error:#}").contains("runtime activation is busy") {
+            bail!("runtime-activation contention returned an unclear error: {error:#}");
+        }
+        Ok(())
+    }
+
     fn create_fifo(path: &Path) -> Result<()> {
         let path = CString::new(path.as_os_str().as_bytes())?;
         let status = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
@@ -2646,6 +2697,7 @@ mod tests {
             true,
             &move |_| {
                 assert_store_lock_available(&reload_store_path)?;
+                assert_runtime_activation_lease_busy(&reload_store_path)?;
                 Ok(verified_reload_summary())
             },
         )?;
@@ -2657,6 +2709,8 @@ mod tests {
             Some(replacement.account_id.clone())
         );
         assert!(auth::auth_file_matches_account(&auth_path, &replacement));
+        let successor = acquire_runtime_activation_lease(&store_path)?;
+        drop(successor);
         Ok(())
     }
 
@@ -3467,13 +3521,14 @@ mod tests {
                     Ok(verified_reload_summary())
                 },
             ),
-            move |store_lock| {
+            move |store_lock, runtime_lease| {
                 *barrier_loads_for_loader.lock().unwrap() += 1;
                 let snapshot = store_lock.load()?;
                 let mut fresh_accounts = snapshot.accounts;
                 fresh_accounts.push(fresh_for_loader.clone());
                 let mut fresh_generation = snapshot.generation;
-                activation::commit_accounts_with_confirmed_generation_continuity(
+                activation::commit_accounts_with_confirmed_generation_continuity_under_runtime_lease(
+                    runtime_lease,
                     store_lock,
                     &mut fresh_generation,
                     &fresh_accounts,
@@ -3643,6 +3698,7 @@ mod tests {
             RotateNowDependencies::new(
                 move |account| {
                     assert_store_lock_available(&quota_store_path)?;
+                    assert_runtime_activation_lease_busy(&quota_store_path)?;
                     let mut result = fetch_from_account(account)?;
                     if account.email == "active@example.com" {
                         let mut calls = active_fetches_for_closure.lock().unwrap();
@@ -3662,6 +3718,7 @@ mod tests {
                 },
                 move |_account| {
                     assert_store_lock_available(&bank_store_path)?;
+                    assert_runtime_activation_lease_busy(&bank_store_path)?;
                     let mut calls = bank_fetches_for_closure.lock().unwrap();
                     *calls += 1;
                     let available_count = u32::from(*calls == 1);
@@ -3686,6 +3743,7 @@ mod tests {
                 },
                 move |_account, _bank, _request_id| {
                     assert_store_lock_available(&consume_store_path)?;
+                    assert_runtime_activation_lease_busy(&consume_store_path)?;
                     *consume_calls_for_closure.lock().unwrap() += 1;
                     Ok(ConsumeResult {
                         code: rate_limit_resets::ConsumeCode::Reset,
@@ -3694,6 +3752,7 @@ mod tests {
                 },
                 move |_| {
                     assert_store_lock_available(&reload_store_path)?;
+                    assert_runtime_activation_lease_busy(&reload_store_path)?;
                     Ok(verified_reload_summary())
                 },
             ),
@@ -3721,6 +3780,8 @@ mod tests {
             quota_availability_at(active, Utc::now()),
             QuotaAvailability::Usable
         );
+        let successor = acquire_runtime_activation_lease(&store_path)?;
+        drop(successor);
         Ok(())
     }
 
@@ -4137,6 +4198,7 @@ mod tests {
                 let quota_fetches = Arc::clone(&quota_fetches);
                 move |account| {
                     assert_store_lock_available(&quota_store_path)?;
+                    assert_runtime_activation_lease_busy(&quota_store_path)?;
                     let mut result = fetch_from_account(account)?;
                     let mut calls = quota_fetches.lock().unwrap();
                     *calls += 1;
@@ -4155,6 +4217,7 @@ mod tests {
                 let bank_fetches = Arc::clone(&bank_fetches);
                 move |_account| {
                     assert_store_lock_available(&bank_store_path)?;
+                    assert_runtime_activation_lease_busy(&bank_store_path)?;
                     let mut calls = bank_fetches.lock().unwrap();
                     *calls += 1;
                     Ok(if *calls == 1 {
@@ -4168,6 +4231,7 @@ mod tests {
                 let consume_calls = Arc::clone(&consume_calls);
                 move |_account, _bank, _request_id| {
                     assert_store_lock_available(&consume_store_path)?;
+                    assert_runtime_activation_lease_busy(&consume_store_path)?;
                     *consume_calls.lock().unwrap() += 1;
                     Ok(ConsumeResult {
                         code: rate_limit_resets::ConsumeCode::Reset,
@@ -4202,6 +4266,8 @@ mod tests {
             quota_availability_at(redeemed, Utc::now()),
             QuotaAvailability::Usable
         );
+        let successor = acquire_runtime_activation_lease(&store_path)?;
+        drop(successor);
         Ok(())
     }
 

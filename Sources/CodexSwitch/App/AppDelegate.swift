@@ -173,6 +173,28 @@ private enum ScopedAccountActivationResult: Sendable {
     case blocked
 }
 
+private enum ExternalHandoffAdoptionResult: Sendable {
+    case notAdopted
+    case adopted(CodexAccount)
+}
+
+private enum ExternalHandoffResolution: Sendable {
+    case unavailable
+    case deferred
+    case adopted(CodexAccount)
+}
+
+private enum ExternalHandoffAdoptionError: Error {
+    case revalidationFailed
+    case transientRevalidation
+}
+
+enum ExternalHandoffFollowUp: Equatable {
+    case adopt
+    case retryRuntime
+    case none
+}
+
 /// Write crash info to ~/.codexswitch/logs/crash.log for debugging
 private func writeCrashLog(_ message: String) {
     let dir = NSString("~/.codexswitch/logs").expandingTildeInPath
@@ -351,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var terminationFlushTask: Task<Void, Never>?
     private var terminationFlushCompleted = false
     private var accountPersistenceRevision: UInt64 = 0
+    private var externalHandoffAdoptionInFlight = false
     private var externalAuthReconciliationInFlight = false
     private var externalAuthReconciliationPending = false
 
@@ -583,9 +606,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .valid(let account):
             imported = account
         }
+
         guard let existing = accountManager.accounts.first(where: {
             $0.accountId == imported.accountId
         }) else {
+            if let state = accountManager.activationState {
+                switch await adoptVerifiedExternalHandoffIfPresent(
+                    expectedState: state,
+                    expectedObservedProviderAccountId: imported.accountId,
+                    requiresDifferentJournalTarget: true
+                ) {
+                case .adopted(let adopted):
+                    await startSameTargetRuntimeRetry(
+                        to: adopted,
+                        source: "external_handoff"
+                    )
+                    return
+                case .deferred:
+                    return
+                case .unavailable:
+                    break
+                }
+            }
             if accountManager.activationState?.phase == .manualReview,
                accountManager.activationState?.detail == .externalAuthTargetUnknown {
                 return
@@ -617,6 +659,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             || existing.refreshToken != target.refreshToken
             || existing.idToken != target.idToken
         if !targetChanged, !credentialsChanged {
+            switch Self.externalHandoffFollowUp(
+                state: accountManager.activationState,
+                configuredAccountId: configured?.id,
+                observedTargetAccountId: target.id
+            ) {
+            case .adopt:
+                guard let state = accountManager.activationState else { return }
+                switch await adoptVerifiedExternalHandoffIfPresent(
+                    expectedState: state,
+                    expectedObservedProviderAccountId: target.accountId,
+                    requiresDifferentJournalTarget: true
+                ) {
+                case .adopted(let adopted):
+                    await startSameTargetRuntimeRetry(
+                        to: adopted,
+                        source: "external_handoff"
+                    )
+                    return
+                case .deferred:
+                    return
+                case .unavailable:
+                    break
+                }
+            case .retryRuntime:
+                guard await durableAccountStoreMatches(target) else { return }
+                await startSameTargetRuntimeRetry(
+                    to: target,
+                    source: "external_handoff_deferred_revalidation"
+                )
+                return
+            case .none:
+                break
+            }
             guard Self.verifiedExternalAuthRecoveryTarget(
                 state: accountManager.activationState,
                 configuredAccountId: configured?.id,
@@ -629,6 +704,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 source: "external_auth_recovered"
             )
             return
+        }
+
+        if let state = accountManager.activationState {
+            switch await adoptVerifiedExternalHandoffIfPresent(
+                expectedState: state,
+                expectedObservedProviderAccountId: target.accountId,
+                requiresDifferentJournalTarget: false
+            ) {
+            case .adopted(let adopted):
+                await startSameTargetRuntimeRetry(
+                    to: adopted,
+                    source: "external_handoff"
+                )
+                return
+            case .deferred:
+                return
+            case .unavailable:
+                break
+            }
         }
 
         if let state = accountManager.activationState,
@@ -673,7 +767,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             targetAccountId: target.id,
             expectedConfiguredAccountId: configured?.id,
             source: "external-auth",
-            isManual: false
+            requestKind: .automatic
         ) { [weak self] prepared in
             guard let self else { return false }
             return await self.commitConfiguredCredentialMutation(
@@ -1355,10 +1449,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let revision = accountPersistenceRevision
         terminationFlushTask = Task { @MainActor [weak self, weak sender] in
             do {
-                try await persistence.persistDurably(accounts, revision: revision)
-                SwapLog.append(.debug(
-                    "ACCOUNTS_PERSISTED context=termination-flush revision=\(revision)"
-                ))
+                _ = try await persistence.persistTelemetrySnapshot(
+                    accounts,
+                    revision: revision
+                )
             } catch {
                 logger.error("Final account persistence flush failed: \(error.localizedDescription)")
                 SwapLog.append(.debug(
@@ -1619,6 +1713,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 accountManager.publishActivationState(stored)
                 return
             }
+            switch await adoptVerifiedExternalHandoffIfPresent(
+                expectedState: stored,
+                expectedObservedProviderAccountId: nil,
+                requiresDifferentJournalTarget: true
+            ) {
+            case .adopted:
+                return
+            case .deferred:
+                accountManager.publishActivationState(stored)
+                return
+            case .unavailable:
+                break
+            }
             guard let targetAccountId = stored.configuredAccountId,
                   let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) else {
                 await enterActivationManualReview(
@@ -1776,7 +1883,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 targetAccountId: target.id,
                 expectedConfiguredAccountId: accountManager.configuredAccount?.id,
                 source: "launch-activation-bootstrap",
-                isManual: false
+                requestKind: .automatic
             ) { [weak self] prepared in
                 guard let self else { return false }
                 return await self.commitConfiguredCredentialMutation(
@@ -2043,6 +2150,231 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ))
             return false
         }
+    }
+
+    private func adoptVerifiedExternalHandoffIfPresent(
+        expectedState: AccountActivationState,
+        expectedObservedProviderAccountId: String?,
+        requiresDifferentJournalTarget: Bool
+    ) async -> ExternalHandoffResolution {
+        guard !isExiting,
+              !externalHandoffAdoptionInFlight,
+              pendingSwapTargetAccountId == nil,
+              swapConvergenceTask == nil,
+              expectedState.phase == .confirmed
+                || expectedState.phase == .committedDegraded else {
+            return .unavailable
+        }
+
+        externalHandoffAdoptionInFlight = true
+        defer { externalHandoffAdoptionInFlight = false }
+
+        accountPersistenceRevision &+= 1
+        let revision = accountPersistenceRevision
+        let initialTarget: CodexAccount
+        do {
+            let accounts = try await accountPersistence.adoptExternalSnapshot(
+                revision: revision
+            )
+            let observation = await Task.detached(priority: .utility) {
+                AccountImporter.observeCurrentAccount()
+            }.value
+            switch observation {
+            case .valid(let observed):
+                guard let target = Self.verifiedExternalHandoffTarget(
+                    accounts: accounts,
+                    authObservation: observation
+                ) else {
+                    return expectedObservedProviderAccountId.map({
+                        $0 == observed.accountId
+                    }) == true ? .deferred : .unavailable
+                }
+                guard expectedObservedProviderAccountId.map({
+                    $0 == target.accountId
+                }) ?? true,
+                !requiresDifferentJournalTarget
+                    || expectedState.configuredAccountId != target.id else {
+                    return .unavailable
+                }
+                initialTarget = target
+            case .invalid(let reason) where reason.isRetryableObservationFailure:
+                SwapLog.append(.debug(
+                    "ACTIVATION_EXTERNAL_HANDOFF_DEFERRED reason=\(reason.rawValue)"
+                ))
+                return .deferred
+            case .unreadable(let reason):
+                SwapLog.append(.debug(
+                    "ACTIVATION_EXTERNAL_HANDOFF_DEFERRED reason=\(reason.rawValue)"
+                ))
+                return .deferred
+            case .absent, .invalid:
+                return .unavailable
+            }
+        } catch {
+            SwapLog.append(.debug(
+                "ACTIVATION_EXTERNAL_HANDOFF_READ_FAILED error=\(error.localizedDescription)"
+            ))
+            return .deferred
+        }
+
+        switch RustActivationJournal.handoffDisposition(for: initialTarget) {
+        case .ready:
+            break
+        case .deferred(let reason), .blocked(let reason):
+            accountManager.publishActivationNotice(reason)
+            SwapLog.append(.debug(
+                "ACTIVATION_EXTERNAL_HANDOFF_DEFERRED target=\(initialTarget.id.uuidString) reason=\(reason)"
+            ))
+            return .deferred
+        }
+
+        let activationGeneration = UUID()
+        let scoped = await accountMutationTransaction.withActivationLease(
+            targetAccountId: initialTarget.id,
+            activationGeneration: activationGeneration
+        ) { [weak self] lease in
+            guard let self, !self.isExiting else {
+                return ExternalHandoffAdoptionResult.notAdopted
+            }
+            var adoptedState: AccountActivationState?
+            do {
+                let revalidatedAccounts = try await self.accountPersistence
+                    .adoptExternalSnapshot(revision: revision)
+                let revalidatedObservation = await Task.detached(priority: .utility) {
+                    AccountImporter.observeCurrentAccount()
+                }.value
+                guard let revalidatedTarget = Self.verifiedExternalHandoffTarget(
+                    accounts: revalidatedAccounts,
+                    authObservation: revalidatedObservation
+                ),
+                    revalidatedTarget.id == initialTarget.id,
+                    expectedObservedProviderAccountId.map({
+                        $0 == revalidatedTarget.accountId
+                    }) ?? true,
+                    !requiresDifferentJournalTarget
+                        || expectedState.configuredAccountId != revalidatedTarget.id,
+                    await self.accountMutationTransaction.owns(lease) else {
+                    return .notAdopted
+                }
+                guard case .ready = RustActivationJournal.handoffDisposition(
+                    for: revalidatedTarget
+                ) else {
+                    return .notAdopted
+                }
+
+                let adopted = try await self.accountActivationCoordinator
+                    .adoptVerifiedExternalHandoff(
+                        targetAccountId: revalidatedTarget.id,
+                        expectedState: expectedState,
+                        newActivationGeneration: activationGeneration,
+                        authorizeEffect: { [accountMutationTransaction] state in
+                            accountMutationTransaction.leaseAuthorizes(
+                                lease,
+                                targetAccountId: revalidatedTarget.id,
+                                activationGeneration: activationGeneration
+                            ) && state == expectedState
+                        }
+                    )
+                adoptedState = adopted
+
+                let synchronizedAccounts: [CodexAccount]
+                do {
+                    synchronizedAccounts = try await self.accountPersistence
+                        .adoptExternalSnapshot(revision: revision)
+                } catch {
+                    if Self.externalHandoffFinalStoreErrorIsTransient(error) {
+                        throw ExternalHandoffAdoptionError.transientRevalidation
+                    }
+                    throw ExternalHandoffAdoptionError.revalidationFailed
+                }
+                let synchronizedObservation = await Task.detached(priority: .utility) {
+                    AccountImporter.observeCurrentAccount()
+                }.value
+                if Self.externalHandoffFinalObservationIsTransient(
+                    synchronizedObservation
+                ) {
+                    throw ExternalHandoffAdoptionError.transientRevalidation
+                }
+                guard let synchronizedTarget = Self.verifiedExternalHandoffTarget(
+                    accounts: synchronizedAccounts,
+                    authObservation: synchronizedObservation
+                ),
+                synchronizedTarget.id == revalidatedTarget.id,
+                expectedObservedProviderAccountId.map({
+                    $0 == synchronizedTarget.accountId
+                }) ?? true,
+                await self.accountMutationTransaction.owns(lease),
+                try await self.accountActivationCoordinator.load() == adopted,
+                self.accountManager.adoptVerifiedExternalHandoff(
+                    synchronizedAccounts,
+                    targetAccountId: synchronizedTarget.id
+                ) else {
+                    throw ExternalHandoffAdoptionError.revalidationFailed
+                }
+
+                self.accountManager.publishActivationState(adopted)
+                self.swapGeneration &+= 1
+                CLIStatusChecker.invalidateForAccountSwap()
+                SwapLog.append(.debug(
+                    "ACTIVATION_EXTERNAL_HANDOFF_ADOPTED target=\(synchronizedTarget.id.uuidString) previous_target=\(expectedState.configuredAccountId?.uuidString ?? "none")"
+                ))
+                return .adopted(synchronizedTarget)
+            } catch {
+                if let adoptionError = error as? ExternalHandoffAdoptionError,
+                   case .transientRevalidation = adoptionError,
+                   let adoptedState {
+                    self.accountManager.publishActivationState(adoptedState)
+                    SwapLog.append(.debug(
+                        "ACTIVATION_EXTERNAL_HANDOFF_DEFERRED target=\(initialTarget.id.uuidString) reason=transient_final_revalidation"
+                    ))
+                    return .notAdopted
+                }
+                if let adoptedState {
+                    do {
+                        let failed = try await self.accountActivationCoordinator
+                            .failVerifiedExternalHandoff(
+                                targetAccountId: initialTarget.id,
+                                expectedActivationGeneration: activationGeneration,
+                                authorizeEffect: { [accountMutationTransaction] state in
+                                    accountMutationTransaction.leaseAuthorizes(
+                                        lease,
+                                        targetAccountId: initialTarget.id,
+                                        activationGeneration: activationGeneration
+                                    ) && state == adoptedState
+                                }
+                            )
+                        self.accountManager.publishActivationState(failed)
+                    } catch {
+                        do {
+                            self.accountManager.publishActivationState(
+                                try await self.accountActivationCoordinator.load()
+                            )
+                        } catch {
+                            self.accountManager.publishActivationNotice(
+                                "Activation journal changed during external handoff"
+                            )
+                        }
+                    }
+                }
+                SwapLog.append(.debug(
+                    "ACTIVATION_EXTERNAL_HANDOFF_REJECTED target=\(initialTarget.id.uuidString) error=\(error.localizedDescription)"
+                ))
+                return .notAdopted
+            }
+        }
+
+        guard let scoped else {
+            accountManager.publishActivationNotice(
+                "Another account mutation is already in progress"
+            )
+            return .deferred
+        }
+        if case .adopted(let target) = scoped {
+            statusBarController?.updateIcon()
+            updatePopoverContent()
+            return .adopted(target)
+        }
+        return .deferred
     }
 
     private func durableAccountStoreHasNoConfiguredAccount() async -> Bool {
@@ -2385,14 +2717,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @discardableResult
-    private func persistAccountsSnapshot(context: String, log: Bool = true) async -> Bool {
+    private func persistAccountsSnapshot(
+        context: String,
+        expectedCredentialAuthority: [CodexAccount],
+        log: Bool = true
+    ) async -> Bool {
+        guard !externalHandoffAdoptionInFlight else {
+            SwapLog.append(.debug(
+                "ACCOUNTS_PERSIST_BLOCKED context=\(context) reason=external_handoff_adoption"
+            ))
+            return false
+        }
         let accounts = accountManager.accounts
         accountPersistenceRevision &+= 1
         let revision = accountPersistenceRevision
         let outcome: AppDelegateAccountsPersistenceOutcome
         do {
-            try await accountPersistence.persistDurably(accounts, revision: revision)
-            outcome = .persisted
+            switch try await accountPersistence.persistDurably(
+                accounts,
+                ifCredentialAuthorityMatches: expectedCredentialAuthority,
+                revision: revision
+            ) {
+            case .persisted:
+                outcome = .persisted
+            case .discardedCredentialDrift:
+                outcome = .failed(
+                    "credential authority changed before account persistence"
+                )
+                externalAuthReconciliationPending = true
+                SwapLog.append(.debug(
+                    "ACCOUNTS_PERSIST_DISCARDED context=\(context) reason=credential_or_selection_changed"
+                ))
+            }
         } catch {
             outcome = .failed(error.localizedDescription)
         }
@@ -2413,17 +2769,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @discardableResult
     private func persistAuthorizedAccountsSnapshot(
         context: String,
+        expectedCredentialAuthority: [CodexAccount],
         permit: AccountActivationEffectPermit
     ) async -> Bool {
+        guard !externalHandoffAdoptionInFlight else {
+            SwapLog.append(.debug(
+                "ACCOUNTS_PERSIST_BLOCKED context=\(context) reason=external_handoff_adoption"
+            ))
+            return false
+        }
         let accounts = accountManager.accounts
         accountPersistenceRevision &+= 1
         let revision = accountPersistenceRevision
         do {
-            try await accountPersistence.persistDurably(
+            switch try await accountPersistence.persistDurably(
                 accounts,
+                ifCredentialAuthorityMatches: expectedCredentialAuthority,
                 revision: revision,
                 authorizeEffect: { permit.isCurrentlyAuthorized() }
-            )
+            ) {
+            case .persisted:
+                break
+            case .discardedCredentialDrift:
+                externalAuthReconciliationPending = true
+                SwapLog.append(.debug(
+                    "ACCOUNTS_PERSIST_DISCARDED context=\(context) reason=credential_or_selection_changed"
+                ))
+                return false
+            }
             SwapLog.append(.debug(
                 "ACCOUNTS_PERSISTED context=\(context) configured=\(accountManager.configuredAccount?.email ?? "none")"
             ))
@@ -2440,7 +2813,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    @discardableResult
+    private func persistTelemetrySnapshot(context: String) async -> Bool {
+        guard !externalHandoffAdoptionInFlight else { return false }
+        let accounts = accountManager.accounts
+        accountPersistenceRevision &+= 1
+        let revision = accountPersistenceRevision
+        do {
+            let persisted = try await accountPersistence.persistTelemetrySnapshot(
+                accounts,
+                revision: revision
+            )
+            if !persisted {
+                externalAuthReconciliationPending = true
+                SwapLog.append(.debug(
+                    "ACCOUNTS_TELEMETRY_DISCARDED context=\(context) reason=credential_or_selection_changed"
+                ))
+            }
+            return persisted
+        } catch {
+            SwapLog.append(.debug(
+                "ACCOUNTS_PERSIST_FAILED context=\(context) error=\(error.localizedDescription)"
+            ))
+            return false
+        }
+    }
+
     private func queueTelemetryPersistence(context _: String) {
+        guard !externalHandoffAdoptionInFlight else { return }
         let accounts = accountManager.accounts
         accountPersistenceRevision &+= 1
         let revision = accountPersistenceRevision
@@ -3019,7 +3419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         targetAccountId: account.id,
                         expectedConfiguredAccountId: activatesFirstAccount ? nil : duplicate?.id,
                         source: activatesFirstAccount ? "first-account" : "duplicate-active-account",
-                        isManual: true
+                        requestKind: .manual
                     ) { [weak self] prepared in
                         guard let self else { return false }
                         return await self.commitConfiguredCredentialMutation(
@@ -3048,7 +3448,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         accountManager.accounts = previousAccounts
                         return
                     }
-                    guard await persistAccountsSnapshot(context: "add-account") else {
+                    guard await persistAccountsSnapshot(
+                        context: "add-account",
+                        expectedCredentialAuthority: previousAccounts
+                    ) else {
                         accountManager.accounts = previousAccounts
                         return
                     }
@@ -3176,6 +3579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func refreshToken(for accountId: UUID) async {
         guard !isExiting else { return }
+        let credentialAuthorityBeforeRefresh = accountManager.accounts
         guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
         guard !account.isRuntimeUnusable else {
             await quotaPoller.stopPolling(for: accountId)
@@ -3196,7 +3600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 targetAccountId: account.id,
                 expectedConfiguredAccountId: account.id,
                 source: "token-refresh",
-                isManual: false
+                requestKind: .automatic
             ) { [weak self] prepared in
                 guard let self else { return false }
                 do {
@@ -3267,7 +3671,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if case .rejectedConfiguredAccount = accountManager.upsertInactiveAccount(updated) {
                 return
             }
-            guard await persistAccountsSnapshot(context: "token-refresh") else { return }
+            guard await persistAccountsSnapshot(
+                context: "token-refresh",
+                expectedCredentialAuthority: credentialAuthorityBeforeRefresh
+            ) else { return }
             refreshSubscriptionInfoIfNeeded(force: true)
             SwapLog.append(.tokenRefreshed(email: account.email))
             startPollingForAccount(accountId)
@@ -3292,7 +3699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 until: Date().addingTimeInterval(30 * 24 * 60 * 60)
             )
             accountManager.updatePollingError(for: account.id, error: "Re-authentication required")
-            _ = await persistAccountsSnapshot(context: "token-refresh-failed")
+            _ = await persistTelemetrySnapshot(context: "token-refresh-failed")
             updatePopoverContent()
             if shouldNotify {
                 NotificationManager.notifyTokenRefreshFailed(account: account)
@@ -4051,7 +4458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             switch outcome {
             case .pendingPersistence(let attempt):
                 accountManager.clearRuntimeUnusable(for: accountId)
-                guard await persistAccountsSnapshot(context: "reset-reconciled") else {
+                guard await persistTelemetrySnapshot(context: "reset-reconciled") else {
                     SwapLog.append(.debug(
                         "RESET_RECONCILIATION_PERSISTENCE_PENDING account=\(account.email) attempt=\(attempt.id.uuidString) source=\(source) automatic_redemption=suppressed"
                     ))
@@ -5617,7 +6024,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         targetAccountId: UUID,
         expectedConfiguredAccountId: UUID?,
         source: String,
-        isManual: Bool,
+        requestKind: AccountActivationRequestKind,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil,
         operation: @escaping @MainActor @Sendable (PreparedAccountActivation) async -> Bool
     ) async -> Bool {
@@ -5645,7 +6052,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 targetAccountId: targetAccountId,
                 expectedConfiguredAccountId: expectedConfiguredAccountId,
                 source: source,
-                isManual: isManual,
+                requestKind: requestKind,
                 activationGeneration: activationGeneration,
                 lease: lease,
                 policyAuthority: policyAuthority
@@ -5669,9 +6076,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .completed(let succeeded):
             return succeeded
         case .retrySameTarget:
-            if isManual,
+            if requestKind == .manual,
                let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) {
-                await startSameTargetRuntimeRetry(to: target, source: "manual")
+                await startSameTargetRuntimeRetry(
+                    to: target,
+                    source: "manual"
+                )
             }
             return false
         case .blocked:
@@ -5683,7 +6093,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         targetAccountId: UUID,
         expectedConfiguredAccountId: UUID?,
         source: String,
-        isManual: Bool,
+        requestKind: AccountActivationRequestKind,
         activationGeneration: UUID,
         lease: AccountMutationLease,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil
@@ -5699,7 +6109,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         do {
-            let requestKind: AccountActivationRequestKind = isManual ? .manual : .automatic
             let decision = try await accountActivationCoordinator
                 .beginAuthorizedCredentialMutation(
                 targetAccountId: targetAccountId,
@@ -5867,7 +6276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 targetAccountId: to.id,
                 expectedConfiguredAccountId: from.id,
                 source: "swap",
-                isManual: isManual,
+                requestKind: isManual ? .manual : .automatic,
                 policyAuthority: isManual ? nil : automaticPolicyLease?.authority
             ) { [weak self] prepared in
                 guard let self else { return false }
@@ -6067,6 +6476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         recordsSwap: Bool,
         committedDetail: AccountActivationDetail = .runtimeConfirmationPending
     ) async -> Bool {
+        let expectedCredentialAuthority = accountManager.accounts
         let result = await accountMutationTransaction.commitConfiguredCredentials(
             AccountActivationCommitOperations(
                 authorizeMutation: { [weak self] in
@@ -6108,6 +6518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 persistAccountStore: { [weak self] permit in
                     await self?.persistAuthorizedAccountsSnapshot(
                         context: persistenceContext,
+                        expectedCredentialAuthority: expectedCredentialAuthority,
                         permit: permit
                     ) == true
                 },
@@ -6539,6 +6950,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return nil
         }
         return observedTargetAccountId
+    }
+
+    nonisolated static func externalHandoffFollowUp(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        observedTargetAccountId: UUID
+    ) -> ExternalHandoffFollowUp {
+        guard let state else { return .none }
+        if state.configuredAccountId != observedTargetAccountId {
+            return .adopt
+        }
+        if state.phase == .committedDegraded,
+           state.detail == .externalAuthObserved,
+           configuredAccountId == observedTargetAccountId {
+            return .retryRuntime
+        }
+        return .none
+    }
+
+    nonisolated static func externalHandoffFinalObservationIsTransient(
+        _ observation: AccountAuthObservation
+    ) -> Bool {
+        switch observation {
+        case .invalid(let reason):
+            return reason.isRetryableObservationFailure
+        case .unreadable:
+            return true
+        case .valid, .absent:
+            return false
+        }
+    }
+
+    nonisolated static func externalHandoffFinalStoreErrorIsTransient(
+        _ error: Error
+    ) -> Bool {
+        if error as? AccountPersistenceCoordinatorError == .authorizationLost {
+            return true
+        }
+        guard let keychainError = error as? KeychainError else { return false }
+        switch keychainError {
+        case .lockTimedOut, .staleGeneration, .runtimeActivationLeaseUnavailable:
+            return true
+        case .lockFailed(_, _, let code), .fileOperationFailed(_, _, let code):
+            return code == EINTR
+                || code == EAGAIN
+                || code == EBUSY
+                || code == ESTALE
+        case .saveFailed, .loadFailed, .deleteFailed,
+             .duplicateAccountId, .duplicateLocalId, .missingAccountId,
+             .missingLocalId, .invalidLegacyCredentialResult,
+             .invalidActiveAccountCount, .unsafePath, .readbackMismatch:
+            return false
+        }
+    }
+
+    nonisolated static func verifiedExternalHandoffTarget(
+        accounts: [CodexAccount],
+        authObservation: AccountAuthObservation
+    ) -> CodexAccount? {
+        guard case .valid(let observed) = authObservation,
+              let target = accounts.first(where: \.isActive),
+              accountStoreMatches(account: target, accounts: accounts),
+              credentialsMatch(target, observed) else {
+            return nil
+        }
+        return target
     }
 
     struct RetryExhaustedTopologyBaseline: Equatable {
@@ -7094,6 +7571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func reauthenticateAccount(_ accountId: UUID) {
         guard !isExiting else { return }
         guard let original = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
+        let credentialAuthorityBeforeLogin = accountManager.accounts
 
         Task { @MainActor [weak self] in
             guard let self, !self.isExiting else { return }
@@ -7108,7 +7586,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             until: Date().addingTimeInterval(30 * 24 * 60 * 60)
                         )
                         accountManager.updatePollingError(for: accountId, error: "Re-authentication required")
-                        _ = await persistAccountsSnapshot(context: "reauth-validation-failed")
+                        _ = await persistTelemetrySnapshot(
+                            context: "reauth-validation-failed"
+                        )
                         statusBarController.updateIcon()
                         updatePopoverContent()
                         SwapLog.append(.debug("ACCOUNT_REAUTH_VALIDATION_FAILED email=\(original.email) error=\(String(describing: validationError))"))
@@ -7135,7 +7615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                 targetAccountId: candidate.id,
                                 expectedConfiguredAccountId: original.id,
                                 source: "reauthentication",
-                                isManual: true
+                                requestKind: .manual
                             ) { [weak self] prepared in
                                 guard let self else { return false }
                                 return await self.commitConfiguredCredentialMutation(
@@ -7175,7 +7655,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             )
                         }
                         if !reauthenticatesActiveAccount {
-                            guard await persistAccountsSnapshot(context: "reauth-account") else {
+                            guard await persistAccountsSnapshot(
+                                context: "reauth-account",
+                                expectedCredentialAuthority: credentialAuthorityBeforeLogin
+                            ) else {
                                 return
                             }
                         } else {
@@ -7221,7 +7704,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         }
                         if accountManager.configuredAccount?.id != candidate.id,
                            !(await persistAccountsSnapshot(
-                               context: "reauth-added-different-account"
+                               context: "reauth-added-different-account",
+                               expectedCredentialAuthority: credentialAuthorityBeforeLogin
                            )) {
                             return
                         }
@@ -7544,15 +8028,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func removeAllAccountsDurably() async {
-        let emails = accountManager.accounts.map(\.email)
-        accountPersistenceRevision &+= 1
-        let revision = accountPersistenceRevision
+        let expectedCredentialAuthority = accountManager.accounts
+        guard let accountId = accountManager.configuredAccount?.id
+                ?? expectedCredentialAuthority.first?.id else {
+            return
+        }
+        let emails = expectedCredentialAuthority.map(\.email)
+        let deletionOutcome: AccountTelemetryPersistenceOutcome?
         do {
-            try await accountPersistence.deleteAllDurably(revision: revision)
+            deletionOutcome = try await accountMutationTransaction
+                .withAccountStoreDeletionLease(
+                    accountId: accountId,
+                    mutationGeneration: UUID()
+                ) { [self] _ in
+                    accountPersistenceRevision &+= 1
+                    return try await accountPersistence.deleteAllDurably(
+                        ifCredentialAuthorityMatches: expectedCredentialAuthority,
+                        revision: accountPersistenceRevision
+                    )
+                }
         } catch {
             logger.error("Failed to clear account stores: \(error.localizedDescription)")
             SwapLog.append(.debug(
                 "ACCOUNTS_DELETE_ALL_FAILED error=\(error.localizedDescription)"
+            ))
+            return
+        }
+        guard let deletionOutcome else {
+            SwapLog.append(.debug(
+                "ACCOUNTS_DELETE_ALL_BLOCKED reason=account_mutation_in_progress"
+            ))
+            return
+        }
+        guard case .persisted = deletionOutcome else {
+            externalAuthReconciliationPending = true
+            SwapLog.append(.debug(
+                "ACCOUNTS_DELETE_ALL_DISCARDED reason=credential_or_selection_changed"
             ))
             return
         }

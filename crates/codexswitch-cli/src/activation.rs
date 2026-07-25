@@ -119,6 +119,24 @@ pub struct ActivationBarrierContext<'a> {
     pub reload_enabled: bool,
 }
 
+pub(crate) struct RuntimeActivationLease {
+    _guard: secure_file::SecureFileLock,
+    store_path: PathBuf,
+}
+
+impl RuntimeActivationLease {
+    fn require_store(&self, store_path: &Path) -> Result<()> {
+        if self.store_path != store_path {
+            bail!(
+                "runtime-activation lease belongs to {}, not {}",
+                self.store_path.display(),
+                store_path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActivationJournalIdentity {
     generation: SecureFileGeneration,
@@ -198,11 +216,24 @@ impl ObservedReload {
 
 pub fn reconcile_activation_barrier<R>(
     context: ActivationBarrierContext<'_>,
+    reload: R,
+) -> Result<Option<ActivationOutcome>>
+where
+    R: FnMut(&Path) -> Result<ReloadSummary>,
+{
+    let runtime_lease = acquire_runtime_activation_lease(context.store_lock.store_path())?;
+    reconcile_activation_barrier_under_runtime_lease(&runtime_lease, context, reload)
+}
+
+fn reconcile_activation_barrier_under_runtime_lease<R>(
+    runtime_lease: &RuntimeActivationLease,
+    context: ActivationBarrierContext<'_>,
     mut reload: R,
 ) -> Result<Option<ActivationOutcome>>
 where
     R: FnMut(&Path) -> Result<ReloadSummary>,
 {
+    runtime_lease.require_store(context.store_lock.store_path())?;
     reconcile_activation_barrier_with(context, &mut reload)
         .map(|resolution| resolution.map(|(_, outcome)| outcome))
 }
@@ -372,7 +403,28 @@ pub(crate) fn reconcile_activation_barrier_unlocked<R>(
 where
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
-    reconcile_activation_barrier_unlocked_with_topology(
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    reconcile_activation_barrier_unlocked_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        reload_enabled,
+        reload,
+    )
+}
+
+pub(crate) fn reconcile_activation_barrier_unlocked_under_runtime_lease<R>(
+    runtime_lease: &RuntimeActivationLease,
+    store_path: &Path,
+    auth_path: &Path,
+    reload_enabled: bool,
+    reload: &R,
+) -> Result<Option<ActivationOutcome>>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    reconcile_activation_barrier_unlocked_with_topology_under_runtime_lease(
+        runtime_lease,
         store_path,
         auth_path,
         reload_enabled,
@@ -381,7 +433,8 @@ where
     )
 }
 
-fn reconcile_activation_barrier_unlocked_with_topology<R, T>(
+fn reconcile_activation_barrier_unlocked_with_topology_under_runtime_lease<R, T>(
+    runtime_lease: &RuntimeActivationLease,
     store_path: &Path,
     auth_path: &Path,
     reload_enabled: bool,
@@ -392,12 +445,14 @@ where
     R: Fn(&Path) -> Result<ReloadSummary>,
     T: Fn(&ReloadSummary, &Path) -> Result<()>,
 {
+    runtime_lease.require_store(store_path)?;
     let prepared = {
         let store_lock = crate::account_store::lock_account_store(store_path)?;
         let snapshot = store_lock.load()?;
         let mut generation = snapshot.generation;
         let mut accounts = snapshot.accounts;
-        let outcome = reconcile_activation_barrier(
+        let outcome = reconcile_activation_barrier_under_runtime_lease(
+            runtime_lease,
             ActivationBarrierContext {
                 store_lock: &store_lock,
                 generation: &mut generation,
@@ -452,7 +507,34 @@ pub(crate) fn activate_with_unlocked_reload<R>(
 where
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
-    activate_with_unlocked_reload_with_topology(
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    activate_with_unlocked_reload_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        generation,
+        accounts,
+        target_id,
+        reload_enabled,
+        reload,
+    )
+}
+
+pub(crate) fn activate_with_unlocked_reload_under_runtime_lease<R>(
+    runtime_lease: &RuntimeActivationLease,
+    store_path: &Path,
+    auth_path: &Path,
+    generation: &mut AccountStoreGeneration,
+    accounts: &mut [CodexAccount],
+    target_id: Uuid,
+    reload_enabled: bool,
+    reload: &R,
+) -> Result<ActivationOutcome>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    activate_with_unlocked_reload_with_topology_under_runtime_lease(
+        runtime_lease,
         store_path,
         auth_path,
         generation,
@@ -464,6 +546,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn activate_with_unlocked_reload_with_topology<R, T>(
     store_path: &Path,
     auth_path: &Path,
@@ -478,13 +561,44 @@ where
     R: Fn(&Path) -> Result<ReloadSummary>,
     T: Fn(&ReloadSummary, &Path) -> Result<()>,
 {
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    activate_with_unlocked_reload_with_topology_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        generation,
+        accounts,
+        target_id,
+        reload_enabled,
+        reload,
+        revalidate_topology,
+    )
+}
+
+fn activate_with_unlocked_reload_with_topology_under_runtime_lease<R, T>(
+    runtime_lease: &RuntimeActivationLease,
+    store_path: &Path,
+    auth_path: &Path,
+    generation: &mut AccountStoreGeneration,
+    accounts: &mut [CodexAccount],
+    target_id: Uuid,
+    reload_enabled: bool,
+    reload: &R,
+    revalidate_topology: T,
+) -> Result<ActivationOutcome>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+    T: Fn(&ReloadSummary, &Path) -> Result<()>,
+{
+    runtime_lease.require_store(store_path)?;
     let (prepared, expected_identity) = {
         let store_lock = crate::account_store::lock_account_store(store_path)?;
         let current = store_lock.load()?;
         if current.generation != *generation {
             bail!("account store changed before activation commit; retry from a fresh snapshot");
         }
-        let outcome = activate_with(
+        let outcome = activate_with_under_runtime_lease(
+            runtime_lease,
             ActivationContext {
                 store_lock: &store_lock,
                 generation,
@@ -566,6 +680,7 @@ where
     R: Fn(&Path) -> Result<ReloadSummary>,
     T: Fn(&ReloadSummary, &Path) -> Result<()>,
 {
+    let _runtime_activation_lease = acquire_runtime_activation_lease(store_path)?;
     let expected = {
         let store_lock = crate::account_store::lock_account_store(store_path)?;
         let record = read_activation_record(&store_lock)?
@@ -684,10 +799,24 @@ pub fn activate_with<R>(context: ActivationContext<'_>, reload: R) -> Result<Act
 where
     R: FnMut(&Path) -> Result<ReloadSummary>,
 {
-    activate_with_dependencies(context, commit_auth_file, reload)
+    let runtime_lease = acquire_runtime_activation_lease(context.store_lock.store_path())?;
+    activate_with_under_runtime_lease(&runtime_lease, context, reload)
+}
+
+pub(crate) fn activate_with_under_runtime_lease<R>(
+    runtime_lease: &RuntimeActivationLease,
+    context: ActivationContext<'_>,
+    reload: R,
+) -> Result<ActivationOutcome>
+where
+    R: FnMut(&Path) -> Result<ReloadSummary>,
+{
+    runtime_lease.require_store(context.store_lock.store_path())?;
+    activate_with_dependencies(runtime_lease, context, commit_auth_file, reload)
 }
 
 fn activate_with_dependencies<A, R>(
+    runtime_lease: &RuntimeActivationLease,
     context: ActivationContext<'_>,
     mut commit_auth: A,
     mut reload: R,
@@ -704,6 +833,7 @@ where
         target_id,
         reload_enabled,
     } = context;
+    runtime_lease.require_store(store_lock.store_path())?;
     if let Some((durable_target_id, outcome)) = reconcile_activation_barrier_with(
         ActivationBarrierContext {
             store_lock,
@@ -964,12 +1094,40 @@ pub fn replace_accounts_with<R>(
     replacement_accounts: Vec<CodexAccount>,
     auth_path: &Path,
     reload_enabled: bool,
+    reload: R,
+) -> Result<ActivationOutcome>
+where
+    R: FnMut(&Path) -> Result<ReloadSummary>,
+{
+    let runtime_lease = acquire_runtime_activation_lease(store_lock.store_path())?;
+    replace_accounts_with_under_runtime_lease(
+        &runtime_lease,
+        store_lock,
+        generation,
+        current_accounts,
+        replacement_accounts,
+        auth_path,
+        reload_enabled,
+        reload,
+    )
+}
+
+pub(crate) fn replace_accounts_with_under_runtime_lease<R>(
+    runtime_lease: &RuntimeActivationLease,
+    store_lock: &AccountStoreLock,
+    generation: &mut AccountStoreGeneration,
+    current_accounts: &mut Vec<CodexAccount>,
+    replacement_accounts: Vec<CodexAccount>,
+    auth_path: &Path,
+    reload_enabled: bool,
     mut reload: R,
 ) -> Result<ActivationOutcome>
 where
     R: FnMut(&Path) -> Result<ReloadSummary>,
 {
+    runtime_lease.require_store(store_lock.store_path())?;
     replace_accounts_with_dependencies(
+        runtime_lease,
         store_lock,
         generation,
         current_accounts,
@@ -982,6 +1140,7 @@ where
 }
 
 fn replace_accounts_with_dependencies<A, R>(
+    runtime_lease: &RuntimeActivationLease,
     store_lock: &AccountStoreLock,
     generation: &mut AccountStoreGeneration,
     current_accounts: &mut Vec<CodexAccount>,
@@ -995,6 +1154,7 @@ where
     A: FnMut(&Path, &CodexAccount) -> Result<AuthFileCommit>,
     R: FnMut(&Path) -> Result<ReloadSummary>,
 {
+    runtime_lease.require_store(store_lock.store_path())?;
     if let Some(recovered) = recover_prepared_activation(store_lock, auth_path)? {
         *generation = recovered.generation;
         *current_accounts = recovered.accounts;
@@ -2098,6 +2258,24 @@ pub fn activation_record_path(store_path: &Path) -> PathBuf {
     store_path.with_extension("activation.json")
 }
 
+fn runtime_activation_lease_path(store_path: &Path) -> PathBuf {
+    store_path.with_extension("runtime-activation")
+}
+
+pub(crate) fn acquire_runtime_activation_lease(
+    store_path: &Path,
+) -> Result<RuntimeActivationLease> {
+    let guard = secure_file::try_lock(&runtime_activation_lease_path(store_path), true)
+        .context("failed to acquire the cross-process runtime-activation lease")?
+        .context(
+            "runtime activation is busy: another process owns the cross-process runtime-activation lease",
+        )?;
+    Ok(RuntimeActivationLease {
+        _guard: guard,
+        store_path: store_path.to_path_buf(),
+    })
+}
+
 fn provider_io_lease_path(store_path: &Path) -> PathBuf {
     store_path.with_extension("provider-io")
 }
@@ -2266,8 +2444,13 @@ pub(crate) fn commit_accounts_preserving_confirmed_generation_continuity(
     accounts: &[CodexAccount],
     auth_path: &Path,
 ) -> Result<()> {
-    commit_accounts_with_confirmed_generation_continuity(
-        store_lock, generation, accounts, auth_path,
+    let runtime_lease = acquire_runtime_activation_lease(store_lock.store_path())?;
+    commit_accounts_with_confirmed_generation_continuity_under_runtime_lease(
+        &runtime_lease,
+        store_lock,
+        generation,
+        accounts,
+        auth_path,
     )
 }
 
@@ -2278,6 +2461,26 @@ pub(crate) fn commit_accounts_with_provider_io_activation(
     auth_path: &Path,
     guard: &ProviderIoActivationGuard,
 ) -> Result<()> {
+    let runtime_lease = acquire_runtime_activation_lease(store_lock.store_path())?;
+    commit_accounts_with_provider_io_activation_under_runtime_lease(
+        &runtime_lease,
+        store_lock,
+        generation,
+        accounts,
+        auth_path,
+        guard,
+    )
+}
+
+pub(crate) fn commit_accounts_with_provider_io_activation_under_runtime_lease(
+    runtime_lease: &RuntimeActivationLease,
+    store_lock: &AccountStoreLock,
+    generation: &mut AccountStoreGeneration,
+    accounts: &[CodexAccount],
+    auth_path: &Path,
+    guard: &ProviderIoActivationGuard,
+) -> Result<()> {
+    runtime_lease.require_store(store_lock.store_path())?;
     validate_provider_io_activation_locked(store_lock, auth_path, guard)
         .context("account-store commit refused a changed provider-I/O activation guard")?;
     if generation.as_str() != guard.store_generation.as_str() {
@@ -2304,6 +2507,24 @@ pub(crate) fn commit_accounts_with_confirmed_generation_continuity(
     accounts: &[CodexAccount],
     auth_path: &Path,
 ) -> Result<()> {
+    let runtime_lease = acquire_runtime_activation_lease(store_lock.store_path())?;
+    commit_accounts_with_confirmed_generation_continuity_under_runtime_lease(
+        &runtime_lease,
+        store_lock,
+        generation,
+        accounts,
+        auth_path,
+    )
+}
+
+pub(crate) fn commit_accounts_with_confirmed_generation_continuity_under_runtime_lease(
+    runtime_lease: &RuntimeActivationLease,
+    store_lock: &AccountStoreLock,
+    generation: &mut AccountStoreGeneration,
+    accounts: &[CodexAccount],
+    auth_path: &Path,
+) -> Result<()> {
+    runtime_lease.require_store(store_lock.store_path())?;
     let record = read_activation_record(store_lock)?
         .context("account-store commit requires a current Confirmed activation record")?;
     commit_accounts_from_confirmed_record_with(
@@ -2498,6 +2719,123 @@ mod tests {
         Ok(())
     }
 
+    fn assert_runtime_activation_lease_busy(store_path: &Path) -> Result<()> {
+        let error = acquire_runtime_activation_lease(store_path)
+            .err()
+            .context("runtime-activation lease was unexpectedly acquirable")?;
+        if !format!("{error:#}").contains("runtime activation is busy") {
+            bail!("runtime-activation contention returned an unclear error: {error:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_lease_serializes_unlocked_owners_and_releases() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let candidate = account("candidate@example.com", false);
+        save_accounts(&store_path, &[active.clone(), candidate.clone()])?;
+        commit_auth_file(&auth_path, &active)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let reload_calls = Cell::new(0usize);
+        let owner = acquire_runtime_activation_lease(&store_path)?;
+
+        assert_eq!(
+            runtime_activation_lease_path(&store_path),
+            dir.path().join("accounts.runtime-activation")
+        );
+        assert!(dir.path().join("accounts.runtime-activation.lock").exists());
+
+        let reconcile_error =
+            reconcile_activation_barrier_unlocked(&store_path, &auth_path, true, &|_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default())
+            })
+            .unwrap_err();
+        assert!(format!("{reconcile_error:#}").contains("runtime activation is busy"));
+
+        let activation_error = activate_with_unlocked_reload(
+            &store_path,
+            &auth_path,
+            &mut generation,
+            &mut accounts,
+            candidate.id,
+            true,
+            &|_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{activation_error:#}").contains("runtime activation is busy"));
+
+        let manual_review_error =
+            resolve_manual_review_activation_unlocked(&store_path, &auth_path, &|_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default())
+            })
+            .unwrap_err();
+        assert!(format!("{manual_review_error:#}").contains("runtime activation is busy"));
+
+        let store_lock = lock_account_store(&store_path)?;
+        let direct_activation_error = activate_with(
+            ActivationContext {
+                store_lock: &store_lock,
+                generation: &mut generation,
+                accounts: &mut accounts,
+                auth_path: &auth_path,
+                target_id: candidate.id,
+                reload_enabled: false,
+            },
+            |_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{direct_activation_error:#}").contains("runtime activation is busy"));
+
+        let direct_replace_error = replace_accounts_with(
+            &store_lock,
+            &mut generation,
+            &mut accounts,
+            vec![active.clone()],
+            &auth_path,
+            false,
+            |_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{direct_replace_error:#}").contains("runtime activation is busy"));
+
+        let provider_guard = ProviderIoActivationGuard {
+            store_generation: generation.clone(),
+            journal: observe_activation_record_for_store(&store_path)?.identity,
+        };
+        let provider_commit_error = commit_accounts_with_provider_io_activation(
+            &store_lock,
+            &mut generation,
+            &accounts,
+            &auth_path,
+            &provider_guard,
+        )
+        .unwrap_err();
+        assert!(format!("{provider_commit_error:#}").contains("runtime activation is busy"));
+        assert_eq!(reload_calls.get(), 0);
+        drop(store_lock);
+
+        drop(owner);
+        let successor = acquire_runtime_activation_lease(&store_path)?;
+        drop(successor);
+        Ok(())
+    }
+
     #[test]
     fn unlocked_activation_runs_reload_and_final_topology_proof_without_store_lock() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2522,6 +2860,7 @@ mod tests {
             true,
             &move |_| {
                 assert_store_lock_available(&reload_store_path)?;
+                assert_runtime_activation_lease_busy(&reload_store_path)?;
                 Ok(ReloadSummary::default()
                     .with_sighup_sent(vec![42])
                     .with_signaled(vec![42])
@@ -2529,6 +2868,7 @@ mod tests {
             },
             move |summary, _| {
                 assert_store_lock_available(&topology_store_path)?;
+                assert_runtime_activation_lease_busy(&topology_store_path)?;
                 if !summary.has_bound_activation_proof() {
                     bail!("topology proof received unbound runtime evidence");
                 }
@@ -2541,6 +2881,8 @@ mod tests {
             read_activation_record_for_store(&store_path)?.map(|record| record.state),
             Some(ActivationState::Confirmed)
         );
+        let successor = acquire_runtime_activation_lease(&store_path)?;
+        drop(successor);
         Ok(())
     }
 
@@ -3653,6 +3995,7 @@ mod tests {
             &auth_path,
             &move |_| {
                 assert_store_lock_available(&reload_store_path)?;
+                assert_runtime_activation_lease_busy(&reload_store_path)?;
                 Ok(ReloadSummary::default()
                     .with_sighup_sent(vec![42])
                     .with_signaled(vec![42])
@@ -3660,6 +4003,7 @@ mod tests {
             },
             move |summary, _| {
                 assert_store_lock_available(&topology_store_path)?;
+                assert_runtime_activation_lease_busy(&topology_store_path)?;
                 if !summary.has_bound_activation_proof() {
                     bail!("manual-resolution topology proof was not activation-bound");
                 }
@@ -3672,6 +4016,8 @@ mod tests {
             read_activation_record_for_store(&store_path)?.map(|record| record.state),
             Some(ActivationState::Confirmed)
         );
+        let successor = acquire_runtime_activation_lease(&store_path)?;
+        drop(successor);
         Ok(())
     }
 
@@ -3851,8 +4197,10 @@ mod tests {
         let mut generation = snapshot.generation;
         let mut accounts = snapshot.accounts;
         let target_id = accounts[1].id;
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
 
         let outcome = activate_with_dependencies(
+            &runtime_lease,
             ActivationContext {
                 store_lock: &store_lock,
                 generation: &mut generation,
@@ -3896,8 +4244,10 @@ mod tests {
         let snapshot = store_lock.load()?;
         let mut generation = snapshot.generation;
         let mut accounts = snapshot.accounts;
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
 
         let outcome = activate_with_dependencies(
+            &runtime_lease,
             ActivationContext {
                 store_lock: &store_lock,
                 generation: &mut generation,
@@ -3950,8 +4300,10 @@ mod tests {
         let mut current_accounts = snapshot.accounts;
         let replacement = vec![account("imported@example.com", true)];
         let reload_calls = std::cell::Cell::new(0usize);
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
 
         let outcome = replace_accounts_with_dependencies(
+            &runtime_lease,
             &store_lock,
             &mut generation,
             &mut current_accounts,

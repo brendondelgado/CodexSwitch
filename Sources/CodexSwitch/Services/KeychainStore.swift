@@ -4,6 +4,11 @@ import os
 
 private let logger = Logger(subsystem: "com.codexswitch", category: "AccountStore")
 
+enum AccountTelemetryPersistenceOutcome: Sendable {
+    case persisted([CodexAccount])
+    case discardedCredentialDrift([CodexAccount])
+}
+
 /// File-based account storage at ~/.codexswitch/accounts.json (600 permissions).
 /// Migrates from legacy Keychain on first load.
 struct KeychainStore: Sendable {
@@ -107,6 +112,33 @@ struct KeychainStore: Sendable {
     }
 
     func loadAll() throws -> [CodexAccount] {
+        let existing = try withExclusiveLock { lockedFile in
+            try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+        }
+        guard existing.bytes == nil else {
+            return existing.accounts
+        }
+        let leaseURL = URL(fileURLWithPath: storePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("accounts.runtime-activation.lock")
+        if AccountActivationCrossProcessLeaseContext.holds(leaseURL) {
+            return try loadAllMigratingLegacyCredentials()
+        }
+        guard let crossProcessLease =
+                AccountActivationCrossProcessLease.acquireForAccountMutation(
+                    at: leaseURL
+                ) else {
+            throw KeychainError.runtimeActivationLeaseUnavailable(path: leaseURL.path)
+        }
+        defer { crossProcessLease.release() }
+        return try AccountActivationCrossProcessLeaseContext.$heldLease.withValue(
+            crossProcessLease
+        ) {
+            try loadAllMigratingLegacyCredentials()
+        }
+    }
+
+    private func loadAllMigratingLegacyCredentials() throws -> [CodexAccount] {
         try withExclusiveLock { lockedFile in
             try loadSnapshotOrMigrate(lockedFile: lockedFile).accounts
         }
@@ -167,6 +199,26 @@ struct KeychainStore: Sendable {
         }
     }
 
+    func deleteAll(
+        ifCredentialAuthorityMatches expectedAccounts: [CodexAccount]
+    ) throws -> AccountTelemetryPersistenceOutcome {
+        try withExclusiveLock { lockedFile in
+            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+            guard Self.credentialAuthorityMatches(
+                snapshot.accounts,
+                expectedAccounts
+            ) else {
+                return .discardedCredentialDrift(snapshot.accounts)
+            }
+            try deleteStore(
+                expectedGeneration: snapshot.generation,
+                lockedFile: lockedFile
+            )
+            try deleteLegacyKeychainItem()
+            return .persisted([])
+        }
+    }
+
     func saveAll(_ accounts: [CodexAccount]) throws {
         try withExclusiveLock { lockedFile in
             let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
@@ -175,6 +227,47 @@ struct KeychainStore: Sendable {
                 expectedGeneration: snapshot.generation,
                 lockedFile: lockedFile
             )
+        }
+    }
+
+    func saveAll(
+        _ accounts: [CodexAccount],
+        ifCredentialAuthorityMatches expectedAccounts: [CodexAccount]
+    ) throws -> AccountTelemetryPersistenceOutcome {
+        try withExclusiveLock { lockedFile in
+            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+            guard Self.credentialAuthorityMatches(
+                snapshot.accounts,
+                expectedAccounts
+            ) else {
+                return .discardedCredentialDrift(snapshot.accounts)
+            }
+            let committed = try commit(
+                accounts,
+                expectedGeneration: snapshot.generation,
+                lockedFile: lockedFile
+            )
+            return .persisted(committed.accounts)
+        }
+    }
+
+    func saveTelemetry(
+        _ observedAccounts: [CodexAccount]
+    ) throws -> AccountTelemetryPersistenceOutcome {
+        try withExclusiveLock { lockedFile in
+            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+            guard let merged = Self.mergingTelemetry(
+                from: observedAccounts,
+                into: snapshot.accounts
+            ) else {
+                return .discardedCredentialDrift(snapshot.accounts)
+            }
+            let committed = try commit(
+                merged,
+                expectedGeneration: snapshot.generation,
+                lockedFile: lockedFile
+            )
+            return .persisted(committed.accounts)
         }
     }
 
@@ -422,6 +515,68 @@ struct KeychainStore: Sendable {
             return cleaned
         }
     }
+
+    private static func mergingTelemetry(
+        from observedAccounts: [CodexAccount],
+        into durableAccounts: [CodexAccount]
+    ) -> [CodexAccount]? {
+        guard observedAccounts.count == durableAccounts.count else { return nil }
+        var observedById: [UUID: CodexAccount] = [:]
+        for account in observedAccounts {
+            guard observedById.updateValue(account, forKey: account.id) == nil else {
+                return nil
+            }
+        }
+
+        return try? durableAccounts.map { durable in
+            guard let observed = observedById[durable.id],
+                  observed.accountId == durable.accountId,
+                  observed.accessToken == durable.accessToken,
+                  observed.refreshToken == durable.refreshToken,
+                  observed.idToken == durable.idToken,
+                  observed.isActive == durable.isActive else {
+                throw TelemetryMergeError.credentialDrift
+            }
+            var merged = durable
+            merged.quotaSnapshot = observed.quotaSnapshot
+            merged.planType = observed.planType
+            merged.lastRefreshed = observed.lastRefreshed
+            merged.subscriptionRenewsAt = observed.subscriptionRenewsAt
+            merged.subscriptionExpiresAt = observed.subscriptionExpiresAt
+            merged.subscriptionWillRenew = observed.subscriptionWillRenew
+            merged.hasActiveSubscription = observed.hasActiveSubscription
+            merged.fiveHourPrimedAt = observed.fiveHourPrimedAt
+            merged.rateLimitResetBank = observed.rateLimitResetBank
+            merged.runtimeUnusableUntil = observed.runtimeUnusableUntil
+            merged.runtimeUnusableReason = observed.runtimeUnusableReason
+            return merged
+        }
+    }
+
+    private static func credentialAuthorityMatches(
+        _ lhs: [CodexAccount],
+        _ rhs: [CodexAccount]
+    ) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        var rhsById: [UUID: CodexAccount] = [:]
+        for account in rhs {
+            guard rhsById.updateValue(account, forKey: account.id) == nil else {
+                return false
+            }
+        }
+        return lhs.allSatisfy { account in
+            guard let expected = rhsById[account.id] else { return false }
+            return account.accountId == expected.accountId
+                && account.accessToken == expected.accessToken
+                && account.refreshToken == expected.refreshToken
+                && account.idToken == expected.idToken
+                && account.isActive == expected.isActive
+        }
+    }
+
+    private enum TelemetryMergeError: Error {
+        case credentialDrift
+    }
 }
 
 enum KeychainError: Error, Equatable, LocalizedError {
@@ -440,6 +595,7 @@ enum KeychainError: Error, Equatable, LocalizedError {
     case unsafePath(path: String, reason: String)
     case staleGeneration(expected: String, actual: String)
     case readbackMismatch(path: String)
+    case runtimeActivationLeaseUnavailable(path: String)
 
     var errorDescription: String? {
         switch self {
@@ -470,6 +626,8 @@ enum KeychainError: Error, Equatable, LocalizedError {
             return "Account store generation changed while locked: expected \(expected), found \(actual)"
         case .readbackMismatch(let path):
             return "Account store readback did not prove committed state for \(path)"
+        case .runtimeActivationLeaseUnavailable(let path):
+            return "Account activation lease is held by another writer: \(path)"
         }
     }
 }

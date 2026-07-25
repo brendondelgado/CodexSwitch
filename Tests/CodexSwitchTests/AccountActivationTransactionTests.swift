@@ -267,6 +267,11 @@ struct AccountActivationTransactionTests {
             activationGeneration: generation
         ) { _ in true }
         #expect(overlappingReset == nil)
+        let overlappingDeletion = await transaction.withAccountStoreDeletionLease(
+            accountId: target,
+            mutationGeneration: UUID()
+        ) { _ in true }
+        #expect(overlappingDeletion == nil)
 
         unwind.continuation.yield()
         #expect(await owner.value == false)
@@ -275,6 +280,11 @@ struct AccountActivationTransactionTests {
             activationGeneration: generation
         ) { _ in true }
         #expect(afterUnwind == true)
+        let deletionAfterUnwind = await transaction.withAccountStoreDeletionLease(
+            accountId: target,
+            mutationGeneration: UUID()
+        ) { _ in true }
+        #expect(deletionAfterUnwind == true)
     }
 
     @MainActor
