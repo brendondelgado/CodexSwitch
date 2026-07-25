@@ -1,0 +1,21 @@
+Tests/CodexSwitchTests/AppDelegateNotificationTests.swift
+  s_70c8e194852bb5::t_158d667db6ddf8 33-49,446,496,507,540-558,560-565,567-572,574-577,579-580,582-591,593-598,600-607
+Sources/CodexSwitch/Services/NotificationManager.swift
+  s_70c8e194852bb5::t_158d667db6ddf8 4,12,17,23,35,48,53-54,60-79,83-84,87-101,109-112,118,129,133,137-141,362-363,396-405,409-414,417
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "601030195964f45d8ead91de158744d9645d081c",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
