@@ -315,7 +315,12 @@ recovery with account A selected in `accounts.json` and account B's complete
 tokens in `auth.json`: `Preparing` must name B, the account-store conditional
 write must compare against A, and the committed store must select B. There must
 be no `ACCOUNTS_PERSIST_DISCARDED ... credential_or_selection_changed` caused by
-CodexSwitch's own preselection.
+CodexSwitch's own preselection. Force the conditional write to fail and verify
+that memory and user defaults still select A; publish B only after the durable
+store returns the exact committed snapshot. Update quota telemetry while
+revalidation is suspended and verify the committed snapshot preserves that
+newer telemetry. Repeat the update while the durable write is suspended and
+verify publication preserves it while rejecting credential or selection drift.
 
 A short runtime-evidence lease expiring is not itself an activation failure.
 Observe at least two lease-expiry intervals after a successful desktop swap and

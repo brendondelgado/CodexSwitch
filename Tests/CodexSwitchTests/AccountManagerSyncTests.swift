@@ -402,6 +402,135 @@ struct AccountManagerSyncTests {
         #expect(defaults.string(forKey: "activeAccountId") == current.id.uuidString)
     }
 
+    @Test("Configured credential staging is pure until durable publication")
+    func configuredCredentialStagingIsPure() {
+        let source = CodexAccount(
+            email: "source@test.com",
+            accessToken: "source-access",
+            refreshToken: "source-refresh",
+            idToken: "source-id",
+            accountId: "source-provider",
+            isActive: true
+        )
+        let target = CodexAccount(
+            email: "target@test.com",
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            idToken: "old-id",
+            accountId: "target-provider"
+        )
+        var refreshedTarget = target
+        refreshedTarget.accessToken = "new-access"
+        refreshedTarget.refreshToken = "new-refresh"
+        refreshedTarget.idToken = "new-id"
+        let original = [source, target]
+        let latestQuota = quotaSnapshot(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 42
+        )
+        var latest = original
+        latest[1].quotaSnapshot = latestQuota
+
+        let staged = AccountManager.configuredCredentialSnapshot(
+            from: latest,
+            applying: refreshedTarget,
+            at: Date(timeIntervalSince1970: 1_800_100_300)
+        )
+
+        #expect(original.filter(\.isActive).map(\.id) == [source.id])
+        #expect(staged?.filter(\.isActive).map(\.id) == [target.id])
+        #expect(staged?.first(where: { $0.id == target.id })?.accessToken
+            == "new-access")
+        #expect(staged?.first(where: { $0.id == target.id })?.refreshToken
+            == "new-refresh")
+        #expect(staged?.first(where: { $0.id == target.id })?.idToken == "new-id")
+        #expect(staged?.first(where: { $0.id == target.id })?.quotaSnapshot
+            == latestQuota)
+    }
+
+    @Test("Durable credential publication preserves telemetry updated during persistence")
+    @MainActor func durableCredentialPublicationPreservesConcurrentTelemetry() throws {
+        let defaults = isolatedDefaults()
+        let manager = AccountManager(userDefaults: defaults)
+        var source = CodexAccount(
+            email: "source@test.com",
+            accessToken: "source-access",
+            refreshToken: "source-refresh",
+            idToken: "source-id",
+            accountId: "source-provider",
+            isActive: true
+        )
+        var target = CodexAccount(
+            email: "target@test.com",
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            idToken: "old-id",
+            accountId: "target-provider"
+        )
+        let expected = [source, target]
+        var refreshedTarget = target
+        refreshedTarget.accessToken = "new-access"
+        refreshedTarget.refreshToken = "new-refresh"
+        refreshedTarget.idToken = "new-id"
+        let persisted = try #require(
+            AccountManager.configuredCredentialSnapshot(
+                from: expected,
+                applying: refreshedTarget
+            )
+        )
+
+        let latestQuota = quotaSnapshot(
+            fiveHourRemaining: 100,
+            weeklyRemaining: 37
+        )
+        target.quotaSnapshot = latestQuota
+        manager.accounts = [source, target]
+        defaults.set(source.id.uuidString, forKey: "activeAccountId")
+
+        #expect(manager.adoptVerifiedCommittedCredentialHandoff(
+            persisted,
+            expectedCredentialAuthority: expected,
+            targetAccountId: target.id
+        ))
+        let publishedTarget = try #require(manager.configuredAccount)
+        #expect(publishedTarget.id == target.id)
+        #expect(publishedTarget.accessToken == "new-access")
+        #expect(publishedTarget.refreshToken == "new-refresh")
+        #expect(publishedTarget.idToken == "new-id")
+        #expect(publishedTarget.quotaSnapshot == latestQuota)
+        #expect(defaults.string(forKey: "activeAccountId") == target.id.uuidString)
+
+        source.accessToken = "unexpected-concurrent-credential"
+        manager.accounts = [source, target]
+        let beforeRejected = manager.accounts
+        #expect(!manager.adoptVerifiedCommittedCredentialHandoff(
+            persisted,
+            expectedCredentialAuthority: expected,
+            targetAccountId: target.id
+        ))
+        #expect(manager.accounts.map(\.accessToken) == beforeRejected.map(\.accessToken))
+        #expect(manager.accounts.map(\.isActive) == beforeRejected.map(\.isActive))
+
+        let firstDefaults = isolatedDefaults()
+        let firstManager = AccountManager(userDefaults: firstDefaults)
+        var firstAccount = CodexAccount(
+            email: "first@test.com",
+            accessToken: "first-access",
+            refreshToken: "first-refresh",
+            idToken: "first-id",
+            accountId: "first-provider"
+        )
+        firstAccount.isActive = true
+        #expect(firstManager.adoptVerifiedCommittedCredentialHandoff(
+            [firstAccount],
+            expectedCredentialAuthority: [],
+            targetAccountId: firstAccount.id
+        ))
+        #expect(firstManager.configuredAccount?.id == firstAccount.id)
+        #expect(firstDefaults.string(forKey: "activeAccountId")
+            == firstAccount.id.uuidString)
+    }
+
     @Test("Recovery ignores stale defaults when no durable configured record exists")
     @MainActor func recoveryRejectsStaleStoredPreference() async {
         let defaults = isolatedDefaults()

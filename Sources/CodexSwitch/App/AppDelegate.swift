@@ -1871,58 +1871,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             target.lastRefreshed = observedAccount.lastRefreshed ?? target.lastRefreshed
         }
 
-        do {
-            let durableAccounts = try await accountPersistence.loadAll()
-            if Self.accountStoreMatches(account: target, accounts: durableAccounts),
-               Self.authFileMatches(account: target, atPath: Self.codexAuthPath) {
-                guard accountManager.adoptVerifiedExternalHandoff(
-                    durableAccounts,
-                    targetAccountId: target.id
-                ) else {
-                    await enterActivationManualReview(
-                        targetAccountId: target.id,
-                        detail: .configuredFilesInconsistent
-                    )
-                    return
-                }
-                let state = try await accountActivationCoordinator.bootstrapCommittedDegraded(
-                    targetAccountId: target.id,
-                    detail: .launchRuntimeEvidenceExpired
-                )
-                accountManager.publishActivationState(state)
-                return
-            }
-
-            _ = await withPreparedActiveCredentialMutation(
-                targetAccountId: target.id,
-                expectedConfiguredAccountId: previousConfigured?.id,
-                source: "launch-activation-bootstrap",
-                requestKind: .automatic
-            ) { [weak self] prepared in
-                guard let self else { return false }
-                return await self.commitConfiguredCredentialMutation(
-                    from: previousConfigured ?? target,
-                    to: target,
-                    reason: .manual,
-                    mutationRoute: Self.journalFreeBootstrapMutationRoute(
-                        previousConfiguredAccountId: previousConfigured?.id
-                    ),
-                    persistenceContext: "launch-activation-bootstrap",
-                    authAlreadyConfigured: true,
-                    swapStart: Date(),
-                    prepared: prepared,
-                    recordsSwap: false,
-                    committedDetail: .launchRuntimeEvidenceExpired
-                )
-            }
-        } catch {
-            await enterActivationManualReview(
-                targetAccountId: target.id,
-                detail: .journalUnavailable
+        _ = await withPreparedActiveCredentialMutation(
+            targetAccountId: target.id,
+            expectedConfiguredAccountId: previousConfigured?.id,
+            source: "launch-activation-bootstrap",
+            requestKind: .automatic
+        ) { [weak self] prepared in
+            guard let self else { return false }
+            return await self.commitConfiguredCredentialMutation(
+                from: previousConfigured ?? target,
+                to: target,
+                reason: .manual,
+                mutationRoute: Self.journalFreeBootstrapMutationRoute(
+                    previousConfiguredAccountId: previousConfigured?.id
+                ),
+                persistenceContext: "launch-activation-bootstrap",
+                authAlreadyConfigured: true,
+                swapStart: Date(),
+                prepared: prepared,
+                recordsSwap: false,
+                committedDetail: .launchRuntimeEvidenceExpired
             )
-            SwapLog.append(.debug(
-                "ACTIVATION_BOOTSTRAP_FAILED target=\(target.id.uuidString) error=\(error.localizedDescription)"
-            ))
         }
     }
 
@@ -2798,42 +2767,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    @discardableResult
     private func persistAuthorizedAccountsSnapshot(
+        _ accounts: [CodexAccount],
         context: String,
         expectedCredentialAuthority: [CodexAccount],
         permit: AccountActivationEffectPermit
-    ) async -> Bool {
+    ) async -> [CodexAccount]? {
         guard !externalHandoffAdoptionInFlight else {
             SwapLog.append(.debug(
                 "ACCOUNTS_PERSIST_BLOCKED context=\(context) reason=external_handoff_adoption"
             ))
-            return false
+            return nil
         }
-        let accounts = accountManager.accounts
         accountPersistenceRevision &+= 1
         let revision = accountPersistenceRevision
         do {
+            let persisted: [CodexAccount]
             switch try await accountPersistence.persistDurably(
                 accounts,
                 ifCredentialAuthorityMatches: expectedCredentialAuthority,
                 revision: revision,
                 authorizeEffect: { permit.isCurrentlyAuthorized() }
             ) {
-            case .persisted:
-                break
+            case .persisted(let committed):
+                persisted = committed
             case .discardedCredentialDrift:
                 externalAuthReconciliationPending = true
                 SwapLog.append(.debug(
                     "ACCOUNTS_PERSIST_DISCARDED context=\(context) reason=credential_or_selection_changed"
                 ))
-                return false
+                return nil
             }
             SwapLog.append(.debug(
-                "ACCOUNTS_PERSISTED context=\(context) configured=\(accountManager.configuredAccount?.email ?? "none")"
+                "ACCOUNTS_PERSISTED context=\(context) configured=\(persisted.first(where: \.isActive)?.email ?? "none")"
             ))
-            scheduleLinuxDevboxCredentialSyncIfNeeded(context: context)
-            return true
+            return persisted
         } catch {
             logger.warning(
                 "Failed to persist authorized accounts snapshot (\(context)): \(error.localizedDescription)"
@@ -2841,7 +2809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             SwapLog.append(.debug(
                 "ACCOUNTS_PERSIST_FAILED context=\(context) error=\(error.localizedDescription)"
             ))
-            return false
+            return nil
         }
     }
 
@@ -6386,7 +6354,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let durableConfiguredTargetMatches: Bool
         switch route {
         case .firstActivation:
-            durableConfiguredTargetMatches = await durableAccountStoreHasNoConfiguredAccount()
+            durableConfiguredTargetMatches =
+                await durableAccountStoreHasNoConfiguredAccount()
+                && (!authAlreadyConfigured
+                    || Self.authFileMatches(
+                        account: to,
+                        atPath: Self.codexAuthPath
+                    ))
         case .externalAuthObservation:
             durableConfiguredTargetMatches = await durableAccountStoreMatches(from)
                 && authAlreadyConfigured
@@ -6508,7 +6482,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         recordsSwap: Bool,
         committedDetail: AccountActivationDetail = .runtimeConfirmationPending
     ) async -> Bool {
-        let expectedCredentialAuthority = accountManager.accounts
         let result = await accountMutationTransaction.commitConfiguredCredentials(
             AccountActivationCommitOperations(
                 authorizeMutation: { [weak self] in
@@ -6528,31 +6501,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                               state: self.accountManager.activationState,
                               at: Date()
                           ),
-                          self.accountManager.applyConfiguredCredentialMutation(
-                              to,
-                              permit: permit
-                          ) else {
+                          AccountManager.configuredCredentialSnapshot(
+                              from: self.accountManager.accounts,
+                              applying: to
+                          ) != nil
+                    else {
                         return false
                     }
-                    CLIStatusChecker.invalidateForAccountSwap()
-                    self.accountManager.setConfiguredAccount(to.id)
                     return true
                 },
                 authorizePreparingEffect: { [weak self] in
                     guard let self else { return nil }
+                    let configuredAccountId =
+                        self.accountManager.configuredAccount?.id
+                    guard configuredAccountId
+                            == prepared.expectedConfiguredAccountId
+                            || configuredAccountId == to.id else {
+                        return nil
+                    }
                     return await self.activationEffectPermit(
                         prepared,
                         targetAccountId: to.id,
                         requiredPhase: .preparing,
-                        configuredAccountId: to.id
+                        configuredAccountId: configuredAccountId
                     )
                 },
                 persistAccountStore: { [weak self] permit in
-                    await self?.persistAuthorizedAccountsSnapshot(
-                        context: persistenceContext,
-                        expectedCredentialAuthority: expectedCredentialAuthority,
-                        permit: permit
-                    ) == true
+                    guard let self else { return false }
+                    let expectedCredentialAuthority = self.accountManager.accounts
+                    guard let configuredCredentialSnapshot =
+                            AccountManager.configuredCredentialSnapshot(
+                                from: expectedCredentialAuthority,
+                                applying: to
+                            ),
+                          let persisted =
+                            await self.persistAuthorizedAccountsSnapshot(
+                                configuredCredentialSnapshot,
+                                context: persistenceContext,
+                                expectedCredentialAuthority: expectedCredentialAuthority,
+                                permit: permit
+                            ),
+                          self.accountManager.adoptVerifiedCommittedCredentialHandoff(
+                              persisted,
+                              expectedCredentialAuthority: expectedCredentialAuthority,
+                              targetAccountId: to.id
+                          ) else {
+                        return false
+                    }
+                    CLIStatusChecker.invalidateForAccountSwap()
+                    self.accountManager.clearPollingError(for: to.id)
+                    self.scheduleLinuxDevboxCredentialSyncIfNeeded(
+                        context: persistenceContext
+                    )
+                    return true
                 },
                 persistAuth: { [weak self] permit in
                     guard let self else { return false }

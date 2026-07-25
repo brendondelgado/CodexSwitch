@@ -120,7 +120,13 @@ durable selection as the compare-and-swap authority until `Preparing` is
 journaled and the activation transaction commits the new selection. It must not
 preselect the observed account in memory or in user defaults before that
 transaction. A journal-free first activation uses the same rule with an
-explicit no-configured-account authority.
+explicit no-configured-account authority. At the persistence boundary, the
+transaction builds a detached credential snapshot from the latest in-memory
+telemetry, commits and reads back that snapshot under the shared lease, and only
+then publishes the committed selection to memory and user defaults. Publication
+merges any telemetry that changed during the durable write without accepting
+credential or selection drift. Account-set growth is accepted only when the
+committed target is the one new identity, including first-account activation.
 
 The auth commit includes access token, refresh token, identity token when present, provider account identity, and required metadata. Sending only a new access token can appear successful until the next refresh and is prohibited.
 

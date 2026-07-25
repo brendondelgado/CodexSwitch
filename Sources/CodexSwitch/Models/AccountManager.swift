@@ -320,6 +320,108 @@ final class AccountManager {
         return true
     }
 
+    @discardableResult
+    func adoptVerifiedCommittedCredentialHandoff(
+        _ persistedAccounts: [CodexAccount],
+        expectedCredentialAuthority: [CodexAccount],
+        targetAccountId: UUID
+    ) -> Bool {
+        guard let merged = Self.committedCredentialHandoffSnapshot(
+            persistedAccounts,
+            preservingTelemetryFrom: accounts,
+            expectedCredentialAuthority: expectedCredentialAuthority,
+            targetAccountId: targetAccountId
+        ) else {
+            return false
+        }
+        accounts = merged
+        userDefaults.set(targetAccountId.uuidString, forKey: "activeAccountId")
+        return true
+    }
+
+    nonisolated static func committedCredentialHandoffSnapshot(
+        _ persistedAccounts: [CodexAccount],
+        preservingTelemetryFrom currentAccounts: [CodexAccount],
+        expectedCredentialAuthority: [CodexAccount],
+        targetAccountId: UUID
+    ) -> [CodexAccount]? {
+        guard persistedAccounts.filter(\.isActive).map(\.id) == [targetAccountId],
+              currentAccounts.count == expectedCredentialAuthority.count else {
+            return nil
+        }
+
+        var currentById: [UUID: CodexAccount] = [:]
+        var expectedById: [UUID: CodexAccount] = [:]
+        var persistedIds: Set<UUID> = []
+        for account in currentAccounts {
+            guard currentById.updateValue(account, forKey: account.id) == nil else {
+                return nil
+            }
+        }
+        for account in expectedCredentialAuthority {
+            guard expectedById.updateValue(account, forKey: account.id) == nil else {
+                return nil
+            }
+        }
+        for account in persistedAccounts {
+            guard persistedIds.insert(account.id).inserted else { return nil }
+        }
+
+        let expectedIds = Set(expectedById.keys)
+        guard Set(currentById.keys) == expectedIds else { return nil }
+        let insertsTarget = !expectedIds.contains(targetAccountId)
+        let committedIds = insertsTarget
+            ? expectedIds.union([targetAccountId])
+            : expectedIds
+        guard persistedIds == committedIds else { return nil }
+
+        return try? persistedAccounts.map { persisted in
+            guard let expected = expectedById[persisted.id] else {
+                guard insertsTarget, persisted.id == targetAccountId else {
+                    throw CommittedCredentialHandoffError.credentialDrift
+                }
+                return persisted
+            }
+            guard let current = currentById[persisted.id],
+                  current.accountId == expected.accountId,
+                  current.accessToken == expected.accessToken,
+                  current.refreshToken == expected.refreshToken,
+                  current.idToken == expected.idToken,
+                  current.isActive == expected.isActive else {
+                throw CommittedCredentialHandoffError.credentialDrift
+            }
+
+            var merged = persisted
+            if current.quotaSnapshot != expected.quotaSnapshot
+                || current.planType != expected.planType
+                || current.lastRefreshed != expected.lastRefreshed
+                || current.subscriptionRenewsAt != expected.subscriptionRenewsAt
+                || current.subscriptionExpiresAt != expected.subscriptionExpiresAt
+                || current.subscriptionWillRenew != expected.subscriptionWillRenew
+                || current.hasActiveSubscription != expected.hasActiveSubscription {
+                merged.quotaSnapshot = current.quotaSnapshot
+                merged.planType = current.planType
+                merged.lastRefreshed = current.lastRefreshed
+                merged.subscriptionRenewsAt = current.subscriptionRenewsAt
+                merged.subscriptionExpiresAt = current.subscriptionExpiresAt
+                merged.subscriptionWillRenew = current.subscriptionWillRenew
+                merged.hasActiveSubscription = current.hasActiveSubscription
+            }
+            if current.fiveHourPrimedAt != expected.fiveHourPrimedAt {
+                merged.fiveHourPrimedAt = current.fiveHourPrimedAt
+            }
+            if current.rateLimitResetBank != expected.rateLimitResetBank {
+                merged.rateLimitResetBank = current.rateLimitResetBank
+            }
+            if current.runtimeUnusableUntil != expected.runtimeUnusableUntil
+                || current.runtimeUnusableReason != expected.runtimeUnusableReason {
+                merged.runtimeUnusableUntil = current.runtimeUnusableUntil
+                merged.runtimeUnusableReason = current.runtimeUnusableReason
+            }
+            return merged
+        }
+    }
+
     /// Inserts a new identity only. Existing identities, including the configured one, are immutable here.
     @discardableResult
     func addAccount(_ account: CodexAccount) -> Bool {
@@ -358,49 +460,68 @@ final class AccountManager {
         return .updated(accounts[idx].id)
     }
 
-    @discardableResult
-    func applyConfiguredCredentialMutation(
-        _ account: CodexAccount,
-        permit: AccountCredentialMutationPermit
-    ) -> Bool {
+    nonisolated static func configuredCredentialSnapshot(
+        from accounts: [CodexAccount],
+        applying account: CodexAccount,
+        at date: Date = Date()
+    ) -> [CodexAccount]? {
         let targetAccountId = account.id
-        guard permit.targetAccountId == targetAccountId,
-              permit.authorizes(
-                  state: activationState,
-                  at: Date()
-              ) else {
-            return false
-        }
         guard !accounts.contains(where: {
             $0.id != targetAccountId && $0.accountId == account.accountId
         }) else {
-            return false
+            return nil
         }
-        if let idx = accounts.firstIndex(where: { $0.id == targetAccountId }) {
-            applyCredentialUpdate(account, at: idx)
-            return true
+        var snapshot = accounts
+        if let index = snapshot.firstIndex(where: { $0.id == targetAccountId }) {
+            snapshot[index] = credentialUpdatedAccount(
+                snapshot[index],
+                from: account,
+                at: date
+            )
+        } else {
+            snapshot.append(account)
         }
-        accounts.append(account)
-        return true
+        for index in snapshot.indices {
+            snapshot[index].isActive = snapshot[index].id == targetAccountId
+        }
+        return snapshot
     }
 
     private func applyCredentialUpdate(_ account: CodexAccount, at index: Int) {
-        accounts[index].email = account.email
-        accounts[index].accountId = account.accountId
-        accounts[index].accessToken = account.accessToken
-        accounts[index].refreshToken = account.refreshToken
-        accounts[index].idToken = account.idToken
-        accounts[index].lastRefreshed = account.lastRefreshed ?? Date()
-        accounts[index].rateLimitResetBank = account.rateLimitResetBank
-            ?? accounts[index].rateLimitResetBank
-        accounts[index].runtimeUnusableUntil = account.runtimeUnusableUntil
-        accounts[index].runtimeUnusableReason = account.runtimeUnusableReason
-        if accounts[index].quotaSnapshot?.hasExpiredExhaustedWindow() == true {
-            accounts[index].quotaSnapshot = nil
-        }
+        accounts[index] = Self.credentialUpdatedAccount(
+            accounts[index],
+            from: account,
+            at: Date()
+        )
         if account.runtimeUnusableUntil == nil, account.runtimeUnusableReason == nil {
             pollingErrors[accounts[index].id] = nil
         }
+    }
+
+    nonisolated private static func credentialUpdatedAccount(
+        _ existing: CodexAccount,
+        from account: CodexAccount,
+        at date: Date
+    ) -> CodexAccount {
+        var updated = existing
+        updated.email = account.email
+        updated.accountId = account.accountId
+        updated.accessToken = account.accessToken
+        updated.refreshToken = account.refreshToken
+        updated.idToken = account.idToken
+        updated.lastRefreshed = account.lastRefreshed ?? date
+        updated.rateLimitResetBank = account.rateLimitResetBank
+            ?? existing.rateLimitResetBank
+        updated.runtimeUnusableUntil = account.runtimeUnusableUntil
+        updated.runtimeUnusableReason = account.runtimeUnusableReason
+        if updated.quotaSnapshot?.hasExpiredExhaustedWindow(now: date) == true {
+            updated.quotaSnapshot = nil
+        }
+        return updated
+    }
+
+    private enum CommittedCredentialHandoffError: Error {
+        case credentialDrift
     }
 
     func recordSwap(_ event: SwapEvent) {
