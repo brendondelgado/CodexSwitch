@@ -84,6 +84,10 @@ enum NotificationManager {
     private static let resetExpirationNotificationDedupeDefaultsKey =
         "resetExpirationNotificationDedupeKeys.v1"
     private static let maximumResetExpirationNotificationDedupeKeys = 256
+    private static let linuxDevboxReadinessIncidentDefaultsKey =
+        "linuxDevboxReadinessNotificationIncidentActive.v1"
+    static let linuxDevboxReadinessNotificationIdentifier =
+        "linux-devbox-readiness-active-incident"
     private static let resetExpirationNotificationCoordinator =
         RateLimitResetNotificationDedupeCoordinator(
             defaultsKey: resetExpirationNotificationDedupeDefaultsKey,
@@ -333,16 +337,43 @@ enum NotificationManager {
 
     static func notifyLinuxDevboxReadinessIssue(summary: String) {
         guard isEnabled, Bundle.main.bundleIdentifier != nil else { return }
+        guard claimLinuxDevboxReadinessNotificationIncident() else { return }
         let content = UNMutableNotificationContent()
         content.title = "CodexSwitch: Linux Devbox Not Ready"
         content.body = summary
         content.sound = .default
 
         let request = UNNotificationRequest(
-            identifier: "linux-devbox-readiness-\(UUID().uuidString)",
+            identifier: linuxDevboxReadinessNotificationIdentifier,
             content: content,
             trigger: nil
         )
         UNUserNotificationCenter.current().add(request)
+    }
+
+    @discardableResult
+    static func claimLinuxDevboxReadinessNotificationIncident(
+        userDefaults: UserDefaults = .standard
+    ) -> Bool {
+        guard !userDefaults.bool(forKey: linuxDevboxReadinessIncidentDefaultsKey) else {
+            return false
+        }
+        userDefaults.set(true, forKey: linuxDevboxReadinessIncidentDefaultsKey)
+        return true
+    }
+
+    static func clearLinuxDevboxReadinessNotificationIncident(
+        userDefaults: UserDefaults = .standard
+    ) {
+        userDefaults.removeObject(forKey: linuxDevboxReadinessIncidentDefaultsKey)
+    }
+
+    static func resolveLinuxDevboxReadinessIssue() {
+        clearLinuxDevboxReadinessNotificationIncident()
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        let identifiers = [linuxDevboxReadinessNotificationIdentifier]
+        center.removePendingNotificationRequests(withIdentifiers: identifiers)
+        center.removeDeliveredNotifications(withIdentifiers: identifiers)
     }
 }

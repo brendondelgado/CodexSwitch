@@ -514,6 +514,34 @@ struct AppDelegateNotificationTests {
         #expect(defaults.stringArray(forKey: defaultsKey) == [dedupeKey])
     }
 
+    @Test("VPS readiness notification is persisted once per incident")
+    func linuxDevboxReadinessNotificationDedupesAcrossRelaunches() {
+        let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        #expect(NotificationManager.claimLinuxDevboxReadinessNotificationIncident(
+            userDefaults: defaults
+        ))
+        let relaunchedDefaults = UserDefaults(suiteName: suiteName)!
+        #expect(!NotificationManager.claimLinuxDevboxReadinessNotificationIncident(
+            userDefaults: relaunchedDefaults
+        ))
+
+        NotificationManager.clearLinuxDevboxReadinessNotificationIncident(
+            userDefaults: relaunchedDefaults
+        )
+
+        #expect(NotificationManager.claimLinuxDevboxReadinessNotificationIncident(
+            userDefaults: defaults
+        ))
+        #expect(
+            NotificationManager.linuxDevboxReadinessNotificationIdentifier
+                == "linux-devbox-readiness-active-incident"
+        )
+    }
+
     private func isolatedDefaults() -> UserDefaults {
         let suite = "CodexSwitchTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

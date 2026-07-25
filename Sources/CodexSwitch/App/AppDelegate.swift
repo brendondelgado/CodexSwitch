@@ -8251,6 +8251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func checkLinuxDevboxReadiness(force: Bool = false) {
         let settings = LinuxDevboxMonitor.settings()
         guard settings.isConfigured else {
+            NotificationManager.resolveLinuxDevboxReadinessIssue()
             lastLinuxDevboxReady = nil
             lastLinuxDevboxFullCheckAt = nil
             invalidateLinuxDevboxReadinessTask()
@@ -8384,6 +8385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     case .success(let states):
                         self.lastLinuxDevboxReady = true
                         self.linuxDevboxConsecutiveIssueChecks = 0
+                        NotificationManager.resolveLinuxDevboxReadinessIssue()
                         self.lastLinuxDevboxAccountMirrorSucceededAt = Date()
                         let accountStateActiveEmail = states.first(where: \.isActive)?.email
                         self.accountManager.linuxDevboxStatus = Self

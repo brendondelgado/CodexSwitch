@@ -52,10 +52,12 @@ cross_dependencies:
   - Sources/CodexSwitch/App/AppDelegate.swift
   - Sources/CodexSwitch/Models/AccountManager.swift
   - Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  - Sources/CodexSwitch/Services/NotificationManager.swift
   - Sources/CodexSwitch/Services/SingleInstanceLock.swift
   - Tests/CodexSwitchTests/SwapEngineTests.swift
   - Tests/CodexSwitchTests/CLIStatusCheckerTests.swift
   - Tests/CodexSwitchTests/LinuxDevboxMonitorTests.swift
+  - Tests/CodexSwitchTests/AppDelegateNotificationTests.swift
   - Tests/CodexSwitchTests/SingleInstanceLockTests.swift
   - Tests/CodexSwitchTests/CodexVersionCheckerTests.swift
   - Tests/CodexSwitchTests/DesktopRuntimeReloadClientTests.swift
@@ -75,7 +77,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-24
+  last_updated: 2026-07-25
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -824,6 +826,7 @@ are committed to `main`.
 Mac CodexSwitch and Linux `codexswitch-cli` run the same eligibility rules, but their daemon/runtime control remains host-local. They should converge on token, plan, quota, subscription, and runtime-blocker state through encrypted Mac -> VPS account-state sync plus each host's own `https://chatgpt.com/backend-api/wham/usage` polling. They must not automatically share active-account selection, runtime acknowledgements, daemon state, or stale `/status` banners from an existing Codex session.
 
 - A background VPS readiness check may display the VPS active email, but it must not set the Mac active account, rewrite local `auth.json`, or start a Mac auto-swap.
+- One continuous VPS-not-ready incident may enqueue at most one persisted Mac notification, including across menu-app relaunches. The request uses one stable identifier so Notification Center replaces rather than accumulates the incident. A verified ready result or disabling the monitor clears the incident latch and any matching delivered or pending notification.
 - While a live `codex-vps` remote session is intentionally mirroring VPS account state in the menu bar, the VPS daemon owns automatic rotation. The Mac must not execute a second auto-swap from that mirrored state or issue repeated account-swapped notifications.
 - An asynchronous `auth.json` observation may promote a stable external account change, but it must be discarded when the local active account changes while the file read is suspended. The next timer pass can read again; a stale pre-swap observation must never revert a completed swap or re-export the old account to the VPS.
 
