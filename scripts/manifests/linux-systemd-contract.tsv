@@ -44,15 +44,8 @@ resource:codexswitch.service:MemoryMax	6442450944
 resource:codexswitch.service:MemorySwapMax	2147483648
 resource:signul-codex-app-server.service:MemoryMax	15032385536
 resource:signul-codex-app-server.service:MemorySwapMax	2147483648
-dependency:codexswitch.service:Requires	sysinit.target
-dependency:signul-codex-app-server.service:Requires	sysinit.target
-dependency:codexswitch.service:Conflicts	shutdown.target
-dependency:signul-codex-app-server.service:Conflicts	shutdown.target
-dependency:codexswitch.service:Before	shutdown.target
-dependency:signul-codex-app-server.service:Before	shutdown.target
-dependency:codexswitch.service:After	basic.target sysinit.target
 dependency:signul-codex-app-server.service:Wants	network-online.target
-dependency:signul-codex-app-server.service:After	basic.target network-online.target sysinit.target
+dependency:signul-codex-app-server.service:After	network-online.target
 start-barrier:codexswitch.service:Required	1
 start-barrier:signul-codex-app-server.service:Required	1
 start-barrier:codexswitch-knowledge-sync.service:Required	1

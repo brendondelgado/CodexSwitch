@@ -323,9 +323,83 @@ expected_effective_systemd_dependency() {
     return 0
   fi
   case "$property" in
-    Requisite|Wants|BindsTo|PartOf|Upholds|OnFailure|OnSuccess|PropagatesStopTo|StopPropagatedFrom|JoinsNamespaceOf|RequiredBy|RequisiteOf|WantedBy|BoundBy|ConsistsOf|UpheldBy|ConflictedBy|Triggers|TriggeredBy|PropagatedFrom|References|ReferencedBy) printf '%s' "" ;;
+    Requires|Requisite|Wants|BindsTo|PartOf|Upholds|Conflicts|Before|After|OnFailure|OnSuccess|PropagatesStopTo|StopPropagatedFrom|JoinsNamespaceOf|RequiredBy|RequisiteOf|WantedBy|BoundBy|ConsistsOf|UpheldBy|ConflictedBy|Triggers|TriggeredBy|PropagatedFrom|References|ReferencedBy) printf '%s' "" ;;
     *) return 1 ;;
   esac
+}
+
+validate_effective_systemd_dependency() {
+  local unit="$1"
+  local property="$2"
+  local observed="$3"
+  local expected="$4"
+  local working_directory=""
+
+  if [[ "$unit" == "signul-codex-app-server.service" ]]; then
+    working_directory="$(expected_systemd_value "$unit" WorkingDirectory)"
+  fi
+
+  python3 - "$unit" "$property" "$observed" "$expected" "$SERVICE_DIR" "$working_directory" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+unit, property_name, observed_text, expected_text, service_dir_text, working_directory = sys.argv[1:]
+observed = observed_text.split()
+expected = expected_text.split()
+
+if len(observed) != len(set(observed)):
+    raise SystemExit("duplicate effective dependency")
+
+missing = sorted(set(expected) - set(observed))
+extras = set(observed) - set(expected)
+allowed = set()
+
+if property_name == "Requires":
+    allowed.update(("app.slice", "basic.target", "sysinit.target"))
+elif property_name == "Conflicts":
+    allowed.add("shutdown.target")
+elif property_name == "Before":
+    allowed.add("shutdown.target")
+elif property_name == "After":
+    allowed.update(("app.slice", "basic.target", "sysinit.target"))
+
+def mount_unit_name(path: Path) -> str:
+    if path == Path("/"):
+        return "-.mount"
+    escaped = []
+    for value in str(path).strip("/").encode("utf-8"):
+        character = chr(value)
+        if character.isascii() and (character.isalnum() or character in "_."):
+            escaped.append(character)
+        elif character == "/":
+            escaped.append("-")
+        else:
+            escaped.append(f"\\x{value:02x}")
+    return "".join(escaped) + ".mount"
+
+
+if working_directory and property_name in ("Requires", "After"):
+    path = Path(working_directory)
+    allowed.update(mount_unit_name(parent) for parent in (path, *path.parents))
+
+service_dir = Path(service_dir_text)
+enablement = service_dir / "default.target.wants" / unit
+if enablement.is_symlink():
+    target = os.readlink(enablement)
+    if target in (f"../{unit}", str(service_dir / unit)):
+        if property_name in ("Before", "WantedBy"):
+            allowed.add("default.target")
+
+unexpected = sorted(extras - allowed)
+if missing or unexpected:
+    detail = []
+    if missing:
+        detail.append(f"missing={','.join(missing)}")
+    if unexpected:
+        detail.append(f"unexpected={','.join(unexpected)}")
+    raise SystemExit(" ".join(detail))
+PY
 }
 
 validate_effective_systemd_dependencies() {
@@ -338,7 +412,8 @@ validate_effective_systemd_dependencies() {
     while IFS= read -r property; do
       expected="$(expected_effective_systemd_dependency "$unit" "$property")" || fail "missing expected effective dependency policy: $unit $property"
       observed="$(systemctl --user show "$unit" -p "$property" --value)" || fail "failed to read effective dependency property: unit=$unit property=$property"
-      [[ "$observed" == "$expected" ]] || fail "effective systemd dependency mismatch: unit=$unit property=$property observed=$observed expected=$expected"
+      validate_effective_systemd_dependency "$unit" "$property" "$observed" "$expected" || \
+        fail "effective systemd dependency mismatch: unit=$unit property=$property observed=$observed expected=$expected"
     done < <(systemd_dependency_properties)
   done
 }

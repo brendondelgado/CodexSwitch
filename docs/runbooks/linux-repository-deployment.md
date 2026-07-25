@@ -563,17 +563,28 @@ name only the repository-owned unit and one expected drop-in below the user
 systemd directory. Effective forward, reverse, ordering, propagation, trigger,
 alias, and install relationship properties are queried with `systemctl show`;
 unexpected relationships fail even when no textual directive appears in
-`systemctl cat`.
+`systemctl cat`. Dependency values are compared as token sets because systemd
+does not guarantee output order. The checked-in dependency manifest contains
+only relationships declared by the managed unit files. The effective-state
+check separately permits the bounded defaults synthesized by a user systemd
+manager: the basic or sysinit target, the default application slice, shutdown
+ordering, exact mount units implied by the app-server's owned
+`WorkingDirectory`, and the `default.target` reverse relationship only while
+the exact repository-owned enablement link exists. This keeps the check
+portable across supported systemd versions without treating arbitrary
+manager-visible dependencies as release policy.
 The conflict gate treats every execution and identity directive, environment
 or credential input, CPU/NUMA control, memory/OOM control, IO/block-IO control,
 task or resource limit, timeout/restart/watchdog/start-limit control, and
 security/sandbox/capability/network-path restriction as owned behavior.
-Every systemd dependency, ordering, and lifecycle-propagation family is owned.
+Every explicitly configured systemd dependency, ordering, and
+lifecycle-propagation family is owned.
 This includes `Requires*`, `Wants*`, `Requisite*`, `BindsTo`, `PartOf`,
 `Upholds`, `Conflicts`, `Before`, `After`, `OnFailure*`, `OnSuccess*`,
 `Propagates*`, `*PropagatedFrom`, `JoinsNamespaceOf`, mount dependencies,
 default-dependency controls, isolation controls, and manual start/stop
-refusals. Only dependencies present in the exact four-file payload may appear.
+refusals. Only dependencies present in the exact four-file payload or the
+bounded manager-generated defaults above may appear.
 Every merged directive is classified: unknown sections, unknown keys, empty
 resets, and values without an exact manifest expectation are conflicts.
 Any unknown managed drop-in blocks activation and cannot be approved away;

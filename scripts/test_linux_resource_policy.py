@@ -1319,12 +1319,12 @@ PY
                 *:DropInPaths)
                   barrier="$runtime_control_dir/$unit.d/00-codexswitch-activation-guard.conf"
                   [ ! -f "$barrier" ] || printf '%s\n' "$barrier" ;;
-                codexswitch.service:Requires|signul-codex-app-server.service:Requires) echo sysinit.target ;;
+                codexswitch.service:Requires|signul-codex-app-server.service:Requires) echo 'basic.target app.slice' ;;
                 codexswitch.service:Conflicts|signul-codex-app-server.service:Conflicts) echo shutdown.target ;;
                 codexswitch.service:Before|signul-codex-app-server.service:Before) echo shutdown.target ;;
-                codexswitch.service:After) echo 'basic.target sysinit.target' ;;
+                codexswitch.service:After) echo 'basic.target app.slice' ;;
                 signul-codex-app-server.service:Wants) echo network-online.target ;;
-                signul-codex-app-server.service:After) echo 'basic.target network-online.target sysinit.target' ;;
+                signul-codex-app-server.service:After) echo 'network-online.target basic.target -.mount app.slice' ;;
                 codexswitch.service:MainPID|signul-codex-app-server.service:MainPID) echo 4242 ;;
                 *:Wants|*:Requisite|*:BindsTo|*:PartOf|*:Upholds|*:OnFailure|*:OnSuccess|*:PropagatesStopTo|*:StopPropagatedFrom|*:JoinsNamespaceOf|*:RequiredBy|*:RequisiteOf|*:WantedBy|*:BoundBy|*:ConsistsOf|*:UpheldBy|*:ConflictedBy|*:Triggers|*:TriggeredBy|*:PropagatedFrom|*:References|*:ReferencedBy) echo '' ;;
                 codexswitch.service:MemoryMax) echo 6442450944 ;;
