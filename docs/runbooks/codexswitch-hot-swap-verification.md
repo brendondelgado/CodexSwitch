@@ -29,6 +29,7 @@ toc:
   - Incident Review Questions
 cross_dependencies:
   - docs/architecture/quota-and-reset-policy.md
+  - docs/architecture/macos-runtime-discovery.md
   - docs/architecture/runtime-and-host-ownership.md
   - crates/codexswitch-cli/src/readiness.rs
   - crates/codexswitch-cli/src/reload.rs
@@ -106,10 +107,11 @@ missing after a successful reload.
 
 Every acknowledgement identifies its `runtimeKind`; the signaler validates the
 contract expected for the discovered process rather than accepting whichever
-contract the acknowledgement claims. Both contracts require the exact request
+contract the acknowledgement claims. Every contract requires the exact request
 nonce and matching independently loaded and active auth fingerprints.
 
-An external ChatGPT desktop or SSH app-server uses the strict
+An ordinary external app-server, including a non-bridge ChatGPT desktop target
+or a VPS app-server reached through SSH or a Unix socket, uses the strict
 `external-app-server` contract. It must successfully parse the current auth
 source, prove that the newly cached auth fingerprint matches the independently
 parsed `auth.json` fingerprint, and deliver `account/updated` to at least one
@@ -145,14 +147,22 @@ auth manager; it does not claim a currently connected client was notified. Once
 any writer accepts the notification, the idle shape is forbidden and every
 eligible writer must complete the transport write. An accepted-but-undelivered
 writer, timeout, partial write set, or failed proof channel remains degraded.
-The desktop `external-app-server` contract accepts the idle-listener shape only
-when `initializedFrontendCount`, `skippedFrontendCount`,
+The sole exact all-zero desktop exception is the dedicated
+`managed-desktop-bridge` runtime kind. The classifier may assign it only to the
+repository-managed Mac bridge after proving the bound process owns the loopback
+listener on port `9223`. Its idle-listener shape is valid only when
+`initializedFrontendCount`, `skippedFrontendCount`,
 `eligibleFrontendCount`, `rejectedFrontendCount`, and `frontendWriteCount` are
-all exactly zero. That shape proves a dormant listener's backend auth cache for
-the next connection and does not claim that ChatGPT was notified. If any
-frontend is initialized, even one that is skipped or rejects enqueue, the
-desktop contract remains strict and requires completed writes for every
-eligible frontend.
+all present and exactly zero. Missing counters, mixed values, or any nonzero
+value do not satisfy that branch. If any frontend is initialized, even one that
+is skipped or rejects enqueue, the managed bridge remains strict and requires
+completed writes for every eligible frontend. No connected client, a loopback
+address on another port, or an ACK that merely claims this kind is sufficient.
+Ordinary `external-app-server` never receives this exception. The separately
+classified headless remote-control contract above retains its broader idle
+behavior and does not use the managed bridge's exact all-zero branch. SSH/Unix
+transport or an absent frontend alone never changes an ordinary external
+app-server into headless remote-control.
 
 A local interactive CLI embeds an in-process app-server but has no desktop
 renderer writer. Its `local-interactive-cli` acknowledgement may complete after
@@ -311,10 +321,13 @@ committed generation; a CAS mismatch must preserve concurrent state and leave
 durable manual-review evidence.
 
 Use `import --offline-file-only` or `update-bundle --offline-file-only` only
-after repository deployment has positively proved the managed runtime idle.
+after repository deployment has positively proved the managed runtime
+quiesced.
 That command must publish an `Import/FileOnly` barrier without calling reload.
 After startup, reconcile the same target to `Confirmed` before declaring the
 deployment active. Interactive imports retain live convergence by default.
+Deployment quiescence is not an idle ACK and does not relax runtime-kind
+classification or delivery evidence.
 
 ## Mac Activation Barrier Recovery
 
@@ -413,7 +426,8 @@ CLI.
 
 CodexSwitch must evaluate these independently:
 
-- **Mac desktop:** official OpenAI signing and plugin health are separate from desktop hot-swap. The desktop status must not show green unless the live desktop runtime acknowledges reload.
+- **Mac desktop:** official OpenAI signing and plugin health are separate from desktop hot-swap. An ordinary desktop app-server is `external-app-server` and must prove frontend delivery before status can show green.
+- **Managed desktop bridge:** only the repository-managed Mac bridge whose bound process owns the loopback listener on port `9223` may identify as `managed-desktop-bridge`. It may use an idle ACK only when every required frontend writer and delivery counter is present and exactly zero; no other desktop or transport gets this exception.
 - **Mac local CLI:** only native interactive Codex CLI binaries with the CLI-specific capability marker are signal targets. Wrapper shells, code-mode hosts, `exec` subprocesses, SSH clients, and `--remote` clients are not the account-bearing local runtime. Both `~/.local/bin/codex` and `/opt/homebrew/bin/codex` must resolve their managed launcher target to the native binary before validation. A local launch must fail with a repair instruction when no complete hot-swap runtime is available; it must never silently fall back to the stock npm or desktop-bundled CLI, because that creates a process that can observe exhausted credentials but cannot adopt the next account in-turn.
 - **Mac CLI discovery:** preliminary `pgrep` candidates use exact process-name matching for `codex`. Full-command-line matching is prohibited because unrelated CodexSwitch paths and short-lived tools can make an otherwise valid batch incomplete.
 - **Mac CLI process identity:** after `ps` discovery, reclassify every candidate from its kernel-resolved executable path. Any executable inside a macOS `.app/Contents/` tree is an application or helper, not an interactive Codex CLI, even when an unquoted path segment such as `Codex Computer Use.app` makes the first whitespace-delimited token look like a `codex` binary.
@@ -422,7 +436,7 @@ CodexSwitch must evaluate these independently:
 - **Retry-exhausted CLI recovery:** topology observation runs off the main actor and is throttled. Once historical CLIs are gone, one new all-managed topology may re-arm same-target convergence; an unchanged failing topology must not loop.
 - **Desktop code-mode helper:** `codex-code-mode-host` is a worker owned by the desktop app-server, not an independent interactive CLI. It must not appear as a Mac CLI readiness blocker or receive a standalone auth-reload signal; readiness follows its parent app-server.
 - **Mac remote client:** a `codex --remote` process on the Mac is a transport client, not the account-bearing app-server. It must not be treated as the VPS hot-swap target.
-- **Linux VPS app-server:** the app-server process is the primary account-bearing runtime for KittyLitter/remote sessions and must acknowledge reload.
+- **Linux VPS app-server:** ordinary VPS app-servers, including the SSH `unix://` daemon, remain strict `external-app-server` targets and must prove frontend delivery. Only the positively classified port-8390 `headless-remote-control-app-server` retains the broader headless idle contract; SSH/Unix transport or missing frontends do not promote an ordinary external app-server into it.
 - **Remote SSH proxy:** `codex app-server proxy` is a transport bridge, not the account-bearing runtime, so it is excluded from SIGHUP targeting. After promoting a new VPS binary, reconnect the desktop's remote SSH transport so the proxy adopts the new protocol and model catalog; validate auth against the long-running remote-control app-server.
 - **Linux patched CLI:** `/home/signul/.local/share/codexswitch/current/patched-codex/codex ...` is a native Codex runtime even when launched with arguments such as `--yolo`. Detection must inspect the executable token, not only exact command-line suffixes. The app-server detector must also accept `app-server --remote-control --listen ws://...`; otherwise the VPS can write `auth.json` but report `signaled 0 Codex hot-swap process(es)`.
 - **Background ACK repair:** the daemon may repair missing ACKs for live interactive CLI sessions. Discovery attempts are capped at one per 60 seconds even when no ACK is missing; a healthy no-work result must advance the cadence clock. It must not repeatedly signal an app-server that has not proven live reload support, because a supervised WebSocket app-server can exit on `SIGHUP` and enter a disconnecting restart loop.
@@ -557,7 +571,10 @@ response is valid when it has the expected `id` and exactly one
 
 Do not report success from the bridge connection alone. The activation journal
 must become `confirmed`, and the matching `hotswap-ack/<pid>.json` must prove
-the strict runtime reload.
+the runtime reload under `managed-desktop-bridge`. If ChatGPT is connected, the
+ACK must prove completed frontend delivery. If the repository-managed bridge is
+dormant, only the exact all-zero counter shape is valid; an
+`external-app-server` ACK, missing counters, or a listener on another port fails.
 
 ## CLI Update Storage Safety
 
@@ -1011,10 +1028,11 @@ Before claiming hot-swap is fixed or ready:
   listener owner, and running executable vnode all agree. A stale independent
   CLI forwarding wrapper must not block this desktop-only bootstrap.
 - [ ] With ChatGPT closed and zero initialized bridge frontends, a swap accepts
-  only the exact all-zero idle-listener ACK and both the Swift app and Rust CLI
-  bind it to the current activation. With any initialized, skipped, eligible,
-  or rejected desktop frontend, the idle shape is rejected and completed
-  frontend delivery remains mandatory.
+  only an exact all-zero `managed-desktop-bridge` idle-listener ACK bound to the
+  repository-managed Mac process and loopback listener on port `9223`, and both
+  the Swift app and Rust CLI bind it to the current activation. With any
+  initialized, skipped, eligible, or rejected desktop frontend, the idle shape
+  is rejected and completed frontend delivery remains mandatory.
 - [ ] The Swift managed-launcher fixture uses real tab bytes and contains no
   literal `\t` indentation sequences, matching the Rust-generated launcher.
 - [ ] Relaunching or reinstalling CodexSwitch preserves a same-target
@@ -1028,7 +1046,8 @@ Before claiming hot-swap is fixed or ready:
   that owns its listening TCP socket. A concurrent managed
   `app-server --listen stdio://` host process is ignored and cannot create a
   phantom missing-socket target.
-- [ ] The desktop runtime contains the account-update marker, and the ACK proves matching disk/active auth fingerprints, the current signal nonce, and at least one completed frontend write.
+- [ ] Every ordinary `external-app-server`, including a desktop or VPS target reached through SSH/Unix, proves matching disk/active auth fingerprints, the current signal nonce, and at least one completed frontend write.
+- [ ] Any broader idle result comes from a positively classified `headless-remote-control-app-server` topology, not from generic `external-app-server`, SSH/Unix transport, or an absent frontend.
 - [ ] A local interactive CLI ACK identifies `local-interactive-cli`, proves matching disk/active auth fingerprints and the current signal nonce, reports auth-generation/reconnect readiness, and reports zero desktop frontend writes.
 - [ ] The Rust readiness path accepts a Swift UUID request nonce when the full version-3 binding matches, and rejects empty, oversized, whitespace, or control-character nonces.
 - [ ] ChatGPT framework helpers and crash reporters do not appear in CLI readiness or restart target lists.
@@ -1068,8 +1087,20 @@ Every future hot-swap change must include tests for:
 - A fresh ACK from the running PID remains authoritative when the executable at that path was replaced after process start or the executable path cannot be resolved.
 - Desktop readiness rejects binaries that reload backend auth without broadcasting `account/updated` to the shell.
 - Missing or malformed auth produces no successful ACK and does not replace valid cached auth with `None`.
-- Only the capability-bound `headless-remote-control-app-server` kind may use an explicit zero-count idle-listener ACK after verified auth reload. Rejected-before-eligibility historical connections are excluded from the writer count, but any writer that accepted the notification is eligible and forbids the idle shape until its transport write completes. Strict external app-servers, an accepted-but-undelivered writer, timeout, contradictory count, or same-second stale ACK cannot use the idle shape.
-- Strict and headless external app-server ACK accounting includes initialized
+- Only the identity-bound repository-managed Mac loopback listener on port
+  `9223` can classify as `managed-desktop-bridge` and accept an exact all-zero
+  idle ACK; missing or mixed counters, another port, and a self-claimed kind
+  fail. Any initialized frontend restores the completed-delivery requirement.
+- `headless-remote-control-app-server` keeps its broader idle behavior only
+  after positive topology and capability classification. Rejected-before-
+  eligibility historical connections may be excluded from its live writer
+  count, but any writer that accepted the notification forbids the headless idle
+  shape until its transport write completes.
+- Ordinary `external-app-server`, including VPS SSH/Unix targets, always
+  requires positive frontend delivery. Generic idleness, an
+  accepted-but-undelivered writer, timeout, contradictory counts, or a
+  same-second stale ACK cannot satisfy it.
+- App-server ACK accounting includes initialized
   frontends that were intentionally skipped:
   `skipped + eligible + rejected == initialized`. The live
   `initializedFrontendCount=2, skippedFrontendCount=1,
@@ -1082,7 +1113,11 @@ Every future hot-swap change must include tests for:
 - The SIGHUP request nonce is unique per signal and must be echoed by the matching PID ACK.
 - Reused ACK PIDs and newly acknowledged PIDs are tracked separately; only the
   latter may produce a `SIGHUP_SENT` event.
-- An external app-server rejects a CLI-kind ACK, and a local interactive CLI accepts only its CLI-kind ACK with exact nonce/fingerprints plus auth-generation/reconnect readiness.
+- An external app-server rejects every ACK whose runtime kind is not
+  `external-app-server`; every other runtime kind likewise rejects an
+  `external-app-server` ACK, and a local interactive CLI accepts only its
+  CLI-kind ACK with exact nonce/fingerprints plus auth-generation/reconnect
+  readiness.
 - A stale in-process app-server handler exits on a closed outgoing channel before it can read the request; the request remains available for the live handler and injected-turn binding, while `account/updated` delivery to the TUI remains best-effort.
 - A stale `desktop-auth-watcher-ready` file cannot make a current desktop process report ready.
 - Desktop updates are downloaded and signature-verified while the app is live, but replacement and compatibility patching wait for app termination.

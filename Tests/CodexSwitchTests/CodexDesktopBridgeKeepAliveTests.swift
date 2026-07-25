@@ -130,7 +130,7 @@ struct CodexDesktopBridgeKeepAliveTests {
         let binding = CodexReloadBinding(
             processIdentity: identity,
             kernelExecutableIdentity: kernelIdentity,
-            runtimeKind: .externalAppServer,
+            runtimeKind: .managedDesktopBridge,
             authFileIdentity: CodexAuthFileIdentity(
                 canonicalPath: home.appendingPathComponent(".codex/auth.json").path,
                 device: 8,
@@ -156,6 +156,21 @@ struct CodexDesktopBridgeKeepAliveTests {
 
         #expect(CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
             binding: binding,
+            socketPort: 9223,
+            launchAgentPID: 42,
+            bridgeFilesCurrent: true,
+            verifiedRoute: verifiedRoute
+        ))
+        let ordinaryExternalBinding = CodexReloadBinding(
+            processIdentity: binding.processIdentity,
+            kernelExecutableIdentity: binding.kernelExecutableIdentity,
+            runtimeKind: .externalAppServer,
+            authFileIdentity: binding.authFileIdentity,
+            requestNonce: binding.requestNonce,
+            issuedAtUnixMilliseconds: binding.issuedAtUnixMilliseconds
+        )
+        #expect(!CodexDesktopBridgeKeepAlive.firstAcknowledgementBootstrapIsAuthorized(
+            binding: ordinaryExternalBinding,
             socketPort: 9223,
             launchAgentPID: 42,
             bridgeFilesCurrent: true,

@@ -920,9 +920,8 @@ enum SwapEngine {
         let execution = executeReloadBatch(
             preliminaryPIDs: preliminaryReloadPIDs(from: discoveryResult),
             discoveryProvider: {
-                runtimeDiscoverySnapshot(
+                desktopRuntimeDiscoverySnapshot(
                     from: discoveryResult,
-                    runtimeKind: .externalAppServer,
                     requiredOwnerUID: UInt32(getuid()),
                     identityProvider: signalProcessIdentity,
                     argumentProvider: processArguments
@@ -1055,9 +1054,13 @@ enum SwapEngine {
         hasStartupAcknowledgement: Bool,
         firstAcknowledgementBootstrapAuthorized: Bool
     ) -> Bool {
-        hasStartupAcknowledgement
+        guard binding.runtimeKind == .externalAppServer
+                || binding.runtimeKind == .managedDesktopBridge else {
+            return false
+        }
+        return hasStartupAcknowledgement
             || (
-                binding.runtimeKind == .externalAppServer
+                binding.runtimeKind == .managedDesktopBridge
                     && firstAcknowledgementBootstrapAuthorized
             )
     }
@@ -1139,6 +1142,91 @@ enum SwapEngine {
             kernelExecutableIdentity(pid: $0)
         }
     ) -> CodexRuntimeDiscoverySnapshot {
+        classifiedRuntimeDiscoverySnapshot(
+            from: processSnapshot,
+            requiredOwnerUID: requiredOwnerUID,
+            identityProvider: identityProvider,
+            argumentProvider: argumentProvider,
+            kernelExecutableIdentityProvider: kernelExecutableIdentityProvider
+        ) { process in
+            processMatchesRuntime(process, runtimeKind: runtimeKind)
+                ? runtimeKind
+                : nil
+        }
+    }
+
+    nonisolated static func desktopRuntimeDiscoverySnapshot(
+        from discoveryResult: CodexPGrepDiscoveryResult,
+        requiredOwnerUID: UInt32,
+        identityProvider: (Int32) -> CodexSignalProcessIdentity?,
+        argumentProvider: (Int32) -> [String]?,
+        kernelExecutableIdentityProvider: (Int32) -> CodexKernelExecutableIdentity? = {
+            kernelExecutableIdentity(pid: $0)
+        },
+        managedDesktopRuntimePath: String? = installedManagedDesktopRuntimePath()
+    ) -> CodexRuntimeDiscoverySnapshot {
+        switch discoveryResult {
+        case .noMatches:
+            return CodexRuntimeDiscoverySnapshot(targets: [], isComplete: true)
+        case .snapshot(let processSnapshot):
+            return desktopRuntimeDiscoverySnapshot(
+                from: processSnapshot,
+                requiredOwnerUID: requiredOwnerUID,
+                identityProvider: identityProvider,
+                argumentProvider: argumentProvider,
+                kernelExecutableIdentityProvider: kernelExecutableIdentityProvider,
+                managedDesktopRuntimePath: managedDesktopRuntimePath
+            )
+        case .failed:
+            return CodexRuntimeDiscoverySnapshot(targets: [], isComplete: false)
+        }
+    }
+
+    nonisolated static func desktopRuntimeDiscoverySnapshot(
+        from discoveryResult: CodexPGrepDiscoveryResult,
+        requiredOwnerUID: UInt32
+    ) -> CodexRuntimeDiscoverySnapshot {
+        desktopRuntimeDiscoverySnapshot(
+            from: discoveryResult,
+            requiredOwnerUID: requiredOwnerUID,
+            identityProvider: signalProcessIdentity,
+            argumentProvider: processArguments,
+            kernelExecutableIdentityProvider: kernelExecutableIdentity
+        )
+    }
+
+    nonisolated static func desktopRuntimeDiscoverySnapshot(
+        from processSnapshot: CodexPGrepProcessSnapshot,
+        requiredOwnerUID: UInt32,
+        identityProvider: (Int32) -> CodexSignalProcessIdentity?,
+        argumentProvider: (Int32) -> [String]?,
+        kernelExecutableIdentityProvider: (Int32) -> CodexKernelExecutableIdentity? = {
+            kernelExecutableIdentity(pid: $0)
+        },
+        managedDesktopRuntimePath: String? = installedManagedDesktopRuntimePath()
+    ) -> CodexRuntimeDiscoverySnapshot {
+        classifiedRuntimeDiscoverySnapshot(
+            from: processSnapshot,
+            requiredOwnerUID: requiredOwnerUID,
+            identityProvider: identityProvider,
+            argumentProvider: argumentProvider,
+            kernelExecutableIdentityProvider: kernelExecutableIdentityProvider
+        ) { process in
+            desktopRuntimeKind(
+                for: process,
+                managedDesktopRuntimePath: managedDesktopRuntimePath
+            )
+        }
+    }
+
+    private nonisolated static func classifiedRuntimeDiscoverySnapshot(
+        from processSnapshot: CodexPGrepProcessSnapshot,
+        requiredOwnerUID: UInt32,
+        identityProvider: (Int32) -> CodexSignalProcessIdentity?,
+        argumentProvider: (Int32) -> [String]?,
+        kernelExecutableIdentityProvider: (Int32) -> CodexKernelExecutableIdentity?,
+        runtimeClassifier: (CodexIdentityBoundProcess) -> HotSwapRuntimeKind?
+    ) -> CodexRuntimeDiscoverySnapshot {
         var targets: [CodexRuntimeTarget] = []
         var isComplete = processSnapshot.isComplete
 
@@ -1153,13 +1241,24 @@ enum SwapEngine {
                 isComplete = false
                 continue
             }
-            guard processMatchesRuntime(process, runtimeKind: runtimeKind) else {
+            guard let runtimeKind = runtimeClassifier(process) else {
                 continue
             }
             targets.append(CodexRuntimeTarget(process: process, runtimeKind: runtimeKind))
         }
 
         return CodexRuntimeDiscoverySnapshot(targets: targets, isComplete: isComplete)
+    }
+
+    nonisolated static func installedManagedDesktopRuntimePath(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> String? {
+        CodexVersionChecker.managedRuntimeRoute(
+            managedLauncherPath:
+                CodexManagedRuntimeTrust.defaultManagedLauncherPath(
+                    homeDirectory: homeDirectory
+                )
+        )?.runtimePath
     }
 
     nonisolated static func identityBoundProcess(
@@ -1200,11 +1299,20 @@ enum SwapEngine {
 
     nonisolated static func processMatchesRuntime(
         _ process: CodexIdentityBoundProcess,
-        runtimeKind: HotSwapRuntimeKind
+        runtimeKind: HotSwapRuntimeKind,
+        managedDesktopRuntimePath: String? = nil
     ) -> Bool {
         let executablePath = process.kernelExecutableIdentity.canonicalPath
         guard executablePath == process.identity.executablePath else { return false }
         let runtimeArguments = process.arguments.dropFirst().map { $0.lowercased() }
+        let isDesktopAppServer = runtimeArguments.contains("app-server")
+            && !runtimeArguments.contains("--remote-control")
+            && hasExplicitLoopbackWebSocketListener(process.arguments)
+            && DesktopRuntimeDiagnostics.classifyAppServerPath(executablePath)
+                == .desktopAppServer
+        let isManagedDesktopBridge = isDesktopAppServer
+            && managedDesktopRuntimePath == executablePath
+            && hasManagedDesktopBridgeInvocation(process.arguments)
 
         switch runtimeKind {
         case .localInteractiveCLI:
@@ -1217,36 +1325,40 @@ enum SwapEngine {
                     || argument.hasPrefix("--remote=")
             })
         case .externalAppServer:
-            return runtimeArguments.contains("app-server")
-                && !runtimeArguments.contains("--remote-control")
-                && hasExplicitLoopbackWebSocketListener(process.arguments)
-                && DesktopRuntimeDiagnostics.classifyAppServerPath(executablePath) == .desktopAppServer
+            return isDesktopAppServer && !isManagedDesktopBridge
+        case .managedDesktopBridge:
+            return isManagedDesktopBridge
         case .headlessRemoteControlAppServer:
             return false
         }
     }
 
+    nonisolated static func desktopRuntimeKind(
+        for process: CodexIdentityBoundProcess,
+        managedDesktopRuntimePath: String?
+    ) -> HotSwapRuntimeKind? {
+        if processMatchesRuntime(
+            process,
+            runtimeKind: .managedDesktopBridge,
+            managedDesktopRuntimePath: managedDesktopRuntimePath
+        ) {
+            return .managedDesktopBridge
+        }
+        if processMatchesRuntime(
+            process,
+            runtimeKind: .externalAppServer,
+            managedDesktopRuntimePath: managedDesktopRuntimePath
+        ) {
+            return .externalAppServer
+        }
+        return nil
+    }
+
     nonisolated static func hasExplicitLoopbackWebSocketListener(
         _ arguments: [String]
     ) -> Bool {
-        var listenerValues: [String] = []
-
-        var index = 0
-        while index < arguments.count {
-            let argument = arguments[index]
-            if argument == "--listen" {
-                guard arguments.indices.contains(index + 1) else { return false }
-                listenerValues.append(arguments[index + 1])
-                index += 2
-                continue
-            }
-            if argument.hasPrefix("--listen=") {
-                listenerValues.append(String(argument.dropFirst("--listen=".count)))
-            }
-            index += 1
-        }
-
-        guard listenerValues.count == 1,
+        guard let listenerValues = explicitListenerValues(arguments),
+              listenerValues.count == 1,
               let components = URLComponents(string: listenerValues[0]),
               components.scheme?.lowercased() == "ws",
               let host = components.host?.lowercased(),
@@ -1258,6 +1370,41 @@ enum SwapEngine {
             return false
         }
         return true
+    }
+
+    nonisolated static func hasManagedDesktopBridgeInvocation(
+        _ arguments: [String]
+    ) -> Bool {
+        guard arguments.count == 7 else { return false }
+        return Array(arguments.dropFirst()) == [
+            "-c",
+            "features.code_mode_host=true",
+            "app-server",
+            "--analytics-default-enabled",
+            "--listen",
+            CodexDesktopBridgeKeepAlive.websocketURL,
+        ]
+    }
+
+    private nonisolated static func explicitListenerValues(
+        _ arguments: [String]
+    ) -> [String]? {
+        var listenerValues: [String] = []
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--listen" {
+                guard arguments.indices.contains(index + 1) else { return nil }
+                listenerValues.append(arguments[index + 1])
+                index += 2
+                continue
+            }
+            if argument.hasPrefix("--listen=") {
+                listenerValues.append(String(argument.dropFirst("--listen=".count)))
+            }
+            index += 1
+        }
+        return listenerValues
     }
 
     nonisolated static func runtimeTargetIsCurrent(
@@ -1307,7 +1454,10 @@ enum SwapEngine {
                 kernelExecutableIdentity: executableBefore,
                 arguments: argumentsAfter
             ),
-            runtimeKind: target.runtimeKind
+            runtimeKind: target.runtimeKind,
+            managedDesktopRuntimePath: target.runtimeKind == .managedDesktopBridge
+                ? expectedIdentity.executablePath
+                : installedManagedDesktopRuntimePath()
         )
     }
 
@@ -1710,8 +1860,51 @@ enum SwapEngine {
             kernelExecutableIdentityProvider: kernelExecutableIdentity
         )
 
-        return localRuntimeEvidenceSnapshot(
+        return liveLocalRuntimeEvidenceSnapshot(
             discoverySnapshot: discovery,
+            homeDirectory: homeDirectory,
+            requiredOwnerUID: requiredOwnerUID
+        )
+    }
+
+    nonisolated static func localDesktopRuntimeEvidenceSnapshot(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        requiredOwnerUID: UInt32 = UInt32(getuid())
+    ) -> CodexLocalRuntimeEvidenceSnapshot {
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
+            arguments: localCodexProcessDiscoveryArguments,
+            timeout: 3
+        )
+        let discovery = desktopRuntimeDiscoverySnapshot(
+            from: pgrepDiscoveryResult(
+                stdout: result.stdout,
+                terminationStatus: result.terminationStatus,
+                timedOut: result.timedOut
+            ),
+            requiredOwnerUID: requiredOwnerUID,
+            identityProvider: signalProcessIdentity,
+            argumentProvider: processArguments,
+            kernelExecutableIdentityProvider: kernelExecutableIdentity,
+            managedDesktopRuntimePath: installedManagedDesktopRuntimePath(
+                homeDirectory: homeDirectory
+            )
+        )
+
+        return liveLocalRuntimeEvidenceSnapshot(
+            discoverySnapshot: discovery,
+            homeDirectory: homeDirectory,
+            requiredOwnerUID: requiredOwnerUID
+        )
+    }
+
+    private nonisolated static func liveLocalRuntimeEvidenceSnapshot(
+        discoverySnapshot: CodexRuntimeDiscoverySnapshot,
+        homeDirectory: URL,
+        requiredOwnerUID: UInt32
+    ) -> CodexLocalRuntimeEvidenceSnapshot {
+        return localRuntimeEvidenceSnapshot(
+            discoverySnapshot: discoverySnapshot,
             observationProvider: { target in
                 runtimeObservation(
                     for: target,
@@ -2057,7 +2250,10 @@ enum SwapEngine {
                 kernelExecutableIdentity: kernelExecutableIdentity,
                 arguments: argumentsAfter
             ),
-            runtimeKind: runtimeKind
+            runtimeKind: runtimeKind,
+            managedDesktopRuntimePath: runtimeKind == .managedDesktopBridge
+                ? processIdentity.executablePath
+                : installedManagedDesktopRuntimePath()
         )
     }
 
@@ -2514,6 +2710,11 @@ enum SwapEngine {
         case .externalAppServer:
             return externalAppServerAcknowledgementIsValid(
                 acknowledgement,
+                idlePolicy: .never
+            )
+        case .managedDesktopBridge:
+            return externalAppServerAcknowledgementIsValid(
+                acknowledgement,
                 idlePolicy: .zeroInitializedFrontends
             )
         case .headlessRemoteControlAppServer:
@@ -2535,6 +2736,7 @@ enum SwapEngine {
     }
 
     private enum AppServerIdlePolicy {
+        case never
         case zeroInitializedFrontends
         case noEligibleFrontends
     }
@@ -2567,6 +2769,8 @@ enum SwapEngine {
             && eligible > 0
             && acknowledgement.frontendWriteCount == eligible
         let idleCountsAreAllowed = switch idlePolicy {
+        case .never:
+            false
         case .zeroInitializedFrontends:
             initialized == 0 && skipped == 0 && eligible == 0 && rejected == 0
         case .noEligibleFrontends:

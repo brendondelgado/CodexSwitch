@@ -269,7 +269,7 @@ enum CodexDesktopBridgeKeepAlive {
         bridgeFilesCurrent: Bool,
         verifiedRoute: CodexManagedRuntimeTrust.VerifiedRoute?
     ) -> Bool {
-        guard binding.runtimeKind == .externalAppServer,
+        guard binding.runtimeKind == .managedDesktopBridge,
               socketPort == port,
               binding.processIdentity.ownerUID == UInt32(getuid()),
               launchAgentPID == binding.processIdentity.pid,

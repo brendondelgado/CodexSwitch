@@ -105,13 +105,31 @@ Version `3` is the structured request/ACK wire version. Static binary patch
 markers are installation hints only and never substitute for a version-`3`
 artifact or identity check.
 
+Runtime kinds are closed authorization contracts derived by the classifier, not
+labels that an ACK may select for itself:
+
+- `managed-desktop-bridge` is reserved for the repository-managed Mac bridge
+  whose loopback listener is proven to use port `9223` and whose process and
+  listener identities satisfy the complete binding and revalidation contract.
+  Only this runtime kind may use the exact all-zero desktop idle branch.
+- `external-app-server` covers every ordinary external app-server, including a
+  VPS app-server reached through SSH or a Unix socket. It remains strict and
+  must prove delivery of `account/updated` to at least one initialized frontend;
+  transport shape, no connected client, or zero counters never grants the
+  managed bridge exception.
+- `headless-remote-control-app-server` retains its separate, broader idle
+  contract after positive topology classification. It does not inherit the
+  managed bridge's exact all-zero desktop-counter exception, and SSH, Unix
+  transport, or an absent frontend is not enough to classify an ordinary
+  external app-server as headless remote-control.
+
 ## Desktop Transport Bridge
 
 Current ChatGPT desktop builds launch their private local app-server over stdio.
 That child has no independently connectable endpoint, so CodexSwitch cannot
 perform an externally verified account reload against it.
 
-CodexSwitch owns one local desktop bridge at
+CodexSwitch owns one local `managed-desktop-bridge` at
 `ws://127.0.0.1:9223`. A launch agent keeps one patched Codex app-server
 listening there and publishes `CODEX_APP_SERVER_WS_URL` so ChatGPT uses the same
 runtime. The bridge uses the normal OpenAI app-server transport; it is not a
@@ -128,14 +146,16 @@ The bridge contract is:
    `jsonrpc: "2.0"` or the current envelope containing only `id` plus
    `result`/`error`. An explicit non-2.0 `jsonrpc` value remains invalid.
 6. A successful account RPC is still followed by the version-3 SIGHUP
-   request/ACK proof. When at least one initialized frontend exists, the bridge
-   remains strict and every eligible frontend must complete the
-   `account/updated` transport write. When the launchd-kept bridge has exactly
-   zero initialized frontends, it may instead acknowledge that its backend auth
-   cache is current and that a future frontend will initialize against that
-   cache. This zero-frontend shape does not claim that ChatGPT was notified.
-   The bridge never weakens process, socket-owner, auth file, or
-   token-fingerprint validation.
+   request/ACK proof bound to `managed-desktop-bridge`. When at least one
+   initialized frontend exists, the bridge remains strict and every eligible
+   frontend must complete the `account/updated` transport write. When the
+   launchd-kept bridge has exactly zero initialized frontends, it may instead
+   acknowledge that its backend auth cache is current and that a future
+   frontend will initialize against that cache, but every required frontend
+   writer and delivery counter must be present and exactly zero. Missing
+   counters, mixed values, or any nonzero value are not an exact all-zero idle
+   ACK. This shape does not claim that ChatGPT was notified. The bridge never
+   weakens process, socket-owner, auth file, or token-fingerprint validation.
 
 ## Artifact Validation
 
@@ -178,8 +198,8 @@ not from `pgrep` text. A signal path must:
    device/inode and complete token fingerprint, then form the immutable binding.
 6. Establish capability from complete startup request and ACK evidence matching
    the current observation. The one exception is first-ACK bootstrap during an
-   explicit desktop activation for the repository-owned bridge on port `9223`:
-   its launchd PID, generated
+   explicit desktop activation for the repository-owned
+   `managed-desktop-bridge` on port `9223`: its launchd PID, generated
    bridge files, the exact managed launcher embedded in those bridge files,
    expected runtime/helper hashes, and the running executable vnode must all
    match before CodexSwitch may write one request and send one signal. The
@@ -206,11 +226,11 @@ evidence.
 The managed `9223` bootstrap closes the otherwise circular first-start
 dependency: a newly launched app-server cannot have an identity-bound ACK until
 it has received its first identity-bound request. Bootstrap is mutation-path
-only, applies to the exact launchd-owned bridge PID and socket, and still
-requires the normal post-signal ACK with matching auth fingerprints. If an
-initialized frontend exists, the ACK also requires every eligible frontend
-write. If the initialized count is exactly zero, the ACK must instead carry the
-explicit zero-count idle-listener shape. It never makes readiness green by
+only, applies to the exact launchd-owned `managed-desktop-bridge` PID and socket,
+and still requires the normal post-signal ACK with matching auth fingerprints.
+If an initialized frontend exists, the ACK also requires every eligible
+frontend write. If the initialized count is exactly zero, the ACK must instead
+carry the exact all-zero idle-listener shape. It never makes readiness green by
 itself and does not authorize arbitrary app-servers or local interactive CLI
 processes.
 
@@ -295,26 +315,31 @@ runtime is `unknown`; only a non-empty, complete snapshot is `ready`. Ordinary
 readiness is read-only: it performs no artifact deletion, filesystem mutation,
 or PID liveness probe. Retention, if introduced, must be an explicit
 binding-aware maintenance operation serialized under the same PID admission.
-An exact zero-frontend idle ACK is valid activation evidence for the dormant
-backend but is not active desktop readiness. Status remains non-ready until a
-later ACK proves delivery to an initialized frontend. Likewise, the managed
-bridge's listening port alone never means the ChatGPT host is running or
-connected.
+An exact zero-frontend `managed-desktop-bridge` idle ACK is valid activation
+evidence for the dormant backend but is not active desktop readiness. Status
+remains non-ready until a later ACK proves delivery to an initialized frontend.
+Likewise, the managed bridge's listening port alone never means the ChatGPT host
+is running or connected.
 
 Desktop `account/read` JSON-RPC verification is diagnostic and cannot replace
 the identity-bound request/ACK proof. A `.reloaded` result requires at least one
 explicit target identity to match: normalized email or canonical account ID.
-Strict and headless external app-server ACK accounting is exact:
+App-server ACK accounting is exact:
 `skippedFrontendCount + eligibleFrontendCount + rejectedFrontendCount`
 must equal `initializedFrontendCount`, and `frontendWriteCount` must equal the
 eligible count. Initialized frontends that are intentionally skipped remain
 part of the total and do not invalidate an otherwise complete delivery proof.
-An `external-app-server` may use the idle-listener shape only when all four
-frontend counts and `frontendWriteCount` are exactly zero. This proves a
-dormant listener's backend auth cache for its next connection; any initialized,
-skipped, eligible, or rejected frontend makes that shape invalid and restores
-the completed-write requirement. A `headless-remote-control-app-server` keeps
-its broader idle-listener policy because it has no desktop renderer contract.
+An ordinary `external-app-server`, including a VPS target reached through SSH
+or a Unix socket, always requires positive completed frontend delivery and may
+not use an idle-listener shape. Only the identity-bound repository-managed
+`managed-desktop-bridge` on loopback port `9223` may use the exact all-zero
+shape, and only when all four frontend counts and `frontendWriteCount` are
+present and exactly zero. Any initialized, skipped, eligible, or rejected
+frontend makes that shape invalid and restores the completed-write requirement.
+A positively classified `headless-remote-control-app-server` keeps its broader
+idle-listener policy because it has no desktop renderer contract; that separate
+policy may account for disconnected historical connections and is not the
+managed bridge's exact all-zero exception.
 Interactive CLI ACKs carry no frontend accounting values. Canonical serializers
 omit all four keys; decoders also treat explicit JSON `null` as no value for
 backward-compatible parsing.
@@ -336,8 +361,14 @@ token-fingerprint drift, mutually matching nonce replay, canonical executable
 path/device/inode drift, argv/runtime-kind drift immediately before signaling
 and during evidence acceptance, auth same-content inode replacement, aggregate
 ACK deadlines, socket-owner/port reuse, locked-write drift, and identity changes
-during capability proof. Concurrent batch tests also prove that a competing
-desktop discovery provider cannot run until the first attempt releases PID
-admission after strict ACK completion. All tests use typed snapshots and injected
-process, argv, executable-vnode, socket, file, clock, ACK, and signal seams; there
-is no environment-enabled live reload test.
+during capability proof. Runtime-kind tests prove that only the
+identity-verified repository-managed loopback listener on port `9223` can use a
+`managed-desktop-bridge` exact all-zero idle ACK, that missing or mixed counters
+fail, that ordinary `external-app-server` targets including VPS SSH/Unix
+topologies require positive frontend delivery, and that
+`headless-remote-control-app-server` uses only its separately classified idle
+contract. Concurrent batch tests also prove that a competing desktop discovery
+provider cannot run until the first attempt releases PID admission after strict
+ACK completion. All tests use typed snapshots and injected process, argv,
+executable-vnode, socket, file, clock, ACK, and signal seams; there is no
+environment-enabled live reload test.

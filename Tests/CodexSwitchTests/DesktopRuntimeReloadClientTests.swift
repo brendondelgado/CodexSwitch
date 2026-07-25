@@ -772,15 +772,15 @@ struct DesktopRuntimeReloadClientTests {
                     ))
                 },
                 runtimeDiscovery: { discoveryResult, requiredOwnerUID in
-                    SwapEngine.runtimeDiscoverySnapshot(
+                    SwapEngine.desktopRuntimeDiscoverySnapshot(
                         from: discoveryResult,
-                        runtimeKind: .externalAppServer,
                         requiredOwnerUID: requiredOwnerUID,
                         identityProvider: { processesByPID[$0]?.identity },
                         argumentProvider: { argumentsByPID[$0] },
                         kernelExecutableIdentityProvider: {
                             processesByPID[$0]?.kernelExecutableIdentity
-                        }
+                        },
+                        managedDesktopRuntimePath: nil
                     )
                 },
                 socketBinding: { target in

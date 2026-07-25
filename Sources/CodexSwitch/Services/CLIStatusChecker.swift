@@ -227,16 +227,14 @@ enum CLIStatusChecker {
 
     private nonisolated static func _checkDesktopApp() -> DesktopAppStatus {
         let patchStatus = DesktopPatchManager.currentStatus()
-        let runtimeEvidence = SwapEngine.localRuntimeEvidenceSnapshot(
-            runtimeKind: .externalAppServer
-        )
+        let runtimeEvidence = SwapEngine.localDesktopRuntimeEvidenceSnapshot()
         let runtimeState: DesktopRuntimeHotSwapState
         if !runtimeEvidence.isComplete {
             runtimeState = .restartRequired
-        } else if runtimeEvidence.runtimes.isEmpty {
-            runtimeState = .unknown
         } else {
-            runtimeState = .ready
+            runtimeState = DesktopPatchManager.runtimeHotSwapState(
+                from: runtimeEvidence
+            )
         }
 
         // Check WebSocket port first

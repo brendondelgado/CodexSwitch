@@ -166,6 +166,20 @@ fn patch_app_server_reload_template(
                     });
                 if has_remote_control && has_websocket_listener {
                     "headless-remote-control-app-server"
+                } else if cfg!(target_os = "macos")
+                    && arguments.len() == 7
+                    && arguments
+                        .first()
+                        .and_then(|executable| executable.rsplit('/').next())
+                        .is_some_and(|executable| executable == "codex")
+                    && arguments[1] == "-c"
+                    && arguments[2] == "features.code_mode_host=true"
+                    && arguments[3] == "app-server"
+                    && arguments[4] == "--analytics-default-enabled"
+                    && arguments[5] == "--listen"
+                    && arguments[6] == "ws://127.0.0.1:9223"
+                {
+                    "managed-desktop-bridge"
                 } else {
                     "external-app-server"
                 }
@@ -413,7 +427,7 @@ fn patch_app_server_reload_template(
                         "headless-remote-control-app-server" => {
                             eligible_frontend_count == 0
                         }
-                        "external-app-server" => {
+                        "managed-desktop-bridge" => {
                             initialized_frontend_count == 0
                                 && skipped_frontend_count == 0
                                 && eligible_frontend_count == 0
@@ -824,4 +838,48 @@ fn patch_app_server_reload_template(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod managed_desktop_bridge_template_tests {
+    #[test]
+    fn generated_app_server_keeps_managed_idle_policy_narrow() {
+        let source = include_str!("source_app_server_template.rs");
+        let managed_wire_name = ["managed", "desktop", "bridge"].join("-");
+        let managed_match_arm = format!("\"{managed_wire_name}\" =>");
+        let external_match_arm = ["\"", "external-app-server", "\" =>"].concat();
+        let exact_listener = ["ws://127.0.0.1:", "9223"].concat();
+        let exact_argument_count = ["arguments.len()", " == 7"].concat();
+        let macos_gate = ["cfg!(target_os = ", "\"macos\")"].concat();
+        let code_mode_argument =
+            ["arguments[2]", " == \"features.code_mode_host=true\""].concat();
+        let analytics_argument =
+            ["arguments[4]", " == \"--analytics-default-enabled\""].concat();
+        let managed_idle_policy = [
+            "\"managed-desktop-bridge\" => {\n",
+            "                            initialized_frontend_count == 0\n",
+            "                                && skipped_frontend_count == 0\n",
+            "                                && eligible_frontend_count == 0\n",
+            "                                && rejected_frontend_count == 0\n",
+            "                        }",
+        ]
+        .concat();
+        let headless_idle_policy = [
+            "\"headless-remote-control-app-server\" => {\n",
+            "                            eligible_frontend_count == 0\n",
+            "                        }",
+        ]
+        .concat();
+
+        assert!(source.contains(&format!("\"{managed_wire_name}\"")));
+        assert!(source.contains(&managed_match_arm));
+        assert!(!source.contains(&external_match_arm));
+        assert!(source.contains(&exact_listener));
+        assert!(source.contains(&exact_argument_count));
+        assert!(source.contains(&macos_gate));
+        assert!(source.contains(&code_mode_argument));
+        assert!(source.contains(&analytics_argument));
+        assert!(source.contains(&managed_idle_policy));
+        assert!(source.contains(&headless_idle_policy));
+    }
 }

@@ -7,7 +7,8 @@ struct CLIStatusCheckerTests {
         pid: Int32 = 42,
         observationRuntimeKind: HotSwapRuntimeKind = .localInteractiveCLI,
         acknowledgementRuntimeKind: HotSwapRuntimeKind = .localInteractiveCLI,
-        accountID: String = "account-1"
+        accountID: String = "account-1",
+        idleListenerReady: Bool = false
     ) -> CodexLocalRuntimeEvidence {
         let identity = CodexSignalProcessIdentity(
             pid: pid,
@@ -48,6 +49,7 @@ struct CLIStatusCheckerTests {
             issuedAtUnixMilliseconds: 1_500_000
         )
         let isCLI = acknowledgementRuntimeKind == .localInteractiveCLI
+        let isIdleAppServer = !isCLI && idleListenerReady
         return CodexLocalRuntimeEvidence(
             observation: observation,
             startupAcknowledgement: CodexReloadAcknowledgement(
@@ -55,10 +57,15 @@ struct CLIStatusCheckerTests {
                 acknowledgedAtUnixMilliseconds: 1_500_100,
                 loadedTokenFingerprint: auth.completeTokenFingerprint,
                 activeTokenFingerprint: auth.completeTokenFingerprint,
-                frontendNotified: !isCLI,
-                frontendWriteCount: isCLI ? 0 : 1,
+                frontendNotified: !isCLI && !isIdleAppServer,
+                frontendWriteCount: isCLI || isIdleAppServer ? 0 : 1,
                 authGeneration: isCLI ? 1 : nil,
-                reconnectReady: isCLI ? true : nil
+                reconnectReady: isCLI ? true : nil,
+                initializedFrontendCount: isCLI ? nil : (isIdleAppServer ? 0 : 1),
+                skippedFrontendCount: isCLI ? nil : 0,
+                eligibleFrontendCount: isCLI ? nil : (isIdleAppServer ? 0 : 1),
+                rejectedFrontendCount: isCLI ? nil : 0,
+                idleListenerReady: isCLI ? nil : idleListenerReady
             )
         )
     }
@@ -161,6 +168,24 @@ struct CLIStatusCheckerTests {
 
         #expect(readiness.ready == false)
         #expect(readiness.detail == "pid=42 incompleteEvidence=true")
+    }
+
+    @Test("CLI readiness rejects an idle managed desktop bridge")
+    func cliReadinessRejectsManagedDesktopBridge() {
+        let readiness = CLIStatusChecker.codexCLIRuntimeEvidenceIsHotSwapReady(
+            CodexLocalRuntimeEvidenceSnapshot(
+                runtimes: [
+                    runtimeEvidence(
+                        observationRuntimeKind: .managedDesktopBridge,
+                        acknowledgementRuntimeKind: .managedDesktopBridge,
+                        idleListenerReady: true
+                    ),
+                ],
+                isComplete: true
+            )
+        )
+
+        #expect(!readiness.ready)
     }
 
     @Test("CLI status evaluates injected observational evidence without bootstrapping")

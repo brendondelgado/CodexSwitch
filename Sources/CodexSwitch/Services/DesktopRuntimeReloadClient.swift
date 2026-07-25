@@ -734,9 +734,8 @@ struct DesktopRuntimeReloadClient: Sendable {
                 )
             },
             runtimeDiscovery: { discoveryResult, requiredOwnerUID in
-                SwapEngine.runtimeDiscoverySnapshot(
+                SwapEngine.desktopRuntimeDiscoverySnapshot(
                     from: discoveryResult,
-                    runtimeKind: .externalAppServer,
                     requiredOwnerUID: requiredOwnerUID
                 )
             },
@@ -828,7 +827,10 @@ struct DesktopRuntimeReloadClient: Sendable {
               targetPIDs.count == discovery.targets.count,
               targetPIDs.isSubset(of: preliminaryPIDs),
               discovery.targets.allSatisfy({ target in
-                  target.runtimeKind == .externalAppServer
+                  (
+                      target.runtimeKind == .externalAppServer
+                          || target.runtimeKind == .managedDesktopBridge
+                  )
                       && target.process.identity.ownerUID == dependencies.requiredOwnerUID
               }) else {
             admission.release()

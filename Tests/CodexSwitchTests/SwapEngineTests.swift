@@ -387,6 +387,12 @@ struct SwapEngineTests {
                 "codex", "app-server", "--analytics-default-enabled", "--listen",
                 "ws://127.0.0.1:9223",
             ]
+        case .managedDesktopBridge:
+            defaultArguments = [
+                "codex", "-c", "features.code_mode_host=true", "app-server",
+                "--analytics-default-enabled", "--listen",
+                CodexDesktopBridgeKeepAlive.websocketURL,
+            ]
         case .headlessRemoteControlAppServer:
             defaultArguments = [
                 "codex", "app-server", "--remote-control", "--listen",
@@ -1062,6 +1068,27 @@ struct SwapEngineTests {
         #expect(!SwapEngine.processMatchesRuntime(vendorAppServer, runtimeKind: .externalAppServer))
     }
 
+    @Test("Managed desktop bridge has an explicit stable wire kind")
+    func managedDesktopBridgeHasStableWireKind() throws {
+        #expect(HotSwapRuntimeKind.managedDesktopBridge.rawValue == "managed-desktop-bridge")
+        #expect(HotSwapRuntimeKind.externalAppServer.rawValue == "external-app-server")
+
+        let encoded = try JSONEncoder().encode(HotSwapRuntimeKind.managedDesktopBridge)
+        #expect(String(decoding: encoded, as: UTF8.self) == #""managed-desktop-bridge""#)
+        #expect(
+            try JSONDecoder().decode(
+                HotSwapRuntimeKind.self,
+                from: Data(#""managed-desktop-bridge""#.utf8)
+            ) == .managedDesktopBridge
+        )
+        #expect(
+            try JSONDecoder().decode(
+                HotSwapRuntimeKind.self,
+                from: Data(#""external-app-server""#.utf8)
+            ) == .externalAppServer
+        )
+    }
+
     @Test("Desktop app-server listener classification is explicit and loopback-only")
     func desktopAppServerListenerClassificationIsExplicitAndLoopbackOnly() {
         #expect(SwapEngine.hasExplicitLoopbackWebSocketListener([
@@ -1082,31 +1109,61 @@ struct SwapEngineTests {
         ]))
     }
 
-    @Test("Desktop discovery ignores a concurrent managed stdio app-server")
-    func desktopDiscoveryIgnoresConcurrentManagedStdioAppServer() {
-        let socketPID: Int32 = 41
-        let stdioPID: Int32 = 42
+    @Test("Desktop discovery classifies mixed external and managed runtimes")
+    func desktopDiscoveryClassifiesMixedExternalAndManagedRuntimes() {
+        let externalPID: Int32 = 41
+        let managedPID: Int32 = 42
+        let stdioPID: Int32 = 43
+        let remoteControlPID: Int32 = 44
+        let externalPath = "/Applications/ChatGPT.app/Contents/Resources/codex"
+        let managedPath =
+            "/Users/me/.local/share/codexswitch/prepared-codex/0.144.1/runtime/codex"
         let identities = [
-            socketPID: signalIdentity(pid: socketPID),
-            stdioPID: signalIdentity(pid: stdioPID),
+            externalPID: signalIdentity(
+                pid: externalPID,
+                executablePath: externalPath
+            ),
+            managedPID: signalIdentity(
+                pid: managedPID,
+                executablePath: managedPath
+            ),
+            stdioPID: signalIdentity(
+                pid: stdioPID,
+                executablePath: managedPath
+            ),
+            remoteControlPID: signalIdentity(
+                pid: remoteControlPID,
+                executablePath: managedPath
+            ),
         ]
-        let discovery = SwapEngine.runtimeDiscoverySnapshot(
+        let discovery = SwapEngine.desktopRuntimeDiscoverySnapshot(
             from: CodexPGrepProcessSnapshot(
-                pids: [socketPID, stdioPID],
+                pids: [externalPID, managedPID, stdioPID, remoteControlPID],
                 isComplete: true
             ),
-            runtimeKind: .externalAppServer,
             requiredOwnerUID: 501,
             identityProvider: { identities[$0] },
             argumentProvider: { pid in
                 switch pid {
-                case socketPID:
+                case externalPID:
                     return [
-                        "codex", "app-server", "--listen",
-                        "ws://127.0.0.1:9223",
+                        "codex", "-c", "features.code_mode_host=true", "app-server",
+                        "--analytics-default-enabled", "--listen",
+                        CodexDesktopBridgeKeepAlive.websocketURL,
+                    ]
+                case managedPID:
+                    return [
+                        "codex", "-c", "features.code_mode_host=true", "app-server",
+                        "--analytics-default-enabled", "--listen",
+                        CodexDesktopBridgeKeepAlive.websocketURL,
                     ]
                 case stdioPID:
                     return ["codex", "app-server", "--listen", "stdio://"]
+                case remoteControlPID:
+                    return [
+                        "codex", "app-server", "--remote-control", "--listen",
+                        "ws://127.0.0.1:8390",
+                    ]
                 default:
                     return nil
                 }
@@ -1117,11 +1174,19 @@ struct SwapEngineTests {
                     path: identity.executablePath,
                     inode: 10_000 + UInt64(pid)
                 )
-            }
+            },
+            managedDesktopRuntimePath: managedPath
         )
 
         #expect(discovery.isComplete)
-        #expect(discovery.targets.map { $0.process.identity.pid } == [socketPID])
+        #expect(
+            discovery.targets.map { $0.process.identity.pid }
+                == [externalPID, managedPID]
+        )
+        #expect(
+            discovery.targets.map(\.runtimeKind)
+                == [.externalAppServer, .managedDesktopBridge]
+        )
     }
 
     @Test("Identity-bound argv capture requires owner and matching identities")
@@ -1985,7 +2050,7 @@ struct SwapEngineTests {
             currentBinding: strictBinding,
             expectedBinding: strictBinding,
             nowUnixMilliseconds: now
-        ) != nil)
+        ) == nil)
 
         for initializedDesktop in [
             CodexReloadAcknowledgement(
@@ -2035,6 +2100,87 @@ struct SwapEngineTests {
                 nowUnixMilliseconds: now
             ) == nil)
         }
+    }
+
+    @Test("Managed bridge idle ACK exception is exact and external remains strict")
+    func managedBridgeIdleAcknowledgementIsStrictlyScoped() {
+        let now: Int64 = 1_500_200
+        let externalBinding = reloadBinding(
+            target: runtimeTarget(pid: 51, runtimeKind: .externalAppServer)
+        )
+        let managedBinding = reloadBinding(
+            target: runtimeTarget(pid: 52, runtimeKind: .managedDesktopBridge)
+        )
+        let candidate = {
+            (
+                binding: CodexReloadBinding,
+                initialized: Int,
+                skipped: Int,
+                eligible: Int,
+                rejected: Int,
+                notified: Bool,
+                writeCount: Int,
+                idle: Bool
+            ) in
+            CodexReloadAcknowledgement(
+                binding: binding,
+                acknowledgedAtUnixMilliseconds: 1_500_100,
+                loadedTokenFingerprint:
+                    binding.authFileIdentity.completeTokenFingerprint,
+                activeTokenFingerprint:
+                    binding.authFileIdentity.completeTokenFingerprint,
+                frontendNotified: notified,
+                frontendWriteCount: writeCount,
+                authGeneration: nil,
+                reconnectReady: nil,
+                initializedFrontendCount: initialized,
+                skippedFrontendCount: skipped,
+                eligibleFrontendCount: eligible,
+                rejectedFrontendCount: rejected,
+                idleListenerReady: idle
+            )
+        }
+        let isValid = {
+            (binding: CodexReloadBinding, acknowledgement: CodexReloadAcknowledgement) in
+            let artifacts = artifactSnapshots(
+                binding: binding,
+                acknowledgement: acknowledgement
+            )
+            return SwapEngine.validatedReloadAcknowledgement(
+                request: artifacts.0,
+                acknowledgement: artifacts.1,
+                currentBinding: binding,
+                expectedBinding: binding,
+                nowUnixMilliseconds: now
+            ) != nil
+        }
+
+        #expect(!isValid(
+            externalBinding,
+            candidate(externalBinding, 0, 0, 0, 0, false, 0, true)
+        ))
+        #expect(isValid(
+            managedBinding,
+            candidate(managedBinding, 0, 0, 0, 0, false, 0, true)
+        ))
+
+        let nonEmptyIdleShapes = [
+            candidate(managedBinding, 1, 1, 0, 0, false, 0, true),
+            candidate(managedBinding, 1, 0, 0, 1, false, 0, true),
+            candidate(managedBinding, 1, 0, 1, 0, false, 0, true),
+        ]
+        for acknowledgement in nonEmptyIdleShapes {
+            #expect(!isValid(managedBinding, acknowledgement))
+        }
+
+        let managedActive = candidate(
+            managedBinding, 2, 1, 1, 0, true, 1, false
+        )
+        let externalActive = candidate(
+            externalBinding, 2, 1, 1, 0, true, 1, false
+        )
+        #expect(isValid(managedBinding, managedActive))
+        #expect(isValid(externalBinding, externalActive))
     }
 
     @Test("Reload artifacts reject stale and future authority")

@@ -13,6 +13,7 @@ enum DesktopRuntimeHotSwapState: Sendable, Equatable {
 
 enum HotSwapRuntimeKind: String, Decodable, Sendable, Equatable {
     case externalAppServer = "external-app-server"
+    case managedDesktopBridge = "managed-desktop-bridge"
     case headlessRemoteControlAppServer = "headless-remote-control-app-server"
     case localInteractiveCLI = "local-interactive-cli"
 }
@@ -646,19 +647,14 @@ enum DesktopPatchManager {
     nonisolated static func runtimeHotSwapState(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         runtimeEvidenceProvider: @Sendable (
-            HotSwapRuntimeKind,
             URL
-        ) -> CodexLocalRuntimeEvidenceSnapshot = { runtimeKind, homeDirectory in
-            SwapEngine.localRuntimeEvidenceSnapshot(
-                runtimeKind: runtimeKind,
+        ) -> CodexLocalRuntimeEvidenceSnapshot = { homeDirectory in
+            SwapEngine.localDesktopRuntimeEvidenceSnapshot(
                 homeDirectory: homeDirectory
             )
         }
     ) -> DesktopRuntimeHotSwapState {
-        let evidence = runtimeEvidenceProvider(
-            .externalAppServer,
-            homeDirectory
-        )
+        let evidence = runtimeEvidenceProvider(homeDirectory)
         return runtimeHotSwapState(from: evidence)
     }
 
@@ -667,7 +663,10 @@ enum DesktopPatchManager {
     ) -> DesktopRuntimeHotSwapState {
         guard evidence.isComplete, !evidence.runtimes.isEmpty else { return .unknown }
         return evidence.runtimes.allSatisfy { runtime in
-            runtime.observation.target.runtimeKind == .externalAppServer
+            (
+                runtime.observation.target.runtimeKind == .externalAppServer
+                    || runtime.observation.target.runtimeKind == .managedDesktopBridge
+            )
                 && runtime.startupAcknowledgement.idleListenerReady != true
                 && SwapEngine.bindingMatchesObservation(
                     runtime.startupAcknowledgement.binding,

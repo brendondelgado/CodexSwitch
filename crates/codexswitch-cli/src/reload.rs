@@ -292,12 +292,15 @@ const HOT_SWAP_ARTIFACT_RETENTION: HotSwapArtifactRetention = HotSwapArtifactRet
 };
 #[cfg(not(target_os = "linux"))]
 const PS_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "macos")]
+const MANAGED_DESKTOP_BRIDGE_LAUNCHD_LABEL: &str = "com.codexswitch.desktop-app-server-9223";
 static HOT_SWAP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
 pub enum HotSwapRuntimeKind {
     ExternalAppServer,
+    ManagedDesktopBridge,
     HeadlessRemoteControlAppServer,
     LocalInteractiveCli,
 }
@@ -1062,10 +1065,18 @@ where
             ));
             continue;
         }
-        if !hot_swap_binding_matches_current(&request.binding, process, &auth_path, runtime_kind) {
+        if hot_swap_runtime_kind(process) != Some(runtime_kind)
+            || !hot_swap_binding_matches_current(
+                &request.binding,
+                process,
+                &auth_path,
+                runtime_kind,
+            )
+        {
             summary.skipped.push((
                 process.pid,
-                "process start or kernel executable identity changed before SIGHUP".to_string(),
+                "runtime kind, managed route, process start, or kernel executable identity changed before SIGHUP"
+                    .to_string(),
             ));
             continue;
         }
@@ -1405,6 +1416,7 @@ fn validate_opened_regular_file(
 #[cfg(test)]
 fn binary_has_sighup_support(path: &Path) -> bool {
     binary_has_sighup_support_for_runtime(path, HotSwapRuntimeKind::ExternalAppServer)
+        && binary_has_sighup_support_for_runtime(path, HotSwapRuntimeKind::ManagedDesktopBridge)
         && binary_has_sighup_support_for_runtime(
             path,
             HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
@@ -1482,7 +1494,7 @@ impl BinaryMarkerState {
 
     fn is_complete_for_runtime(&self, runtime_kind: HotSwapRuntimeKind) -> bool {
         let has_runtime_markers = match runtime_kind {
-            HotSwapRuntimeKind::ExternalAppServer => {
+            HotSwapRuntimeKind::ExternalAppServer | HotSwapRuntimeKind::ManagedDesktopBridge => {
                 self.external_app_server.iter().all(|found| *found)
             }
             HotSwapRuntimeKind::HeadlessRemoteControlAppServer => {
@@ -1987,7 +1999,10 @@ fn hot_swap_ack_matches_request(
         && ack.loaded_token_fingerprint == expected_fingerprint
         && ack.active_token_fingerprint == expected_fingerprint
         && match runtime_kind {
-            HotSwapRuntimeKind::ExternalAppServer => external_app_server_ack_is_verified(
+            HotSwapRuntimeKind::ExternalAppServer => {
+                external_app_server_ack_is_verified(ack, AppServerIdlePolicy::Reject)
+            }
+            HotSwapRuntimeKind::ManagedDesktopBridge => external_app_server_ack_is_verified(
                 ack,
                 AppServerIdlePolicy::ZeroInitializedFrontends,
             ),
@@ -2009,6 +2024,7 @@ fn hot_swap_ack_matches_request(
 
 #[derive(Clone, Copy)]
 enum AppServerIdlePolicy {
+    Reject,
     ZeroInitializedFrontends,
     NoEligibleFrontends,
 }
@@ -2031,6 +2047,7 @@ fn external_app_server_ack_is_verified(ack: &HotSwapAck, idle_policy: AppServerI
         && eligible > 0
         && ack.frontend_write_count == eligible;
     let idle_counts_are_allowed = match idle_policy {
+        AppServerIdlePolicy::Reject => false,
         AppServerIdlePolicy::ZeroInitializedFrontends => {
             initialized == 0 && skipped == 0 && eligible == 0 && rejected == 0
         }
@@ -2598,11 +2615,48 @@ pub fn process_is_sighup_safe_target(process: &CodexProcess, binary_has_markers:
 }
 
 pub fn hot_swap_runtime_kind(process: &CodexProcess) -> Option<HotSwapRuntimeKind> {
+    let target_is_macos = cfg!(target_os = "macos");
+    let managed_runtime = (target_is_macos
+        && is_managed_desktop_bridge_app_server_command_line(
+            &process.command_line,
+            target_is_macos,
+        ))
+    .then(current_managed_desktop_runtime_route)
+    .flatten();
+    #[cfg(target_os = "macos")]
+    let managed_launchd_pid = (managed_runtime.as_deref() == Some(process.executable.as_path()))
+        .then(|| current_managed_desktop_bridge_launchd_pid(process.owner_uid))
+        .flatten();
+    #[cfg(not(target_os = "macos"))]
+    let managed_launchd_pid = None;
+    hot_swap_runtime_kind_for_platform(
+        process,
+        target_is_macos,
+        managed_runtime.as_deref(),
+        managed_launchd_pid,
+    )
+}
+
+fn hot_swap_runtime_kind_for_platform(
+    process: &CodexProcess,
+    target_is_macos: bool,
+    managed_runtime: Option<&Path>,
+    managed_launchd_pid: Option<i32>,
+) -> Option<HotSwapRuntimeKind> {
     if is_native_codex_runtime(&process.executable)
         && is_codex_app_server_command_line(&process.command_line)
     {
         if is_headless_remote_control_app_server_command_line(&process.command_line) {
             return Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer);
+        }
+        if managed_runtime == Some(process.executable.as_path())
+            && managed_launchd_pid == Some(process.pid)
+            && is_managed_desktop_bridge_app_server_command_line(
+                &process.command_line,
+                target_is_macos,
+            )
+        {
+            return Some(HotSwapRuntimeKind::ManagedDesktopBridge);
         }
         return Some(HotSwapRuntimeKind::ExternalAppServer);
     }
@@ -2610,6 +2664,39 @@ pub fn hot_swap_runtime_kind(process: &CodexProcess) -> Option<HotSwapRuntimeKin
         return Some(HotSwapRuntimeKind::LocalInteractiveCli);
     }
     None
+}
+
+fn current_managed_desktop_runtime_route() -> Option<PathBuf> {
+    let launcher = crate::patched_codex::default_installed_binary().ok()?;
+    let runtime = crate::patched_codex::resolve_installed_runtime(&launcher).ok()?;
+    (runtime != launcher).then_some(runtime)
+}
+
+#[cfg(target_os = "macos")]
+fn current_managed_desktop_bridge_launchd_pid(owner_uid: u32) -> Option<i32> {
+    if owner_uid != unsafe { libc_geteuid() } {
+        return None;
+    }
+    let job = format!("gui/{owner_uid}/{MANAGED_DESKTOP_BRIDGE_LAUNCHD_LABEL}");
+    let output = bounded_command::output(
+        Command::new("/bin/launchctl").args(["print", job.as_str()]),
+        PS_COMMAND_TIMEOUT,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_launchctl_job_pid(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_launchctl_job_pid(output: &str) -> Option<i32> {
+    let mut pid_values = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pid = "));
+    let pid = pid_values.next()?.parse::<i32>().ok()?;
+    (pid > 0 && pid_values.next().is_none()).then_some(pid)
 }
 
 pub fn is_codex_cli_command_line(command_line: &str) -> bool {
@@ -2715,6 +2802,30 @@ fn is_headless_remote_control_app_server_command_line(command_line: &str) -> boo
                     .is_some_and(|value| value.starts_with("ws://")))
     });
     has_remote_control && has_websocket_listener
+}
+
+fn is_managed_desktop_bridge_app_server_command_line(
+    command_line: &str,
+    target_is_macos: bool,
+) -> bool {
+    if !target_is_macos || !is_codex_app_server_command_line(command_line) {
+        return false;
+    }
+    let parts = command_line
+        .split_whitespace()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    parts.len() == 7
+        && parts
+            .first()
+            .and_then(|executable| executable.rsplit('/').next())
+            == Some("codex")
+        && parts[1] == "-c"
+        && parts[2] == "features.code_mode_host=true"
+        && parts[3] == "app-server"
+        && parts[4] == "--analytics-default-enabled"
+        && parts[5] == "--listen"
+        && parts[6] == "ws://127.0.0.1:9223"
 }
 
 fn first_command_token_is_native_codex(command_line: &str) -> bool {
@@ -3101,6 +3212,145 @@ mod tests {
         assert!(!is_codex_app_server_command_line(
             "/home/signul/.local/share/codexswitch/patched-codex/codex app-server proxy --sock /tmp/control.sock"
         ));
+    }
+
+    #[test]
+    fn managed_desktop_bridge_runtime_kind_is_exact_and_macos_only() {
+        let managed_runtime =
+            PathBuf::from("/Users/me/.local/share/codexswitch/generations/current/codex");
+        let exact_command_line = format!(
+            "{} -c features.code_mode_host=true app-server --analytics-default-enabled --listen ws://127.0.0.1:9223",
+            managed_runtime.display()
+        );
+        let mut process = CodexProcess {
+            pid: 42,
+            owner_uid: 501,
+            start_identity: "macos:123".to_string(),
+            started_at_unix: 1,
+            command_line: exact_command_line,
+            executable: managed_runtime.clone(),
+        };
+
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(
+                &process,
+                true,
+                Some(&managed_runtime),
+                Some(process.pid),
+            ),
+            Some(HotSwapRuntimeKind::ManagedDesktopBridge)
+        );
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(
+                &process,
+                false,
+                Some(&managed_runtime),
+                Some(process.pid),
+            ),
+            Some(HotSwapRuntimeKind::ExternalAppServer)
+        );
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(&process, true, None, Some(process.pid)),
+            Some(HotSwapRuntimeKind::ExternalAppServer)
+        );
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(
+                &process,
+                true,
+                Some(&managed_runtime),
+                Some(process.pid + 1),
+            ),
+            Some(HotSwapRuntimeKind::ExternalAppServer)
+        );
+
+        for near_miss in [
+            "/Users/me/codex app-server --analytics-default-enabled --listen ws://127.0.0.1:9223",
+            "/Users/me/codex -c features.code_mode_host=true app-server --listen ws://127.0.0.1:9223",
+            "/Users/me/codex -c features.code_mode_host=true app-server --analytics-default-enabled --listen=ws://127.0.0.1:9223",
+            "/Users/me/codex -c features.code_mode_host=true app-server --analytics-default-enabled --listen ws://localhost:9223",
+            "/Users/me/codex -c features.code_mode_host=true app-server --analytics-default-enabled --listen ws://127.0.0.1:9224",
+            "/Users/me/codex -c features.code_mode_host=true app-server --analytics-default-enabled --listen ws://127.0.0.1:9223 --extra",
+            "/Users/me/codex -c features.code_mode_host=true app-server --analytics-default-enabled --listen unix://",
+        ] {
+            process.command_line = near_miss.to_string();
+            assert_eq!(
+                hot_swap_runtime_kind_for_platform(
+                    &process,
+                    true,
+                    Some(&managed_runtime),
+                    Some(process.pid),
+                ),
+                Some(HotSwapRuntimeKind::ExternalAppServer),
+                "{near_miss}"
+            );
+        }
+
+        process.command_line = "/Users/me/codex -c features.code_mode_host=true app-server --remote-control --listen ws://127.0.0.1:9223".to_string();
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(
+                &process,
+                true,
+                Some(&managed_runtime),
+                Some(process.pid),
+            ),
+            Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer)
+        );
+    }
+
+    #[test]
+    fn stock_binary_with_managed_desktop_argv_remains_external() {
+        let managed_runtime =
+            PathBuf::from("/Users/me/.local/share/codexswitch/generations/current/codex");
+        let stock_runtime = PathBuf::from("/Applications/Codex.app/Contents/Resources/codex");
+        let process = CodexProcess {
+            pid: 42,
+            owner_uid: 501,
+            start_identity: "macos:123".to_string(),
+            started_at_unix: 1,
+            command_line: format!(
+                "{} -c features.code_mode_host=true app-server --analytics-default-enabled --listen ws://127.0.0.1:9223",
+                stock_runtime.display()
+            ),
+            executable: stock_runtime,
+        };
+
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(
+                &process,
+                true,
+                Some(managed_runtime.as_path()),
+                Some(process.pid),
+            ),
+            Some(HotSwapRuntimeKind::ExternalAppServer)
+        );
+    }
+
+    #[test]
+    fn managed_desktop_bridge_launchd_pid_parser_is_exact() {
+        assert_eq!(
+            parse_launchctl_job_pid(
+                "gui/501/com.codexswitch.desktop-app-server-9223 = {\n\tpid = 4242\n\tstate = running\n}\n"
+            ),
+            Some(4242)
+        );
+        assert_eq!(parse_launchctl_job_pid("pid = 0\n"), None);
+        assert_eq!(parse_launchctl_job_pid("pid = -1\n"), None);
+        assert_eq!(parse_launchctl_job_pid("pid = invalid\npid = 4242\n"), None);
+        assert_eq!(parse_launchctl_job_pid("pid = 4242\npid = 4343\n"), None);
+        assert_eq!(parse_launchctl_job_pid("state = running\n"), None);
+    }
+
+    #[test]
+    fn managed_desktop_bridge_runtime_kind_has_a_stable_wire_name() -> Result<()> {
+        assert_eq!(
+            serde_json::to_string(&HotSwapRuntimeKind::ManagedDesktopBridge)?,
+            "\"managed-desktop-bridge\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HotSwapRuntimeKind>("\"managed-desktop-bridge\"")?,
+            HotSwapRuntimeKind::ManagedDesktopBridge
+        );
+        Ok(())
     }
 
     #[test]
@@ -3613,6 +3863,7 @@ mod tests {
             "codexswitch-hotswap-contract-v3",
             "codexswitch-hotswap-headless-idle-v1",
             "codexswitch-hotswap-cli-contract-v3",
+            "managed-desktop-bridge",
             "skippedFrontendCount",
             "rejectedFrontendCount",
         ] {
@@ -3690,7 +3941,7 @@ mod tests {
     }
 
     #[test]
-    fn external_v3_ack_distinguishes_idle_listener_from_failed_delivery() -> Result<()> {
+    fn app_server_v3_ack_distinguishes_idle_policies_from_failed_delivery() -> Result<()> {
         let (mut request, mut idle) = shared_v3_fixture()?;
         request.binding.runtime_kind = HotSwapRuntimeKind::HeadlessRemoteControlAppServer;
         idle.binding = request.binding.clone();
@@ -3788,6 +4039,18 @@ mod tests {
             HotSwapRuntimeKind::ExternalAppServer,
             strict_idle.acknowledged_at_unix_milliseconds,
         ));
+
+        let mut managed_request = strict_request.clone();
+        managed_request.binding.runtime_kind = HotSwapRuntimeKind::ManagedDesktopBridge;
+        let mut managed_delivery = strict_idle.clone();
+        managed_delivery.binding = managed_request.binding.clone();
+        assert!(hot_swap_ack_matches_request(
+            &managed_delivery,
+            &managed_request,
+            HotSwapRuntimeKind::ManagedDesktopBridge,
+            managed_delivery.acknowledged_at_unix_milliseconds,
+        ));
+
         strict_idle.frontend_notified = false;
         strict_idle.frontend_write_count = 0;
         strict_idle.initialized_frontend_count = Some(0);
@@ -3795,31 +4058,40 @@ mod tests {
         strict_idle.eligible_frontend_count = Some(0);
         strict_idle.rejected_frontend_count = Some(0);
         strict_idle.idle_listener_ready = true;
-        assert!(hot_swap_ack_matches_request(
+        assert!(!hot_swap_ack_matches_request(
             &strict_idle,
             &strict_request,
             HotSwapRuntimeKind::ExternalAppServer,
             strict_idle.acknowledged_at_unix_milliseconds,
         ));
 
-        let mut strict_skipped = strict_idle.clone();
-        strict_skipped.initialized_frontend_count = Some(1);
-        strict_skipped.skipped_frontend_count = Some(1);
-        assert!(!hot_swap_ack_matches_request(
-            &strict_skipped,
-            &strict_request,
-            HotSwapRuntimeKind::ExternalAppServer,
-            strict_skipped.acknowledged_at_unix_milliseconds,
+        let mut managed_idle = strict_idle.clone();
+        managed_idle.binding = managed_request.binding.clone();
+        assert!(hot_swap_ack_matches_request(
+            &managed_idle,
+            &managed_request,
+            HotSwapRuntimeKind::ManagedDesktopBridge,
+            managed_idle.acknowledged_at_unix_milliseconds,
         ));
 
-        let mut strict_rejected = strict_idle;
-        strict_rejected.initialized_frontend_count = Some(1);
-        strict_rejected.rejected_frontend_count = Some(1);
+        let mut managed_skipped = managed_idle.clone();
+        managed_skipped.initialized_frontend_count = Some(1);
+        managed_skipped.skipped_frontend_count = Some(1);
         assert!(!hot_swap_ack_matches_request(
-            &strict_rejected,
-            &strict_request,
-            HotSwapRuntimeKind::ExternalAppServer,
-            strict_rejected.acknowledged_at_unix_milliseconds,
+            &managed_skipped,
+            &managed_request,
+            HotSwapRuntimeKind::ManagedDesktopBridge,
+            managed_skipped.acknowledged_at_unix_milliseconds,
+        ));
+
+        let mut managed_rejected = managed_idle;
+        managed_rejected.initialized_frontend_count = Some(1);
+        managed_rejected.rejected_frontend_count = Some(1);
+        assert!(!hot_swap_ack_matches_request(
+            &managed_rejected,
+            &managed_request,
+            HotSwapRuntimeKind::ManagedDesktopBridge,
+            managed_rejected.acknowledged_at_unix_milliseconds,
         ));
         Ok(())
     }
@@ -4366,6 +4638,10 @@ mod tests {
         assert!(binary_has_sighup_support_for_runtime(
             &binary,
             HotSwapRuntimeKind::ExternalAppServer,
+        ));
+        assert!(binary_has_sighup_support_for_runtime(
+            &binary,
+            HotSwapRuntimeKind::ManagedDesktopBridge,
         ));
         assert!(!binary_has_sighup_support_for_runtime(
             &binary,

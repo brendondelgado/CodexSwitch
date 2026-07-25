@@ -128,12 +128,18 @@ struct DesktopRuntimeHotSwapStateTests {
         )
         #expect(DesktopPatchManager.runtimeHotSwapState(from: wrongKind) == .unknown)
 
-        let dormantBackend = CodexLocalRuntimeEvidenceSnapshot(
-            runtimes: [runtimeEvidence(idleListenerReady: true)],
+        let idleManagedBridge = CodexLocalRuntimeEvidenceSnapshot(
+            runtimes: [
+                runtimeEvidence(
+                    observationKind: .managedDesktopBridge,
+                    acknowledgementKind: .managedDesktopBridge,
+                    idleListenerReady: true
+                ),
+            ],
             isComplete: true
         )
         #expect(
-            DesktopPatchManager.runtimeHotSwapState(from: dormantBackend)
+            DesktopPatchManager.runtimeHotSwapState(from: idleManagedBridge)
                 == .unknown
         )
     }
@@ -293,8 +299,7 @@ struct DesktopRuntimeHotSwapStateTests {
         for evidence in evidenceCases {
             let state = DesktopPatchManager.runtimeHotSwapState(
                 homeDirectory: home,
-                runtimeEvidenceProvider: { runtimeKind, observedHome in
-                    #expect(runtimeKind == .externalAppServer)
+                runtimeEvidenceProvider: { observedHome in
                     #expect(observedHome == home)
                     return evidence
                 }

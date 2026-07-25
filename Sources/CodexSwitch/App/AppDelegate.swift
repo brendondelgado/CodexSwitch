@@ -2473,9 +2473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         cli: SwapEngine.localRuntimeEvidenceSnapshot(
                             runtimeKind: .localInteractiveCLI
                         ),
-                        desktop: SwapEngine.localRuntimeEvidenceSnapshot(
-                            runtimeKind: .externalAppServer
-                        ),
+                        desktop: SwapEngine.localDesktopRuntimeEvidenceSnapshot(),
                         observedAt: Date()
                     )
                 }.value
@@ -7415,9 +7413,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                             cli: SwapEngine.localRuntimeEvidenceSnapshot(
                                                 runtimeKind: .localInteractiveCLI
                                             ),
-                                            desktop: SwapEngine.localRuntimeEvidenceSnapshot(
-                                                runtimeKind: .externalAppServer
-                                            )
+                                            desktop: SwapEngine
+                                                .localDesktopRuntimeEvidenceSnapshot()
                                         )
                                 }
                             )

@@ -50,6 +50,7 @@ cross_dependencies:
   - ../../scripts/codex-vps
   - ../../scripts/patch-asar.py
   - ../../scripts/test_patch_asar.py
+  - macos-runtime-discovery.md
   - macos-runtime-artifact.md
   - ../runbooks/codexswitch-hot-swap-verification.md
   - ../runbooks/linux-repository-deployment.md
@@ -500,12 +501,16 @@ Supported reload mechanisms are ordered by runtime capability:
 2. Verified Codex CLI/app-server SIGHUP implementation with request/ack evidence.
 3. Explicit operator restart when the running version lacks a safe reload contract.
 
-On macOS, an `external-app-server` desktop target must declare an explicit
-loopback WebSocket listener in its current arguments and own that listening TCP
-socket. A `codex app-server --listen stdio://` process belongs to its invoking
-host harness; it is not a desktop credential owner and must not enter desktop
-reload discovery. Path classification alone is insufficient because managed
-Codex binaries can serve both transports from the same executable.
+Runtime kind is an authorization contract derived from verified process and
+listener topology, never a label trusted from the acknowledgement. On macOS,
+only the repository-managed bridge may classify as
+`managed-desktop-bridge`: it must declare the exact loopback WebSocket listener
+on port `9223` in its current arguments and own that listening TCP socket. A
+`codex app-server --listen stdio://` process belongs to its invoking host
+harness; it is not a desktop credential owner and must not enter desktop reload
+discovery. Path classification alone is insufficient because managed Codex
+binaries can serve both transports from the same executable. Any other external
+app-server remains `external-app-server` and strict.
 
 On Linux, both account-bearing app-server modes are reload targets: the
 repository-owned WebSocket service and the built-in SSH remote daemon listening
@@ -528,10 +533,11 @@ idle-listener acknowledgement, including any initialized-but-disconnected
 historical connection count. That idle proof is runtime convergence, not
 notification of a live client: it is valid only after the same bound auth reload
 and cache fingerprint checks, and the next client initializes against that
-reloaded auth manager. Desktop and other `external-app-server` runtimes remain
-strict and cannot use idle proof. A timeout from an eligible writer, a partial
-write set, contradictory counts, missing capability marker, or runtime-kind
-mismatch remains degraded.
+reloaded auth manager. The managed desktop bridge may use only its separate exact
+all-zero exception. Ordinary `external-app-server` runtimes, including the VPS
+SSH/Unix app-server, remain strict and cannot use idle proof. A timeout from an
+eligible writer, a partial write set, contradictory counts, missing capability
+marker, or runtime-kind mismatch remains degraded.
 
 Successful signal delivery is recorded separately from verified acknowledgement.
 The runtime reloads backend auth before it attempts frontend delivery, so an
@@ -698,18 +704,19 @@ not as v3 rotation evidence, and are never eligible for automatic repair.
 When a daemon tick rejects an activation barrier, the outer daemon loop remains
 side-effect free: it performs no quota network calls, reset effects, auth writes,
 or runtime reloads for that tick.
-On macOS, a newly started repository-owned desktop bridge may establish its
-first ACK during an explicit desktop activation only after CodexSwitch verifies
-the canonical `9223` listener, launchd PID, generated bridge files, exact
-managed-launcher route embedded in the bridge script, expected runtime and
-helper hashes, and the running executable vnode. The local and Homebrew CLI
-forwarding wrappers remain part of CLI route verification, not desktop bridge
-authorization. This narrow bootstrap is not status evidence: activation remains
-degraded until the runtime returns the normal identity-bound ACK. An active
-desktop frontend requires a completed `account/updated` write. A dormant bridge
-with exactly zero initialized frontends may instead prove only that its backend
-auth cache is current for the next frontend connection; nonzero skipped,
-eligible, or rejected counts cannot use that idle shape.
+On macOS, a newly started repository-owned `managed-desktop-bridge` may
+establish its first ACK during an explicit desktop activation only after
+CodexSwitch verifies the canonical `9223` listener, launchd PID, generated
+bridge files, exact managed-launcher route embedded in the bridge script,
+expected runtime and helper hashes, and the running executable vnode. The local
+and Homebrew CLI forwarding wrappers remain part of CLI route verification, not
+desktop bridge authorization. This narrow bootstrap is not status evidence:
+activation remains degraded until the runtime returns the normal identity-bound
+ACK. An active desktop frontend requires a completed `account/updated` write. A
+dormant bridge with exactly zero initialized frontends may instead prove only
+that its backend auth cache is current for the next frontend connection; every
+required frontend counter must be present and exactly zero. Missing counters or
+nonzero skipped, eligible, or rejected counts cannot use that idle shape.
 The current managed local CLI may establish its first ACK under the same
 artifact and running-vnode proof, using the CLI-specific v3 acknowledgement
 shape. Exact-name preliminary discovery prevents unrelated command lines from
@@ -822,24 +829,27 @@ symlink, replacement, or unavailable `/proc/<pid>/exe` evidence fails closed;
 bounded byte scanning is not a substitute for a nonblocking regular-file open.
 
 Bundle import is preparation followed by runtime convergence, with the two
-phases explicitly separated when deployment requires the runtime to be idle.
+phases explicitly separated when repository deployment has positively
+quiesced the runtime.
 Parsing, expiry checking, account validation, and candidate selection do not
-write the store. Under the account-store lock, an idle import records the exact
-pre-import store and auth rollback state, commits and verifies the replacement
-files, and durably publishes an `Import`/`FileOnly` activation barrier. It does
-not attempt reload and does not treat zero runtime targets as a reason to claim
-success or roll back a valid file-only preparation. After the managed runtime
-starts, the coordinator must reconcile that same barrier with the canonical v3
-request/ACK exchange before advancing it to `Confirmed`; failed or absent ACK
-evidence leaves the activation degraded. A write or crash-recovery failure
-restores only state still owned by that activation generation. If either store
-or auth has changed concurrently, rollback preserves the newer state and leaves
-a durable `ManualReview` record instead of overwriting it.
+write the store. Under the account-store lock, an offline file-only import
+records the exact pre-import store and auth rollback state, commits and verifies
+the replacement files, and durably publishes an `Import`/`FileOnly` activation
+barrier. It does not attempt reload and does not treat zero runtime targets as a
+reason to claim success or roll back a valid file-only preparation. After the
+managed runtime starts, the coordinator must reconcile that same barrier with
+the canonical v3 request/ACK exchange before advancing it to `Confirmed`; failed
+or absent ACK evidence leaves the activation degraded. A write or crash-recovery
+failure restores only state still owned by that activation generation. If
+either store or auth has changed concurrently, rollback preserves the newer
+state and leaves a durable `ManualReview` record instead of overwriting it.
 
 `codexswitch-cli import` and `update-bundle` default to live convergence. A
-repository deployment that has positively proved the runtime idle must pass
-`--offline-file-only`; this flag changes only the new import's handoff and never
-waives convergence of a pre-existing activation barrier.
+repository deployment that has positively proved runtime quiescence must pass
+`--offline-file-only`; this flag changes only the new import's handoff and
+never waives convergence of a pre-existing activation barrier. Deployment
+quiescence is not a runtime reload ACK and grants no runtime-kind idle
+exception.
 
 Background cross-host replication must pass `update-bundle --preserve-active`.
 The command merges credential changes into the VPS pool while retaining the
@@ -892,7 +902,10 @@ actor boundary on every supported Swift 6 toolchain.
   `ws://127.0.0.1:9223`. CodexSwitch keeps that bridge alive and publishes
   `CODEX_APP_SERVER_WS_URL` before ChatGPT starts. Private stdio app-server
   children are not part of the supported steady state because they cannot
-  accept CodexSwitch's externally verified reload request.
+  accept CodexSwitch's externally verified reload request. Only this
+  identity-verified repository-managed listener may classify as
+  `managed-desktop-bridge` or use its exact all-zero idle ACK. Every other Mac
+  external app-server follows the strict frontend-delivery contract.
 - Every fresh desktop bridge connection completes the app-server `initialize`
   handshake before account mutation or verification. Current app-server
   responses may omit the optional `jsonrpc` member; identity verification and
@@ -953,9 +966,12 @@ actor boundary on every supported Swift 6 toolchain.
 - The port-8390 WebSocket service and the built-in SSH `unix://` app-server are
   separate account-bearing runtimes. Both participate in discovery and verified
   reload whenever they are running; `app-server proxy` helpers never do. The
-  port-8390 remote-control service may use the explicit headless idle proof. The
-  SSH daemon remains a strict external app-server and must prove frontend
-  delivery whenever it is retained as a live account-bearing runtime.
+  positively classified port-8390
+  `headless-remote-control-app-server` service may use its explicit broader
+  headless idle proof. The SSH daemon remains a strict `external-app-server` and
+  must prove frontend delivery whenever it is retained as a live
+  account-bearing runtime. SSH/Unix transport alone never supplies headless
+  classification, and no VPS runtime may claim `managed-desktop-bridge`.
 - Service status is readable without starting the service.
 - Remote usage aggregation preserves the model identity supplied by runtime
   evidence. Missing model evidence is reported as `unknown`; it is never
@@ -978,7 +994,9 @@ actor boundary on every supported Swift 6 toolchain.
   accepted legacy pointer is an absolute link to a direct child of the managed
   `releases` directory; the next activation normalizes it to the relative form.
 - Build and preparation use bounded memory and storage away from live runtime paths.
-- Activation occurs only through the deployment runbook after readiness and idle checks.
+- Activation occurs only through the deployment runbook after readiness and
+  deployment-quiescence checks. Quiescence does not relax the runtime ACK
+  contract.
 
 ## Remote Session Contract
 
