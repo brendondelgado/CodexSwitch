@@ -1,0 +1,22 @@
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_7350638777c13b 1402,1407-1409,1419,1423-1425
+  s_70c8e194852bb5::t_21a1d27fb9d25b 1426-1427
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_7350638777c13b 4274-4275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "7b9a2a7c1d59d1ba8ac04c7d4fb687bae6644bc8",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
