@@ -42,6 +42,11 @@ private final class TestSemaphore: @unchecked Sendable {
 
 @Suite("SwapEngine")
 struct SwapEngineTests {
+    private struct SharedReloadContractFixture: Decodable {
+        let requestArtifact: CodexReloadRequestArtifact
+        let acknowledgement: CodexReloadAcknowledgement
+    }
+
     @Test("Earliest usable reset ignores healthy windows")
     func earliestUsableResetIgnoresHealthyWindows() {
         let now = Date(timeIntervalSince1970: 1_000)
@@ -464,6 +469,7 @@ struct SwapEngineTests {
             authGeneration: isCLI ? 7 : nil,
             reconnectReady: isCLI ? true : nil,
             initializedFrontendCount: isCLI ? nil : 1,
+            skippedFrontendCount: isCLI ? nil : 0,
             eligibleFrontendCount: isCLI ? nil : 1,
             rejectedFrontendCount: isCLI ? nil : 0
         )
@@ -1791,6 +1797,44 @@ struct SwapEngineTests {
         }
     }
 
+    @Test("Shared v3 fixture decodes the live frontend accounting shape")
+    func sharedV3FixtureDecodesLiveFrontendAccounting() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                "Fixtures/RuntimeConvergence/reload-contract-v3.json"
+            )
+        let fixture = try JSONDecoder().decode(
+            SharedReloadContractFixture.self,
+            from: Data(contentsOf: fixtureURL)
+        )
+        let binding = fixture.requestArtifact.binding
+        let acknowledgement = fixture.acknowledgement
+        let observation = CodexRuntimeObservation(
+            target: CodexRuntimeTarget(
+                process: CodexIdentityBoundProcess(
+                    identity: binding.processIdentity,
+                    kernelExecutableIdentity: binding.kernelExecutableIdentity,
+                    arguments: ["codex", "app-server"]
+                ),
+                runtimeKind: binding.runtimeKind
+            ),
+            authFileIdentity: binding.authFileIdentity
+        )
+
+        #expect(acknowledgement.binding == binding)
+        #expect(acknowledgement.initializedFrontendCount == 2)
+        #expect(acknowledgement.skippedFrontendCount == 1)
+        #expect(acknowledgement.eligibleFrontendCount == 1)
+        #expect(acknowledgement.rejectedFrontendCount == 0)
+        #expect(acknowledgement.frontendWriteCount == 1)
+        #expect(SwapEngine.acknowledgementSupportsPassiveRuntimeEvidence(
+            acknowledgement,
+            observation: observation
+        ))
+    }
+
     @Test("External ACK distinguishes an idle listener from failed frontend delivery")
     func externalAcknowledgementDistinguishesIdleListenerFromFailedDelivery() {
         let target = runtimeTarget(pid: 41, runtimeKind: .headlessRemoteControlAppServer)
@@ -1799,6 +1843,7 @@ struct SwapEngineTests {
         let candidate = {
             (
                 initialized: Int?,
+                skipped: Int?,
                 eligible: Int?,
                 rejected: Int?,
                 notified: Bool,
@@ -1815,6 +1860,7 @@ struct SwapEngineTests {
                 authGeneration: 7,
                 reconnectReady: nil,
                 initializedFrontendCount: initialized,
+                skippedFrontendCount: skipped,
                 eligibleFrontendCount: eligible,
                 rejectedFrontendCount: rejected,
                 idleListenerReady: idle
@@ -1834,19 +1880,23 @@ struct SwapEngineTests {
             ) != nil
         }
 
-        #expect(isValid(candidate(0, 0, 0, false, 0, true)))
-        #expect(isValid(candidate(1, 0, 1, false, 0, true)))
-        #expect(isValid(candidate(2, 2, 0, true, 2, false)))
-        #expect(isValid(candidate(2, 1, 1, true, 1, false)))
-        #expect(!isValid(candidate(nil, nil, nil, true, 1, false)))
-        #expect(!isValid(candidate(2, 2, nil, true, 2, false)))
-        #expect(!isValid(candidate(nil, 2, 0, true, 2, false)))
-        #expect(!isValid(candidate(2, nil, 0, true, 2, false)))
-        #expect(!isValid(candidate(1, 2, 0, true, 2, false)))
-        #expect(!isValid(candidate(2, 1, 0, true, 1, false)))
-        #expect(!isValid(candidate(0, 0, 0, false, 0, false)))
-        #expect(!isValid(candidate(1, 1, 0, false, 0, false)))
-        #expect(!isValid(candidate(2, 2, 0, true, 1, false)))
+        #expect(isValid(candidate(0, 0, 0, 0, false, 0, true)))
+        #expect(isValid(candidate(1, 0, 0, 1, false, 0, true)))
+        #expect(isValid(candidate(2, 0, 2, 0, true, 2, false)))
+        #expect(isValid(candidate(2, 0, 1, 1, true, 1, false)))
+        #expect(isValid(candidate(2, 1, 1, 0, true, 1, false)))
+        #expect(!isValid(candidate(nil, nil, nil, nil, true, 1, false)))
+        #expect(!isValid(candidate(2, nil, 2, 0, true, 2, false)))
+        #expect(!isValid(candidate(2, 0, 2, nil, true, 2, false)))
+        #expect(!isValid(candidate(nil, 0, 2, 0, true, 2, false)))
+        #expect(!isValid(candidate(2, 0, nil, 0, true, 2, false)))
+        #expect(!isValid(candidate(1, 0, 2, 0, true, 2, false)))
+        #expect(!isValid(candidate(2, 0, 1, 0, true, 1, false)))
+        #expect(!isValid(candidate(2, -1, 2, 1, true, 2, false)))
+        #expect(!isValid(candidate(Int.max, Int.max, 1, 0, true, 1, false)))
+        #expect(!isValid(candidate(0, 0, 0, 0, false, 0, false)))
+        #expect(!isValid(candidate(1, 0, 1, 0, false, 0, false)))
+        #expect(!isValid(candidate(2, 0, 2, 0, true, 1, false)))
 
         let strictTarget = runtimeTarget(pid: 42, runtimeKind: .externalAppServer)
         let strictBinding = reloadBinding(target: strictTarget)
@@ -1854,6 +1904,35 @@ struct SwapEngineTests {
         #expect(SwapEngine.validatedReloadAcknowledgement(
             request: strictCompleteArtifacts.0,
             acknowledgement: strictCompleteArtifacts.1,
+            currentBinding: strictBinding,
+            expectedBinding: strictBinding,
+            nowUnixMilliseconds: now
+        ) != nil)
+
+        let strictSkippedFrontend = CodexReloadAcknowledgement(
+            binding: strictBinding,
+            acknowledgedAtUnixMilliseconds: 1_500_100,
+            loadedTokenFingerprint:
+                strictBinding.authFileIdentity.completeTokenFingerprint,
+            activeTokenFingerprint:
+                strictBinding.authFileIdentity.completeTokenFingerprint,
+            frontendNotified: true,
+            frontendWriteCount: 1,
+            authGeneration: 7,
+            reconnectReady: nil,
+            initializedFrontendCount: 2,
+            skippedFrontendCount: 1,
+            eligibleFrontendCount: 1,
+            rejectedFrontendCount: 0,
+            idleListenerReady: false
+        )
+        let strictSkippedArtifacts = artifactSnapshots(
+            binding: strictBinding,
+            acknowledgement: strictSkippedFrontend
+        )
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: strictSkippedArtifacts.0,
+            acknowledgement: strictSkippedArtifacts.1,
             currentBinding: strictBinding,
             expectedBinding: strictBinding,
             nowUnixMilliseconds: now
@@ -1891,6 +1970,7 @@ struct SwapEngineTests {
             authGeneration: 7,
             reconnectReady: nil,
             initializedFrontendCount: 0,
+            skippedFrontendCount: 0,
             eligibleFrontendCount: 0,
             rejectedFrontendCount: 0,
             idleListenerReady: true

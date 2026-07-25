@@ -150,6 +150,7 @@ struct CodexReloadAcknowledgement: Codable, Equatable, Sendable {
     let authGeneration: UInt64?
     let reconnectReady: Bool?
     let initializedFrontendCount: Int?
+    let skippedFrontendCount: Int?
     let eligibleFrontendCount: Int?
     let rejectedFrontendCount: Int?
     let idleListenerReady: Bool?
@@ -164,6 +165,7 @@ struct CodexReloadAcknowledgement: Codable, Equatable, Sendable {
         authGeneration: UInt64?,
         reconnectReady: Bool?,
         initializedFrontendCount: Int? = nil,
+        skippedFrontendCount: Int? = nil,
         eligibleFrontendCount: Int? = nil,
         rejectedFrontendCount: Int? = nil,
         idleListenerReady: Bool? = nil
@@ -177,6 +179,7 @@ struct CodexReloadAcknowledgement: Codable, Equatable, Sendable {
         self.authGeneration = authGeneration
         self.reconnectReady = reconnectReady
         self.initializedFrontendCount = initializedFrontendCount
+        self.skippedFrontendCount = skippedFrontendCount
         self.eligibleFrontendCount = eligibleFrontendCount
         self.rejectedFrontendCount = rejectedFrontendCount
         self.idleListenerReady = idleListenerReady
@@ -2524,6 +2527,7 @@ enum SwapEngine {
                 && acknowledgement.authGeneration != nil
                 && acknowledgement.reconnectReady == true
                 && acknowledgement.initializedFrontendCount == nil
+                && acknowledgement.skippedFrontendCount == nil
                 && acknowledgement.eligibleFrontendCount == nil
                 && acknowledgement.rejectedFrontendCount == nil
                 && acknowledgement.idleListenerReady != true
@@ -2535,13 +2539,22 @@ enum SwapEngine {
         allowIdleListener: Bool
     ) -> Bool {
         guard let initialized = acknowledgement.initializedFrontendCount,
+              let skipped = acknowledgement.skippedFrontendCount,
               let eligible = acknowledgement.eligibleFrontendCount,
               let rejected = acknowledgement.rejectedFrontendCount,
               initialized >= 0,
+              skipped >= 0,
               eligible >= 0,
-              rejected >= 0,
-              eligible <= Int.max - rejected,
-              eligible + rejected == initialized else {
+              rejected >= 0 else {
+            return false
+        }
+        let (skippedAndEligible, firstOverflow) =
+            skipped.addingReportingOverflow(eligible)
+        let (accountedFrontends, secondOverflow) =
+            skippedAndEligible.addingReportingOverflow(rejected)
+        guard !firstOverflow,
+              !secondOverflow,
+              accountedFrontends == initialized else {
             return false
         }
         let deliveredToFrontend = acknowledgement.idleListenerReady != true

@@ -3566,11 +3566,7 @@ mod tests {
             "../../../Tests/Fixtures/RuntimeConvergence/reload-contract-v3.json"
         ))?;
         let request = serde_json::from_value(fixture["requestArtifact"].clone())?;
-        let mut ack: HotSwapAck = serde_json::from_value(fixture["acknowledgement"].clone())?;
-        ack.initialized_frontend_count.get_or_insert(1);
-        ack.skipped_frontend_count.get_or_insert(0);
-        ack.eligible_frontend_count.get_or_insert(1);
-        ack.rejected_frontend_count.get_or_insert(0);
+        let ack: HotSwapAck = serde_json::from_value(fixture["acknowledgement"].clone())?;
         Ok((request, ack))
     }
 

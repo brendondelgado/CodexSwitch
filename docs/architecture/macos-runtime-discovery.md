@@ -26,7 +26,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical
-  last_updated: 2026-07-16
+  last_updated: 2026-07-24
 ---
 
 # macOS Runtime Discovery
@@ -290,6 +290,14 @@ binding-aware maintenance operation serialized under the same PID admission.
 Desktop `account/read` JSON-RPC verification is diagnostic and cannot replace
 the identity-bound request/ACK proof. A `.reloaded` result requires at least one
 explicit target identity to match: normalized email or canonical account ID.
+Strict and headless external app-server ACK accounting is exact:
+`skippedFrontendCount + eligibleFrontendCount + rejectedFrontendCount`
+must equal `initializedFrontendCount`, and `frontendWriteCount` must equal the
+eligible count. Initialized frontends that are intentionally skipped remain
+part of the total and do not invalidate an otherwise complete delivery proof.
+Interactive CLI ACKs carry no frontend accounting values. Canonical serializers
+omit all four keys; decoders also treat explicit JSON `null` as no value for
+backward-compatible parsing.
 Account IDs are non-empty printable ASCII without whitespace and compare as
 exact UTF-8 bytes; they are never trimmed or case-folded. The target account ID
 is validated before endpoint discovery or token transmission. Invalid IDs, case

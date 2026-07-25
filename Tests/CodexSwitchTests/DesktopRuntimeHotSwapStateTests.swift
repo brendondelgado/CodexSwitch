@@ -75,7 +75,11 @@ struct DesktopRuntimeHotSwapStateTests {
                 frontendNotified: !isCLI,
                 frontendWriteCount: isCLI ? 0 : 1,
                 authGeneration: isCLI ? 1 : nil,
-                reconnectReady: isCLI ? true : nil
+                reconnectReady: isCLI ? true : nil,
+                initializedFrontendCount: isCLI ? nil : 2,
+                skippedFrontendCount: isCLI ? nil : 1,
+                eligibleFrontendCount: isCLI ? nil : 1,
+                rejectedFrontendCount: isCLI ? nil : 0
             )
         )
     }

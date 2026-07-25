@@ -1051,6 +1051,15 @@ Every future hot-swap change must include tests for:
 - Desktop readiness rejects binaries that reload backend auth without broadcasting `account/updated` to the shell.
 - Missing or malformed auth produces no successful ACK and does not replace valid cached auth with `None`.
 - Only the capability-bound `headless-remote-control-app-server` kind may use an explicit zero-count idle-listener ACK after verified auth reload. Rejected-before-eligibility historical connections are excluded from the writer count, but any writer that accepted the notification is eligible and forbids the idle shape until its transport write completes. Strict external app-servers, an accepted-but-undelivered writer, timeout, contradictory count, or same-second stale ACK cannot use the idle shape.
+- Strict and headless external app-server ACK accounting includes initialized
+  frontends that were intentionally skipped:
+  `skipped + eligible + rejected == initialized`. The live
+  `initializedFrontendCount=2, skippedFrontendCount=1,
+  eligibleFrontendCount=1, rejectedFrontendCount=0, frontendWriteCount=1` shape
+  is a complete delivery proof, while omitted, negative, overflowing, or
+  contradictory counts are rejected. Interactive CLI ACKs omit all four
+  frontend accounting keys when serialized; decoders treat explicit JSON `null`
+  as the same no-value state for backward-compatible parsing.
 - A successfully delivered SIGHUP marks runtime auth as potentially changed even when no ACK follows; import rollback requires verified compensating convergence or a durable `ManualReview` result.
 - The SIGHUP request nonce is unique per signal and must be echoed by the matching PID ACK.
 - Reused ACK PIDs and newly acknowledged PIDs are tracked separately; only the

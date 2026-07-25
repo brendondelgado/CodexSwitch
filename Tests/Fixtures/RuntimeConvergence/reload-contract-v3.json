@@ -57,6 +57,10 @@
     "activeTokenFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "frontendNotified": true,
     "frontendWriteCount": 1,
+    "initializedFrontendCount": 2,
+    "skippedFrontendCount": 1,
+    "eligibleFrontendCount": 1,
+    "rejectedFrontendCount": 0,
     "authGeneration": 17
   }
 }
