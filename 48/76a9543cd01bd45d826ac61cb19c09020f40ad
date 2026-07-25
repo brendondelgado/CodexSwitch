@@ -1,0 +1,30 @@
+Sources/CodexSwitch/Services/NotificationManager.swift
+  s_70c8e194852bb5::t_ac1595a513666a 288-289,583-599
+  s_70c8e194852bb5::t_53b68fa17ac8ed 50,56,58-59,62-65,67-158,161-165,168,171,173-174,176-190,192-216,218-224,226-230,232-235,237-253,260-261,267-276,298
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_5d633c43723ca0 8422,8443
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_c876316548b331 831
+  s_70c8e194852bb5::t_ed7bd887790a91 829-830
+Tests/CodexSwitchTests/AppDelegateNotificationTests.swift
+  s_70c8e194852bb5::t_738d1b5560649c 64-65,789
+  s_70c8e194852bb5::t_ddb42080b17596 818-828
+  s_70c8e194852bb5::t_5951de235fad08 50-63,66-78,563-564,570,585-639,662,665-674,676-685,688-725,734-735,737-744,748-765,768,772-788,790-816
+  s_70c8e194852bb5::t_9d88d4b06f6112 817
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "4876a9543cd01bd45d826ac61cb19c09020f40ad",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
