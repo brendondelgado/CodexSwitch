@@ -6773,7 +6773,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.updatePopoverContent()
         }
 
-        let convergenceTask = Task.detached(priority: .userInitiated) { [weak self] in
+        // Runtime convergence must inherit the cross-process lease task-local.
+        let convergenceTask = Task(priority: .userInitiated) { [weak self] in
             let shouldStartReload = await self?.activationWorkIsCurrent(
                 prepared,
                 targetAccountId: to.id

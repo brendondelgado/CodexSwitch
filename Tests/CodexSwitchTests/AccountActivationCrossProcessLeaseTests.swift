@@ -155,4 +155,43 @@ struct AccountActivationCrossProcessLeaseTests {
         after.release()
         try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent())
     }
+
+    @MainActor
+    @Test("Inherited convergence child can persist under the parent lease")
+    func inheritedChildKeepsTransactionLeaseProof() async throws {
+        let journalURL = makeSecureTestFileURL(
+            prefix: "codexswitch-account-activation-child-task-local",
+            fileName: "account-activation.json"
+        )
+        let leaseURL = journalURL.deletingLastPathComponent()
+            .appendingPathComponent("accounts.runtime-activation.lock")
+        let coordinator = AccountActivationCoordinator(
+            url: journalURL,
+            crossProcessLeaseURL: leaseURL
+        )
+        let transaction = AccountActivationTransaction(
+            crossProcessLeaseURL: leaseURL
+        )
+        let target = UUID()
+        let generation = UUID()
+
+        let persisted = try await transaction.withActivationLease(
+            targetAccountId: target,
+            activationGeneration: generation
+        ) { _ in
+            let child = Task {
+                await Task.yield()
+                #expect(AccountActivationCrossProcessLeaseContext.holds(leaseURL))
+                return try await coordinator.markManualReview(
+                    targetAccountId: target,
+                    detail: .runtimeAcknowledgementIncomplete
+                )
+            }
+            return try await child.value
+        }
+
+        #expect(persisted?.phase == .manualReview)
+        #expect(try await coordinator.load() == persisted)
+        try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent())
+    }
 }

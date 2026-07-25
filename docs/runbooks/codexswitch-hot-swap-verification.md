@@ -322,6 +322,11 @@ revalidation is suspended and verify the committed snapshot preserves that
 newer telemetry. Repeat the update while the durable write is suspended and
 verify publication preserves it while rejecting credential or selection drift.
 
+Delay desktop convergence beyond one reload timeout and verify the resulting
+confirmation or degraded journal update succeeds under the original
+cross-process lease. The convergence implementation must not use a detached
+task.
+
 A short runtime-evidence lease expiring is not itself an activation failure.
 Observe at least two lease-expiry intervals after a successful desktop swap and
 verify that CodexSwitch performs read-only evidence refreshes without another

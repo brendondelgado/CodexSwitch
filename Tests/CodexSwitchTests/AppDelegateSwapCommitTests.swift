@@ -242,6 +242,27 @@ struct AppDelegateSwapCommitTests {
         #expect(bridgeWait.lowerBound < recovery.lowerBound)
     }
 
+    @Test("Runtime convergence inherits the cross-process activation lease")
+    func runtimeConvergenceIsNotDetached() throws {
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/App/AppDelegate.swift",
+            encoding: .utf8
+        )
+        let start = try #require(source.range(
+            of: "private func beginRuntimeConvergence("
+        ))
+        let end = try #require(source.range(
+            of: "private func activationWorkIsCurrent(",
+            range: start.upperBound..<source.endIndex
+        ))
+        let implementation = source[start.lowerBound..<end.lowerBound]
+
+        #expect(implementation.contains(
+            "let convergenceTask = Task(priority: .userInitiated)"
+        ))
+        #expect(!implementation.contains("Task.detached"))
+    }
+
     @Test("No live runtime remains configured-only")
     func noRuntimeIsConfiguredOnly() {
         let completion = AccountActivationConvergenceEvaluator.completion(
