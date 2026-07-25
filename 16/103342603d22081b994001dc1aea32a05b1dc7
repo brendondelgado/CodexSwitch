@@ -1,0 +1,28 @@
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_b80e15f003d2b7 298-302
+Sources/CodexSwitch/Services/DesktopPatchManager.swift
+  s_70c8e194852bb5::t_b80e15f003d2b7 671
+Tests/CodexSwitchTests/DesktopStatusTests.swift
+  s_70c8e194852bb5::t_b80e15f003d2b7 7-22
+Sources/CodexSwitch/Services/CLIStatusChecker.swift
+  s_70c8e194852bb5::t_b80e15f003d2b7 243-247,294-298
+  s_70c8e194852bb5::t_e8e165ce82838f 299-300
+Tests/CodexSwitchTests/DesktopRuntimeHotSwapStateTests.swift
+  s_70c8e194852bb5::t_b80e15f003d2b7 29-30,76-77,80-84,130-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "16103342603d22081b994001dc1aea32a05b1dc7",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
