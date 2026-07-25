@@ -8419,8 +8419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         summary: readiness.summary
                     )
                     SwapLog.append(.debug("LINUX_DEVBOX_NOT_READY summary=\(readiness.summary)"))
-                    if !suppressNotification,
-                       wasReady != false || issueCount == 2 {
+                    if !suppressNotification {
                         NotificationManager.notifyLinuxDevboxReadinessIssue(summary: readiness.summary)
                     }
                 }
@@ -8441,8 +8440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     summary: failure.message
                 )
                 SwapLog.append(.debug("LINUX_DEVBOX_CHECK_FAILED message=\(failure.message)"))
-                if !suppressNotification,
-                   wasReady != false || issueCount == 2 {
+                if !suppressNotification {
                     NotificationManager.notifyLinuxDevboxReadinessIssue(summary: failure.message)
                 }
             }

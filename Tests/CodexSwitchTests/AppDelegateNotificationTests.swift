@@ -47,6 +47,35 @@ private final class NotificationRemovalHarness: @unchecked Sendable {
     }
 }
 
+private final class BlockingNotificationRemovalHarness: @unchecked Sendable {
+    private let lock = NSLock()
+    private var removals = 0
+    private let removalStarted = DispatchSemaphore(value: 0)
+    private let allowRemovalToFinish = DispatchSemaphore(value: 0)
+
+    func remove() {
+        lock.lock()
+        removals += 1
+        lock.unlock()
+        removalStarted.signal()
+        allowRemovalToFinish.wait()
+    }
+
+    func waitUntilRemovalStarts() -> Bool {
+        removalStarted.wait(timeout: .now() + 2) == .success
+    }
+
+    func finishRemoval() {
+        allowRemovalToFinish.signal()
+    }
+
+    func count() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return removals
+    }
+}
+
 @Suite("AppDelegate notifications")
 struct AppDelegateNotificationTests {
     @Test("Codex app termination observer does not use ObjC selector callback")
@@ -531,14 +560,14 @@ struct AppDelegateNotificationTests {
         #expect(defaults.stringArray(forKey: defaultsKey) == [dedupeKey])
     }
 
-    @Test("VPS readiness notification is persisted once per incident")
-    func linuxDevboxReadinessNotificationDedupesAcrossRelaunches() {
+    @Test("VPS readiness notification persists its claim before enqueue completion")
+    func linuxDevboxReadinessNotificationDedupesAcrossPreCallbackRelaunch() {
         let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let defaultsKey = "linux-readiness-test.\(UUID().uuidString)"
-        let coordinator = NotificationDedupeCoordinator(
+        let coordinator = IncidentNotificationDedupeCoordinator(
             defaultsKey: defaultsKey,
             maximumPersistedKeys: 1
         )
@@ -553,7 +582,61 @@ struct AppDelegateNotificationTests {
         let enqueue: NotificationDedupeCoordinator.Enqueue = { request, completion in
             enqueueHarness.enqueue(request, completion: completion)
         }
-        let remove: NotificationDedupeCoordinator.Remove = {
+        let remove: IncidentNotificationDedupeCoordinator.Remove = {
+            removalHarness.remove()
+        }
+
+        #expect(coordinator.enqueue(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            removeAfterCancellation: remove,
+            using: enqueue
+        ))
+        #expect(defaults.stringArray(forKey: defaultsKey) == [identifier])
+        #expect(enqueueHarness.count() == 1)
+
+        let relaunchedCoordinator = IncidentNotificationDedupeCoordinator(
+            defaultsKey: defaultsKey,
+            maximumPersistedKeys: 1
+        )
+        #expect(!relaunchedCoordinator.enqueue(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: UserDefaults(suiteName: suiteName)!,
+            removeAfterCancellation: remove,
+            using: enqueue
+        ))
+        #expect(enqueueHarness.count() == 1)
+        enqueueHarness.complete(at: 0, error: nil)
+        #expect(defaults.stringArray(forKey: defaultsKey) == [identifier])
+        #expect(identifier == "linux-devbox-readiness-active-incident")
+    }
+
+    @Test("VPS readiness cancellation queues one replacement until cleanup")
+    func linuxDevboxReadinessCancellationQueuesReplacement() {
+        let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaultsKey = "linux-readiness-cancel.\(UUID().uuidString)"
+        let coordinator = IncidentNotificationDedupeCoordinator(
+            defaultsKey: defaultsKey,
+            maximumPersistedKeys: 1
+        )
+        let enqueueHarness = ResetNotificationEnqueueHarness()
+        let removalHarness = NotificationRemovalHarness()
+        let identifier = NotificationManager.linuxDevboxReadinessNotificationIdentifier
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: UNMutableNotificationContent(),
+            trigger: nil
+        )
+        let enqueue: IncidentNotificationDedupeCoordinator.Enqueue = {
+            request, completion in
+            enqueueHarness.enqueue(request, completion: completion)
+        }
+        let remove: IncidentNotificationDedupeCoordinator.Remove = {
             removalHarness.remove()
         }
 
@@ -576,11 +659,7 @@ struct AppDelegateNotificationTests {
             userDefaults: defaults,
             using: remove
         )
-        #expect(removalHarness.count() == 1)
-        #expect(defaults.stringArray(forKey: defaultsKey) == nil)
-
-        enqueueHarness.complete(at: 0, error: nil)
-        #expect(removalHarness.count() == 2)
+        #expect(removalHarness.count() == 0)
         #expect(defaults.stringArray(forKey: defaultsKey) == nil)
 
         #expect(coordinator.enqueue(
@@ -590,21 +669,163 @@ struct AppDelegateNotificationTests {
             removeAfterCancellation: remove,
             using: enqueue
         ))
+        #expect(enqueueHarness.count() == 1)
+        #expect(defaults.stringArray(forKey: defaultsKey) == [identifier])
+
+        enqueueHarness.complete(at: 0, error: nil)
+        #expect(removalHarness.count() == 1)
+        #expect(enqueueHarness.count() == 2)
         enqueueHarness.complete(at: 1, error: nil)
         #expect(defaults.stringArray(forKey: defaultsKey) == [identifier])
 
-        let relaunchedCoordinator = NotificationDedupeCoordinator(
+        coordinator.resolve(
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            using: remove
+        )
+        #expect(removalHarness.count() == 2)
+        #expect(defaults.stringArray(forKey: defaultsKey) == nil)
+    }
+
+    @Test("VPS readiness enqueue failure releases its provisional claim")
+    func linuxDevboxReadinessNotificationRetriesAfterFailure() {
+        let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaultsKey = "linux-readiness-retry.\(UUID().uuidString)"
+        let coordinator = IncidentNotificationDedupeCoordinator(
             defaultsKey: defaultsKey,
             maximumPersistedKeys: 1
         )
-        #expect(!relaunchedCoordinator.enqueue(
+        let enqueueHarness = ResetNotificationEnqueueHarness()
+        let removalHarness = NotificationRemovalHarness()
+        let identifier = NotificationManager.linuxDevboxReadinessNotificationIdentifier
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: UNMutableNotificationContent(),
+            trigger: nil
+        )
+        let enqueue: IncidentNotificationDedupeCoordinator.Enqueue = {
+            request, completion in
+            enqueueHarness.enqueue(request, completion: completion)
+        }
+        let remove: IncidentNotificationDedupeCoordinator.Remove = {
+            removalHarness.remove()
+        }
+
+        #expect(coordinator.enqueue(
             request: request,
             dedupeKey: identifier,
-            userDefaults: UserDefaults(suiteName: suiteName)!,
+            userDefaults: defaults,
             removeAfterCancellation: remove,
             using: enqueue
         ))
-        #expect(identifier == "linux-devbox-readiness-active-incident")
+        enqueueHarness.complete(at: 0, error: NSError(domain: "test", code: 1))
+        #expect(defaults.stringArray(forKey: defaultsKey) == nil)
+
+        #expect(coordinator.enqueue(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            removeAfterCancellation: remove,
+            using: enqueue
+        ))
+        #expect(enqueueHarness.count() == 2)
+    }
+
+    @Test("VPS readiness replacement waits for blocking late-delivery cleanup")
+    func linuxDevboxReadinessReplacementWaitsForCleanup() {
+        let suiteName = "CodexSwitchTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaultsKey = "linux-readiness-cleanup.\(UUID().uuidString)"
+        let coordinator = IncidentNotificationDedupeCoordinator(
+            defaultsKey: defaultsKey,
+            maximumPersistedKeys: 1
+        )
+        let enqueueHarness = ResetNotificationEnqueueHarness()
+        let removalHarness = BlockingNotificationRemovalHarness()
+        let completionFinished = DispatchSemaphore(value: 0)
+        let identifier = NotificationManager.linuxDevboxReadinessNotificationIdentifier
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: UNMutableNotificationContent(),
+            trigger: nil
+        )
+        let enqueue: IncidentNotificationDedupeCoordinator.Enqueue = {
+            request, completion in
+            enqueueHarness.enqueue(request, completion: completion)
+        }
+        let remove: IncidentNotificationDedupeCoordinator.Remove = {
+            removalHarness.remove()
+        }
+
+        #expect(coordinator.enqueue(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            removeAfterCancellation: remove,
+            using: enqueue
+        ))
+        coordinator.resolve(
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            using: remove
+        )
+        #expect(coordinator.enqueue(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            removeAfterCancellation: remove,
+            using: enqueue
+        ))
+
+        DispatchQueue.global().async {
+            enqueueHarness.complete(at: 0, error: nil)
+            completionFinished.signal()
+        }
+        #expect(removalHarness.waitUntilRemovalStarts())
+        #expect(removalHarness.count() == 1)
+        #expect(enqueueHarness.count() == 1)
+        #expect(!coordinator.enqueue(
+            request: request,
+            dedupeKey: identifier,
+            userDefaults: defaults,
+            removeAfterCancellation: remove,
+            using: enqueue
+        ))
+
+        removalHarness.finishRemoval()
+        #expect(completionFinished.wait(timeout: .now() + 2) == .success)
+        #expect(enqueueHarness.count() == 2)
+    }
+
+    @Test("Persistent incident dedupe allows later readiness checks to retry failures")
+    func linuxDevboxReadinessChecksKeepOfferingDedupeRetry() throws {
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/App/AppDelegate.swift",
+            encoding: .utf8
+        )
+
+        #expect(!source.contains("wasReady != false || issueCount == 2"))
+        #expect(source.components(separatedBy:
+            "NotificationManager.notifyLinuxDevboxReadinessIssue"
+        ).count == 3)
+    }
+
+    @Test("Legacy readiness cleanup excludes the fixed incident identifier")
+    func linuxDevboxReadinessLegacyCleanupIsScoped() {
+        #expect(NotificationManager.isLegacyLinuxDevboxReadinessNotification(
+            "linux-devbox-readiness-52A72FA6-38E8-46BD-89E7-54A6AC33C0CA"
+        ))
+        #expect(!NotificationManager.isLegacyLinuxDevboxReadinessNotification(
+            NotificationManager.linuxDevboxReadinessNotificationIdentifier
+        ))
+        #expect(!NotificationManager.isLegacyLinuxDevboxReadinessNotification(
+            "swap-52A72FA6-38E8-46BD-89E7-54A6AC33C0CA"
+        ))
     }
 
     private func isolatedDefaults() -> UserDefaults {

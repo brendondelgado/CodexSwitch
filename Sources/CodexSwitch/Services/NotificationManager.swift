@@ -14,13 +14,11 @@ final class NotificationDedupeCoordinator: @unchecked Sendable {
         UNNotificationRequest,
         @escaping @Sendable (Error?) -> Void
     ) -> Void
-    typealias Remove = @Sendable () -> Void
 
     private let lock = NSLock()
     private let defaultsKey: String
     private let maximumPersistedKeys: Int
     private var inFlightKeys = Set<String>()
-    private var cancelledInFlightKeys = Set<String>()
 
     init(defaultsKey: String, maximumPersistedKeys: Int) {
         self.defaultsKey = defaultsKey
@@ -32,7 +30,6 @@ final class NotificationDedupeCoordinator: @unchecked Sendable {
         request: UNNotificationRequest,
         dedupeKey: String,
         userDefaults: UserDefaults,
-        removeAfterCancellation: Remove? = nil,
         using enqueue: @escaping Enqueue
     ) -> Bool {
         lock.lock()
@@ -50,53 +47,21 @@ final class NotificationDedupeCoordinator: @unchecked Sendable {
             self?.complete(
                 dedupeKey: dedupeKey,
                 error: error,
-                userDefaults: defaultsReference.value,
-                removeAfterCancellation: removeAfterCancellation
+                userDefaults: defaultsReference.value
             )
         }
         return true
     }
 
-    func resolve(
-        dedupeKey: String,
-        userDefaults: UserDefaults,
-        using remove: Remove
-    ) {
-        lock.lock()
-        let remainingKeys = (userDefaults.stringArray(forKey: defaultsKey) ?? [])
-            .filter { $0 != dedupeKey }
-        if remainingKeys.isEmpty {
-            userDefaults.removeObject(forKey: defaultsKey)
-        } else {
-            userDefaults.set(remainingKeys, forKey: defaultsKey)
-        }
-        if inFlightKeys.contains(dedupeKey) {
-            cancelledInFlightKeys.insert(dedupeKey)
-        }
-        lock.unlock()
-        remove()
-    }
-
     private func complete(
         dedupeKey: String,
         error: Error?,
-        userDefaults: UserDefaults,
-        removeAfterCancellation: Remove?
+        userDefaults: UserDefaults
     ) {
         lock.lock()
-        guard inFlightKeys.remove(dedupeKey) != nil else {
-            lock.unlock()
-            return
-        }
-        if cancelledInFlightKeys.remove(dedupeKey) != nil {
-            lock.unlock()
-            if error == nil {
-                removeAfterCancellation?()
-            }
-            return
-        }
+        defer { lock.unlock() }
+        inFlightKeys.remove(dedupeKey)
         guard error == nil else {
-            lock.unlock()
             return
         }
 
@@ -107,7 +72,6 @@ final class NotificationDedupeCoordinator: @unchecked Sendable {
             orderedKeys.append(key)
         }
         guard knownKeys.insert(dedupeKey).inserted else {
-            lock.unlock()
             return
         }
         orderedKeys.append(dedupeKey)
@@ -115,7 +79,201 @@ final class NotificationDedupeCoordinator: @unchecked Sendable {
             orderedKeys.removeFirst(orderedKeys.count - maximumPersistedKeys)
         }
         userDefaults.set(orderedKeys, forKey: defaultsKey)
+    }
+}
+
+final class IncidentNotificationDedupeCoordinator: @unchecked Sendable {
+    typealias Enqueue = NotificationDedupeCoordinator.Enqueue
+    typealias Remove = @Sendable () -> Void
+
+    private struct Submission: @unchecked Sendable {
+        let id = UUID()
+        let request: UNNotificationRequest
+        let dedupeKey: String
+        let defaults: NotificationDefaultsReference
+        let remove: Remove
+        let enqueue: Enqueue
+    }
+
+    private enum State {
+        case submitting(Submission)
+        case cancelling(Submission, replacement: Submission?)
+        case cleaning(replacement: Submission?)
+    }
+
+    private let lock = NSLock()
+    private let defaultsKey: String
+    private let maximumPersistedKeys: Int
+    private var states: [String: State] = [:]
+
+    init(defaultsKey: String, maximumPersistedKeys: Int) {
+        self.defaultsKey = defaultsKey
+        self.maximumPersistedKeys = maximumPersistedKeys
+    }
+
+    @discardableResult
+    func enqueue(
+        request: UNNotificationRequest,
+        dedupeKey: String,
+        userDefaults: UserDefaults,
+        removeAfterCancellation: @escaping Remove,
+        using enqueue: @escaping Enqueue
+    ) -> Bool {
+        let submission = Submission(
+            request: request,
+            dedupeKey: dedupeKey,
+            defaults: NotificationDefaultsReference(userDefaults),
+            remove: removeAfterCancellation,
+            enqueue: enqueue
+        )
+        var shouldSubmit = false
+
+        lock.lock()
+        let persistedKeys = Set(userDefaults.stringArray(forKey: defaultsKey) ?? [])
+        switch states[dedupeKey] {
+        case .submitting:
+            lock.unlock()
+            return false
+        case .cancelling(let active, let replacement):
+            guard replacement == nil, !persistedKeys.contains(dedupeKey) else {
+                lock.unlock()
+                return false
+            }
+            persistClaim(dedupeKey, userDefaults: userDefaults)
+            states[dedupeKey] = .cancelling(active, replacement: submission)
+        case .cleaning(let replacement):
+            guard replacement == nil, !persistedKeys.contains(dedupeKey) else {
+                lock.unlock()
+                return false
+            }
+            persistClaim(dedupeKey, userDefaults: userDefaults)
+            states[dedupeKey] = .cleaning(replacement: submission)
+        case nil:
+            guard !persistedKeys.contains(dedupeKey) else {
+                lock.unlock()
+                return false
+            }
+            persistClaim(dedupeKey, userDefaults: userDefaults)
+            states[dedupeKey] = .submitting(submission)
+            shouldSubmit = true
+        }
         lock.unlock()
+
+        if shouldSubmit {
+            submit(submission)
+        }
+        return true
+    }
+
+    func resolve(
+        dedupeKey: String,
+        userDefaults: UserDefaults,
+        using remove: @escaping Remove
+    ) {
+        var shouldRemove = false
+
+        lock.lock()
+        let hadPersistedClaim = (userDefaults.stringArray(forKey: defaultsKey) ?? [])
+            .contains(dedupeKey)
+        clearClaim(dedupeKey, userDefaults: userDefaults)
+        switch states[dedupeKey] {
+        case .submitting(let active):
+            states[dedupeKey] = .cancelling(active, replacement: nil)
+        case .cancelling(let active, _):
+            states[dedupeKey] = .cancelling(active, replacement: nil)
+        case .cleaning:
+            states[dedupeKey] = .cleaning(replacement: nil)
+        case nil where hadPersistedClaim:
+            states[dedupeKey] = .cleaning(replacement: nil)
+            shouldRemove = true
+        case nil:
+            break
+        }
+        lock.unlock()
+
+        if shouldRemove {
+            remove()
+            finishCleanup(dedupeKey: dedupeKey)
+        }
+    }
+
+    private func submit(_ submission: Submission) {
+        submission.enqueue(submission.request) { [weak self] error in
+            self?.complete(submission, error: error)
+        }
+    }
+
+    private func complete(_ submission: Submission, error: Error?) {
+        var shouldClean = false
+
+        lock.lock()
+        switch states[submission.dedupeKey] {
+        case .submitting(let active) where active.id == submission.id:
+            if error != nil {
+                clearClaim(
+                    submission.dedupeKey,
+                    userDefaults: submission.defaults.value
+                )
+            }
+            states[submission.dedupeKey] = nil
+        case .cancelling(let active, let replacement)
+            where active.id == submission.id:
+            states[submission.dedupeKey] = .cleaning(replacement: replacement)
+            shouldClean = true
+        default:
+            break
+        }
+        lock.unlock()
+
+        if shouldClean {
+            submission.remove()
+            finishCleanup(dedupeKey: submission.dedupeKey)
+        }
+    }
+
+    private func finishCleanup(dedupeKey: String) {
+        var replacement: Submission?
+
+        lock.lock()
+        if case .cleaning(let queued) = states[dedupeKey] {
+            replacement = queued
+            if let queued {
+                states[dedupeKey] = .submitting(queued)
+            } else {
+                states[dedupeKey] = nil
+            }
+        }
+        lock.unlock()
+
+        if let replacement {
+            submit(replacement)
+        }
+    }
+
+    private func persistClaim(_ dedupeKey: String, userDefaults: UserDefaults) {
+        var orderedKeys: [String] = []
+        var knownKeys = Set<String>()
+        for key in userDefaults.stringArray(forKey: defaultsKey) ?? []
+            where knownKeys.insert(key).inserted {
+            orderedKeys.append(key)
+        }
+        if knownKeys.insert(dedupeKey).inserted {
+            orderedKeys.append(dedupeKey)
+        }
+        if orderedKeys.count > maximumPersistedKeys {
+            orderedKeys.removeFirst(orderedKeys.count - maximumPersistedKeys)
+        }
+        userDefaults.set(orderedKeys, forKey: defaultsKey)
+    }
+
+    private func clearClaim(_ dedupeKey: String, userDefaults: UserDefaults) {
+        let remainingKeys = (userDefaults.stringArray(forKey: defaultsKey) ?? [])
+            .filter { $0 != dedupeKey }
+        if remainingKeys.isEmpty {
+            userDefaults.removeObject(forKey: defaultsKey)
+        } else {
+            userDefaults.set(remainingKeys, forKey: defaultsKey)
+        }
     }
 }
 
@@ -127,6 +285,8 @@ enum NotificationManager {
     private static let maximumResetExpirationNotificationDedupeKeys = 256
     private static let linuxDevboxReadinessIncidentDefaultsKey =
         "linuxDevboxReadinessNotificationIncidentKeys.v1"
+    private static let legacyLinuxDevboxReadinessNotificationPrefix =
+        "linux-devbox-readiness-"
     static let linuxDevboxReadinessNotificationIdentifier =
         "linux-devbox-readiness-active-incident"
     private static let resetExpirationNotificationCoordinator =
@@ -135,7 +295,7 @@ enum NotificationManager {
             maximumPersistedKeys: maximumResetExpirationNotificationDedupeKeys
         )
     private static let linuxDevboxReadinessNotificationCoordinator =
-        NotificationDedupeCoordinator(
+        IncidentNotificationDedupeCoordinator(
             defaultsKey: linuxDevboxReadinessIncidentDefaultsKey,
             maximumPersistedKeys: 1
         )
@@ -420,5 +580,22 @@ enum NotificationManager {
         let identifiers = [linuxDevboxReadinessNotificationIdentifier]
         center.removePendingNotificationRequests(withIdentifiers: identifiers)
         center.removeDeliveredNotifications(withIdentifiers: identifiers)
+        center.getPendingNotificationRequests { requests in
+            let legacyIdentifiers = requests.map(\.identifier).filter(
+                isLegacyLinuxDevboxReadinessNotification
+            )
+            center.removePendingNotificationRequests(withIdentifiers: legacyIdentifiers)
+        }
+        center.getDeliveredNotifications { notifications in
+            let legacyIdentifiers = notifications.map(\.request.identifier).filter(
+                isLegacyLinuxDevboxReadinessNotification
+            )
+            center.removeDeliveredNotifications(withIdentifiers: legacyIdentifiers)
+        }
+    }
+
+    static func isLegacyLinuxDevboxReadinessNotification(_ identifier: String) -> Bool {
+        identifier != linuxDevboxReadinessNotificationIdentifier
+            && identifier.hasPrefix(legacyLinuxDevboxReadinessNotificationPrefix)
     }
 }
