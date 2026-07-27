@@ -528,6 +528,15 @@ discovery. Path classification alone is insufficient because managed Codex
 binaries can serve both transports from the same executable. Any other external
 app-server remains `external-app-server` and strict.
 
+Runtime discovery lanes must not count the same PID twice. After the desktop
+transaction admits and acknowledges a desktop or managed-bridge PID, the
+interactive-CLI pass excludes that exact identity from its candidate set. A
+managed bridge whose executable is also named `codex` is not an incomplete CLI
+discovery and must not turn a complete desktop acknowledgement into
+`cli_discovery_or_reload_failed`. Unacknowledged or identity-changed desktop
+targets remain failures in the desktop lane; exclusion never converts partial
+desktop convergence into success.
+
 On Linux, both account-bearing app-server modes are reload targets: the
 repository-owned WebSocket service and the built-in SSH remote daemon listening
 on `unix://`. A `codex app-server proxy` process only transports a client to an

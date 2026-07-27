@@ -6,6 +6,7 @@ private let logger = Logger(subsystem: "com.codexswitch", category: "QuotaPoller
 actor QuotaPoller {
     private let session: URLSession
     private var pollTasks: [UUID: Task<Void, Never>] = [:]
+    private var pollGenerations: [UUID: UUID] = [:]
 
     private static let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
     private static let inactiveExhaustedPlanUpgradePollInterval: TimeInterval = 5
@@ -167,70 +168,117 @@ actor QuotaPoller {
         for accountId: UUID,
         accountProvider: @escaping @Sendable (UUID) async -> CodexAccount?,
         onUpdate: @escaping @Sendable (UUID, QuotaSnapshot, String) -> Void,
-        onError: @escaping @Sendable (UUID, PollerError) -> Void
+        onError: @escaping @Sendable (UUID, PollerError) -> Void,
+        initialDelay: @escaping @Sendable (Bool) -> TimeInterval = { hasData in
+            hasData ? 0 : TimeInterval.random(in: 5...15)
+        }
     ) {
         stopPolling(for: accountId)
 
-        pollTasks[accountId] = Task {
-            // First poll: fetch immediately when we already have account state.
-            // Brand-new accounts use a small random delay to avoid burst traffic.
-            let initialAccount = await accountProvider(accountId)
-            let hasData = initialAccount?.quotaSnapshot != nil
-            var interval: TimeInterval = hasData
-                ? 0
-                : TimeInterval.random(in: 5...15)
+        let generation = UUID()
+        pollGenerations[accountId] = generation
+        pollTasks[accountId] = Task { [weak self] in
+            await self?.runPollingLoop(
+                for: accountId,
+                generation: generation,
+                accountProvider: accountProvider,
+                onUpdate: onUpdate,
+                onError: onError,
+                initialDelay: initialDelay
+            )
+        }
+    }
 
-            logger.info("Starting poll for \(accountId) — initial interval: \(String(format: "%.0f", interval))s, hasData: \(hasData)")
+    private func runPollingLoop(
+        for accountId: UUID,
+        generation: UUID,
+        accountProvider: @escaping @Sendable (UUID) async -> CodexAccount?,
+        onUpdate: @escaping @Sendable (UUID, QuotaSnapshot, String) -> Void,
+        onError: @escaping @Sendable (UUID, PollerError) -> Void,
+        initialDelay: @escaping @Sendable (Bool) -> TimeInterval
+    ) async {
+        defer { finishPolling(accountId: accountId, generation: generation) }
 
-            while !Task.isCancelled {
-                if interval > 0 {
-                    try? await Task.sleep(for: .seconds(interval))
-                    guard !Task.isCancelled else { return }
-                }
+        // First poll: fetch immediately when we already have account state.
+        // Brand-new accounts use a small random delay to avoid burst traffic.
+        let initialAccount = await accountProvider(accountId)
+        guard generationIsCurrent(generation, for: accountId) else { return }
+        let hasData = initialAccount?.quotaSnapshot != nil
+        var interval = max(0, initialDelay(hasData))
 
-                guard let currentAccount = await accountProvider(accountId) else {
-                    logger.error("Account \(accountId) not found in provider — stopping poll")
-                    onError(accountId, .invalidResponse)
-                    return
-                }
-                guard !currentAccount.hasHardRuntimeBlock else {
-                    logger.info("Account \(currentAccount.email, privacy: .private) has a hard runtime block — stopping poll until account state changes")
-                    return
-                }
+        logger.info("Starting poll for \(accountId) — initial interval: \(String(format: "%.0f", interval))s, hasData: \(hasData)")
 
+        while generationIsCurrent(generation, for: accountId) {
+            if interval > 0 {
                 do {
-                    let result = try await self.fetchQuota(for: currentAccount)
-                    onUpdate(accountId, result.snapshot, result.planType)
-
-                    if currentAccount.isActive {
-                        interval = Self.pollInterval(for: result.snapshot, isActive: true)
-                    } else {
-                        interval = Self.inactivePollInterval(for: currentAccount, snapshot: result.snapshot)
-                    }
-
-                    logger.info("Poll success for \(currentAccount.email, privacy: .private) [active=\(currentAccount.isActive)] — next in \(String(format: "%.0f", interval))s")
-                } catch let error as PollerError {
-                    logger.error("Poll error for \(currentAccount.email, privacy: .private): \(String(describing: error), privacy: .public)")
-                    onError(accountId, error)
-                    if case .tokenExpired = error { return }
-                    interval = 60 // Back off on error
+                    try await Task.sleep(for: .seconds(interval))
                 } catch {
-                    logger.error("Poll network error for \(currentAccount.email, privacy: .private): \(error.localizedDescription, privacy: .public)")
-                    onError(accountId, .networkError(error.localizedDescription))
-                    interval = 60
+                    return
                 }
+                guard generationIsCurrent(generation, for: accountId) else { return }
+            }
+
+            guard let currentAccount = await accountProvider(accountId) else {
+                guard generationIsCurrent(generation, for: accountId) else { return }
+                logger.error("Account \(accountId) not found in provider — stopping poll")
+                onError(accountId, .invalidResponse)
+                return
+            }
+            guard !currentAccount.hasHardRuntimeBlock else {
+                logger.info("Account \(currentAccount.email, privacy: .private) has a hard runtime block — stopping poll until account state changes")
+                return
+            }
+
+            do {
+                let result = try await self.fetchQuota(for: currentAccount)
+                guard generationIsCurrent(generation, for: accountId) else { return }
+                onUpdate(accountId, result.snapshot, result.planType)
+
+                if currentAccount.isActive {
+                    interval = Self.pollInterval(for: result.snapshot, isActive: true)
+                } else {
+                    interval = Self.inactivePollInterval(for: currentAccount, snapshot: result.snapshot)
+                }
+
+                logger.info("Poll success for \(currentAccount.email, privacy: .private) [active=\(currentAccount.isActive)] — next in \(String(format: "%.0f", interval))s")
+            } catch let error as PollerError {
+                guard generationIsCurrent(generation, for: accountId) else { return }
+                logger.error("Poll error for \(currentAccount.email, privacy: .private): \(String(describing: error), privacy: .public)")
+                onError(accountId, error)
+                interval = 60
+            } catch {
+                guard generationIsCurrent(generation, for: accountId) else { return }
+                logger.error("Poll network error for \(currentAccount.email, privacy: .private): \(error.localizedDescription, privacy: .public)")
+                onError(accountId, .networkError(error.localizedDescription))
+                interval = 60
             }
         }
     }
 
+    func pollingAccountIds() -> Set<UUID> {
+        Set(pollGenerations.keys)
+    }
+
     func stopPolling(for accountId: UUID) {
+        pollGenerations[accountId] = nil
         pollTasks[accountId]?.cancel()
         pollTasks[accountId] = nil
     }
 
     func stopAll() {
+        pollGenerations.removeAll()
         for (_, task) in pollTasks { task.cancel() }
         pollTasks.removeAll()
+    }
+
+    private func generationIsCurrent(_ generation: UUID, for accountId: UUID) -> Bool {
+        !Task.isCancelled && pollGenerations[accountId] == generation
+    }
+
+    private func finishPolling(accountId: UUID, generation: UUID) {
+        guard pollGenerations[accountId] == generation else { return }
+        pollGenerations[accountId] = nil
+        pollTasks[accountId] = nil
     }
 }
 

@@ -84,7 +84,7 @@ enum AccountActivationReloadTransactionResult: Equatable, Sendable {
 
 struct AccountActivationReloadTransaction: Sendable {
     typealias DesktopReload = @Sendable (CodexAccount) async -> DesktopReloadResult
-    typealias CLIReload = @Sendable () -> CodexReloadSummary
+    typealias CLIReload = @Sendable (Set<Int32>) -> CodexReloadSummary
 
     private let desktopReload: DesktopReload
     private let cliReload: CLIReload
@@ -93,8 +93,10 @@ struct AccountActivationReloadTransaction: Sendable {
         desktopReload: @escaping DesktopReload = { account in
             await DesktopRuntimeReloadClient().reloadAuth(account: account)
         },
-        cliReload: @escaping CLIReload = {
-            SwapEngine.signalCodexReload()
+        cliReload: @escaping CLIReload = { excludedRuntimePIDs in
+            SwapEngine.signalCodexReload(
+                excludingRuntimePIDs: excludedRuntimePIDs
+            )
         }
     ) {
         self.desktopReload = desktopReload
@@ -113,7 +115,7 @@ struct AccountActivationReloadTransaction: Sendable {
         let cliResult: CodexReloadSummary
         switch desktopResult {
         case .reloaded, .noDesktopRuntime:
-            cliResult = cliReload()
+            cliResult = cliReload(desktopResult.acknowledgedRuntimePIDs)
         case .unsupported, .failed:
             cliResult = CodexReloadSummary(
                 discoveredRuntimeCount: 0,

@@ -720,6 +720,7 @@ enum SwapEngine {
 
     @discardableResult
     static func signalCodexReload(
+        excludingRuntimePIDs: Set<Int32> = [],
         authorizeEffect: @Sendable () -> Bool = { true }
     ) -> CodexReloadSummary {
         guard authorizeEffect() else {
@@ -743,10 +744,13 @@ enum SwapEngine {
             arguments: localCodexProcessDiscoveryArguments,
             timeout: 3
         )
-        let discoveryResult = pgrepDiscoveryResult(
-            stdout: result.stdout,
-            terminationStatus: result.terminationStatus,
-            timedOut: result.timedOut
+        let discoveryResult = Self.excludingRuntimePIDs(
+            excludingRuntimePIDs,
+            from: pgrepDiscoveryResult(
+                stdout: result.stdout,
+                terminationStatus: result.terminationStatus,
+                timedOut: result.timedOut
+            )
         )
         if case .failed(let reason) = discoveryResult {
             logger.error("Local Codex pgrep discovery failed: \(reason)")
@@ -1480,6 +1484,26 @@ enum SwapEngine {
     ) -> Set<Int32> {
         guard case .snapshot(let snapshot) = discoveryResult else { return [] }
         return Set(snapshot.pids)
+    }
+
+    nonisolated static func excludingRuntimePIDs(
+        _ excludedPIDs: Set<Int32>,
+        from discoveryResult: CodexPGrepDiscoveryResult
+    ) -> CodexPGrepDiscoveryResult {
+        guard !excludedPIDs.isEmpty,
+              case .snapshot(let snapshot) = discoveryResult else {
+            return discoveryResult
+        }
+        let remainingPIDs = snapshot.pids.filter { !excludedPIDs.contains($0) }
+        guard !remainingPIDs.isEmpty else {
+            return snapshot.isComplete ? .noMatches : .snapshot(
+                CodexPGrepProcessSnapshot(pids: [], isComplete: false)
+            )
+        }
+        return .snapshot(CodexPGrepProcessSnapshot(
+            pids: remainingPIDs,
+            isComplete: snapshot.isComplete
+        ))
     }
 
     nonisolated static func executeReloadBatch(

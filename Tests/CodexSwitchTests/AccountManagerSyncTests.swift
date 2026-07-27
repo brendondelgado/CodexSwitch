@@ -660,6 +660,36 @@ struct AccountManagerSyncTests {
         #expect(manager.accounts.first?.hasActiveSubscription == true)
     }
 
+    @Test("An older poll callback cannot overwrite newer quota")
+    @MainActor func olderQuotaUpdateIsIgnored() {
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let current = quotaSnapshot(
+            fiveHourRemaining: 80,
+            weeklyRemaining: 70,
+            fetchedAt: Date(timeIntervalSince1970: 1_800_000_100)
+        )
+        let stale = quotaSnapshot(
+            fiveHourRemaining: 1,
+            weeklyRemaining: 2,
+            fetchedAt: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        let account = CodexAccount(
+            email: "current@test.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "provider-account",
+            quotaSnapshot: current,
+            planType: "pro"
+        )
+        manager.addAccount(account)
+
+        manager.updateQuota(for: account.id, snapshot: stale, planType: "free")
+
+        #expect(manager.accounts.first?.quotaSnapshot == current)
+        #expect(manager.accounts.first?.planType == "pro")
+    }
+
     @Test("Quota updates clear stale 5h primed marker when backend window is still unstarted")
     @MainActor func quotaUpdatesClearStaleFiveHourPrimedMarker() {
         let defaults = isolatedDefaults()

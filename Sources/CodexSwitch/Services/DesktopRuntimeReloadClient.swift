@@ -55,6 +55,20 @@ enum DesktopReloadResult: Sendable, Equatable {
             )
         }
     }
+
+    var acknowledgedRuntimePIDs: Set<Int32> {
+        guard case .reloaded(
+            _,
+            _,
+            _,
+            let acknowledgedRuntimeBindings
+        ) = self else {
+            return []
+        }
+        return Set(acknowledgedRuntimeBindings.map {
+            $0.target.process.identity.pid
+        })
+    }
 }
 
 struct CodexDesktopRuntimeSocketBinding: Sendable, Equatable {

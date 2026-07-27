@@ -56,6 +56,16 @@ The effective remaining capacity for an allowed account is the minimum remaining
 
 All policy decisions use one injected `now` and one quota maximum age of 15 minutes. This covers the normal ten-minute relaxed polling interval plus scheduling and network jitter, while a missed relaxed poll makes the snapshot stale before a second full interval elapses; urgent polling updates sooner. An observation is fresh from its fetch instant through exactly that boundary; future-dated or older observations are stale. Freshness is policy input, not presentation state.
 
+Each non-blocked account has one generation-owned poll task. Replacing a poll
+cancels the old generation, and callbacks from a cancelled or superseded
+generation are discarded before they reach account state. The Mac coordinator
+periodically reconciles the expected account set with the poller's live task
+set, restarts missing tasks, and stops tasks for removed or hard-blocked
+accounts. A token-expired response may request credential refresh, but failure
+or deferral of that refresh must not leave the account permanently unpolled.
+Provider failures remain degraded polling state and do not trigger process
+restart loops.
+
 ## Weekly-only Operation
 
 The service may temporarily omit the five-hour window for paid accounts. In that state:

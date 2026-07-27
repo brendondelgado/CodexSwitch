@@ -485,4 +485,30 @@ struct QuotaPollerTests {
 
         #expect(QuotaPoller.inactivePollInterval(for: account, snapshot: snapshot) == 60)
     }
+
+    @Test("A completed poll generation removes itself from supervision")
+    func completedPollGenerationCleansUp() async {
+        let poller = QuotaPoller()
+        let accountId = UUID()
+
+        await withCheckedContinuation { continuation in
+            Task {
+                await poller.startPolling(
+                    for: accountId,
+                    accountProvider: { _ in nil },
+                    onUpdate: { _, _, _ in },
+                    onError: { _, _ in continuation.resume() },
+                    initialDelay: { _ in 0 }
+                )
+            }
+        }
+
+        for _ in 0..<20 {
+            if !(await poller.pollingAccountIds()).contains(accountId) {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(!(await poller.pollingAccountIds()).contains(accountId))
+    }
 }

@@ -369,6 +369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var retryExhaustedTopologyCheckTask: Task<Void, Never>?
     private var lastRetryExhaustedTopologyCheckAt: Date?
     private var retryExhaustedTopologyBaseline: RetryExhaustedTopologyBaseline?
+    private var quotaPollingReconciliationTask: Task<Void, Never>?
     private var isExiting = false
     private var terminationFlushTask: Task<Void, Never>?
     private var terminationFlushCompleted = false
@@ -530,6 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.scheduleAutomaticCodexUpdateIfNeeded()
                     self?.scheduleCodexBrowserSessionRepairIfNeeded()
                     self?.scheduleRetryExhaustedTopologyRecoveryIfNeeded()
+                    self?.reconcileQuotaPollingIfNeeded()
                     CLIStatusChecker.refresh(activeAccountId: self?.accountManager.configuredAccount?.accountId) { [weak self] in
                         self?.updatePopoverContent()
                     }
@@ -3479,6 +3481,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func startAllPolling() {
         for account in accountManager.accounts {
             startPollingForAccount(account.id)
+        }
+    }
+
+    private func reconcileQuotaPollingIfNeeded() {
+        guard !isExiting, quotaPollingReconciliationTask == nil else { return }
+        let expectedAccountIds = Set(accountManager.accounts.lazy
+            .filter { !$0.hasHardRuntimeBlock }
+            .map(\.id))
+        let knownAccountIds = Set(accountManager.accounts.map(\.id))
+        let poller = quotaPoller
+
+        quotaPollingReconciliationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.quotaPollingReconciliationTask = nil }
+            let pollingAccountIds = await poller.pollingAccountIds()
+            guard !Task.isCancelled, !self.isExiting else { return }
+
+            for accountId in pollingAccountIds.subtracting(expectedAccountIds) {
+                await poller.stopPolling(for: accountId)
+            }
+            for accountId in expectedAccountIds.subtracting(pollingAccountIds) {
+                guard knownAccountIds.contains(accountId) else { continue }
+                SwapLog.append(.debug(
+                    "POLL_SELF_HEAL_RESTART account=\(accountId.uuidString)"
+                ))
+                self.startPollingForAccount(accountId)
+            }
         }
     }
 
@@ -8019,6 +8048,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         automaticPolicyLeaseState.cancel()
         retryExhaustedTopologyCheckTask?.cancel()
         retryExhaustedTopologyCheckTask = nil
+        quotaPollingReconciliationTask?.cancel()
+        quotaPollingReconciliationTask = nil
         automaticCodexUpdateTask?.cancel()
         automaticCodexUpdateTask = nil
         globalCLIRepairInFlight = false

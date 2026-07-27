@@ -1713,6 +1713,28 @@ struct SwapEngineTests {
         ) == .failed("status_1_with_output"))
     }
 
+    @Test("Desktop runtime exclusions cannot poison interactive CLI discovery")
+    func desktopRuntimePIDsAreExcludedFromCLIProbe() {
+        let bridgeOnly = CodexPGrepDiscoveryResult.snapshot(
+            CodexPGrepProcessSnapshot(pids: [51_246], isComplete: true)
+        )
+        #expect(SwapEngine.excludingRuntimePIDs(
+            [51_246],
+            from: bridgeOnly
+        ) == .noMatches)
+
+        let mixed = CodexPGrepDiscoveryResult.snapshot(
+            CodexPGrepProcessSnapshot(pids: [51_246, 60_001], isComplete: true)
+        )
+        #expect(SwapEngine.excludingRuntimePIDs(
+            [51_246],
+            from: mixed
+        ) == .snapshot(CodexPGrepProcessSnapshot(
+            pids: [60_001],
+            isComplete: true
+        )))
+    }
+
     @Test("pgrep discovery rejects invalid UTF-8 for status zero or one")
     func pgrepDiscoveryRejectsInvalidUTF8() {
         var output = Data("42 /usr/local/bin/codex\n".utf8)

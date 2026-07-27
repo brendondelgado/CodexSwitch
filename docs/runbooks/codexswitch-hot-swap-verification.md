@@ -924,6 +924,13 @@ The daemon may use a slower normal polling interval while the active account has
 
 When the user-visible status would round remaining quota to `1%`, or when any hard runtime usage-limit signal appears, it must rotate before the next user request depends on that exhausted account.
 
+The Mac coordinator reconciles poll-task ownership on its existing five-second
+health tick. Every account without a hard runtime block must have exactly one
+current poll generation. Completed, cancelled, or superseded generations must
+remove themselves without deleting a newer generation, and stale callbacks must
+not overwrite a newer quota snapshot. Clearing a hard block must restore polling
+without an app restart.
+
 Inactive accounts need a separate upgrade watch because plan purchases happen
 out-of-band while CodexSwitch is already running. On a healthy no-rotation tick,
 the daemon probes at most one due inactive account and selects it with a stable,
@@ -1111,6 +1118,12 @@ Every future hot-swap change must include tests for:
 - The desktop activation client invokes strict reload before releasing its
   initialized verification connection; regression tests assert the ordering so
   a refactor cannot reintroduce the close-before-SIGHUP race.
+- A desktop bridge PID acknowledged by the desktop transaction is excluded from
+  interactive-CLI discovery. When it is the only exact-name `codex` process, a
+  `1/1` desktop acknowledgement converges instead of entering retry exhaustion.
+- Poll generations clean up only their own task record, cancelled generations
+  cannot publish, and periodic reconciliation restarts a missing eligible poll
+  exactly once while preserving intentional hard-runtime blocks.
 - `headless-remote-control-app-server` keeps its broader idle behavior only
   after positive topology and capability classification. Rejected-before-
   eligibility historical connections may be excluded from its live writer

@@ -156,6 +156,13 @@ final class AccountManager {
 
     func updateQuota(for accountId: UUID, snapshot: QuotaSnapshot, planType: String) {
         guard let idx = accounts.firstIndex(where: { $0.id == accountId }) else { return }
+        if let current = accounts[idx].quotaSnapshot,
+           snapshot.fetchedAt < current.fetchedAt {
+            SwapLog.append(.debug(
+                "STALE_QUOTA_IGNORED account=\(accounts[idx].email) current=\(Int(current.fetchedAt.timeIntervalSince1970)) candidate=\(Int(snapshot.fetchedAt.timeIntervalSince1970))"
+            ))
+            return
+        }
         let hadReauthenticationBlock = accounts[idx].requiresReauthentication
         guard !snapshot.hasBackendUsagePlaceholder else {
             accounts[idx].planType = planType

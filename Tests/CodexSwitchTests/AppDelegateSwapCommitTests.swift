@@ -19,6 +19,23 @@ private final class ReloadCallCounter: @unchecked Sendable {
     }
 }
 
+private final class ReloadPIDRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Set<Int32> = []
+
+    func record(_ pids: Set<Int32>) {
+        lock.lock()
+        value = pids
+        lock.unlock()
+    }
+
+    func read() -> Set<Int32> {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 @Suite("Account activation reload transaction")
 struct AppDelegateSwapCommitTests {
     @Test("Delayed external auth reads are discarded after a newer swap and replayed")
@@ -329,7 +346,7 @@ struct AppDelegateSwapCommitTests {
                     acknowledgedRuntimeCount: 2
                 )
             },
-            cliReload: {
+            cliReload: { _ in
                 cliCalls.increment()
                 return CodexReloadSummary(
                     discoveredRuntimeCount: 1,
@@ -368,7 +385,7 @@ struct AppDelegateSwapCommitTests {
                     acknowledgedRuntimeCount: 1
                 )
             },
-            cliReload: {
+            cliReload: { _ in
                 cliCalls.increment()
                 return CodexReloadSummary(
                     discoveredRuntimeCount: 1,
@@ -404,7 +421,7 @@ struct AppDelegateSwapCommitTests {
                     acknowledgedRuntimeCount: 1
                 )
             },
-            cliReload: {
+            cliReload: { _ in
                 cliCalls.increment()
                 return CodexReloadSummary(
                     discoveredRuntimeCount: 1,
@@ -423,6 +440,45 @@ struct AppDelegateSwapCommitTests {
             Issue.record("Expected cancellation after the desktop await")
             return
         }
+    }
+
+    @Test("Desktop runtime PIDs are excluded from interactive CLI discovery")
+    func desktopRuntimeIsNotCountedAsCLI() async {
+        let desktopPID: Int32 = 51_246
+        let recorder = ReloadPIDRecorder()
+        let transaction = AccountActivationReloadTransaction(
+            desktopReload: { _ in
+                .reloaded(
+                    method: "account/login/start",
+                    discoveredRuntimeCount: 1,
+                    acknowledgedRuntimeCount: 1,
+                    acknowledgedRuntimeBindings: [
+                        desktopRuntimeBinding(pid: desktopPID),
+                    ]
+                )
+            },
+            cliReload: { excludedPIDs in
+                recorder.record(excludedPIDs)
+                return CodexReloadSummary(
+                    discoveredRuntimeCount: 0,
+                    acknowledgedRuntimeCount: 0
+                )
+            }
+        )
+
+        let result = await transaction.converge(
+            account: makeAccount(),
+            authorizeAfterDesktop: { true }
+        )
+
+        #expect(recorder.read() == [desktopPID])
+        guard case .completed(_, let completion) = result else {
+            Issue.record("Expected runtime convergence")
+            return
+        }
+        #expect(completion.outcome == .runtimeCurrent)
+        #expect(completion.discoveredRuntimeCount == 1)
+        #expect(completion.acknowledgedRuntimeCount == 1)
     }
 
     @MainActor
@@ -538,6 +594,37 @@ struct AppDelegateSwapCommitTests {
             idToken: "id-token",
             accountId: accountId,
             isActive: isActive
+        )
+    }
+
+    private func desktopRuntimeBinding(pid: Int32) -> CodexDesktopRuntimeSocketBinding {
+        let path = "/Users/me/.local/share/codexswitch/runtime/codex"
+        let identity = CodexSignalProcessIdentity(
+            pid: pid,
+            ownerUID: 501,
+            executablePath: path,
+            startSeconds: 1_000,
+            startMicroseconds: 12
+        )
+        return CodexDesktopRuntimeSocketBinding(
+            target: CodexRuntimeTarget(
+                process: CodexIdentityBoundProcess(
+                    identity: identity,
+                    kernelExecutableIdentity: CodexKernelExecutableIdentity(
+                        canonicalPath: path,
+                        device: 7,
+                        inode: 10_000 + UInt64(pid)
+                    ),
+                    arguments: [
+                        path,
+                        "app-server",
+                        "--listen",
+                        "ws://127.0.0.1:9223",
+                    ]
+                ),
+                runtimeKind: .managedDesktopBridge
+            ),
+            port: 9223
         )
     }
 }
