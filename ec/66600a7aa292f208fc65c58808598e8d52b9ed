@@ -1,0 +1,43 @@
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_6f97a170c652b0 372,534,3487-3513,8051-8052
+Sources/CodexSwitch/Models/AccountManager.swift
+  s_70c8e194852bb5::t_8cc5a603b4dd38 159-165
+Sources/CodexSwitch/Services/AccountActivationConvergence.swift
+  s_70c8e194852bb5::t_b1877c9091b3ba 87,96-99,118
+Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
+  s_70c8e194852bb5::t_a07a7a26a4f4b8 58-71
+Sources/CodexSwitch/Services/QuotaPoller.swift
+  s_70c8e194852bb5::t_e1ecf73dccf926 9,171-174,178-190,192-215,218-219,221-230,232-235,237-240,242-253,258-261,263,269,273-282
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_445c31ccc5a4a3 723,747-753,1489-1508
+Tests/CodexSwitchTests/AccountManagerSyncTests.swift
+  s_70c8e194852bb5::t_970f3edf10c48b 663-692
+Tests/CodexSwitchTests/AppDelegateSwapCommitTests.swift
+  s_70c8e194852bb5::t_9875a32300a82e 22-38,349,388,424,445-483,599-629
+Tests/CodexSwitchTests/QuotaPollerTests.swift
+  s_70c8e194852bb5::t_7daa8c639f39b8 488-513
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_bf3005fba07081 1716-1737
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_1ac9a3a04a9228 59-68
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_29edd3bc5c02f5 531-539
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_a2364858b36936 927-933,1121-1126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "ec66600a7aa292f208fc65c58808598e8d52b9ed",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
