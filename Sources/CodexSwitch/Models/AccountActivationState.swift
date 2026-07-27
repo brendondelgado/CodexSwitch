@@ -63,6 +63,11 @@ enum AccountActivationDetail: String, Codable, Equatable, Sendable {
 enum AccountActivationRequestKind: Equatable, Sendable {
     case automatic
     case manual
+    case poolAuthority
+
+    var permitsOperatorRecovery: Bool {
+        self == .manual || self == .poolAuthority
+    }
 }
 
 enum AccountActivationRequestDecision: Equatable, Sendable {
@@ -136,7 +141,7 @@ struct AccountActivationState: Codable, Equatable, Sendable {
             }
             return .beginActivation
         case .committedDegraded:
-            if kind == .manual {
+            if kind.permitsOperatorRecovery {
                 return configuredAccountId == accountId
                     ? .retrySameTarget
                     : .beginActivation
@@ -147,7 +152,7 @@ struct AccountActivationState: Codable, Equatable, Sendable {
         case .preparing:
             return .blocked("Mac account activation is incomplete; account changes are paused")
         case .manualReview:
-            if kind == .manual, let detail {
+            if kind.permitsOperatorRecovery, let detail {
                 if configuredAccountId == accountId,
                    detail.allowsManualSameTargetRetry {
                     return .retrySameTarget

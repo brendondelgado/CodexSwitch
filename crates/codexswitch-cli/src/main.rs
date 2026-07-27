@@ -7,10 +7,12 @@ mod codex_update;
 mod daemon;
 mod import;
 mod patched_codex;
+mod pool_authority;
 mod quota;
 mod rate_limit_resets;
 mod readiness;
 mod reload;
+mod remote_authority;
 mod secure_drop;
 mod secure_file;
 mod token_refresh;
@@ -24,23 +26,30 @@ use account_store::{
 };
 #[cfg(test)]
 use account_store::{commit_accounts, save_accounts};
-#[cfg(test)]
-use activation::activate_with;
 use activation::{
     acquire_runtime_activation_lease, activate_with_under_runtime_lease,
-    activate_with_unlocked_reload, activate_with_unlocked_reload_under_runtime_lease,
+    activate_with_unlocked_reload_under_runtime_lease,
     commit_accounts_with_provider_io_activation_under_runtime_lease,
-    preflight_provider_io_activation, reconcile_activation_barrier_unlocked,
-    reconcile_activation_barrier_unlocked_under_runtime_lease,
+    preflight_provider_io_activation, reconcile_activation_barrier_unlocked_under_runtime_lease,
     replace_accounts_with_under_runtime_lease, resolve_manual_review_activation_unlocked,
     validate_provider_io_activation, validate_provider_io_activation_locked, ActivationContext,
     ActivationOutcome, ActivationState, RuntimeActivationLease,
+};
+#[cfg(test)]
+use activation::{
+    activate_with, activate_with_unlocked_reload, reconcile_activation_barrier_unlocked,
 };
 use anyhow::{bail, Context, Result};
 use auth::default_auth_path;
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
 use import::prepare_import_bundle;
+use pool_authority::{
+    observe_status as observe_pool_authority_status, parse_reason as parse_pool_authority_reason,
+    parse_selector as parse_pool_authority_selector, PoolAuthorityLock, PoolAuthorityPhase,
+    PoolAuthorityStatus, PoolRotationOperation, RotationOperationDisposition,
+    TargetRequestDisposition,
+};
 use quota::{apply_fetch_result, fetch_quota, FetchResult};
 use rate_limit_resets::{
     consume_rate_limit_reset, fetch_rate_limit_reset_bank, orchestrate_reset_with_provider_guard,
@@ -108,6 +117,22 @@ enum Command {
         offline_file_only: bool,
     },
     Status,
+    PoolAuthorityStatus {
+        #[arg(long)]
+        json: bool,
+    },
+    RequestPoolTarget {
+        #[arg(value_parser = parse_pool_authority_selector)]
+        account: String,
+        #[arg(long, value_parser = parse_canonical_uuid)]
+        request_id: Uuid,
+        #[arg(long)]
+        expected_epoch: u64,
+        #[arg(long, value_parser = parse_pool_authority_reason)]
+        reason: String,
+        #[arg(long)]
+        json: bool,
+    },
     Files {
         #[command(subcommand)]
         command: secure_drop::FilesCommand,
@@ -176,6 +201,9 @@ enum Command {
         /// Allow this command to consume a banked reset before rotating.
         #[arg(long)]
         allow_banked_reset: bool,
+        /// Durable idempotency key for a remotely initiated VPS rotation.
+        #[arg(long, value_parser = parse_canonical_uuid)]
+        operation_id: Option<Uuid>,
         /// Commit store/auth without claiming a hot swap. Intended only when no runtime is live.
         #[arg(long)]
         offline_file_only: bool,
@@ -263,6 +291,22 @@ fn main() -> Result<()> {
             "Updated",
         ),
         Command::Status => status(&store_path),
+        Command::PoolAuthorityStatus { json } => pool_authority_status(&store_path, json),
+        Command::RequestPoolTarget {
+            account,
+            request_id,
+            expected_epoch,
+            reason,
+            json,
+        } => request_pool_target(
+            &store_path,
+            &auth_path,
+            &account,
+            request_id,
+            expected_epoch,
+            &reason,
+            json,
+        ),
         Command::Files { command } => secure_drop::run(command),
         Command::AuthDiagnostics { json } => auth_diagnostics(&store_path, &auth_path, json),
         Command::CodexUpdateStatus { json } => codex_update_status(json),
@@ -289,6 +333,7 @@ fn main() -> Result<()> {
             reason,
             cooldown_seconds,
             allow_banked_reset,
+            operation_id,
             offline_file_only,
             receipt_nonce,
             json,
@@ -298,6 +343,7 @@ fn main() -> Result<()> {
             &reason,
             cooldown_seconds,
             allow_banked_reset,
+            operation_id,
             !offline_file_only,
             receipt_nonce,
             json,
@@ -305,11 +351,9 @@ fn main() -> Result<()> {
         Command::ResolveActivation { yes, json } => {
             resolve_activation(&store_path, &auth_path, yes, json)
         }
-        Command::Daemon { interval_seconds } => daemon::run_loop(
-            &store_path,
-            &auth_path,
-            Duration::from_secs(interval_seconds),
-        ),
+        Command::Daemon { interval_seconds } => {
+            run_daemon(&store_path, &auth_path, interval_seconds)
+        }
         Command::Poll { account } => poll(&store_path, &auth_path, account.as_deref()),
         Command::RestartCodex {
             yes,
@@ -322,6 +366,18 @@ fn main() -> Result<()> {
             replace_system_entry,
             replace_npm_vendor,
         } => install_patched_codex(source, yes, replace_system_entry, replace_npm_vendor),
+    }
+}
+
+fn run_daemon(store_path: &Path, auth_path: &Path, interval_seconds: u64) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (store_path, auth_path, interval_seconds);
+        bail!("macOS cannot run an independent pool-authority daemon");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        daemon::run_loop(store_path, auth_path, Duration::from_secs(interval_seconds))
     }
 }
 
@@ -384,11 +440,33 @@ where
             .context("import is blocked by unresolved prior runtime convergence")?;
     }
 
+    let authority_target = if preserve_active {
+        #[cfg(target_os = "macos")]
+        {
+            let status = remote_authority::fetch_status()?;
+            remote_authority::validate_adoptable_status(&status)?;
+            Some(status.desired_provider_account_id)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let snapshot = load_account_store_snapshot(store_path)?;
+            let mut authority =
+                PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, store_path)?;
+            Some(
+                authority
+                    .bootstrap_from_active(&snapshot.accounts)?
+                    .desired_provider_account_id,
+            )
+        }
+    } else {
+        None
+    };
+
     let (account_count, prepared) = {
         let store_lock = lock_account_store(store_path)?;
         let snapshot = store_lock.load()?;
-        let replacement_accounts = if preserve_active {
-            preserve_host_active_account(imported_accounts, &snapshot.accounts)?
+        let replacement_accounts = if let Some(authority_target) = authority_target.as_deref() {
+            preserve_authority_active_account(imported_accounts, authority_target)?
         } else {
             imported_accounts
         };
@@ -422,29 +500,432 @@ where
     Ok((account_count, outcome))
 }
 
-fn preserve_host_active_account(
+fn preserve_authority_active_account(
     mut incoming: Vec<account_store::CodexAccount>,
-    current: &[account_store::CodexAccount],
+    authority_target: &str,
 ) -> Result<Vec<account_store::CodexAccount>> {
     validate_accounts(&incoming).context("incoming credential bundle is invalid")?;
-    if current.is_empty() {
-        return Ok(incoming);
-    }
-    validate_accounts(current).context("current host account store is invalid")?;
-    let current_active = active_account(current)
-        .context("current host account store has no active provider account")?;
-
     for account in &mut incoming {
-        account.is_active = account.account_id == current_active.account_id;
+        account.is_active = account.account_id == authority_target;
     }
     if !incoming
         .iter()
-        .any(|account| account.account_id == current_active.account_id)
+        .any(|account| account.account_id == authority_target)
     {
-        incoming.push(current_active.clone());
+        bail!(
+            "credential bundle does not contain pool-authority target {}",
+            authority_target
+        );
     }
-    validate_accounts(&incoming).context("host-preserving credential merge is invalid")?;
+    validate_accounts(&incoming).context("authority-preserving credential merge is invalid")?;
     Ok(incoming)
+}
+
+fn pool_authority_status(store_path: &Path, json: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let status = {
+        let _ = store_path;
+        remote_authority::fetch_status()?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let status =
+        observe_pool_authority_status(store_path)?.context("pool authority is not initialized")?;
+    print_pool_authority_status(&status, json)
+}
+
+fn request_pool_target(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    request_id: Uuid,
+    expected_epoch: u64,
+    reason: &str,
+    json: bool,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let status = request_pool_target_via_remote_with(
+        store_path,
+        auth_path,
+        selector,
+        request_id,
+        expected_epoch,
+        reason,
+        |provider_id, request_id, expected_epoch, reason| {
+            remote_authority::request_target(provider_id, request_id, expected_epoch, reason)
+        },
+        remote_authority::fetch_status,
+        &reload_codex_hot_swap_processes,
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    let status = request_pool_target_with(
+        store_path,
+        auth_path,
+        selector,
+        request_id,
+        expected_epoch,
+        reason,
+        &reload_codex_hot_swap_processes,
+    )?;
+    print_pool_authority_status(&status, json)
+}
+
+fn print_pool_authority_status(status: &PoolAuthorityStatus, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(status)?);
+    } else {
+        println!(
+            "pool authority epoch={} phase={:?} target={} request={} reason={}",
+            status.epoch,
+            status.phase,
+            status.desired_provider_account_id,
+            status.request_id,
+            status.reason
+        );
+        if let Some(detail) = status.detail.as_deref() {
+            println!("detail: {detail}");
+        }
+    }
+    Ok(())
+}
+
+fn request_pool_target_with<R>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    request_id: Uuid,
+    expected_epoch: u64,
+    reason: &str,
+    reload: &R,
+) -> Result<PoolAuthorityStatus>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    parse_pool_authority_selector(selector).map_err(anyhow::Error::msg)?;
+    parse_pool_authority_reason(reason).map_err(anyhow::Error::msg)?;
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    let mut authority = PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, store_path)?;
+    authority.reject_stale_request_before_io(request_id, expected_epoch)?;
+    if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        true,
+        reload,
+    )? {
+        if let Err(error) = require_confirmed_activation(outcome) {
+            let detail = format!("prior VPS pool-target activation was not confirmed: {error:#}");
+            if authority.record().is_some() {
+                authority.mark_degraded(&detail)?;
+            }
+            return Err(error)
+                .context("pool-target request is blocked by unresolved prior runtime convergence");
+        }
+    }
+
+    let snapshot = load_account_store_snapshot(store_path)?;
+    let target_id = resolve_account_selector(&snapshot.accounts, selector)?;
+    let target = snapshot
+        .accounts
+        .iter()
+        .find(|account| account.id == target_id)
+        .cloned()
+        .context("pool-target account disappeared")?;
+    authority.bootstrap_from_active(&snapshot.accounts)?;
+    let (disposition, record) =
+        authority.begin_target_request(&target.account_id, request_id, expected_epoch, reason)?;
+
+    if !disposition.needs_convergence()
+        && record.phase == PoolAuthorityPhase::Stable
+        && active_account(&snapshot.accounts).map(|account| account.account_id.as_str())
+            == Some(record.desired_provider_account_id.as_str())
+    {
+        return Ok(PoolAuthorityStatus::from(&record));
+    }
+
+    authority.mark_converging(Some("VPS runtime convergence is pending"))?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let activation = activate_with_unlocked_reload_under_runtime_lease(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        &mut generation,
+        &mut accounts,
+        target.id,
+        true,
+        reload,
+    );
+    let final_record = match activation {
+        Ok(outcome) if outcome.is_confirmed() => authority.mark_stable()?,
+        Ok(outcome) => {
+            let detail = outcome.detail.unwrap_or_else(|| {
+                format!(
+                    "VPS activation remained {:?} without complete runtime confirmation",
+                    outcome.state
+                )
+            });
+            authority.mark_degraded(&detail)?
+        }
+        Err(error) => {
+            let detail = format!("VPS authority target activation failed: {error:#}");
+            authority.mark_degraded(&detail)?;
+            return Err(error).context("pool target remains degraded");
+        }
+    };
+    Ok(PoolAuthorityStatus::from(&final_record))
+}
+
+struct RemoteLocalAdoption {
+    target: account_store::CodexAccount,
+    activation_state: ActivationState,
+    reload: ReloadSummary,
+    reload_attempted: bool,
+}
+
+const REMOTE_AUTHORITY_RECONCILIATION_ATTEMPTS: usize = 3;
+
+fn request_pool_target_via_remote_with<T, F, R>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    request_id: Uuid,
+    expected_epoch: u64,
+    reason: &str,
+    request_remote: T,
+    fetch_remote: F,
+    reload: &R,
+) -> Result<PoolAuthorityStatus>
+where
+    T: Fn(&str, Uuid, u64, &str) -> Result<PoolAuthorityStatus>,
+    F: Fn() -> Result<PoolAuthorityStatus>,
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    parse_pool_authority_selector(selector).map_err(anyhow::Error::msg)?;
+    parse_pool_authority_reason(reason).map_err(anyhow::Error::msg)?;
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    let snapshot = load_account_store_snapshot(store_path)?;
+    let target_id = resolve_account_selector(&snapshot.accounts, selector)?;
+    let target_provider_account_id = snapshot
+        .accounts
+        .iter()
+        .find(|account| account.id == target_id)
+        .map(|account| account.account_id.clone())
+        .context("remote pool-target account disappeared")?;
+
+    let status = resolve_committed_remote_status_with(
+        request_remote(
+            &target_provider_account_id,
+            request_id,
+            expected_epoch,
+            reason,
+        )?,
+        &fetch_remote,
+    )?;
+    if status.request_id != request_id
+        || status.desired_provider_account_id != target_provider_account_id
+    {
+        bail!("remote authority did not confirm the requested provider account");
+    }
+    let (_, final_status) = converge_local_to_remote_authority_with(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        status,
+        false,
+        &fetch_remote,
+        reload,
+    )?;
+    Ok(final_status)
+}
+
+fn resolve_committed_remote_status_with<F>(
+    mut status: PoolAuthorityStatus,
+    fetch_remote: &F,
+) -> Result<PoolAuthorityStatus>
+where
+    F: Fn() -> Result<PoolAuthorityStatus>,
+{
+    for _ in 1..REMOTE_AUTHORITY_RECONCILIATION_ATTEMPTS {
+        if status.phase != PoolAuthorityPhase::Converging {
+            break;
+        }
+        status = fetch_remote()?;
+    }
+    remote_authority::validate_adoptable_status(&status)?;
+    Ok(status)
+}
+
+fn converge_local_to_remote_authority_with<F, R>(
+    runtime_lease: &RuntimeActivationLease,
+    store_path: &Path,
+    auth_path: &Path,
+    initial_status: PoolAuthorityStatus,
+    force_first_reload: bool,
+    fetch_remote: &F,
+    reload: &R,
+) -> Result<(RemoteLocalAdoption, PoolAuthorityStatus)>
+where
+    F: Fn() -> Result<PoolAuthorityStatus>,
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    let mut desired = resolve_committed_remote_status_with(initial_status, fetch_remote)?;
+    let mut force_reload = force_first_reload;
+    for _ in 0..REMOTE_AUTHORITY_RECONCILIATION_ATTEMPTS {
+        let adoption = adopt_remote_provider_under_runtime_lease(
+            runtime_lease,
+            store_path,
+            auth_path,
+            &desired.desired_provider_account_id,
+            force_reload,
+            reload,
+        )?;
+        let observed = resolve_committed_remote_status_with(fetch_remote()?, fetch_remote)?;
+        if observed.epoch < desired.epoch {
+            bail!("remote pool-authority epoch moved backwards during local adoption");
+        }
+        if observed.epoch == desired.epoch
+            && observed.desired_provider_account_id != desired.desired_provider_account_id
+        {
+            bail!("remote pool-authority target changed without advancing its epoch");
+        }
+        if observed.desired_provider_account_id == desired.desired_provider_account_id {
+            return Ok((adoption, observed));
+        }
+        desired = observed;
+        force_reload = true;
+    }
+    bail!("remote pool authority kept advancing during bounded local adoption")
+}
+
+fn adopt_remote_provider_under_runtime_lease<R>(
+    runtime_lease: &RuntimeActivationLease,
+    store_path: &Path,
+    auth_path: &Path,
+    desired_provider_account_id: &str,
+    force_reload: bool,
+    reload: &R,
+) -> Result<RemoteLocalAdoption>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
+        runtime_lease,
+        store_path,
+        auth_path,
+        true,
+        reload,
+    )? {
+        require_confirmed_activation(outcome)
+            .context("remote-authority adoption is blocked by prior local convergence")?;
+    }
+    let snapshot = load_account_store_snapshot(store_path)?;
+    let target = snapshot
+        .accounts
+        .iter()
+        .find(|account| account.account_id == desired_provider_account_id)
+        .cloned()
+        .context("remote-authority target is absent from the local account store")?;
+    let already_configured = active_account(&snapshot.accounts).map(|account| account.id)
+        == Some(target.id)
+        && auth::auth_file_matches_account(auth_path, &target);
+    if already_configured && !force_reload {
+        return Ok(RemoteLocalAdoption {
+            target,
+            activation_state: ActivationState::Confirmed,
+            reload: ReloadSummary::default().with_topology_verified(true),
+            reload_attempted: false,
+        });
+    }
+
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let outcome = activate_with_unlocked_reload_under_runtime_lease(
+        runtime_lease,
+        store_path,
+        auth_path,
+        &mut generation,
+        &mut accounts,
+        target.id,
+        true,
+        reload,
+    )?;
+    let activation_state = outcome.state;
+    let summary = require_confirmed_activation(outcome)
+        .context("local runtime did not converge to the remote-authority target")?;
+    if !auth::auth_file_matches_account(auth_path, &target) {
+        bail!("local auth file does not match the adopted remote-authority target");
+    }
+    Ok(RemoteLocalAdoption {
+        target,
+        activation_state,
+        reload: summary,
+        reload_attempted: true,
+    })
+}
+
+fn converge_existing_pool_authority_target<R>(
+    runtime_lease: &RuntimeActivationLease,
+    authority: &mut PoolAuthorityLock,
+    store_path: &Path,
+    auth_path: &Path,
+    snapshot: account_store::AccountStoreSnapshot,
+    reload_enabled: bool,
+    reload: &R,
+) -> Result<()>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    let desired_provider_account_id = authority
+        .require_record()?
+        .desired_provider_account_id
+        .clone();
+    let Some(target) = snapshot
+        .accounts
+        .iter()
+        .find(|account| account.account_id == desired_provider_account_id)
+        .cloned()
+    else {
+        let detail = format!(
+            "pool-authority target {} is absent from the VPS account store",
+            desired_provider_account_id
+        );
+        authority.mark_degraded(&detail)?;
+        bail!("{detail}");
+    };
+    authority.mark_converging(Some("VPS same-target authority recovery is pending"))?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let activation = activate_with_unlocked_reload_under_runtime_lease(
+        runtime_lease,
+        store_path,
+        auth_path,
+        &mut generation,
+        &mut accounts,
+        target.id,
+        reload_enabled,
+        reload,
+    );
+    match activation {
+        Ok(outcome) if outcome.is_confirmed() => {
+            authority.mark_stable()?;
+            Ok(())
+        }
+        Ok(outcome) => {
+            let detail = outcome.detail.unwrap_or_else(|| {
+                format!(
+                    "VPS authority recovery remained {:?} without complete runtime confirmation",
+                    outcome.state
+                )
+            });
+            authority.mark_degraded(&detail)?;
+            bail!("{detail}");
+        }
+        Err(error) => {
+            let detail = format!("VPS same-target authority recovery failed: {error:#}");
+            authority.mark_degraded(&detail)?;
+            Err(error).context("VPS pool authority remains degraded")
+        }
+    }
 }
 
 pub(crate) fn doctor(store_path: &Path, auth_path: &Path, json: bool) -> Result<()> {
@@ -796,24 +1277,67 @@ fn collect_auth_diagnostics(store_path: &Path, auth_path: &Path) -> Result<AuthD
 }
 
 pub(crate) fn swap(store_path: &Path, auth_path: &Path, selector: &str) -> Result<()> {
-    let (target_email, summary) = swap_with_reload(
-        store_path,
-        auth_path,
-        selector,
-        reload_codex_hot_swap_processes,
-    )?;
-    println!(
-        "Swapped to {}; signaled {} Codex hot-swap process(es), restarted {}",
-        target_email,
-        summary.signaled.len(),
-        summary.restarted.len()
-    );
-    for (pid, reason) in &summary.skipped {
-        println!("Skipped pid={pid}: {reason}");
+    #[cfg(target_os = "macos")]
+    let status = {
+        let observed = remote_authority::fetch_committed_status()?;
+        request_pool_target_via_remote_with(
+            store_path,
+            auth_path,
+            selector,
+            Uuid::new_v4(),
+            observed.epoch,
+            "manual_cli_swap",
+            |provider_id, request_id, expected_epoch, reason| {
+                remote_authority::request_target(provider_id, request_id, expected_epoch, reason)
+            },
+            remote_authority::fetch_status,
+            &reload_codex_hot_swap_processes,
+        )?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let status = {
+        let expected_epoch = observe_pool_authority_status(store_path)?
+            .map(|status| status.epoch)
+            .unwrap_or(1);
+        request_pool_target_with(
+            store_path,
+            auth_path,
+            selector,
+            Uuid::new_v4(),
+            expected_epoch,
+            "manual_cli_swap",
+            &reload_codex_hot_swap_processes,
+        )?
+    };
+    if status.phase == PoolAuthorityPhase::Converging {
+        bail!(
+            "pool target {} remains {:?}: {}",
+            status.desired_provider_account_id,
+            status.phase,
+            status.detail.as_deref().unwrap_or("no detail")
+        );
     }
+    if status.phase == PoolAuthorityPhase::Degraded {
+        eprintln!(
+            "warning: pool target {} is committed at epoch {} but VPS health is degraded: {}",
+            status.desired_provider_account_id,
+            status.epoch,
+            status.detail.as_deref().unwrap_or("no detail")
+        );
+    }
+    let target_email = load_accounts(store_path)?
+        .into_iter()
+        .find(|account| account.account_id == status.desired_provider_account_id)
+        .map(|account| account.email)
+        .context("stable pool target disappeared after swap")?;
+    println!(
+        "Pool target is {} at authority epoch {}",
+        target_email, status.epoch
+    );
     Ok(())
 }
 
+#[cfg(test)]
 fn swap_with_reload<R>(
     store_path: &Path,
     auth_path: &Path,
@@ -1176,6 +1700,7 @@ where
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RotateNowReport {
+    operation_id: Option<Uuid>,
     receipt_nonce: Option<Uuid>,
     reason: String,
     previous_email: String,
@@ -1197,6 +1722,11 @@ struct RotateNowReport {
     used_banked_reset: bool,
     banked_resets_remaining: Option<u32>,
     reset_reason: Option<SmartResetReason>,
+    authority_epoch: u64,
+    authority_phase: PoolAuthorityPhase,
+    authority_provider_account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority_detail: Option<String>,
     #[serde(skip)]
     skipped: Vec<(i32, String)>,
 }
@@ -1207,6 +1737,7 @@ pub(crate) fn rotate_now(
     reason: &str,
     cooldown_seconds: i64,
     allow_banked_reset: bool,
+    operation_id: Option<Uuid>,
     reload_processes: bool,
     receipt_nonce: Option<Uuid>,
     json_output: bool,
@@ -1227,6 +1758,26 @@ pub(crate) fn rotate_now(
             }),
         None => reload_codex_hot_swap_processes(path),
     };
+    #[cfg(target_os = "macos")]
+    let mut report = rotate_now_via_remote_with(
+        RotateNowContext {
+            store_path,
+            auth_path,
+            reason,
+            cooldown_seconds,
+            reload_processes,
+            allow_banked_reset,
+            operation_id,
+            receipt_nonce,
+        },
+        |reason, cooldown_seconds, allow_banked_reset| {
+            remote_authority::rotate(reason, cooldown_seconds, allow_banked_reset)
+        },
+        remote_authority::fetch_status,
+        remote_authority::mark_rotation_locally_converged,
+        &reload,
+    )?;
+    #[cfg(not(target_os = "macos"))]
     let mut report = rotate_now_with_resets(
         RotateNowContext {
             store_path,
@@ -1235,6 +1786,7 @@ pub(crate) fn rotate_now(
             cooldown_seconds,
             reload_processes,
             allow_banked_reset,
+            operation_id,
             receipt_nonce,
         },
         RotateNowDependencies::new(
@@ -1320,6 +1872,104 @@ fn merge_reload_evidence(aggregate: &mut ReloadSummary, summary: &ReloadSummary)
         .extend(summary.acknowledged_request_nonces.iter().cloned());
 }
 
+fn rotate_now_via_remote_with<T, F, M, R>(
+    context: RotateNowContext<'_>,
+    rotate_remote: T,
+    fetch_remote: F,
+    mark_locally_converged: M,
+    reload: &R,
+) -> Result<RotateNowReport>
+where
+    T: Fn(&str, i64, bool) -> Result<remote_authority::RemoteRotationOutcome>,
+    F: Fn() -> Result<PoolAuthorityStatus>,
+    M: Fn(Uuid) -> Result<()>,
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    let RotateNowContext {
+        store_path,
+        auth_path,
+        reason,
+        cooldown_seconds,
+        reload_processes,
+        allow_banked_reset,
+        operation_id,
+        receipt_nonce,
+    } = context;
+    if !reload_processes {
+        bail!("macOS remote-authority rotation requires live local runtime reload");
+    }
+    if operation_id.is_some() {
+        bail!("macOS rotation operation IDs are managed by the remote transport journal");
+    }
+    parse_pool_authority_reason(reason).map_err(anyhow::Error::msg)?;
+    let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    let before = load_account_store_snapshot(store_path)?;
+    let previous = active_account(&before.accounts)
+        .cloned()
+        .context("local account store has no active account")?;
+    let previous_email = previous.email.clone();
+    let previous_token_hash_prefix = token_hash_prefix(&previous.access_token);
+
+    let remote = rotate_remote(reason, cooldown_seconds, allow_banked_reset)?;
+    let status = resolve_committed_remote_status_with(remote.status.clone(), &fetch_remote)?;
+    let pre_adoption_target = before
+        .accounts
+        .iter()
+        .find(|account| account.account_id == status.desired_provider_account_id)
+        .context("remote-authority target is absent from the local account store")?;
+    if receipt_nonce.is_some()
+        && pre_adoption_target.id == previous.id
+        && auth::auth_file_matches_account(auth_path, pre_adoption_target)
+    {
+        bail!(
+            "remote authority retained the current local credentials; receipt-bound rotation cannot advance"
+        );
+    }
+
+    let (adoption, final_status) = converge_local_to_remote_authority_with(
+        &runtime_lease,
+        store_path,
+        auth_path,
+        status,
+        true,
+        &fetch_remote,
+        reload,
+    )?;
+    require_rotation_receipt_proof(&adoption.reload, receipt_nonce, true)?;
+    mark_locally_converged(remote.operation_id)?;
+    let next_token_fingerprint = auth::account_token_fingerprint(&adoption.target)
+        .context("remote-authority target has incomplete token material")?;
+    Ok(RotateNowReport {
+        operation_id: Some(remote.operation_id),
+        receipt_nonce,
+        reason: remote.reason,
+        previous_email,
+        previous_token_hash_prefix,
+        next_email: adoption.target.email.clone(),
+        next_token_hash_prefix: token_hash_prefix(&adoption.target.access_token),
+        next_token_fingerprint,
+        auth_path: auth_path.display().to_string(),
+        activation_state: adoption.activation_state,
+        runtime_converged: adoption.reload.verified_hot_swap(),
+        reload_attempted: adoption.reload_attempted,
+        topology_verified: adoption.reload.topology_verified,
+        request_count: adoption.reload.generated_request_nonces.len(),
+        sighup_sent_processes: adoption.reload.sighup_sent.len(),
+        signaled_processes: adoption.reload.signaled.len(),
+        restarted_processes: adoption.reload.restarted.len(),
+        skipped_processes: adoption.reload.skipped.len(),
+        acknowledged_request_nonces: adoption.reload.acknowledged_request_nonces.clone(),
+        used_banked_reset: remote.used_banked_reset,
+        banked_resets_remaining: remote.banked_resets_remaining,
+        reset_reason: remote.reset_reason,
+        authority_epoch: final_status.epoch,
+        authority_phase: final_status.phase,
+        authority_provider_account_id: final_status.desired_provider_account_id,
+        authority_detail: final_status.detail,
+        skipped: adoption.reload.skipped,
+    })
+}
+
 #[cfg(test)]
 fn rotate_now_with<F, R>(
     store_path: &Path,
@@ -1342,6 +1992,7 @@ where
             cooldown_seconds,
             reload_processes,
             allow_banked_reset: false,
+            operation_id: None,
             receipt_nonce: None,
         },
         RotateNowDependencies::new(
@@ -1362,7 +2013,70 @@ struct RotateNowContext<'a> {
     cooldown_seconds: i64,
     reload_processes: bool,
     allow_banked_reset: bool,
+    operation_id: Option<Uuid>,
     receipt_nonce: Option<Uuid>,
+}
+
+fn completed_rotation_operation_report(
+    store_path: &Path,
+    auth_path: &Path,
+    receipt_nonce: Option<Uuid>,
+    operation: &PoolRotationOperation,
+    authority: &pool_authority::PoolAuthorityRecord,
+) -> Result<RotateNowReport> {
+    if receipt_nonce.is_some() {
+        bail!("a VPS operation replay cannot satisfy a new local runtime receipt");
+    }
+    let accounts = load_accounts(store_path)?;
+    let active =
+        active_account(&accounts).context("completed rotation replay has no active account")?;
+    if active.account_id != authority.desired_provider_account_id
+        || !auth::auth_file_matches_account(auth_path, active)
+    {
+        bail!("completed rotation replay does not match the current VPS authority activation");
+    }
+    let used_banked_reset = operation
+        .used_banked_reset
+        .context("completed rotation operation is missing reset outcome")?;
+    let reset_reason = operation
+        .reset_reason
+        .as_deref()
+        .map(|reason| {
+            serde_json::from_value::<SmartResetReason>(Value::String(reason.to_string()))
+                .context("completed rotation operation has an unsupported reset reason")
+        })
+        .transpose()?;
+    let fingerprint = auth::account_token_fingerprint(active)
+        .context("completed rotation replay has incomplete token material")?;
+    Ok(RotateNowReport {
+        operation_id: Some(operation.operation_id),
+        receipt_nonce,
+        reason: operation.reason.clone(),
+        previous_email: active.email.clone(),
+        previous_token_hash_prefix: token_hash_prefix(&active.access_token),
+        next_email: active.email.clone(),
+        next_token_hash_prefix: token_hash_prefix(&active.access_token),
+        next_token_fingerprint: fingerprint,
+        auth_path: auth_path.display().to_string(),
+        activation_state: ActivationState::Confirmed,
+        runtime_converged: true,
+        reload_attempted: false,
+        topology_verified: true,
+        request_count: 0,
+        sighup_sent_processes: 0,
+        signaled_processes: 0,
+        restarted_processes: 0,
+        skipped_processes: 0,
+        acknowledged_request_nonces: Vec::new(),
+        used_banked_reset,
+        banked_resets_remaining: operation.banked_resets_remaining,
+        reset_reason,
+        authority_epoch: authority.epoch,
+        authority_phase: authority.phase,
+        authority_provider_account_id: authority.desired_provider_account_id.clone(),
+        authority_detail: authority.detail.clone(),
+        skipped: Vec::new(),
+    })
 }
 
 struct RotateNowDependencies<F, B, C, R> {
@@ -1428,6 +2142,7 @@ where
         cooldown_seconds,
         reload_processes,
         allow_banked_reset,
+        operation_id,
         receipt_nonce,
     } = context;
     let RotateNowDependencies {
@@ -1439,7 +2154,32 @@ where
     if receipt_nonce.is_some() && !reload_processes {
         bail!("receipt-bound rotation requires live runtime reload");
     }
+    parse_pool_authority_reason(reason).map_err(anyhow::Error::msg)?;
     let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    let initial_snapshot = load_account_store_snapshot(store_path)?;
+    let mut authority = PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, store_path)?;
+    authority.bootstrap_from_active(&initial_snapshot.accounts)?;
+    let operation_disposition = operation_id
+        .map(|operation_id| {
+            authority.begin_rotation_operation(
+                operation_id,
+                reason,
+                cooldown_seconds,
+                allow_banked_reset,
+            )
+        })
+        .transpose()?;
+    if let Some((RotationOperationDisposition::Replay, operation)) = operation_disposition.as_ref()
+    {
+        return completed_rotation_operation_report(
+            store_path,
+            auth_path,
+            receipt_nonce,
+            operation,
+            authority.require_record()?,
+        );
+    }
+    let mut prior_activation_confirmed = false;
     if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
         store_path,
@@ -1450,9 +2190,72 @@ where
         // This outcome belongs to an activation that predated the current
         // command. Offline mode may create FileOnly for the new request, but it
         // must never waive runtime convergence of an older barrier.
+        if !outcome.is_confirmed() {
+            let detail = outcome
+                .detail
+                .as_deref()
+                .unwrap_or("prior VPS activation remains unconfirmed");
+            authority.mark_degraded(detail)?;
+        }
         require_confirmed_activation(outcome)?;
+        prior_activation_confirmed = true;
         let store_lock = lock_account_store(store_path)?;
         let _ = load_after_barrier(&store_lock, &runtime_lease)?;
+    }
+    let authority_snapshot = load_account_store_snapshot(store_path)?;
+    let authority_record = authority.require_record()?.clone();
+    let authority_active_matches = active_account(&authority_snapshot.accounts)
+        .map(|account| account.account_id.as_str())
+        == Some(authority_record.desired_provider_account_id.as_str());
+    if authority_record.phase != PoolAuthorityPhase::Stable || !authority_active_matches {
+        if prior_activation_confirmed && authority_active_matches {
+            authority.mark_stable()?;
+        } else {
+            converge_existing_pool_authority_target(
+                &runtime_lease,
+                &mut authority,
+                store_path,
+                auth_path,
+                authority_snapshot,
+                reload_processes,
+                &reload_fn,
+            )?;
+        }
+    }
+    if matches!(
+        operation_disposition,
+        Some((RotationOperationDisposition::Recover, _))
+    ) && operation_id == Some(authority.require_record()?.request_id)
+        && active_account(&load_accounts(store_path)?).map(|account| account.account_id.clone())
+            == Some(
+                authority
+                    .require_record()?
+                    .desired_provider_account_id
+                    .clone(),
+            )
+        && matches!(
+            authority.require_record()?.phase,
+            PoolAuthorityPhase::Stable | PoolAuthorityPhase::Degraded
+        )
+    {
+        let target_provider_account_id = authority
+            .require_record()?
+            .desired_provider_account_id
+            .clone();
+        let operation = authority.complete_rotation_operation(
+            operation_id.context("recovering rotation lost its operation ID")?,
+            &target_provider_account_id,
+            false,
+            None,
+            None,
+        )?;
+        return completed_rotation_operation_report(
+            store_path,
+            auth_path,
+            receipt_nonce,
+            &operation,
+            authority.require_record()?,
+        );
     }
     let snapshot = preflight_provider_io_activation(store_path, auth_path)
         .context("rotate-now provider-I/O activation preflight failed")?;
@@ -1511,6 +2314,7 @@ where
                     candidate_observations: Some(&candidate_observations),
                     allow_reset: allow_banked_reset,
                     direct_runtime_usage_limit: true,
+                    operation_id,
                     refresh_strategy: ResetQuotaRefreshStrategy::Direct,
                     now: Utc::now(),
                 },
@@ -1589,7 +2393,23 @@ where
                     let next_token_fingerprint =
                         auth::account_token_fingerprint(&accounts[next_active_index])
                     .context("reset activation has incomplete token material")?;
+                    let banked_resets_remaining = accounts[next_active_index]
+                        .rate_limit_reset_bank
+                        .as_ref()
+                        .map(|bank| bank.available_count);
+                    let reset_reason = outcome.reason;
+                    if let Some(operation_id) = operation_id {
+                        authority.complete_rotation_operation(
+                            operation_id,
+                            &accounts[next_active_index].account_id,
+                            true,
+                            banked_resets_remaining,
+                            reset_reason.map(SmartResetReason::as_str),
+                        )?;
+                    }
+                    let authority_record = authority.require_record()?.clone();
                     return Ok(RotateNowReport {
+                        operation_id,
                         receipt_nonce,
                         reason: reason.to_string(),
                         previous_email: previous_email.clone(),
@@ -1613,11 +2433,13 @@ where
                             .acknowledged_request_nonces
                             .clone(),
                         used_banked_reset: true,
-                        banked_resets_remaining: accounts[next_active_index]
-                            .rate_limit_reset_bank
-                            .as_ref()
-                            .map(|bank| bank.available_count),
-                        reset_reason: outcome.reason,
+                        banked_resets_remaining,
+                        reset_reason,
+                        authority_epoch: authority_record.epoch,
+                        authority_phase: authority_record.phase,
+                        authority_provider_account_id: authority_record
+                            .desired_provider_account_id,
+                        authority_detail: authority_record.detail,
                         skipped: summary.skipped,
                     });
                 }
@@ -1671,6 +2493,16 @@ where
 
     validate_provider_io_activation(store_path, auth_path, &activation_guard)
         .context("rotate-now activation changed before rotation")?;
+    let request_id = operation_id.unwrap_or_else(Uuid::new_v4);
+    let expected_epoch = authority.require_record()?.epoch;
+    let (disposition, _) =
+        authority.begin_target_request(&target.account_id, request_id, expected_epoch, reason)?;
+    if !matches!(
+        disposition,
+        TargetRequestDisposition::Started | TargetRequestDisposition::Replay
+    ) {
+        bail!("rotate-now cross-target authority transition was not newly serialized");
+    }
     let activation = activate_with_unlocked_reload_under_runtime_lease(
         &runtime_lease,
         store_path,
@@ -1680,13 +2512,52 @@ where
         target.id,
         reload_processes,
         &reload_fn,
-    )?;
+    );
+    let activation = match activation {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let detail = format!("VPS rotate-now target activation failed: {error:#}");
+            authority.mark_degraded(&detail)?;
+            return Err(error).context("rotate-now pool authority remains degraded");
+        }
+    };
     let activation_state = activation.state;
-    let summary = require_rotation_activation(activation, reload_processes)?;
-    require_rotation_receipt_proof(&summary, receipt_nonce, reload_processes)?;
+    let summary = match require_rotation_activation(activation, reload_processes) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let detail = format!("VPS rotate-now runtime convergence failed: {error:#}");
+            authority.mark_degraded(&detail)?;
+            return Err(error).context("rotate-now pool authority remains degraded");
+        }
+    };
+    if let Err(error) = require_rotation_receipt_proof(&summary, receipt_nonce, reload_processes) {
+        let detail = format!("VPS rotate-now receipt convergence failed: {error:#}");
+        authority.mark_degraded(&detail)?;
+        return Err(error).context("rotate-now pool authority remains degraded");
+    }
+    if summary.verified_hot_swap() {
+        authority.mark_stable()?;
+    } else {
+        authority.mark_degraded("VPS rotate-now completed without live runtime convergence")?;
+    }
     let next_token_fingerprint = auth::account_token_fingerprint(&target)
         .context("rotation target has incomplete token material")?;
+    let banked_resets_remaining = accounts[active_index]
+        .rate_limit_reset_bank
+        .as_ref()
+        .map(|bank| bank.available_count);
+    if let Some(operation_id) = operation_id {
+        authority.complete_rotation_operation(
+            operation_id,
+            &target.account_id,
+            false,
+            banked_resets_remaining,
+            None,
+        )?;
+    }
+    let authority_record = authority.require_record()?.clone();
     Ok(RotateNowReport {
+        operation_id,
         receipt_nonce,
         reason: reason.to_string(),
         previous_email,
@@ -1706,11 +2577,12 @@ where
         skipped_processes: summary.skipped.len(),
         acknowledged_request_nonces: summary.acknowledged_request_nonces.clone(),
         used_banked_reset: false,
-        banked_resets_remaining: accounts[active_index]
-            .rate_limit_reset_bank
-            .as_ref()
-            .map(|bank| bank.available_count),
+        banked_resets_remaining,
         reset_reason: None,
+        authority_epoch: authority_record.epoch,
+        authority_phase: authority_record.phase,
+        authority_provider_account_id: authority_record.desired_provider_account_id,
+        authority_detail: authority_record.detail,
         skipped: summary.skipped,
     })
 }
@@ -2073,6 +2945,27 @@ mod tests {
             .with_topology_verified(true)
     }
 
+    fn remote_status(
+        epoch: u64,
+        phase: PoolAuthorityPhase,
+        provider_id: &str,
+        request_id: Uuid,
+    ) -> PoolAuthorityStatus {
+        PoolAuthorityStatus {
+            epoch,
+            phase,
+            desired_provider_account_id: provider_id.to_string(),
+            request_id,
+            reason: "manual_cli_swap".to_string(),
+            observed_at: Utc::now(),
+            updated_at: Utc::now(),
+            previous_provider_account_id: "previous-provider".to_string(),
+            detail: (phase == PoolAuthorityPhase::Degraded)
+                .then(|| "VPS runtime health is degraded".to_string()),
+            rotation_operations: Vec::new(),
+        }
+    }
+
     fn confirm_provider_io_activation(store_path: &Path, auth_path: &Path) -> Result<()> {
         let accounts = load_accounts(store_path)?;
         let active = active_account(&accounts)
@@ -2081,6 +2974,170 @@ mod tests {
         swap_with_reload(store_path, auth_path, &active.email, |_| {
             Ok(verified_reload_summary())
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_remote_target_transport_has_zero_local_store_auth_or_reload_effects() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let target = account("target@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, target.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let store_before = fs::read(&store_path)?;
+        let auth_before = fs::read(&auth_path)?;
+        let activation_path = activation::activation_record_path(&store_path);
+        let activation_before = fs::read(&activation_path)?;
+        let reload_count = Arc::new(Mutex::new(0usize));
+        let observed_reloads = Arc::clone(&reload_count);
+
+        let error = request_pool_target_via_remote_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            Uuid::new_v4(),
+            1,
+            "manual_cli_swap",
+            |_provider_id, _request_id, _expected_epoch, _reason| {
+                bail!("simulated remote transport failure")
+            },
+            || bail!("status fetch must not run after failed target request"),
+            &move |_path| {
+                *observed_reloads.lock().unwrap() += 1;
+                Ok(verified_reload_summary())
+            },
+        )
+        .expect_err("failed remote transport must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("simulated remote transport failure"));
+        assert_eq!(fs::read(&store_path)?, store_before);
+        assert_eq!(fs::read(&auth_path)?, auth_before);
+        assert_eq!(fs::read(&activation_path)?, activation_before);
+        assert_eq!(*reload_count.lock().unwrap(), 0);
+        assert!(!pool_authority::pool_authority_path(&store_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_degraded_remote_target_is_adopted_without_local_authority() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let target = account("target@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, target.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let request_id = Uuid::new_v4();
+        let degraded = remote_status(
+            2,
+            PoolAuthorityPhase::Degraded,
+            &target.account_id,
+            request_id,
+        );
+
+        let final_status = request_pool_target_via_remote_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            request_id,
+            1,
+            "manual_cli_swap",
+            {
+                let degraded = degraded.clone();
+                move |_provider_id, _request_id, _expected_epoch, _reason| Ok(degraded.clone())
+            },
+            {
+                let degraded = degraded.clone();
+                move || Ok(degraded.clone())
+            },
+            &|_path| Ok(verified_reload_summary()),
+        )?;
+
+        assert_eq!(final_status.phase, PoolAuthorityPhase::Degraded);
+        assert_eq!(
+            final_status.detail.as_deref(),
+            Some("VPS runtime health is degraded")
+        );
+        assert_eq!(
+            active_account(&load_accounts(&store_path)?).map(|account| account.account_id.clone()),
+            Some(target.account_id.clone())
+        );
+        assert!(auth::auth_file_matches_account(&auth_path, &target));
+        assert!(!pool_authority::pool_authority_path(&store_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_adoption_revalidation_converges_b_to_newer_c_before_success() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let target_b = account("target-b@example.com", false, 10.0, 10.0);
+        let target_c = account("target-c@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, target_b.clone(), target_c.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let request_id = Uuid::new_v4();
+        let status_b = remote_status(
+            2,
+            PoolAuthorityPhase::Stable,
+            &target_b.account_id,
+            request_id,
+        );
+        let status_c = remote_status(
+            3,
+            PoolAuthorityPhase::Stable,
+            &target_c.account_id,
+            Uuid::new_v4(),
+        );
+        let statuses = Arc::new(Mutex::new(
+            vec![status_c.clone(), status_c.clone()].into_iter(),
+        ));
+        let observed_statuses = Arc::clone(&statuses);
+        let adopted = Arc::new(Mutex::new(Vec::new()));
+        let observed_adoptions = Arc::clone(&adopted);
+        let reload_store = store_path.clone();
+
+        let final_status = request_pool_target_via_remote_with(
+            &store_path,
+            &auth_path,
+            &target_b.account_id,
+            request_id,
+            1,
+            "manual_cli_swap",
+            move |_provider_id, _request_id, _expected_epoch, _reason| Ok(status_b.clone()),
+            move || {
+                observed_statuses
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .context("test status sequence was exhausted")
+            },
+            &move |_path| {
+                let active_provider = active_account(&load_accounts(&reload_store)?)
+                    .context("reload observation has no active account")?
+                    .account_id
+                    .clone();
+                observed_adoptions.lock().unwrap().push(active_provider);
+                Ok(verified_reload_summary())
+            },
+        )?;
+
+        assert_eq!(final_status.epoch, 3);
+        assert_eq!(
+            final_status.desired_provider_account_id,
+            target_c.account_id
+        );
+        assert_eq!(
+            *adopted.lock().unwrap(),
+            vec![target_b.account_id.clone(), target_c.account_id.clone()]
+        );
+        assert!(auth::auth_file_matches_account(&auth_path, &target_c));
+        assert!(!pool_authority::pool_authority_path(&store_path).exists());
         Ok(())
     }
 
@@ -2679,6 +3736,108 @@ mod tests {
     }
 
     #[test]
+    fn pool_target_request_replay_keeps_epoch_and_skips_second_reload() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let target = account("target@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active.clone(), target.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let reload_count = Arc::new(Mutex::new(0usize));
+        let request_id = Uuid::parse_str("37f84870-9b39-45ae-aee9-3e0a63e1f989")?;
+
+        let first = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            request_id,
+            1,
+            "swift_manual_selection",
+            &{
+                let reload_count = Arc::clone(&reload_count);
+                move |_| {
+                    *reload_count.lock().unwrap() += 1;
+                    Ok(verified_reload_summary())
+                }
+            },
+        )?;
+        let replay = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            request_id,
+            1,
+            "swift_manual_selection",
+            &{
+                let reload_count = Arc::clone(&reload_count);
+                move |_| {
+                    *reload_count.lock().unwrap() += 1;
+                    Ok(verified_reload_summary())
+                }
+            },
+        )?;
+
+        assert_eq!(first.epoch, 2);
+        assert_eq!(first.phase, PoolAuthorityPhase::Stable);
+        assert_eq!(replay.epoch, first.epoch);
+        assert_eq!(replay.request_id, request_id);
+        assert_eq!(*reload_count.lock().unwrap(), 1);
+        assert_eq!(
+            active_account(&load_accounts(&store_path)?).map(|account| account.account_id.clone()),
+            Some(target.account_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_pool_target_epoch_fails_before_store_auth_or_reload_io() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let target = account("target@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active.clone(), target.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let snapshot = load_account_store_snapshot(&store_path)?;
+        let mut authority =
+            PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, &store_path)?;
+        authority.bootstrap_from_active(&snapshot.accounts)?;
+        drop(authority);
+        drop(runtime_lease);
+        let store_before = fs::read(&store_path)?;
+        let auth_before = fs::read(&auth_path)?;
+        let reload_count = Arc::new(Mutex::new(0usize));
+
+        let error = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            Uuid::new_v4(),
+            0,
+            "stale_swift_request",
+            &{
+                let reload_count = Arc::clone(&reload_count);
+                move |_| {
+                    *reload_count.lock().unwrap() += 1;
+                    Ok(verified_reload_summary())
+                }
+            },
+        )
+        .expect_err("stale authority request must fail closed");
+
+        assert!(error.to_string().contains("stale pool-authority epoch"));
+        assert_eq!(*reload_count.lock().unwrap(), 0);
+        assert_eq!(fs::read(&store_path)?, store_before);
+        assert_eq!(fs::read(&auth_path)?, auth_before);
+        let status = observe_pool_authority_status(&store_path)?.unwrap();
+        assert_eq!(status.epoch, 1);
+        assert_eq!(status.desired_provider_account_id, active.account_id);
+        Ok(())
+    }
+
+    #[test]
     fn import_production_path_runs_runtime_reload_without_store_lock() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
@@ -2735,6 +3894,7 @@ mod tests {
                 cooldown_seconds: 18_000,
                 reload_processes: true,
                 allow_banked_reset: false,
+                operation_id: None,
                 receipt_nonce: Some(receipt_nonce),
             },
             RotateNowDependencies::new(
@@ -2785,6 +3945,7 @@ mod tests {
                 cooldown_seconds: 18_000,
                 reload_processes: false,
                 allow_banked_reset: false,
+                operation_id: None,
                 receipt_nonce: Some(Uuid::new_v4()),
             },
             RotateNowDependencies::new(
@@ -2849,6 +4010,58 @@ mod tests {
                 json: true,
             } if account == "pro@example.com"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn pool_authority_cli_contract_uses_stable_names_and_canonical_request_ids() -> Result<()> {
+        let status = Args::try_parse_from(["codexswitch-cli", "pool-authority-status", "--json"])?;
+        assert!(matches!(
+            status.command,
+            Command::PoolAuthorityStatus { json: true }
+        ));
+
+        let request_id = "37f84870-9b39-45ae-aee9-3e0a63e1f989";
+        let request = Args::try_parse_from([
+            "codexswitch-cli",
+            "request-pool-target",
+            "provider-account-id",
+            "--request-id",
+            request_id,
+            "--expected-epoch",
+            "41",
+            "--reason",
+            "swift_manual_selection",
+            "--json",
+        ])?;
+        assert!(matches!(
+            request.command,
+            Command::RequestPoolTarget {
+                account,
+                request_id: parsed_request_id,
+                expected_epoch: 41,
+                reason,
+                json: true,
+            } if account == "provider-account-id"
+                && parsed_request_id.hyphenated().to_string() == request_id
+                && reason == "swift_manual_selection"
+        ));
+
+        assert!(Args::try_parse_from([
+            "codexswitch-cli",
+            "request-pool-target",
+            "provider-account-id",
+            "--request-id",
+            "37F84870-9B39-45AE-AEE9-3E0A63E1F989",
+            "--expected-epoch",
+            "41",
+            "--reason",
+            "swift_manual_selection",
+            "--json",
+        ])
+        .is_err());
+        assert!(parse_pool_authority_selector(&"x".repeat(257)).is_err());
+        assert!(parse_pool_authority_reason("line one\nline two").is_err());
         Ok(())
     }
 
@@ -2959,7 +4172,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_bundle_merge_preserves_host_active_provider_identity() -> Result<()> {
+    fn credential_bundle_merge_preserves_authority_provider_identity() -> Result<()> {
         let current_active = account("vps-active@example.com", true, 10.0, 10.0);
         let current_inactive = account("mac-active@example.com", false, 10.0, 10.0);
         let mut incoming_vps = current_active.clone();
@@ -2968,9 +4181,9 @@ mod tests {
         let mut incoming_mac = current_inactive.clone();
         incoming_mac.is_active = true;
 
-        let merged = preserve_host_active_account(
+        let merged = preserve_authority_active_account(
             vec![incoming_mac, incoming_vps],
-            &[current_active.clone(), current_inactive],
+            &current_active.account_id,
         )?;
 
         let active = active_account(&merged).context("merged host lost its active account")?;
@@ -2980,20 +4193,17 @@ mod tests {
     }
 
     #[test]
-    fn credential_bundle_merge_retains_remote_only_active_account() -> Result<()> {
+    fn credential_bundle_merge_rejects_missing_authority_target() -> Result<()> {
         let current_active = account("vps-only@example.com", true, 10.0, 10.0);
         let incoming_active = account("mac-only@example.com", true, 10.0, 10.0);
 
-        let merged = preserve_host_active_account(
-            vec![incoming_active],
-            std::slice::from_ref(&current_active),
-        )?;
+        let error =
+            preserve_authority_active_account(vec![incoming_active], &current_active.account_id)
+                .expect_err("missing authority target must fail before credential mutation");
 
-        assert_eq!(merged.len(), 2);
-        assert_eq!(
-            active_account(&merged).map(|account| account.account_id.as_str()),
-            Some(current_active.account_id.as_str())
-        );
+        assert!(error
+            .to_string()
+            .contains("does not contain pool-authority target"));
         Ok(())
     }
 
@@ -3154,7 +4364,7 @@ mod tests {
 
     #[test]
     fn rotate_now_defaults_to_rotation_without_consuming_banked_reset() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 20.0, 100.0);
@@ -3173,6 +4383,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: false,
+                operation_id: None,
                 receipt_nonce: None,
             },
             RotateNowDependencies::new(
@@ -3209,7 +4420,7 @@ mod tests {
 
     #[test]
     fn rotate_now_reconciles_activation_barrier_before_reset_policy() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let first = account("first@example.com", true, 10.0, 10.0);
@@ -3248,6 +4459,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: true,
+                operation_id: None,
                 receipt_nonce: None,
             },
             RotateNowDependencies::new(
@@ -3284,7 +4496,7 @@ mod tests {
 
     #[test]
     fn rotate_now_offline_rejects_prior_file_only_barrier_before_policy() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 10.0, 10.0);
@@ -3327,6 +4539,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: false,
                 allow_banked_reset: true,
+                operation_id: None,
                 receipt_nonce: None,
             },
             RotateNowDependencies::new(
@@ -3399,6 +4612,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: true,
+                operation_id: None,
                 receipt_nonce: None,
             },
             RotateNowDependencies::new(
@@ -3453,7 +4667,7 @@ mod tests {
 
     #[test]
     fn rotate_now_repairs_legacy_barrier_then_selects_fresh_target() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 100.0, 100.0);
@@ -3480,10 +4694,7 @@ mod tests {
             detail: Some(activation::LEGACY_DEGRADED_TOKEN_MISMATCH.to_string()),
             updated_at: Utc::now(),
         };
-        fs::write(
-            activation::activation_record_path(&store_path),
-            serde_json::to_vec_pretty(&record)?,
-        )?;
+        overwrite_test_activation_record(&store_path, &record)?;
         drop(store_lock);
 
         let observed_fingerprints = Arc::new(Mutex::new(Vec::new()));
@@ -3500,6 +4711,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: false,
+                operation_id: None,
                 receipt_nonce: None,
             },
             RotateNowDependencies::new(
@@ -3552,7 +4764,7 @@ mod tests {
 
     #[test]
     fn rotate_now_no_candidate_advances_matching_confirmed_generation() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 10.0, 10.0);
@@ -3597,7 +4809,7 @@ mod tests {
 
     #[test]
     fn rotate_now_no_candidate_fails_closed_without_matching_confirmation() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 10.0, 10.0);
@@ -3629,7 +4841,7 @@ mod tests {
 
     #[test]
     fn rotate_now_offline_file_only_is_explicit_and_never_runtime_confirmed() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 100.0, 100.0);
@@ -3666,7 +4878,7 @@ mod tests {
 
     #[test]
     fn rotate_now_banked_reset_opt_in_consumes_and_keeps_active() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 20.0, 100.0);
@@ -3693,6 +4905,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: true,
+                operation_id: None,
                 receipt_nonce: None,
             },
             RotateNowDependencies::new(
@@ -3787,7 +5000,7 @@ mod tests {
 
     #[test]
     fn rotate_now_reload_failure_leaves_recoverable_barrier_without_second_reset() -> Result<()> {
-        let temp = TempDir::new()?;
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 20.0, 100.0);
@@ -3807,6 +5020,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: true,
+                operation_id: None,
                 receipt_nonce: None,
             },
             RotateNowDependencies::new(
@@ -4501,6 +5715,7 @@ mod tests {
                 cooldown_seconds: 21_600,
                 reload_processes: true,
                 allow_banked_reset: true,
+                operation_id: None,
                 receipt_nonce: None,
             },
             RotateNowDependencies::new(

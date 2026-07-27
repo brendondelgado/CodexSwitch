@@ -24,6 +24,20 @@ enum VPSRuntimeAccountPresentation: Equatable, Sendable {
     case disconnected
 }
 
+enum AccountHostConvergenceState: Equatable, Sendable {
+    case converged
+    case pending
+    case degraded
+    case unknown
+    case unavailable
+    case notConfigured
+}
+
+struct AccountHostConvergencePresentation: Equatable, Sendable {
+    let mac: AccountHostConvergenceState
+    let vps: AccountHostConvergenceState
+}
+
 @MainActor @Observable
 final class AccountManager {
     var accounts: [CodexAccount] = []
@@ -37,6 +51,8 @@ final class AccountManager {
     var activationState: AccountActivationState?
     var activationNotice: String?
     var uiRefreshRevision: Int = 0
+    private(set) var poolAuthorityObservation: PoolAuthorityObservation?
+    private(set) var remoteAuthorityEndpointConfigured = false
 
     private let userDefaults: UserDefaults
     init(userDefaults: UserDefaults = .standard) {
@@ -45,6 +61,45 @@ final class AccountManager {
 
     var configuredAccount: CodexAccount? {
         accounts.first(where: \.isActive)
+    }
+
+    var poolTargetAccount: CodexAccount? {
+        if let providerAccountId = poolAuthorityObservation?
+            .desiredProviderAccountId {
+            let matches = accounts.filter {
+                $0.normalizedProviderAccountId == providerAccountId
+            }
+            return matches.count == 1 ? matches[0] : nil
+        }
+        return remoteAuthorityEndpointConfigured ? nil : configuredAccount
+    }
+
+    func isPoolTarget(_ account: CodexAccount) -> Bool {
+        poolTargetAccount?.id == account.id
+    }
+
+    func publishPoolAuthorityObservation(
+        _ observation: PoolAuthorityObservation
+    ) {
+        guard poolAuthorityObservation.map({
+            observation.epoch >= $0.epoch
+        }) ?? true else {
+            return
+        }
+        remoteAuthorityEndpointConfigured = true
+        poolAuthorityObservation = observation
+        uiRefreshRevision &+= 1
+    }
+
+    func publishRemoteAuthorityEndpointConfigured(_ configured: Bool) {
+        guard remoteAuthorityEndpointConfigured != configured else { return }
+        remoteAuthorityEndpointConfigured = configured
+        uiRefreshRevision &+= 1
+    }
+
+    func clearPoolAuthorityObservation() {
+        poolAuthorityObservation = nil
+        uiRefreshRevision &+= 1
     }
 
     var runtimeCurrentAccount: CodexAccount? {
@@ -99,6 +154,86 @@ final class AccountManager {
             : .notCurrent
     }
 
+    func hostConvergencePresentation(
+        forPoolTarget account: CodexAccount,
+        now: Date = Date()
+    ) -> AccountHostConvergencePresentation {
+        guard isPoolTarget(account) else {
+            return AccountHostConvergencePresentation(mac: .unknown, vps: .unknown)
+        }
+
+        let mac: AccountHostConvergenceState
+        if activationState?.runtimeIsCurrent(for: account.id, at: now) == true {
+            mac = .converged
+        } else if let activationState {
+            if activationState.configuredAccountId != nil,
+               activationState.configuredAccountId != account.id {
+                mac = .degraded
+            } else {
+                switch activationState.phase {
+                case .preparing:
+                    mac = .pending
+                case .committedDegraded, .manualReview, .confirmed:
+                    mac = .degraded
+                }
+            }
+        } else {
+            mac = .pending
+        }
+
+        let vps: AccountHostConvergenceState
+        if let authority = poolAuthorityObservation,
+           authority.desiredProviderAccountId
+            == account.normalizedProviderAccountId {
+            switch linuxDevboxStatus.state {
+            case .ready where authority.isFresh(at: now):
+                let readyProvider = Self.boundedRemoteProviderAccountId(
+                    linuxDevboxStatus.activeProviderAccountId
+                )
+                if readyProvider == authority.desiredProviderAccountId {
+                    switch authority.phase {
+                    case .stable:
+                        vps = .converged
+                    case .converging:
+                        vps = .pending
+                    case .degraded:
+                        vps = .degraded
+                    }
+                } else if readyProvider == nil {
+                    vps = .unknown
+                } else {
+                    vps = .degraded
+                }
+            case .notReady, .failed, .stale:
+                vps = .unavailable
+            case .ready, .checking, .notConfigured:
+                vps = .unknown
+            }
+        } else {
+            switch linuxDevboxStatus.state {
+            case .notConfigured:
+                vps = .notConfigured
+            case .checking:
+                vps = .pending
+            case .notReady, .failed, .stale:
+                vps = .unavailable
+            case .ready:
+                switch vpsRuntimePresentation(for: account, now: now) {
+                case .current:
+                    vps = .converged
+                case .notCurrent:
+                    vps = .degraded
+                case .unknown:
+                    vps = .unknown
+                case .disconnected:
+                    vps = .unavailable
+                }
+            }
+        }
+
+        return AccountHostConvergencePresentation(mac: mac, vps: vps)
+    }
+
     private static func boundedRemoteProviderAccountId(_ value: String?) -> String? {
         guard let value,
               !value.isEmpty,
@@ -139,6 +274,9 @@ final class AccountManager {
     var sortedAccounts: [CodexAccount] {
         let now = Date()
         return accounts.sorted { a, b in
+            let aIsPoolTarget = isPoolTarget(a)
+            let bIsPoolTarget = isPoolTarget(b)
+            if aIsPoolTarget != bIsPoolTarget { return aIsPoolTarget }
             if a.isActive != b.isActive { return a.isActive }
             let aImmediatelyUsable = SwapEngine.isImmediatelyUsable(a, now: now)
             let bImmediatelyUsable = SwapEngine.isImmediatelyUsable(b, now: now)

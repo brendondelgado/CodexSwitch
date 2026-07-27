@@ -238,7 +238,7 @@ enum AccountCredentialMutationRuntimePolicy {
     ) -> Bool {
         switch route {
         case .swap:
-            return reason != .manual
+            return reason != .manual && reason != .poolAuthority
         case .tokenRefresh, .activeReauthentication, .planUpgrade:
             return true
         case .firstActivation, .externalAuthObservation:

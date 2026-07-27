@@ -78,6 +78,49 @@ struct PopoverContentView: View {
             && state.detail?.allowsManualSameTargetRetry == true
     }
 
+    static func macConvergenceLabel(for state: AccountHostConvergenceState) -> String {
+        hostConvergenceLabel(host: "Mac", state: state)
+    }
+
+    static func vpsConvergenceLabel(for state: AccountHostConvergenceState) -> String {
+        hostConvergenceLabel(host: "VPS", state: state)
+    }
+
+    private static func hostConvergenceLabel(
+        host: String,
+        state: AccountHostConvergenceState
+    ) -> String {
+        switch state {
+        case .converged:
+            return "\(host) converged"
+        case .pending:
+            return "\(host) convergence pending"
+        case .degraded:
+            return "\(host) convergence degraded"
+        case .unknown:
+            return "\(host) convergence unknown"
+        case .unavailable:
+            return "\(host) unavailable"
+        case .notConfigured:
+            return "\(host) not configured"
+        }
+    }
+
+    private static func hostConvergenceColor(
+        for state: AccountHostConvergenceState
+    ) -> Color {
+        switch state {
+        case .converged:
+            return .green
+        case .pending:
+            return .blue
+        case .degraded, .unavailable:
+            return .orange
+        case .unknown, .notConfigured:
+            return .secondary
+        }
+    }
+
     /// Find the non-active account whose weekly resets soonest (for "Next Available" fallback)
     static func nextWeeklyResetAccount(
         from accounts: [CodexAccount],
@@ -137,8 +180,8 @@ struct PopoverContentView: View {
                 Text("CodexSwitch")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                if let configured = manager.configuredAccount {
-                    Text("Mac configured: \(configured.email)")
+                if let configured = manager.poolTargetAccount {
+                    Text("Pool target: \(configured.email)")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -206,9 +249,7 @@ struct PopoverContentView: View {
                             ForEach(manager.sortedAccounts) { account in
                                 AccountCardView(
                                     account: account,
-                                    isConfigured: manager.configuredAccount?.id == account.id,
-                                    isRuntimeCurrent: manager.runtimeCurrentAccount?.id == account.id,
-                                    vpsRuntimePresentation: manager.vpsRuntimePresentation(for: account),
+                                    isConfigured: manager.isPoolTarget(account),
                                     pollingError: manager.pollingErrors[account.id],
                                     rateLimitResetPresentation: manager.rateLimitResetPresentations[account.id],
                                     rateLimitResetCoordinatorAuthorization:
@@ -243,38 +284,43 @@ struct PopoverContentView: View {
                     }
 
                     // Current account + CLI status + Next up
-                    if let active = manager.configuredAccount {
+                    if let active = manager.poolTargetAccount {
                         let cliStatus = CLIStatusChecker.cachedCLIStatus
                         let desktopStatus = CLIStatusChecker.cachedDesktopStatus
                         let runtimeCurrent = manager.runtimeCurrentAccount?.id == active.id
-                        let vpsRuntime = manager.vpsRuntimePresentation(for: active)
-                        let ownership = AccountCardView.hostOwnershipLabels(
-                            isConfigured: true,
-                            isRuntimeCurrent: runtimeCurrent,
-                            vpsRuntimePresentation: vpsRuntime
+                        let convergence = manager.hostConvergencePresentation(
+                            forPoolTarget: active
                         )
                         Divider()
 
-                        // Current account
+                        // One authority target, with host convergence shown globally.
                         HStack(spacing: 6) {
-                            Image(systemName: "person.circle.fill")
-                                .foregroundStyle(runtimeCurrent ? .green : .orange)
+                            Image(systemName: "scope")
+                                .foregroundStyle(.green)
                                 .font(.system(size: 11))
                             VStack(alignment: .leading, spacing: 1) {
+                                Text("Pool Target")
+                                    .font(.system(size: 8.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
                                 Text(active.email)
                                     .font(.system(size: 10, weight: .semibold))
                                     .lineLimit(1)
                                     .truncationMode(.middle)
-                                Text(ownership.macConfigured)
-                                    .foregroundStyle(.orange)
-                                Text(ownership.macRuntime)
-                                    .foregroundStyle(runtimeCurrent ? .green : .secondary)
-                                Text(ownership.vpsRuntime)
-                                    .foregroundStyle(
-                                        vpsRuntime == .current
-                                            ? .blue
-                                            : .secondary
-                                    )
+                                Label(
+                                    Self.macConvergenceLabel(for: convergence.mac),
+                                    systemImage: "laptopcomputer"
+                                )
+                                .foregroundStyle(
+                                    Self.hostConvergenceColor(for: convergence.mac)
+                                )
+                                Label(
+                                    Self.vpsConvergenceLabel(for: convergence.vps),
+                                    systemImage: "server.rack"
+                                )
+                                .foregroundStyle(
+                                    Self.hostConvergenceColor(for: convergence.vps)
+                                )
+                                .help(manager.linuxDevboxStatus.summary)
                             }
                             .font(.system(size: 8.5, weight: .medium))
                             Spacer()
@@ -337,8 +383,8 @@ struct PopoverContentView: View {
                                             .font(.system(size: 9, weight: .semibold))
                                     }
                                     .buttonStyle(.plain)
-                                    .help("Retry Mac runtime activation")
-                                    .accessibilityLabel("Retry Mac runtime activation")
+                                    .help("Retry pool target convergence")
+                                    .accessibilityLabel("Retry pool target convergence")
                                 }
                                 Spacer(minLength: 0)
                             }
@@ -371,24 +417,6 @@ struct PopoverContentView: View {
                                 .padding(.horizontal, 12)
                                 .padding(.leading, 34)
                                 .padding(.bottom, 1)
-                        }
-
-                        let linuxStatus = manager.linuxDevboxStatus
-                        if linuxStatus.isVisible {
-                            HStack(spacing: 4) {
-                                Image(systemName: linuxStatus.icon)
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(linuxStatus.isHealthy ? .green : .orange)
-                                Text(linuxStatus.label)
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundStyle(linuxStatus.isHealthy ? .green : .orange)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                Spacer(minLength: 0)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.leading, 17)
-                            .padding(.bottom, 1)
                         }
 
                         // Desktop app connection status (read from cache)

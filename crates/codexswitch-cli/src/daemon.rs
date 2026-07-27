@@ -22,6 +22,7 @@ use crate::auth::auth_file_matches_account;
 #[cfg(test)]
 use crate::auth::write_auth_file;
 use crate::codex_update;
+use crate::pool_authority::{PoolAuthorityLock, PoolAuthorityPhase, TargetRequestDisposition};
 use crate::quota::{apply_fetch_result, fetch_quota, FetchResult};
 use crate::rate_limit_resets::{
     fetch_rate_limit_reset_bank, orchestrate_pool_reset_with_selection_and_provider_guard,
@@ -273,6 +274,10 @@ where
         reload: reload_fn,
     } = dependencies;
     let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    let bootstrap_snapshot = load_store_snapshot(store_path)?;
+    let mut authority = PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, store_path)?;
+    authority.bootstrap_from_active(&bootstrap_snapshot.accounts)?;
+    let mut prior_activation_confirmed = false;
     if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
         store_path,
@@ -281,6 +286,11 @@ where
         &reload_fn,
     )? {
         if let Some(tick) = pending_activation_tick(&outcome, base_interval) {
+            let detail = outcome
+                .detail
+                .as_deref()
+                .unwrap_or("VPS daemon runtime convergence is pending");
+            authority.mark_degraded(detail)?;
             if outcome.state == ActivationState::CommittedDegraded {
                 if let Err(error) = refresh_quota_observations_during_activation_barrier(
                     store_path,
@@ -293,7 +303,34 @@ where
             }
             return Ok(tick);
         }
-        require_confirmed_activation(outcome)?;
+        if let Err(error) = require_confirmed_activation(outcome) {
+            let detail = format!("prior VPS daemon activation was not confirmed: {error:#}");
+            authority.mark_degraded(&detail)?;
+            return Err(error).context("daemon pool authority remains degraded");
+        }
+        prior_activation_confirmed = true;
+    }
+    let authority_snapshot = load_store_snapshot(store_path)?;
+    let mut authority_record = authority.require_record()?.clone();
+    let authority_active_matches = active_account(&authority_snapshot.accounts)
+        .map(|account| account.account_id.as_str())
+        == Some(authority_record.desired_provider_account_id.as_str());
+    if prior_activation_confirmed
+        && authority_active_matches
+        && authority_record.phase != PoolAuthorityPhase::Stable
+    {
+        authority_record = authority.mark_stable()?;
+    }
+    if authority_record.phase != PoolAuthorityPhase::Stable || !authority_active_matches {
+        return recover_pool_authority_target(
+            &runtime_lease,
+            &mut authority,
+            store_path,
+            auth_path,
+            authority_snapshot,
+            base_interval,
+            &reload_fn,
+        );
     }
     let snapshot = preflight_provider_io_activation(store_path, auth_path)
         .context("daemon provider-I/O activation preflight failed")?;
@@ -447,6 +484,7 @@ where
                     candidate_observations: candidate_observations.as_ref(),
                     allow_reset: consume_banked_resets,
                     direct_runtime_usage_limit,
+                    operation_id: None,
                     refresh_strategy: ResetQuotaRefreshStrategy::RefreshExpiredToken,
                     now: Utc::now(),
                 },
@@ -470,6 +508,24 @@ where
                     },
                     |accounts: &mut [CodexAccount], reset_account_index: usize| {
                         let target_id = accounts[reset_account_index].id;
+                        let target_provider_account_id =
+                            accounts[reset_account_index].account_id.clone();
+                        let current = authority.require_record()?.clone();
+                        if target_provider_account_id == current.desired_provider_account_id {
+                            authority.mark_converging(Some(
+                                "VPS banked-reset runtime convergence is pending",
+                            ))?;
+                        } else {
+                            let (disposition, _) = authority.begin_target_request(
+                                &target_provider_account_id,
+                                Uuid::new_v4(),
+                                current.epoch,
+                                "daemon_banked_reset",
+                            )?;
+                            if !matches!(disposition, TargetRequestDisposition::Started) {
+                                bail!("daemon reset authority transition was not newly serialized");
+                            }
+                        }
                         activate_with_under_runtime_lease(
                             &runtime_lease,
                             ActivationContext {
@@ -512,9 +568,20 @@ where
                     let refreshed = load_store_snapshot(store_path)?;
                     accounts = refreshed.accounts;
                     if let Some(tick) = pending_activation_tick(&activation, base_interval) {
+                        let detail = activation
+                            .detail
+                            .as_deref()
+                            .unwrap_or("VPS banked-reset runtime convergence is pending");
+                        authority.mark_degraded(detail)?;
                         return Ok(tick);
                     }
-                    require_confirmed_activation(activation)?;
+                    if let Err(error) = require_confirmed_activation(activation) {
+                        let detail =
+                            format!("VPS banked-reset convergence was not confirmed: {error:#}");
+                        authority.mark_degraded(&detail)?;
+                        return Err(error).context("daemon pool authority remains degraded");
+                    }
+                    authority.mark_stable()?;
                     println!(
                         "reconciled banked reset for {} ({}); {} reset(s) remain",
                         accounts[reset_account_index].email,
@@ -544,10 +611,20 @@ where
                 ),
                 None => {}
             },
-            Err(error) => eprintln!(
-                "warning: reset reconciliation failed for {}; continuing with normal rotation: {error:#}",
-                accounts[active_index].email
-            ),
+            Err(error) => {
+                let authority_transition_started = authority
+                    .record()
+                    .is_some_and(|record| record.phase != PoolAuthorityPhase::Stable);
+                if authority_transition_started {
+                    let detail = format!("VPS banked-reset reconciliation failed: {error:#}");
+                    authority.mark_degraded(&detail)?;
+                    return Err(error).context("daemon pool authority remains degraded");
+                }
+                eprintln!(
+                    "warning: reset reconciliation failed for {}; continuing with normal rotation: {error:#}",
+                    accounts[active_index].email
+                );
+            }
         }
     }
 
@@ -589,11 +666,30 @@ where
                     target_id,
                     true,
                     &reload_fn,
-                )?;
+                );
+                let activation = match activation {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let detail =
+                            format!("VPS daemon same-target convergence failed: {error:#}");
+                        authority.mark_degraded(&detail)?;
+                        return Err(error).context("daemon pool authority remains degraded");
+                    }
+                };
                 if let Some(tick) = pending_activation_tick(&activation, base_interval) {
+                    let detail = activation
+                        .detail
+                        .as_deref()
+                        .unwrap_or("VPS daemon same-target runtime convergence is pending");
+                    authority.mark_degraded(detail)?;
                     return Ok(tick);
                 }
-                require_confirmed_activation(activation)?;
+                if let Err(error) = require_confirmed_activation(activation) {
+                    let detail =
+                        format!("VPS daemon same-target convergence was not confirmed: {error:#}");
+                    authority.mark_degraded(&detail)?;
+                    return Err(error).context("daemon pool authority remains degraded");
+                }
             } else {
                 commit_daemon_accounts(
                     &runtime_lease,
@@ -655,6 +751,22 @@ where
 
     validate_provider_io_activation(store_path, auth_path, &activation_guard)
         .context("daemon activation changed before rotation")?;
+    let authority_reason = if plan_upgrade_target.is_some() {
+        "daemon_plan_upgrade"
+    } else {
+        "daemon_quota_rotation"
+    };
+    let request_id = Uuid::new_v4();
+    let expected_epoch = authority.require_record()?.epoch;
+    let (disposition, _) = authority.begin_target_request(
+        &target.account_id,
+        request_id,
+        expected_epoch,
+        authority_reason,
+    )?;
+    if !matches!(disposition, TargetRequestDisposition::Started) {
+        bail!("daemon cross-target authority transition was not newly serialized");
+    }
     let activation = activate_with_unlocked_reload_under_runtime_lease(
         &runtime_lease,
         store_path,
@@ -664,11 +776,32 @@ where
         target.id,
         true,
         &reload_fn,
-    )?;
+    );
+    let activation = match activation {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let detail = format!("VPS daemon target activation failed: {error:#}");
+            authority.mark_degraded(&detail)?;
+            return Err(error).context("daemon pool authority remains degraded");
+        }
+    };
     if let Some(tick) = pending_activation_tick(&activation, base_interval) {
+        let detail = activation
+            .detail
+            .as_deref()
+            .unwrap_or("VPS daemon runtime convergence is pending");
+        authority.mark_degraded(detail)?;
         return Ok(tick);
     }
-    let summary = require_confirmed_activation(activation)?;
+    let summary = match require_confirmed_activation(activation) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let detail = format!("VPS daemon target convergence was not confirmed: {error:#}");
+            authority.mark_degraded(&detail)?;
+            return Err(error).context("daemon pool authority remains degraded");
+        }
+    };
+    authority.mark_stable()?;
     println!(
         "swapped to {} and signaled {} Codex hot-swap process(es), restarted {}",
         target.email,
@@ -676,6 +809,68 @@ where
         summary.restarted.len()
     );
     Ok(DaemonTick::settled(true, base_interval))
+}
+
+fn recover_pool_authority_target<R>(
+    runtime_lease: &RuntimeActivationLease,
+    authority: &mut PoolAuthorityLock,
+    store_path: &Path,
+    auth_path: &Path,
+    snapshot: AccountStoreSnapshot,
+    base_interval: Duration,
+    reload: &R,
+) -> Result<DaemonTick>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    let record = authority.require_record()?.clone();
+    let Some(target) = snapshot
+        .accounts
+        .iter()
+        .find(|account| account.account_id == record.desired_provider_account_id)
+        .cloned()
+    else {
+        let detail = format!(
+            "pool-authority target {} is absent from the VPS account store",
+            record.desired_provider_account_id
+        );
+        authority.mark_degraded(&detail)?;
+        bail!("{detail}");
+    };
+    authority.mark_converging(Some("VPS same-target authority recovery is pending"))?;
+    let mut generation = snapshot.generation;
+    let mut accounts = snapshot.accounts;
+    let activation = activate_with_unlocked_reload_under_runtime_lease(
+        runtime_lease,
+        store_path,
+        auth_path,
+        &mut generation,
+        &mut accounts,
+        target.id,
+        true,
+        reload,
+    );
+    match activation {
+        Ok(outcome) if outcome.is_confirmed() => {
+            authority.mark_stable()?;
+            Ok(DaemonTick::settled(false, base_interval))
+        }
+        Ok(outcome) => {
+            let detail = outcome.detail.unwrap_or_else(|| {
+                format!(
+                    "VPS authority recovery remained {:?} without complete runtime confirmation",
+                    outcome.state
+                )
+            });
+            authority.mark_degraded(&detail)?;
+            Ok(DaemonTick::runtime_convergence_pending(base_interval))
+        }
+        Err(error) => {
+            let detail = format!("VPS same-target authority recovery failed: {error:#}");
+            authority.mark_degraded(&detail)?;
+            Err(error).context("VPS pool authority remains degraded")
+        }
+    }
 }
 
 fn require_confirmed_activation(outcome: ActivationOutcome) -> Result<ReloadSummary> {
@@ -1133,6 +1328,12 @@ mod tests {
             rate_limit_reset_bank: None,
             is_active: active,
         }
+    }
+
+    fn secure_temp_dir() -> Result<TempDir> {
+        let temp = TempDir::new()?;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))?;
+        Ok(temp)
     }
 
     fn window(kind: QuotaWindowKind, used_percent: f64) -> QuotaWindow {
@@ -2726,8 +2927,8 @@ mod tests {
     }
 
     #[test]
-    fn active_at_one_percent_rotates_immediately() -> Result<()> {
-        let temp = TempDir::new()?;
+    fn daemon_rotation_publishes_stable_pool_authority_transition() -> Result<()> {
+        let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
         let accounts = vec![
@@ -2753,6 +2954,13 @@ mod tests {
             active_account(&stored).map(|account| account.email.as_str()),
             Some("ready@example.com")
         );
+        let authority = crate::pool_authority::observe_status(&store_path)?
+            .context("daemon rotation did not publish pool authority")?;
+        assert_eq!(authority.epoch, 2);
+        assert_eq!(authority.phase, PoolAuthorityPhase::Stable);
+        assert_eq!(authority.desired_provider_account_id, "ready@example.com");
+        assert_eq!(authority.reason, "daemon_quota_rotation");
+        assert!(authority.observed_at >= authority.updated_at);
         Ok(())
     }
 
@@ -3149,6 +3357,12 @@ mod tests {
                 .map(|bank| bank.available_count),
             Some(0)
         );
+        let authority = crate::pool_authority::observe_status(&store_path)?
+            .context("banked-reset rotation did not publish pool authority")?;
+        assert_eq!(authority.epoch, 2);
+        assert_eq!(authority.phase, PoolAuthorityPhase::Stable);
+        assert_eq!(authority.desired_provider_account_id, "pro@example.com");
+        assert_eq!(authority.reason, "daemon_banked_reset");
         Ok(())
     }
 

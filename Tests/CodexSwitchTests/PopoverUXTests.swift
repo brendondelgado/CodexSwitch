@@ -38,27 +38,18 @@ struct PopoverUXTests {
         )
     }
 
-    @Test("Host ownership presentation keeps all three fields visible")
+    @Test("Pool target presentation keeps host convergence global")
     @MainActor
-    func hostOwnershipFieldsRemainSimultaneous() {
-        let labels = AccountCardView.hostOwnershipLabels(
-            isConfigured: true,
-            isRuntimeCurrent: true,
-            vpsRuntimePresentation: .current
-        )
-
-        #expect(labels.macConfigured == "Mac Configured")
-        #expect(labels.macRuntime == "Mac Runtime Current")
-        #expect(labels.vpsRuntime == "VPS Runtime Current")
+    func poolTargetConvergenceRemainsGlobal() {
+        #expect(PopoverContentView.macConvergenceLabel(for: .converged) == "Mac converged")
+        #expect(PopoverContentView.vpsConvergenceLabel(for: .converged) == "VPS converged")
         let source = try? String(
             contentsOfFile: "Sources/CodexSwitch/Views/PopoverContentView.swift",
             encoding: .utf8
         )
-        #expect(source?.contains("Mac configured: \\(configured.email)") == true)
-        #expect(StatusBarController.accountScopeLabel(
-            configuredAccountId: UUID(uuidString: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")!,
-            runtimeCurrentAccountId: UUID(uuidString: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")!
-        ) == "Mac Configured; Mac Runtime Current")
+        #expect(source?.contains("Text(\"Pool Target\")") == true)
+        #expect(source?.contains("Self.macConvergenceLabel") == true)
+        #expect(source?.contains("Self.vpsConvergenceLabel") == true)
     }
 
     @Test("Popover keeps native menu-bar anchor and installs outside-click monitors")

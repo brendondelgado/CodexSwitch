@@ -329,6 +329,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var linuxDevboxReadinessGeneration: UInt64 = 0
     private var linuxDevboxReadinessTaskContext: LinuxDevboxReadinessTaskContext?
     private var linuxDevboxConsecutiveIssueChecks = 0
+    private var poolAuthorityClientState = PoolAuthorityClientState()
+    private var poolAuthorityStatusCheckInFlight = false
+    private var poolAuthorityRequestInFlight = false
+    private var poolAuthorityOperationAuthority: PoolAuthorityOperationAuthority?
+    private var poolAuthorityStatusGeneration: UInt64 = 0
+    private var remoteAuthorityTransportSettings: LinuxDevboxMonitorSettings?
+    private var remoteAuthorityTransportWriteGeneration: UInt64 = 0
     private var lastSubscriptionRefresh: Date?
     private var lastCLIRepairCheck: Date?
     private var globalCLIRepairInFlight = false
@@ -6053,10 +6060,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         source: String,
         requestKind: AccountActivationRequestKind,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil,
+        operationAuthority: PoolAuthorityOperationAuthority? = nil,
         operation: @escaping @MainActor @Sendable (PreparedAccountActivation) async -> Bool
     ) async -> Bool {
         guard !isExiting,
-              policyAuthority?.authorizes() ?? true else {
+              policyAuthority?.authorizes() ?? true,
+              operationAuthority?.authorizes() ?? true else {
             return false
         }
         if pendingSwapTargetAccountId != nil || swapConvergenceTask != nil {
@@ -6072,7 +6081,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             activationGeneration: activationGeneration
         ) { [weak self] lease in
             guard let self,
-                  policyAuthority?.authorizes() ?? true else {
+                  policyAuthority?.authorizes() ?? true,
+                  operationAuthority?.authorizes() ?? true else {
                 return ScopedAccountActivationResult.blocked
             }
             switch await self.prepareActiveCredentialMutation(
@@ -6082,7 +6092,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 requestKind: requestKind,
                 activationGeneration: activationGeneration,
                 lease: lease,
-                policyAuthority: policyAuthority
+                policyAuthority: policyAuthority,
+                operationAuthority: operationAuthority
             ) {
             case .prepared(let prepared):
                 return .completed(await operation(prepared))
@@ -6103,11 +6114,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .completed(let succeeded):
             return succeeded
         case .retrySameTarget:
-            if requestKind == .manual,
+            if requestKind.permitsOperatorRecovery,
                let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) {
                 await startSameTargetRuntimeRetry(
                     to: target,
-                    source: "manual"
+                    source: requestKind == .poolAuthority ? "pool-authority" : "manual"
                 )
             }
             return false
@@ -6123,10 +6134,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         requestKind: AccountActivationRequestKind,
         activationGeneration: UUID,
         lease: AccountMutationLease,
-        policyAuthority: AccountAutomaticPolicyAuthority? = nil
+        policyAuthority: AccountAutomaticPolicyAuthority? = nil,
+        operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> AccountActivationPreparationResult {
         guard !isExiting,
               policyAuthority?.authorizes() ?? true,
+              operationAuthority?.authorizes() ?? true,
               accountManager.configuredAccount?.id == expectedConfiguredAccountId,
               await accountMutationTransaction.owns(lease) else {
             accountManager.publishActivationNotice(
@@ -6143,6 +6156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 requestedActivationGeneration: activationGeneration,
                 authorizeEffect: { [accountMutationTransaction] _ in
                     (policyAuthority?.authorizes() ?? true)
+                        && (operationAuthority?.authorizes() ?? true)
                         && accountMutationTransaction.leaseAuthorizes(
                             lease,
                             targetAccountId: targetAccountId,
@@ -6201,6 +6215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let recoveryAuthorization: AccountActivationCoordinator.StateEffectAuthorization = {
                 [accountMutationTransaction] _ in
                 (policyAuthority?.authorizes() ?? true)
+                    && (operationAuthority?.authorizes() ?? true)
                     && accountMutationTransaction.leaseAuthorizes(
                         lease,
                         targetAccountId: targetAccountId,
@@ -6284,6 +6299,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ))
             return
         }
+        let linuxSettings = LinuxDevboxMonitor.settings()
+        if Self.swapRequiresRemoteAuthority(linuxSettings) {
+            executeRemoteFirstSwap(
+                from: from,
+                to: to,
+                reason: reason,
+                settings: linuxSettings,
+                automaticPermit: automaticPermit,
+                automaticPolicyLease: automaticPolicyLease
+            )
+            return
+        }
         Task { @MainActor [weak self] in
             guard let self, !self.isExiting else { return }
             if !isManual {
@@ -6318,12 +6345,235 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    private func executeRemoteFirstSwap(
+        from: CodexAccount,
+        to: CodexAccount,
+        reason: SwapEvent.SwapReason,
+        settings: LinuxDevboxMonitorSettings,
+        automaticPermit: AccountActivationRuntimePermit?,
+        automaticPolicyLease: AccountAutomaticPolicyLease?
+    ) {
+        guard !poolAuthorityRequestInFlight else {
+            accountManager.publishActivationNotice(
+                "VPS pool authority is already processing an account request"
+            )
+            return
+        }
+        guard let targetProviderAccountId = to.normalizedProviderAccountId else {
+            accountManager.publishActivationNotice(
+                "Target account has no stable provider identity"
+            )
+            return
+        }
+        if reason != .manual {
+            guard let automaticPermit,
+                  let automaticPolicyLease,
+                  automaticPolicyEvaluationIsCurrent(automaticPolicyLease),
+                  automaticPolicyLease.authority.authorizes(),
+                  automaticPermit.targetAccountId == from.id,
+                  automaticPermit.authorizes(
+                      state: accountManager.activationState,
+                      at: Date()
+                  ),
+                  accountManager.configuredAccount?.id == from.id else {
+                return
+            }
+        }
+
+        poolAuthorityRequestInFlight = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.poolAuthorityRequestInFlight = false }
+
+            let baselineResult = await Task.detached(priority: .utility) {
+                LinuxDevboxMonitor.fetchPoolAuthorityStatus(settings: settings)
+            }.value
+            let knownProviderAccountIds = self.accountManager.accounts.compactMap(
+                \.normalizedProviderAccountId
+            )
+            let baseline = try? baselineResult.get()
+            let remoteFirstDecision = self.poolAuthorityClientState.remoteFirstDecision(
+                observation: baseline,
+                targetProviderAccountId: targetProviderAccountId,
+                knownProviderAccountIds: knownProviderAccountIds,
+                now: Date()
+            )
+
+            let acceptedObservation: PoolAuthorityObservation
+            switch remoteFirstDecision {
+            case .adoptExisting(let baseline):
+                acceptedObservation = baseline
+            case .requestRequired(let baseline):
+                let request: PoolAuthorityRequest
+                do {
+                    request = try PoolAuthorityRequest(
+                        selector: targetProviderAccountId,
+                        requestId: UUID().uuidString.lowercased(),
+                        expectedEpoch: baseline.epoch,
+                        reason: reason.rawValue
+                    )
+                } catch {
+                    self.failClosedPoolAuthoritySwap(
+                        "VPS pool authority request is invalid; Mac credentials were not changed"
+                    )
+                    return
+                }
+                let requestResult = await Task.detached(priority: .utility) {
+                    LinuxDevboxMonitor.requestPoolTarget(
+                        settings: settings,
+                        request: request,
+                        requiresEpochAdvance: true
+                    )
+                }.value
+                guard case .success(let resolution) = requestResult else {
+                    self.failClosedPoolAuthoritySwap(
+                        "VPS pool authority did not confirm the requested account; Mac credentials were not changed"
+                    )
+                    return
+                }
+                acceptedObservation = resolution.observation
+            case .failClosed(let detail):
+                self.failClosedPoolAuthoritySwap(
+                    "VPS pool authority is unavailable or contradictory (\(detail)); Mac credentials were not changed"
+                )
+                return
+            }
+
+            if reason != .manual {
+                guard let automaticPermit,
+                      let automaticPolicyLease,
+                      self.automaticPolicyEvaluationIsCurrent(automaticPolicyLease),
+                      automaticPolicyLease.authority.authorizes(),
+                      automaticPermit.targetAccountId == from.id,
+                      automaticPermit.authorizes(
+                          state: self.accountManager.activationState,
+                          at: Date()
+                      ),
+                      self.accountManager.configuredAccount?.id == from.id else {
+                    return
+                }
+            }
+            self.handlePoolAuthorityObservation(
+                acceptedObservation,
+                permitsConverging: true,
+                automaticPolicyLease: reason == .manual ? nil : automaticPolicyLease
+            )
+        }
+    }
+
+    nonisolated static func swapRequiresRemoteAuthority(
+        _ settings: LinuxDevboxMonitorSettings
+    ) -> Bool {
+        settings.hasRemoteAuthorityEndpoint
+    }
+
+    private func failClosedPoolAuthoritySwap(_ message: String) {
+        accountManager.publishActivationNotice(message)
+        SwapLog.append(.debug("POOL_AUTHORITY_SWAP_BLOCKED message=\(message)"))
+        updatePopoverContent()
+    }
+
+    private func handlePoolAuthorityObservation(
+        _ observation: PoolAuthorityObservation,
+        permitsConverging: Bool,
+        automaticPolicyLease: AccountAutomaticPolicyLease? = nil
+    ) {
+        let knownProviderAccountIds = accountManager.accounts.compactMap(
+            \.normalizedProviderAccountId
+        )
+        let decision = LinuxDevboxMonitor.poolAuthorityAdoptionDecision(
+            state: &poolAuthorityClientState,
+            observation: observation,
+            localProviderAccountId: accountManager.configuredAccount?
+                .normalizedProviderAccountId,
+            knownProviderAccountIds: knownProviderAccountIds,
+            permitsConverging: permitsConverging,
+            now: Date()
+        )
+        if case .rejected = decision {
+            // Invalid observations never become presentation authority.
+        } else {
+            accountManager.publishPoolAuthorityObservation(observation)
+        }
+        guard case .adopt = decision,
+              let target = accountManager.accounts.first(where: {
+                  $0.normalizedProviderAccountId
+                      == observation.desiredProviderAccountId
+              }) else {
+            if case .rejected(let reason) = decision {
+                SwapLog.append(.debug(
+                    "POOL_AUTHORITY_OBSERVATION_REJECTED epoch=\(observation.epoch) reason=\(reason)"
+                ))
+            }
+            return
+        }
+
+        if let current = poolAuthorityOperationAuthority,
+           observation.epoch > current.epoch {
+            current.revoke()
+        }
+        let operationAuthority = PoolAuthorityOperationAuthority(
+            epoch: observation.epoch,
+            providerAccountId: observation.desiredProviderAccountId
+        )
+        poolAuthorityOperationAuthority = operationAuthority
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            guard operationAuthority.authorizes(),
+                  let from = self.accountManager.configuredAccount else {
+                self.poolAuthorityClientState.finishAdoption(
+                    epoch: observation.epoch,
+                    succeeded: false,
+                    at: Date()
+                )
+                return
+            }
+            if from.id == target.id {
+                self.poolAuthorityClientState.finishAdoption(
+                    epoch: observation.epoch,
+                    succeeded: true,
+                    at: Date()
+                )
+                return
+            }
+            let succeeded = await self.withPreparedActiveCredentialMutation(
+                targetAccountId: target.id,
+                expectedConfiguredAccountId: from.id,
+                source: "pool-authority",
+                requestKind: .poolAuthority,
+                policyAuthority: automaticPolicyLease?.authority,
+                operationAuthority: operationAuthority
+            ) { [weak self] prepared in
+                guard let self, operationAuthority.authorizes() else {
+                    return false
+                }
+                return await self.executeSwapTransaction(
+                    from: from,
+                    to: target,
+                    reason: .poolAuthority,
+                    swapStart: Date(),
+                    prepared: prepared,
+                    operationAuthority: operationAuthority
+                )
+            }
+            self.poolAuthorityClientState.finishAdoption(
+                epoch: observation.epoch,
+                succeeded: succeeded,
+                at: Date()
+            )
+        }
+    }
+
     private func executeSwapTransaction(
         from: CodexAccount,
         to: CodexAccount,
         reason: SwapEvent.SwapReason,
         swapStart: Date,
-        prepared: PreparedAccountActivation
+        prepared: PreparedAccountActivation,
+        operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> Bool {
         SwapLog.append(.swapTriggered(
             from: from.email,
@@ -6354,7 +6604,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             authAlreadyConfigured: false,
             swapStart: swapStart,
             prepared: prepared,
-            recordsSwap: true
+            recordsSwap: true,
+            operationAuthority: operationAuthority
         )
     }
 
@@ -6507,12 +6758,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         swapStart: Date,
         prepared: PreparedAccountActivation,
         recordsSwap: Bool,
-        committedDetail: AccountActivationDetail = .runtimeConfirmationPending
+        committedDetail: AccountActivationDetail = .runtimeConfirmationPending,
+        operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> Bool {
         let result = await accountMutationTransaction.commitConfiguredCredentials(
             AccountActivationCommitOperations(
                 authorizeMutation: { [weak self] in
-                    guard let self else { return nil }
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true else { return nil }
                     return await self.revalidateCredentialMutation(
                         route: mutationRoute,
                         from: from,
@@ -6524,6 +6777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 },
                 mutateCredentials: { [weak self] permit in
                     guard let self,
+                          operationAuthority?.authorizes() ?? true,
                           permit.authorizes(
                               state: self.accountManager.activationState,
                               at: Date()
@@ -6538,7 +6792,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     return true
                 },
                 authorizePreparingEffect: { [weak self] in
-                    guard let self else { return nil }
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true else { return nil }
                     let configuredAccountId =
                         self.accountManager.configuredAccount?.id
                     guard configuredAccountId
@@ -6554,7 +6809,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     )
                 },
                 persistAccountStore: { [weak self] permit in
-                    guard let self else { return false }
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true else { return false }
                     let expectedCredentialAuthority = self.accountManager.accounts
                     guard let configuredCredentialSnapshot =
                             AccountManager.configuredCredentialSnapshot(
@@ -6583,7 +6839,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     return true
                 },
                 persistAuth: { [weak self] permit in
-                    guard let self else { return false }
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true else { return false }
                     if authAlreadyConfigured {
                         let matches = permit.isCurrentlyAuthorized()
                             && Self.authFileMatches(
@@ -6606,12 +6863,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     )
                 },
                 verifyDurableFiles: { [weak self] permit in
-                    guard let self, permit.isCurrentlyAuthorized() else { return false }
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true,
+                          permit.isCurrentlyAuthorized() else { return false }
                     let matches = await self.durableConfiguredFilesMatch(to)
                     return matches && permit.isCurrentlyAuthorized()
                 },
                 markCommittedDegraded: { [weak self] permit in
-                    guard let self else { return false }
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true else { return false }
                     do {
                         let degraded = try await self.accountActivationCoordinator
                             .markCommittedDegraded(
@@ -6621,7 +6881,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                 acknowledgedRuntimeCount: 0,
                                 detail: committedDetail,
                                 authorizeEffect: { state in
-                                    permit.authorizes(state: state, at: Date())
+                                    (operationAuthority?.authorizes() ?? true)
+                                        && permit.authorizes(state: state, at: Date())
                                 }
                             )
                         guard degraded.phase == .committedDegraded,
@@ -6640,7 +6901,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                 },
                 authorizeConvergence: { [weak self] in
-                    guard let self else { return nil }
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true else { return nil }
                     return await self.activationEffectPermit(
                         prepared,
                         targetAccountId: to.id,
@@ -6649,14 +6911,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     )
                 },
                 convergeRuntime: { [weak self] permit in
-                    guard let self, permit.isCurrentlyAuthorized() else { return false }
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true,
+                          permit.isCurrentlyAuthorized() else { return false }
                     await self.beginRuntimeConvergence(
                         from: from,
                         to: to,
                         reason: reason,
                         swapStart: swapStart,
                         prepared: prepared,
-                        recordsSwap: recordsSwap
+                        recordsSwap: recordsSwap,
+                        operationAuthority: operationAuthority
                     )
                     return true
                 }
@@ -6791,8 +7056,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         reason: SwapEvent.SwapReason,
         swapStart: Date,
         prepared: PreparedAccountActivation,
-        recordsSwap: Bool
+        recordsSwap: Bool,
+        operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async {
+        guard operationAuthority?.authorizes() ?? true else {
+            await abandonSwapRuntimeConvergence(
+                prepared: prepared,
+                targetAccountId: to.id
+            )
+            return
+        }
         startPollingForAccount(to.id)
         statusBarController.updateIcon()
         updatePopoverContent()
@@ -6804,7 +7077,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let convergenceTask = Task(priority: .userInitiated) { [weak self] in
             let shouldStartReload = await self?.activationWorkIsCurrent(
                 prepared,
-                targetAccountId: to.id
+                targetAccountId: to.id,
+                operationAuthority: operationAuthority
             ) == true
             guard !Task.isCancelled, shouldStartReload else {
                 SwapLog.append(.debug(
@@ -6823,7 +7097,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 authorizeAfterDesktop: { [weak self] in
                     await self?.activationWorkIsCurrent(
                         prepared,
-                        targetAccountId: to.id
+                        targetAccountId: to.id,
+                        operationAuthority: operationAuthority
                     ) == true
                 }
             ) else {
@@ -6876,7 +7151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 swapStart: swapStart,
                 prepared: prepared,
                 completion: completion,
-                recordsSwap: recordsSwap
+                recordsSwap: recordsSwap,
+                operationAuthority: operationAuthority
             )
         }
         swapConvergenceTask = convergenceTask
@@ -6885,9 +7161,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func activationWorkIsCurrent(
         _ prepared: PreparedAccountActivation,
-        targetAccountId: UUID
+        targetAccountId: UUID,
+        operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> Bool {
-        AccountActivationOperationProof(
+        guard operationAuthority?.authorizes() ?? true else {
+            return false
+        }
+        return AccountActivationOperationProof(
             state: accountManager.activationState,
             targetAccountId: targetAccountId,
             activationGeneration: prepared.activationGeneration,
@@ -7297,7 +7577,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         swapStart: Date,
         prepared: PreparedAccountActivation,
         completion: AccountActivationRuntimeCompletion,
-        recordsSwap: Bool
+        recordsSwap: Bool,
+        operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async {
         guard !isExiting else {
             await abandonSwapRuntimeConvergence(
@@ -7306,7 +7587,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             return
         }
-        guard await activationWorkIsCurrent(prepared, targetAccountId: to.id) else {
+        guard await activationWorkIsCurrent(
+            prepared,
+            targetAccountId: to.id,
+            operationAuthority: operationAuthority
+        ) else {
             SwapLog.append(.debug(
                 "SWAP_COMPLETION_DISCARDED generation=\(prepared.swapGeneration) target=\(to.email) current_generation=\(swapGeneration) current_target=\(pendingSwapTargetAccountId?.uuidString ?? "none")"
             ))
@@ -7325,7 +7610,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 requiredPhase: .committedDegraded
             )
             guard freshRuntimePermit != nil,
-                  await activationWorkIsCurrent(prepared, targetAccountId: to.id) else {
+                  await activationWorkIsCurrent(
+                      prepared,
+                      targetAccountId: to.id,
+                      operationAuthority: operationAuthority
+                  ) else {
                 if let degraded = accountManager.activationState,
                    degraded.phase == .committedDegraded,
                    degraded.configuredAccountId == to.id {
@@ -7381,10 +7670,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let confirmationResult = await accountActivationConfirmationTransaction.confirm(
                     AccountActivationConfirmationOperations(
                         verifyDurableFiles: { [weak self] in
-                            await self?.durableConfiguredFilesMatch(to) == true
+                            guard operationAuthority?.authorizes() ?? true else {
+                                return false
+                            }
+                            return await self?.durableConfiguredFilesMatch(to) == true
                         },
                         authorizeConfirmation: { [weak self] in
-                            guard let self else { return nil }
+                            guard let self,
+                                  operationAuthority?.authorizes() ?? true else {
+                                return nil
+                            }
                             return await self.activationEffectPermit(
                                 prepared,
                                 targetAccountId: to.id,
@@ -7395,6 +7690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         },
                         reauthorizeConfirmation: { [weak self] confirmationPermit in
                             guard let self,
+                                  operationAuthority?.authorizes() ?? true,
                                   confirmationPermit.isCurrentlyAuthorized(),
                                   let revalidatedEvidence = await self
                                     .revalidatedRuntimeEvidence(freshEvidence, for: to) else {
@@ -7416,6 +7712,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         },
                         persistConfirmation: { [weak self] confirmationPermit in
                             guard let self,
+                                  operationAuthority?.authorizes() ?? true,
                                   let revalidatedEvidence = confirmationPermit.runtimePermit?.evidence,
                                   revalidatedEvidence.hasConcreteRuntimeBindings else {
                                 return nil
@@ -7432,7 +7729,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                     guard confirmationPermit.authorizes(
                                         state: state,
                                         at: Date()
-                                    ), revalidatedEvidence.runtimeBindings.allSatisfy({
+                                    ),
+                                    operationAuthority?.authorizes() ?? true,
+                                    revalidatedEvidence.runtimeBindings.allSatisfy({
                                         SwapEngine.reloadBindingIsCurrent($0)
                                     }) else {
                                         return false
@@ -7497,6 +7796,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     )
                 }
                 guard confirmed.phase == .confirmed,
+                      operationAuthority?.authorizes() ?? true,
                       confirmed.configuredAccountId == to.id,
                       confirmed.activationGeneration == prepared.activationGeneration,
                       await accountMutationTransaction.owns(prepared.lease),
@@ -7514,7 +7814,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 state = confirmed
             case .configuredOnly:
-                guard let failurePermit = await activationEffectPermit(
+                guard operationAuthority?.authorizes() ?? true,
+                      let failurePermit = await activationEffectPermit(
                     prepared,
                     targetAccountId: to.id,
                     requiredPhase: .committedDegraded,
@@ -7530,11 +7831,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     acknowledgedRuntimeCount: completion.acknowledgedRuntimeCount,
                     detail: .noLocalRuntime,
                     authorizeEffect: { current in
-                        failurePermit.authorizes(state: current, at: Date())
+                        (operationAuthority?.authorizes() ?? true)
+                            && failurePermit.authorizes(state: current, at: Date())
                     }
                 )
             case .restartRequired:
-                guard let failurePermit = await activationEffectPermit(
+                guard operationAuthority?.authorizes() ?? true,
+                      let failurePermit = await activationEffectPermit(
                     prepared,
                     targetAccountId: to.id,
                     requiredPhase: .committedDegraded,
@@ -7550,9 +7853,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     acknowledgedRuntimeCount: completion.acknowledgedRuntimeCount,
                     detail: .runtimeAcknowledgementIncomplete,
                     authorizeEffect: { current in
-                        failurePermit.authorizes(state: current, at: Date())
+                        (operationAuthority?.authorizes() ?? true)
+                            && failurePermit.authorizes(state: current, at: Date())
                     }
                 )
+            }
+            guard operationAuthority?.authorizes() ?? true else {
+                await abandonSwapRuntimeConvergence(
+                    prepared: prepared,
+                    targetAccountId: to.id
+                )
+                return
             }
             accountManager.publishActivationState(state)
         } catch {
@@ -8178,10 +8489,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         linuxDevboxMonitorTimer?.invalidate()
         linuxDevboxMonitorTimer = Timer.scheduledTimer(withTimeInterval: LinuxDevboxMonitor.activeRemoteAccountStatePollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
+                self?.checkPoolAuthorityStatus()
                 self?.checkLinuxDevboxReadiness()
             }
         }
+        checkPoolAuthorityStatus()
         checkLinuxDevboxReadiness(force: true)
+    }
+
+    private func checkPoolAuthorityStatus() {
+        let settings = LinuxDevboxMonitor.settings()
+        publishRemoteAuthorityTransportConfigIfNeeded(settings)
+        accountManager.publishRemoteAuthorityEndpointConfigured(
+            settings.hasRemoteAuthorityEndpoint
+        )
+        guard Self.swapRequiresRemoteAuthority(settings) else {
+            poolAuthorityStatusGeneration &+= 1
+            poolAuthorityStatusCheckInFlight = false
+            poolAuthorityClientState.reset()
+            accountManager.clearPoolAuthorityObservation()
+            poolAuthorityOperationAuthority?.revoke()
+            poolAuthorityOperationAuthority = nil
+            return
+        }
+        guard !poolAuthorityStatusCheckInFlight,
+              !poolAuthorityRequestInFlight else {
+            return
+        }
+
+        poolAuthorityStatusCheckInFlight = true
+        poolAuthorityStatusGeneration &+= 1
+        let generation = poolAuthorityStatusGeneration
+        Task { @MainActor [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                LinuxDevboxMonitor.fetchPoolAuthorityStatus(settings: settings)
+            }.value
+            guard let self else {
+                return
+            }
+            self.poolAuthorityStatusCheckInFlight = false
+            guard generation == self.poolAuthorityStatusGeneration,
+                  settings == LinuxDevboxMonitor.settings() else {
+                return
+            }
+            guard case .success(let observation) = result else {
+                return
+            }
+            if let operation = self.poolAuthorityOperationAuthority,
+               observation.epoch > operation.epoch {
+                operation.revoke()
+            }
+            self.handlePoolAuthorityObservation(
+                observation,
+                permitsConverging: false
+            )
+        }
+    }
+
+    private func publishRemoteAuthorityTransportConfigIfNeeded(
+        _ settings: LinuxDevboxMonitorSettings
+    ) {
+        guard remoteAuthorityTransportSettings != settings else {
+            return
+        }
+        remoteAuthorityTransportSettings = settings
+        remoteAuthorityTransportWriteGeneration &+= 1
+        let generation = remoteAuthorityTransportWriteGeneration
+        Task { @MainActor [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                Result {
+                    try RemoteAuthorityTransportConfigStore().write(
+                        settings: settings
+                    )
+                }
+            }.value
+            guard let self,
+                  generation == self.remoteAuthorityTransportWriteGeneration else {
+                return
+            }
+            if case .failure(let error) = result {
+                self.remoteAuthorityTransportSettings = nil
+                SwapLog.append(.debug(
+                    "REMOTE_AUTHORITY_CONFIG_WRITE_FAILED error=\(error.localizedDescription)"
+                ))
+            }
+        }
     }
 
     private func startTokenUsageMetricsMonitor() {

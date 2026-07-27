@@ -35,6 +35,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/KeychainStore.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  - ../../Sources/CodexSwitch/Services/PoolAuthority.swift
   - ../../Sources/CodexSwitch/Services/CodexVersionChecker.swift
   - ../../Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
   - ../../Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
@@ -46,6 +47,8 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Views/StatusBarController.swift
   - ../../crates/codexswitch-cli/src/account_store.rs
   - ../../crates/codexswitch-cli/src/activation.rs
+  - ../../crates/codexswitch-cli/src/pool_authority.rs
+  - ../../crates/codexswitch-cli/src/remote_authority.rs
   - ../../crates/codexswitch-cli/src/import.rs
   - ../../crates/codexswitch-cli/src/reload.rs
   - ../../crates/codexswitch-cli/src/codex_update.rs
@@ -81,7 +84,7 @@ they are not separate account-selection domains:
 - The VPS coordinator owns the VPS account store, VPS `~/.codex/auth.json`, its
   local activation journal, and VPS reload targets.
 - The Mac remote monitor reads the authority record and per-host convergence.
-- `codex-vps` and the SSH CLI transport explicit authority requests and
+- `codex-vps` and the SSH CLI transport carry explicit authority requests and
   observations. They do not create a second decision owner.
 
 A connected remote session does not suppress Mac CLI protection. When VPS
@@ -107,17 +110,18 @@ CodexSwitch state directory. The record contains:
 - phase: `stable`, `converging`, or `degraded`;
 - bounded idempotency `requestId`, request reason, and timestamps;
 - the previous epoch and provider identity needed for diagnosis;
-- per-host convergence state and bounded non-secret evidence summaries.
+- a bounded history of non-secret rotation operation outcomes.
 
 It never contains access, refresh, or identity tokens. The authority record uses
 the same no-follow, owner-checked, mode-`0600`, generation-CAS, atomic rename,
 file `fsync`, parent-directory `fsync`, and exact readback properties as other
 CodexSwitch journals.
 
-The VPS daemon is the autonomous policy owner and the serialized authority
-writer. Local VPS CLI commands and remote Mac requests enter that same
-transaction instead of writing the record independently. Each request carries a
-globally unique request identifier and expected epoch:
+The VPS daemon is the autonomous policy owner. The daemon, local VPS CLI, and
+remote Mac requests serialize every authority mutation through the same runtime
+activation lease and secure authority-journal lock. No caller maintains an
+independent desired-target record. Each target request carries a globally
+unique request identifier and expected epoch:
 
 - replaying the same request identifier returns its recorded result;
 - a different request with a stale expected epoch is rejected before provider,
@@ -129,6 +133,21 @@ globally unique request identifier and expected epoch:
 Authority observation is read-only. Fetching authority status, per-host
 convergence, or a prior request result does not poll quota, refresh tokens,
 redeem a reset, write credentials, or reload a runtime.
+
+The Mac CLI transport configuration is the token-free mode-`0600` file
+`~/.codexswitch/remote-authority.json`. It contains only a schema version,
+enabled flag, bounded SSH host, user, port, and canonical absolute private-key
+path. The menu app publishes it atomically whenever endpoint settings change,
+even when readiness notifications are disabled. The Rust client honors normal
+OpenSSH host aliases while overriding batch mode, identity selection, host-key
+checking, connection attempts, and timeouts.
+
+Runtime-triggered remote rotations also use a durable Mac operation journal and
+a bounded VPS operation history. A retry reuses the same operation identifier.
+After an unknown SSH outcome, the Mac performs read-only status reconciliation
+before retrying; it never submits a second banked-reset effect merely because a
+response was lost. The local operation becomes complete only after Mac
+credentials and runtime acknowledgement converge to the recorded VPS target.
 
 Mac adoption requires one fresh, internally consistent observation whose
 authority epoch, desired provider identity, request result, and VPS readiness
@@ -160,7 +179,9 @@ missing host effects for the same epoch.
 
 If the VPS is configured but unavailable, the Mac preserves process and session
 state but fails closed for manual and automatic account changes. It displays the
-last authority observation as stale and does not label its account pool-current.
+last committed authority identity as the sole pool target while marking host
+convergence stale or unavailable. It never promotes the Mac-local active flag
+into a replacement target.
 The VPS can continue autonomous operation while the Mac is offline; an offline
 Mac is reported as offline/not required and does not prevent the VPS target from
 becoming stable. When the Mac reconnects, it adopts the latest authority epoch
@@ -1040,7 +1061,8 @@ therefore remains off the UI actor while the state mutation has one explicit
 actor boundary on every supported Swift 6 toolchain.
 
 - The menu app presents one pool-wide desired account from a fresh VPS
-  authority observation. Mac and VPS status are per-host convergence details
+  authority observation, retaining only the last committed identity when
+  transport becomes stale. Mac and VPS status are per-host convergence details
   for that one target, not separate active-account selections.
 - The ChatGPT desktop and CodexSwitch share one patched local app-server on
   `ws://127.0.0.1:9223`. CodexSwitch keeps that bridge alive and publishes
@@ -1071,8 +1093,10 @@ actor boundary on every supported Swift 6 toolchain.
   epoch, or readiness identity A plus authority identity B is contradictory
   and remains unknown through integration. Duplicate emails can never mark two
   cards current. Quota movement never proves authority or runtime ownership.
-  Missing, stale, contradictory, or disconnected authority evidence is labeled
-  stale, unavailable, or degraded and receives no current styling.
+  Missing authority evidence suppresses local fallback. Stale or disconnected
+  evidence retains the last committed target identity but labels host health
+  stale, unavailable, or degraded. Contradictory evidence is rejected and can
+  never replace the last valid target.
 - `AccountManager` exposes the authority-selected target separately from
   host-local configured and runtime-current observations. It has no ambiguous
   `activeAccount` alias. Generic inactive-account upserts cannot alter
@@ -1089,7 +1113,8 @@ actor boundary on every supported Swift 6 toolchain.
   enter manual review without changing account files.
 - The popover identifies the pool target once and shows Mac and VPS convergence
   in a shared status area. Repeated host warnings do not appear on every account
-  card.
+  card. The pool target is listed first even while a host is still converging;
+  list order never elevates a stale host-local `isActive` flag over authority.
 - Local quota exhaustion submits a remote-first authority request. If a VPS is
   configured but unavailable, the request fails closed: current sessions are
   preserved, no local target changes, and the UI shows authority unavailable.
@@ -1114,11 +1139,12 @@ actor boundary on every supported Swift 6 toolchain.
 
 ## VPS Contract
 
-- One Rust daemon owns the durable pool authority, autonomous candidate
-  selection, and VPS host activation.
-- The CLI submits idempotent authority requests to the daemon and reads
-  authority observations. It never implements an independent rotation policy
-  or writes the desired target directly.
+- One Rust daemon owns autonomous candidate selection and VPS host activation.
+  Every daemon and CLI authority mutation uses the same runtime lease and secure
+  journal lock.
+- The CLI submits idempotent authority requests through that shared transaction
+  and reads authority observations. It never implements an independent
+  desired-target record.
 - The port-8390 WebSocket service and the built-in SSH `unix://` app-server are
   separate account-bearing runtimes. Both participate in discovery and verified
   reload whenever they are running; `app-server proxy` helpers never do. The
@@ -1199,14 +1225,12 @@ rebinds the record to that exact account, performs and verifies a runtime reload
 then handles any newly requested cross-account activation. Other manual-review
 reasons remain blocked.
 
-The authority-selected pool target is listed first in the menu when authority
-evidence is fresh. Candidate ranking is shown separately as "Next up"; it must
-not move an inactive candidate above the target or imply that list order is
-activation state. Per-host configured or runtime identities are convergence
-details and never create a second highlighted account. Runtime-current emphasis
-is reserved for host evidence bound to the current authority epoch; stale or
-unavailable authority removes pool-current emphasis without inventing a local
-replacement.
+The authority-selected pool target is listed first in the menu. Candidate
+ranking is shown separately as "Next up"; it must not move an inactive candidate
+above the target or imply that list order is activation state. Per-host
+configured or runtime identities are convergence details and never create a
+second highlighted account. Stale or unavailable authority degrades host health
+without inventing a local replacement or a second target.
 
 ## Update And Patch Contract
 

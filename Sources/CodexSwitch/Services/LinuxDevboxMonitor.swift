@@ -4,6 +4,10 @@ import Foundation
 import Security
 
 struct LinuxDevboxMonitorSettings: Equatable, Sendable {
+    static let maximumHostBytes = 253
+    static let maximumUserBytes = 64
+    static let maximumSSHKeyPathBytes = 4 * 1_024
+
     let enabled: Bool
     let host: String
     let user: String
@@ -11,8 +15,144 @@ struct LinuxDevboxMonitorSettings: Equatable, Sendable {
     let port: Int
 
     var isConfigured: Bool {
-        enabled && !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !user.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        enabled && hasRemoteAuthorityEndpoint
+    }
+
+    var hasRemoteAuthorityEndpoint: Bool {
+        Self.isValidHost(host)
+            && Self.isValidUser(user)
+            && (1...65_535).contains(port)
+    }
+
+    fileprivate static func isBoundedPrintable(
+        _ value: String,
+        maximumBytes: Int
+    ) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty
+            && trimmed == value
+            && value.utf8.count <= maximumBytes
+            && value.unicodeScalars.allSatisfy {
+                $0.value >= 32 && $0.value != 127
+            }
+    }
+
+    private static func isValidHost(_ value: String) -> Bool {
+        isBoundedPrintable(value, maximumBytes: maximumHostBytes)
+            && !value.hasPrefix("-")
+            && value.utf8.allSatisfy { byte in
+                switch byte {
+                case 65...90, 97...122, 48...57, 46, 45, 58, 91, 93:
+                    true
+                default:
+                    false
+                }
+            }
+    }
+
+    private static func isValidUser(_ value: String) -> Bool {
+        isBoundedPrintable(value, maximumBytes: maximumUserBytes)
+            && !value.hasPrefix("-")
+            && value.utf8.allSatisfy { byte in
+                switch byte {
+                case 65...90, 97...122, 48...57, 46, 95, 45:
+                    true
+                default:
+                    false
+                }
+            }
+    }
+}
+
+struct RemoteAuthorityTransportConfig: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+
+    let version: Int
+    let enabled: Bool
+    let host: String
+    let user: String
+    let port: Int
+    let sshKeyPath: String
+
+    init(settings: LinuxDevboxMonitorSettings) {
+        let normalizedKeyPath = Self.normalizedSSHKeyPath(settings.sshKeyPath)
+        self.version = Self.currentVersion
+        if settings.hasRemoteAuthorityEndpoint, let normalizedKeyPath {
+            self.enabled = true
+            self.host = settings.host
+            self.user = settings.user
+            self.port = settings.port
+            self.sshKeyPath = normalizedKeyPath
+        } else {
+            self.enabled = false
+            self.host = ""
+            self.user = ""
+            self.port = 22
+            self.sshKeyPath = ""
+        }
+    }
+
+    static func normalizedSSHKeyPath(_ value: String) -> String? {
+        guard LinuxDevboxMonitorSettings.isBoundedPrintable(
+            value,
+            maximumBytes: LinuxDevboxMonitorSettings.maximumSSHKeyPathBytes
+        ) else {
+            return nil
+        }
+        let expanded = NSString(string: value).expandingTildeInPath
+        let standardized = NSString(string: expanded).standardizingPath
+        guard standardized.hasPrefix("/") else {
+            return nil
+        }
+        let canonical = URL(fileURLWithPath: standardized)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+        guard LinuxDevboxMonitorSettings.isBoundedPrintable(
+            canonical,
+            maximumBytes: LinuxDevboxMonitorSettings.maximumSSHKeyPathBytes
+        ), canonical.hasPrefix("/") else {
+            return nil
+        }
+        return canonical
+    }
+}
+
+struct RemoteAuthorityTransportConfigStore: Sendable {
+    static let defaultPath = NSString(
+        string: "~/.codexswitch/remote-authority.json"
+    ).expandingTildeInPath
+
+    private let transaction: SecureAtomicFileTransaction
+
+    init(path: String = defaultPath) {
+        transaction = SecureAtomicFileTransaction(
+            path: path,
+            subject: "remote authority transport configuration"
+        )
+    }
+
+    @discardableResult
+    func write(
+        settings: LinuxDevboxMonitorSettings
+    ) throws -> RemoteAuthorityTransportConfig {
+        let config = RemoteAuthorityTransportConfig(settings: settings)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(config)
+        guard data.count <= 16 * 1_024 else {
+            throw PoolAuthorityValidationError.invalidField(
+                "remote-authority.json"
+            )
+        }
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            _ = try lockedFile.replace(
+                data,
+                expectedGeneration: current.generation
+            )
+        }
+        return config
     }
 }
 
@@ -579,6 +719,8 @@ enum LinuxDevboxMonitor {
     static let normalReadinessPollInterval: TimeInterval = 60
     static let automaticCredentialBundleLifetime: TimeInterval = 10 * 60
     static let pollAccountRetryPolicy: SSHRetryPolicy = .preExecutionTransportOnly
+    static let poolAuthorityStatusTimeout: TimeInterval = 20
+    static let poolAuthorityRequestTimeout: TimeInterval = 30
 
     private struct RemoteAuthDiagnostics: Decodable, Sendable {
         let activeAccountId: String?
@@ -1166,6 +1308,220 @@ enum LinuxDevboxMonitor {
         } catch {
             return .failure(LinuxDevboxMonitorFailure(message: "Failed to parse Linux devbox readiness JSON: \(error.localizedDescription)"))
         }
+    }
+
+    static func fetchPoolAuthorityStatus(
+        settings: LinuxDevboxMonitorSettings
+    ) -> Result<PoolAuthorityObservation, LinuxDevboxMonitorFailure> {
+        guard settings.hasRemoteAuthorityEndpoint else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox monitor is not configured"
+            ))
+        }
+        let result = runSSH(
+            settings: settings,
+            remoteCommand: remotePoolAuthorityStatusCommand(),
+            timeout: poolAuthorityStatusTimeout,
+            retryPolicy: .readOnly
+        )
+        return decodePoolAuthorityStatusResult(result)
+    }
+
+    static func requestPoolTarget(
+        settings: LinuxDevboxMonitorSettings,
+        request: PoolAuthorityRequest,
+        requiresEpochAdvance: Bool,
+        now: Date = Date()
+    ) -> Result<PoolAuthorityRequestResolution, LinuxDevboxMonitorFailure> {
+        guard settings.hasRemoteAuthorityEndpoint else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox monitor is not configured"
+            ))
+        }
+        return requestPoolTargetWithCandidates(
+            sshArgumentCandidates(settings: settings),
+            request: request,
+            requiresEpochAdvance: requiresEpochAdvance,
+            now: now,
+            runner: { executableURL, arguments, timeout in
+                ProcessRunner.run(
+                    executableURL: executableURL,
+                    arguments: arguments,
+                    timeout: timeout
+                )
+            },
+            statusFetcher: {
+                fetchPoolAuthorityStatus(settings: settings)
+            }
+        )
+    }
+
+    static func requestPoolTargetWithCandidates(
+        _ candidates: [[String]],
+        request: PoolAuthorityRequest,
+        requiresEpochAdvance: Bool,
+        now: Date = Date(),
+        executionToken: String = UUID().uuidString.lowercased(),
+        runner: (URL, [String], TimeInterval) -> ProcessRunResult,
+        statusFetcher: () -> Result<PoolAuthorityObservation, LinuxDevboxMonitorFailure>
+    ) -> Result<PoolAuthorityRequestResolution, LinuxDevboxMonitorFailure> {
+        let outcome = runSSHOutcomeWithCandidates(
+            candidates,
+            remoteCommand: remotePoolTargetRequestCommand(request),
+            timeout: poolAuthorityRequestTimeout,
+            retryPolicy: .preExecutionTransportOnly,
+            executionToken: executionToken,
+            runner: runner
+        )
+        let result = outcome.result
+        var originalFailure: LinuxDevboxMonitorFailure?
+        if !result.timedOut,
+           outcome.executionState == .completed,
+           result.terminationStatus == 0 {
+            switch decodePoolAuthorityObservation(result.stdout) {
+            case .success(let observation):
+                let validation = validatePoolAuthorityRequestObservation(
+                    observation,
+                    request: request,
+                    requiresEpochAdvance: requiresEpochAdvance,
+                    now: now,
+                    resolution: { .accepted($0) }
+                )
+                if case .success = validation {
+                    return validation
+                }
+                if case .failure(let failure) = validation {
+                    originalFailure = failure
+                }
+            case .failure(let failure):
+                originalFailure = failure
+            }
+        }
+        if outcome.executionState == .notStarted {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Pool authority request did not start; no local account change was made"
+            ))
+        }
+        if outcome.executionState == .completed {
+            let message = result.stderrString.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            originalFailure = originalFailure ?? LinuxDevboxMonitorFailure(
+                message: message.isEmpty
+                    ? "Pool authority request failed with status \(result.terminationStatus)"
+                    : message
+            )
+        }
+
+        // Every started request without a valid success payload is reconciled
+        // exactly once by read-only status. The mutation is never replayed.
+        switch statusFetcher() {
+        case .success(let observation):
+            let reconciliation = validatePoolAuthorityRequestObservation(
+                observation,
+                request: request,
+                requiresEpochAdvance: requiresEpochAdvance,
+                now: now,
+                resolution: { .reconciledAfterUnknown($0) }
+            )
+            if case .success = reconciliation {
+                return reconciliation
+            }
+            if let originalFailure {
+                return .failure(originalFailure)
+            }
+            return reconciliation
+        case .failure(let failure):
+            if let originalFailure {
+                return .failure(originalFailure)
+            }
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Pool authority request outcome is unknown and read-only reconciliation failed: \(failure.message)",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
+    }
+
+    static func decodePoolAuthorityObservation(
+        _ data: Data
+    ) -> Result<PoolAuthorityObservation, LinuxDevboxMonitorFailure> {
+        do {
+            return .success(try JSONDecoder().decode(
+                PoolAuthorityObservation.self,
+                from: data
+            ))
+        } catch {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Failed to parse pool authority JSON: \(error.localizedDescription)"
+            ))
+        }
+    }
+
+    static func poolAuthorityAdoptionDecision(
+        state: inout PoolAuthorityClientState,
+        observation: PoolAuthorityObservation,
+        localProviderAccountId: String?,
+        knownProviderAccountIds: [String],
+        permitsConverging: Bool,
+        now: Date
+    ) -> PoolAuthorityAdoptionDecision {
+        state.adoptionDecision(
+            for: observation,
+            localProviderAccountId: localProviderAccountId,
+            knownProviderAccountIds: knownProviderAccountIds,
+            permitsConverging: permitsConverging,
+            now: now
+        )
+    }
+
+    private static func decodePoolAuthorityStatusResult(
+        _ result: ProcessRunResult
+    ) -> Result<PoolAuthorityObservation, LinuxDevboxMonitorFailure> {
+        guard !result.timedOut else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "SSH timed out while fetching pool authority status"
+            ))
+        }
+        guard result.terminationStatus == 0 else {
+            let message = result.stderrString.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            return .failure(LinuxDevboxMonitorFailure(
+                message: message.isEmpty
+                    ? "SSH pool authority status failed with status \(result.terminationStatus)"
+                    : message
+            ))
+        }
+        guard !result.stdoutTruncated, !result.stderrTruncated else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Pool authority status output was truncated"
+            ))
+        }
+        return decodePoolAuthorityObservation(result.stdout)
+    }
+
+    private static func validatePoolAuthorityRequestObservation(
+        _ observation: PoolAuthorityObservation,
+        request: PoolAuthorityRequest,
+        requiresEpochAdvance: Bool,
+        now: Date,
+        resolution: (PoolAuthorityObservation) -> PoolAuthorityRequestResolution
+    ) -> Result<PoolAuthorityRequestResolution, LinuxDevboxMonitorFailure> {
+        let requestIdMatches = UUID(uuidString: observation.requestId)
+            == UUID(uuidString: request.requestId)
+        let epochMatches = requiresEpochAdvance
+            ? observation.epoch > request.expectedEpoch
+            : observation.epoch >= request.expectedEpoch
+        guard requestIdMatches,
+              observation.desiredProviderAccountId == request.selector,
+              epochMatches,
+              observation.isFresh(at: now) else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Pool authority response does not match the requested target, request ID, epoch, or freshness",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
+        return .success(resolution(observation))
     }
 
     static func pollAccount(
@@ -1902,6 +2258,14 @@ enum LinuxDevboxMonitor {
 
     static func remoteSwapCommand(selector: String) -> String {
         "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli swap \(shellQuote(selector))"
+    }
+
+    static func remotePoolAuthorityStatusCommand() -> String {
+        "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli pool-authority-status --json"
+    }
+
+    static func remotePoolTargetRequestCommand(_ request: PoolAuthorityRequest) -> String {
+        "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli request-pool-target \(shellQuote(request.selector)) --request-id \(shellQuote(request.requestId)) --expected-epoch \(request.expectedEpoch) --reason \(shellQuote(request.reason)) --json"
     }
 
     static func scpArgumentCandidates(settings: LinuxDevboxMonitorSettings) -> [[String]] {

@@ -80,28 +80,28 @@ struct AccountCardViewTests {
         )
     }
 
-    @Test("Primary click triggers a manual swap for inactive accounts")
+    @Test("Primary click requests a pool-target switch for non-target accounts")
     @MainActor
-    func primaryClickTriggersSwap() {
+    func primaryClickRequestsPoolTargetSwitch() {
         let account = makeAccount(isActive: false)
         var didSwap = false
         let view = AccountCardView(account: account, pollingError: nil, onReauthenticate: nil, onForceSwap: {
             didSwap = true
         })
 
+        #expect(AccountCardView.switchPoolTargetLabel == "Switch pool target to this account")
         #expect(view.handlePrimaryClick())
         #expect(didSwap)
     }
 
-    @Test("Primary click ignores the runtime-current account")
+    @Test("Primary click ignores the configured pool target")
     @MainActor
-    func primaryClickIgnoresRuntimeCurrentAccount() {
+    func primaryClickIgnoresConfiguredPoolTarget() {
         let account = makeAccount(isActive: true)
         var didSwap = false
         let view = AccountCardView(
             account: account,
             isConfigured: true,
-            isRuntimeCurrent: true,
             pollingError: nil,
             onReauthenticate: nil,
             onForceSwap: {
@@ -113,15 +113,14 @@ struct AccountCardViewTests {
         #expect(!didSwap)
     }
 
-    @Test("Primary click retries a configured account whose runtime is not current")
+    @Test("A pool target never becomes a second switch action during host mismatch")
     @MainActor
-    func primaryClickRetriesConfiguredNonCurrentAccount() {
+    func poolTargetDoesNotBecomeAnotherSwitchActionDuringMismatch() {
         let account = makeAccount(isActive: true)
         var didSwap = false
         let view = AccountCardView(
             account: account,
             isConfigured: true,
-            isRuntimeCurrent: false,
             pollingError: nil,
             onReauthenticate: nil,
             onForceSwap: {
@@ -129,8 +128,9 @@ struct AccountCardViewTests {
             }
         )
 
-        #expect(view.handlePrimaryClick())
-        #expect(didSwap)
+        #expect(AccountCardView.poolTargetLabel == "Pool Target")
+        #expect(!view.handlePrimaryClick())
+        #expect(!didSwap)
     }
 
     @Test("Primary click triggers re-authentication for stale accounts")
@@ -166,25 +166,15 @@ struct AccountCardViewTests {
             pollingError: nil,
             onReauthenticate: nil,
             onForceSwap: {}
-        ).primaryActionAccessibilityHint == "Switch Mac to this account")
+        ).primaryActionAccessibilityHint == "Switch pool target to this account")
 
         #expect(AccountCardView(
             account: account,
             isConfigured: true,
-            isRuntimeCurrent: false,
             pollingError: nil,
             onReauthenticate: nil,
             onForceSwap: {}
-        ).primaryActionAccessibilityHint == "Retry Mac runtime activation")
-
-        #expect(AccountCardView(
-            account: account,
-            isConfigured: true,
-            isRuntimeCurrent: true,
-            pollingError: nil,
-            onReauthenticate: nil,
-            onForceSwap: {}
-        ).primaryActionAccessibilityHint == "Mac runtime is already using this account")
+        ).primaryActionAccessibilityHint == "This account is the pool target")
 
         #expect(AccountCardView(
             account: account,

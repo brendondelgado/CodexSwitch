@@ -12,5 +12,6 @@ struct SwapEvent: Codable, Sendable {
         case tokenInvalidated
         case usageUnavailable
         case manual
+        case poolAuthority
     }
 }

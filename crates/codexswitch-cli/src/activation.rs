@@ -125,7 +125,7 @@ pub(crate) struct RuntimeActivationLease {
 }
 
 impl RuntimeActivationLease {
-    fn require_store(&self, store_path: &Path) -> Result<()> {
+    pub(crate) fn require_store(&self, store_path: &Path) -> Result<()> {
         if self.store_path != store_path {
             bail!(
                 "runtime-activation lease belongs to {}, not {}",

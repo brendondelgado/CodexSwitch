@@ -39,6 +39,8 @@ cross_dependencies:
   - Sources/CodexSwitch/Services/SwapEngine.swift
   - crates/codexswitch-cli/src/codex_update.rs
   - crates/codexswitch-cli/src/daemon.rs
+  - crates/codexswitch-cli/src/pool_authority.rs
+  - crates/codexswitch-cli/src/remote_authority.rs
   - crates/codexswitch-cli/src/quota.rs
   - crates/codexswitch-cli/src/account_store.rs
   - crates/codexswitch-cli/src/patched_codex.rs
@@ -55,6 +57,7 @@ cross_dependencies:
   - Sources/CodexSwitch/App/AppDelegate.swift
   - Sources/CodexSwitch/Models/AccountManager.swift
   - Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  - Sources/CodexSwitch/Services/PoolAuthority.swift
   - Sources/CodexSwitch/Services/NotificationManager.swift
   - Sources/CodexSwitch/Services/SingleInstanceLock.swift
   - Tests/CodexSwitchTests/SwapEngineTests.swift
@@ -196,22 +199,27 @@ runtime has already rejected.
 
 ## Pool Authority Contract
 
-The VPS daemon is the sole writer of the pool's token-free authority record.
+The VPS daemon is the autonomous policy owner for the pool's token-free
+authority record. Daemon and CLI mutations serialize through the same runtime
+lease and secure authority-journal lock.
 The record contains a monotonically increasing epoch, one desired stable
 provider identifier, the request ID that selected it, phase
-`stable`/`converging`/`degraded`, and bounded per-host convergence summaries. It
-contains no OAuth token, refresh token, identity token, or raw auth payload.
+`stable`/`converging`/`degraded`, and bounded non-secret rotation-operation
+outcomes. Per-host convergence is verified separately against that target. The
+record contains no OAuth token, refresh token, identity token, or raw auth
+payload.
 
 Every Mac manual switch, automatic quota rotation, and injected runtime-limit
 rotation is remote-first:
 
 1. Generate or reuse one request ID for the logical operation.
-2. Submit it through the SSH CLI path to the VPS daemon.
+2. Submit it through the SSH CLI path to the VPS authority transaction.
 3. Receive the idempotent result and committed authority epoch.
 4. Converge Mac credentials and runtimes to that exact epoch and target.
 5. Publish Mac convergence evidence without changing the desired target.
 
-The VPS daemon serializes manual requests and autonomous rotation. Replaying a
+The shared VPS runtime lease and authority lock serialize manual requests and
+autonomous rotation. Replaying a
 request ID returns its original result and never advances the epoch twice. A
 different request that races with a `converging` or `degraded` epoch cannot
 select another target; it waits, returns the current state, or fails explicitly.
@@ -235,6 +243,18 @@ The VPS is always required. An offline Mac that is not participating is
 offline/not required, allowing VPS standalone operation to reach `stable`.
 After the Mac requests or begins adoption for an epoch, its result is tracked
 explicitly and credential sync cannot satisfy that convergence requirement.
+
+Mac CLI transport is configured by the token-free mode-`0600` file
+`~/.codexswitch/remote-authority.json`. Verify that it contains an enabled
+endpoint and canonical private-key path but no tokens or private-key bytes.
+Normal OpenSSH aliases remain available; CodexSwitch still forces batch mode,
+the selected identity, strict host-key verification, one connection attempt,
+and bounded timeouts.
+
+Runtime-limit rotation uses a durable operation ID on both sides. If SSH times
+out after the VPS commits, rerunning the Mac operation must reconcile that same
+ID from read-only status and complete local adoption. It must not redeem another
+banked reset or advance a second epoch.
 
 ## Swap Commit Contract
 
@@ -1106,6 +1126,10 @@ Before claiming hot-swap is fixed or ready:
   `stable`/`converging`/`degraded` phase.
 - [ ] Replaying the same target request ID returns the same epoch and target
   without a second account-store write, runtime reload, or notification.
+- [ ] Replaying a timed-out rotation operation ID returns the recorded target
+  and banked-reset result without consuming another reset.
+- [ ] `~/.codexswitch/remote-authority.json` is owner-only, token-free, enabled
+  whenever an endpoint is configured, and resolves the configured SSH alias.
 - [ ] Concurrent Mac manual, Mac automatic, and VPS automatic requests produce
   one serialized desired target; no host publishes a second legitimate active
   account.
@@ -1250,7 +1274,9 @@ Every future hot-swap change must include tests for:
   mismatches, and host evidence bound to another epoch.
 - The UI renders one desired target plus per-host convergence and never derives
   authority from quota movement, email, credential bundles, or local active
-  flags.
+  flags. The authority target remains first while a host converges.
+- Remote rotation timeout reconciliation reuses one operation ID and cannot
+  duplicate a banked-reset effect.
 - Marker-only binaries are **not** ready without live acknowledgement.
 - A fresh ACK from the running PID remains authoritative when the executable at that path was replaced after process start or the executable path cannot be resolved.
 - Desktop readiness rejects binaries that reload backend auth without broadcasting `account/updated` to the shell.

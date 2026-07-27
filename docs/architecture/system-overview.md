@@ -19,11 +19,15 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/KeychainStore.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../Sources/CodexSwitch/Services/RateLimitResetService.swift
+  - ../../Sources/CodexSwitch/Services/PoolAuthority.swift
+  - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
   - ../../Tests/CodexSwitchTests/KeychainStoreTests.swift
   - ../../Tests/CodexSwitchTests/SharedPolicyFixtureTests.swift
   - ../../Tests/Fixtures/Policy
   - ../../crates/codexswitch-cli/src/daemon.rs
   - ../../crates/codexswitch-cli/src/account_store.rs
+  - ../../crates/codexswitch-cli/src/pool_authority.rs
+  - ../../crates/codexswitch-cli/src/remote_authority.rs
   - ../../scripts/codex-vps
   - ../../scripts/patch-asar.py
   - ../../scripts/test_patch_asar.py
@@ -119,13 +123,17 @@ Activation records source and target account, store generation, complete token h
 The VPS persists one token-free authority record containing a monotonically
 increasing epoch, exactly one desired provider account identifier, a bounded
 request identifier for idempotency, phase (`stable`, `converging`, or
-`degraded`), reason, timestamps, and per-host convergence summaries. It contains
-no access, refresh, or identity tokens.
+`degraded`), reason, timestamps, and bounded non-secret rotation outcomes. It
+contains no access, refresh, or identity tokens. Host convergence is observed
+separately against that one desired identity.
 
-Only the VPS coordinator advances the authority epoch. Mac manual and automatic
-swap requests are remote-first authority requests. A repeated request identifier
-returns the existing result, while a different request carrying a stale expected
-epoch is rejected without changing authority or host credentials.
+Only a transaction serialized through the VPS runtime lease and authority
+journal lock advances the epoch. Mac manual and automatic swap requests are
+remote-first authority requests. A repeated request or rotation operation
+identifier returns the existing result, while a different request carrying a
+stale expected epoch is rejected without changing authority or host credentials.
+The Mac SSH transport config is token-free, mode `0600`, and separate from
+readiness-notification enablement.
 
 ### Reset Attempt
 

@@ -173,7 +173,7 @@ impl RateLimitResetCredit {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SmartResetReason {
     WeeklyExhausted,
@@ -797,6 +797,7 @@ pub struct ResetOrchestrationContext<'a> {
     pub candidate_observations: Option<&'a CurrentQuotaObservations>,
     pub allow_reset: bool,
     pub direct_runtime_usage_limit: bool,
+    pub operation_id: Option<Uuid>,
     pub refresh_strategy: ResetQuotaRefreshStrategy,
     pub now: DateTime<Utc>,
 }
@@ -914,6 +915,7 @@ where
         candidate_observations,
         allow_reset,
         direct_runtime_usage_limit,
+        operation_id,
         refresh_strategy,
         now,
     } = context;
@@ -956,7 +958,7 @@ where
         )
     });
     let reason = reason.flatten();
-    let flow = reconcile_or_attempt_reset_with_provider_guard(
+    let flow = reconcile_or_attempt_reset_with_provider_guard_and_request_id(
         ResetReconciliationContext {
             store_lock,
             account: &mut accounts[reset_account_index],
@@ -971,6 +973,7 @@ where
             &mut consume,
         ),
         &mut validate_provider_io,
+        operation_id,
     )?;
 
     let completion = if flow.is_usable_success() {
@@ -1026,7 +1029,27 @@ where
 pub fn reconcile_or_attempt_reset_with_provider_guard<B, Q, C, V>(
     context: ResetReconciliationContext<'_>,
     dependencies: ResetReconciliationDependencies<B, Q, C>,
+    validate_provider_io: V,
+) -> Result<ResetFlowResult>
+where
+    B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
+    Q: FnMut(&mut CodexAccount) -> Result<()>,
+    C: FnMut(&CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    V: FnMut(&AccountStoreLock) -> Result<()>,
+{
+    reconcile_or_attempt_reset_with_provider_guard_and_request_id(
+        context,
+        dependencies,
+        validate_provider_io,
+        None,
+    )
+}
+
+fn reconcile_or_attempt_reset_with_provider_guard_and_request_id<B, Q, C, V>(
+    context: ResetReconciliationContext<'_>,
+    dependencies: ResetReconciliationDependencies<B, Q, C>,
     mut validate_provider_io: V,
+    preferred_request_id: Option<Uuid>,
 ) -> Result<ResetFlowResult>
 where
     B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
@@ -1052,6 +1075,7 @@ where
         previous_bank,
         observed_bank,
         attempt_reset,
+        preferred_request_id,
         now,
         dependencies,
         &mut validate_provider_io,
@@ -1068,6 +1092,7 @@ fn reconcile_or_attempt_reset_inner<B, Q, C, V>(
     previous_bank: Option<RateLimitResetBank>,
     observed_bank: RateLimitResetBank,
     attempt_reset: bool,
+    preferred_request_id: Option<Uuid>,
     now: DateTime<Utc>,
     dependencies: ResetReconciliationDependencies<B, Q, C>,
     validate_provider_io: &mut V,
@@ -1104,9 +1129,29 @@ where
                 return Ok(ResetPreparation::Suppressed(manual_review.reason.clone()));
             }
 
-            let mut active_attempt = journal.attempts.iter().rposition(|attempt| {
-                (attempt.account_id == account.account_id || attempt.local_account_id == account.id)
-                    && attempt.state.suppresses_redemption()
+            let preferred_attempt = preferred_request_id.and_then(|request_id| {
+                journal
+                    .attempts
+                    .iter()
+                    .position(|attempt| attempt.request_id == request_id)
+            });
+            if let Some(index) = preferred_attempt {
+                let attempt = &journal.attempts[index];
+                if attempt.account_id != account.account_id
+                    && attempt.local_account_id != account.id
+                {
+                    bail!(
+                        "reset operation ID {} belongs to a different provider account",
+                        attempt.request_id
+                    );
+                }
+            }
+            let mut active_attempt = preferred_attempt.or_else(|| {
+                journal.attempts.iter().rposition(|attempt| {
+                    (attempt.account_id == account.account_id
+                        || attempt.local_account_id == account.id)
+                        && attempt.state.suppresses_redemption()
+                })
             });
 
             if active_attempt.is_none() {
@@ -1153,7 +1198,7 @@ where
                 .oldest_expiring_available_credit(now)
                 .and_then(RateLimitResetCredit::normalized_id)
                 .map(str::to_string);
-            let request_id = Uuid::new_v4();
+            let request_id = preferred_request_id.unwrap_or_else(Uuid::new_v4);
             journal.attempts.push(new_reset_attempt(
                 account,
                 &observed_bank,
