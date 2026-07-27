@@ -17,6 +17,8 @@ toc:
   - Policy Examples
   - Shared Test Contract
 cross_dependencies:
+  - system-overview.md
+  - runtime-and-host-ownership.md
   - ../../Sources/CodexSwitch/Models/QuotaSnapshot.swift
   - ../../Sources/CodexSwitch/Services/UsageResponseParser.swift
   - ../../Sources/CodexSwitch/Services/SwapEngine.swift
@@ -30,7 +32,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-21
+  last_updated: 2026-07-27
 ---
 
 # Quota And Reset Policy
@@ -91,17 +93,30 @@ An account is immediately usable only when all are true:
 
 Unknown and stale accounts are observable but cannot outrank confirmed usable accounts.
 
-The switching and reset paths share the same candidate eligibility and deterministic ranking implementation. Semantic entry points may narrow that common candidate set, for example to higher plan tiers, but must not reimplement freshness, usability, or ordering.
+The switching and reset paths share the same candidate eligibility and
+deterministic ranking implementation. When a VPS is configured, the VPS daemon
+is the sole policy and desired-target authority. Mac manual actions, automatic
+quota reactions, and injected runtime limit signals submit idempotent requests
+to that authority over the SSH CLI path; they do not rank and activate a local
+replacement first. Semantic entry points may narrow the common candidate set,
+for example to higher plan tiers, but must not reimplement freshness, usability,
+or ordering.
 
-Reset conservation evaluates every immediately usable account, including the active account. Switching may exclude the active account because it cannot be its own destination, but that exclusion must not hide usable capacity when deciding whether another account may spend a reset.
+Reset conservation evaluates every immediately usable account, including the
+authority-selected target. Switching may exclude that target because it cannot
+be its own destination, but that exclusion must not hide usable capacity when
+deciding whether another account may spend a reset.
 
 ## Background Polling
 
-The active account is always the first quota observation on a healthy daemon
-tick. Background maintenance must not delay that safety check by polling every
-stale inactive account serially.
+The authority-selected account is always the first quota observation on a
+healthy VPS daemon tick. Background maintenance must not delay that safety check
+by polling every stale inactive account serially. A Mac quota observer may
+refresh presentation data and submit evidence to the authority, but observation
+alone cannot select or activate a target and must not cause polling or inference
+side effects on authority reads.
 
-When the active account remains usable and no cached plan upgrade requires a
+When the authority-selected account remains usable and no cached plan upgrade requires a
 rotation, a tick may probe at most one due inactive account. Selection is
 deterministic and fair across successive polling buckets, and a failed probe
 does not advance that account's quota freshness. A required rotation is
@@ -111,6 +126,10 @@ whose current observation cannot safely authorize selection.
 ## Candidate Ranking
 
 The policy optimizes for fast inference first, usable capacity second, and churn avoidance third.
+The VPS daemon evaluates this policy inside one serialized authority transaction.
+It commits at most one new desired provider identifier and monotonically
+increasing epoch for a request ID; host convergence happens after that durable
+decision. A retry with the same request ID returns the original result.
 
 Use this order:
 
@@ -142,7 +161,7 @@ Before redemption:
 1. Confirm the account is genuinely blocked by quota, not stale auth or transport failure.
 2. Confirm an unused reset exists in a fresh inventory generation.
 3. Confirm there is no unresolved attempt for the same stable provider account.
-4. Evaluate usable Pro accounts, then usable Plus accounts, including the active account.
+4. Evaluate usable Pro accounts, then usable Plus accounts, including the authority-selected target.
 5. Evaluate time until natural recovery.
 
 A reset is normally suppressed when the account's natural weekly recovery is within 24 hours. It may be used inside that guard only when all higher-priority capacity is unavailable and work requires capacity now. The decision and exception reason must be recorded.
@@ -153,15 +172,22 @@ A stale positive snapshot cannot authorize selection or activation. A stale deni
 
 ## Durable Redemption
 
-The Mac menu app is the sole automatic redemption owner. The VPS daemon has no
-automatic-reset option. An explicit operator command may request one manual
-redemption, but it does not create a second background owner.
+When a VPS is configured, its daemon is the sole automatic redemption owner as
+part of the same serialized policy domain that owns rotation. Mac automatic
+policy and manual controls submit requests through the SSH CLI transport and
+adopt the returned authority observation. If the configured VPS is unavailable,
+the Mac fails closed without redeeming, selecting, or activating another
+account. A deliberately unconfigured standalone Mac may use the same journaled
+domain locally, but it cannot run concurrently as a second owner of a configured
+VPS pool.
 
-`codexswitch-cli redeem-reset <account>` is that manual entrypoint. It accepts
-one exact account selector, requires a paid account with complete runtime
+`codexswitch-cli redeem-reset <account>` is the manual entrypoint. On a
+configured Mac it submits one idempotent request to the VPS daemon; on the VPS
+it enters the daemon's local serialized policy transaction. It accepts one
+exact account selector, requires a paid account with complete runtime
 credentials, a normalized stable provider identity, a fresh blocked quota
 observation, and a fresh available credit with an explicit future expiration,
-and never changes the active account or auth file. Each invocation uses the canonical account-store reset journal,
+and never changes the authority target or auth file. Each invocation uses the canonical account-store reset journal,
 submits at most one credit, reconciles a newer inventory and quota observation,
 and commits the refreshed target account before reporting success. A usable
 account, a free account, an unknown or stale quota, or an unresolved prior
@@ -187,7 +213,8 @@ authorize the next credit against the older quota observation.
 
 The final in-process authorization re-fetches quota and inventory and requires
 the complete available-credit list and count to match the prepared attempt. It
-also revalidates the exact activation generation and phase, mutation lease,
+also revalidates the exact authority epoch and desired provider identifier,
+activation generation and phase, mutation lease,
 durable configured files, external-redemption hold, and the complete submitted
 journal value. The journal readback must exactly equal the expected submitted
 attempt, including account, credit, starting count, bank and quota timestamps,
@@ -218,8 +245,10 @@ duplicate-spend protection.
 ## Manual Redemption
 
 The menu app exposes the same one-account manual operation on each eligible
-account. The action names the account, confirms before submission, and consumes
-only that account's oldest-expiring available credit. It requires a fresh paid
+account. With a configured VPS, the action is a remote request rather than a
+local effect; authority unavailability disables it with an explicit reason.
+The action names the account, confirms before submission, and consumes only
+that account's oldest-expiring available credit. It requires a fresh paid
 account inventory whose available credits all have normalized identifiers and
 explicit future expirations, complete runtime credentials, a fresh quota
 observation proving that the account is blocked, no unresolved attempt for the
@@ -255,8 +284,8 @@ churn and cannot finalize the attempt without explicit consumed evidence.
 Inventory `fetchedAt` is the response-completion time, never the request-start
 time, so a credit expiring while the GET is in flight cannot appear unexpired.
 
-A manual redemption never changes the configured account, writes `auth.json`,
-initiates a swap, or reloads a local runtime. It may proceed from an exact
+A manual redemption never changes the authority target or configured account,
+writes `auth.json`, initiates a swap, or reloads a local runtime. It may proceed from an exact
 `confirmed` or `committed_degraded` activation journal when the durable
 configured files and exclusive mutation lease still match. The UI remains in
 redeeming or reconciling state until a
@@ -293,7 +322,8 @@ hold.
 - Render an observation older than the runtime freshness contract as
   `quota=stale`; never print its cached percentages as current capacity.
 - Label weekly-only operation through the meter itself; do not show an alarming missing-five-hour error.
-- Separate local Mac status from VPS status.
+- Present exactly one authority-selected pool target, plus separate Mac and VPS
+  convergence details for that target. Never style two accounts as current.
 - Separate remaining quota from reset inventory.
 - Attribute the next reset expiration to its account and sort expiration
   notices by urgency, then exact expiration.
@@ -309,10 +339,12 @@ hold.
   show the exhausted state and every observed natural-reset timestamp/countdown.
   A denial label must not discard usable recovery metadata.
 - Do not let a cached UI percentage override fresher runtime/API evidence.
-- Before rotating because of an apparent limit, poll the active account when
-  possible and persist the observation with its fetch time. A fresh provider
+- Before rotating because of an apparent limit, poll the authority-selected account when
+  possible and persist the observation with its fetch time, then submit the
+  evidence in an idempotent authority request. A fresh provider
   denial or typed runtime limit overrides an older cached 100-percent value;
-  the stale value must not keep an exhausted account selected.
+  the stale value must not keep an exhausted account selected. The Mac does not
+  activate the candidate before receiving the authority epoch.
 - Quota and reset-inventory network calls never hold the account-store lock.
   Their results commit only after a generation recheck, so a slow poll cannot
   block a manual swap and cannot overwrite a newer activation.
@@ -341,4 +373,7 @@ Swift and Rust must consume the same fixture scenarios and produce equivalent do
 - natural-reset guard boundaries;
 - timeout and crash recovery during redemption;
 - changed local identity for the same provider account;
+- idempotent request replay and monotonically increasing authority epochs;
+- authority unavailable on a configured Mac, with no local selection effect;
+- one desired target with independent Mac and VPS convergence outcomes;
 - UI absence versus zero semantics.

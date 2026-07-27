@@ -4,7 +4,9 @@ description: Canonical Mac, VPS, activation, reload, remote-session, update, and
 toc:
   - Runtime And Host Ownership
   - Purpose
-  - One Owner Per Host
+  - One Pool Authority And One Effect Owner Per Host
+  - Pool Authority Protocol
+  - Pool Authority State Machine
   - Account Store Protocol
   - Activation Transaction
   - Runtime Reload
@@ -52,12 +54,13 @@ cross_dependencies:
   - ../../scripts/test_patch_asar.py
   - macos-runtime-discovery.md
   - macos-runtime-artifact.md
+  - system-overview.md
   - ../runbooks/codexswitch-hot-swap-verification.md
   - ../runbooks/linux-repository-deployment.md
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-25
+  last_updated: 2026-07-27
 ---
 
 # Runtime And Host Ownership
@@ -66,24 +69,102 @@ version_control:
 
 This contract prevents the Mac menu app, Mac CLI, VPS daemon, remote monitor, and helper scripts from racing to control the same session or account state.
 
-## One Owner Per Host
+## One Pool Authority And One Effect Owner Per Host
 
-The Mac and VPS are separate activation domains:
+The Mac and VPS are separate credential and runtime convergence domains, but
+they are not separate account-selection domains:
 
-- The Mac coordinator owns Mac account state, `~/.codex/auth.json`, and local reload targets.
-- The VPS coordinator owns VPS account state, VPS `~/.codex/auth.json`, and VPS reload targets.
-- The Mac remote monitor reads VPS observations and displays them.
-- `codex-vps` transports explicit operator actions to the VPS.
+- The VPS coordinator is the sole authority for the pool's desired provider
+  account.
+- The Mac coordinator owns Mac `accounts.json`, `~/.codex/auth.json`, its local
+  activation journal, and Mac reload targets.
+- The VPS coordinator owns the VPS account store, VPS `~/.codex/auth.json`, its
+  local activation journal, and VPS reload targets.
+- The Mac remote monitor reads the authority record and per-host convergence.
+- `codex-vps` and the SSH CLI transport explicit authority requests and
+  observations. They do not create a second decision owner.
 
-A connected remote session does not suppress Mac CLI protection, change the Mac active account, or cause a VPS observation to be written into Mac auth state.
+A connected remote session does not suppress Mac CLI protection. When VPS
+authority is configured, however, the Mac cannot select a replacement account
+locally. Manual clicks, quota exhaustion, token invalidation, plan promotion,
+and runtime usage-limit handling submit a remote-first idempotent request. The
+Mac changes local credentials only after a fresh authority response names the
+target and epoch.
 
-Automatic Mac-to-VPS credential replication does not transfer activation
-ownership. Before exporting, the Mac re-marks the replicated snapshot with the
-freshly observed VPS active provider identity; if that identity is absent from
-the Mac pool, sync fails closed. The VPS imports automatic bundles with
-`update-bundle --preserve-active`, which independently retains its current
-active provider identity. Bundle metadata may describe an active account for a
-manual import, but it is never authoritative during background replication.
+Credential replication is not an authority channel. Background Mac-to-VPS sync
+may update account membership and token material, but it must preserve the
+provider identity selected by the current VPS authority epoch. Bundle metadata,
+array order, Mac `isActive`, and a stale VPS store flag cannot advance or replace
+the authority target.
+
+## Pool Authority Protocol
+
+The VPS persists a bounded token-free authority record under the private
+CodexSwitch state directory. The record contains:
+
+- format version and monotonically increasing `epoch`;
+- exactly one `desiredProviderAccountId`;
+- phase: `stable`, `converging`, or `degraded`;
+- bounded idempotency `requestId`, request reason, and timestamps;
+- the previous epoch and provider identity needed for diagnosis;
+- per-host convergence state and bounded non-secret evidence summaries.
+
+It never contains access, refresh, or identity tokens. The authority record uses
+the same no-follow, owner-checked, mode-`0600`, generation-CAS, atomic rename,
+file `fsync`, parent-directory `fsync`, and exact readback properties as other
+CodexSwitch journals.
+
+The VPS daemon is the autonomous policy owner and the serialized authority
+writer. Local VPS CLI commands and remote Mac requests enter that same
+transaction instead of writing the record independently. Each request carries a
+globally unique request identifier and expected epoch:
+
+- replaying the same request identifier returns its recorded result;
+- a different request with a stale expected epoch is rejected before provider,
+  credential, reset, or reload effects;
+- a request while another target is converging may only reconcile that same
+  epoch and target;
+- only a stable current epoch may admit a new cross-target request.
+
+Authority observation is read-only. Fetching authority status, per-host
+convergence, or a prior request result does not poll quota, refresh tokens,
+redeem a reset, write credentials, or reload a runtime.
+
+Mac adoption requires one fresh, internally consistent observation whose
+authority epoch, desired provider identity, request result, and VPS readiness
+identity agree. Email is presentation metadata only. A stale, unreachable,
+malformed, duplicate, or contradictory observation authorizes no Mac mutation.
+
+## Pool Authority State Machine
+
+```text
+stable(E, A)
+    -> converging(E+1, B)
+    -> stable(E+1, B)
+
+converging(E+1, B)
+    -> degraded(E+1, B)
+    -> converging(E+1, B)   same-target reconciliation only
+    -> stable(E+1, B)
+```
+
+The authority persists `converging(E+1, B)` before either host may present B as
+pool-current. `desiredProviderAccountId` remains singular in every phase.
+
+A validation failure before the new epoch is committed leaves `stable(E, A)`
+unchanged. After `converging(E+1, B)` is durable, automatic rollback to A is
+prohibited because one runtime may already have accepted B. Partial or failed
+host convergence therefore produces `degraded(E+1, B)`, retains B as the sole
+desired target, and blocks another cross-target decision. Recovery retries only
+missing host effects for the same epoch.
+
+If the VPS is configured but unavailable, the Mac preserves process and session
+state but fails closed for manual and automatic account changes. It displays the
+last authority observation as stale and does not label its account pool-current.
+The VPS can continue autonomous operation while the Mac is offline; an offline
+Mac is reported as offline/not required and does not prevent the VPS target from
+becoming stable. When the Mac reconnects, it adopts the latest authority epoch
+before another local account-changing operation is admitted.
 
 ## Account Store Protocol
 
@@ -104,6 +185,14 @@ The containing private directory is mode `0700`. Whole-file writes outside this 
 
 Selection and activation are different phases. An activation succeeds only after the durable state and runtime agree.
 
+Pool selection precedes host activation. When VPS authority is configured, a
+host activation transaction must carry the exact authority epoch and desired
+provider identity that authorized it. The local activation journal binds that
+authority evidence to its existing local account identifier, store generation,
+complete token fingerprint, runtime targets, and acknowledgements. A host may
+retry convergence for that same epoch, but it may not select a different target
+as local recovery.
+
 The Mac invariant is simple: every active credential mutation is
 configured-only until fresh runtime convergence is journaled. This includes an
 account swap, active-token refresh, active-account reauthentication, first
@@ -111,23 +200,26 @@ account activation, and promotion of a target observed in an externally changed
 `auth.json`. Persisting credentials is never itself runtime-current evidence.
 
 ```text
-observe -> choose -> lock -> revalidate -> commit auth/store
-       -> readback -> reload verified targets -> acknowledge -> publish
+observe authority -> lock -> revalidate epoch/target -> commit auth/store
+                  -> readback -> reload verified targets -> acknowledge -> publish
 ```
 
 Startup target discovery is read-only. When `auth.json` names a different known
-account than the durable account-store selection, CodexSwitch must retain the
-durable selection as the compare-and-swap authority until `Preparing` is
-journaled and the activation transaction commits the new selection. It must not
-preselect the observed account in memory or in user defaults before that
-transaction. A journal-free first activation uses the same rule with an
-explicit no-configured-account authority. At the persistence boundary, the
-transaction builds a detached credential snapshot from the latest in-memory
-telemetry, commits and reads back that snapshot under the shared lease, and only
-then publishes the committed selection to memory and user defaults. Publication
-merges any telemetry that changed during the durable write without accepting
-credential or selection drift. Account-set growth is accepted only when the
-committed target is the one new identity, including first-account activation.
+account than the durable account-store selection, neither file may select a pool
+target. With a configured VPS, CodexSwitch retains both as host-local evidence
+until a fresh authority observation names the target; the target entering
+`Preparing` must match that exact epoch and provider identity. With no VPS
+configured, a journal-free standalone first activation uses the existing local
+selection rule.
+
+At the persistence boundary, the transaction builds a detached credential
+snapshot from the latest in-memory telemetry, commits and reads back that
+snapshot under the shared lease, and only then publishes the configured
+selection to memory and user defaults. Publication merges telemetry that changed
+during the durable write without accepting credential or selection drift.
+Account-set growth is accepted only when the committed target is the one new
+identity, including first-account activation. A local durable selection or
+external `auth.json` observation cannot replace the authority target.
 
 Runtime convergence remains a child of the activation transaction and inherits
 its cross-process lease task-local. Detaching convergence loses that proof and
@@ -275,15 +367,15 @@ generation and requires current runtime acknowledgements before `Confirmed`;
 it never clears the barrier from observation alone.
 
 An explicit operator request may escape a valid `CommittedDegraded` barrier by
-selecting another account. It may also escape `ManualReview` only when that
-state was produced by the bounded automatic-retry ceiling. The request starts a
-fresh `Preparing` generation for the selected target and must still commit and
-read back the complete account store and `auth.json` before runtime convergence
-begins. Automatic requests remain blocked, same-target clicks remain
-reconciliation retries, and corrupt, unreadable, ambiguous, or inconsistent
-manual-review states remain hard barriers. This escape exists so a runtime that
-cannot acknowledge one configured account cannot pin the operator to that
-account indefinitely.
+selecting another account only after the VPS authority has committed a newer
+epoch naming that account. It may also escape `ManualReview` only when that
+state was produced by the bounded automatic-retry ceiling and the authority
+target agrees. The request starts a fresh `Preparing` generation for the
+authority-selected target and must still commit and read back the complete
+account store and `auth.json` before runtime convergence begins. Automatic
+requests remain blocked, same-target clicks remain reconciliation retries, and
+corrupt, unreadable, ambiguous, or inconsistent manual-review states remain
+hard barriers.
 
 A `durable_configuration_changed` review is a narrower recoverable case. It may
 start only an explicit or one-shot launch reconciliation for the same configured
@@ -297,12 +389,13 @@ discovered local runtime before publishing `Confirmed`.
 `Confirmed` durably completes the barrier only for the lifetime of its evidence.
 Do not oscillate accounts automatically.
 
-An explicit manual cross-account switch is authorized by the operator request
-plus exact durable agreement between the current account store and `auth.json`;
-it does not require fresh runtime-current proof for the account being left.
-Requiring that proof would make recovery impossible precisely when a runtime is
-stale or cannot acknowledge. The newly selected account is still
-configured-only until strict target runtime convergence succeeds.
+An explicit manual cross-account switch is authorized by the operator request,
+the matching committed VPS authority epoch, and exact durable agreement between
+the current account store and `auth.json`; it does not require fresh
+runtime-current proof for the account being left. Requiring that proof would
+make recovery impossible precisely when a runtime is stale or cannot
+acknowledge. The newly selected account is still configured-only until strict
+target runtime convergence succeeds.
 
 If authorization fails before the credential mutation runs, no configured file
 has changed. The coordinator must restore the prior durable activation state
@@ -434,8 +527,8 @@ or a persistence failure enters `ManualReview`. Observation has typed
 `absent`, `valid`, `invalid`, and `unreadable` outcomes. Absence is normal only
 when no configured auth is expected. A corrupt, symlinked, wrong-mode,
 unreadable, or configured-inconsistent auth file enters `ManualReview` without
-mutating credentials. VPS observations never satisfy or replace Mac runtime
-evidence.
+mutating credentials. VPS authority evidence authorizes only the desired
+target; it never satisfies or replaces Mac runtime evidence.
 
 Activation and reset redemption share one typed account-mutation lease. A lease
 has a monotonically increasing generation and exactly one owner. The owner holds
@@ -709,17 +802,23 @@ and fingerprint, then retries verified runtime convergence. The repair publishes
 active provider identity, incomplete token set, store/auth mismatch, malformed
 journal, or unknown activation kind remains a hard barrier.
 
-After a Rust CLI activation commits both shared credential files, the running
-Swift menu app observes the new `auth.json` identity and adopts the already
-selected `accounts.json` target through the external-handoff path above. The
-Swift app must not require its short-lived evidence lease for the previous
+After an authority-approved Rust CLI activation commits both shared credential
+files, the running Swift menu app may adopt the handoff only when the fresh pool
+authority epoch and desired provider identifier exactly match the selected
+`accounts.json` target. On the Mac, `swap` and `rotate-now` submit an
+idempotent request to the VPS authority over the existing SSH CLI transport,
+observe the committed epoch, and only then perform local host convergence. On
+the VPS, the same commands enter the daemon's serialized authority transaction;
+they do not write an independent desired target.
+
+The Swift app must not require its short-lived evidence lease for the previous
 target to remain current, and it must not keep presenting the previous account
-while the shared files select the new one. It does not rewrite the Rust-owned
-store generation during adoption. It still independently proves the new runtime
-ACK before updating its activation journal and runtime-current UI.
-An account newly imported by the Rust CLI is eligible for this same adoption;
-the stale Swift in-memory account list is not used as the authority for deciding
-whether the provider identity is known.
+after the authority and shared files select the new one. It does not rewrite
+the Rust-owned store generation during adoption. It still independently proves
+the new runtime ACK before updating its activation journal and per-host
+convergence UI. An account newly imported by the Rust CLI is eligible for this
+same adoption only after the VPS authority selects it; the stale Swift
+in-memory account list and the imported bundle's active bit are not authority.
 
 Legacy `ManualReview` records created solely by the former degraded-token-set
 mismatch are eligible for the same repair only when their version, rotation
@@ -844,17 +943,24 @@ operations pass through the same prior-barrier convergence before parsing can
 lead to any store or auth mutation.
 
 In-runtime usage-limit and authentication-failure rotation uses the same
-external reload protocol as every other Rust activation. The injected runtime
-obtains its already verified auth binding, passes that exact path to
-`codexswitch-cli`, and never substitutes `~/.codex/auth.json`. The CLI keeps the
-activation pending while it sends the path-and-fingerprint reload request and
-waits for the runtime acknowledgement. The turn retries only after the CLI
-reports verified convergence and the turn's `AuthManager` independently reloads
-that same path and proves the reported complete fingerprint. Before the injected
-turn uses an ACK-sourced path, it reopens the bounded ACK and matching request
+authority request and external reload protocol as every other Rust activation.
+The injected runtime obtains its already verified auth binding, passes that
+exact path to `codexswitch-cli`, and never substitutes
+`~/.codex/auth.json`. On the Mac, the CLI forwards the idempotent rotation
+request to the VPS authority over SSH and waits for the resulting epoch before
+starting local convergence. On the VPS, it submits the request to the local
+daemon authority transaction. Neither path selects a target independently.
+
+The CLI keeps host activation pending while it sends the
+path-and-fingerprint reload request and waits for the runtime acknowledgement.
+The turn retries only after the CLI reports verified convergence to the exact
+authority epoch and the turn's `AuthManager` independently reloads that same
+path and proves the reported complete fingerprint. Before the injected turn
+uses an ACK-sourced path, it reopens the bounded ACK and matching request
 without following symlinks, proves freshness, runtime kind, request nonce,
-current process start identity, and the current on-disk complete fingerprint.
-Stale PID artifacts or a changed auth file disable rotation.
+authority epoch, desired provider identifier, current process start identity,
+and the current on-disk complete fingerprint. Stale PID artifacts, a changed
+auth file, or an authority mismatch disable rotation.
 
 On Linux, marker and executable inspection opens the kernel-resolved process
 executable without following a mutable user path, requires a regular file, and
@@ -887,9 +993,11 @@ exception.
 
 Background cross-host replication must pass `update-bundle --preserve-active`.
 The command merges credential changes into the VPS pool while retaining the
-VPS coordinator's active provider identity, then converges that same identity
-through the normal activation barrier. An incoming bundle cannot select the VPS
-active account merely because another host marked it active.
+authority-selected provider identity at its current epoch, then converges that
+same identity through the normal activation barrier. An incoming bundle cannot
+select the pool target merely because another host marked it active. If the
+authority target is absent from the merged store, the update fails before
+mutation instead of silently choosing a replacement.
 
 The Rust account-store implementation anchors traversal at a trusted root and
 opens every component with `openat` plus `O_NOFOLLOW`. Lock, store, and temporary
@@ -931,7 +1039,9 @@ capturing `AppDelegate` inside a `MainActor.run` closure. The background work
 therefore remains off the UI actor while the state mutation has one explicit
 actor boundary on every supported Swift 6 toolchain.
 
-- The menu app presents local account state and read-only VPS state separately.
+- The menu app presents one pool-wide desired account from a fresh VPS
+  authority observation. Mac and VPS status are per-host convergence details
+  for that one target, not separate active-account selections.
 - The ChatGPT desktop and CodexSwitch share one patched local app-server on
   `ws://127.0.0.1:9223`. CodexSwitch keeps that bridge alive and publishes
   `CODEX_APP_SERVER_WS_URL` before ChatGPT starts. Private stdio app-server
@@ -946,39 +1056,43 @@ actor boundary on every supported Swift 6 toolchain.
   the strict SIGHUP acknowledgement remain mandatory. The account-verification
   connection stays open through that acknowledgement so the activation proves
   a completed frontend write before releasing its transport.
-- Provider quota is shared, but runtime ownership is host-specific. Every account
-  card presents simultaneous `Mac Configured`, `Mac Runtime`, and `VPS Runtime`
-  fields, including when the configured and runtime-current Mac identities are
-  the same. The card perimeter must not imply one pool-global active account:
-  Mac configured/runtime state and VPS runtime-current state use independent
-  edge accents, and the popover header explicitly labels the configured identity
-  as Mac-local. One account may be `Mac Runtime Current` while another is
-  `VPS Runtime Current`. VPS current is
-  derived only from a fresh, successful remote account-state observation whose
-  explicit `isActive` record carries a bounded non-secret stable provider account
-  identifier that exactly matches the local record and independently agrees with
-  the readiness snapshot's provider identifier. Email is display metadata only.
-  Duplicate local provider identifiers, duplicate active remote identifiers, or
-  readiness identity A plus account-state identity B is contradictory and remains
-  unknown through integration; neither source may overwrite the other. Duplicate
-  emails can never mark two cards current. Quota movement never proves VPS
-  ownership. Missing, stale, contradictory, or disconnected remote evidence is
-  labeled unknown or disconnected and never receives Mac-current green styling.
-- `AccountManager` exposes `configuredAccount` and `runtimeCurrentAccount` with
-  distinct meanings. It has no `activeAccount` alias. Generic inactive-account
-  upserts cannot alter configured credentials; configured token mutations require
-  a journaled activation lease.
+- Provider quota is shared, while runtime convergence evidence remains
+  host-specific. Exactly one account card may receive pool-target styling, and
+  only from a fresh, internally consistent authority observation. That card
+  shows `Mac` and `VPS` convergence summaries such as current, pending,
+  degraded, offline, or not required. A host's stale local credential or
+  runtime identity is diagnostic evidence under that target; it never gives a
+  second account card legitimate current styling.
+- Authority observations carry a bounded non-secret stable provider account
+  identifier, epoch, phase, and per-host convergence summaries. The provider
+  identifier must match exactly one local record and agree with any host
+  readiness identity reported for the same epoch. Email is display metadata
+  only. Duplicate provider identifiers, multiple authority targets, a regressed
+  epoch, or readiness identity A plus authority identity B is contradictory
+  and remains unknown through integration. Duplicate emails can never mark two
+  cards current. Quota movement never proves authority or runtime ownership.
+  Missing, stale, contradictory, or disconnected authority evidence is labeled
+  stale, unavailable, or degraded and receives no current styling.
+- `AccountManager` exposes the authority-selected target separately from
+  host-local configured and runtime-current observations. It has no ambiguous
+  `activeAccount` alias. Generic inactive-account upserts cannot alter
+  configured credentials; configured token mutations require a journaled
+  activation lease bound to the current authority epoch.
 - Account cards, status-bar tooltips, popover labels, green rings, and current
-  styling receive runtime-current identity explicitly. Configured quota may still
-  drive a status ring, but until activation is freshly confirmed its label is
-  `Configured`, never `Current`.
+  styling receive the single authority target explicitly. Per-host runtime
+  evidence determines convergence labels, not which account is the target.
+  Quota may still drive a status ring, but without fresh authority its label is
+  never `Current`.
 - On launch, a degraded Mac activation journal restores its same-target barrier
   before polling can select another account. Consistent committed files resume
   bounded convergence retries. Missing targets or inconsistent/corrupt evidence
   enter manual review without changing account files.
-- The popover identifies the host scope as Mac local and shows a concise
-  degraded/restart-required status while the activation barrier is present.
-- Local quota exhaustion can activate another local account even while a VPS connection is open.
+- The popover identifies the pool target once and shows Mac and VPS convergence
+  in a shared status area. Repeated host warnings do not appear on every account
+  card.
+- Local quota exhaustion submits a remote-first authority request. If a VPS is
+  configured but unavailable, the request fails closed: current sessions are
+  preserved, no local target changes, and the UI shows authority unavailable.
 - Launch schedules the synchronous keep-alive installer on a detached utility
   task; watchdog setup and its bounded subprocesses never block the main actor.
 - Desktop browser-partition repair is diagnostic and narrowly scoped. Back up before recreation and never move it while the app is running.
@@ -1000,8 +1114,11 @@ actor boundary on every supported Swift 6 toolchain.
 
 ## VPS Contract
 
-- One Rust coordinator owns automatic VPS account activation.
-- The CLI and daemon share domain functions; they do not implement independent rotation policies.
+- One Rust daemon owns the durable pool authority, autonomous candidate
+  selection, and VPS host activation.
+- The CLI submits idempotent authority requests to the daemon and reads
+  authority observations. It never implements an independent rotation policy
+  or writes the desired target directly.
 - The port-8390 WebSocket service and the built-in SSH `unix://` app-server are
   separate account-bearing runtimes. Both participate in discovery and verified
   reload whenever they are running; `app-server proxy` helpers never do. The
@@ -1082,11 +1199,14 @@ rebinds the record to that exact account, performs and verifies a runtime reload
 then handles any newly requested cross-account activation. Other manual-review
 reasons remain blocked.
 
-The configured Mac account is listed first in the menu. Candidate ranking is
-shown separately as "Next up"; it must not move an inactive candidate above the
-configured account and imply that list order is activation state.
-Configured-only state uses warning styling. Runtime-current emphasis is
-reserved for a fresh `Confirmed` activation record.
+The authority-selected pool target is listed first in the menu when authority
+evidence is fresh. Candidate ranking is shown separately as "Next up"; it must
+not move an inactive candidate above the target or imply that list order is
+activation state. Per-host configured or runtime identities are convergence
+details and never create a second highlighted account. Runtime-current emphasis
+is reserved for host evidence bound to the current authority epoch; stale or
+unavailable authority removes pool-current emphasis without inventing a local
+replacement.
 
 ## Update And Patch Contract
 
@@ -1239,12 +1359,15 @@ Large downloads and binaries are streamed. Reading a multi-gigabyte executable i
 
 A hot-swap claim requires all of:
 
-1. Store generation advanced once.
-2. Active account and auth readback agree.
-3. Complete token hash matches the selected account.
-4. The intended runtime target accepted the reload.
-5. The prior process identity was not confused with a reused PID.
-6. A new request succeeds without exiting and resuming the session.
-7. No unrelated process or remote host state changed.
+1. One authority request ID produced at most one committed epoch advance.
+2. The authority record names exactly one desired provider identifier.
+3. Each required host's store generation advanced at most once for that epoch.
+4. Each converged host's active account and auth readback agree with the
+   authority target.
+5. Each converged host's complete token hash matches the selected account.
+6. Each intended runtime target accepted a reload bound to the authority epoch.
+7. The prior process identity was not confused with a reused PID.
+8. A new request succeeds without exiting and resuming the session.
+9. No unrelated process or non-target account state changed.
 
 A deployment claim additionally requires source provenance, service readiness, post-activation resource checks, and a tested rollback pointer.

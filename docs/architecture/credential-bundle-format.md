@@ -14,6 +14,8 @@ toc:
   - Reconciliation and Retry
   - Polling Distinction
 cross_dependencies:
+  - system-overview.md
+  - runtime-and-host-ownership.md
   - ../../Sources/CodexSwitch/Models/LinuxDevboxBundle.swift
   - ../../Sources/CodexSwitch/Services/LinuxDevboxExportService.swift
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
@@ -22,7 +24,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-13
+  last_updated: 2026-07-27
 ---
 
 # Credential Bundle Format
@@ -57,9 +59,10 @@ duplicate fields, and require exact salt, nonce, tag, and derived-key lengths.
 
 ## Authenticated Payload Consistency
 
-Authenticated metadata is a redundant integrity description, not a hint. A
-version 2 decoder accepts a payload only when all of these values exactly match
-the authenticated account array before any account-selection policy runs:
+Authenticated metadata is a redundant integrity description, not an authority
+claim. A version 2 decoder accepts a payload only when all of these values
+exactly match the authenticated account array before any account-selection
+policy runs:
 
 - `accountCount` equals the array length.
 - `emails` equals the account emails in payload order.
@@ -70,9 +73,13 @@ the authenticated account array before any account-selection policy runs:
 Exporters derive all five fields from the final ordered account array. Importers
 must reject a mismatch instead of repairing metadata, selecting a replacement
 active account, or committing any account-store or auth-file mutation.
-After validation, import preserves that authenticated active identity exactly.
-Plan preference and quota policy do not run between bundle validation and
-persistence.
+The active fields prove only that the payload is internally consistent. They do
+not advance the pool authority epoch or select a VPS target. During
+authority-managed `update-bundle --preserve-active`, import validates the
+payload and then preserves the provider identity selected by the current fresh
+authority record. If that identity is absent from the validated payload, import
+fails before mutation. Only an explicit first-time pool initialization may seed
+an authority record from a validated bundle; ordinary sync cannot.
 
 ## Key Derivation
 
@@ -150,10 +157,11 @@ Before the Mac creates a remote staging directory, it must durably commit one
 token-free operation record under `~/.codexswitch`. The record contains only an
 operation identifier, a target-host fingerprint, the local credential-state
 fingerprint, expected non-secret account-identity and complete credential-set
-fingerprints, the expected active provider account identifier and token-hash
-prefix, the pre-mutation remote evidence, the derived staging paths, timestamps,
-phase, and a human-readable reason. Raw tokens, bundle bytes, passphrases,
-emails, and private keys are forbidden from the journal.
+fingerprints, the expected authority epoch and desired provider account
+identifier, the expected active token-hash prefix, the pre-mutation remote
+evidence, the derived staging paths, timestamps, phase, and a human-readable
+reason. Raw tokens, bundle bytes, passphrases, emails, and private keys are
+forbidden from the journal.
 
 The operation identifier owns both local and remote staging paths. A crash,
 forced exit, or relaunch with a `pending` record is therefore outcome-unknown;
@@ -181,8 +189,10 @@ then reads remote auth diagnostics and token-free account evidence. The evidence
 includes a one-way fingerprint over every account's provider identifier, full
 token tuple, and active flag; raw credentials never leave the VPS. It may
 classify the operation as committed only when that complete credential-set
-fingerprint, the active provider identifier, active token-hash prefix,
-auth/store agreement, and account-identity fingerprint all match the journal.
+fingerprint, authority epoch and desired provider identifier, active token-hash
+prefix, auth/store agreement, and account-identity fingerprint all match the
+journal. Credential-file active flags must agree with the authority-selected
+VPS identity, but they cannot establish authority by themselves.
 Remote account-state output reconstructs only the explicit status fields,
 recursively removes token-named members from nested status objects, and fails
 closed before writing stdout if any raw credential value would otherwise

@@ -5,6 +5,7 @@ toc:
   - CodexSwitch Hot-Swap Verification Runbook
   - Why This Exists
   - Readiness Contract
+  - Pool Authority Contract
   - Swap Commit Contract
   - Rust Runtime Handoff Evidence
   - Mac Activation Barrier Recovery
@@ -28,6 +29,7 @@ toc:
   - Regression Requirements
   - Incident Review Questions
 cross_dependencies:
+  - docs/architecture/system-overview.md
   - docs/architecture/quota-and-reset-policy.md
   - docs/architecture/macos-runtime-discovery.md
   - docs/architecture/runtime-and-host-ownership.md
@@ -78,7 +80,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-25
+  last_updated: 2026-07-27
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -91,11 +93,23 @@ The lesson is blunt: **installation is not behavior**. A green state is only hon
 
 ## Readiness Contract
 
-A Codex runtime is hot-swap ready only when all three facts are true:
+A Codex pool is hot-swap ready only when all four facts are true:
 
-1. **Store state:** CodexSwitch has an active account selected and at least one usable fallback account.
-2. **Auth file state:** `~/.codex/auth.json` matches CodexSwitch's active account token source.
-3. **Runtime state:** each live Codex runtime has acknowledged a reload after the latest swap signal. Process start time is never substitute evidence.
+1. **Authority state:** a fresh VPS authority record names exactly one desired
+   provider account at a monotonically increasing epoch.
+2. **Store state:** each required host selects that exact provider account and
+   has at least one usable fallback account.
+3. **Auth file state:** each required host's `~/.codex/auth.json` matches that
+   host's selected account token source.
+4. **Runtime state:** each required live Codex runtime has acknowledged a reload
+   bound to the current authority epoch. Process start time is never substitute
+   evidence.
+
+When a VPS is configured but its authority record cannot be observed freshly,
+the Mac reports authority unavailable and permits no manual or automatic
+cross-account activation. Existing sessions continue on their current local
+credentials. Status and authority reads must not poll quota, trigger inference,
+write credentials, send signals, or repair runtimes.
 
 Marker strings such as `sighup-verified` and `SIGHUP: auth reloaded` are necessary but not sufficient. They prove the binary was patched; they do not prove the running process loaded the new token.
 
@@ -180,22 +194,68 @@ unusable and select a ready replacement even when the usage endpoint still
 reports apparent headroom; otherwise the retry repeats with credentials the
 runtime has already rejected.
 
+## Pool Authority Contract
+
+The VPS daemon is the sole writer of the pool's token-free authority record.
+The record contains a monotonically increasing epoch, one desired stable
+provider identifier, the request ID that selected it, phase
+`stable`/`converging`/`degraded`, and bounded per-host convergence summaries. It
+contains no OAuth token, refresh token, identity token, or raw auth payload.
+
+Every Mac manual switch, automatic quota rotation, and injected runtime-limit
+rotation is remote-first:
+
+1. Generate or reuse one request ID for the logical operation.
+2. Submit it through the SSH CLI path to the VPS daemon.
+3. Receive the idempotent result and committed authority epoch.
+4. Converge Mac credentials and runtimes to that exact epoch and target.
+5. Publish Mac convergence evidence without changing the desired target.
+
+The VPS daemon serializes manual requests and autonomous rotation. Replaying a
+request ID returns its original result and never advances the epoch twice. A
+different request that races with a `converging` or `degraded` epoch cannot
+select another target; it waits, returns the current state, or fails explicitly.
+Recovery retries converge the same epoch and target. Selecting a replacement
+requires a new serialized authority transaction and a new epoch.
+
+The valid phase transitions are:
+
+```text
+stable(E, A) -> converging(E+1, B) -> stable(E+1, B)
+                                  -> degraded(E+1, B)
+degraded(E, A) -> converging(E, A) -> stable(E, A)
+```
+
+A request rejected before authority commit leaves `stable(E, A)` unchanged.
+After commit, partial host failure does not roll authority back or infer a new
+target. The UI shows B once as the desired pool target and shows each host as
+converged, pending, degraded, offline, or not required.
+
+The VPS is always required. An offline Mac that is not participating is
+offline/not required, allowing VPS standalone operation to reach `stable`.
+After the Mac requests or begins adoption for an epoch, its result is tracked
+explicitly and credential sync cannot satisfy that convergence requirement.
+
 ## Swap Commit Contract
 
-CodexSwitch distinguishes the configured account from the account proven active
-inside each runtime. Writing auth.json and selecting an account in accounts.json
-establishes only configured state. The menu must not label that account current,
-emit SWAP_COMPLETED, or send a success notification until all required live
-local runtimes acknowledge the same account and complete token fingerprint.
+CodexSwitch distinguishes the authority-selected target from the credentials
+configured on each host and the account proven active inside each runtime.
+Writing `auth.json` and selecting an account in `accounts.json` establishes only
+host-configured state. The menu must not report a pool swap stable, emit
+`SWAP_COMPLETED`, or send a success notification until every required host has
+acknowledged the same authority epoch and complete token fingerprint.
 
 A swap is transactional across these boundaries:
 
-1. The account-store update must be durably writable. A disk-full or lock/write
+1. The VPS authority transaction durably commits at most one new epoch and
+   desired provider identifier for the request ID.
+2. Each host account-store update must be durably writable. A disk-full or lock/write
    failure aborts the swap before success is published.
-2. auth.json must be written atomically and read back as the intended account.
-3. Each discovered account-bearing runtime must either acknowledge the new auth
-   generation or be reported explicitly as restart-required.
-4. Status and quota observations from an older swap generation must not be
+3. `auth.json` must be written atomically and read back as the authority target.
+4. Each discovered account-bearing runtime must either acknowledge the new
+   authority epoch and auth generation or be reported explicitly as degraded.
+5. Status and quota observations from an older authority epoch or host
+   activation generation must not be
    allowed to overwrite the current generation.
 
 CLI swap and rotate commands must exit unsuccessfully when any discovered
@@ -220,42 +280,48 @@ a ChatGPT account, compares normalized email when both sides provide one, and
 compares canonical meaningful plan tiers. It must not claim that account ID was
 verified by this endpoint.
 
-When convergence is incomplete, the UI must show configured and runtime state
-separately. Healthy quota for the configured account is not evidence that a
-still-running CLI or desktop process stopped using the prior account.
+When convergence is incomplete, the UI must show the one desired target and
+each host's convergence separately. Healthy quota for the target is not
+evidence that a still-running CLI or desktop process stopped using the prior
+account, and that prior runtime identity does not become a second active card.
 
 ## Rust Runtime Handoff Evidence
 
 For a Rust CLI swap, daemon rotation, import activation, or rotation injected
 from a running Codex turn, require all of the following in one attempt:
 
-1. The durable activation record names the intended store generation and full
-   token fingerprint.
-2. The reload request contains the exact configured absolute auth path. A
+1. The durable authority record names the intended epoch and stable provider
+   identifier, and the request ID resolves idempotently to that record.
+2. The durable host activation record names the same authority epoch, intended
+   store generation, and full token fingerprint.
+3. The reload request contains the exact configured absolute auth path. A
    missing runtime binding is a hard failure; it does not authorize the default
    `~/.codex/auth.json` path.
-3. At least one expected live runtime is signalled, every expected target ACKs,
-   and each ACK matches PID/start identity, nonce, auth path, and both loaded and
-   active fingerprints.
-4. An injected turn parses the CLI's structured result, proves the same auth
-   path and fingerprint, and performs an independent verified reload of its
-   `AuthManager` before retrying.
+4. At least one expected live runtime is signalled, every expected target ACKs,
+   and each ACK matches authority epoch, provider identifier, PID/start
+   identity, nonce, auth path, and both loaded and active fingerprints.
+5. An injected turn parses the CLI's structured result, proves the same
+   authority epoch, auth path, and fingerprint, and performs an independent
+   verified reload of its `AuthManager` before retrying.
 
 When the Mac menu app remains running during a Rust CLI swap, also verify the
 Swift handoff:
 
-1. `accounts.json` and `auth.json` select the same known provider account with
+1. The Mac initiated no local target selection before the VPS returned the
+   committed authority epoch.
+2. `accounts.json` and `auth.json` select the authority's provider account with
    the same complete token set.
-2. The Swift activation journal advances to that account in a fresh activation
-   generation.
-3. The menu-bar configured highlight and runtime-current state both name that
-   account only after fresh runtime convergence.
-4. The Codex/ChatGPT PID is unchanged and the log does not repeat
+3. The Swift activation journal advances to that account in a fresh activation
+   generation bound to the authority epoch.
+4. The menu shows one pool target and reports the Mac runtime current only
+   after fresh runtime convergence.
+5. The Codex/ChatGPT PID is unchanged and the log does not repeat
    `ACTIVATION_CREDENTIAL_MUTATION_BLOCKED ... source=external-auth`.
 
-The handoff may only adopt a store already switched by the Rust CLI. It must not
-rewrite either credential file, rewrite a mismatched store, clear a
-manual-review barrier, or treat durable file agreement as an ACK. Verify that a
+The handoff may only adopt a store already switched for the same fresh
+authority epoch. It must not infer authority from credential files, rewrite a
+mismatched store, clear a manual-review barrier, or treat durable file agreement
+as an ACK. Verify that a
 queued Swift telemetry flush cannot restore the prior active account after
 adoption and that no Swift account-store write occurs during the adoption
 barrier. A stale periodic or termination snapshot must log
@@ -431,7 +497,12 @@ CodexSwitch must evaluate these independently:
 - **Mac local CLI:** only native interactive Codex CLI binaries with the CLI-specific capability marker are signal targets. Wrapper shells, code-mode hosts, `exec` subprocesses, SSH clients, and `--remote` clients are not the account-bearing local runtime. Both `~/.local/bin/codex` and `/opt/homebrew/bin/codex` must resolve their managed launcher target to the native binary before validation. A local launch must fail with a repair instruction when no complete hot-swap runtime is available; it must never silently fall back to the stock npm or desktop-bundled CLI, because that creates a process that can observe exhausted credentials but cannot adopt the next account in-turn.
 - **Mac CLI discovery:** preliminary `pgrep` candidates use exact process-name matching for `codex`. Full-command-line matching is prohibited because unrelated CodexSwitch paths and short-lived tools can make an otherwise valid batch incomplete.
 - **Mac CLI process identity:** after `ps` discovery, reclassify every candidate from its kernel-resolved executable path. Any executable inside a macOS `.app/Contents/` tree is an application or helper, not an interactive Codex CLI, even when an unquoted path segment such as `Codex Computer Use.app` makes the first whitespace-delimited token look like a `codex` binary.
-- **Mac coordinator readiness:** the signed `CodexSwitch.app` menu process owns local polling and rotation; a separate `codexswitch-cli daemon` process is not required on macOS. The compatibility `daemonRunning` doctor field reports whether the platform coordinator is present.
+- **Mac coordinator readiness:** the signed `CodexSwitch.app` menu process owns
+  Mac observation and host convergence; a separate `codexswitch-cli daemon`
+  process is not required on macOS. It submits every cross-account operation to
+  the VPS daemon authority when a VPS is configured. The compatibility
+  `daemonRunning` doctor field reports whether the local platform coordinator
+  is present, not authority ownership.
 - **Mac CLI first ACK:** a current attested managed CLI may receive its first request only when its route, hashes, read-only files, owner, and running executable vnode all match. A historical runtime without the v3 CLI contract requires one exit and resume.
 - **Retry-exhausted CLI recovery:** topology observation runs off the main actor and is throttled. Once historical CLIs are gone, one new all-managed topology may re-arm same-target convergence; an unchanged failing topology must not loop.
 - **Desktop code-mode helper:** `codex-code-mode-host` is a worker owned by the desktop app-server, not an independent interactive CLI. It must not appear as a Mac CLI readiness blocker or receive a standalone auth-reload signal; readiness follows its parent app-server.
@@ -866,30 +937,48 @@ are committed to `main`.
 
 ## Account State Boundaries
 
-Mac CodexSwitch and Linux `codexswitch-cli` run the same eligibility rules, but their daemon/runtime control remains host-local. They should converge on token, plan, quota, subscription, and runtime-blocker state through encrypted Mac -> VPS account-state sync plus each host's own `https://chatgpt.com/backend-api/wham/usage` polling. They must not automatically share active-account selection, runtime acknowledgements, daemon state, or stale `/status` banners from an existing Codex session.
+Mac CodexSwitch and Linux `codexswitch-cli` run the same eligibility rules, but
+the VPS daemon is the only desired-account authority for a configured pool.
+Hosts retain local ownership of credential writes, activation journals, and
+runtime acknowledgements. They converge token, plan, quota, subscription, and
+runtime-blocker state through encrypted Mac -> VPS account-state sync plus each
+host's own `https://chatgpt.com/backend-api/wham/usage` polling. Credential sync
+is never an authority channel.
 
-- A background VPS readiness check may display the VPS active email, but it must not set the Mac active account, rewrite local `auth.json`, or start a Mac auto-swap.
+- A fresh background authority observation may set the Mac's displayed pool
+  target and request same-target Mac convergence. A readiness check, account
+  bundle, active email, quota movement, or stale `/status` banner cannot select
+  a target or advance the epoch.
 - One continuous VPS-not-ready incident may enqueue at most one persisted Mac notification, including across menu-app relaunches. The request uses one stable identifier so Notification Center replaces rather than accumulates the incident. Persist the incident claim before submitting the asynchronous Notification Center request so a relaunch cannot enter a pre-callback duplication gap.
 - A verified ready result or disabling the monitor clears the incident claim and immediately removes any matching delivered or pending notification. Notification add/remove handoffs are serialized: a new incident cannot submit its fixed-ID request until prior cleanup returns, while a late successful callback removes the request again only when no newer durable generation owns that identifier. A failed enqueue clears only its own generation so the next readiness observation can retry; repeated unhealthy observations are therefore safe retry opportunities, not additional notifications.
 - On upgrade, a persisted claim from the preceding array-based latch is promoted to the durable generation latch before notification submission and the legacy key is removed. This preserves one continuous incident across the migration instead of emitting one additional alert.
 - Readiness resolution also removes legacy UUID-suffixed VPS readiness alerts left by older CodexSwitch builds. That asynchronous migration cleanup must exclude the current fixed incident identifier so it cannot delete a replacement notification submitted after cleanup begins.
-- While a live `codex-vps` remote session is intentionally mirroring VPS account state in the menu bar, the VPS daemon owns automatic rotation. The Mac must not execute a second auto-swap from that mirrored state or issue repeated account-swapped notifications.
-- An asynchronous `auth.json` observation may promote a stable external account change, but it must be discarded when the local active account changes while the file read is suspended. The next timer pass can read again; a stale pre-swap observation must never revert a completed swap or re-export the old account to the VPS.
+- The VPS daemon owns automatic rotation whether the Mac is online or offline.
+  The Mac submits limit evidence and adopts the resulting epoch; it must not
+  execute a second local selection or issue repeated swap notifications.
+- An asynchronous `auth.json` observation may update per-host convergence only
+  when it matches the current authority epoch and target. It must be discarded
+  when either changes while the file read is suspended. The next observation
+  can read again; stale local auth can never revert a completed authority
+  transaction or become a new pool target.
 
 When the Mac menu app and VPS CLI disagree, compare safe evidence in this order:
 
-1. Token hash prefix for the account on both hosts.
-2. Live `wham/usage` primary and secondary windows for that token.
-3. `auth-diagnostics` active account and `auth.json` hash on the host that sent the request.
-4. The active Codex session's own `/status`, treating any "limits may be stale" warning as non-authoritative until rechecked.
+1. Durable authority epoch, desired provider identifier, request ID, and phase.
+2. Each host's convergence record for that exact epoch.
+3. Token hash prefix and `auth-diagnostics` readback on each converging host.
+4. Live `wham/usage` windows for the authority-selected token.
+5. The active Codex session's own `/status`, treating any "limits may be stale"
+   warning as non-authoritative until rechecked.
 
 ## Manual Account Controls
 
 Each account card is one manual activation control. Its visible click target and
 default macOS accessibility press action must call the same primary action:
 reauthenticate an unusable account, retry a configured-but-unconfirmed account,
-or switch the Mac to another account. Hover and tooltip helpers must be declared
-non-hit-testable so they cannot intercept that control.
+or request another pool target. With a configured VPS, that target request goes
+to the VPS authority before any Mac credential mutation. Hover and tooltip
+helpers must be declared non-hit-testable so they cannot intercept that control.
 
 The control must remain available while an automatic-retry-limit
 `ManualReview` barrier is visible. A successful press must produce activation
@@ -897,9 +986,10 @@ journal evidence; a visual highlight change without a new activation generation
 is not proof that the request ran.
 
 The manual switch revalidates exact durable source credentials but does not
-require the old runtime to be current. It must then converge the newly selected
-target normally. If authorization stops before credential mutation, verify that
-the prior activation journal was restored and neither configured file changed.
+require the old runtime to be current. It must receive the idempotent authority
+result, then converge the newly selected target normally. If the VPS is
+unavailable or authorization stops before authority commit, verify that the
+epoch, activation journal, and both configured files remain unchanged.
 
 ## Menu App Process Boundaries
 
@@ -919,23 +1009,35 @@ Quota-unavailable is not the same state as reauthentication-required. Placeholde
 
 Authentication failures are different. A 401/token-expired/token-invalidated account must be marked runtime-unusable, excluded from swap candidates and pooled usage, persisted, mirrored between Mac and VPS, and shown as `Needs login` even if an old quota snapshot still exists. Stale exhausted reset text must never hide a known auth blocker.
 
-A direct runtime `usage_limit` signal from Codex is also authoritative. The active account must be marked runtime-unusable and rotated away even if a fresh `/wham/usage` response still reports apparent remaining percentage. The usage endpoint can lag or omit model-specific exhaustion; it must not be allowed to reselect the same account after Codex already refused a request.
+A direct runtime `usage_limit` signal from Codex is authoritative exhaustion
+evidence, not target-selection authority. The signal is submitted with one
+request ID to the VPS daemon, which marks the current target runtime-unusable
+and selects a replacement even if a fresh `/wham/usage` response still reports
+apparent remaining percentage. The usage endpoint can lag or omit
+model-specific exhaustion; it must not be allowed to reselect the same account
+after Codex already refused a request.
 
 ## Quota Polling Cadence
 
-The daemon may use a slower normal polling interval while the active account has comfortable quota, but it must tighten as soon as either tracked quota window falls below the danger band:
+The VPS daemon may use a slower normal polling interval while the
+authority-selected account has comfortable quota, but it must tighten as soon
+as any observed blocking window falls below the danger band:
 
 - `<= 5%` remaining: poll every `2s`.
 - `<= 2%` remaining: poll every `1s`.
 
-When the user-visible status would round remaining quota to `1%`, or when any hard runtime usage-limit signal appears, it must rotate before the next user request depends on that exhausted account.
+When the user-visible status would round remaining quota to `1%`, or when any
+hard runtime usage-limit signal appears, the VPS daemon must commit a replacement
+target before the next user request depends on that exhausted account. A Mac
+observer submits a remote-first request and never rotates locally first.
 
-The Mac coordinator reconciles poll-task ownership on its existing five-second
-health tick. Every account without a hard runtime block must have exactly one
-current poll generation. Completed, cancelled, or superseded generations must
-remove themselves without deleting a newer generation, and stale callbacks must
-not overwrite a newer quota snapshot. Clearing a hard block must restore polling
-without an app restart.
+The Mac coordinator may reconcile presentation poll-task ownership on its
+existing five-second health tick. Every account without a hard runtime block
+has at most one current poll generation. Completed, cancelled, or superseded
+generations must remove themselves without deleting a newer generation, and
+stale callbacks must not overwrite a newer quota snapshot or authority
+observation. Clearing a hard block may restore observation without an app
+restart, but never grants local target-selection authority.
 
 Inactive accounts need a separate upgrade watch because plan purchases happen
 out-of-band while CodexSwitch is already running. On a healthy no-rotation tick,
@@ -949,18 +1051,26 @@ poll that same account immediately instead of waiting for background rotation.
 
 ## Mac Menubar VPS Freshness
 
-When a Mac-side Codex client is attached to the VPS app-server, the menubar may display the sanitized VPS account observation from `codexswitch-cli account-state` cadence, not the slower readiness cadence. That observation is a separate remote presentation state and never replaces the Mac active account.
+When a Mac-side Codex client is attached to the VPS app-server, the menubar
+reads the sanitized authority observation at `codexswitch-cli account-state`
+cadence, not the slower readiness cadence. That observation is the one pool
+target; Mac and VPS runtime identities are convergence details beneath it.
 
 - Active VPS remote client detected: fetch sanitized VPS account state every `5s`, with overlapping checks suppressed.
-- VPS auto-swap execution stays on the VPS. Mac local auto-swap continues to protect Mac local runtimes and is not suppressed by the remote connection.
+- VPS autonomous selection stays on the VPS. Mac limit handling sends one
+  remote-first request and converges the returned target locally.
 - No active VPS remote client detected: keep the normal `60s` readiness cadence.
 - The detector must include both `codex-vps` terminal clients and Codex.app-launched `codex --remote ws://100.95.84.123:8390 ...` clients.
 - SSH/Tailscale tunnel helper processes are transport plumbing and must not be mistaken for an active Codex remote client.
-- The Mac menu app must not push local active-account swaps to the VPS. The VPS rotates itself through its own coordinator and hot-swap path even when the Mac is offline. The Mac may display VPS state in a clearly remote view and sync non-authoritative observations, but background sync preserves each host's active account unless that host's coordinator rotates it.
+- Every Mac manual or automatic target change is an idempotent request to the
+  VPS daemon. The VPS rotates autonomously when the Mac is offline. If the
+  configured VPS cannot be reached, the Mac retains the current session and
+  fails closed without changing its local target.
 - Automatic credential sync must invoke `update-bundle --preserve-active`, and
-  the generated bundle must identify the freshly observed VPS active provider
-  account. Reject the sync if that provider identity is missing from the Mac
-  pool; do not guess a replacement or promote the Mac active account.
+  preserve the provider account selected by the fresh authority epoch. Reject
+  the sync if that provider identity is missing from either pool; do not guess a
+  replacement, import another host's active bit as authority, or advance the
+  epoch.
 
 ## Pool Capacity Math
 
@@ -991,6 +1101,17 @@ green state.
 
 Before claiming hot-swap is fixed or ready:
 
+- [ ] Authority status is read-only, token-free, and fresh; it names exactly one
+  desired provider identifier, epoch, request ID, and valid
+  `stable`/`converging`/`degraded` phase.
+- [ ] Replaying the same target request ID returns the same epoch and target
+  without a second account-store write, runtime reload, or notification.
+- [ ] Concurrent Mac manual, Mac automatic, and VPS automatic requests produce
+  one serialized desired target; no host publishes a second legitimate active
+  account.
+- [ ] With a configured but unreachable VPS, Mac manual and automatic swaps
+  fail closed without changing `accounts.json`, `auth.json`, the activation
+  journal, or the running session.
 - [ ] `codexswitch-cli auth-diagnostics` shows active account hash equals `auth.json` hash.
 - [ ] `codexswitch-cli doctor` reports live runtimes as verified, not merely patched.
 - [ ] On the VPS, `codex --version` matches
@@ -1090,7 +1211,8 @@ Before claiming hot-swap is fixed or ready:
 - [ ] The installed ASAR contains `CODEXSWITCH_RECENT_THREADS_STATE_DB_V1`, ordinary sidebar `thread/list` requests use `useStateDbOnly: true`, and archive/search/hydration behavior is unchanged.
 - [ ] The installed ASAR contains `CODEXSWITCH_STATSIG_FAIL_OPEN_V1` exactly once, and the failed post-login bootstrap branch mounts the synchronous fail-open provider rather than the unbounded async identity/client fallback.
 - [ ] The bundled `patch-asar.py` hash matches the source used for the CodexSwitch build, the app contains the lockfile-pinned ASAR CLI and module without symlinks, the selected Node runtime satisfies the CLI minimum, modern ESM `@electron/asar` and legacy CommonJS `asar` fixtures produce the same Electron header-hash contract without `npx` or a network install, the desktop-patch log records Fast fallback application without a structure warning, and the ASAR integrity hash plus strict code-sign verification pass before relaunch.
-- [ ] A forced rotation changes the configured account and signals the expected process count.
+- [ ] A forced rotation advances the authority epoch once, changes each
+  required host to the authority target, and signals the expected process count.
 - [ ] From `CommittedDegraded`, an explicit cross-target operator selection starts a fresh activation while automatic rotation remains blocked.
 - [ ] From retry-exhausted `ManualReview`, an explicit cross-target operator selection can recover; every other manual-review reason remains blocked.
 - [ ] A manual cross-account switch can leave an unconfirmed source runtime when the account store and `auth.json` still agree exactly.
@@ -1098,7 +1220,9 @@ Before claiming hot-swap is fixed or ready:
 - [ ] Launch recovery repairs `activation_file_commit_failed` only when the account store and `auth.json` agree on one known account, and publishes configured-only state.
 - [ ] Each account card exposes a default accessibility press action, and pressing it produces the same activation request as a normal click.
 - [ ] The account-card hover overlay is non-hit-testable and cannot swallow a click.
-- [ ] The menu lists the configured account first and does not style it as runtime-current until fresh confirmation exists.
+- [ ] The menu lists and highlights only the fresh authority target, with Mac
+  and VPS convergence shown separately; a stale prior runtime identity never
+  highlights a second card.
 - [ ] The app-server journal or ack file proves the signal handler ran after the rotation.
 - [ ] With a disposable live desktop session, `CODEXSWITCH_RUN_LIVE_DESKTOP_RELOAD=1 swift test --filter SwapEngineTests/liveDesktopAppServerReloadWhenRequested` exercises discovery, capability gating, `SIGHUP`, and acknowledgement as one path.
 - [ ] The next real Codex request or remote compact uses the new account and does not repeat the old usage-limit error.
@@ -1113,6 +1237,20 @@ correctly exercises rejection paths instead of the intended test scenario.
 
 Every future hot-swap change must include tests for:
 
+- A durable token-free authority record accepts only monotonically increasing
+  epochs, exactly one desired provider identifier, and the three defined phases.
+- Request ID replay is idempotent across success, convergence, and degraded
+  results, including daemon restart.
+- Concurrent manual and automatic requests serialize through the VPS daemon;
+  host activation and credential sync cannot select another target.
+- A configured Mac with unavailable or stale VPS authority fails closed while
+  preserving current sessions and files; a deliberately unconfigured
+  standalone Mac remains a separate supported mode.
+- Authority adoption rejects regressed epochs, multiple targets, target/store
+  mismatches, and host evidence bound to another epoch.
+- The UI renders one desired target plus per-host convergence and never derives
+  authority from quota movement, email, credential bundles, or local active
+  flags.
 - Marker-only binaries are **not** ready without live acknowledgement.
 - A fresh ACK from the running PID remains authoritative when the executable at that path was replaced after process start or the executable path cannot be resolved.
 - Desktop readiness rejects binaries that reload backend auth without broadcasting `account/updated` to the shell.
@@ -1163,14 +1301,17 @@ Every future hot-swap change must include tests for:
 - An in-flight `auth.json` read cannot revert a local account swap that completes before the read returns.
 - Account cards keep one shared primary action for normal clicks and the default
   accessibility press action, while hover helpers remain non-hit-testable.
-- Manual swap authorization requires exact durable source credentials but not
-  source runtime-current evidence; automatic swaps and active credential
-  maintenance retain their fresh runtime-proof requirement.
+- Manual swap authorization requires exact durable source credentials and a
+  committed VPS authority result but not source runtime-current evidence;
+  automatic swaps and active credential maintenance retain their fresh
+  runtime-proof requirement.
 - Pre-credential authorization failures restore the operation's prior journal
   under the same lease, and launch repair of file-commit failures requires exact
   store/auth agreement before publishing configured-only recovery.
 - App-server patching targets the `AuthManager` captured by `MessageProcessor`, not an earlier preload/auth probe.
-- Expired or quota-exhausted active accounts rotate to usable candidates and rewrite `auth.json`.
+- Expired or quota-exhausted authority targets produce one idempotent remote
+  rotation request, then each required host rewrites `auth.json` only for the
+  committed epoch.
 - Runtime `UsageLimitReached` inside Codex generates a canonical receipt UUID,
   invokes only `$HOME/.local/bin/codexswitch-cli`, rotates once, reloads the
   active turn `AuthManager`, and retries before surfacing the original error.
@@ -1210,7 +1351,8 @@ Every future hot-swap change must include tests for:
   probe, rotates that opportunity fairly, preserves freshness on failure, and
   still refreshes every required candidate before a swap decision.
 - Mac plan changes trigger a safe `codexswitch-cli poll <account>` on the configured Linux devbox without transferring or logging secrets.
-- Mac menubar active-account display follows VPS account-state within a few seconds while a Codex.app or CLI `--remote` VPS session is active.
+- Mac menubar pool-target display follows the fresh VPS authority observation
+  within a few seconds while a Codex.app or CLI `--remote` VPS session is active.
 - Desktop discovery and updates cover `/Applications/ChatGPT.app` and the legacy `/Applications/Codex.app` without maintaining divergent path constants.
 - Patched CLI promotion includes `codex-code-mode-host` on both Mac and Linux, and refuses an incomplete prepared runtime.
 - A running desktop `codex-code-mode-host` helper is excluded from standalone Mac CLI detection even when it lives beside `codex` in a prepared runtime directory.
@@ -1236,10 +1378,12 @@ Every future hot-swap change must include tests for:
 
 When a swap fails, answer these before applying a fix:
 
-1. Which process actually sent the failed request?
-2. Which auth source did that process load at startup?
-3. Did `auth.json` change to the intended active account?
-4. Did the live process acknowledge the reload after the change?
-5. Did the next request use the new account, or only the store/auth file changed?
+1. Which authority request ID and expected epoch initiated the operation?
+2. Did the VPS commit exactly one desired target and resulting epoch?
+3. Which host and process failed to converge?
+4. Which auth source did that process load at startup?
+5. Did `auth.json` change to the authority-selected account?
+6. Did the live process acknowledge the reload for that authority epoch?
+7. Did the next request use the new account, or only the store/auth file change?
 
 If any answer is unknown, CodexSwitch must not report readiness as green.

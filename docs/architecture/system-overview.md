@@ -32,7 +32,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-13
+  last_updated: 2026-07-27
 ---
 
 # CodexSwitch System Overview
@@ -57,8 +57,9 @@ In scope:
 - CodexSwitch account records and quota snapshots.
 - Complete Codex token activation in `~/.codex/auth.json`.
 - Verified Codex CLI and app-server reloads.
-- Mac menu-bar presentation of the same domain state.
-- VPS daemon operation and remote status transport.
+- One VPS-authoritative desired provider account for the complete Mac/VPS pool.
+- Mac menu-bar presentation of that authority state and each host's convergence.
+- VPS daemon operation, authority persistence, and remote status transport.
 - Banked-reset inventory and redemption safety.
 - Bounded CodexSwitch-created logs, backups, downloads, and staging data.
 
@@ -68,32 +69,42 @@ Out of scope:
 - Hermes or other third-party agent authentication.
 - Destructive cleanup of user projects, conversations, or arbitrary caches.
 - Starting, killing, or repairing services as a side effect of a status command.
-- Treating the Mac and VPS as one shared active account.
+- Allowing a Mac or VPS-local policy decision to replace the pool target without
+  a VPS authority transaction.
 
 ## System Topology
 
 ```text
-                         read-only remote status
- Mac menu app  <-------------------------------------  VPS coordinator
-      |                                                     |
-      | local activation                                    | VPS activation
-      v                                                     v
+                    authority requests + observations
+ Mac menu app  <------------------------------------>  VPS coordinator
+      |                                               desired target + epoch
+      | adopts fresh authority target                         |
+      v                                                       v
+ Mac activation journal                              VPS activation journal
+      |                                                       |
+      v                                                       v
  ~/.codex/auth.json                                  ~/.codex/auth.json
-      |                                                     |
-      | verified reload                                     | verified reload
-      v                                                     v
+      |                                                       |
+      | verified reload                                       | verified reload
+      v                                                       v
  Mac Codex CLI / desktop app-server                 VPS CLI / app-server
-
-              accounts.json + quota/reset state per host
 ```
 
-Each host has its own coordinator and runtime activation transaction. `codex-vps` transports commands and status; it does not grant the VPS authority to rewrite Mac active state.
+The VPS coordinator is the sole authority for the desired provider account.
+Each host still owns its local credential commit, activation journal, and
+runtime reload. A VPS authority observation does not directly rewrite Mac
+files; it authorizes the Mac coordinator to converge those files to the one
+authority-selected target.
 
 ## Core State
 
 ### Account Record
 
-An account has a stable local identity, provider account identity when known, plan, complete token bundle, quota snapshot, reset inventory, health state, and an active flag. A non-empty account store has exactly one active account.
+An account has a stable local identity, provider account identity when known,
+plan, complete token bundle, quota snapshot, reset inventory, health state, and
+an active flag. A non-empty account store has exactly one active account. When
+VPS authority is configured, that active flag is a host-local projection of the
+fresh authority target, not an independent selection.
 
 ### Quota Snapshot
 
@@ -102,6 +113,19 @@ A snapshot contains zero or more typed windows, global allowance state, fetch ti
 ### Activation Operation
 
 Activation records source and target account, store generation, complete token hash, runtime targets, acknowledgements, and rollback evidence. Account selection is not complete merely because the active flag changed.
+
+### Pool Authority Record
+
+The VPS persists one token-free authority record containing a monotonically
+increasing epoch, exactly one desired provider account identifier, a bounded
+request identifier for idempotency, phase (`stable`, `converging`, or
+`degraded`), reason, timestamps, and per-host convergence summaries. It contains
+no access, refresh, or identity tokens.
+
+Only the VPS coordinator advances the authority epoch. Mac manual and automatic
+swap requests are remote-first authority requests. A repeated request identifier
+returns the existing result, while a different request carrying a stale expected
+epoch is rejected without changing authority or host credentials.
 
 ### Reset Attempt
 
@@ -121,7 +145,10 @@ Swift and Rust share `~/.codexswitch/accounts.json` and therefore implement the 
 8. Explicit user-requested deletion is intentionally destructive across both stores and never reports success until legacy cleanup is confirmed successful or already missing. When `accounts.json` is authoritative and accounts remain, commit and read back the reduced file first, then clean up legacy credentials; a commit failure preserves both prior authorities, while a cleanup failure reports failure and leaves the reduced file authoritative. Deleting the last account and delete-all generation-check and safely unlink the file, `fsync` the parent directory, prove no-follow readback is missing, and only then remove the legacy Keychain credential. They do not write an empty replacement `accounts.json`; failed absence proof preserves the legacy credential, and failed cleanup reports failure with the legacy credential remaining recoverable.
 9. Deleting one account from a legacy-only store does not run migration first. Decode and validate the legacy records in memory. If the requested account is the last matching record, durably prove `accounts.json` remains missing and then remove the legacy credential without ever creating the file. If validated records remain, commit and read back only those records before removing the legacy credential. A missing match or any failure before the final absence or replacement proof leaves the legacy credential unchanged. If cleanup fails after proof, the operation fails: an absent file leaves the legacy data recoverable, while a proven replacement file remains authoritative and prevents remigration.
 
-The protocol provides durable compare-and-swap semantics for one host. It does not make Mac and VPS account stores a shared authority.
+The protocol provides durable compare-and-swap semantics for one host. The
+stores are not a shared filesystem and retain separate generations, but their
+active selections must converge to the provider identity named by the VPS
+authority epoch.
 
 The same Swift secure-file primitive protects `~/.codex/auth.json` and the reset-attempt journal. Each file has its own same-directory lock and generation, but all use the descriptor-anchored path policy, unique exclusive temporary files, file and directory `fsync`, atomic rename, and exact-byte no-follow readback. Structured callers decode and validate the proven bytes before publishing success.
 
@@ -138,20 +165,39 @@ Account-store I/O runs on a serial persistence actor, never on `MainActor`. User
 
 ### Decision
 
-1. Evaluate whether the active account is usable using the canonical injected-time freshness policy.
-2. Rank immediately usable paid accounts through the one shared eligibility and ranking implementation.
-3. Consider a banked reset only when switching cannot preserve a better outcome.
-4. Suppress a reset near a natural weekly recovery unless no usable alternative exists and capacity is required now.
+1. The VPS coordinator evaluates whether the authority target is usable using
+   the canonical injected-time freshness policy.
+2. It ranks immediately usable paid accounts through the canonical Rust
+   eligibility and ranking implementation.
+3. It considers a banked reset only when switching cannot preserve a better
+   outcome.
+4. It suppresses a reset near a natural weekly recovery unless no usable
+   alternative exists and capacity is required now.
+5. Mac usage-limit, token-invalidated, routine, and manual requests do not select
+   or activate a local replacement first. They submit one idempotent authority
+   request and await the resulting epoch.
 
 ### Activation
 
-1. Acquire the host account-store operation lock.
-2. Revalidate source state and target eligibility.
-3. Persist the target account and complete token bundle atomically.
-4. Read back and verify the committed identity and token hash.
-5. Reload only verified runtime targets.
-6. Record acknowledgement or actionable degraded state.
-7. Publish status after commit, never before it.
+1. The VPS serializes a request against the current authority epoch.
+2. It persists the new desired target and next epoch as `converging` before any
+   host reports the new target current.
+3. Each host independently acquires its account-store operation lock, validates
+   that fresh authority epoch, and atomically persists the target account and
+   complete local token bundle.
+4. Each host reads back the committed identity and token hash, reloads only
+   verified runtime targets, and records local acknowledgement or degraded
+   evidence.
+5. The Mac reports convergence for that exact epoch and target. Stale or
+   contradictory reports cannot advance authority state.
+6. The VPS publishes `stable` only when required host evidence agrees. Partial
+   convergence remains `degraded` on the same desired target and does not choose
+   another target automatically.
+
+The VPS is always a required host. A Mac that is offline and not participating
+is reported as offline/not required, so VPS standalone operation can become
+stable. Once the Mac requests or begins adoption for an epoch, its convergence
+result is tracked explicitly and cannot be replaced by credential-sync evidence.
 
 ### Desktop Compatibility Patch
 
@@ -186,8 +232,9 @@ hard rejection.
 | Layer | Mac | VPS/Linux | Responsibility |
 | --- | --- | --- | --- |
 | Presentation | SwiftUI views, status bar | CLI/status JSON | Render domain state and explicit commands |
-| Coordination | `AppDelegate`, `AccountManager` during migration | Rust daemon | Own host-local observation and activation |
-| Policy | Swift domain services during migration | Rust domain modules | Evaluate quota, ranking, reset, readiness |
+| Pool authority | authority client | Rust daemon | Own the one desired provider target, epoch, and request idempotency |
+| Host convergence | `AppDelegate`, activation services | Rust activation modules | Apply the authority target to local credentials and verified runtimes |
+| Policy | Observation and standalone-only adapters | Rust domain modules | Evaluate quota and readiness on both hosts; rank/select on the VPS |
 | Persistence | `KeychainStore` file protocol | `account_store.rs` | Locked, validated, atomic account state |
 | Runtime reload | desktop reload client and signal services | `reload.rs` | Verify identity, deliver reload, collect ack |
 | Transport | `LinuxDevboxMonitor` | status endpoints | Read VPS state without taking Mac ownership |
@@ -210,14 +257,20 @@ CodexSwitch assumes these failures are normal and recoverable:
 - A PID exits and is reused before a signal is sent.
 - A runtime reload is accepted but acknowledgement is delayed.
 - A download, patch, build, or install is interrupted.
-- The Mac loses the VPS tunnel while local work continues.
+- The Mac loses the VPS authority connection while local credentials and
+  sessions remain intact.
 - A deployed artifact is older than repository source.
 
 The response is durable state, revalidation, bounded retry, and explicit degraded status. It is not repeated mutation until an error disappears.
 
 ## Design Decisions
 
-- One owner per host prevents Swift, Rust, scripts, and remote monitors from racing whole-file writes.
+- One fixed VPS decision owner prevents Mac and VPS policy from selecting
+  different accounts. One local effect owner per host still prevents Swift,
+  Rust, scripts, and remote monitors from racing credential and runtime writes.
+- A configured but unavailable authority fails closed for new Mac activation
+  decisions. Cached authority state may be displayed as stale but cannot
+  authorize another target.
 - Optional quota windows prevent a temporary service policy change from becoming false exhaustion.
 - Complete token bundles prevent access-token-only swaps from failing on the next refresh.
 - Read-only diagnostics make `status` safe to run during incidents.
