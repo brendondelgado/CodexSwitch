@@ -454,7 +454,13 @@ CodexSwitch must evaluate these independently:
 - **Generation continuity:** quota and reset observation commits must either
   advance a matching `Confirmed` activation to the exact new account-store
   generation or leave a durable barrier. Reconciliation validates `Confirmed`
-  records too; a store/journal split cannot be treated as ready.
+  records too; a store/journal split cannot be treated as ready. A stale
+  `Confirmed` record may self-repair only when its target still names the sole
+  active account and that account's complete current token set exactly matches
+  `auth.json`; the coordinator must downgrade through `CommittedDegraded`,
+  obtain a fresh generation-bound runtime ACK, and only then republish
+  `Confirmed`. Cross-account or divergent state performs zero provider I/O and
+  zero runtime reload.
 - **Operator observation preflight:** `poll` and `redeem-reset` reconcile and
   validate the activation barrier before any provider callback. Transitional or
   unresolved activation state must produce zero quota, inventory, and consume

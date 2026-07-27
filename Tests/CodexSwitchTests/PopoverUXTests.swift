@@ -50,6 +50,11 @@ struct PopoverUXTests {
         #expect(labels.macConfigured == "Mac Configured")
         #expect(labels.macRuntime == "Mac Runtime Current")
         #expect(labels.vpsRuntime == "VPS Runtime Current")
+        let source = try? String(
+            contentsOfFile: "Sources/CodexSwitch/Views/PopoverContentView.swift",
+            encoding: .utf8
+        )
+        #expect(source?.contains("Mac configured: \\(configured.email)") == true)
         #expect(StatusBarController.accountScopeLabel(
             configuredAccountId: UUID(uuidString: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")!,
             runtimeCurrentAccountId: UUID(uuidString: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")!

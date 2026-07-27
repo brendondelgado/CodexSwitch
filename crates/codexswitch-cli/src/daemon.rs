@@ -2204,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_confirmed_generation_blocks_daemon_before_provider_io() -> Result<()> {
+    fn stale_same_target_confirmed_generation_reconverges_before_provider_io() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
@@ -2218,6 +2218,78 @@ mod tests {
             kind: crate::activation::ActivationKind::Rotation,
             previous_account_id: active.account_id.clone(),
             target_account_id: active.account_id.clone(),
+            store_generation: "prospective-generation-that-never-committed".to_string(),
+            auth_fingerprint: crate::auth::account_token_fingerprint(&active),
+            base_store_generation: None,
+            owned_store_generation: None,
+            base_auth_generation: None,
+            owned_auth_generation: None,
+            rollback: None,
+            detail: None,
+            updated_at: Utc::now(),
+        };
+        let activation_path = crate::activation::activation_record_path(&store_path);
+        std::fs::write(&activation_path, serde_json::to_vec_pretty(&record)?)?;
+        std::fs::set_permissions(&activation_path, std::fs::Permissions::from_mode(0o600))?;
+
+        let fetch_calls = Arc::new(Mutex::new(0usize));
+        let reload_calls = Arc::new(Mutex::new(0usize));
+        let tick = run_once_report_with(
+            &store_path,
+            &auth_path,
+            Duration::from_secs(300),
+            {
+                let calls = Arc::clone(&fetch_calls);
+                move |account| {
+                    *calls.lock().unwrap() += 1;
+                    ready_fetch(account)
+                }
+            },
+            |_| Ok(()),
+            {
+                let calls = Arc::clone(&reload_calls);
+                move |_| {
+                    *calls.lock().unwrap() += 1;
+                    Ok(verified_reload_summary())
+                }
+            },
+        )?;
+
+        assert!(!tick.swapped);
+        assert_eq!(*fetch_calls.lock().unwrap(), 1);
+        assert_eq!(*reload_calls.lock().unwrap(), 1);
+        let store_lock = lock_account_store(&store_path)?;
+        let current = store_lock.load()?;
+        let repaired = crate::activation::read_activation_record(&store_lock)?
+            .context("same-target repair did not leave a durable activation record")?;
+        assert_eq!(
+            repaired.state,
+            crate::activation::ActivationState::Confirmed
+        );
+        assert_eq!(repaired.target_account_id, active.account_id);
+        assert_eq!(repaired.store_generation, current.generation.as_str());
+        assert_eq!(
+            repaired.auth_fingerprint,
+            crate::auth::account_token_fingerprint(&active)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_cross_target_confirmed_generation_blocks_before_provider_io() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        write_auth_file(&auth_path, &active)?;
+
+        let record = crate::activation::ActivationRecord {
+            version: 3,
+            state: crate::activation::ActivationState::Confirmed,
+            kind: crate::activation::ActivationKind::Rotation,
+            previous_account_id: active.account_id.clone(),
+            target_account_id: "different-provider-account".to_string(),
             store_generation: "prospective-generation-that-never-committed".to_string(),
             auth_fingerprint: crate::auth::account_token_fingerprint(&active),
             base_store_generation: None,

@@ -1673,6 +1673,44 @@ where
             generation,
             auth_fingerprint.as_deref(),
         ) {
+            let structurally_repairable = record.version == ACTIVATION_RECORD_VERSION
+                && record.kind != ActivationKind::Unknown
+                && record.target_account_id == active.account_id
+                && record.base_store_generation.is_none()
+                && record.owned_store_generation.is_none()
+                && record.base_auth_generation.is_none()
+                && record.owned_auth_generation.is_none()
+                && record.rollback.is_none()
+                && auth_file_matches_account(auth_path, active);
+            if structurally_repairable {
+                let target = active.clone();
+                let target_id = target.id;
+                let target_fingerprint = complete_account_token_fingerprint(&target)
+                    .context("same-target Confirmed repair requires complete token material")?;
+                record.state = ActivationState::CommittedDegraded;
+                record.store_generation = generation.as_str().to_string();
+                record.auth_fingerprint = Some(target_fingerprint.clone());
+                record.detail = Some(
+                    "stale Confirmed activation reconciled from exact same-target store/auth convergence; runtime acknowledgement remains required"
+                        .to_string(),
+                );
+                record.updated_at = Utc::now();
+                write_activation_record(store_lock, &record)?;
+                let outcome = resume_committed_degraded(
+                    DurableConvergenceContext {
+                        store_lock,
+                        generation,
+                        accounts,
+                        auth_path,
+                        target: &target,
+                        target_fingerprint: &target_fingerprint,
+                        reload_enabled,
+                    },
+                    record,
+                    reload,
+                )?;
+                return Ok(Some((target_id, outcome)));
+            }
             bail!(
                 "durable Confirmed activation is stale or does not match current store/auth state"
             );

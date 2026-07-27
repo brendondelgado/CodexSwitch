@@ -7,6 +7,12 @@ struct AccountCardHostOwnershipLabels: Equatable, Sendable {
     let vpsRuntime: String
 }
 
+struct AccountCardHostVisualState: Equatable, Sendable {
+    let macConfigured: Bool
+    let macRuntimeCurrent: Bool
+    let vpsRuntimeCurrent: Bool
+}
+
 struct AccountCardView: View {
     let account: CodexAccount
     var isConfigured: Bool = false
@@ -117,6 +123,33 @@ struct AccountCardView: View {
                 : "Mac Runtime Not Current",
             vpsRuntime: vpsRuntimeLabel(vpsRuntimePresentation)
         )
+    }
+
+    static func hostVisualState(
+        isConfigured: Bool,
+        isRuntimeCurrent: Bool,
+        vpsRuntimePresentation: VPSRuntimeAccountPresentation
+    ) -> AccountCardHostVisualState {
+        AccountCardHostVisualState(
+            macConfigured: isConfigured,
+            macRuntimeCurrent: isRuntimeCurrent,
+            vpsRuntimeCurrent: vpsRuntimePresentation == .current
+        )
+    }
+
+    private var hostVisualState: AccountCardHostVisualState {
+        Self.hostVisualState(
+            isConfigured: isConfigured,
+            isRuntimeCurrent: isRuntimeCurrent,
+            vpsRuntimePresentation: vpsRuntimePresentation
+        )
+    }
+
+    private var macHostAccent: Color? {
+        if hostVisualState.macRuntimeCurrent {
+            return Self.activeGreen
+        }
+        return hostVisualState.macConfigured ? .orange : nil
     }
 
     private var vpsRuntimeColor: Color {
@@ -573,13 +606,26 @@ struct AccountCardView: View {
         }
         .padding(8)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(
+        .overlay {
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(
-                    isRuntimeCurrent ? Self.activeGreen : (isConfigured ? .orange : .clear),
-                    lineWidth: isRuntimeCurrent ? 2.5 : 1.5
-                )
-        )
+                .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+        }
+        .overlay(alignment: .leading) {
+            if let macHostAccent {
+                Capsule()
+                    .fill(macHostAccent)
+                    .frame(width: 3)
+                    .padding(.vertical, 7)
+            }
+        }
+        .overlay(alignment: .trailing) {
+            if hostVisualState.vpsRuntimeCurrent {
+                Capsule()
+                    .fill(.blue)
+                    .frame(width: 3)
+                    .padding(.vertical, 7)
+            }
+        }
         .overlay(alignment: .topLeading) {
             emailHoverOverlay
         }
@@ -587,10 +633,6 @@ struct AccountCardView: View {
             AccountCardHoverTrackingView(email: account.email, isHovering: $isHovering)
                 .allowsHitTesting(false)
         }
-        .shadow(
-            color: isRuntimeCurrent ? Self.activeGreen.opacity(0.4) : .clear,
-            radius: 5
-        )
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .help(account.email)
         .zIndex(isHovering ? 1 : 0)

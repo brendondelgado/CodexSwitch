@@ -138,7 +138,7 @@ struct PopoverContentView: View {
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if let configured = manager.configuredAccount {
-                    Text(configured.email)
+                    Text("Mac configured: \(configured.email)")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)

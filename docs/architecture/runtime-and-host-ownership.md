@@ -702,8 +702,12 @@ refresh may replace the complete access, refresh, and identity token set without
 changing the provider account. A fingerprint change alone must therefore never
 turn a file-converged activation into `ManualReview`: when exactly one active
 store record still names the journal target and `auth.json` exactly matches that
-record's complete current token set, the coordinator advances the journal to
-that current fingerprint and retries verified runtime convergence.
+record's complete current token set, the coordinator advances a stale
+`Confirmed` record through `CommittedDegraded` to that current store generation
+and fingerprint, then retries verified runtime convergence. The repair publishes
+`Confirmed` only after a new generation-bound runtime acknowledgement. A changed
+active provider identity, incomplete token set, store/auth mismatch, malformed
+journal, or unknown activation kind remains a hard barrier.
 
 After a Rust CLI activation commits both shared credential files, the running
 Swift menu app observes the new `auth.json` identity and adopts the already
@@ -945,7 +949,10 @@ actor boundary on every supported Swift 6 toolchain.
 - Provider quota is shared, but runtime ownership is host-specific. Every account
   card presents simultaneous `Mac Configured`, `Mac Runtime`, and `VPS Runtime`
   fields, including when the configured and runtime-current Mac identities are
-  the same. One account may be `Mac Runtime Current` while another is
+  the same. The card perimeter must not imply one pool-global active account:
+  Mac configured/runtime state and VPS runtime-current state use independent
+  edge accents, and the popover header explicitly labels the configured identity
+  as Mac-local. One account may be `Mac Runtime Current` while another is
   `VPS Runtime Current`. VPS current is
   derived only from a fresh, successful remote account-state observation whose
   explicit `isActive` record carries a bounded non-secret stable provider account

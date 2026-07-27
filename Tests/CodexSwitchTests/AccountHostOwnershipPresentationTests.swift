@@ -41,6 +41,37 @@ struct AccountHostOwnershipPresentationTests {
         #expect(vpsOwnership.macConfigured == "Mac Not Configured")
         #expect(vpsOwnership.macRuntime == "Mac Runtime Not Current")
         #expect(vpsOwnership.vpsRuntime == "VPS Runtime Current")
+
+        let macVisualState = AccountCardView.hostVisualState(
+            isConfigured: true,
+            isRuntimeCurrent: true,
+            vpsRuntimePresentation: .notCurrent
+        )
+        #expect(macVisualState.macConfigured)
+        #expect(macVisualState.macRuntimeCurrent)
+        #expect(!macVisualState.vpsRuntimeCurrent)
+
+        let vpsVisualState = AccountCardView.hostVisualState(
+            isConfigured: false,
+            isRuntimeCurrent: false,
+            vpsRuntimePresentation: .current
+        )
+        #expect(!vpsVisualState.macConfigured)
+        #expect(!vpsVisualState.macRuntimeCurrent)
+        #expect(vpsVisualState.vpsRuntimeCurrent)
+    }
+
+    @Test("One card can independently show both host runtimes")
+    func sameAccountCanCarryBothHostAccents() {
+        let visualState = AccountCardView.hostVisualState(
+            isConfigured: true,
+            isRuntimeCurrent: true,
+            vpsRuntimePresentation: .current
+        )
+
+        #expect(visualState.macConfigured)
+        #expect(visualState.macRuntimeCurrent)
+        #expect(visualState.vpsRuntimeCurrent)
     }
 
     @Test("Stale or disconnected VPS evidence never remains current")
