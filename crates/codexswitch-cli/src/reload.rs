@@ -8,9 +8,13 @@ use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDateTime, TimeZone};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "macos", test))]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
+use std::net::{SocketAddr, TcpStream};
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -407,7 +411,91 @@ fn read_linux_process_identity(pid: i32) -> Option<CodexProcess> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn discover_codex_processes_platform(include_app_server: bool) -> Result<Vec<CodexProcess>> {
+    Ok(discover_macos_named_processes("codex")?
+        .into_iter()
+        .filter(|process| process_matches_discovery_scope(process, include_app_server))
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn discover_macos_named_processes(process_name_pattern: &str) -> Result<Vec<CodexProcess>> {
+    let current_uid = unsafe { libc_geteuid() };
+    let current_uid_text = current_uid.to_string();
+    let output = bounded_command::output(
+        Command::new("/usr/bin/pgrep").args([
+            "-l",
+            "-x",
+            "-U",
+            current_uid_text.as_str(),
+            process_name_pattern,
+        ]),
+        PS_COMMAND_TIMEOUT,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .context("failed to run pgrep for Codex process discovery")?;
+    let pids = parse_macos_pgrep_snapshot(&output.stdout, output.status.code())?;
+    let current_pid = std::process::id() as i32;
+    let mut processes = Vec::with_capacity(pids.len());
+    for pid in pids {
+        if pid == current_pid {
+            continue;
+        }
+        let process = current_macos_owned_process_identity(pid)?.with_context(|| {
+            format!("pgrep candidate pid {pid} exited before kernel identity binding")
+        })?;
+        if process.owner_uid != current_uid {
+            bail!("pgrep candidate pid {pid} changed owner during discovery");
+        }
+        processes.push(process);
+    }
+    Ok(processes)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_pgrep_snapshot(stdout: &[u8], status_code: Option<i32>) -> Result<Vec<i32>> {
+    let output = std::str::from_utf8(stdout).context("pgrep output was not valid UTF-8")?;
+    let trimmed = output.trim();
+    match status_code {
+        Some(1) if trimmed.is_empty() => return Ok(Vec::new()),
+        Some(1) => bail!("pgrep exited with status 1 but returned output"),
+        Some(0) if trimmed.is_empty() => bail!("pgrep exited successfully without output"),
+        Some(0) => {}
+        Some(status) => bail!("pgrep exited with status {status}"),
+        None => bail!("pgrep terminated without an exit status"),
+    }
+
+    let mut names_by_pid = HashMap::<i32, &str>::new();
+    let mut ordered = Vec::new();
+    for line in output.lines() {
+        let Some((pid_text, process_name)) = split_first_field(line) else {
+            bail!("pgrep returned a malformed process row");
+        };
+        let pid = pid_text
+            .parse::<i32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .context("pgrep returned an invalid pid")?;
+        if process_name.trim().is_empty() {
+            bail!("pgrep returned an empty process name");
+        }
+        if let Some(previous) = names_by_pid.get(&pid) {
+            if *previous != process_name {
+                bail!("pgrep returned ambiguous rows for pid {pid}");
+            }
+            continue;
+        }
+        names_by_pid.insert(pid, process_name);
+        ordered.push(pid);
+    }
+    if ordered.is_empty() {
+        bail!("pgrep returned no usable process rows");
+    }
+    Ok(ordered)
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
 fn discover_codex_processes_platform(include_app_server: bool) -> Result<Vec<CodexProcess>> {
     let current_uid = unsafe { libc_geteuid() };
     let output = bounded_command::output(
@@ -652,7 +740,12 @@ fn current_process_identity(pid: i32) -> Option<CodexProcess> {
     read_linux_process_identity(pid)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn current_process_identity(pid: i32) -> Option<CodexProcess> {
+    current_macos_owned_process_identity(pid).ok().flatten()
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
 fn current_process_identity(pid: i32) -> Option<CodexProcess> {
     let output = bounded_command::output(
         Command::new("/bin/ps").args([
@@ -677,14 +770,7 @@ fn current_process_identity(pid: i32) -> Option<CodexProcess> {
     )
     .into_iter()
     .find(|process| process.pid == pid)?;
-    #[cfg(target_os = "macos")]
-    {
-        enrich_macos_process_identity(process)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Some(process)
-    }
+    Some(process)
 }
 
 #[cfg(target_os = "macos")]
@@ -744,6 +830,101 @@ fn read_macos_kernel_process_identity(pid: i32) -> Option<MacKernelProcessIdenti
 }
 
 #[cfg(target_os = "macos")]
+const MACOS_PROCARGS_MAX_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "macos")]
+fn read_macos_process_command_line(pid: i32) -> Result<Option<String>> {
+    let mut mib = [libc::CTL_KERN, 49, pid];
+    let mut size = 0_usize;
+    let size_result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size_result != 0 {
+        let error = std::io::Error::last_os_error();
+        if !macos_pid_exists(pid)? {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| format!("failed to size argv for live pid {pid}"));
+    }
+    if size < std::mem::size_of::<libc::c_int>() || size > MACOS_PROCARGS_MAX_BYTES {
+        bail!("live pid {pid} returned an invalid bounded argv size: {size}");
+    }
+
+    let mut bytes = vec![0_u8; size];
+    let read_result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read_result != 0 {
+        let error = std::io::Error::last_os_error();
+        if !macos_pid_exists(pid)? {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| format!("failed to read argv for live pid {pid}"));
+    }
+    if size < std::mem::size_of::<libc::c_int>() || size > bytes.len() {
+        bail!("live pid {pid} changed its argv size during bounded read");
+    }
+    bytes.truncate(size);
+    parse_macos_procargs2_command_line(&bytes).map(Some)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_procargs2_command_line(bytes: &[u8]) -> Result<String> {
+    let argc_bytes: [u8; std::mem::size_of::<libc::c_int>()] = bytes
+        .get(..std::mem::size_of::<libc::c_int>())
+        .context("KERN_PROCARGS2 omitted argc")?
+        .try_into()
+        .context("KERN_PROCARGS2 argc had the wrong width")?;
+    let argc = libc::c_int::from_ne_bytes(argc_bytes);
+    if argc <= 0 || argc as usize > 4096 {
+        bail!("KERN_PROCARGS2 returned an invalid argc");
+    }
+
+    let mut cursor = std::mem::size_of::<libc::c_int>();
+    let executable_end = bytes[cursor..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|offset| cursor + offset)
+        .context("KERN_PROCARGS2 omitted the executable terminator")?;
+    cursor = executable_end.saturating_add(1);
+    while cursor < bytes.len() && bytes[cursor] == 0 {
+        cursor += 1;
+    }
+
+    let mut arguments = Vec::with_capacity(argc as usize);
+    for index in 0..argc as usize {
+        if cursor >= bytes.len() {
+            bail!("KERN_PROCARGS2 ended before argv was complete");
+        }
+        let end = bytes[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| cursor + offset)
+            .context("KERN_PROCARGS2 returned an unterminated argument")?;
+        let argument = &bytes[cursor..end];
+        if index == 0 && argument.is_empty() {
+            bail!("KERN_PROCARGS2 returned an empty argv[0]");
+        }
+        arguments.push(String::from_utf8_lossy(argument).into_owned());
+        cursor = end.saturating_add(1);
+    }
+    Ok(arguments.join(" "))
+}
+
+#[cfg(target_os = "macos")]
 fn apply_macos_kernel_process_identity(
     mut process: CodexProcess,
     identity: &MacKernelProcessIdentity,
@@ -772,58 +953,36 @@ fn current_macos_owned_process_identity(pid: i32) -> Result<Option<CodexProcess>
         Some(identity) => identity,
         None if !macos_pid_exists(pid)? => return Ok(None),
         None => {
-            bail!(
-                "live prepared runtime pid {} could not provide a kernel identity during confirmation",
-                pid
-            )
+            bail!("live runtime pid {pid} could not provide a kernel identity")
         }
     };
-    let output = bounded_command::output(
-        Command::new("/bin/ps").args([
-            "-p",
-            &pid.to_string(),
-            "-o",
-            "pid=,uid=,lstart=,command=",
-            "-ww",
-        ]),
-        PS_COMMAND_TIMEOUT,
-        bounded_command::SMALL_OUTPUT_LIMIT,
-    )
-    .context("failed to run ps for prepared runtime identity confirmation")?;
-    if !output.status.success() {
-        if !macos_pid_exists(pid)? {
-            return Ok(None);
-        }
-        bail!(
-            "ps exited with {} during prepared runtime identity confirmation",
-            output.status
-        );
+    let current_uid = unsafe { libc_geteuid() };
+    if kernel_identity.owner_uid != current_uid {
+        bail!("live runtime pid {pid} is not owned by the current user");
     }
-    let process = parse_ps_owned_processes(
-        &String::from_utf8_lossy(&output.stdout),
-        unsafe { libc_geteuid() },
-        std::process::id() as i32,
-    )
-    .into_iter()
-    .find(|process| process.pid == pid);
-    let process = match process {
-        Some(process) => process,
-        None if !macos_pid_exists(pid)? => return Ok(None),
-        None => {
-            bail!(
-                "live prepared runtime pid {} was absent from the owned process inventory",
-                pid
-            )
-        }
+    let command_line = match read_macos_process_command_line(pid)? {
+        Some(command_line) => command_line,
+        None => return Ok(None),
     };
-    apply_macos_kernel_process_identity(process, &kernel_identity)
-        .map(Some)
-        .with_context(|| {
-            format!(
-                "live prepared runtime pid {} changed owner during identity confirmation",
-                pid
-            )
-        })
+    let confirmation = match read_macos_kernel_process_identity(pid) {
+        Some(identity) => identity,
+        None if !macos_pid_exists(pid)? => return Ok(None),
+        None => bail!("live runtime pid {pid} lost its kernel identity during argv binding"),
+    };
+    if confirmation != kernel_identity {
+        bail!("live runtime pid {pid} changed kernel identity during argv binding");
+    }
+    Ok(Some(CodexProcess {
+        pid,
+        owner_uid: kernel_identity.owner_uid,
+        start_identity: format!(
+            "macos:{}:{:06}",
+            kernel_identity.start_seconds, kernel_identity.start_microseconds
+        ),
+        started_at_unix: kernel_identity.start_seconds,
+        command_line,
+        executable: kernel_identity.executable,
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -1255,6 +1414,284 @@ where
     Ok(ManagedHeadlessAckMaintenance::Renewed { pid: process.pid })
 }
 
+#[cfg(any(target_os = "macos", test))]
+const MANAGED_DESKTOP_BRIDGE_RPC_MAX_BYTES: usize = 256 * 1024;
+#[cfg(target_os = "macos")]
+const MANAGED_DESKTOP_BRIDGE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "macos")]
+struct ManagedDesktopBridgeSession {
+    process: CodexProcess,
+    websocket: tungstenite::WebSocket<TcpStream>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct ManagedDesktopAuthTokens {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    account_id: String,
+}
+
+#[cfg(target_os = "macos")]
+impl ManagedDesktopBridgeSession {
+    fn open(processes: &[CodexProcess], auth_path: &Path) -> Result<Option<Self>> {
+        let mut managed = processes.iter().filter(|process| {
+            hot_swap_runtime_kind(process) == Some(HotSwapRuntimeKind::ManagedDesktopBridge)
+        });
+        let Some(process) = managed.next() else {
+            return Ok(None);
+        };
+        if managed.next().is_some() {
+            bail!("multiple managed desktop bridges were discovered");
+        }
+        if !process_identity_is_current(process) {
+            bail!("managed desktop bridge identity changed before WebSocket initialization");
+        }
+
+        let stream = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], 9223)),
+            MANAGED_DESKTOP_BRIDGE_RPC_TIMEOUT,
+        )
+        .context("failed to connect to the managed desktop bridge")?;
+        stream
+            .set_read_timeout(Some(MANAGED_DESKTOP_BRIDGE_RPC_TIMEOUT))
+            .context("failed to bound managed desktop bridge reads")?;
+        stream
+            .set_write_timeout(Some(MANAGED_DESKTOP_BRIDGE_RPC_TIMEOUT))
+            .context("failed to bound managed desktop bridge writes")?;
+        stream
+            .set_nodelay(true)
+            .context("failed to configure the managed desktop bridge socket")?;
+
+        let config = tungstenite::protocol::WebSocketConfig::default()
+            .read_buffer_size(16 * 1024)
+            .write_buffer_size(0)
+            .max_write_buffer_size(MANAGED_DESKTOP_BRIDGE_RPC_MAX_BYTES)
+            .max_message_size(Some(MANAGED_DESKTOP_BRIDGE_RPC_MAX_BYTES))
+            .max_frame_size(Some(MANAGED_DESKTOP_BRIDGE_RPC_MAX_BYTES));
+        let (mut websocket, _) =
+            tungstenite::client_with_config("ws://127.0.0.1:9223", stream, Some(config)).map_err(
+                |error| anyhow::anyhow!("managed desktop WebSocket handshake failed: {error}"),
+            )?;
+        let initialize = managed_desktop_initialize_request();
+        let response = managed_desktop_rpc(&mut websocket, &initialize, 0)?;
+        validate_managed_desktop_rpc_success(&response, 0, "initialize")?;
+
+        let tokens = managed_desktop_auth_tokens(auth_path)?;
+        let login = managed_desktop_login_request(&tokens);
+        let response = managed_desktop_rpc(&mut websocket, &login, 1)?;
+        validate_managed_desktop_rpc_success(&response, 1, "account/login/start")?;
+        let account_read = managed_desktop_account_read_request(2);
+        let response = managed_desktop_rpc(&mut websocket, &account_read, 2)?;
+        validate_managed_desktop_account_read(&response, &tokens.account_id, 2)?;
+
+        if !process_identity_is_current(process)
+            || hot_swap_runtime_kind(process) != Some(HotSwapRuntimeKind::ManagedDesktopBridge)
+        {
+            bail!("managed desktop bridge identity changed during WebSocket initialization");
+        }
+
+        Ok(Some(Self {
+            process: process.clone(),
+            websocket,
+        }))
+    }
+
+    fn verify_reloaded_account(&mut self, auth_path: &Path) -> Result<()> {
+        if !process_identity_is_current(&self.process)
+            || hot_swap_runtime_kind(&self.process)
+                != Some(HotSwapRuntimeKind::ManagedDesktopBridge)
+        {
+            bail!("managed desktop bridge identity changed before account verification");
+        }
+        let expected_account_id = hot_swap_auth_file_identity(auth_path)?.account_id;
+        let request = managed_desktop_account_read_request(3);
+        let response = managed_desktop_rpc(&mut self.websocket, &request, 3)?;
+        validate_managed_desktop_account_read(&response, &expected_account_id, 3)?;
+        if !process_identity_is_current(&self.process) {
+            bail!("managed desktop bridge identity changed after account verification");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn managed_desktop_initialize_request() -> serde_json::Value {
+    serde_json::json!({
+        "method": "initialize",
+        "id": 0,
+        "params": {
+            "clientInfo": {
+                "name": "codexswitch-cli",
+                "title": "CodexSwitch CLI",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true
+            }
+        }
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn managed_desktop_auth_tokens(auth_path: &Path) -> Result<ManagedDesktopAuthTokens> {
+    let auth_path = absolute_auth_path(auth_path)?;
+    let observed = secure_file::observe(&auth_path, HOT_SWAP_AUTH_FILE_MAX_BYTES as usize, false)?;
+    let bytes = observed
+        .bytes()
+        .context("auth file disappeared before managed desktop login")?;
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("auth file is malformed")?;
+    let tokens = value
+        .get("tokens")
+        .and_then(serde_json::Value::as_object)
+        .context("auth file has no token object")?;
+    let read_token = |key: &str| -> Result<String> {
+        let token = tokens
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("auth file has no {key}"))?;
+        if token.trim().is_empty() {
+            bail!("auth file {key} is empty");
+        }
+        Ok(token.to_string())
+    };
+    let result = ManagedDesktopAuthTokens {
+        id_token: read_token("id_token")?,
+        access_token: read_token("access_token")?,
+        refresh_token: read_token("refresh_token")?,
+        account_id: read_token("account_id")?,
+    };
+    complete_token_fingerprint(
+        &result.id_token,
+        &result.access_token,
+        &result.refresh_token,
+        &result.account_id,
+    )
+    .context("auth file has incomplete token material")?;
+    Ok(result)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn managed_desktop_login_request(tokens: &ManagedDesktopAuthTokens) -> serde_json::Value {
+    serde_json::json!({
+        "method": "account/login/start",
+        "id": 1,
+        "params": {
+            "type": "chatgptAuthTokens",
+            "accessToken": tokens.access_token,
+            "chatgptAccountId": tokens.account_id,
+            "refreshToken": tokens.refresh_token,
+            "idToken": tokens.id_token
+        }
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn managed_desktop_account_read_request(id: i64) -> serde_json::Value {
+    serde_json::json!({
+        "method": "account/read",
+        "id": id,
+        "params": {
+            "refreshToken": false
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn managed_desktop_rpc(
+    websocket: &mut tungstenite::WebSocket<TcpStream>,
+    request: &serde_json::Value,
+    expected_id: i64,
+) -> Result<serde_json::Value> {
+    let serialized = serde_json::to_string(request)
+        .context("failed to serialize managed desktop RPC request")?;
+    if serialized.len() > MANAGED_DESKTOP_BRIDGE_RPC_MAX_BYTES {
+        bail!("managed desktop RPC request exceeded its byte limit");
+    }
+    websocket
+        .send(tungstenite::Message::Text(serialized.into()))
+        .context("failed to send managed desktop RPC request")?;
+
+    for _ in 0..128 {
+        let message = websocket
+            .read()
+            .context("failed to read managed desktop RPC response")?;
+        let value = match message {
+            tungstenite::Message::Text(text) => {
+                serde_json::from_slice::<serde_json::Value>(text.as_bytes())
+                    .context("managed desktop returned malformed JSON")?
+            }
+            tungstenite::Message::Binary(bytes) => {
+                serde_json::from_slice::<serde_json::Value>(bytes.as_ref())
+                    .context("managed desktop returned malformed JSON")?
+            }
+            tungstenite::Message::Ping(payload) => {
+                websocket
+                    .send(tungstenite::Message::Pong(payload))
+                    .context("failed to answer managed desktop WebSocket ping")?;
+                continue;
+            }
+            tungstenite::Message::Close(_) => {
+                bail!("managed desktop WebSocket closed before its RPC response")
+            }
+            _ => continue,
+        };
+        if value.get("id").and_then(serde_json::Value::as_i64) == Some(expected_id) {
+            return Ok(value);
+        }
+    }
+    bail!("managed desktop RPC response limit exceeded")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_managed_desktop_rpc_success(
+    response: &serde_json::Value,
+    expected_id: i64,
+    method: &str,
+) -> Result<()> {
+    if response.get("id").and_then(serde_json::Value::as_i64) != Some(expected_id) {
+        bail!("managed desktop {method} response ID did not match");
+    }
+    if response.get("error").is_some_and(|error| !error.is_null()) {
+        bail!("managed desktop {method} returned an RPC error");
+    }
+    if response.get("result").is_none() {
+        bail!("managed desktop {method} response omitted its result");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_managed_desktop_account_read(
+    response: &serde_json::Value,
+    expected_account_id: &str,
+    expected_id: i64,
+) -> Result<()> {
+    validate_managed_desktop_rpc_success(response, expected_id, "account/read")?;
+    let account = response
+        .pointer("/result/account")
+        .and_then(serde_json::Value::as_object)
+        .context("managed desktop account/read response omitted its account")?;
+    if account.get("type").and_then(serde_json::Value::as_str) != Some("chatgpt") {
+        bail!("managed desktop account/read response was not a ChatGPT account");
+    }
+
+    let account_ids = ["chatgptAccountId", "accountId", "account_id"]
+        .into_iter()
+        .filter_map(|key| account.get(key).and_then(serde_json::Value::as_str))
+        .filter(|account_id| !account_id.is_empty())
+        .collect::<HashSet<_>>();
+    if account_ids.len() != 1 {
+        bail!("managed desktop account/read identity was missing or ambiguous");
+    }
+    if account_ids.iter().next().copied() != Some(expected_account_id) {
+        bail!("managed desktop account/read identity did not match auth.json");
+    }
+    Ok(())
+}
+
 fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<ReloadSummary> {
     reload_codex_processes_with_receipt(include_app_server, auth_path, None)
 }
@@ -1287,7 +1724,9 @@ where
     Guard: FnMut() -> Result<()>,
     Discover: FnOnce() -> Result<Vec<CodexProcess>>,
 {
-    reload_discovered_codex_processes_with(
+    #[cfg(target_os = "macos")]
+    let mut managed_desktop_session = ManagedDesktopBridgeSession::open(&processes, auth_path)?;
+    let summary = reload_discovered_codex_processes_with(
         processes,
         auth_path,
         receipt_nonce,
@@ -1310,7 +1749,14 @@ where
         |process, request, runtime_kind, timeout| {
             wait_for_hot_swap_ack(process, request, runtime_kind, timeout).is_some()
         },
-    )
+    )?;
+    #[cfg(target_os = "macos")]
+    if let Some(session) = managed_desktop_session.as_mut() {
+        if summary.signaled.contains(&session.process.pid) {
+            session.verify_reloaded_account(auth_path)?;
+        }
+    }
+    Ok(summary)
 }
 
 fn reload_discovered_codex_processes_with<Guard, Discover, Prune, Markers, Signal, Wait>(
@@ -3307,6 +3753,108 @@ mod tests {
             command_line: "/usr/local/bin/codex".to_string(),
             executable: PathBuf::from("/usr/local/bin/codex"),
         }
+    }
+
+    #[test]
+    fn macos_pgrep_snapshot_is_strict_and_deduplicated() -> Result<()> {
+        assert!(parse_macos_pgrep_snapshot(b"", Some(1))?.is_empty());
+        assert_eq!(
+            parse_macos_pgrep_snapshot(b"42 codex\n42 codex\n84 codex\n", Some(0))?,
+            vec![42, 84]
+        );
+        assert!(parse_macos_pgrep_snapshot(b"", Some(0)).is_err());
+        assert!(parse_macos_pgrep_snapshot(b"42 codex\n", Some(1)).is_err());
+        assert!(parse_macos_pgrep_snapshot(b"42 codex\n42 other\n", Some(0)).is_err());
+        assert!(parse_macos_pgrep_snapshot(&[0xff], Some(0)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn macos_procargs2_parser_preserves_complete_argv() -> Result<()> {
+        let mut bytes = (3 as libc::c_int).to_ne_bytes().to_vec();
+        bytes.extend_from_slice(b"/usr/local/bin/codex\0\0");
+        bytes.extend_from_slice(b"/usr/local/bin/codex\0");
+        bytes.extend_from_slice(b"-c\0");
+        bytes.extend_from_slice(b"model=gpt-5.6\0");
+        assert_eq!(
+            parse_macos_procargs2_command_line(&bytes)?,
+            "/usr/local/bin/codex -c model=gpt-5.6"
+        );
+
+        let mut incomplete = (2 as libc::c_int).to_ne_bytes().to_vec();
+        incomplete.extend_from_slice(b"/usr/local/bin/codex\0\0/usr/local/bin/codex\0");
+        assert!(parse_macos_procargs2_command_line(&incomplete).is_err());
+        assert!(parse_macos_procargs2_command_line(&[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn managed_desktop_requests_use_the_complete_token_set() {
+        let initialize = managed_desktop_initialize_request();
+        assert_eq!(initialize["method"], "initialize");
+        assert_eq!(initialize["id"], 0);
+
+        let tokens = ManagedDesktopAuthTokens {
+            id_token: "identity".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            account_id: "acct-current".to_string(),
+        };
+        let login = managed_desktop_login_request(&tokens);
+        assert_eq!(login["method"], "account/login/start");
+        assert_eq!(login["params"]["idToken"], "identity");
+        assert_eq!(login["params"]["accessToken"], "access");
+        assert_eq!(login["params"]["refreshToken"], "refresh");
+        assert_eq!(login["params"]["chatgptAccountId"], "acct-current");
+
+        let account_read = managed_desktop_account_read_request(2);
+        assert_eq!(account_read["method"], "account/read");
+        assert_eq!(account_read["id"], 2);
+        assert_eq!(account_read["params"]["refreshToken"], false);
+    }
+
+    #[test]
+    fn managed_desktop_account_verification_accepts_aliases_and_rejects_drift() -> Result<()> {
+        for key in ["chatgptAccountId", "accountId", "account_id"] {
+            let mut account = serde_json::Map::new();
+            account.insert("type".to_string(), serde_json::json!("chatgpt"));
+            account.insert(key.to_string(), serde_json::json!("acct-current"));
+            let response = serde_json::json!({
+                "id": 2,
+                "result": { "account": account }
+            });
+            validate_managed_desktop_account_read(&response, "acct-current", 2)?;
+        }
+
+        let mismatch = serde_json::json!({
+            "id": 2,
+            "result": {
+                "account": {
+                    "type": "chatgpt",
+                    "chatgptAccountId": "acct-stale"
+                }
+            }
+        });
+        assert!(validate_managed_desktop_account_read(&mismatch, "acct-current", 2).is_err());
+
+        let ambiguous = serde_json::json!({
+            "id": 2,
+            "result": {
+                "account": {
+                    "type": "chatgpt",
+                    "chatgptAccountId": "acct-current",
+                    "accountId": "acct-other"
+                }
+            }
+        });
+        assert!(validate_managed_desktop_account_read(&ambiguous, "acct-current", 2).is_err());
+        assert!(validate_managed_desktop_rpc_success(
+            &serde_json::json!({"id": 0, "error": {"message": "no"}}),
+            0,
+            "initialize"
+        )
+        .is_err());
+        Ok(())
     }
 
     fn external_runtime_marker_fixture() -> Vec<u8> {

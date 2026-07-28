@@ -22,7 +22,7 @@ version_control:
   branch: main
   base_commit: 664edf6
   status: active-audit
-  last_updated: 2026-07-21
+  last_updated: 2026-07-28
 ---
 
 # CodexSwitch Codebase Audit
@@ -32,6 +32,20 @@ version_control:
 The reliability failures were not caused by one broken threshold. CodexSwitch accumulated multiple writers, duplicated policies, implicit repair behavior, unbounded maintenance artifacts, and weak boundaries between Mac, VPS, desktop, CLI, and optional integrations.
 
 The repository has strong individual mechanisms, but orchestration grew faster than its contracts. The cleanup therefore prioritizes state ownership and transaction boundaries before cosmetic refactoring.
+
+The 2026-07-28 live Mac replay found a separate reload-latency defect: one
+activation revalidated each runtime through many serial `/bin/ps` subprocesses.
+With several retained Codex sessions, a single same-account convergence forked
+more than eighty probes and ran for over a minute before reaching SIGHUP. The
+durable correction is one bounded exact-name PID snapshot followed by direct
+kernel identity and argv reads for discovery and pre-signal revalidation.
+
+The same replay also proved that the Rust CLI used a signal-only managed-bridge
+path. By the time SIGHUP arrived, no verified frontend writer remained open, so
+the bridge correctly refused an ACK with `no eligible frontend writer`. The
+CLI now performs the full desktop JSON-RPC login and identity verification,
+retains that initialized writer through the bound SIGHUP/ACK operation, and
+verifies the account again before reporting convergence.
 
 Current audit completion is approximately 96 percent. Repository remediation
 and deterministic local verification are complete; full native CI and live

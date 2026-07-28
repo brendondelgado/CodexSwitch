@@ -20,13 +20,14 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeDiagnostics.swift
+  - ../../crates/codexswitch-cli/src/reload.rs
   - ../../Tests/CodexSwitchTests/SwapEngineTests.swift
   - ../../Tests/CodexSwitchTests/DesktopRuntimeHotSwapStateTests.swift
   - ../../Tests/CodexSwitchTests/DesktopRuntimeReloadClientTests.swift
 version_control:
   branch: main
   status: canonical
-  last_updated: 2026-07-25
+  last_updated: 2026-07-28
 ---
 
 # macOS Runtime Discovery
@@ -41,23 +42,27 @@ contract.
 
 ## Discovery Contract
 
-CodexSwitch currently uses bounded `/usr/bin/pgrep` calls to enumerate candidate
-PIDs because the repository has no structured API that covers both CLI and
-app-server process enumeration. The command text emitted by `pgrep` is used only
-to detect duplicate-row ambiguity and is discarded before classification. The
-snapshot boundary must:
+CodexSwitch uses one bounded exact-name `/usr/bin/pgrep` call to enumerate
+candidate PIDs because macOS has no single structured API that enumerates both
+CLI and app-server processes. The process-name hint emitted by `pgrep` is used
+only to detect duplicate-row ambiguity and is discarded before classification.
+Every accepted PID is then bound through `proc_pidinfo`, `proc_pidpath`, and a
+bounded `KERN_PROCARGS2` read. Runtime discovery and immediate pre-signal
+revalidation must not invoke `/bin/ps` once per process; serial subprocess
+probes make account handoff latency proportional to the number of running
+sessions and can outlive the interrupted turn. The snapshot boundary must:
 
 1. Reject timeouts and exit statuses other than `0` or `1`.
 2. Decode stdout as strict UTF-8; undecodable output is an unsafe failure.
 3. Treat status `1` as `noMatches` only when stdout is blank. Nonblank stdout
    with status `1` is contradictory and fails closed.
 4. For status `0`, accept only rows containing a positive `Int32` PID and a
-   non-empty command line separated by whitespace.
+   non-empty process-name hint separated by whitespace.
 5. Normalize accepted rows into a typed PID snapshot so stale `pgrep` command
    text can never become classification input or reach a signal path.
-6. Collapse only exact duplicate PID and full-command rows. Arguments affect
-   runtime classification, so any repeated PID with a different normalized
-   command line is ambiguous and every row for that PID is quarantined.
+6. Collapse only exact duplicate PID and process-name rows. Any repeated PID
+   with a different normalized process name is ambiguous and every row for
+   that PID is quarantined.
 7. Mark the process-enumeration boundary unsafe when at least one valid row
    survives but any arbitrary malformed or ambiguous row was dropped. An unsafe
    enumeration makes the entire reload fail closed with
@@ -67,9 +72,10 @@ snapshot boundary must:
    rows. An empty successful snapshot is also a failure because it contradicts
    `pgrep` status `0`.
 9. After a complete PID enumeration, preserve every PID that cannot be bound to
-   a stable owner, start identity, argv, executable path, device, and inode as a
-   typed blocker with its failure reason. A blocker is convergence evidence; it
-   is never silently dropped or counted as an acknowledged runtime.
+   a stable owner, start identity, bounded kernel argv, executable path, device,
+   and inode as a typed blocker with its failure reason. A blocker is
+   convergence evidence; it is never silently dropped or counted as an
+   acknowledged runtime.
 10. After identity binding, exclude non-account-bearing Codex subprocess modes,
     including `sandbox`, `exec`, app-server, remote-client, and ephemeral
     invocations. They are neither reload targets nor blockers in the interactive
@@ -86,7 +92,10 @@ If every row is malformed or ambiguous, discovery fails without signalling.
 Status `1` with blank output remains the only authoritative no-match result at
 the process-enumeration boundary.
 
-Once credentials have committed, a complete PID enumeration followed by an
+The initial snapshot performs one external enumeration and then uses direct
+kernel reads for every candidate. Immediate revalidation repeats only those
+bounded kernel reads; it does not spawn another process-table command. Once
+credentials have committed, a complete PID enumeration followed by an
 identity-binding failure has a different safety shape. CodexSwitch may persist
 requests, signal, and collect acknowledgements for every independently verified
 survivor because each signal still carries its own complete authorization.
@@ -200,6 +209,10 @@ The bridge contract is:
    app-server may still account for the initialized connection while its writer
    is already gone, producing a timing-dependent rejected or incomplete
    delivery. The socket is closed only after the ACK attempt completes.
+   The Swift app coordinator and Rust CLI coordinator implement this same
+   initialize, full-token login, account verification, retained-writer, SIGHUP,
+   ACK, and post-ACK verification transaction; neither may provide a signal-only
+   shortcut for the managed bridge.
 
 ## Artifact Validation
 
