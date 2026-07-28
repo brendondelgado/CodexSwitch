@@ -573,10 +573,11 @@ The Linux daemon maintains readiness for the one managed headless app-server
 owned by `signul-codex-app-server.service`. This maintenance is not generic
 process repair and never targets an external app-server or an interactive CLI.
 
-After a successful primary daemon tick, readiness maintenance runs at most once
-per 60 seconds. The cadence advances when the check finds no work, rejects an
-ineligible runtime, or completes a renewal attempt. A fast quota-poll loop
-therefore cannot become a signal loop.
+After every primary daemon attempt, readiness maintenance runs independently of
+quota/API/network success and at most once per 60 seconds. The cadence advances
+when the check finds no work, rejects an ineligible runtime, or completes a
+renewal attempt. A fast or failing quota-poll loop therefore cannot become a
+signal loop or allow a healthy local ACK to expire.
 
 The daemon renews only when the managed runtime has no valid request-bound ACK
 or when its current ACK will expire before the next ordinary renewal interval.
@@ -604,9 +605,11 @@ source, a skipped target, or an unacknowledged signal remains not ready and
 does not fall back to a broader process scan.
 
 A systemd restart changes PID or start identity and invalidates the prior ACK.
-The next successful, due daemon tick must establish readiness for the new
-managed identity. A healthy current ACK produces no signal. Failed primary
-ticks and unresolved activation barriers do not launch this auxiliary path.
+The next due daemon iteration must establish readiness for the new managed
+identity even when the primary quota tick fails. A healthy current ACK produces
+no signal. Activation barriers continue to block credential mutation and remain
+independently visible in readiness reporting; they do not suppress this exact,
+same-auth runtime proof.
 
 ## Unified ChatGPT Desktop Bundle
 

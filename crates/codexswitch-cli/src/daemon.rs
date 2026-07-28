@@ -142,6 +142,29 @@ where
     result
 }
 
+fn maintain_managed_readiness_after_tick_with<CompletedAt, Observe, Maintain>(
+    tick_result: Result<DaemonTick>,
+    cadence: &mut ManagedReadinessCadence,
+    now: Instant,
+    completed_at: CompletedAt,
+    observe_managed_runtime: Observe,
+    maintain_ack: Maintain,
+) -> (Result<DaemonTick>, Result<ManagedReadinessTick>)
+where
+    CompletedAt: FnOnce() -> Instant,
+    Observe: FnOnce() -> Result<Option<ManagedHeadlessAppServerIdentity>>,
+    Maintain: FnOnce(&ManagedHeadlessAppServerIdentity) -> Result<ManagedHeadlessAckMaintenance>,
+{
+    let readiness_result = maintain_managed_readiness_with(
+        cadence,
+        now,
+        completed_at,
+        observe_managed_runtime,
+        maintain_ack,
+    );
+    (tick_result, readiness_result)
+}
+
 struct DaemonTickContext<'a> {
     store_path: &'a Path,
     auth_path: &'a Path,
@@ -1319,38 +1342,49 @@ pub fn run_loop(store_path: &Path, auth_path: &Path, interval: Duration) -> Resu
                 reload_codex_hot_swap_processes,
             ),
         );
-        let tick_succeeded = tick_result.is_ok();
-        if tick_succeeded {
-            match maintain_managed_readiness_with(
-                &mut managed_readiness_cadence,
-                Instant::now(),
-                Instant::now,
-                codex_update::managed_headless_app_server_identity,
-                |identity| {
-                    maintain_managed_headless_app_server_ack(
-                        identity,
-                        auth_path,
-                        MANAGED_READINESS_MINIMUM_ACK_REMAINING,
-                    )
-                },
-            ) {
-                Ok(ManagedReadinessTick::Renewed { pid }) => {
-                    eprintln!("renewed managed app-server hot-swap readiness for pid {pid}");
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!("managed app-server readiness maintenance failed: {error:#}");
-                }
+        let (tick_result, readiness_result) = maintain_managed_readiness_after_tick_with(
+            tick_result,
+            &mut managed_readiness_cadence,
+            Instant::now(),
+            Instant::now,
+            codex_update::managed_headless_app_server_identity,
+            |identity| {
+                maintain_managed_headless_app_server_ack(
+                    identity,
+                    auth_path,
+                    MANAGED_READINESS_MINIMUM_ACK_REMAINING,
+                )
+            },
+        );
+        match readiness_result {
+            Ok(ManagedReadinessTick::Renewed { pid }) => {
+                eprintln!("renewed managed app-server hot-swap readiness for pid {pid}");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("managed app-server readiness maintenance failed: {error:#}");
             }
         }
-        let mut sleep_interval =
-            complete_daemon_iteration(tick_result, interval, &mut was_fast_polling);
-        if tick_succeeded {
-            sleep_interval =
-                sleep_interval.min(managed_readiness_cadence.time_until_due(Instant::now()));
-        }
+        let sleep_interval = complete_daemon_iteration_with_readiness(
+            tick_result,
+            interval,
+            &mut was_fast_polling,
+            &managed_readiness_cadence,
+            Instant::now(),
+        );
         std::thread::sleep(sleep_interval);
     }
+}
+
+fn complete_daemon_iteration_with_readiness(
+    tick_result: Result<DaemonTick>,
+    base_interval: Duration,
+    was_fast_polling: &mut bool,
+    managed_readiness_cadence: &ManagedReadinessCadence,
+    now: Instant,
+) -> Duration {
+    complete_daemon_iteration(tick_result, base_interval, was_fast_polling)
+        .min(managed_readiness_cadence.time_until_due(now))
 }
 
 fn complete_daemon_iteration(
@@ -1593,6 +1627,46 @@ mod tests {
         );
         assert_eq!(second.unwrap(), ManagedReadinessTick::NotDue);
         assert_eq!(maintenance_calls.get(), 1);
+    }
+
+    #[test]
+    fn failed_quota_tick_does_not_suppress_due_managed_readiness() -> Result<()> {
+        let start = Instant::now();
+        let identity = managed_readiness_identity(42, "linux:quota-failed");
+        let failed_tick = Err(anyhow::anyhow!("quota API unavailable"));
+        let mut cadence = ManagedReadinessCadence::default();
+        let maintenance_calls = std::cell::Cell::new(0);
+
+        let (failed_tick, readiness) = maintain_managed_readiness_after_tick_with(
+            failed_tick,
+            &mut cadence,
+            start,
+            || start,
+            || Ok(Some(identity.clone())),
+            |observed| {
+                maintenance_calls.set(maintenance_calls.get() + 1);
+                assert_eq!(observed, &identity);
+                Ok(ManagedHeadlessAckMaintenance::Renewed { pid: observed.pid })
+            },
+        );
+        let readiness = readiness?;
+        assert!(failed_tick.is_err());
+        let mut was_fast_polling = false;
+        let sleep_interval = complete_daemon_iteration_with_readiness(
+            failed_tick,
+            Duration::from_secs(300),
+            &mut was_fast_polling,
+            &cadence,
+            start,
+        );
+
+        assert_eq!(
+            readiness,
+            ManagedReadinessTick::Renewed { pid: identity.pid }
+        );
+        assert_eq!(maintenance_calls.get(), 1);
+        assert_eq!(sleep_interval, MANAGED_READINESS_MAINTENANCE_INTERVAL);
+        Ok(())
     }
 
     #[test]
