@@ -1320,7 +1320,7 @@ esac
         enforce_updater_retention_at(
             &state,
             data_dir,
-            SystemTime::now() + PREPARED_TREE_MAX_AGE + Duration::from_secs(1),
+            SystemTime::now(),
         )?;
 
         assert!(generations[0].exists(), "leased generation was pruned");
