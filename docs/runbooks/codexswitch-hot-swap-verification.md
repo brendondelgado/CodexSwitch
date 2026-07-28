@@ -84,7 +84,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-27
+  last_updated: 2026-07-28
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -620,6 +620,13 @@ signal loop or allow a healthy local ACK to expire.
 
 The daemon renews only when the managed runtime has no valid request-bound ACK
 or when its current ACK will expire before the next ordinary renewal interval.
+Before observing the managed runtime, maintenance must acquire the same
+nonblocking `accounts.runtime-activation.lock` lease used by rotations and hold
+it through reload and ACK verification. Contention defers that maintenance
+attempt without observing the process, touching request/ACK files, or sending
+`SIGHUP`; the 60-second cadence still advances so contention cannot create a
+busy loop or suppress a later retry.
+
 Before writing a request or sending `SIGHUP`, it must prove all of the following
 from fresh observations:
 

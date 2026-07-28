@@ -2303,15 +2303,20 @@ fn runtime_activation_lease_path(store_path: &Path) -> PathBuf {
 pub(crate) fn acquire_runtime_activation_lease(
     store_path: &Path,
 ) -> Result<RuntimeActivationLease> {
+    try_acquire_runtime_activation_lease(store_path)?.context(
+        "runtime activation is busy: another process owns the cross-process runtime-activation lease",
+    )
+}
+
+pub(crate) fn try_acquire_runtime_activation_lease(
+    store_path: &Path,
+) -> Result<Option<RuntimeActivationLease>> {
     let guard = secure_file::try_lock(&runtime_activation_lease_path(store_path), true)
-        .context("failed to acquire the cross-process runtime-activation lease")?
-        .context(
-            "runtime activation is busy: another process owns the cross-process runtime-activation lease",
-        )?;
-    Ok(RuntimeActivationLease {
+        .context("failed to acquire the cross-process runtime-activation lease")?;
+    Ok(guard.map(|guard| RuntimeActivationLease {
         _guard: guard,
         store_path: store_path.to_path_buf(),
-    })
+    }))
 }
 
 fn provider_io_lease_path(store_path: &Path) -> PathBuf {
@@ -2764,6 +2769,19 @@ mod tests {
         if !format!("{error:#}").contains("runtime activation is busy") {
             bail!("runtime-activation contention returned an unclear error: {error:#}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_lease_try_acquire_reports_contention_and_recovers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let owner = acquire_runtime_activation_lease(&store_path)?;
+
+        assert!(try_acquire_runtime_activation_lease(&store_path)?.is_none());
+
+        drop(owner);
+        assert!(try_acquire_runtime_activation_lease(&store_path)?.is_some());
         Ok(())
     }
 

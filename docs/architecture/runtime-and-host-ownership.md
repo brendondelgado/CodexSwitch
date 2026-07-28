@@ -64,7 +64,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-27
+  last_updated: 2026-07-28
 ---
 
 # Runtime And Host Ownership
@@ -414,6 +414,14 @@ recovered under that same lease after the bounded grace interval. Matching
 `ManualReview` and `RolledBack` records remain blocked. The shared lease, not a
 timestamp by itself, prevents Rust and Swift from replacing the same per-PID
 request with different nonces.
+
+Periodic Linux managed-readiness maintenance is also a runtime-convergence
+owner. Before observing the managed process or touching request/ACK files, it
+must acquire that same cross-process lease with a nonblocking attempt and retain
+it through any bounded reload and ACK verification. Lease contention is a
+normal deferred maintenance result: it performs no runtime observation, file
+mutation, or signal, advances the ordinary maintenance cadence, and retries on
+a later due tick.
 
 The Swift activation journal enforces this lease centrally. Every durable
 journal transition either inherits task-local proof from an enclosing Swift

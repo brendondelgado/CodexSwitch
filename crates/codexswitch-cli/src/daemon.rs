@@ -14,7 +14,8 @@ use crate::activation::{
     activate_with_unlocked_reload_under_runtime_lease,
     commit_accounts_with_provider_io_activation_under_runtime_lease,
     preflight_provider_io_activation, read_activation_record,
-    reconcile_activation_barrier_unlocked_under_runtime_lease, validate_provider_io_activation,
+    reconcile_activation_barrier_unlocked_under_runtime_lease,
+    try_acquire_runtime_activation_lease, validate_provider_io_activation,
     validate_provider_io_activation_locked, ActivationContext, ActivationOutcome, ActivationState,
     ProviderIoActivationGuard, RuntimeActivationLease,
 };
@@ -107,33 +108,40 @@ impl ManagedReadinessCadence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedReadinessTick {
     NotDue,
+    DeferredForActivation,
     NoManagedRuntime,
     Current,
     Renewed { pid: i32 },
 }
 
-fn maintain_managed_readiness_with<CompletedAt, Observe, Maintain>(
+fn maintain_managed_readiness_with<Lease, CompletedAt, AcquireLease, Observe, Maintain>(
     cadence: &mut ManagedReadinessCadence,
     now: Instant,
     completed_at: CompletedAt,
+    acquire_runtime_lease: AcquireLease,
     observe_managed_runtime: Observe,
     maintain_ack: Maintain,
 ) -> Result<ManagedReadinessTick>
 where
     CompletedAt: FnOnce() -> Instant,
+    AcquireLease: FnOnce() -> Result<Option<Lease>>,
     Observe: FnOnce() -> Result<Option<ManagedHeadlessAppServerIdentity>>,
     Maintain: FnOnce(&ManagedHeadlessAppServerIdentity) -> Result<ManagedHeadlessAckMaintenance>,
 {
     if !cadence.claim_if_due(now) {
         return Ok(ManagedReadinessTick::NotDue);
     }
-    let result = match observe_managed_runtime() {
-        Ok(None) => Ok(ManagedReadinessTick::NoManagedRuntime),
-        Ok(Some(identity)) => match maintain_ack(&identity) {
-            Ok(ManagedHeadlessAckMaintenance::Current) => Ok(ManagedReadinessTick::Current),
-            Ok(ManagedHeadlessAckMaintenance::Renewed { pid }) => {
-                Ok(ManagedReadinessTick::Renewed { pid })
-            }
+    let result = match acquire_runtime_lease() {
+        Ok(None) => Ok(ManagedReadinessTick::DeferredForActivation),
+        Ok(Some(_runtime_lease)) => match observe_managed_runtime() {
+            Ok(None) => Ok(ManagedReadinessTick::NoManagedRuntime),
+            Ok(Some(identity)) => match maintain_ack(&identity) {
+                Ok(ManagedHeadlessAckMaintenance::Current) => Ok(ManagedReadinessTick::Current),
+                Ok(ManagedHeadlessAckMaintenance::Renewed { pid }) => {
+                    Ok(ManagedReadinessTick::Renewed { pid })
+                }
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         },
         Err(error) => Err(error),
@@ -142,16 +150,18 @@ where
     result
 }
 
-fn maintain_managed_readiness_after_tick_with<CompletedAt, Observe, Maintain>(
+fn maintain_managed_readiness_after_tick_with<Lease, CompletedAt, AcquireLease, Observe, Maintain>(
     tick_result: Result<DaemonTick>,
     cadence: &mut ManagedReadinessCadence,
     now: Instant,
     completed_at: CompletedAt,
+    acquire_runtime_lease: AcquireLease,
     observe_managed_runtime: Observe,
     maintain_ack: Maintain,
 ) -> (Result<DaemonTick>, Result<ManagedReadinessTick>)
 where
     CompletedAt: FnOnce() -> Instant,
+    AcquireLease: FnOnce() -> Result<Option<Lease>>,
     Observe: FnOnce() -> Result<Option<ManagedHeadlessAppServerIdentity>>,
     Maintain: FnOnce(&ManagedHeadlessAppServerIdentity) -> Result<ManagedHeadlessAckMaintenance>,
 {
@@ -159,6 +169,7 @@ where
         cadence,
         now,
         completed_at,
+        acquire_runtime_lease,
         observe_managed_runtime,
         maintain_ack,
     );
@@ -1347,6 +1358,7 @@ pub fn run_loop(store_path: &Path, auth_path: &Path, interval: Duration) -> Resu
             &mut managed_readiness_cadence,
             Instant::now(),
             Instant::now,
+            || try_acquire_runtime_activation_lease(store_path),
             codex_update::managed_headless_app_server_identity,
             |identity| {
                 maintain_managed_headless_app_server_ack(
@@ -1542,6 +1554,7 @@ mod tests {
                 &mut cadence,
                 now,
                 || now,
+                || Ok(Some(())),
                 || {
                     observations.set(observations.get() + 1);
                     Ok(None)
@@ -1579,6 +1592,7 @@ mod tests {
                 &mut cadence,
                 start + Duration::from_secs(offset),
                 || start + Duration::from_secs(offset),
+                || Ok(Some(())),
                 || Ok(Some(identity.clone())),
                 |_| {
                     maintenance_calls.set(maintenance_calls.get() + 1);
@@ -1610,6 +1624,7 @@ mod tests {
             &mut cadence,
             start,
             || start + Duration::from_secs(70),
+            || Ok(Some(())),
             || Ok(Some(identity)),
             |_| {
                 maintenance_calls.set(maintenance_calls.get() + 1);
@@ -1622,11 +1637,85 @@ mod tests {
             &mut cadence,
             start + Duration::from_secs(71),
             || panic!("not-due cadence requested a completion timestamp"),
+            || -> Result<Option<()>> {
+                panic!("not-due cadence tried to acquire the activation lease")
+            },
             || panic!("cadence retry probed before it was due"),
             |_| panic!("cadence retry maintained before it was due"),
         );
         assert_eq!(second.unwrap(), ManagedReadinessTick::NotDue);
         assert_eq!(maintenance_calls.get(), 1);
+    }
+
+    #[test]
+    fn managed_readiness_lease_contention_defers_without_reload_and_recovers() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let start = Instant::now();
+        let identity = managed_readiness_identity(42, "linux:lease-recovery");
+        let owner = acquire_runtime_activation_lease(&store_path)?;
+        let mut cadence = ManagedReadinessCadence::default();
+        let observations = std::cell::Cell::new(0);
+        let reload_or_signal_calls = std::cell::Cell::new(0);
+
+        let deferred = maintain_managed_readiness_with(
+            &mut cadence,
+            start,
+            || start,
+            || try_acquire_runtime_activation_lease(&store_path),
+            || {
+                observations.set(observations.get() + 1);
+                Ok(Some(identity.clone()))
+            },
+            |_| {
+                reload_or_signal_calls.set(reload_or_signal_calls.get() + 1);
+                Ok(ManagedHeadlessAckMaintenance::Renewed { pid: identity.pid })
+            },
+        )?;
+
+        assert_eq!(deferred, ManagedReadinessTick::DeferredForActivation);
+        assert_eq!(observations.get(), 0);
+        assert_eq!(reload_or_signal_calls.get(), 0);
+        assert_eq!(
+            cadence.time_until_due(start),
+            MANAGED_READINESS_MAINTENANCE_INTERVAL
+        );
+        let not_due = maintain_managed_readiness_with(
+            &mut cadence,
+            start + Duration::from_secs(1),
+            || panic!("not-due contention retry requested a completion timestamp"),
+            || -> Result<Option<RuntimeActivationLease>> {
+                panic!("not-due contention retry tried to acquire the activation lease")
+            },
+            || panic!("not-due contention retry observed the managed runtime"),
+            |_| panic!("not-due contention retry attempted reload"),
+        )?;
+        assert_eq!(not_due, ManagedReadinessTick::NotDue);
+
+        drop(owner);
+        let recovered = maintain_managed_readiness_with(
+            &mut cadence,
+            start + MANAGED_READINESS_MAINTENANCE_INTERVAL,
+            || start + MANAGED_READINESS_MAINTENANCE_INTERVAL,
+            || try_acquire_runtime_activation_lease(&store_path),
+            || {
+                observations.set(observations.get() + 1);
+                Ok(Some(identity.clone()))
+            },
+            |observed| {
+                reload_or_signal_calls.set(reload_or_signal_calls.get() + 1);
+                assert_eq!(observed, &identity);
+                Ok(ManagedHeadlessAckMaintenance::Renewed { pid: observed.pid })
+            },
+        )?;
+
+        assert_eq!(
+            recovered,
+            ManagedReadinessTick::Renewed { pid: identity.pid }
+        );
+        assert_eq!(observations.get(), 1);
+        assert_eq!(reload_or_signal_calls.get(), 1);
+        Ok(())
     }
 
     #[test]
@@ -1642,6 +1731,7 @@ mod tests {
             &mut cadence,
             start,
             || start,
+            || Ok(Some(())),
             || Ok(Some(identity.clone())),
             |observed| {
                 maintenance_calls.set(maintenance_calls.get() + 1);
@@ -1680,6 +1770,7 @@ mod tests {
             &mut cadence,
             start,
             || start,
+            || Ok(Some(())),
             || Ok(Some(original)),
             |_| Ok(ManagedHeadlessAckMaintenance::Current),
         )?;
@@ -1687,6 +1778,7 @@ mod tests {
             &mut cadence,
             start + MANAGED_READINESS_MAINTENANCE_INTERVAL,
             || start + MANAGED_READINESS_MAINTENANCE_INTERVAL,
+            || Ok(Some(())),
             || Ok(Some(restarted.clone())),
             |identity| {
                 assert_eq!(identity, &restarted);
