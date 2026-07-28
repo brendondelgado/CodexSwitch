@@ -15,8 +15,21 @@ on:
         description: Exact 40-character commit behind the upstream rust-v version tag
         required: true
         type: string
+      base_runtime_run_id:
+        description: Optional successful workflow run whose attested upstream runtime pair may be reused
+        required: false
+        type: string
+      base_runtime_artifact_name:
+        description: Exact artifact name from base_runtime_run_id
+        required: false
+        type: string
+      base_runtime_source_sha:
+        description: Exact CodexSwitch commit attested by the base runtime artifact
+        required: false
+        type: string
 
 permissions:
+  actions: read
   attestations: write
   contents: read
   id-token: write
@@ -65,6 +78,9 @@ jobs:
           EXPECTED_CODEXSWITCH_SHA: ${{ inputs.codexswitch_git_sha }}
           UPSTREAM_CODEX_VERSION: ${{ inputs.upstream_codex_version }}
           EXPECTED_UPSTREAM_CODEX_SHA: ${{ inputs.upstream_codex_git_sha }}
+          BASE_RUNTIME_RUN_ID: ${{ inputs.base_runtime_run_id }}
+          BASE_RUNTIME_ARTIFACT_NAME: ${{ inputs.base_runtime_artifact_name }}
+          BASE_RUNTIME_SOURCE_SHA: ${{ inputs.base_runtime_source_sha }}
         run: |
           set -euo pipefail
           sha_pattern='^[0-9a-f]{40}$'
@@ -81,6 +97,28 @@ jobs:
           if [[ ! "$UPSTREAM_CODEX_VERSION" =~ $version_pattern ]]; then
             echo "::error::upstream_codex_version must be a stable three-component version"
             exit 1
+          fi
+          reuse_inputs=0
+          [[ -n "$BASE_RUNTIME_RUN_ID" ]] && reuse_inputs=$((reuse_inputs + 1))
+          [[ -n "$BASE_RUNTIME_ARTIFACT_NAME" ]] && reuse_inputs=$((reuse_inputs + 1))
+          [[ -n "$BASE_RUNTIME_SOURCE_SHA" ]] && reuse_inputs=$((reuse_inputs + 1))
+          if (( reuse_inputs != 0 && reuse_inputs != 3 )); then
+            echo "::error::base runtime reuse requires run ID, artifact name, and source SHA together"
+            exit 1
+          fi
+          if (( reuse_inputs == 3 )); then
+            if [[ ! "$BASE_RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::base_runtime_run_id must be a positive decimal workflow run ID"
+              exit 1
+            fi
+            if [[ ! "$BASE_RUNTIME_SOURCE_SHA" =~ $sha_pattern ]]; then
+              echo "::error::base_runtime_source_sha must be 40 lowercase hexadecimal characters"
+              exit 1
+            fi
+            if [[ ! "$BASE_RUNTIME_ARTIFACT_NAME" =~ ^[A-Za-z0-9._-]{1,200}$ ]]; then
+              echo "::error::base_runtime_artifact_name has an unsafe shape"
+              exit 1
+            fi
           fi
 
           actual_sha="$(git rev-parse HEAD)"
@@ -119,6 +157,7 @@ jobs:
             printf 'UPSTREAM_TARGET_DIR=%s/codex-target\n' "$RUNNER_TEMP"
             printf 'PATCH_DRIVER=%s/patch-codex-source\n' "$RUNNER_TEMP"
             printf 'ARTIFACT_DIR=%s/codexswitch-macos-runtime-artifact\n' "$RUNNER_TEMP"
+            printf 'BASE_ARTIFACT_DIR=%s/codexswitch-base-runtime-artifact\n' "$RUNNER_TEMP"
           } >> "$GITHUB_ENV"
 
       - name: Prepare the Rust toolchain
@@ -318,6 +357,7 @@ jobs:
           fi
 
       - name: Derive exact upstream target cache ABI
+        if: ${{ inputs.base_runtime_run_id == '' }}
         id: target_cache_abi
         working-directory: ${{ runner.temp }}/codex-upstream/codex-rs
         env:
@@ -369,6 +409,7 @@ jobs:
           echo "Upstream target cache ABI: $cache_abi_sha256"
 
       - name: Restore exact upstream Cargo target cache
+        if: ${{ inputs.base_runtime_run_id == '' }}
         id: upstream_target_cache
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -377,6 +418,7 @@ jobs:
           key: macos-runtime-target-v3-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}
 
       - name: Build the patched Codex runtime pair
+        if: ${{ inputs.base_runtime_run_id == '' }}
         working-directory: ${{ runner.temp }}/codex-upstream/codex-rs
         env:
           SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
@@ -390,6 +432,96 @@ jobs:
             --jobs "$CARGO_BUILD_JOBS" \
             -p codex-cli \
             -p codex-code-mode-host
+
+      - name: Reuse an attested unchanged upstream runtime pair
+        if: ${{ inputs.base_runtime_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_RUNTIME_RUN_ID: ${{ inputs.base_runtime_run_id }}
+          BASE_RUNTIME_ARTIFACT_NAME: ${{ inputs.base_runtime_artifact_name }}
+          BASE_RUNTIME_SOURCE_SHA: ${{ inputs.base_runtime_source_sha }}
+          EXPECTED_UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          EXPECTED_PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          trusted_repository="brendondelgado/CodexSwitch"
+          trusted_workflow="brendondelgado/CodexSwitch/.github/workflows/build-fork.yml"
+
+          if [[ -e "$BASE_ARTIFACT_DIR" ]]; then
+            echo "::error::base artifact destination already exists"
+            exit 1
+          fi
+          install -d -m 0700 "$BASE_ARTIFACT_DIR"
+          gh run download "$BASE_RUNTIME_RUN_ID" \
+            --repo "$trusted_repository" \
+            --name "$BASE_RUNTIME_ARTIFACT_NAME" \
+            --dir "$BASE_ARTIFACT_DIR"
+
+          expected_names="$RUNNER_TEMP/expected-base-artifact-files.txt"
+          actual_names="$RUNNER_TEMP/actual-base-artifact-files.txt"
+          printf '%s\n' codex codex-code-mode-host codexswitch-cli manifest.json \
+            | LC_ALL=C sort > "$expected_names"
+          find "$BASE_ARTIFACT_DIR" -mindepth 1 -maxdepth 1 -exec basename {} \; \
+            | LC_ALL=C sort > "$actual_names"
+          diff -u "$expected_names" "$actual_names"
+
+          while IFS= read -r member; do
+            path="$BASE_ARTIFACT_DIR/$member"
+            if [[ ! -f "$path" || -L "$path" || ! -s "$path" ]]; then
+              echo "::error::base artifact member is not a nonempty regular file: $member"
+              exit 1
+            fi
+            gh attestation verify "$path" \
+              --repo "$trusted_repository" \
+              --signer-workflow "$trusted_workflow" \
+              --signer-digest "$BASE_RUNTIME_SOURCE_SHA" \
+              --source-ref refs/heads/main \
+              --source-digest "$BASE_RUNTIME_SOURCE_SHA" \
+              --deny-self-hosted-runners >/dev/null
+          done < "$expected_names"
+
+          jq -e \
+            --arg sourceSha "$BASE_RUNTIME_SOURCE_SHA" \
+            --arg upstreamVersion "$UPSTREAM_CODEX_VERSION" \
+            --arg upstreamSha "$EXPECTED_UPSTREAM_SHA" \
+            --arg patchSha256 "$EXPECTED_PATCH_SHA256" \
+            '
+              type == "object" and
+              (keys == ["architecture", "buildEpoch", "codexSwitchBuildVersion", "codexSwitchGitSha", "files", "format", "sourcePatchSha256", "targetTriple", "upstreamCodexGitSha", "upstreamCodexVersion"]) and
+              .format == "codexswitch-macos-runtime-artifact-v1" and
+              .codexSwitchGitSha == $sourceSha and
+              .upstreamCodexVersion == $upstreamVersion and
+              .upstreamCodexGitSha == $upstreamSha and
+              .sourcePatchSha256 == $patchSha256 and
+              .targetTriple == "aarch64-apple-darwin" and
+              .architecture == "arm64" and
+              ([.files[].name] == ["codex", "codex-code-mode-host", "codexswitch-cli"]) and
+              (all(.files[];
+                (keys == ["bytes", "name", "sha256"]) and
+                (.bytes | (type == "number" and . > 0 and . <= 2147483648)) and
+                (.sha256 | test("^[0-9a-f]{64}$"))
+              ))
+            ' "$BASE_ARTIFACT_DIR/manifest.json" >/dev/null
+
+          file_sha256() {
+            shasum -a 256 "$1" | awk '{print $1}'
+          }
+          file_bytes() {
+            stat -f '%z' "$1"
+          }
+          for name in codex codex-code-mode-host codexswitch-cli; do
+            manifest_bytes="$(jq -r --arg name "$name" '.files[] | select(.name == $name) | .bytes' "$BASE_ARTIFACT_DIR/manifest.json")"
+            manifest_sha256="$(jq -r --arg name "$name" '.files[] | select(.name == $name) | .sha256' "$BASE_ARTIFACT_DIR/manifest.json")"
+            if [[ "$manifest_bytes" != "$(file_bytes "$BASE_ARTIFACT_DIR/$name")" \
+              || "$manifest_sha256" != "$(file_sha256 "$BASE_ARTIFACT_DIR/$name")" ]]; then
+              echo "::error::base manifest identity mismatch for $name"
+              exit 1
+            fi
+          done
+
+          for name in codex codex-code-mode-host; do
+            install -m 0755 "$BASE_ARTIFACT_DIR/$name" "$ARTIFACT_DIR/$name"
+          done
 
       - name: Revalidate both source trees after compilation
         env:
@@ -441,6 +573,7 @@ jobs:
           fi
 
       - name: Stage the exact four-file artifact directory
+        if: ${{ inputs.base_runtime_run_id == '' }}
         run: |
           set -euo pipefail
           runtime_build_dir="$UPSTREAM_TARGET_DIR/$TARGET_TRIPLE/release"
@@ -711,7 +844,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save verified upstream Cargo target cache
-        if: ${{ success() && steps.upstream_target_cache.outputs.cache-hit != 'true' }}
+        if: ${{ success() && inputs.base_runtime_run_id == '' && steps.upstream_target_cache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -721,6 +854,10 @@ jobs:
       - name: Remove ephemeral upstream Cargo target
         if: ${{ always() }}
         run: rm -rf -- "$RUNNER_TEMP/codex-target"
+
+      - name: Remove ephemeral base runtime artifact
+        if: ${{ always() }}
+        run: rm -rf -- "$RUNNER_TEMP/codexswitch-base-runtime-artifact"
 
       - name: Save remote Cargo downloads
         if: ${{ always() && steps.cargo_download_cache.outputs.cache-hit != 'true' }}

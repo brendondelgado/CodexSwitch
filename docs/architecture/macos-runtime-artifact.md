@@ -6,6 +6,7 @@ toc:
   - Purpose
   - App Artifact Boundary
   - Build Gate
+  - Verified Runtime Pair Reuse
   - Trust Bootstrap
   - Manifest
   - App Manifest
@@ -28,7 +29,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-25
+  last_updated: 2026-07-28
 ---
 
 # macOS Runtime Artifact
@@ -107,6 +108,30 @@ the patch driver makes only that helper crate-visible and uses it for both
 injected `account/updated` sends. Older bare-notification variants remain
 supported; an envelope-bearing source without the known helper fails closed
 before the release compile begins.
+
+## Verified Runtime Pair Reuse
+
+A control-plane-only CodexSwitch change may reuse `codex` and
+`codex-code-mode-host` from an earlier successful run of the same trusted
+workflow instead of recompiling unchanged upstream source. Reuse is explicit
+and requires the base run ID, exact artifact name, and exact base CodexSwitch
+commit. Omitting any member disables reuse; partial or malformed reuse input
+fails before compilation.
+
+The workflow downloads the named base artifact through GitHub Actions,
+requires exactly its four canonical files, and independently verifies every
+member's GitHub attestation against the repository, `refs/heads/main`, the
+trusted workflow, and the exact base commit. It then proves the base manifest's
+upstream version, upstream commit, source-patch digest, target triple,
+architecture, member order, byte counts, and hashes against the newly derived
+source-patch identity. Only the two upstream runtime executables are copied
+forward. The old control plane and manifest are never reused.
+
+The new control plane is always compiled from the dispatched commit. The
+workflow repeats architecture, signature, runtime marker, and version checks,
+generates a new manifest bound to the new commit and build epoch, and attests
+all four final members under that new commit before upload. A source-patch,
+upstream, artifact, attestation, or member-identity mismatch fails closed.
 
 ## Trust Bootstrap
 
