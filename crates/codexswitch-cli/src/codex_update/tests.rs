@@ -4723,6 +4723,8 @@ async fn run_turn() {
         assert!(patched.contains("fn codexswitch_verified_rotation_result("));
         assert!(patched.contains("codexswitch-runtime-rotation-handoff-v1"));
         assert!(patched.contains("report.get(\"receiptNonce\")"));
+        assert!(patched.contains("report.get(\"operationId\")"));
+        assert!(patched.contains("report.get(\"callerAcceptanceRequired\")"));
         assert!(patched.contains("report.get(\"runtimeConverged\")"));
         assert!(patched.contains("report.get(\"topologyVerified\")"));
         assert!(patched.contains("report.get(\"requestCount\")"));
@@ -4740,6 +4742,8 @@ async fn run_turn() {
         assert!(patched.contains("const CODEXSWITCH_ROTATION_MAX_ATTEMPTS: usize = 3;"));
         assert!(patched.contains("async fn codexswitch_retry_rotation_attempt("));
         assert!(patched.contains("async fn codexswitch_run_rotation_attempt("));
+        assert!(patched.contains("async fn codexswitch_acknowledge_remote_rotation("));
+        assert!(patched.contains(".arg(\"acknowledge-remote-rotation\")"));
         assert!(rotation_source.contains("let mut codexswitch_rotation_attempt = 0;"));
         assert!(patched.contains("\"transport failure or timeout\""));
         assert!(patched.contains("\"malformed or unverified rotation response\""));
@@ -4771,6 +4775,16 @@ async fn run_turn() {
         assert!(rotation_source.contains("if !manager_already_matches_handoff"));
         assert!(rotation_source.contains("own_handoff.auth_generation"));
         assert!(rotation_source.contains("pre_rotation_auth_generation"));
+        let final_identity_index = rotation_source
+            .find("if auth_manager.codexswitch_auth_file_identity(&auth_path).ok()")
+            .unwrap();
+        let caller_ack_index = rotation_source
+            .find("if codexswitch_acknowledge_remote_rotation(")
+            .unwrap();
+        assert!(
+            final_identity_index < caller_ack_index,
+            "caller acknowledgement must follow exact handoff and AuthManager validation"
+        );
         assert!(!rotation_source.contains("if !changed"));
         let external_reload_start = patched
             .find("async fn codexswitch_reload_changed_external_auth(")
@@ -5447,11 +5461,15 @@ async fn run_turn() {
         assert!(patched.contains("fn codexswitch_verified_rotation_result("));
         assert!(patched.contains("codexswitch-runtime-rotation-handoff-v1"));
         assert!(patched.contains("report.get(\"receiptNonce\")"));
+        assert!(patched.contains("report.get(\"operationId\")"));
+        assert!(patched.contains("report.get(\"callerAcceptanceRequired\")"));
         assert!(patched.contains("report.get(\"requestCount\")"));
         assert!(patched.contains("report.get(\"acknowledgedRequestNonces\")"));
         assert!(patched.contains("codexswitch_reload_auth_json_verified(&auth_path)"));
         assert!(patched.contains("if !manager_already_matches_handoff"));
         assert!(patched.contains("own_handoff.auth_generation"));
+        assert!(patched.contains("codexswitch_acknowledge_remote_rotation("));
+        assert!(patched.contains(".arg(\"acknowledge-remote-rotation\")"));
         assert!(!patched.contains("if !changed\n        || loaded_fingerprint"));
         assert!(!patched.contains("auth_manager.reload().await"));
         assert!(patched.contains("CODEXSWITCH_ROTATE_TIMEOUT_SECONDS"));

@@ -147,15 +147,37 @@ Runtime-triggered remote rotations also use a durable Mac operation journal and
 a bounded VPS operation history. A retry reuses the same operation identifier.
 After an unknown SSH outcome, the Mac performs read-only status reconciliation
 before retrying; it never submits a second banked-reset effect merely because a
-response was lost. The local operation becomes complete only after Mac
-credentials and runtime acknowledgement converge to the recorded VPS target.
+response was lost. Receipt-bound interrupted turns use an explicit durable
+two-phase handoff:
+
+```text
+pending -> awaiting_caller_acceptance -> locally_converged
+```
+
+The control CLI may enter `awaiting_caller_acceptance` only after Mac
+credentials and every required runtime acknowledgement converge to the recorded
+VPS target. It returns the exact durable operation ID and caller receipt without
+marking the operation locally converged. The patched turn independently validates
+the returned receipt-bound handoff, converges its in-memory auth manager, and
+then acknowledges that exact operation and receipt. Only that acknowledgement
+may enter `locally_converged`.
+
 Interrupted-turn recovery may retry transient transport, timeout, malformed
 response, or missing-ACK failures within the original turn, but every bounded
-attempt retains the same receipt and durable rotation operation. A pending
-operation is reusable only when reason, cooldown, and banked-reset permission
-all match. A semantic mismatch first performs read-only reconciliation: a
-completed prior operation may be locally converged, while an unresolved prior
-operation blocks the new request without submitting either operation again.
+attempt retains the same receipt and durable rotation operation. A retry with
+the same non-empty receipt reuses that operation even if it is already locally
+converged, which makes a lost caller-acknowledgement response idempotent. A new
+receipt may take over an operation still awaiting caller acceptance only by
+reconverging the same completed remote outcome; it cannot submit a second remote
+mutation or reset. Direct and manual CLI calls have no external caller-acceptance
+phase and may enter `locally_converged` immediately after their own complete
+local convergence.
+
+A nonterminal operation is reusable only when reason, cooldown, and banked-reset
+permission all match. A semantic mismatch first performs read-only
+reconciliation: a completed prior operation may be locally converged, while an
+unresolved prior operation blocks the new request without submitting either
+operation again.
 
 Mac adoption requires one fresh, internally consistent observation whose
 authority epoch, desired provider identity, request result, and VPS readiness

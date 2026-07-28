@@ -225,6 +225,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Complete the caller side of a receipt-bound remote rotation handoff.
+    #[command(name = "acknowledge-remote-rotation", hide = true)]
+    AcknowledgeRemoteRotation {
+        #[arg(long, value_parser = parse_canonical_uuid)]
+        operation_id: Uuid,
+        #[arg(long, value_parser = parse_canonical_uuid)]
+        receipt_nonce: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
     /// Confirm a reviewed activation barrier without changing account credentials.
     ResolveActivation {
         #[arg(long)]
@@ -359,6 +369,11 @@ fn main() -> Result<()> {
             receipt_nonce,
             json,
         ),
+        Command::AcknowledgeRemoteRotation {
+            operation_id,
+            receipt_nonce,
+            json,
+        } => acknowledge_remote_rotation(operation_id, receipt_nonce, json),
         Command::ResolveActivation { yes, json } => {
             resolve_activation(&store_path, &auth_path, yes, json)
         }
@@ -1696,6 +1711,7 @@ where
 struct RotateNowReport {
     operation_id: Option<Uuid>,
     receipt_nonce: Option<Uuid>,
+    caller_acceptance_required: bool,
     reason: String,
     previous_email: String,
     previous_token_hash_prefix: String,
@@ -1765,10 +1781,10 @@ pub(crate) fn rotate_now(
             receipt_nonce,
         },
         |reason, cooldown_seconds, allow_banked_reset| {
-            remote_authority::rotate(reason, cooldown_seconds, allow_banked_reset)
+            remote_authority::rotate(reason, cooldown_seconds, allow_banked_reset, receipt_nonce)
         },
         remote_authority::fetch_status,
-        remote_authority::mark_rotation_locally_converged,
+        remote_authority::finish_rotation_control_handoff,
         &reload,
     )?;
     #[cfg(not(target_os = "macos"))]
@@ -1870,13 +1886,13 @@ fn rotate_now_via_remote_with<T, F, M, R>(
     context: RotateNowContext<'_>,
     rotate_remote: T,
     fetch_remote: F,
-    mark_locally_converged: M,
+    finish_control_handoff: M,
     reload: &R,
 ) -> Result<RotateNowReport>
 where
     T: Fn(&str, i64, bool) -> Result<remote_authority::RemoteRotationOutcome>,
     F: Fn() -> Result<PoolAuthorityStatus>,
-    M: Fn(Uuid) -> Result<()>,
+    M: Fn(Uuid, Option<Uuid>) -> Result<bool>,
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
     let RotateNowContext {
@@ -1916,12 +1932,13 @@ where
         reload,
     )?;
     require_rotation_receipt_proof(&adoption.reload, receipt_nonce, true)?;
-    mark_locally_converged(remote.operation_id)?;
+    let caller_acceptance_required = finish_control_handoff(remote.operation_id, receipt_nonce)?;
     let next_token_fingerprint = auth::account_token_fingerprint(&adoption.target)
         .context("remote-authority target has incomplete token material")?;
     Ok(RotateNowReport {
         operation_id: Some(remote.operation_id),
         receipt_nonce,
+        caller_acceptance_required,
         reason: remote.reason,
         previous_email,
         previous_token_hash_prefix,
@@ -1948,6 +1965,37 @@ where
         authority_detail: final_status.detail,
         skipped: adoption.reload.skipped,
     })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteRotationAcknowledgement {
+    operation_id: Uuid,
+    receipt_nonce: Uuid,
+    state: &'static str,
+}
+
+fn acknowledge_remote_rotation(
+    operation_id: Uuid,
+    receipt_nonce: Uuid,
+    json_output: bool,
+) -> Result<()> {
+    remote_authority::acknowledge_rotation_handoff(operation_id, receipt_nonce)?;
+    let report = RemoteRotationAcknowledgement {
+        operation_id,
+        receipt_nonce,
+        state: "locally_converged",
+    };
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Acknowledged remote rotation {} for receipt {}.",
+            operation_id.hyphenated(),
+            receipt_nonce.hyphenated()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2031,6 +2079,7 @@ fn completed_rotation_operation_report(
     Ok(RotateNowReport {
         operation_id: Some(operation.operation_id),
         receipt_nonce,
+        caller_acceptance_required: false,
         reason: operation.reason.clone(),
         previous_email: active.email.clone(),
         previous_token_hash_prefix: token_hash_prefix(&active.access_token),
@@ -2391,6 +2440,7 @@ where
                     return Ok(RotateNowReport {
                         operation_id,
                         receipt_nonce,
+                        caller_acceptance_required: false,
                         reason: reason.to_string(),
                         previous_email: previous_email.clone(),
                         previous_token_hash_prefix,
@@ -2539,6 +2589,7 @@ where
     Ok(RotateNowReport {
         operation_id,
         receipt_nonce,
+        caller_acceptance_required: false,
         reason: reason.to_string(),
         previous_email,
         previous_token_hash_prefix,
@@ -4092,9 +4143,12 @@ mod tests {
             },
             {
                 let observed_marks = Arc::clone(&observed_marks);
-                move |operation_id| {
-                    observed_marks.lock().unwrap().push(operation_id);
-                    Ok(())
+                move |operation_id, receipt_nonce| {
+                    observed_marks
+                        .lock()
+                        .unwrap()
+                        .push((operation_id, receipt_nonce));
+                    Ok(receipt_nonce.is_some())
                 }
             },
             &move |_path| {
@@ -4132,9 +4186,12 @@ mod tests {
             },
             {
                 let observed_marks = Arc::clone(&mark_calls);
-                move |operation_id| {
-                    observed_marks.lock().unwrap().push(operation_id);
-                    Ok(())
+                move |operation_id, receipt_nonce| {
+                    observed_marks
+                        .lock()
+                        .unwrap()
+                        .push((operation_id, receipt_nonce));
+                    Ok(receipt_nonce.is_some())
                 }
             },
             &move |_path| {
@@ -4146,8 +4203,12 @@ mod tests {
         assert_eq!(second.operation_id, Some(operation_id));
         assert_eq!(second.next_email, target.email);
         assert!(second.runtime_converged);
+        assert!(second.caller_acceptance_required);
         assert_eq!(*retry_reload_calls.lock().unwrap(), 1);
-        assert_eq!(*mark_calls.lock().unwrap(), vec![operation_id]);
+        assert_eq!(
+            *mark_calls.lock().unwrap(),
+            vec![(operation_id, Some(receipt_nonce))]
+        );
         Ok(())
     }
 
@@ -4254,8 +4315,9 @@ mod tests {
     }
 
     #[test]
-    fn rotate_now_accepts_only_canonical_receipt_uuid() -> Result<()> {
+    fn rotation_handoff_commands_accept_only_canonical_uuids() -> Result<()> {
         let canonical = "37f84870-9b39-45ae-aee9-3e0a63e1f989";
+        let operation = "fd825556-7f23-40d2-8c76-4ad58f07c805";
         let parsed = Args::try_parse_from([
             "codexswitch-cli",
             "rotate-now",
@@ -4268,6 +4330,24 @@ mod tests {
                 receipt_nonce: Some(receipt_nonce),
                 ..
             } if receipt_nonce.hyphenated().to_string() == canonical
+        ));
+        let acknowledgement = Args::try_parse_from([
+            "codexswitch-cli",
+            "acknowledge-remote-rotation",
+            "--operation-id",
+            operation,
+            "--receipt-nonce",
+            canonical,
+            "--json",
+        ])?;
+        assert!(matches!(
+            acknowledgement.command,
+            Command::AcknowledgeRemoteRotation {
+                operation_id,
+                receipt_nonce,
+                json: true,
+            } if operation_id.hyphenated().to_string() == operation
+                && receipt_nonce.hyphenated().to_string() == canonical
         ));
 
         for invalid in [
@@ -4290,6 +4370,15 @@ mod tests {
             "--receipt-nonce",
             canonical,
             "--offline-file-only",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "codexswitch-cli",
+            "acknowledge-remote-rotation",
+            "--operation-id",
+            "FD825556-7F23-40D2-8C76-4AD58F07C805",
+            "--receipt-nonce",
+            canonical,
         ])
         .is_err());
         Ok(())

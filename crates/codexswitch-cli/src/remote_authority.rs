@@ -29,7 +29,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_STATUS_AGE: ChronoDuration = ChronoDuration::seconds(30);
 const MAX_FUTURE_SKEW: ChronoDuration = ChronoDuration::seconds(30);
 const MAX_COOLDOWN_SECONDS: i64 = 31 * 24 * 60 * 60;
-const REMOTE_ROTATION_JOURNAL_VERSION: u32 = 1;
+const LEGACY_REMOTE_ROTATION_JOURNAL_VERSION: u32 = 1;
+const REMOTE_ROTATION_JOURNAL_VERSION: u32 = 2;
 const STATUS_RECONCILIATION_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,7 @@ pub struct RemoteRotationOutcome {
 #[serde(rename_all = "snake_case")]
 enum RemoteRotationJournalState {
     Pending,
+    AwaitingCallerAcceptance,
     LocallyConverged,
 }
 
@@ -60,6 +62,8 @@ struct RemoteRotationJournal {
     started_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     state: RemoteRotationJournalState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caller_receipt_nonce: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +71,7 @@ struct RemoteRotationIntent {
     reason: String,
     cooldown_seconds: i64,
     allow_banked_reset: bool,
+    caller_receipt_nonce: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,9 +166,15 @@ pub fn rotate(
     reason: &str,
     cooldown_seconds: i64,
     allow_banked_reset: bool,
+    caller_receipt_nonce: Option<Uuid>,
 ) -> Result<RemoteRotationOutcome> {
     let config = load_default_config()?;
-    match begin_or_resume_rotation(reason, cooldown_seconds, allow_banked_reset)? {
+    match begin_or_resume_rotation(
+        reason,
+        cooldown_seconds,
+        allow_banked_reset,
+        caller_receipt_nonce,
+    )? {
         RemoteRotationPreparation::Ready(pending) => rotate_with(&config, &pending, &run_ssh),
         RemoteRotationPreparation::Conflicting { pending, requested } => {
             reconcile_conflicting_rotation_with(&config, &pending, &requested, &run_ssh)
@@ -171,8 +182,26 @@ pub fn rotate(
     }
 }
 
-pub fn mark_rotation_locally_converged(operation_id: Uuid) -> Result<()> {
-    mark_rotation_locally_converged_at(&default_rotation_journal_path()?, operation_id)
+pub fn finish_rotation_control_handoff(
+    operation_id: Uuid,
+    caller_receipt_nonce: Option<Uuid>,
+) -> Result<bool> {
+    let path = default_rotation_journal_path()?;
+    if let Some(receipt_nonce) = caller_receipt_nonce {
+        mark_rotation_awaiting_caller_acceptance_at(&path, operation_id, receipt_nonce)?;
+        Ok(true)
+    } else {
+        mark_direct_rotation_locally_converged_at(&path, operation_id)?;
+        Ok(false)
+    }
+}
+
+pub fn acknowledge_rotation_handoff(operation_id: Uuid, receipt_nonce: Uuid) -> Result<()> {
+    acknowledge_rotation_handoff_at(
+        &default_rotation_journal_path()?,
+        operation_id,
+        receipt_nonce,
+    )
 }
 
 pub fn validate_adoptable_status(status: &PoolAuthorityStatus) -> Result<()> {
@@ -203,12 +232,14 @@ fn begin_or_resume_rotation(
     reason: &str,
     cooldown_seconds: i64,
     allow_banked_reset: bool,
+    caller_receipt_nonce: Option<Uuid>,
 ) -> Result<RemoteRotationPreparation> {
     begin_or_resume_rotation_at(
         &default_rotation_journal_path()?,
         reason,
         cooldown_seconds,
         allow_banked_reset,
+        caller_receipt_nonce,
     )
 }
 
@@ -217,6 +248,7 @@ fn begin_or_resume_rotation_at(
     reason: &str,
     cooldown_seconds: i64,
     allow_banked_reset: bool,
+    caller_receipt_nonce: Option<Uuid>,
 ) -> Result<RemoteRotationPreparation> {
     parse_reason(reason).map_err(anyhow::Error::msg)?;
     if !(0..=MAX_COOLDOWN_SECONDS).contains(&cooldown_seconds) {
@@ -226,6 +258,7 @@ fn begin_or_resume_rotation_at(
         reason: reason.to_string(),
         cooldown_seconds,
         allow_banked_reset,
+        caller_receipt_nonce,
     };
     let file = secure_file::lock(path, true)
         .context("failed to lock the remote rotation transport journal")?;
@@ -241,10 +274,35 @@ fn begin_or_resume_rotation_at(
         .transpose()?;
     if let Some(existing) = existing {
         validate_rotation_journal(&existing)?;
-        if existing.state == RemoteRotationJournalState::Pending {
-            if rotation_journal_matches_intent(&existing, &requested) {
-                return Ok(RemoteRotationPreparation::Ready(existing));
+        let semantics_match = rotation_journal_matches_intent(&existing, &requested);
+        let same_terminal_caller = requested.caller_receipt_nonce.is_some()
+            && requested.caller_receipt_nonce == existing.caller_receipt_nonce;
+        if semantics_match
+            && (existing.state != RemoteRotationJournalState::LocallyConverged
+                || same_terminal_caller)
+        {
+            if existing.version == LEGACY_REMOTE_ROTATION_JOURNAL_VERSION
+                || (existing.state == RemoteRotationJournalState::Pending
+                    && existing.caller_receipt_nonce.is_none()
+                    && requested.caller_receipt_nonce.is_some())
+            {
+                let mut claimed = existing;
+                claimed.version = REMOTE_ROTATION_JOURNAL_VERSION;
+                claimed.caller_receipt_nonce = requested.caller_receipt_nonce;
+                claimed.updated_at = Utc::now();
+                let encoded = serde_json::to_vec_pretty(&claimed)
+                    .context("failed to encode remote rotation journal")?;
+                file.commit(
+                    snapshot.generation(),
+                    &encoded,
+                    REMOTE_ROTATION_JOURNAL_MAX_BYTES,
+                )
+                .context("failed to claim legacy remote rotation transport journal")?;
+                return Ok(RemoteRotationPreparation::Ready(claimed));
             }
+            return Ok(RemoteRotationPreparation::Ready(existing));
+        }
+        if existing.state != RemoteRotationJournalState::LocallyConverged {
             return Ok(RemoteRotationPreparation::Conflicting {
                 pending: existing,
                 requested,
@@ -262,6 +320,7 @@ fn begin_or_resume_rotation_at(
         started_at: now,
         updated_at: now,
         state: RemoteRotationJournalState::Pending,
+        caller_receipt_nonce,
     };
     let encoded =
         serde_json::to_vec_pretty(&journal).context("failed to encode remote rotation journal")?;
@@ -283,7 +342,48 @@ fn rotation_journal_matches_intent(
         && journal.allow_banked_reset == intent.allow_banked_reset
 }
 
-fn mark_rotation_locally_converged_at(path: &Path, operation_id: Uuid) -> Result<()> {
+fn mark_rotation_awaiting_caller_acceptance_at(
+    path: &Path,
+    operation_id: Uuid,
+    receipt_nonce: Uuid,
+) -> Result<()> {
+    let file = secure_file::lock(path, true)
+        .context("failed to lock the remote rotation transport journal")?;
+    let snapshot = file
+        .load(REMOTE_ROTATION_JOURNAL_MAX_BYTES, false)
+        .context("failed to load the remote rotation transport journal")?;
+    let mut journal: RemoteRotationJournal = serde_json::from_slice(
+        snapshot
+            .bytes()
+            .context("remote rotation transport journal disappeared")?,
+    )
+    .context("remote rotation transport journal is malformed")?;
+    validate_rotation_journal(&journal)?;
+    if journal.operation_id != operation_id {
+        bail!("remote rotation transport journal operation changed before caller handoff");
+    }
+    if journal.state == RemoteRotationJournalState::LocallyConverged {
+        if journal.caller_receipt_nonce == Some(receipt_nonce) {
+            return Ok(());
+        }
+        bail!("remote rotation was already accepted by a different caller receipt");
+    }
+    journal.version = REMOTE_ROTATION_JOURNAL_VERSION;
+    journal.state = RemoteRotationJournalState::AwaitingCallerAcceptance;
+    journal.caller_receipt_nonce = Some(receipt_nonce);
+    journal.updated_at = Utc::now();
+    let encoded =
+        serde_json::to_vec_pretty(&journal).context("failed to encode remote rotation journal")?;
+    file.commit(
+        snapshot.generation(),
+        &encoded,
+        REMOTE_ROTATION_JOURNAL_MAX_BYTES,
+    )
+    .context("failed to mark remote rotation as awaiting caller acceptance")?;
+    Ok(())
+}
+
+fn mark_direct_rotation_locally_converged_at(path: &Path, operation_id: Uuid) -> Result<()> {
     let file = secure_file::lock(path, true)
         .context("failed to lock the remote rotation transport journal")?;
     let snapshot = file
@@ -299,6 +399,10 @@ fn mark_rotation_locally_converged_at(path: &Path, operation_id: Uuid) -> Result
     if journal.operation_id != operation_id {
         bail!("remote rotation transport journal operation changed before local convergence");
     }
+    if journal.caller_receipt_nonce.is_some() {
+        bail!("receipt-bound remote rotation requires explicit caller acceptance");
+    }
+    journal.version = REMOTE_ROTATION_JOURNAL_VERSION;
     journal.state = RemoteRotationJournalState::LocallyConverged;
     journal.updated_at = Utc::now();
     let encoded =
@@ -308,16 +412,73 @@ fn mark_rotation_locally_converged_at(path: &Path, operation_id: Uuid) -> Result
         &encoded,
         REMOTE_ROTATION_JOURNAL_MAX_BYTES,
     )
-    .context("failed to mark remote rotation as locally converged")?;
+    .context("failed to mark direct remote rotation as locally converged")?;
+    Ok(())
+}
+
+fn acknowledge_rotation_handoff_at(
+    path: &Path,
+    operation_id: Uuid,
+    receipt_nonce: Uuid,
+) -> Result<()> {
+    let file = secure_file::lock(path, true)
+        .context("failed to lock the remote rotation transport journal")?;
+    let snapshot = file
+        .load(REMOTE_ROTATION_JOURNAL_MAX_BYTES, false)
+        .context("failed to load the remote rotation transport journal")?;
+    let mut journal: RemoteRotationJournal = serde_json::from_slice(
+        snapshot
+            .bytes()
+            .context("remote rotation transport journal disappeared")?,
+    )
+    .context("remote rotation transport journal is malformed")?;
+    validate_rotation_journal(&journal)?;
+    if journal.operation_id != operation_id {
+        bail!("remote rotation caller acknowledgement operation does not match");
+    }
+    if journal.caller_receipt_nonce != Some(receipt_nonce) {
+        bail!("remote rotation caller acknowledgement receipt does not match");
+    }
+    if journal.state == RemoteRotationJournalState::Pending {
+        bail!("remote rotation control handoff has not completed");
+    }
+    if journal.state == RemoteRotationJournalState::LocallyConverged {
+        return Ok(());
+    }
+    journal.version = REMOTE_ROTATION_JOURNAL_VERSION;
+    journal.state = RemoteRotationJournalState::LocallyConverged;
+    journal.updated_at = Utc::now();
+    let encoded =
+        serde_json::to_vec_pretty(&journal).context("failed to encode remote rotation journal")?;
+    file.commit(
+        snapshot.generation(),
+        &encoded,
+        REMOTE_ROTATION_JOURNAL_MAX_BYTES,
+    )
+    .context("failed to acknowledge remote rotation caller handoff")?;
     Ok(())
 }
 
 fn validate_rotation_journal(journal: &RemoteRotationJournal) -> Result<()> {
-    if journal.version != REMOTE_ROTATION_JOURNAL_VERSION {
+    if !matches!(
+        journal.version,
+        LEGACY_REMOTE_ROTATION_JOURNAL_VERSION | REMOTE_ROTATION_JOURNAL_VERSION
+    ) {
         bail!(
             "unsupported remote rotation journal version {}",
             journal.version
         );
+    }
+    if journal.version == LEGACY_REMOTE_ROTATION_JOURNAL_VERSION
+        && (journal.state == RemoteRotationJournalState::AwaitingCallerAcceptance
+            || journal.caller_receipt_nonce.is_some())
+    {
+        bail!("legacy remote rotation journal contains caller-acceptance state");
+    }
+    if journal.state == RemoteRotationJournalState::AwaitingCallerAcceptance
+        && journal.caller_receipt_nonce.is_none()
+    {
+        bail!("remote rotation awaiting caller acceptance has no receipt");
     }
     if journal.operation_id.is_nil() {
         bail!("remote rotation journal operation ID must not be nil");
@@ -946,12 +1107,12 @@ mod tests {
         let temp = secure_temp_dir()?;
         let path = temp.path().join("remote-rotation.json");
         let RemoteRotationPreparation::Ready(first) =
-            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true)?
+            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true, None)?
         else {
             panic!("first rotation must create a ready operation");
         };
         let RemoteRotationPreparation::Ready(resumed) =
-            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true)?
+            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true, None)?
         else {
             panic!("exact semantic match must resume the pending operation");
         };
@@ -963,7 +1124,13 @@ mod tests {
             ("usage_limit", 18_000, false),
         ] {
             let RemoteRotationPreparation::Conflicting { pending, requested } =
-                begin_or_resume_rotation_at(&path, reason, cooldown_seconds, allow_banked_reset)?
+                begin_or_resume_rotation_at(
+                    &path,
+                    reason,
+                    cooldown_seconds,
+                    allow_banked_reset,
+                    None,
+                )?
             else {
                 panic!("each semantic mismatch must reject pending-operation reuse");
             };
@@ -973,14 +1140,118 @@ mod tests {
             assert_eq!(requested.allow_banked_reset, allow_banked_reset);
         }
 
-        mark_rotation_locally_converged_at(&path, first.operation_id)?;
+        mark_direct_rotation_locally_converged_at(&path, first.operation_id)?;
         let RemoteRotationPreparation::Ready(next) =
-            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true)?
+            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true, None)?
         else {
             panic!("locally converged operation must permit a new operation");
         };
         assert_ne!(next.operation_id, first.operation_id);
         assert_eq!(next.state, RemoteRotationJournalState::Pending);
+        Ok(())
+    }
+
+    #[test]
+    fn caller_validation_retries_reuse_one_operation_mutation_and_reset() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let path = temp.path().join("remote-rotation.json");
+        let config = load_config(&write_config(&temp, true)?)?;
+        let first_receipt = Uuid::new_v4();
+        let next_turn_receipt = Uuid::new_v4();
+        let RemoteRotationPreparation::Ready(first) =
+            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true, Some(first_receipt))?
+        else {
+            panic!("first receipt-bound rotation must create an operation");
+        };
+        let operation_id = first.operation_id;
+        let committed = Arc::new(Mutex::new(false));
+        let mutation_count = Arc::new(Mutex::new(0usize));
+        let reset_count = Arc::new(Mutex::new(0usize));
+        let observed_committed = Arc::clone(&committed);
+        let observed_mutations = Arc::clone(&mutation_count);
+        let observed_resets = Arc::clone(&reset_count);
+        let runner = move |_config: &RemoteAuthorityConfig, command: &str, _timeout: Duration| {
+            if command.contains("rotate-now") {
+                *observed_mutations.lock().unwrap() += 1;
+                *observed_resets.lock().unwrap() += 1;
+                *observed_committed.lock().unwrap() = true;
+                return Ok(serde_json::to_vec(&serde_json::json!({
+                    "operationId": operation_id,
+                    "usedBankedReset": true,
+                    "bankedResetsRemaining": 1,
+                    "resetReason": "runtime_usage_limit_no_replacement",
+                }))?);
+            }
+            let mut observed = status(5, "provider-pro", Uuid::new_v4(), Utc::now());
+            if *observed_committed.lock().unwrap() {
+                observed.rotation_operations.push(completed_operation(
+                    operation_id,
+                    "provider-pro",
+                    true,
+                    Some(1),
+                    Some("runtime_usage_limit_no_replacement"),
+                ));
+            }
+            Ok(serde_json::to_vec(&observed)?)
+        };
+
+        let initial = rotate_with(&config, &first, &runner)?;
+        assert_eq!(initial.operation_id, operation_id);
+        mark_rotation_awaiting_caller_acceptance_at(&path, operation_id, first_receipt)?;
+
+        let RemoteRotationPreparation::Ready(same_receipt_retry) =
+            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true, Some(first_receipt))?
+        else {
+            panic!("same caller receipt must reuse the awaiting operation");
+        };
+        assert_eq!(same_receipt_retry.operation_id, operation_id);
+        let same_receipt_outcome = rotate_with(&config, &same_receipt_retry, &runner)?;
+        assert_eq!(same_receipt_outcome.operation_id, operation_id);
+        mark_rotation_awaiting_caller_acceptance_at(&path, operation_id, first_receipt)?;
+
+        let RemoteRotationPreparation::Ready(next_turn_retry) = begin_or_resume_rotation_at(
+            &path,
+            "usage_limit",
+            18_000,
+            true,
+            Some(next_turn_receipt),
+        )?
+        else {
+            panic!("a new receipt must reconcile the awaiting operation");
+        };
+        assert_eq!(next_turn_retry.operation_id, operation_id);
+        let before_reconvergence: RemoteRotationJournal =
+            serde_json::from_slice(&fs::read(&path)?)?;
+        assert_eq!(
+            before_reconvergence.caller_receipt_nonce,
+            Some(first_receipt),
+            "receipt ownership must not change before local reconvergence"
+        );
+        let next_turn_outcome = rotate_with(&config, &next_turn_retry, &runner)?;
+        assert_eq!(next_turn_outcome.operation_id, operation_id);
+        mark_rotation_awaiting_caller_acceptance_at(&path, operation_id, next_turn_receipt)?;
+        assert!(
+            acknowledge_rotation_handoff_at(&path, operation_id, first_receipt).is_err(),
+            "the superseded caller receipt must not accept the handoff"
+        );
+        acknowledge_rotation_handoff_at(&path, operation_id, next_turn_receipt)?;
+        acknowledge_rotation_handoff_at(&path, operation_id, next_turn_receipt)?;
+
+        let RemoteRotationPreparation::Ready(ack_response_retry) = begin_or_resume_rotation_at(
+            &path,
+            "usage_limit",
+            18_000,
+            true,
+            Some(next_turn_receipt),
+        )?
+        else {
+            panic!("the accepted caller receipt must replay its terminal operation");
+        };
+        assert_eq!(ack_response_retry.operation_id, operation_id);
+        let terminal_replay = rotate_with(&config, &ack_response_retry, &runner)?;
+        assert_eq!(terminal_replay.operation_id, operation_id);
+        assert_eq!(*mutation_count.lock().unwrap(), 1);
+        assert_eq!(*reset_count.lock().unwrap(), 1);
         Ok(())
     }
 
@@ -997,11 +1268,13 @@ mod tests {
             started_at: Utc::now(),
             updated_at: Utc::now(),
             state: RemoteRotationJournalState::Pending,
+            caller_receipt_nonce: None,
         };
         let requested = RemoteRotationIntent {
             reason: "token_expired".to_string(),
             cooldown_seconds: 90,
             allow_banked_reset: false,
+            caller_receipt_nonce: None,
         };
         let commands = Arc::new(Mutex::new(Vec::new()));
         let observed_commands = Arc::clone(&commands);
@@ -1042,11 +1315,13 @@ mod tests {
             started_at: Utc::now(),
             updated_at: Utc::now(),
             state: RemoteRotationJournalState::Pending,
+            caller_receipt_nonce: None,
         };
         let requested = RemoteRotationIntent {
             reason: "token_expired".to_string(),
             cooldown_seconds: 90,
             allow_banked_reset: false,
+            caller_receipt_nonce: None,
         };
         let commands = Arc::new(Mutex::new(Vec::new()));
         let observed_commands = Arc::clone(&commands);
@@ -1086,6 +1361,7 @@ mod tests {
             started_at: Utc::now(),
             updated_at: Utc::now(),
             state: RemoteRotationJournalState::Pending,
+            caller_receipt_nonce: None,
         };
         let calls = Arc::new(Mutex::new(0usize));
         let observed_calls = Arc::clone(&calls);
@@ -1138,6 +1414,7 @@ mod tests {
             started_at: Utc::now(),
             updated_at: Utc::now(),
             state: RemoteRotationJournalState::Pending,
+            caller_receipt_nonce: None,
         };
         let committed = Arc::new(Mutex::new(false));
         let mutation_count = Arc::new(Mutex::new(0usize));
@@ -1186,6 +1463,7 @@ mod tests {
             started_at: Utc::now(),
             updated_at: Utc::now(),
             state: RemoteRotationJournalState::Pending,
+            caller_receipt_nonce: None,
         };
         let committed = Arc::new(Mutex::new(false));
         let mutation_count = Arc::new(Mutex::new(0usize));

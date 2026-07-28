@@ -257,6 +257,26 @@ out after the VPS commits, rerunning the Mac operation must reconcile that same
 ID from read-only status and complete local adoption. It must not redeem another
 banked reset or advance a second epoch.
 
+For a receipt-bound interrupted turn, also verify the Mac transport journal
+does not become terminal when `rotate-now` returns. The required sequence is:
+
+1. `rotate-now --receipt-nonce R` returns operation `O` with
+   `callerAcceptanceRequired: true` only after receipt-bound runtime convergence.
+2. The journal records `O`, `R`, and `awaiting_caller_acceptance`.
+3. The patched caller validates the exact handoff and converges its in-memory
+   auth manager.
+4. `acknowledge-remote-rotation --operation-id O --receipt-nonce R` changes the
+   journal to `locally_converged`.
+
+If step 3 fails, another `rotate-now` attempt with receipt `R` must return
+operation `O` and reconcile the recorded VPS outcome without another remote
+mutation or reset. If step 4 succeeds but its response is lost, replaying receipt
+`R` must still return `O`; the acknowledgement command is idempotent for the
+exact operation and receipt. A mismatched operation or receipt must fail closed.
+An unbound direct/manual CLI call reports
+`callerAcceptanceRequired: false` and completes its own journal only after its
+local runtime convergence succeeds.
+
 ## Swap Commit Contract
 
 CodexSwitch distinguishes the authority-selected target from the credentials

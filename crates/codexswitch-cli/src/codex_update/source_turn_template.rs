@@ -562,6 +562,8 @@ async fn codexswitch_run_bounded_rotation(
 
 #[cfg(unix)]
 struct CodexSwitchRotationProof {
+    operation_id: Option<String>,
+    caller_acceptance_required: bool,
     fingerprint: String,
     acknowledged_request_nonces: Vec<String>,
 }
@@ -578,6 +580,19 @@ fn codexswitch_verified_rotation_result(
         return None;
     }
     let report = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
+    let caller_acceptance_required = report.get("callerAcceptanceRequired")?.as_bool()?;
+    let operation_id = match report.get("operationId")? {
+        serde_json::Value::String(operation_id)
+            if codexswitch_is_canonical_uuid(operation_id) =>
+        {
+            Some(operation_id.clone())
+        }
+        serde_json::Value::Null => None,
+        _ => return None,
+    };
+    if caller_acceptance_required && operation_id.is_none() {
+        return None;
+    }
     if !codexswitch_is_canonical_uuid(receipt_nonce)
         || report.get("receiptNonce")?.as_str()? != receipt_nonce
         || report.get("authPath")?.as_str()? != auth_path.to_str()?
@@ -623,9 +638,51 @@ fn codexswitch_verified_rotation_result(
         return None;
     }
     Some(CodexSwitchRotationProof {
+        operation_id,
+        caller_acceptance_required,
         fingerprint: fingerprint.to_string(),
         acknowledged_request_nonces,
     })
+}
+
+#[cfg(unix)]
+async fn codexswitch_acknowledge_remote_rotation(
+    control_execution_path: &std::path::Path,
+    control_cli: &CodexSwitchControlCli,
+    proof: &CodexSwitchRotationProof,
+    receipt_nonce: &str,
+) -> bool {
+    if !proof.caller_acceptance_required {
+        return true;
+    }
+    let Some(operation_id) = proof.operation_id.as_deref() else {
+        return false;
+    };
+    let mut command = tokio::process::Command::new(control_execution_path);
+    command
+        .arg("acknowledge-remote-rotation")
+        .arg("--operation-id")
+        .arg(operation_id)
+        .arg("--receipt-nonce")
+        .arg(receipt_nonce)
+        .arg("--json");
+    let Some(output) = codexswitch_run_bounded_rotation(command, control_cli).await else {
+        return false;
+    };
+    if !output.status.success() {
+        warn!(
+            "CodexSwitch interrupted-turn caller acknowledgement exited with status {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return false;
+    }
+    let Ok(report) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return false;
+    };
+    report.get("operationId").and_then(|value| value.as_str()) == Some(operation_id)
+        && report.get("receiptNonce").and_then(|value| value.as_str()) == Some(receipt_nonce)
+        && report.get("state").and_then(|value| value.as_str()) == Some("locally_converged")
 }
 
 #[cfg(unix)]
@@ -929,6 +986,28 @@ async fn codexswitch_rotate_after_failure(
     {
         warn!("CodexSwitch interrupted-turn AuthManager fingerprint convergence failed");
         return false;
+    }
+    let mut acknowledgement_attempt = 0;
+    loop {
+        if codexswitch_acknowledge_remote_rotation(
+            &control_execution_path,
+            &control_cli,
+            &proof,
+            &receipt_nonce,
+        )
+        .await
+        {
+            break;
+        }
+        if !codexswitch_retry_rotation_attempt(
+            acknowledgement_attempt,
+            "caller acknowledgement failure",
+        )
+        .await
+        {
+            return false;
+        }
+        acknowledgement_attempt += 1;
     }
     sess.send_event(
         turn_context,
