@@ -1471,9 +1471,10 @@ impl ManagedDesktopBridgeSession {
             .max_message_size(Some(MANAGED_DESKTOP_BRIDGE_RPC_MAX_BYTES))
             .max_frame_size(Some(MANAGED_DESKTOP_BRIDGE_RPC_MAX_BYTES));
         let (mut websocket, _) =
-            tungstenite::client_with_config("ws://127.0.0.1:9223", stream, Some(config)).map_err(
-                |error| anyhow::anyhow!("managed desktop WebSocket handshake failed: {error}"),
-            )?;
+            tungstenite::client::client_with_config("ws://127.0.0.1:9223", stream, Some(config))
+                .map_err(|error| {
+                    anyhow::anyhow!("managed desktop WebSocket handshake failed: {error}")
+                })?;
         let initialize = managed_desktop_initialize_request();
         let response = managed_desktop_rpc(&mut websocket, &initialize, 0)?;
         validate_managed_desktop_rpc_success(&response, 0, "initialize")?;
