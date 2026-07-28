@@ -4,7 +4,7 @@ use crate::auth::auth_file_fingerprint;
 use crate::bounded_command;
 use crate::secure_file::{self, SecureFileGeneration};
 use anyhow::{bail, Context, Result};
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), test))]
 use chrono::{Local, NaiveDateTime, TimeZone};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
@@ -508,14 +508,15 @@ pub(crate) fn discover_live_prepared_runtime_executables(
                 process.pid
             )
         })?;
-        if !current_process_identity(process.pid)
-            .as_ref()
-            .is_some_and(|current| process_identity_matches(&process, current))
-        {
-            bail!(
-                "live prepared runtime pid {} changed identity during retention inventory",
-                process.pid
-            );
+        match current_macos_owned_process_identity(process.pid)? {
+            None => continue,
+            Some(current) if process_identity_matches(&process, &current) => {}
+            Some(_) => {
+                bail!(
+                    "live prepared runtime pid {} changed identity during retention inventory",
+                    process.pid
+                )
+            }
         }
         identities.push(identity);
     }
@@ -567,7 +568,7 @@ fn unlinked_prepared_runtime_generation_is_absent(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), test))]
 fn parse_ps_processes(
     ps_output: &str,
     include_app_server: bool,
@@ -580,7 +581,7 @@ fn parse_ps_processes(
         .collect()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), test))]
 fn parse_ps_owned_processes(
     ps_output: &str,
     current_uid: u32,
@@ -627,7 +628,7 @@ fn parse_ps_owned_processes(
     processes
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), test))]
 fn split_ps_start_and_command(input: &str) -> Option<(String, &str)> {
     let mut rest = input;
     let mut parts = Vec::with_capacity(5);
@@ -639,7 +640,7 @@ fn split_ps_start_and_command(input: &str) -> Option<(String, &str)> {
     (!rest.is_empty()).then(|| (parts.join(" "), rest))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), test))]
 fn parse_ps_start_unix(value: &str) -> Option<u64> {
     let naive = NaiveDateTime::parse_from_str(value, "%a %b %e %T %Y").ok()?;
     let timestamp = Local.from_local_datetime(&naive).single()?.timestamp();
@@ -765,6 +766,83 @@ fn enrich_macos_process_identity(process: CodexProcess) -> Option<CodexProcess> 
     apply_macos_kernel_process_identity(process, &identity)
 }
 
+#[cfg(target_os = "macos")]
+fn current_macos_owned_process_identity(pid: i32) -> Result<Option<CodexProcess>> {
+    let kernel_identity = match read_macos_kernel_process_identity(pid) {
+        Some(identity) => identity,
+        None if !macos_pid_exists(pid)? => return Ok(None),
+        None => {
+            bail!(
+                "live prepared runtime pid {} could not provide a kernel identity during confirmation",
+                pid
+            )
+        }
+    };
+    let output = bounded_command::output(
+        Command::new("/bin/ps").args([
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "pid=,uid=,lstart=,command=",
+            "-ww",
+        ]),
+        PS_COMMAND_TIMEOUT,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .context("failed to run ps for prepared runtime identity confirmation")?;
+    if !output.status.success() {
+        if !macos_pid_exists(pid)? {
+            return Ok(None);
+        }
+        bail!(
+            "ps exited with {} during prepared runtime identity confirmation",
+            output.status
+        );
+    }
+    let process = parse_ps_owned_processes(
+        &String::from_utf8_lossy(&output.stdout),
+        unsafe { libc_geteuid() },
+        std::process::id() as i32,
+    )
+    .into_iter()
+    .find(|process| process.pid == pid);
+    let process = match process {
+        Some(process) => process,
+        None if !macos_pid_exists(pid)? => return Ok(None),
+        None => {
+            bail!(
+                "live prepared runtime pid {} was absent from the owned process inventory",
+                pid
+            )
+        }
+    };
+    apply_macos_kernel_process_identity(process, &kernel_identity)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "live prepared runtime pid {} changed owner during identity confirmation",
+                pid
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pid_exists(pid: i32) -> Result<bool> {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        _ => Err(error).with_context(|| {
+            format!(
+                "failed to confirm whether prepared runtime pid {} still exists",
+                pid
+            )
+        }),
+    }
+}
+
 fn process_identity_matches(expected: &CodexProcess, observed: &CodexProcess) -> bool {
     expected.pid == observed.pid
         && expected.owner_uid == observed.owner_uid
@@ -780,7 +858,7 @@ pub(crate) fn process_identity_is_current(expected: &CodexProcess) -> bool {
         .is_some_and(|observed| process_identity_matches(expected, observed))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), test))]
 fn split_first_field(input: &str) -> Option<(&str, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
@@ -792,7 +870,7 @@ fn split_first_field(input: &str) -> Option<(&str, &str)> {
     Some((&trimmed[..end], trimmed[end..].trim_start()))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), test))]
 fn executable_from_command_line(command_line: &str) -> Option<PathBuf> {
     command_line
         .split_whitespace()
@@ -4938,6 +5016,18 @@ mod tests {
             &prepared_root
         )?);
         Ok(())
+    }
+
+    #[test]
+    fn prepared_helper_is_owned_for_retention_but_excluded_from_reload_scope() {
+        let ps_output = "\
+18841   501 Mon Jul 27 22:41:53 2026 /Users/me/.local/share/codexswitch/prepared-codex/0.145.0/attempt/codex-code-mode-host
+";
+        let owned = parse_ps_owned_processes(ps_output, 501, 1);
+
+        assert_eq!(owned.len(), 1);
+        assert!(prepared_runtime_process_candidate(&owned[0].executable));
+        assert!(parse_ps_processes(ps_output, true, 501, 1).is_empty());
     }
 
     #[test]

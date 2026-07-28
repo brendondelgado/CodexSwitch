@@ -144,6 +144,14 @@ There is no remaining on-disk generation to protect. An existing attempt,
 unexpected path shape, or metadata error remains a fail-closed inventory
 failure.
 
+Retention confirmation uses the same-user process inventory, not the narrower
+auth-reload target filter. A live `codex-code-mode-host` is intentionally not a
+standalone reload target, but it still owns a mapped prepared-runtime inode and
+must protect its complete generation. If the process is proven absent during
+confirmation, retention may continue because no live mapping remains. A live
+PID with a changed start, command, owner, or executable identity remains a
+fail-closed inventory race.
+
 ## Repair And Verification
 
 Post-install verification accepts only the exact attempt-scoped path captured

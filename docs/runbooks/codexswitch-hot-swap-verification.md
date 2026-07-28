@@ -1521,6 +1521,9 @@ Every future hot-swap change must include tests for:
 - Desktop discovery and updates cover `/Applications/ChatGPT.app` and the legacy `/Applications/Codex.app` without maintaining divergent path constants.
 - Patched CLI promotion includes `codex-code-mode-host` on both Mac and Linux, and refuses an incomplete prepared runtime.
 - A running desktop `codex-code-mode-host` helper is excluded from standalone Mac CLI detection even when it lives beside `codex` in a prepared runtime directory.
+- Prepared-runtime retention confirms that helper through the same-user
+  inventory rather than the narrower reload-target filter, so exclusion from
+  standalone reload signaling cannot look like a PID identity change.
 - A configured app-server under `~/.local/share/codexswitch/prepared-codex/` remains a desktop reload target even though its path contains `codexswitch`.
 - A missing display name for `gpt-5.6-sol` falls back to `5.6 Sol` in both catalog options and the selected-model button while preserving the selected slug and reasoning effort.
 - A stale desktop `available_models` allowlist cannot hide GPT-5.6 entries that the active app-server returned as picker models.
