@@ -119,6 +119,12 @@ pub struct ActivationBarrierContext<'a> {
     pub reload_enabled: bool,
 }
 
+#[derive(Debug, Clone)]
+enum ActivationBarrierMode {
+    Strict,
+    ValidatedRemoteAuthorityAdoption { desired_provider_account_id: String },
+}
+
 pub(crate) struct RuntimeActivationLease {
     _guard: secure_file::SecureFileLock,
     store_path: PathBuf,
@@ -543,6 +549,36 @@ where
         reload_enabled,
         reload,
         |summary, path| summary.revalidate_current_topology(path),
+        ActivationBarrierMode::Strict,
+    )
+}
+
+pub(crate) fn activate_remote_authority_with_unlocked_reload_under_runtime_lease<R>(
+    runtime_lease: &RuntimeActivationLease,
+    store_path: &Path,
+    auth_path: &Path,
+    generation: &mut AccountStoreGeneration,
+    accounts: &mut [CodexAccount],
+    target_id: Uuid,
+    desired_provider_account_id: &str,
+    reload: &R,
+) -> Result<ActivationOutcome>
+where
+    R: Fn(&Path) -> Result<ReloadSummary>,
+{
+    activate_with_unlocked_reload_with_topology_under_runtime_lease(
+        runtime_lease,
+        store_path,
+        auth_path,
+        generation,
+        accounts,
+        target_id,
+        true,
+        reload,
+        |summary, path| summary.revalidate_current_topology(path),
+        ActivationBarrierMode::ValidatedRemoteAuthorityAdoption {
+            desired_provider_account_id: desired_provider_account_id.to_string(),
+        },
     )
 }
 
@@ -572,6 +608,7 @@ where
         reload_enabled,
         reload,
         revalidate_topology,
+        ActivationBarrierMode::Strict,
     )
 }
 
@@ -585,6 +622,7 @@ fn activate_with_unlocked_reload_with_topology_under_runtime_lease<R, T>(
     reload_enabled: bool,
     reload: &R,
     revalidate_topology: T,
+    barrier_mode: ActivationBarrierMode,
 ) -> Result<ActivationOutcome>
 where
     R: Fn(&Path) -> Result<ReloadSummary>,
@@ -597,7 +635,7 @@ where
         if current.generation != *generation {
             bail!("account store changed before activation commit; retry from a fresh snapshot");
         }
-        let outcome = activate_with_under_runtime_lease(
+        let outcome = activate_with_dependencies_mode(
             runtime_lease,
             ActivationContext {
                 store_lock: &store_lock,
@@ -607,7 +645,9 @@ where
                 target_id,
                 reload_enabled: false,
             },
+            commit_auth_file,
             |_| bail!("runtime reload was requested during locked activation preparation"),
+            barrier_mode,
         )?;
         let identity = matches!(
             outcome.state,
@@ -815,11 +855,101 @@ where
     activate_with_dependencies(runtime_lease, context, commit_auth_file, reload)
 }
 
+fn authorize_stale_confirmed_remote_adoption(
+    store_lock: &AccountStoreLock,
+    generation: &AccountStoreGeneration,
+    accounts: &[CodexAccount],
+    auth_path: &Path,
+    target_id: Uuid,
+    desired_provider_account_id: &str,
+) -> Result<Option<ActivationRecord>> {
+    let Some(record) = read_activation_record(store_lock)? else {
+        return Ok(None);
+    };
+    if record.state != ActivationState::Confirmed {
+        return Ok(None);
+    }
+
+    let durable = store_lock.load()?;
+    if &durable.generation != generation {
+        bail!("remote-authority recovery observed a changed account-store generation");
+    }
+    let active = active_account(&durable.accounts)
+        .context("remote-authority recovery requires exactly one active account")?;
+    let active_fingerprint = complete_account_token_fingerprint(active)
+        .context("remote-authority recovery requires complete source tokens")?;
+    if activation_record_confirms_current(
+        &record,
+        active,
+        generation,
+        Some(active_fingerprint.as_str()),
+    ) {
+        return Ok(None);
+    }
+
+    if record.version != ACTIVATION_RECORD_VERSION
+        || record.kind == ActivationKind::Unknown
+        || record.base_store_generation.is_some()
+        || record.owned_store_generation.is_some()
+        || record.base_auth_generation.is_some()
+        || record.owned_auth_generation.is_some()
+        || record.rollback.is_some()
+    {
+        bail!("stale Confirmed activation is not structurally safe for authority recovery");
+    }
+    if desired_provider_account_id.is_empty()
+        || record.target_account_id != desired_provider_account_id
+    {
+        bail!("stale Confirmed activation target does not match the validated remote authority");
+    }
+    if !auth_file_matches_account(auth_path, active) {
+        bail!("remote-authority recovery refused divergent source store/auth state");
+    }
+
+    let matching_targets = accounts
+        .iter()
+        .filter(|account| account.account_id == desired_provider_account_id)
+        .collect::<Vec<_>>();
+    let target = matching_targets
+        .first()
+        .copied()
+        .context("remote-authority target is absent from the local account store")?;
+    if matching_targets.len() != 1 || target.id != target_id {
+        bail!("remote-authority target is not unique in the local account store");
+    }
+    if target.is_active || target.id == active.id {
+        return Ok(None);
+    }
+    complete_account_token_fingerprint(target)
+        .context("remote-authority recovery target has incomplete token material")?;
+    Ok(Some(record))
+}
+
 fn activate_with_dependencies<A, R>(
+    runtime_lease: &RuntimeActivationLease,
+    context: ActivationContext<'_>,
+    commit_auth: A,
+    reload: R,
+) -> Result<ActivationOutcome>
+where
+    A: FnMut(&Path, &CodexAccount) -> Result<AuthFileCommit>,
+    R: FnMut(&Path) -> Result<ReloadSummary>,
+{
+    activate_with_dependencies_mode(
+        runtime_lease,
+        context,
+        commit_auth,
+        reload,
+        ActivationBarrierMode::Strict,
+    )
+}
+
+fn activate_with_dependencies_mode<A, R>(
     runtime_lease: &RuntimeActivationLease,
     context: ActivationContext<'_>,
     mut commit_auth: A,
     mut reload: R,
+    barrier_mode: ActivationBarrierMode,
 ) -> Result<ActivationOutcome>
 where
     A: FnMut(&Path, &CodexAccount) -> Result<AuthFileCommit>,
@@ -834,18 +964,33 @@ where
         reload_enabled,
     } = context;
     runtime_lease.require_store(store_lock.store_path())?;
-    if let Some((durable_target_id, outcome)) = reconcile_activation_barrier_with(
-        ActivationBarrierContext {
+    let prior_activation_record = match barrier_mode {
+        ActivationBarrierMode::Strict => None,
+        ActivationBarrierMode::ValidatedRemoteAuthorityAdoption {
+            ref desired_provider_account_id,
+        } => authorize_stale_confirmed_remote_adoption(
             store_lock,
             generation,
             accounts,
             auth_path,
-            reload_enabled,
-        },
-        &mut reload,
-    )? {
-        if !outcome.is_confirmed() || durable_target_id == target_id {
-            return Ok(outcome);
+            target_id,
+            desired_provider_account_id,
+        )?,
+    };
+    if prior_activation_record.is_none() {
+        if let Some((durable_target_id, outcome)) = reconcile_activation_barrier_with(
+            ActivationBarrierContext {
+                store_lock,
+                generation,
+                accounts,
+                auth_path,
+                reload_enabled,
+            },
+            &mut reload,
+        )? {
+            if !outcome.is_confirmed() || durable_target_id == target_id {
+                return Ok(outcome);
+            }
         }
     }
 
@@ -920,6 +1065,7 @@ where
                 owned_auth_generation: None,
                 previous_active: &previous_active,
                 target: &target,
+                prior_activation_record: prior_activation_record.as_ref(),
             },
             error.context("account store commit failed before auth commit"),
         )?;
@@ -945,6 +1091,7 @@ where
                     owned_auth_generation: None,
                     previous_active: &previous_active,
                     target: &target,
+                    prior_activation_record: prior_activation_record.as_ref(),
                 },
                 error,
             )?;
@@ -966,6 +1113,7 @@ where
                     owned_auth_generation: None,
                     previous_active: &previous_active,
                     target: &target,
+                    prior_activation_record: prior_activation_record.as_ref(),
                 },
                 error,
             )?;
@@ -990,6 +1138,7 @@ where
                 owned_auth_generation: Some(&auth_commit.generation),
                 previous_active: &previous_active,
                 target: &target,
+                prior_activation_record: prior_activation_record.as_ref(),
             },
             error.context("failed to persist owned auth generation"),
         )?;
@@ -1014,6 +1163,7 @@ where
                 owned_auth_generation: Some(&auth_commit.generation),
                 previous_active: &previous_active,
                 target: &target,
+                prior_activation_record: prior_activation_record.as_ref(),
             },
             error.context("activation readback verification failed"),
         )?;
@@ -2007,6 +2157,7 @@ struct ActivationRollbackContext<'a> {
     owned_auth_generation: Option<&'a SecureFileGeneration>,
     previous_active: &'a CodexAccount,
     target: &'a CodexAccount,
+    prior_activation_record: Option<&'a ActivationRecord>,
 }
 
 fn rollback_after_commit_failure(
@@ -2023,6 +2174,7 @@ fn rollback_after_commit_failure(
         owned_auth_generation,
         previous_active,
         target,
+        prior_activation_record,
     } = context;
     let current = store_lock.load()?;
     let store_is_previous = current.raw_bytes() == rollback.store_bytes.as_deref();
@@ -2079,17 +2231,21 @@ fn rollback_after_commit_failure(
     }
     accounts.clone_from_slice(&restored.accounts);
     let detail = format!("activation rolled back after commit failure: {commit_error:#}");
-    write_activation_record(
-        store_lock,
-        &activation_record(
-            ActivationState::RolledBack,
-            previous_active,
-            target,
-            generation,
-            None,
-            Some(detail.clone()),
-        ),
-    )?;
+    if let Some(prior) = prior_activation_record {
+        write_activation_record(store_lock, prior)?;
+    } else {
+        write_activation_record(
+            store_lock,
+            &activation_record(
+                ActivationState::RolledBack,
+                previous_active,
+                target,
+                generation,
+                None,
+                Some(detail.clone()),
+            ),
+        )?;
+    }
     Ok((ActivationState::RolledBack, detail))
 }
 
@@ -2939,6 +3095,133 @@ mod tests {
         );
         let successor = acquire_runtime_activation_lease(&store_path)?;
         drop(successor);
+        Ok(())
+    }
+
+    #[test]
+    fn validated_remote_authority_recovers_exact_stale_confirmed_target() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let target = account("target@example.com", false);
+        save_accounts(&store_path, &[active.clone(), target.clone()])?;
+        commit_auth_file(&auth_path, &active)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let store_lock = lock_account_store(&store_path)?;
+        write_activation_record(
+            &store_lock,
+            &activation_record_ids(
+                ActivationState::Confirmed,
+                &active.account_id,
+                &target.account_id,
+                &generation,
+                account_token_fingerprint(&target),
+                Some("stale confirmation for the authority target".to_string()),
+            ),
+        )?;
+        drop(store_lock);
+
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let outcome = activate_with_unlocked_reload_with_topology_under_runtime_lease(
+            &runtime_lease,
+            &store_path,
+            &auth_path,
+            &mut generation,
+            &mut accounts,
+            target.id,
+            true,
+            &|_| {
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
+            },
+            |summary, _| {
+                if !summary.has_bound_activation_proof() {
+                    bail!("topology proof received unbound runtime evidence");
+                }
+                Ok(())
+            },
+            ActivationBarrierMode::ValidatedRemoteAuthorityAdoption {
+                desired_provider_account_id: target.account_id.clone(),
+            },
+        )?;
+
+        assert!(outcome.is_confirmed());
+        assert_eq!(
+            active_account(
+                &crate::account_store::load_account_store_snapshot(&store_path)?.accounts
+            )
+            .map(|account| account.id),
+            Some(target.id)
+        );
+        assert!(auth_file_matches_account(&auth_path, &target));
+        let record = read_activation_record_for_store(&store_path)?
+            .context("activation record disappeared")?;
+        assert_eq!(record.state, ActivationState::Confirmed);
+        assert_eq!(record.target_account_id, target.account_id);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_authority_recovery_rejects_a_different_stale_target() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let stale_target = account("stale@example.com", false);
+        let desired = account("desired@example.com", false);
+        save_accounts(
+            &store_path,
+            &[active.clone(), stale_target.clone(), desired.clone()],
+        )?;
+        commit_auth_file(&auth_path, &active)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+        let store_lock = lock_account_store(&store_path)?;
+        write_activation_record(
+            &store_lock,
+            &activation_record_ids(
+                ActivationState::Confirmed,
+                &active.account_id,
+                &stale_target.account_id,
+                &generation,
+                account_token_fingerprint(&stale_target),
+                None,
+            ),
+        )?;
+        drop(store_lock);
+
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let error = activate_with_unlocked_reload_with_topology_under_runtime_lease(
+            &runtime_lease,
+            &store_path,
+            &auth_path,
+            &mut generation,
+            &mut accounts,
+            desired.id,
+            true,
+            &|_| Ok(ReloadSummary::default()),
+            |_, _| Ok(()),
+            ActivationBarrierMode::ValidatedRemoteAuthorityAdoption {
+                desired_provider_account_id: desired.account_id.clone(),
+            },
+        )
+        .expect_err("a different stale target must remain a hard barrier");
+
+        assert!(format!("{error:#}").contains("stale Confirmed activation target does not match"));
+        assert_eq!(
+            active_account(
+                &crate::account_store::load_account_store_snapshot(&store_path)?.accounts
+            )
+            .map(|account| account.id),
+            Some(active.id)
+        );
+        assert!(auth_file_matches_account(&auth_path, &active));
         Ok(())
     }
 

@@ -291,6 +291,9 @@ enum AccountCredentialMutationPolicy {
         case .swap:
             if case .higherPlanAvailable = reason { return false }
             if case .manual = reason { return true }
+            if case .poolAuthority = reason {
+                return configuredAccount?.id == from.id
+            }
             guard let configuredAccount, configuredAccount.id == from.id else {
                 return false
             }

@@ -45,6 +45,41 @@ struct PopoverAccountHeadingTests {
         ) == "Mac Configured; Mac Runtime Not Current")
     }
 
+    @Test("Menubar follows the fresh pool target during Mac divergence")
+    func menubarUsesPoolTargetInsteadOfConfiguredAccount() {
+        let configured = account(email: "configured@example.com", isActive: true)
+        let poolTarget = account(email: "target@example.com", isActive: false)
+
+        #expect(StatusBarController.displayAccount(
+            configuredAccount: configured,
+            poolTargetAccount: poolTarget,
+            remoteAuthorityEndpointConfigured: true,
+            authorityIsFresh: true
+        )?.id == poolTarget.id)
+        #expect(StatusBarController.poolTargetScopeLabel(
+            poolTargetAccountId: poolTarget.id,
+            runtimeCurrentAccountId: configured.id
+        ) == "Pool Target; Mac Runtime Not Current")
+    }
+
+    @Test("Menubar never substitutes local quota for missing authority")
+    func menubarFailsClosedWithoutFreshAuthority() {
+        let configured = account(email: "configured@example.com", isActive: true)
+
+        #expect(StatusBarController.displayAccount(
+            configuredAccount: configured,
+            poolTargetAccount: nil,
+            remoteAuthorityEndpointConfigured: true,
+            authorityIsFresh: false
+        ) == nil)
+        #expect(StatusBarController.displayAccount(
+            configuredAccount: configured,
+            poolTargetAccount: nil,
+            remoteAuthorityEndpointConfigured: false,
+            authorityIsFresh: false
+        )?.id == configured.id)
+    }
+
     private func confirmedState(
         _ accountId: UUID,
         observedAt: Date
@@ -65,6 +100,17 @@ struct PopoverAccountHeadingTests {
             runtimeEvidenceObservedAt: observedAt,
             runtimeEvidenceExpiresAt: observedAt.addingTimeInterval(10),
             runtimeBlockers: nil
+        )
+    }
+
+    private func account(email: String, isActive: Bool) -> CodexAccount {
+        CodexAccount(
+            email: email,
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: email,
+            isActive: isActive
         )
     }
 }

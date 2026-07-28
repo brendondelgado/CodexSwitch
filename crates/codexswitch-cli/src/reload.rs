@@ -3084,6 +3084,9 @@ pub fn is_codex_cli_command_line(command_line: &str) -> bool {
     if !lower.contains("codex") {
         return false;
     }
+    if is_direct_codex_subcommand(&lower, "sandbox") {
+        return false;
+    }
 
     let excluded = [
         "codexswitch-cli",
@@ -3118,6 +3121,15 @@ pub fn is_codex_cli_command_line(command_line: &str) -> bool {
         || lower.ends_with("/codex")
         || lower.starts_with("codex ")
         || lower == "codex"
+}
+
+fn is_direct_codex_subcommand(command_line: &str, subcommand: &str) -> bool {
+    let mut parts = command_line.split_whitespace();
+    parts
+        .next()
+        .and_then(|first| first.rsplit('/').next())
+        .is_some_and(|name| name == "codex" || name == "exe")
+        && parts.next() == Some(subcommand)
 }
 
 fn is_codex_cli_runtime(command_line: &str, executable: &Path) -> bool {
@@ -3498,6 +3510,12 @@ mod tests {
     fn command_line_detection_excludes_helpers() {
         assert!(!is_codex_cli_command_line(
             "/Applications/Codex.app/Contents/Resources/codex app-server"
+        ));
+        assert!(!is_codex_cli_command_line(
+            "/Users/me/.local/share/codexswitch/prepared-codex/0.145.0/runtime/codex sandbox -- node kernel.js"
+        ));
+        assert!(is_codex_cli_command_line(
+            "/Users/me/.local/share/codexswitch/prepared-codex/0.145.0/runtime/codex resume --prompt summarize-sandbox-behavior"
         ));
         assert!(!is_codex_cli_command_line(
             "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"

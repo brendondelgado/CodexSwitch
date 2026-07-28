@@ -36,6 +36,27 @@ final class StatusBarController {
             : "Mac Configured; Mac Runtime Not Current"
     }
 
+    static func displayAccount(
+        configuredAccount: CodexAccount?,
+        poolTargetAccount: CodexAccount?,
+        remoteAuthorityEndpointConfigured: Bool,
+        authorityIsFresh: Bool
+    ) -> CodexAccount? {
+        guard remoteAuthorityEndpointConfigured else {
+            return configuredAccount
+        }
+        return authorityIsFresh ? poolTargetAccount : nil
+    }
+
+    static func poolTargetScopeLabel(
+        poolTargetAccountId: UUID,
+        runtimeCurrentAccountId: UUID?
+    ) -> String {
+        runtimeCurrentAccountId == poolTargetAccountId
+            ? "Pool Target; Mac Runtime Current"
+            : "Pool Target; Mac Runtime Not Current"
+    }
+
     /// Update the menu bar icon — circular ring with percentage
     func updateIcon() {
         guard let button = statusItem.button else { return }
@@ -46,24 +67,36 @@ final class StatusBarController {
             return
         }
 
-        guard let active = manager.configuredAccount,
-              let snapshot = active.realQuotaSnapshot else {
-            if let configured = manager.configuredAccount {
-                let scope = Self.accountScopeLabel(
-                    configuredAccountId: configured.id,
-                    runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id
-                )
-                button.toolTip = "\(scope): rate limits unavailable"
-            } else {
-                button.toolTip = "Rate limits unavailable"
-            }
+        let now = Date()
+        let usesRemoteAuthority = manager.remoteAuthorityEndpointConfigured
+        let authorityIsFresh = manager.poolAuthorityObservation?.isFresh(at: now) == true
+        guard let displayedAccount = Self.displayAccount(
+            configuredAccount: manager.configuredAccount,
+            poolTargetAccount: manager.poolTargetAccount,
+            remoteAuthorityEndpointConfigured: usesRemoteAuthority,
+            authorityIsFresh: authorityIsFresh
+        ) else {
+            button.toolTip = usesRemoteAuthority
+                ? "Pool target synchronizing"
+                : "Rate limits unavailable"
             applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "...")
             return
         }
-        let scope = Self.accountScopeLabel(
-            configuredAccountId: active.id,
-            runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id
-        )
+        let scope = usesRemoteAuthority
+            ? Self.poolTargetScopeLabel(
+                poolTargetAccountId: displayedAccount.id,
+                runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id
+            )
+            : Self.accountScopeLabel(
+                configuredAccountId: displayedAccount.id,
+                runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id
+            )
+
+        guard let snapshot = displayedAccount.realQuotaSnapshot else {
+            button.toolTip = "\(scope): rate limits unavailable"
+            applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "...")
+            return
+        }
 
         if snapshot.isDenied {
             let quota = snapshot.limitReached == true ? "quota exhausted" : "quota unavailable"

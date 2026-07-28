@@ -27,8 +27,9 @@ use account_store::{
 #[cfg(test)]
 use account_store::{commit_accounts, save_accounts};
 use activation::{
-    acquire_runtime_activation_lease, activate_with_under_runtime_lease,
-    activate_with_unlocked_reload_under_runtime_lease,
+    acquire_runtime_activation_lease,
+    activate_remote_authority_with_unlocked_reload_under_runtime_lease,
+    activate_with_under_runtime_lease, activate_with_unlocked_reload_under_runtime_lease,
     commit_accounts_with_provider_io_activation_under_runtime_lease,
     preflight_provider_io_activation, reconcile_activation_barrier_unlocked_under_runtime_lease,
     replace_accounts_with_under_runtime_lease, resolve_manual_review_activation_unlocked,
@@ -798,7 +799,7 @@ where
             runtime_lease,
             store_path,
             auth_path,
-            &desired.desired_provider_account_id,
+            &desired,
             reload,
         )?;
         let observed = resolve_committed_remote_status_with(fetch_remote()?, fetch_remote)?;
@@ -822,40 +823,32 @@ fn adopt_remote_provider_under_runtime_lease<R>(
     runtime_lease: &RuntimeActivationLease,
     store_path: &Path,
     auth_path: &Path,
-    desired_provider_account_id: &str,
+    desired: &PoolAuthorityStatus,
     reload: &R,
 ) -> Result<RemoteLocalAdoption>
 where
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
-    if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
-        runtime_lease,
-        store_path,
-        auth_path,
-        true,
-        reload,
-    )? {
-        require_confirmed_activation(outcome)
-            .context("remote-authority adoption is blocked by prior local convergence")?;
-    }
+    remote_authority::validate_adoptable_status(desired)?;
+    let desired_provider_account_id = &desired.desired_provider_account_id;
     let snapshot = load_account_store_snapshot(store_path)?;
     let target = snapshot
         .accounts
         .iter()
-        .find(|account| account.account_id == desired_provider_account_id)
+        .find(|account| account.account_id == desired_provider_account_id.as_str())
         .cloned()
         .context("remote-authority target is absent from the local account store")?;
 
     let mut generation = snapshot.generation;
     let mut accounts = snapshot.accounts;
-    let outcome = activate_with_unlocked_reload_under_runtime_lease(
+    let outcome = activate_remote_authority_with_unlocked_reload_under_runtime_lease(
         runtime_lease,
         store_path,
         auth_path,
         &mut generation,
         &mut accounts,
         target.id,
-        true,
+        desired_provider_account_id,
         reload,
     )?;
     let activation_state = outcome.state;

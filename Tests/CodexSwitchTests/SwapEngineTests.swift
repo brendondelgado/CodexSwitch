@@ -1025,6 +1025,16 @@ struct SwapEngineTests {
             kernelExecutableIdentity: managedKernelIdentity,
             arguments: ["stale-argv-zero", "exec", "--json"]
         )
+        let sandbox = CodexIdentityBoundProcess(
+            identity: managedIdentity,
+            kernelExecutableIdentity: managedKernelIdentity,
+            arguments: ["stale-argv-zero", "sandbox", "--", "node", "kernel.js"]
+        )
+        let sandboxMention = CodexIdentityBoundProcess(
+            identity: managedIdentity,
+            kernelExecutableIdentity: managedKernelIdentity,
+            arguments: ["stale-argv-zero", "resume", "summarize sandbox behavior"]
+        )
         let remote = CodexIdentityBoundProcess(
             identity: managedIdentity,
             kernelExecutableIdentity: managedKernelIdentity,
@@ -1060,6 +1070,11 @@ struct SwapEngineTests {
 
         #expect(SwapEngine.processMatchesRuntime(interactive, runtimeKind: .localInteractiveCLI))
         #expect(!SwapEngine.processMatchesRuntime(exec, runtimeKind: .localInteractiveCLI))
+        #expect(!SwapEngine.processMatchesRuntime(sandbox, runtimeKind: .localInteractiveCLI))
+        #expect(SwapEngine.processMatchesRuntime(
+            sandboxMention,
+            runtimeKind: .localInteractiveCLI
+        ))
         #expect(!SwapEngine.processMatchesRuntime(remote, runtimeKind: .localInteractiveCLI))
         #expect(!SwapEngine.processMatchesRuntime(appServer, runtimeKind: .localInteractiveCLI))
         #expect(SwapEngine.processMatchesRuntime(appServer, runtimeKind: .externalAppServer))

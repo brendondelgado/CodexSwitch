@@ -295,7 +295,7 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
 
         save_block = workflow[target_save:target_cleanup]
         self.assertIn(
-            "if: ${{ success() && steps.upstream_target_cache.outputs.cache-hit != 'true' }}",
+            "if: ${{ success() && inputs.base_runtime_run_id == '' && steps.upstream_target_cache.outputs.cache-hit != 'true' }}",
             save_block,
         )
         self.assertIn("continue-on-error: true", save_block)

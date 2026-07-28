@@ -189,6 +189,15 @@ runtime and an exact target acknowledgement. With no managed runtime, adoption
 remains file-only/degraded; incomplete acknowledgement is degraded. Neither
 state may be reported or persisted as runtime `Confirmed`.
 
+A fresh accepted pool-authority operation is the selection authorization for
+its exact target. Mac-local quota relief, plan preference, candidate ranking,
+and manual-override policy must not veto that adoption merely because the
+currently configured Mac account still has usable quota. Those policies decide
+which target the VPS authority requests; they do not create a second selection
+gate after the authority epoch is committed. The Mac still revalidates the
+operation witness, durable source credentials, target identity, and activation
+lease immediately before mutation.
+
 Provider equality is not an adoption shortcut. The Mac may classify an
 authority observation as already current only when its activation journal is
 `Confirmed`, its runtime evidence is still fresh, its configured and runtime
@@ -240,6 +249,13 @@ The VPS can continue autonomous operation while the Mac is offline; an offline
 Mac is reported as offline/not required and does not prevent the VPS target from
 becoming stable. When the Mac reconnects, it adopts the latest authority epoch
 before another local account-changing operation is admitted.
+
+When a fresh authority observation resolves to one unique local account, the
+menubar quota belongs to that pool target even while Mac credential or runtime
+convergence is pending. It must not render the configured Mac account's quota
+as a normal pool percentage during divergence. If the authority target is
+missing, ambiguous, stale, or unavailable, the menubar shows an explicit
+unknown/synchronizing state rather than substituting a local percentage.
 
 ## Account Store Protocol
 
@@ -707,6 +723,20 @@ blocker in the runtime summary, and refuses `Confirmed` until the blocker exits
 or becomes verifiable. Malformed or ambiguous process enumeration remains an
 unsafe whole-operation failure and sends no signals.
 
+Only the top-level interactive Codex CLI is account-bearing in the local CLI
+lane. `codex sandbox`, `codex exec`, app-server, remote-client, code-mode-host,
+and other subprocess modes are never reload targets and never contribute a
+runtime blocker or acknowledgement requirement.
+
+An updater may retain an attested prepared generation while a live process still
+maps it. Updating the public launcher must not revoke that live process's reload
+eligibility. A retained generation is eligible only when its canonical path is
+inside the bounded prepared-runtime root, its adjacent read-only manifest has
+the expected artifact format and exact runtime/helper hashes, the runtime file
+matches the manifest and live vnode identity, and owner, start time, arguments,
+capability markers, and request/ACK binding all pass the normal checks. An
+already-unlinked generation remains unverified and therefore a typed blocker.
+
 Supported reload mechanisms are ordered by runtime capability:
 
 1. Desktop app-server JSON-RPC token reload with the complete token set and acknowledgement.
@@ -781,6 +811,14 @@ The runtime reloads backend auth before it attempts frontend delivery, so an
 unacknowledged target may already have changed. Import rollback must perform and
 verify compensating convergence after any delivered signal; failure to prove the
 restored runtime enters `ManualReview` instead of claiming a safe rollback.
+
+A stale Rust `Confirmed` journal may be superseded during explicit Mac adoption
+only when a fresh validated remote-authority observation, the journal target,
+and one unique local provider account all name the same desired provider. The
+recovery starts a new journaled activation transaction for that same target; it
+does not delete the old journal, accept a different target, infer authority from
+credential files, or publish confirmation without complete runtime evidence.
+Any mismatch remains fail-closed.
 
 The desktop reload client owns one admitted transaction: JSON-RPC submission,
 identity readback, and its strict acknowledgement all use the same discovery and

@@ -901,6 +901,17 @@ enum SwapEngine {
                                 : "CLI_FIRST_ACK_BOOTSTRAP_DENIED pid=\(binding.processIdentity.pid) reason=runtime_identity_mismatch"
                         ))
                     }
+                    if !managedRuntimeBootstrapAuthorized {
+                        managedRuntimeBootstrapAuthorized =
+                            CodexManagedRuntimeTrust.retainedRuntimeAuthorizes(
+                                binding
+                            )
+                        if managedRuntimeBootstrapAuthorized {
+                            SwapLog.append(.debug(
+                                "CLI_RETAINED_RUNTIME_BOOTSTRAP_AUTHORIZED pid=\(binding.processIdentity.pid)"
+                            ))
+                        }
+                    }
                 }
                 let supported = cliReloadCapabilityIsAuthorized(
                     binding: binding,
@@ -1453,7 +1464,7 @@ enum SwapEngine {
                     || argument == "--ephemeral"
                     || argument == "--remote"
                     || argument.hasPrefix("--remote=")
-            })
+            }) && runtimeArguments.first != "sandbox"
         case .externalAppServer:
             return isDesktopAppServer && !isManagedDesktopBridge
         case .managedDesktopBridge:

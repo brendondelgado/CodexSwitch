@@ -359,6 +359,13 @@ Swift handoff:
 5. The Codex/ChatGPT PID is unchanged and the log does not repeat
    `ACTIVATION_CREDENTIAL_MUTATION_BLOCKED ... source=external-auth`.
 
+Repeat with a healthy Mac-local source account and a fresh VPS authority epoch
+naming another account. The Mac must adopt the authority target even though the
+source still has usable quota; local quota relief and candidate ranking must
+not reject the already-authorized target. While adoption is pending or
+degraded, the menubar must show the authority target's quota or an explicit
+synchronizing/unknown state, never the source account's percentage.
+
 For a provider-equal authority observation, inspect the Swift activation
 journal before accepting an `alreadyCurrent` result:
 
@@ -579,6 +586,8 @@ CodexSwitch must evaluate these independently:
 - **Mac desktop:** official OpenAI signing and plugin health are separate from desktop hot-swap. An ordinary desktop app-server is `external-app-server` and must prove frontend delivery before status can show green.
 - **Managed desktop bridge:** only the repository-managed Mac bridge whose bound process owns the loopback listener on port `9223` may identify as `managed-desktop-bridge`. It may use an idle ACK only when every required frontend writer and delivery counter is present and exactly zero; no other desktop or transport gets this exception.
 - **Mac local CLI:** only native interactive Codex CLI binaries with the CLI-specific capability marker are signal targets. Wrapper shells, code-mode hosts, `exec` subprocesses, SSH clients, and `--remote` clients are not the account-bearing local runtime. Both `~/.local/bin/codex` and `/opt/homebrew/bin/codex` must resolve their managed launcher target to the native binary before validation. A local launch must fail with a repair instruction when no complete hot-swap runtime is available; it must never silently fall back to the stock npm or desktop-bundled CLI, because that creates a process that can observe exhausted credentials but cannot adopt the next account in-turn.
+- **Mac CLI subprocesses:** `codex sandbox` is a tool subprocess, not an interactive account owner. Verify it is excluded from discovery and does not increase discovered, skipped, or acknowledgement counts.
+- **Retained Mac CLI generations:** after an attested runtime update, a still-running prepared generation remains eligible only through exact adjacent-manifest, hash, owner, path-containment, vnode, capability, and request/ACK verification. Prove a retained valid generation acknowledges, while an absent or altered generation remains a typed restart blocker.
 - **Mac CLI discovery:** preliminary `pgrep` candidates use exact process-name matching for `codex`. Full-command-line matching is prohibited because unrelated CodexSwitch paths and short-lived tools can make an otherwise valid batch incomplete.
 - **Mac CLI process identity:** after `ps` discovery, reclassify every candidate from its kernel-resolved executable path. Any executable inside a macOS `.app/Contents/` tree is an application or helper, not an interactive Codex CLI, even when an unquoted path segment such as `Codex Computer Use.app` makes the first whitespace-delimited token look like a `codex` binary.
 - **Mac coordinator readiness:** the signed `CodexSwitch.app` menu process owns
@@ -1518,6 +1527,8 @@ Every future hot-swap change must include tests for:
 - Mac plan changes trigger a safe `codexswitch-cli poll <account>` on the configured Linux devbox without transferring or logging secrets.
 - Mac menubar pool-target display follows the fresh VPS authority observation
   within a few seconds while a Codex.app or CLI `--remote` VPS session is active.
+  During divergence it never substitutes the configured Mac account's quota
+  for the authority target's percentage.
 - Desktop discovery and updates cover `/Applications/ChatGPT.app` and the legacy `/Applications/Codex.app` without maintaining divergent path constants.
 - Patched CLI promotion includes `codex-code-mode-host` on both Mac and Linux, and refuses an incomplete prepared runtime.
 - A running desktop `codex-code-mode-host` helper is excluded from standalone Mac CLI detection even when it lives beside `codex` in a prepared runtime directory.

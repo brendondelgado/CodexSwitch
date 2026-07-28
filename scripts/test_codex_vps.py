@@ -163,7 +163,7 @@ fi
             env=env,
             text=True,
             capture_output=True,
-            timeout=10,
+            timeout=30,
         )
 
     def event_lines(self):

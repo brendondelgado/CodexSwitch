@@ -92,6 +92,10 @@ struct AppDelegateSwapCommitTests {
             route: .swap,
             reason: .manual
         ))
+        #expect(!AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .swap,
+            reason: .poolAuthority
+        ))
         #expect(AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
             route: .swap,
             reason: .quotaExhausted
@@ -115,6 +119,76 @@ struct AppDelegateSwapCommitTests {
         #expect(!AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
             route: .externalAuthObservation,
             reason: .manual
+        ))
+    }
+
+    @Test("Pool authority adoption is not vetoed by healthy local quota")
+    func poolAuthorityAdoptionBypassesLocalCandidatePolicy() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let source = CodexAccount(
+            email: "source@example.com",
+            accessToken: "source-access",
+            refreshToken: "source-refresh",
+            idToken: "source-id",
+            accountId: "source-provider",
+            quotaSnapshot: QuotaSnapshot(
+                allowed: true,
+                limitReached: false,
+                fetchedAt: now,
+                windows: [QuotaWindow(
+                    kind: .weekly,
+                    durationSeconds: 604_800,
+                    usedPercent: 1,
+                    resetsAt: now.addingTimeInterval(86_400),
+                    source: QuotaWindowSourceMetadata(
+                        rateLimit: .main,
+                        slot: .primary
+                    )
+                )]
+            ),
+            isActive: true
+        )
+        let target = CodexAccount(
+            email: "target@example.com",
+            accessToken: "target-access",
+            refreshToken: "target-refresh",
+            idToken: "target-id",
+            accountId: "target-provider",
+            quotaSnapshot: QuotaSnapshot(
+                allowed: true,
+                limitReached: false,
+                fetchedAt: now,
+                windows: [QuotaWindow(
+                    kind: .weekly,
+                    durationSeconds: 604_800,
+                    usedPercent: 20,
+                    resetsAt: now.addingTimeInterval(86_400),
+                    source: QuotaWindowSourceMetadata(
+                        rateLimit: .main,
+                        slot: .primary
+                    )
+                )]
+            )
+        )
+
+        #expect(!source.needsQuotaRelief(at: now))
+        #expect(AccountCredentialMutationPolicy.stillAllows(
+            route: .swap,
+            from: source,
+            to: target,
+            reason: .poolAuthority,
+            accounts: [source, target],
+            configuredAccount: source,
+            now: now
+        ))
+        #expect(!AccountCredentialMutationPolicy.stillAllows(
+            route: .swap,
+            from: source,
+            to: target,
+            reason: .poolAuthority,
+            accounts: [source, target],
+            configuredAccount: target,
+            now: now
         ))
     }
 

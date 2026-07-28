@@ -70,6 +70,10 @@ snapshot boundary must:
    a stable owner, start identity, argv, executable path, device, and inode as a
    typed blocker with its failure reason. A blocker is convergence evidence; it
    is never silently dropped or counted as an acknowledged runtime.
+10. After identity binding, exclude non-account-bearing Codex subprocess modes,
+    including `sandbox`, `exec`, app-server, remote-client, and ephemeral
+    invocations. They are neither reload targets nor blockers in the interactive
+    CLI lane.
 
 ## Race Handling
 
@@ -100,6 +104,14 @@ actionable, but an unchanged set is retried only at the bounded journal cadence.
 Unsafe process enumeration never authorizes confirmation. Existing ACKs for the
 same credential and process binding are reused, so blocker recovery does not
 reload an already-acknowledged desktop bridge.
+
+A live CLI from an older prepared generation remains discoverable after a
+runtime update. It may receive a new request only when CodexSwitch verifies the
+retained generation's adjacent artifact manifest, exact runtime and helper
+hashes, read-only ownership, canonical prepared-root containment, and live
+device/inode identity. Trusting only the current launcher would make every
+successful update strand already-running sessions. A retained runtime whose
+path or manifest is absent stays a typed blocker and requires restart.
 
 ## Reload Binding
 
