@@ -628,6 +628,14 @@ CodexSwitch must evaluate these independently:
   obtain a fresh generation-bound runtime ACK, and only then republish
   `Confirmed`. Cross-account or divergent state performs zero provider I/O and
   zero runtime reload.
+- **Degraded authority telemetry rebase:** after an allowed observational quota
+  commit advances the store generation, a validated remote-authority retry may
+  rebase the same-target `CommittedDegraded` rotation record only when the
+  authority target, sole active store account, unique local target, complete
+  store/auth token set, journal fingerprint, and rollback-free current schema
+  all agree. The retry must still obtain a fresh ACK bound to the rebased
+  generation; mismatched identity, credentials, or journal ownership remains a
+  hard barrier.
 - **Operator observation preflight:** `poll` and `redeem-reset` reconcile and
   validate the activation barrier before any provider callback. Transitional or
   unresolved activation state must produce zero quota, inventory, and consume

@@ -954,6 +954,17 @@ barrier continues to block every account mutation until runtime convergence is
 confirmed. `FileOnly`, `ManualReview`, corrupt journal, and unreadable-state
 failures do not receive this observational exception.
 
+Those permitted telemetry writes can advance the account-store generation
+without changing the selected provider or credential set. A validated remote
+authority adoption may rebase a `CommittedDegraded` rotation record to that
+new generation only when the authority target is the sole active account, the
+target is unique in the local store, `auth.json` exactly matches its complete
+token set, the journal fingerprint still matches, and the current-version
+journal has no rollback or owned-generation payload. The rebased record remains
+`CommittedDegraded` and must obtain a fresh generation-bound runtime
+acknowledgement before becoming `Confirmed`. Any identity, token, journal, or
+rollback divergence remains a hard barrier.
+
 Activation ownership is bound to the stable provider account identifier, while
 the token fingerprint proves one observed credential generation. A normal token
 refresh may replace the complete access, refresh, and identity token set without

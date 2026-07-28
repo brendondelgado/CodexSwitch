@@ -855,7 +855,7 @@ where
     activate_with_dependencies(runtime_lease, context, commit_auth_file, reload)
 }
 
-fn authorize_stale_confirmed_remote_adoption(
+fn prepare_validated_remote_authority_adoption(
     store_lock: &AccountStoreLock,
     generation: &AccountStoreGeneration,
     accounts: &[CodexAccount],
@@ -866,7 +866,10 @@ fn authorize_stale_confirmed_remote_adoption(
     let Some(record) = read_activation_record(store_lock)? else {
         return Ok(None);
     };
-    if record.state != ActivationState::Confirmed {
+    if !matches!(
+        record.state,
+        ActivationState::Confirmed | ActivationState::CommittedDegraded
+    ) {
         return Ok(None);
     }
 
@@ -878,6 +881,55 @@ fn authorize_stale_confirmed_remote_adoption(
         .context("remote-authority recovery requires exactly one active account")?;
     let active_fingerprint = complete_account_token_fingerprint(active)
         .context("remote-authority recovery requires complete source tokens")?;
+
+    if record.state == ActivationState::CommittedDegraded {
+        if record.version != ACTIVATION_RECORD_VERSION
+            || record.kind != ActivationKind::Rotation
+            || record.base_store_generation.is_some()
+            || record.owned_store_generation.is_some()
+            || record.base_auth_generation.is_some()
+            || record.owned_auth_generation.is_some()
+            || record.rollback.is_some()
+        {
+            bail!(
+                "degraded remote-authority activation is not structurally safe for generation recovery"
+            );
+        }
+        if desired_provider_account_id.is_empty()
+            || record.target_account_id != desired_provider_account_id
+            || active.account_id != desired_provider_account_id
+        {
+            bail!(
+                "degraded activation target does not match the validated remote authority and active account"
+            );
+        }
+        if record.auth_fingerprint.as_deref() != Some(active_fingerprint.as_str())
+            || !auth_file_matches_account(auth_path, active)
+        {
+            bail!("remote-authority recovery refused divergent degraded store/auth state");
+        }
+
+        let matching_targets = accounts
+            .iter()
+            .filter(|account| account.account_id == desired_provider_account_id)
+            .collect::<Vec<_>>();
+        let target = matching_targets
+            .first()
+            .copied()
+            .context("remote-authority target is absent from the local account store")?;
+        if matching_targets.len() != 1 || target.id != target_id || target.id != active.id {
+            bail!("remote-authority target is not unique and active in the local account store");
+        }
+
+        if record.store_generation != generation.as_str() {
+            let mut rebased = record;
+            rebased.store_generation = generation.as_str().to_string();
+            rebased.updated_at = Utc::now();
+            write_activation_record(store_lock, &rebased)?;
+        }
+        return Ok(None);
+    }
+
     if activation_record_confirms_current(
         &record,
         active,
@@ -968,7 +1020,7 @@ where
         ActivationBarrierMode::Strict => None,
         ActivationBarrierMode::ValidatedRemoteAuthorityAdoption {
             ref desired_provider_account_id,
-        } => authorize_stale_confirmed_remote_adoption(
+        } => prepare_validated_remote_authority_adoption(
             store_lock,
             generation,
             accounts,
@@ -3163,6 +3215,131 @@ mod tests {
             .context("activation record disappeared")?;
         assert_eq!(record.state, ActivationState::Confirmed);
         assert_eq!(record.target_account_id, target.account_id);
+        Ok(())
+    }
+
+    #[test]
+    fn validated_remote_authority_rebases_degraded_target_after_telemetry_commit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let target = account("target@example.com", true);
+        let alternate = account("alternate@example.com", false);
+        save_accounts(&store_path, &[target.clone(), alternate])?;
+        commit_auth_file(&auth_path, &target)?;
+
+        let initial = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        write_activation_record(
+            &store_lock,
+            &activation_record_ids(
+                ActivationState::CommittedDegraded,
+                &target.account_id,
+                &target.account_id,
+                &initial.generation,
+                account_token_fingerprint(&target),
+                Some("runtime acknowledgement is pending".to_string()),
+            ),
+        )?;
+        drop(store_lock);
+
+        let mut telemetry_commit = fs::read(&store_path)?;
+        telemetry_commit.push(b'\n');
+        fs::write(&store_path, telemetry_commit)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        assert_ne!(snapshot.generation, initial.generation);
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let outcome = activate_with_unlocked_reload_with_topology_under_runtime_lease(
+            &runtime_lease,
+            &store_path,
+            &auth_path,
+            &mut generation,
+            &mut accounts,
+            target.id,
+            true,
+            &|_| {
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
+            },
+            |summary, _| {
+                if !summary.has_bound_activation_proof() {
+                    bail!("topology proof received unbound runtime evidence");
+                }
+                Ok(())
+            },
+            ActivationBarrierMode::ValidatedRemoteAuthorityAdoption {
+                desired_provider_account_id: target.account_id.clone(),
+            },
+        )?;
+
+        assert!(outcome.is_confirmed());
+        assert!(auth_file_matches_account(&auth_path, &target));
+        let record = read_activation_record_for_store(&store_path)?
+            .context("activation record disappeared")?;
+        assert_eq!(record.state, ActivationState::Confirmed);
+        assert_eq!(record.target_account_id, target.account_id);
+        assert_eq!(record.store_generation, generation.as_str());
+        Ok(())
+    }
+
+    #[test]
+    fn validated_remote_authority_rejects_degraded_fingerprint_divergence() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let target = account("target@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&target))?;
+        commit_auth_file(&auth_path, &target)?;
+
+        let initial = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        write_activation_record(
+            &store_lock,
+            &activation_record_ids(
+                ActivationState::CommittedDegraded,
+                &target.account_id,
+                &target.account_id,
+                &initial.generation,
+                Some("different-complete-token-fingerprint".to_string()),
+                None,
+            ),
+        )?;
+        drop(store_lock);
+
+        let mut telemetry_commit = fs::read(&store_path)?;
+        telemetry_commit.push(b'\n');
+        fs::write(&store_path, telemetry_commit)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let error = activate_with_unlocked_reload_with_topology_under_runtime_lease(
+            &runtime_lease,
+            &store_path,
+            &auth_path,
+            &mut generation,
+            &mut accounts,
+            target.id,
+            true,
+            &|_| Ok(ReloadSummary::default()),
+            |_, _| Ok(()),
+            ActivationBarrierMode::ValidatedRemoteAuthorityAdoption {
+                desired_provider_account_id: target.account_id.clone(),
+            },
+        )
+        .expect_err("divergent degraded credentials must remain a hard barrier");
+
+        assert!(format!("{error:#}").contains("divergent degraded store/auth state"));
+        let record = read_activation_record_for_store(&store_path)?
+            .context("activation record disappeared")?;
+        assert_eq!(record.state, ActivationState::CommittedDegraded);
+        assert_eq!(record.store_generation, initial.generation.as_str());
         Ok(())
     }
 
