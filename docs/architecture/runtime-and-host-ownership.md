@@ -965,6 +965,17 @@ journal has no rollback or owned-generation payload. The rebased record remains
 acknowledgement before becoming `Confirmed`. Any identity, token, journal, or
 rollback divergence remains a hard barrier.
 
+The authority may legitimately advance again while that local barrier is
+degraded. A newer validated authority target may supersede the old target only
+when the new target is already the sole active store account, `auth.json`
+exactly matches its complete tokens, both old and new provider identifiers are
+unique in the store, the old journal fingerprint still matches the old
+account's complete tokens, and the old record is the same rollback-free
+current-version rotation shape. The coordinator writes a fresh
+`CommittedDegraded` record from the old target to the newer authority target,
+then requires a current runtime acknowledgement. Authority evidence without
+those complete old-and-new proofs cannot cross the barrier.
+
 Activation ownership is bound to the stable provider account identifier, while
 the token fingerprint proves one observed credential generation. A normal token
 refresh may replace the complete access, refresh, and identity token set without

@@ -636,6 +636,14 @@ CodexSwitch must evaluate these independently:
   all agree. The retry must still obtain a fresh ACK bound to the rebased
   generation; mismatched identity, credentials, or journal ownership remains a
   hard barrier.
+- **Newer authority supersession:** while a rollback-free degraded barrier
+  names target A, advance the VPS authority and exact local store/auth state to
+  unique target B. Recovery may write a fresh A-to-B `CommittedDegraded`
+  generation only when A's journal fingerprint still matches A's complete
+  stored tokens and B is the sole active account with exact auth tokens. It
+  must then obtain B's fresh runtime ACK. Duplicate identities, either token
+  mismatch, rollback payload, malformed state, or unvalidated authority must
+  perform no journal supersession.
 - **Remote lease contention:** make the VPS activation lease unavailable for
   the first target-request attempts and verify that the Mac retries with the
   same request UUID, then succeeds when the lease becomes available. The retry
