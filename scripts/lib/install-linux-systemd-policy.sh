@@ -245,7 +245,9 @@ PY
           fail "failed to read mask barrier fragment: unit=$unit output=${fragment:-<empty>}"
         observed="$(systemctl --user show "$unit" -p DropInPaths --value 2>&1)" || \
           fail "failed to read mask barrier drop-ins: unit=$unit output=${observed:-<empty>}"
-        [[ "$load_state" == "masked" && "$fragment" == "/dev/null" && -z "$observed" ]] || \
+        [[ "$load_state" == "masked" && \
+           ( "$fragment" == "/dev/null" || "$fragment" == "$barrier" ) && \
+           -z "$observed" ]] || \
           fail "systemd mask start barrier is not manager-visible: unit=$unit path=$barrier LoadState=${load_state:-<empty>} FragmentPath=${fragment:-<empty>} DropInPaths=${observed:-<empty>}"
         ;;
       *) fail "systemd start barrier status has an unsupported kind: unit=$unit kind=$kind" ;;

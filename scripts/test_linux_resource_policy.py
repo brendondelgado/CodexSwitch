@@ -1283,7 +1283,12 @@ PY
                 fragment="$service_dir/signul-codex-app-server.service"
                 mask="$runtime_control_dir/signul-codex-app-server.service"
                 if [ -L "$mask" ] && [ "$(readlink "$mask")" = /dev/null ]; then
-                  printf 'LoadState=masked\nActiveState=inactive\nFragmentPath=/dev/null\nExecStart=\nMainPID=0\n'
+                  if [ "${FAKE_SYSTEMD_MASK_FRAGMENT_STYLE:-path}" = dev-null ]; then
+                    mask_fragment=/dev/null
+                  else
+                    mask_fragment="$mask"
+                  fi
+                  printf 'LoadState=masked\nActiveState=inactive\nFragmentPath=%s\nExecStart=\nMainPID=0\n' "$mask_fragment"
                   exit 0
                 fi
                 if [ ! -e "$fragment" ]; then
@@ -1331,7 +1336,11 @@ PY
                 *:FragmentPath)
                   mask="$runtime_control_dir/$unit"
                   if [ -L "$mask" ] && [ "$(readlink "$mask")" = /dev/null ]; then
-                    printf '%s\n' /dev/null
+                    if [ "${FAKE_SYSTEMD_MASK_FRAGMENT_STYLE:-path}" = dev-null ]; then
+                      printf '%s\n' /dev/null
+                    else
+                      printf '%s\n' "$mask"
+                    fi
                   elif [ -f "$service_dir/$unit" ]; then
                     printf '%s/%s\n' "$service_dir" "$unit"
                   else

@@ -128,7 +128,7 @@ if fragment_absent:
             result("unknown", f"activation-mask-load-state-{properties['LoadState']}")
         if properties["ActiveState"] != "inactive":
             result("unknown", f"activation-mask-active-state-{properties['ActiveState']}")
-        if properties["FragmentPath"] != "/dev/null":
+        if properties["FragmentPath"] not in {"/dev/null", str(activation_mask)}:
             result("unknown", "activation-mask-fragment-drift")
         if properties["ExecStart"]:
             result("unknown", "activation-mask-execstart-present")

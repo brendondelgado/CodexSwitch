@@ -71,7 +71,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-25
+  last_updated: 2026-07-28
 ---
 
 # Linux Repository Deployment
@@ -629,7 +629,11 @@ is a hard link to an installer-owned symlink inode targeting `/dev/null`.
 Systemd does not merge condition drop-ins into absent units, so an empty
 `DropInPaths` value for `LoadState=not-found` is expected and can never prove a
 barrier. The runtime mask is instead verified as `LoadState=masked` with
-`FragmentPath=/dev/null`.
+no effective drop-ins. After the owner manifest and private inode anchor prove
+the public mask identity, `FragmentPath` must be either `/dev/null` or the exact
+owned public mask path under the user manager's runtime control directory.
+Supported systemd versions report one of those two equivalent forms; every
+other path remains a blocker.
 
 Every public drop-in or mask retains a private inode anchor. A versioned owner
 manifest records its unit, kind, public path, anchor path, device/inode

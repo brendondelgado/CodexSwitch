@@ -1290,7 +1290,11 @@ actor boundary on every supported Swift 6 toolchain.
   token-owned barrier for every activation-blocking unit. A loaded unit uses a
   false condition drop-in. A `LoadState=not-found` unit uses an exact runtime
   mask to `/dev/null`, because systemd does not merge a drop-in into an absent
-  unit and therefore does not report that drop-in in `DropInPaths`.
+  unit and therefore does not report that drop-in in `DropInPaths`. After
+  filesystem ownership and inode verification, manager visibility requires
+  `LoadState=masked`, no drop-ins, and `FragmentPath` equal to either
+  `/dev/null` or that exact owned runtime-mask path. Systemd versions report
+  one of those two equivalent representations; every other path fails closed.
 - Barrier publication retains a private inode anchor and an owner manifest
   bound to the activation-lock PID, start identity, and token. Cleanup,
   rollback, commit, and dead-owner recovery remove a public drop-in or mask
