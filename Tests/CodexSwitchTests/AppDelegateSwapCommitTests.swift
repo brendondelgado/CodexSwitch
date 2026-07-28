@@ -180,27 +180,61 @@ struct AppDelegateSwapCommitTests {
             .allowsLaunchSameTargetRecovery)
     }
 
-    @Test("Runtime topology recovery captures a baseline before a managed change")
-    func topologyRecoveryRequiresManagedChangedTopology() {
+    @Test("Retry exhaustion recovers once when the typed blocker set changes")
+    func topologyRecoveryRequiresChangedBlockerSet() {
         let target = UUID()
+        let staleBlocker = CodexRuntimeDiscoveryBlocker(
+            pid: 34449,
+            reason: .kernelExecutableUnavailable
+        )
+        let replacementBlocker = CodexRuntimeDiscoveryBlocker(
+            pid: 45550,
+            reason: .processIdentityUnavailable
+        )
         let exhausted = AccountActivationState.manualReview(
             targetAccountId: target,
             detail: .automaticRetryLimitReached,
             retryAttempt: 4,
+            discoveredRuntimeCount: 2,
+            acknowledgedRuntimeCount: 1,
+            runtimeBlockers: [staleBlocker],
             at: Date()
         )
-        let unmanaged = CodexLocalCLIRuntimeTopology(
+        let unmanagedTopology = CodexLocalCLIRuntimeTopology(
             runtimes: [],
             allRuntimesUseManagedRoute: false
         )
-        let managed = CodexLocalCLIRuntimeTopology(
+        let managedTopology = CodexLocalCLIRuntimeTopology(
             runtimes: [],
             allRuntimesUseManagedRoute: true
         )
-        let unmanagedBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
+        let unsafe = CodexLocalCLIRuntimeTopologyObservation.incomplete(
+            CodexIncompleteLocalCLIRuntimeTopology(
+                verifiedTopology: managedTopology,
+                blockers: [replacementBlocker],
+                processSnapshotIsComplete: false
+            )
+        )
+        let stale = CodexLocalCLIRuntimeTopologyObservation.incomplete(
+            CodexIncompleteLocalCLIRuntimeTopology(
+                verifiedTopology: managedTopology,
+                blockers: [staleBlocker],
+                processSnapshotIsComplete: true
+            )
+        )
+        let replacement = CodexLocalCLIRuntimeTopologyObservation.incomplete(
+            CodexIncompleteLocalCLIRuntimeTopology(
+                verifiedTopology: managedTopology,
+                blockers: [replacementBlocker],
+                processSnapshotIsComplete: true
+            )
+        )
+        let managed = CodexLocalCLIRuntimeTopologyObservation.complete(managedTopology)
+        let unmanaged = CodexLocalCLIRuntimeTopologyObservation.complete(unmanagedTopology)
+        let staleBlockerBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
             targetAccountId: target,
             activationGeneration: exhausted.activationGeneration,
-            topology: unmanaged
+            topology: stale
         )
         let managedBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
             targetAccountId: target,
@@ -216,9 +250,9 @@ struct AppDelegateSwapCommitTests {
         #expect(AppDelegate.retryExhaustedTopologyDecision(
             state: exhausted,
             configuredAccountId: target,
-            topology: managed,
+            topology: stale,
             baseline: nil
-        ) == .captureBaseline(managedBaseline))
+        ) == .captureBaseline(staleBlockerBaseline))
         #expect(AppDelegate.retryExhaustedTopologyDecision(
             state: exhausted,
             configuredAccountId: target,
@@ -230,18 +264,49 @@ struct AppDelegateSwapCommitTests {
             configuredAccountId: target,
             topology: managed,
             baseline: staleBaseline
-        ) == .captureBaseline(managedBaseline))
+        ) == .recover(target, managedBaseline))
         #expect(AppDelegate.retryExhaustedTopologyDecision(
             state: exhausted,
             configuredAccountId: target,
             topology: managed,
-            baseline: unmanagedBaseline
+            baseline: staleBlockerBaseline
+        ) == .recover(target, managedBaseline))
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
+            state: exhausted,
+            configuredAccountId: target,
+            topology: replacement,
+            baseline: staleBlockerBaseline
+        ) == .recover(
+            target,
+            AppDelegate.RetryExhaustedTopologyBaseline(
+                targetAccountId: target,
+                activationGeneration: exhausted.activationGeneration,
+                topology: replacement
+            )
+        ))
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
+            state: exhausted,
+            configuredAccountId: target,
+            topology: stale,
+            baseline: staleBlockerBaseline
+        ) == .wait)
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
+            state: exhausted,
+            configuredAccountId: target,
+            topology: unsafe,
+            baseline: staleBlockerBaseline
+        ) == .wait)
+        #expect(AppDelegate.retryExhaustedTopologyDecision(
+            state: exhausted,
+            configuredAccountId: target,
+            topology: managed,
+            baseline: nil
         ) == .recover(target, managedBaseline))
         #expect(AppDelegate.retryExhaustedTopologyDecision(
             state: exhausted,
             configuredAccountId: target,
             topology: unmanaged,
-            baseline: managedBaseline
+            baseline: staleBlockerBaseline
         ) == .wait)
     }
 

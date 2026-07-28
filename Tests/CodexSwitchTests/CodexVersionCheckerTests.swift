@@ -1061,11 +1061,16 @@ struct CodexVersionCheckerTests {
             .deletingLastPathComponent()
             .appending(path: "codex-code-mode-host")
             .path
+        let control = URL(fileURLWithPath: patchedBinary)
+            .deletingLastPathComponent()
+            .appending(path: "codexswitch-cli")
+            .path
         return [
             "#!/usr/bin/env bash",
             "\tset -euo pipefail",
             "\tPATCHED_CODEX='\(patchedBinary)'",
             "\tPATCHED_HELPER='\(helper)'",
+            "\tPATCHED_CONTROL='\(control)'",
             "\tEXPECTED_CODEX_SHA256='\(String(repeating: "a", count: 64))'",
             "\tEXPECTED_HELPER_SHA256='\(String(repeating: "b", count: 64))'",
             "\tCODEX_VPS=\"${CODEXSWITCH_CODEX_VPS:-$HOME/.local/bin/codex-vps}\"",
@@ -1079,9 +1084,9 @@ struct CodexVersionCheckerTests {
             "\t  exec \"$CODEX_VPS\" --remote-client \"$@\"",
             "\tfi",
             "",
-            "\tif [[ -x \"$PATCHED_CODEX\" && -x \"$PATCHED_HELPER\" ]] \\",
-            "\t  && [[ ! -L \"$PATCHED_CODEX\" && ! -L \"$PATCHED_HELPER\" ]]; then",
-            "\t  exec \"$PATCHED_CODEX\" \"$@\"",
+            "\tif [[ -x \"$PATCHED_CODEX\" && -x \"$PATCHED_HELPER\" && -x \"$PATCHED_CONTROL\" ]] \\",
+            "\t  && [[ ! -L \"$PATCHED_CODEX\" && ! -L \"$PATCHED_HELPER\" && ! -L \"$PATCHED_CONTROL\" ]]; then",
+            "\t  exec \"$PATCHED_CONTROL\" run-managed-runtime --runtime \"$PATCHED_CODEX\" -- \"$@\"",
             "\tfi",
             "",
             #"echo "codex: local runtime failed complete provenance/hot-swap validation at $PATCHED_CODEX; run 'codexswitch-cli codex-update-status' and explicitly prepare/install a verified runtime" >&2"#,

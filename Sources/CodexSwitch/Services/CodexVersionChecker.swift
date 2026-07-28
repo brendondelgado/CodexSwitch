@@ -1037,7 +1037,7 @@ final class CodexVersionChecker {
         from script: String
     ) -> ManagedRuntimeTarget? {
         let lines = script.components(separatedBy: "\n")
-        guard lines.count == 25,
+        guard lines.count == 26,
               let patched = launcherSingleQuotedValue(
                 in: lines[2],
                 prefix: "\tPATCHED_CODEX="
@@ -1046,21 +1046,26 @@ final class CodexVersionChecker {
                 in: lines[3],
                 prefix: "\tPATCHED_HELPER="
               ), let normalizedHelper = normalizedAbsoluteLauncherPath(helper),
-              let runtimeSHA256 = launcherSingleQuotedValue(
+              let control = launcherSingleQuotedValue(
                 in: lines[4],
+                prefix: "\tPATCHED_CONTROL="
+              ), let normalizedControl = normalizedAbsoluteLauncherPath(control),
+              let runtimeSHA256 = launcherSingleQuotedValue(
+                in: lines[5],
                 prefix: "\tEXPECTED_CODEX_SHA256="
               ), isLowercaseSHA256(runtimeSHA256),
               let helperSHA256 = launcherSingleQuotedValue(
-                in: lines[5],
+                in: lines[6],
                 prefix: "\tEXPECTED_HELPER_SHA256="
               ), isLowercaseSHA256(helperSHA256) else {
             return nil
         }
-        let expectedHelper = URL(fileURLWithPath: normalizedPatched)
+        let runtimeDirectory = URL(fileURLWithPath: normalizedPatched)
             .deletingLastPathComponent()
-            .appending(path: "codex-code-mode-host")
-            .path
+        let expectedHelper = runtimeDirectory.appending(path: "codex-code-mode-host").path
+        let expectedControl = runtimeDirectory.appending(path: "codexswitch-cli").path
         guard normalizedHelper == expectedHelper,
+              normalizedControl == expectedControl,
               script == rustManagedLauncherScript(
                 patchedBinary: normalizedPatched,
                 runtimeSHA256: runtimeSHA256,
@@ -1133,11 +1138,16 @@ final class CodexVersionChecker {
             .deletingLastPathComponent()
             .appending(path: "codex-code-mode-host")
             .path
+        let control = URL(fileURLWithPath: patchedBinary)
+            .deletingLastPathComponent()
+            .appending(path: "codexswitch-cli")
+            .path
         return [
             "#!/usr/bin/env bash",
             "\tset -euo pipefail",
             "\tPATCHED_CODEX='\(patchedBinary)'",
             "\tPATCHED_HELPER='\(helper)'",
+            "\tPATCHED_CONTROL='\(control)'",
             "\tEXPECTED_CODEX_SHA256='\(runtimeSHA256)'",
             "\tEXPECTED_HELPER_SHA256='\(helperSHA256)'",
             "\tCODEX_VPS=\"${CODEXSWITCH_CODEX_VPS:-$HOME/.local/bin/codex-vps}\"",
@@ -1151,9 +1161,9 @@ final class CodexVersionChecker {
             "\t  exec \"$CODEX_VPS\" --remote-client \"$@\"",
             "\tfi",
             "",
-            "\tif [[ -x \"$PATCHED_CODEX\" && -x \"$PATCHED_HELPER\" ]] \\",
-            "\t  && [[ ! -L \"$PATCHED_CODEX\" && ! -L \"$PATCHED_HELPER\" ]]; then",
-            "\t  exec \"$PATCHED_CODEX\" \"$@\"",
+            "\tif [[ -x \"$PATCHED_CODEX\" && -x \"$PATCHED_HELPER\" && -x \"$PATCHED_CONTROL\" ]] \\",
+            "\t  && [[ ! -L \"$PATCHED_CODEX\" && ! -L \"$PATCHED_HELPER\" && ! -L \"$PATCHED_CONTROL\" ]]; then",
+            "\t  exec \"$PATCHED_CONTROL\" run-managed-runtime --runtime \"$PATCHED_CODEX\" -- \"$@\"",
             "\tfi",
             "",
             #"echo "codex: local runtime failed complete provenance/hot-swap validation at $PATCHED_CODEX; run 'codexswitch-cli codex-update-status' and explicitly prepare/install a verified runtime" >&2"#,

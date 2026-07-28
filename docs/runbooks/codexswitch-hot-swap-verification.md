@@ -1316,6 +1316,13 @@ Every future hot-swap change must include tests for:
 - The SIGHUP request nonce is unique per signal and must be echoed by the matching PID ACK.
 - Reused ACK PIDs and newly acknowledged PIDs are tracked separately; only the
   latter may produce a `SIGHUP_SENT` event.
+- A complete PID enumeration containing one identity-unbindable CLI still
+  writes requests, signals, and collects ACKs for every independently verified
+  CLI. The typed blocker remains in convergence evidence and prevents
+  `Confirmed`; malformed or ambiguous enumeration still sends zero signals.
+- Retry-exhausted Mac recovery captures a typed blocker baseline and grants one
+  bounded same-target retry only when that blocker set changes or exits.
+  Reused desktop ACK evidence produces no repeated desktop JSON-RPC or SIGHUP.
 - An external app-server rejects every ACK whose runtime kind is not
   `external-app-server`; every other runtime kind likewise rejects an
   `external-app-server` ACK, and a local interactive CLI accepts only its
@@ -1368,6 +1375,10 @@ Every future hot-swap change must include tests for:
 - All Rust subprocess, `ps`, and exact-unit `systemctl` paths have deterministic timeout tests. Signal tests cover identity change immediately before delivery and before ACK acceptance.
 - Desktop RPC timeout tests run beside the full concurrent Swift suite and prove that a cancellation-ignoring operation cannot delay the monotonic deadline.
 - Source trees, prepared generations, update logs, request files, and ACK files enforce count, age, and total-byte retention while preserving active/current/rollback artifacts; oversized ACKs are rejected before allocation.
+- Prepared-generation retention cannot remove a generation while a live
+  `codex` or `codex-code-mode-host` process holds its executable path/inode or
+  shared runtime lease. Tests cover both executable names, inode replacement,
+  inventory failure before mutation, and the launch-versus-delete lease race.
 - Artifact scans stop at deterministic entry/time/memory budgets, generated
   request readers cap bytes before allocation, and reset-journal tests prove
   descriptor-anchored generation CAS, exact readback, symlink rejection, and

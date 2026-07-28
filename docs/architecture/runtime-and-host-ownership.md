@@ -621,6 +621,15 @@ On macOS, `argv[0]` is classification input only; `proc_pidpath` supplies the
 executable identity used for signal authorization. Missing or changed kernel
 identity fails closed.
 
+A complete PID enumeration may contain a process whose identity cannot be
+bound, for example a historical CLI whose prepared executable generation has
+lost its pathname. After credentials have committed, that process is a typed
+convergence blocker, not authority to suppress independently authorized
+survivors. CodexSwitch reloads every verified healthy target, preserves the
+blocker in the runtime summary, and refuses `Confirmed` until the blocker exits
+or becomes verifiable. Malformed or ambiguous process enumeration remains an
+unsafe whole-operation failure and sends no signals.
+
 Supported reload mechanisms are ordered by runtime capability:
 
 1. Desktop app-server JSON-RPC token reload with the complete token set and acknowledgement.
@@ -745,6 +754,14 @@ Broad `pkill`, name-only matching, and signalling a newly initialized process ar
 The Mac may publish runtime-current only when at least one expected live runtime
 acknowledges the complete target and every discovered target acknowledges. No
 runtime is an explicit configured-only degraded result, never confirmation.
+
+Retry exhaustion is scoped to one activation generation and one typed blocker
+set. The journaled blocker set remains the baseline across restarts; legacy
+journals without one capture the first passive observation instead. A later
+blocker-set change or exit may create one new bounded retry generation for the
+same target; an unchanged set cannot loop. Recovery reuses current
+process-bound ACKs and must not send desktop JSON-RPC or SIGHUP again to an
+already-acknowledged bridge.
 
 ## Hot-Swap Reliability Closure
 

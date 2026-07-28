@@ -53,6 +53,15 @@ fn enforce_updater_retention_at(
         collect_prepared_generations(data_dir, PREPARED_TREE_MAX_TOTAL_BYTES, &mut enumeration)?;
 
     protect_newest_pair(&sources, &mut protected);
+    protect_newest_pair(&prepared, &mut protected);
+    let live_runtime_identities = live_prepared_runtime_identities(data_dir)?;
+    protected.extend(protected_live_prepared_generations(
+        data_dir,
+        &prepared,
+        &live_runtime_identities,
+    )?);
+    let _retention_leases = acquire_prepared_retention_leases(&prepared, &mut protected)?;
+
     retain_updater_artifacts(
         sources,
         &protected,
@@ -66,7 +75,6 @@ fn enforce_updater_retention_at(
         "Codex source tree",
     )?;
 
-    protect_newest_pair(&prepared, &mut protected);
     retain_updater_artifacts(
         prepared,
         &protected,
@@ -79,6 +87,122 @@ fn enforce_updater_retention_at(
         data_dir,
         "prepared Codex generation",
     )
+}
+
+fn live_prepared_runtime_identities(
+    data_dir: &Path,
+) -> Result<Vec<crate::reload::HotSwapKernelExecutableIdentity>> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::reload::discover_live_prepared_runtime_executables(
+            &data_dir.join("prepared-codex"),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = data_dir;
+        Ok(Vec::new())
+    }
+}
+
+fn protected_live_prepared_generations(
+    data_dir: &Path,
+    prepared: &[UpdaterArtifact],
+    identities: &[crate::reload::HotSwapKernelExecutableIdentity],
+) -> Result<HashSet<PathBuf>> {
+    let prepared_root = data_dir.join("prepared-codex");
+    let canonical_root = match fs::canonicalize(&prepared_root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HashSet::new())
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to resolve prepared runtime root {}",
+                    prepared_root.display()
+                )
+            })
+        }
+    };
+    let mut protected = HashSet::new();
+    for identity in identities {
+        if identity.device == 0 || identity.inode == 0 {
+            bail!("live prepared runtime identity omitted its executable inode");
+        }
+        let executable = Path::new(&identity.canonical_path);
+        if !executable.starts_with(&canonical_root)
+            || !matches!(
+                executable.file_name().and_then(|name| name.to_str()),
+                Some("codex" | "codex-code-mode-host")
+            )
+        {
+            continue;
+        }
+        let Some(generation) = executable.parent() else {
+            bail!("live prepared runtime identity omitted its generation");
+        };
+        let is_attempt_generation = generation
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|parent| parent == canonical_root);
+        let is_legacy_version_generation = generation.parent() == Some(canonical_root.as_path());
+        if !is_attempt_generation && !is_legacy_version_generation {
+            bail!(
+                "live prepared runtime path has an invalid generation shape: {}",
+                executable.display()
+            );
+        }
+        let artifact = prepared
+            .iter()
+            .find(|artifact| artifact.canonical_path == generation)
+            .with_context(|| {
+                format!(
+                    "live prepared runtime generation was absent from retention inventory: {}",
+                    generation.display()
+                )
+            })?;
+        protected.insert(artifact.path.clone());
+    }
+    Ok(protected)
+}
+
+fn acquire_prepared_retention_leases(
+    prepared: &[UpdaterArtifact],
+    protected: &mut HashSet<PathBuf>,
+) -> Result<Vec<patched_codex::RuntimeExecutableLeases>> {
+    let mut leases = Vec::new();
+    for artifact in prepared {
+        if protected.contains(&artifact.path) {
+            continue;
+        }
+        let runtime = artifact.path.join("codex");
+        let helper = artifact.path.join("codex-code-mode-host");
+        let runtime_exists = fs::symlink_metadata(&runtime)
+            .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            .or_else(|error| {
+                (error.kind() == std::io::ErrorKind::NotFound)
+                    .then_some(false)
+                    .ok_or(error)
+            })?;
+        let helper_exists = fs::symlink_metadata(&helper)
+            .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            .or_else(|error| {
+                (error.kind() == std::io::ErrorKind::NotFound)
+                    .then_some(false)
+                    .ok_or(error)
+            })?;
+        if !runtime_exists || !helper_exists {
+            continue;
+        }
+        match patched_codex::try_acquire_exclusive_runtime_leases(&runtime)? {
+            Some(lease) => leases.push(lease),
+            None => {
+                protected.insert(artifact.path.clone());
+            }
+        }
+    }
+    Ok(leases)
 }
 
 fn updater_protected_paths(state: &CodexUpdateState, data_dir: &Path) -> HashSet<PathBuf> {

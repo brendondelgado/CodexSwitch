@@ -54,6 +54,10 @@ struct AccountActivationStateTests {
         let target = UUID()
         let now = Date(timeIntervalSince1970: 1_800_000_100)
         let coordinator = AccountActivationCoordinator(url: url)
+        let blocker = CodexRuntimeDiscoveryBlocker(
+            pid: 34449,
+            reason: .kernelExecutableUnavailable
+        )
 
         _ = try await coordinator.beginPreparing(targetAccountId: target, kind: .automatic, at: now)
         _ = try await coordinator.markCommittedDegraded(
@@ -68,6 +72,7 @@ struct AccountActivationStateTests {
             discoveredRuntimeCount: 2,
             acknowledgedRuntimeCount: 1,
             detail: .runtimeAcknowledgementIncomplete,
+            runtimeBlockers: [blocker],
             at: now.addingTimeInterval(1)
         )
 
@@ -76,6 +81,8 @@ struct AccountActivationStateTests {
         #expect(partial.acknowledgedRuntimeCount == 1)
         #expect(partial.runtimeCurrentAccountId == nil)
         #expect(partial.retryAttempt == 1)
+        #expect(partial.convergenceBlockers == [blocker])
+        #expect(try await AccountActivationCoordinator(url: url).load() == partial)
     }
 
     @Test("A missing journal bootstraps a durable configured-only barrier")

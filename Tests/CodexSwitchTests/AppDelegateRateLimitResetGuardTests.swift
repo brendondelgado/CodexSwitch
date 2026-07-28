@@ -740,7 +740,8 @@ struct AppDelegateRateLimitResetGuardTests {
             detail: nil,
             runtimeEvidenceGeneration: nil,
             runtimeEvidenceObservedAt: nil,
-            runtimeEvidenceExpiresAt: nil
+            runtimeEvidenceExpiresAt: nil,
+            runtimeBlockers: nil
         )
     }
 }

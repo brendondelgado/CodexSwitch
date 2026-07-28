@@ -395,7 +395,8 @@ struct AccountHostOwnershipPresentationTests {
             detail: nil,
             runtimeEvidenceGeneration: UUID(),
             runtimeEvidenceObservedAt: .distantPast,
-            runtimeEvidenceExpiresAt: .distantFuture
+            runtimeEvidenceExpiresAt: .distantFuture,
+            runtimeBlockers: nil
         )
     }
 

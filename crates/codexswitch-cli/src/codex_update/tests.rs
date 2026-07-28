@@ -1226,6 +1226,113 @@ esac
     }
 
     #[test]
+    fn live_codex_and_helper_inode_paths_protect_their_prepared_generations() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path();
+        let codex_generation = data_dir.join("prepared-codex/0.143.0/codex-live");
+        let helper_generation = data_dir.join("prepared-codex/0.144.0/helper-live");
+        let codex = write_test_runtime(&codex_generation, "0.143.0", true)?;
+        let helper_runtime = write_test_runtime(&helper_generation, "0.144.0", true)?;
+        let helper = helper_runtime.with_file_name("codex-code-mode-host");
+        let codex_metadata = fs::metadata(&codex)?;
+        let helper_metadata = fs::metadata(&helper)?;
+        let identities = vec![
+            crate::reload::HotSwapKernelExecutableIdentity {
+                canonical_path: fs::canonicalize(&codex)?.display().to_string(),
+                device: codex_metadata.dev(),
+                inode: codex_metadata.ino(),
+            },
+            crate::reload::HotSwapKernelExecutableIdentity {
+                canonical_path: fs::canonicalize(&helper)?.display().to_string(),
+                device: helper_metadata.dev(),
+                inode: helper_metadata.ino(),
+            },
+        ];
+        let mut enumeration = RetentionEnumerationBudget::new(100);
+        let prepared = collect_prepared_generations(data_dir, 1024 * 1024, &mut enumeration)?;
+
+        let protected =
+            protected_live_prepared_generations(data_dir, &prepared, &identities)?;
+        assert_eq!(
+            protected,
+            HashSet::from([codex_generation, helper_generation])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_old_inode_still_protects_a_same_path_replacement_generation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path();
+        let generation = data_dir.join("prepared-codex/0.144.0/replaced");
+        let codex = write_test_runtime(&generation, "0.144.0", true)?;
+        let original = fs::metadata(&codex)?;
+        let replacement = generation.join("codex.new");
+        fs::write(&replacement, "#!/bin/sh\nexit 0\n")?;
+        set_executable(&replacement)?;
+        fs::rename(&replacement, &codex)?;
+        assert_ne!(fs::metadata(&codex)?.ino(), original.ino());
+
+        let mut enumeration = RetentionEnumerationBudget::new(100);
+        let prepared = collect_prepared_generations(data_dir, 1024 * 1024, &mut enumeration)?;
+        let protected = protected_live_prepared_generations(
+            data_dir,
+            &prepared,
+            &[crate::reload::HotSwapKernelExecutableIdentity {
+                canonical_path: fs::canonicalize(&codex)?.display().to_string(),
+                device: original.dev(),
+                inode: original.ino(),
+            }],
+        )?;
+
+        assert_eq!(protected, HashSet::from([generation]));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_runtime_lease_prevents_generation_retention_deletion() -> Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path();
+        let version_root = data_dir.join("prepared-codex/0.144.0");
+        let mut generations = Vec::new();
+        for attempt in ["a", "b", "c", "d", "e"] {
+            let generation = version_root.join(attempt);
+            write_test_runtime(&generation, "0.144.0", true)?;
+            generations.push(generation);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let leased_runtime = generations[0].join("codex");
+        let leased_helper = generations[0].join("codex-code-mode-host");
+        let runtime_file = fs::File::open(&leased_runtime)?;
+        let helper_file = fs::File::open(&leased_helper)?;
+        assert_eq!(
+            unsafe { libc::flock(runtime_file.as_raw_fd(), libc::LOCK_SH) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::flock(helper_file.as_raw_fd(), libc::LOCK_SH) },
+            0
+        );
+
+        let state = automatic_update_test_state(UpdateStatus::Idle, Utc::now());
+        enforce_updater_retention_at(
+            &state,
+            data_dir,
+            SystemTime::now() + PREPARED_TREE_MAX_AGE + Duration::from_secs(1),
+        )?;
+
+        assert!(generations[0].exists(), "leased generation was pruned");
+        assert!(
+            generations.iter().filter(|generation| generation.exists()).count()
+                == PREPARED_TREE_MAX_COUNT,
+            "retention did not prune exactly one unleased generation"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn updater_artifact_age_guard_prunes_at_exact_boundary() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let artifact_path = temp.path().join("codex-source-stable-0.141.0");
@@ -3678,6 +3785,9 @@ fn timestamped_server_notification(notification: ServerNotification) -> Outgoing
         let helper = prepared.with_file_name("codex-code-mode-host");
         fs::write(&helper, b"host").unwrap();
         set_executable(&helper).unwrap();
+        let control = prepared.with_file_name("codexswitch-cli");
+        fs::write(&control, b"control").unwrap();
+        set_executable(&control).unwrap();
 
         let launcher = temp_dir.path().join("patched-codex/codex");
         fs::create_dir_all(launcher.parent().unwrap()).unwrap();

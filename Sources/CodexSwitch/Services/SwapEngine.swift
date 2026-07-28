@@ -16,6 +16,7 @@ struct CodexReloadSummary: Equatable, Sendable {
     let discoveredRuntimeCount: Int
     let acknowledgedRuntimeCount: Int
     let operationFailed: Bool
+    let blockers: Set<CodexRuntimeDiscoveryBlocker>
 
     var unacknowledgedRuntimeCount: Int {
         discoveredRuntimeCount - acknowledgedRuntimeCount
@@ -24,13 +25,15 @@ struct CodexReloadSummary: Equatable, Sendable {
     init(
         discoveredRuntimeCount: Int,
         acknowledgedRuntimeCount: Int,
-        operationFailed: Bool = false
+        operationFailed: Bool = false,
+        blockers: Set<CodexRuntimeDiscoveryBlocker> = []
     ) {
         let discovered = max(0, discoveredRuntimeCount)
         let acknowledged = max(0, min(acknowledgedRuntimeCount, discovered))
         self.discoveredRuntimeCount = discovered
         self.acknowledgedRuntimeCount = acknowledged
         self.operationFailed = operationFailed
+        self.blockers = blockers
 
         if operationFailed {
             outcome = .restartRequiredOrFailed
@@ -223,9 +226,45 @@ struct CodexRuntimeTarget: Equatable, Sendable {
     let runtimeKind: HotSwapRuntimeKind
 }
 
+enum CodexRuntimeDiscoveryBlockerReason: String, Codable, Equatable, Hashable, Sendable {
+    case processIdentityUnavailable = "process_identity_unavailable"
+    case ownerMismatch = "owner_mismatch"
+    case argumentsUnavailable = "arguments_unavailable"
+    case processIdentityChanged = "process_identity_changed"
+    case kernelExecutableUnavailable = "kernel_executable_unavailable"
+    case kernelExecutableInvalid = "kernel_executable_invalid"
+    case kernelExecutableMismatch = "kernel_executable_mismatch"
+}
+
+struct CodexRuntimeDiscoveryBlocker: Codable, Equatable, Hashable, Sendable {
+    let pid: Int32
+    let reason: CodexRuntimeDiscoveryBlockerReason
+}
+
 struct CodexRuntimeDiscoverySnapshot: Equatable, Sendable {
     let targets: [CodexRuntimeTarget]
-    let isComplete: Bool
+    let blockers: Set<CodexRuntimeDiscoveryBlocker>
+    let processSnapshotIsComplete: Bool
+
+    var isComplete: Bool {
+        processSnapshotIsComplete && blockers.isEmpty
+    }
+
+    init(targets: [CodexRuntimeTarget], isComplete: Bool) {
+        self.targets = targets
+        self.blockers = []
+        self.processSnapshotIsComplete = isComplete
+    }
+
+    init(
+        targets: [CodexRuntimeTarget],
+        blockers: Set<CodexRuntimeDiscoveryBlocker>,
+        processSnapshotIsComplete: Bool
+    ) {
+        self.targets = targets
+        self.blockers = blockers
+        self.processSnapshotIsComplete = processSnapshotIsComplete
+    }
 }
 
 struct CodexLocalCLIRuntimeIdentity: Equatable, Sendable {
@@ -236,6 +275,44 @@ struct CodexLocalCLIRuntimeIdentity: Equatable, Sendable {
 struct CodexLocalCLIRuntimeTopology: Equatable, Sendable {
     let runtimes: [CodexLocalCLIRuntimeIdentity]
     let allRuntimesUseManagedRoute: Bool
+}
+
+struct CodexIncompleteLocalCLIRuntimeTopology: Equatable, Sendable {
+    let verifiedTopology: CodexLocalCLIRuntimeTopology
+    let blockers: Set<CodexRuntimeDiscoveryBlocker>
+    let processSnapshotIsComplete: Bool
+}
+
+enum CodexLocalCLIRuntimeTopologyObservation: Equatable, Sendable {
+    case complete(CodexLocalCLIRuntimeTopology)
+    case incomplete(CodexIncompleteLocalCLIRuntimeTopology)
+
+    var verifiedTopology: CodexLocalCLIRuntimeTopology {
+        switch self {
+        case .complete(let topology):
+            topology
+        case .incomplete(let topology):
+            topology.verifiedTopology
+        }
+    }
+
+    var blockers: Set<CodexRuntimeDiscoveryBlocker> {
+        switch self {
+        case .complete:
+            []
+        case .incomplete(let topology):
+            topology.blockers
+        }
+    }
+
+    var processSnapshotIsComplete: Bool {
+        switch self {
+        case .complete:
+            true
+        case .incomplete(let topology):
+            topology.processSnapshotIsComplete
+        }
+    }
 }
 
 struct CodexRuntimeObservation: Equatable, Sendable {
@@ -1087,10 +1164,12 @@ enum SwapEngine {
         operationFailed: Bool = false
     ) -> CodexReloadSummary {
         let discoveredPIDs = Set(discoverySnapshot.targets.map { $0.process.identity.pid })
+        let blockerPIDs = Set(discoverySnapshot.blockers.map(\.pid))
         return CodexReloadSummary(
-            discoveredRuntimeCount: discoveredPIDs.count,
+            discoveredRuntimeCount: discoveredPIDs.union(blockerPIDs).count,
             acknowledgedRuntimeCount: discoveredPIDs.intersection(acknowledgedPIDs).count,
-            operationFailed: operationFailed || !discoverySnapshot.isComplete
+            operationFailed: operationFailed || !discoverySnapshot.isComplete,
+            blockers: discoverySnapshot.blockers
         )
     }
 
@@ -1232,17 +1311,23 @@ enum SwapEngine {
         runtimeClassifier: (CodexIdentityBoundProcess) -> HotSwapRuntimeKind?
     ) -> CodexRuntimeDiscoverySnapshot {
         var targets: [CodexRuntimeTarget] = []
-        var isComplete = processSnapshot.isComplete
+        var blockers: Set<CodexRuntimeDiscoveryBlocker> = []
 
         for pid in processSnapshot.pids {
-            guard let process = identityBoundProcess(
+            let binding = identityBindingResult(
                 pid: pid,
                 requiredOwnerUID: requiredOwnerUID,
                 identityProvider: identityProvider,
                 argumentProvider: argumentProvider,
                 kernelExecutableIdentityProvider: kernelExecutableIdentityProvider
-            ) else {
-                isComplete = false
+            )
+            guard case .bound(let process) = binding else {
+                if case .blocked(let reason) = binding {
+                    blockers.insert(CodexRuntimeDiscoveryBlocker(
+                        pid: pid,
+                        reason: reason
+                    ))
+                }
                 continue
             }
             guard let runtimeKind = runtimeClassifier(process) else {
@@ -1251,7 +1336,11 @@ enum SwapEngine {
             targets.append(CodexRuntimeTarget(process: process, runtimeKind: runtimeKind))
         }
 
-        return CodexRuntimeDiscoverySnapshot(targets: targets, isComplete: isComplete)
+        return CodexRuntimeDiscoverySnapshot(
+            targets: targets,
+            blockers: blockers,
+            processSnapshotIsComplete: processSnapshot.isComplete
+        )
     }
 
     nonisolated static func installedManagedDesktopRuntimePath(
@@ -1274,31 +1363,68 @@ enum SwapEngine {
             kernelExecutableIdentity(pid: $0)
         }
     ) -> CodexIdentityBoundProcess? {
-        guard let identityBefore = identityProvider(pid),
-              identityBefore.ownerUID == requiredOwnerUID,
-              let arguments = argumentProvider(pid),
-              !arguments.isEmpty,
-              signalIdentityMatches(
-                  expected: identityBefore,
-                  current: identityProvider(pid),
-                  requiredOwnerUID: requiredOwnerUID
-              ),
-              let kernelExecutableIdentity = kernelExecutableIdentityProvider(pid),
-              kernelExecutableIdentity.canonicalPath == identityBefore.executablePath,
-              kernelExecutableIdentity.device > 0,
-              kernelExecutableIdentity.inode > 0,
-              signalIdentityMatches(
-                  expected: identityBefore,
-                  current: identityProvider(pid),
-                  requiredOwnerUID: requiredOwnerUID
-              ) else {
+        guard case .bound(let process) = identityBindingResult(
+            pid: pid,
+            requiredOwnerUID: requiredOwnerUID,
+            identityProvider: identityProvider,
+            argumentProvider: argumentProvider,
+            kernelExecutableIdentityProvider: kernelExecutableIdentityProvider
+        ) else {
             return nil
         }
-        return CodexIdentityBoundProcess(
+        return process
+    }
+
+    private enum CodexIdentityBindingResult {
+        case bound(CodexIdentityBoundProcess)
+        case blocked(CodexRuntimeDiscoveryBlockerReason)
+    }
+
+    private nonisolated static func identityBindingResult(
+        pid: Int32,
+        requiredOwnerUID: UInt32,
+        identityProvider: (Int32) -> CodexSignalProcessIdentity?,
+        argumentProvider: (Int32) -> [String]?,
+        kernelExecutableIdentityProvider: (Int32) -> CodexKernelExecutableIdentity?
+    ) -> CodexIdentityBindingResult {
+        guard let identityBefore = identityProvider(pid) else {
+            return .blocked(.processIdentityUnavailable)
+        }
+        guard identityBefore.ownerUID == requiredOwnerUID else {
+            return .blocked(.ownerMismatch)
+        }
+        guard let arguments = argumentProvider(pid), !arguments.isEmpty else {
+            return .blocked(.argumentsUnavailable)
+        }
+        guard signalIdentityMatches(
+            expected: identityBefore,
+            current: identityProvider(pid),
+            requiredOwnerUID: requiredOwnerUID
+        ) else {
+            return .blocked(.processIdentityChanged)
+        }
+        guard let kernelExecutableIdentity = kernelExecutableIdentityProvider(pid) else {
+            return .blocked(.kernelExecutableUnavailable)
+        }
+        guard kernelExecutableIdentity.device > 0,
+              kernelExecutableIdentity.inode > 0 else {
+            return .blocked(.kernelExecutableInvalid)
+        }
+        guard kernelExecutableIdentity.canonicalPath == identityBefore.executablePath else {
+            return .blocked(.kernelExecutableMismatch)
+        }
+        guard signalIdentityMatches(
+            expected: identityBefore,
+            current: identityProvider(pid),
+            requiredOwnerUID: requiredOwnerUID
+        ) else {
+            return .blocked(.processIdentityChanged)
+        }
+        return .bound(CodexIdentityBoundProcess(
             identity: identityBefore,
             kernelExecutableIdentity: kernelExecutableIdentity,
             arguments: arguments
-        )
+        ))
     }
 
     nonisolated static func processMatchesRuntime(
@@ -1586,7 +1712,7 @@ enum SwapEngine {
             )
         }
 
-        guard discoverySnapshot.isComplete else {
+        guard discoverySnapshot.processSnapshotIsComplete else {
             return CodexReloadExecutionResult(
                 discoverySnapshot: discoverySnapshot,
                 newlyAcknowledgedPIDs: [],
@@ -1599,14 +1725,14 @@ enum SwapEngine {
                 discoverySnapshot: discoverySnapshot,
                 newlyAcknowledgedPIDs: [],
                 reusedAcknowledgedPIDs: [],
-                operationFailed: false
+                operationFailed: !discoverySnapshot.blockers.isEmpty
             )
         }
 
         var pendingBindings: [CodexReloadBinding] = []
         var reusedAcknowledgedPIDs: Set<Int32> = []
         var requestNonces: Set<String> = []
-        var operationFailed = false
+        var operationFailed = !discoverySnapshot.blockers.isEmpty
 
         for target in discoverySnapshot.targets {
             let expectedIdentity = target.process.identity
@@ -1806,7 +1932,7 @@ enum SwapEngine {
 
     /// Read-only, identity-bound evidence for local policy decisions.
     nonisolated static func localCLIRuntimeTopology()
-        -> CodexLocalCLIRuntimeTopology? {
+        -> CodexLocalCLIRuntimeTopologyObservation {
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
             arguments: localCodexProcessDiscoveryArguments,
@@ -1837,8 +1963,7 @@ enum SwapEngine {
     nonisolated static func localCLIRuntimeTopology(
         discoverySnapshot: CodexRuntimeDiscoverySnapshot,
         managedRuntimePath: String?
-    ) -> CodexLocalCLIRuntimeTopology? {
-        guard discoverySnapshot.isComplete else { return nil }
+    ) -> CodexLocalCLIRuntimeTopologyObservation {
         let runtimes = discoverySnapshot.targets
             .map {
                 CodexLocalCLIRuntimeIdentity(
@@ -1855,10 +1980,18 @@ enum SwapEngine {
                     && $0.kernelExecutableIdentity.canonicalPath == path
             }
         } ?? false
-        return CodexLocalCLIRuntimeTopology(
+        let topology = CodexLocalCLIRuntimeTopology(
             runtimes: runtimes,
             allRuntimesUseManagedRoute: allRuntimesUseManagedRoute
         )
+        guard discoverySnapshot.isComplete else {
+            return .incomplete(CodexIncompleteLocalCLIRuntimeTopology(
+                verifiedTopology: topology,
+                blockers: discoverySnapshot.blockers,
+                processSnapshotIsComplete: discoverySnapshot.processSnapshotIsComplete
+            ))
+        }
+        return .complete(topology)
     }
 
     nonisolated static func localRuntimeEvidenceSnapshot(

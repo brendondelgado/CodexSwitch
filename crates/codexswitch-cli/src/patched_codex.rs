@@ -1,8 +1,11 @@
 use crate::bounded_command;
 use anyhow::{bail, Context, Result};
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -12,6 +15,17 @@ pub(crate) const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 
 const INSTALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCHER_MAX_BYTES: u64 = 1024 * 1024;
+
+pub(crate) struct RuntimeExecutableLeases {
+    _runtime: fs::File,
+    _helper: fs::File,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeExecutableLeaseMode {
+    Shared,
+    ExclusiveNonblocking,
+}
 
 #[derive(Debug, Clone)]
 pub struct InstallPatchedCodexOptions {
@@ -385,12 +399,16 @@ pub(crate) fn build_recipe_fingerprint() -> String {
 
 pub(crate) fn launcher_script_for_runtime(patched_binary: &Path) -> Result<String> {
     let helper = patched_binary.with_file_name("codex-code-mode-host");
-    for path in [patched_binary, helper.as_path()] {
+    let control = patched_binary.with_file_name("codexswitch-cli");
+    for path in [patched_binary, helper.as_path(), control.as_path()] {
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("failed to inspect launcher provenance {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.permissions().mode() & 0o111 == 0
+        {
             bail!(
-                "launcher provenance must be a regular non-symlink file: {}",
+                "launcher provenance must be an executable regular non-symlink file: {}",
                 path.display()
             );
         }
@@ -475,6 +493,7 @@ pub fn resolve_installed_runtime(installed_binary: &Path) -> Result<PathBuf> {
     let launcher = std::str::from_utf8(&bytes).context("installed Codex launcher is not UTF-8")?;
     let runtime = launcher_assignment(launcher, "PATCHED_CODEX")?;
     let helper = launcher_assignment(launcher, "PATCHED_HELPER")?;
+    let control = launcher_assignment(launcher, "PATCHED_CONTROL")?;
     let expected_runtime_hash = launcher_assignment(launcher, "EXPECTED_CODEX_SHA256")?;
     let expected_helper_hash = launcher_assignment(launcher, "EXPECTED_HELPER_SHA256")?;
     for (label, hash) in [
@@ -492,20 +511,27 @@ pub fn resolve_installed_runtime(installed_binary: &Path) -> Result<PathBuf> {
 
     let runtime = PathBuf::from(runtime);
     let expected_helper = runtime.with_file_name("codex-code-mode-host");
+    let expected_control = runtime.with_file_name("codexswitch-cli");
     if Path::new(&helper) != expected_helper {
         bail!("installed Codex launcher helper provenance does not match its runtime");
+    }
+    if Path::new(&control) != expected_control {
+        bail!("installed Codex launcher control provenance does not match its runtime");
     }
     let canonical_runtime = fs::canonicalize(&runtime)
         .with_context(|| format!("failed to resolve pinned runtime {}", runtime.display()))?;
     if canonical_runtime != runtime {
         bail!("installed Codex launcher runtime path is not canonical");
     }
-    for path in [&runtime, &expected_helper] {
+    for path in [&runtime, &expected_helper, &expected_control] {
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("failed to inspect pinned runtime file {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.permissions().mode() & 0o111 == 0
+        {
             bail!(
-                "pinned runtime provenance must be a regular non-symlink file: {}",
+                "pinned runtime provenance must be an executable regular non-symlink file: {}",
                 path.display()
             );
         }
@@ -569,10 +595,17 @@ fn launcher_script(patched_binary: &str, runtime_sha256: &str, helper_sha256: &s
             .display()
             .to_string(),
     );
+    let control = shell_quote(
+        &Path::new(patched_binary)
+            .with_file_name("codexswitch-cli")
+            .display()
+            .to_string(),
+    );
     r#"#!/usr/bin/env bash
 	set -euo pipefail
 	PATCHED_CODEX=__PATCHED_CODEX__
 	PATCHED_HELPER=__PATCHED_HELPER__
+	PATCHED_CONTROL=__PATCHED_CONTROL__
 	EXPECTED_CODEX_SHA256=__EXPECTED_CODEX_SHA256__
 	EXPECTED_HELPER_SHA256=__EXPECTED_HELPER_SHA256__
 	CODEX_VPS="${CODEXSWITCH_CODEX_VPS:-$HOME/.local/bin/codex-vps}"
@@ -586,9 +619,9 @@ fn launcher_script(patched_binary: &str, runtime_sha256: &str, helper_sha256: &s
 	  exec "$CODEX_VPS" --remote-client "$@"
 	fi
 
-	if [[ -x "$PATCHED_CODEX" && -x "$PATCHED_HELPER" ]] \
-	  && [[ ! -L "$PATCHED_CODEX" && ! -L "$PATCHED_HELPER" ]]; then
-	  exec "$PATCHED_CODEX" "$@"
+	if [[ -x "$PATCHED_CODEX" && -x "$PATCHED_HELPER" && -x "$PATCHED_CONTROL" ]] \
+	  && [[ ! -L "$PATCHED_CODEX" && ! -L "$PATCHED_HELPER" && ! -L "$PATCHED_CONTROL" ]]; then
+	  exec "$PATCHED_CONTROL" run-managed-runtime --runtime "$PATCHED_CODEX" -- "$@"
 	fi
 
 echo "codex: local runtime failed complete provenance/hot-swap validation at $PATCHED_CODEX; run 'codexswitch-cli codex-update-status' and explicitly prepare/install a verified runtime" >&2
@@ -596,8 +629,140 @@ exit 1
 "#
     .replace("__PATCHED_CODEX__", &quoted)
     .replace("__PATCHED_HELPER__", &helper)
+    .replace("__PATCHED_CONTROL__", &control)
     .replace("__EXPECTED_CODEX_SHA256__", &shell_quote(runtime_sha256))
     .replace("__EXPECTED_HELPER_SHA256__", &shell_quote(helper_sha256))
+}
+
+pub(crate) fn run_managed_runtime(runtime: &Path, arguments: &[OsString]) -> Result<()> {
+    let canonical_runtime = fs::canonicalize(runtime)
+        .with_context(|| format!("failed to resolve managed runtime {}", runtime.display()))?;
+    let current_control = fs::canonicalize(std::env::current_exe()?)
+        .context("failed to resolve the managed runtime control executable")?;
+    guard_managed_runtime_control(&canonical_runtime, &current_control)?;
+
+    let leases =
+        acquire_runtime_executable_leases(&canonical_runtime, RuntimeExecutableLeaseMode::Shared)?
+            .context("managed runtime generation could not acquire its shared use lease")?;
+    preserve_lease_across_exec(&leases)?;
+
+    let error = Command::new(&canonical_runtime).args(arguments).exec();
+    Err(error).with_context(|| {
+        format!(
+            "failed to execute leased managed runtime {}",
+            canonical_runtime.display()
+        )
+    })
+}
+
+pub(crate) fn try_acquire_exclusive_runtime_leases(
+    runtime: &Path,
+) -> Result<Option<RuntimeExecutableLeases>> {
+    acquire_runtime_executable_leases(runtime, RuntimeExecutableLeaseMode::ExclusiveNonblocking)
+}
+
+fn guard_managed_runtime_control(runtime: &Path, control: &Path) -> Result<()> {
+    if !runtime.is_absolute()
+        || runtime.file_name().and_then(|name| name.to_str()) != Some("codex")
+        || control.file_name().and_then(|name| name.to_str()) != Some("codexswitch-cli")
+        || runtime.parent() != control.parent()
+    {
+        bail!("managed runtime control must execute its sibling codex runtime");
+    }
+    Ok(())
+}
+
+fn acquire_runtime_executable_leases(
+    runtime: &Path,
+    mode: RuntimeExecutableLeaseMode,
+) -> Result<Option<RuntimeExecutableLeases>> {
+    let runtime_file = open_runtime_lease_file(runtime)?;
+    let helper_path = runtime.with_file_name("codex-code-mode-host");
+    let helper_file = open_runtime_lease_file(&helper_path)?;
+    let operation = match mode {
+        RuntimeExecutableLeaseMode::Shared => libc::LOCK_SH,
+        RuntimeExecutableLeaseMode::ExclusiveNonblocking => libc::LOCK_EX | libc::LOCK_NB,
+    };
+
+    if !lock_runtime_lease(&runtime_file, operation)? {
+        return Ok(None);
+    }
+    if !lock_runtime_lease(&helper_file, operation)? {
+        unsafe {
+            libc::flock(runtime_file.as_raw_fd(), libc::LOCK_UN);
+        }
+        return Ok(None);
+    }
+    revalidate_runtime_lease_file(runtime, &runtime_file)?;
+    revalidate_runtime_lease_file(&helper_path, &helper_file)?;
+    Ok(Some(RuntimeExecutableLeases {
+        _runtime: runtime_file,
+        _helper: helper_file,
+    }))
+}
+
+fn open_runtime_lease_file(path: &Path) -> Result<fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to open runtime lease target {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect runtime lease target {}", path.display()))?;
+    if !metadata.is_file() || metadata.nlink() == 0 || metadata.permissions().mode() & 0o111 == 0 {
+        bail!(
+            "runtime lease target is not a linked executable regular file: {}",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn lock_runtime_lease(file: &fs::File, operation: libc::c_int) -> Result<bool> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if operation & libc::LOCK_NB != 0 && error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    Err(error).context("failed to acquire prepared runtime executable lease")
+}
+
+fn revalidate_runtime_lease_file(path: &Path, file: &fs::File) -> Result<()> {
+    let opened = file.metadata()?;
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("runtime lease target disappeared: {}", path.display()))?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || current.nlink() == 0
+        || opened.dev() != current.dev()
+        || opened.ino() != current.ino()
+    {
+        bail!(
+            "runtime lease target changed during acquisition: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn preserve_lease_across_exec(leases: &RuntimeExecutableLeases) -> Result<()> {
+    for file in [&leases._runtime, &leases._helper] {
+        let descriptor = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect runtime lease descriptor");
+        }
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to preserve runtime lease descriptor across exec");
+        }
+    }
+    Ok(())
 }
 
 fn ensure_linux_build_prerequisites() -> Result<()> {
@@ -741,7 +906,12 @@ mod tests {
 
         assert!(script
             .contains("PATCHED_CODEX='/home/signul/.local/share/codexswitch/patched-codex/codex'"));
-        assert!(script.contains("exec \"$PATCHED_CODEX\" \"$@\""));
+        assert!(script.contains(
+            "PATCHED_CONTROL='/home/signul/.local/share/codexswitch/patched-codex/codexswitch-cli'"
+        ));
+        assert!(script.contains(
+            "exec \"$PATCHED_CONTROL\" run-managed-runtime --runtime \"$PATCHED_CODEX\" -- \"$@\""
+        ));
         assert!(script.contains("EXPECTED_CODEX_SHA256='runtime-sha256'"));
         assert!(script.contains("EXPECTED_HELPER_SHA256='helper-sha256'"));
         assert!(script.contains("codex-update-status"));
@@ -762,6 +932,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let runtime = temp.path().join("runtime/codex");
         let helper = temp.path().join("runtime/codex-code-mode-host");
+        let control = temp.path().join("runtime/codexswitch-cli");
         let launcher = temp.path().join("bin/codex");
         let trace = temp.path().join("trace");
         fs::create_dir_all(runtime.parent().unwrap())?;
@@ -771,8 +942,13 @@ mod tests {
             "#!/bin/sh\n# sighup-verified SIGHUP: auth reloaded hotswap-ack CodexSwitch rotated accounts after a usage limit CodexSwitch rotated accounts after an auth failure Auth changed, opening new WebSocket with fresh credentials codexswitch-runtime-convergence-v3 codexswitch-runtime-rotation-handoff-v1 CodexSwitch account/updated frontend write acknowledged after auth reload codexswitch-hotswap-contract-v3 codexswitch-hotswap-headless-idle-v1 codexswitch-hotswap-cli-contract-v3 Usage: /goal <objective>\nif [ \"${1:-}\" = --version ]; then echo 'codex-cli 0.144.1'; exit 0; fi\nprintf 'local:%s\\n' \"$*\" >> \"$TRACE\"\n",
         )?;
         fs::write(&helper, "#!/bin/sh\nexit 0\n")?;
+        fs::write(
+            &control,
+            "#!/bin/sh\nshift\n[ \"$1\" = --runtime ]\nshift\nruntime=\"$1\"\nshift\n[ \"$1\" = -- ]\nshift\nexec \"$runtime\" \"$@\"\n",
+        )?;
         set_executable(&runtime)?;
         set_executable(&helper)?;
+        set_executable(&control)?;
         fs::write(&launcher, launcher_script_for_runtime(&runtime)?)?;
         set_executable(&launcher)?;
         assert_eq!(
@@ -794,6 +970,28 @@ mod tests {
         set_executable(&runtime)?;
         assert!(resolve_installed_runtime(&launcher).is_err());
         assert_eq!(fs::read_to_string(&trace)?, "local:local-session\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_runtime_leases_block_retention_until_release() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime = temp.path().join("runtime/codex");
+        let helper = runtime.with_file_name("codex-code-mode-host");
+        fs::create_dir_all(runtime.parent().unwrap())?;
+        fs::write(&runtime, "#!/bin/sh\nexit 0\n")?;
+        fs::write(&helper, "#!/bin/sh\nexit 0\n")?;
+        set_executable(&runtime)?;
+        set_executable(&helper)?;
+
+        let shared =
+            acquire_runtime_executable_leases(&runtime, RuntimeExecutableLeaseMode::Shared)?
+                .context("shared runtime lease was unavailable")?;
+        assert!(try_acquire_exclusive_runtime_leases(&runtime)?.is_none());
+
+        drop(shared);
+        assert!(try_acquire_exclusive_runtime_leases(&runtime)?.is_some());
         Ok(())
     }
 

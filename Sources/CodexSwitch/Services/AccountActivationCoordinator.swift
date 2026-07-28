@@ -285,6 +285,7 @@ actor AccountActivationCoordinator {
         discoveredRuntimeCount: Int,
         acknowledgedRuntimeCount: Int,
         detail: AccountActivationDetail,
+        runtimeBlockers: Set<CodexRuntimeDiscoveryBlocker> = [],
         authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
         at date: Date = Date()
     ) throws -> AccountActivationState {
@@ -307,6 +308,7 @@ actor AccountActivationCoordinator {
                 nextRetryAt: date,
                 discoveredRuntimeCount: discoveredRuntimeCount,
                 acknowledgedRuntimeCount: acknowledgedRuntimeCount,
+                runtimeBlockers: runtimeBlockers,
                 at: date
             )
         }
@@ -318,6 +320,7 @@ actor AccountActivationCoordinator {
         discoveredRuntimeCount: Int,
         acknowledgedRuntimeCount: Int,
         detail: AccountActivationDetail,
+        runtimeBlockers: Set<CodexRuntimeDiscoveryBlocker> = [],
         authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
         at date: Date = Date()
     ) throws -> AccountActivationState {
@@ -338,6 +341,7 @@ actor AccountActivationCoordinator {
                     retryAttempt: nextAttempt,
                     discoveredRuntimeCount: discoveredRuntimeCount,
                     acknowledgedRuntimeCount: acknowledgedRuntimeCount,
+                    runtimeBlockers: runtimeBlockers,
                     at: date
                 )
             }
@@ -354,6 +358,7 @@ actor AccountActivationCoordinator {
                 nextRetryAt: date.addingTimeInterval(delay),
                 discoveredRuntimeCount: discoveredRuntimeCount,
                 acknowledgedRuntimeCount: acknowledgedRuntimeCount,
+                runtimeBlockers: runtimeBlockers,
                 at: date
             )
         }
@@ -502,7 +507,8 @@ actor AccountActivationCoordinator {
                 detail: nil,
                 runtimeEvidenceGeneration: evidenceGeneration,
                 runtimeEvidenceObservedAt: evidenceObservedAt,
-                runtimeEvidenceExpiresAt: evidenceExpiresAt
+                runtimeEvidenceExpiresAt: evidenceExpiresAt,
+                runtimeBlockers: nil
             )
         }
     }
@@ -570,7 +576,8 @@ actor AccountActivationCoordinator {
                 detail: nil,
                 runtimeEvidenceGeneration: evidence.generation,
                 runtimeEvidenceObservedAt: evidence.observedAt,
-                runtimeEvidenceExpiresAt: evidence.expiresAt
+                runtimeEvidenceExpiresAt: evidence.expiresAt,
+                runtimeBlockers: nil
             )
         }
     }
@@ -690,6 +697,7 @@ actor AccountActivationCoordinator {
             "runtimeEvidenceGeneration",
             "runtimeEvidenceObservedAt",
             "runtimeEvidenceExpiresAt",
+            "runtimeBlockers",
         ]
         do {
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -729,6 +737,9 @@ actor AccountActivationCoordinator {
         }
         guard (0...maximumRuntimeCount).contains(state.discoveredRuntimeCount),
               (0...state.discoveredRuntimeCount).contains(state.acknowledgedRuntimeCount),
+              state.convergenceBlockers.count <= state.discoveredRuntimeCount,
+              state.convergenceBlockers.count <= maximumRuntimeCount,
+              state.convergenceBlockers.allSatisfy({ $0.pid > 0 }),
               (0...maximumRetryAttempt).contains(state.retryAttempt) else {
             throw AccountActivationCoordinatorError.corruptJournal("counter is outside its bound")
         }
@@ -745,6 +756,7 @@ actor AccountActivationCoordinator {
                   state.nextRetryAt == nil,
                   state.discoveredRuntimeCount == 0,
                   state.acknowledgedRuntimeCount == 0,
+                  state.convergenceBlockers.isEmpty,
                   state.runtimeEvidenceGeneration == nil,
                   state.runtimeEvidenceObservedAt == nil,
                   state.runtimeEvidenceExpiresAt == nil else {
@@ -768,6 +780,7 @@ actor AccountActivationCoordinator {
                   state.nextRetryAt == nil,
                   state.discoveredRuntimeCount > 0,
                   state.acknowledgedRuntimeCount == state.discoveredRuntimeCount,
+                  state.convergenceBlockers.isEmpty,
                   state.detail == nil,
                   state.runtimeEvidenceGeneration != nil,
                   let observedAt = state.runtimeEvidenceObservedAt,
@@ -795,7 +808,8 @@ actor AccountActivationCoordinator {
             }
             if state.detail != .automaticRetryLimitReached,
                (state.discoveredRuntimeCount != 0
-                    || state.acknowledgedRuntimeCount != 0) {
+                    || state.acknowledgedRuntimeCount != 0
+                    || !state.convergenceBlockers.isEmpty) {
                 throw AccountActivationCoordinatorError.corruptJournal(
                     "manual-review runtime counts are not authorized"
                 )

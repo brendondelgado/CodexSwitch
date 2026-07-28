@@ -80,8 +80,12 @@ The generated launcher performs only bounded, constant-time routing:
 2. For remote mode, require and execute the synchronized remote client.
 3. For local mode, require the prevalidated managed executable and its
    executable companion.
-4. Execute the managed runtime with the CodexSwitch plugin override.
-5. Fail with an actionable repair message when the selected unit is missing.
+4. Acquire a shared advisory lease on both prepared runtime executable inodes
+   through the generation's attested `codexswitch-cli` control binary.
+5. Execute the managed runtime while preserving those lease descriptors for
+   `codex` and inherited `codex-code-mode-host` processes.
+6. Fail with an actionable repair message when the selected unit is missing or
+   its generation cannot be leased.
 
 `CODEX_CLI_PATH` is output from repair for other clients; it is not an
 unchecked launcher fallback.
@@ -122,6 +126,14 @@ prohibited.
 An available update therefore produces a deferred, actionable status. It does
 not become an automatic build merely because the current managed runtime is
 missing or incomplete.
+
+Prepared-generation retention takes nonblocking exclusive leases on both
+runtime executable inodes before deletion and also inventories live macOS
+process mappings by path, device, and inode for compatibility with historical
+launchers. A shared lease or matching live `codex` /
+`codex-code-mode-host` mapping protects the complete generation. Inventory or
+lease uncertainty fails before any retention mutation. This closes both the
+already-running case and the launch-versus-retention race.
 
 ## Repair And Verification
 

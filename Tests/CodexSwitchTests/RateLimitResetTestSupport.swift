@@ -53,7 +53,8 @@ func authorizedResetSubmissionPermit(
         detail: nil,
         runtimeEvidenceGeneration: evidence.generation,
         runtimeEvidenceObservedAt: evidence.observedAt,
-        runtimeEvidenceExpiresAt: evidence.expiresAt
+        runtimeEvidenceExpiresAt: evidence.expiresAt,
+        runtimeBlockers: nil
     )
     let runtimePermit: AccountActivationRuntimePermit? = includesRuntimePermit
         ? AccountActivationRuntimePermit(

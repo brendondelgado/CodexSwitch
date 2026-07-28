@@ -434,10 +434,104 @@ fn discover_codex_processes_platform(include_app_server: bool) -> Result<Vec<Cod
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn discover_live_prepared_runtime_executables(
+    prepared_root: &Path,
+) -> Result<Vec<HotSwapKernelExecutableIdentity>> {
+    let canonical_root = match fs::canonicalize(prepared_root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to resolve prepared runtime root {}",
+                    prepared_root.display()
+                )
+            })
+        }
+    };
+    let output = bounded_command::output(
+        Command::new("/bin/ps").args(["-axo", "pid=,uid=,lstart=,command=", "-ww"]),
+        PS_COMMAND_TIMEOUT,
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .context("failed to run ps for prepared runtime retention")?;
+    if !output.status.success() {
+        bail!(
+            "ps exited with {} during prepared runtime retention",
+            output.status
+        );
+    }
+    let current_uid = unsafe { libc_geteuid() };
+    let candidates = parse_ps_owned_processes(
+        &String::from_utf8_lossy(&output.stdout),
+        current_uid,
+        std::process::id() as i32,
+    )
+    .into_iter()
+    .filter(|process| prepared_runtime_process_candidate(&process.executable))
+    .collect::<Vec<_>>();
+
+    let mut identities = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let process = enrich_macos_process_identity(candidate.clone()).with_context(|| {
+            format!(
+                "live Codex pid {} could not be classified before prepared runtime retention",
+                candidate.pid
+            )
+        })?;
+        if !prepared_runtime_executable_path(&process.executable, &canonical_root) {
+            continue;
+        }
+        let identity = macos_kernel_executable_identity(&process).with_context(|| {
+            format!(
+                "live prepared runtime pid {} could not be bound to its executable inode",
+                process.pid
+            )
+        })?;
+        if !current_process_identity(process.pid)
+            .as_ref()
+            .is_some_and(|current| process_identity_matches(&process, current))
+        {
+            bail!(
+                "live prepared runtime pid {} changed identity during retention inventory",
+                process.pid
+            );
+        }
+        identities.push(identity);
+    }
+    Ok(identities)
+}
+
+#[cfg(target_os = "macos")]
+fn prepared_runtime_process_candidate(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("codex" | "codex-code-mode-host")
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn prepared_runtime_executable_path(path: &Path, prepared_root: &Path) -> bool {
+    path.starts_with(prepared_root) && prepared_runtime_process_candidate(path)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn parse_ps_processes(
     ps_output: &str,
     include_app_server: bool,
+    current_uid: u32,
+    current_pid: i32,
+) -> Vec<CodexProcess> {
+    parse_ps_owned_processes(ps_output, current_uid, current_pid)
+        .into_iter()
+        .filter(|process| process_matches_discovery_scope(process, include_app_server))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parse_ps_owned_processes(
+    ps_output: &str,
     current_uid: u32,
     current_pid: i32,
 ) -> Vec<CodexProcess> {
@@ -470,17 +564,14 @@ fn parse_ps_processes(
         let Some(executable) = executable_from_command_line(command_line) else {
             continue;
         };
-        let process = CodexProcess {
+        processes.push(CodexProcess {
             pid,
             owner_uid: uid,
             start_identity,
             started_at_unix,
             command_line: command_line.to_string(),
             executable,
-        };
-        if process_matches_discovery_scope(&process, include_app_server) {
-            processes.push(process);
-        }
+        });
     }
     processes
 }
@@ -1742,7 +1833,7 @@ fn macos_vnode_path(vnode: &libc::vnode_info_path) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_kernel_executable_identity(
+pub(crate) fn macos_kernel_executable_identity(
     process: &CodexProcess,
 ) -> Result<HotSwapKernelExecutableIdentity> {
     const PROC_PIDREGIONPATHINFO: libc::c_int = 8;

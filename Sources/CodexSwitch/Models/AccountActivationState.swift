@@ -93,6 +93,11 @@ struct AccountActivationState: Codable, Equatable, Sendable {
     let runtimeEvidenceGeneration: UUID?
     let runtimeEvidenceObservedAt: Date?
     let runtimeEvidenceExpiresAt: Date?
+    let runtimeBlockers: Set<CodexRuntimeDiscoveryBlocker>?
+
+    var convergenceBlockers: Set<CodexRuntimeDiscoveryBlocker> {
+        runtimeBlockers ?? []
+    }
 
     var blocksAutomaticMutations: Bool {
         !authorizesAutomaticMutations(at: Date())
@@ -185,7 +190,8 @@ struct AccountActivationState: Codable, Equatable, Sendable {
             detail: nil,
             runtimeEvidenceGeneration: nil,
             runtimeEvidenceObservedAt: nil,
-            runtimeEvidenceExpiresAt: nil
+            runtimeEvidenceExpiresAt: nil,
+            runtimeBlockers: nil
         )
     }
 
@@ -196,6 +202,7 @@ struct AccountActivationState: Codable, Equatable, Sendable {
         retryAttempt: Int = 0,
         discoveredRuntimeCount: Int = 0,
         acknowledgedRuntimeCount: Int = 0,
+        runtimeBlockers: Set<CodexRuntimeDiscoveryBlocker> = [],
         at date: Date
     ) -> Self {
         Self(
@@ -212,7 +219,8 @@ struct AccountActivationState: Codable, Equatable, Sendable {
             detail: detail,
             runtimeEvidenceGeneration: nil,
             runtimeEvidenceObservedAt: nil,
-            runtimeEvidenceExpiresAt: nil
+            runtimeEvidenceExpiresAt: nil,
+            runtimeBlockers: runtimeBlockers.isEmpty ? nil : runtimeBlockers
         )
     }
 
@@ -224,6 +232,7 @@ struct AccountActivationState: Codable, Equatable, Sendable {
         nextRetryAt: Date,
         discoveredRuntimeCount: Int = 0,
         acknowledgedRuntimeCount: Int = 0,
+        runtimeBlockers: Set<CodexRuntimeDiscoveryBlocker> = [],
         at date: Date
     ) -> Self {
         Self(
@@ -240,7 +249,8 @@ struct AccountActivationState: Codable, Equatable, Sendable {
             detail: detail,
             runtimeEvidenceGeneration: nil,
             runtimeEvidenceObservedAt: nil,
-            runtimeEvidenceExpiresAt: nil
+            runtimeEvidenceExpiresAt: nil,
+            runtimeBlockers: runtimeBlockers.isEmpty ? nil : runtimeBlockers
         )
     }
 }

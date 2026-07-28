@@ -58,13 +58,18 @@ snapshot boundary must:
 6. Collapse only exact duplicate PID and full-command rows. Arguments affect
    runtime classification, so any repeated PID with a different normalized
    command line is ambiguous and every row for that PID is quarantined.
-7. Mark the typed snapshot incomplete when at least one valid row survives but
-   any arbitrary malformed or ambiguous row was dropped. An incomplete snapshot
-   makes the entire reload fail closed with `operationFailed = true` and zero
-   signals, even when some independently valid PIDs remain.
+7. Mark the process-enumeration boundary unsafe when at least one valid row
+   survives but any arbitrary malformed or ambiguous row was dropped. An unsafe
+   enumeration makes the entire reload fail closed with
+   `operationFailed = true` and zero signals, even when some independently valid
+   PIDs remain.
 8. Return a distinct failure when status `0` contains no unambiguous accepted
    rows. An empty successful snapshot is also a failure because it contradicts
    `pgrep` status `0`.
+9. After a complete PID enumeration, preserve every PID that cannot be bound to
+   a stable owner, start identity, argv, executable path, device, and inode as a
+   typed blocker with its failure reason. A blocker is convergence evidence; it
+   is never silently dropped or counted as an acknowledged runtime.
 
 ## Race Handling
 
@@ -76,6 +81,24 @@ safe failed operation, not a partial convergence attempt.
 If every row is malformed or ambiguous, discovery fails without signalling.
 Status `1` with blank output remains the only authoritative no-match result at
 the process-enumeration boundary.
+
+Once credentials have committed, a complete PID enumeration followed by an
+identity-binding failure has a different safety shape. CodexSwitch may persist
+requests, signal, and collect acknowledgements for every independently verified
+survivor because each signal still carries its own complete authorization.
+The unbindable PID remains a typed blocker, the reload summary remains failed,
+and activation remains `CommittedDegraded` or retry-exhausted `ManualReview`
+until that PID exits or becomes verifiable. One stale process must not prevent a
+healthy process from adopting already-committed credentials.
+
+Retry-exhausted recovery observes a typed topology containing both verified
+runtimes and the exact blocker set. The persisted retry-exhausted blocker set
+is the baseline across restarts; a legacy journal without typed blockers uses
+its first observation as a non-mutating baseline. A changed or empty blocker
+set may grant one fresh, bounded same-target retry generation; an unchanged
+blocker set grants none. Unsafe process enumeration never authorizes recovery.
+Existing ACKs for the same credential and process binding are reused, so
+blocker recovery does not reload an already-acknowledged desktop bridge.
 
 ## Reload Binding
 

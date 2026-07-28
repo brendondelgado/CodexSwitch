@@ -1496,24 +1496,108 @@ struct SwapEngineTests {
             isComplete: true
         )
         let managedPath = targets[0].process.identity.executablePath
-        let topology = try #require(SwapEngine.localCLIRuntimeTopology(
+        let observation = SwapEngine.localCLIRuntimeTopology(
             discoverySnapshot: discovery,
             managedRuntimePath: managedPath
-        ))
+        )
+        guard case .complete(let topology) = observation else {
+            Issue.record("Expected a complete local CLI topology")
+            return
+        }
 
         #expect(topology.runtimes.map(\.processIdentity.pid) == [41, 42])
         #expect(topology.allRuntimesUseManagedRoute)
         #expect(SwapEngine.localCLIRuntimeTopology(
             discoverySnapshot: discovery,
             managedRuntimePath: "/other/codex"
-        )?.allRuntimesUseManagedRoute == false)
-        #expect(SwapEngine.localCLIRuntimeTopology(
+        ).verifiedTopology.allRuntimesUseManagedRoute == false)
+        let incomplete = SwapEngine.localCLIRuntimeTopology(
             discoverySnapshot: CodexRuntimeDiscoverySnapshot(
                 targets: targets,
                 isComplete: false
             ),
             managedRuntimePath: managedPath
-        ) == nil)
+        )
+        guard case .incomplete(let incompleteTopology) = incomplete else {
+            Issue.record("Expected a typed incomplete local CLI topology")
+            return
+        }
+        #expect(!incompleteTopology.processSnapshotIsComplete)
+        #expect(incompleteTopology.blockers.isEmpty)
+        #expect(incompleteTopology.verifiedTopology.runtimes.count == 2)
+    }
+
+    @Test("One unbindable CLI does not suppress verified survivor reload")
+    func unbindableCLIStillReloadsVerifiedSurvivor() {
+        let healthyPID: Int32 = 41
+        let stalePID: Int32 = 42
+        let healthyIdentity = signalIdentity(pid: healthyPID)
+        let discovery = SwapEngine.runtimeDiscoverySnapshot(
+            from: CodexPGrepProcessSnapshot(
+                pids: [healthyPID, stalePID],
+                isComplete: true
+            ),
+            runtimeKind: .localInteractiveCLI,
+            requiredOwnerUID: 501,
+            identityProvider: { pid in
+                pid == healthyPID ? healthyIdentity : nil
+            },
+            argumentProvider: { pid in
+                pid == healthyPID ? ["codex", "resume", "thread-41"] : nil
+            },
+            kernelExecutableIdentityProvider: { pid in
+                pid == healthyPID
+                    ? self.kernelIdentity(path: healthyIdentity.executablePath)
+                    : nil
+            }
+        )
+        let expectedBlocker = CodexRuntimeDiscoveryBlocker(
+            pid: stalePID,
+            reason: .processIdentityUnavailable
+        )
+        #expect(discovery.targets.map { $0.process.identity.pid } == [healthyPID])
+        #expect(discovery.blockers == [expectedBlocker])
+        #expect(discovery.processSnapshotIsComplete)
+        #expect(!discovery.isComplete)
+
+        var persistedPIDs: [Int32] = []
+        var signaledPIDs: [Int32] = []
+        let execution = SwapEngine.executeReloadBatch(
+            preliminaryPIDs: [healthyPID, stalePID],
+            discoveryProvider: { discovery },
+            requiredOwnerUID: 501,
+            candidateIsEligible: { _ in true },
+            makeBinding: { self.reloadBinding(target: $0) },
+            hotSwapSupport: { _ in true },
+            bindingIsCurrent: { _ in true },
+            persistRequest: { binding in
+                persistedPIDs.append(binding.processIdentity.pid)
+                return true
+            },
+            signal: { pid in
+                signaledPIDs.append(pid)
+                return true
+            },
+            awaitAcknowledgements: { bindings in
+                Set(bindings.map { $0.processIdentity.pid })
+            },
+            gate: CodexReloadAttemptGate()
+        )
+
+        #expect(persistedPIDs == [healthyPID])
+        #expect(signaledPIDs == [healthyPID])
+        #expect(execution.newlyAcknowledgedPIDs == [healthyPID])
+        #expect(execution.operationFailed)
+
+        let summary = SwapEngine.codexReloadSummary(
+            from: discovery,
+            acknowledgedPIDs: execution.acknowledgedPIDs,
+            operationFailed: execution.operationFailed
+        )
+        #expect(summary.discoveredRuntimeCount == 2)
+        #expect(summary.acknowledgedRuntimeCount == 1)
+        #expect(summary.blockers == [expectedBlocker])
+        #expect(summary.outcome == .restartRequiredOrFailed)
     }
 
     @Test("Incomplete CLI and desktop discovery sends zero signals")

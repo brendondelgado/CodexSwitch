@@ -7226,8 +7226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard !Task.isCancelled,
                   !self.isExiting,
                   self.pendingSwapTargetAccountId == nil,
-                  self.swapConvergenceTask == nil,
-                  let topology else {
+                  self.swapConvergenceTask == nil else {
                 return
             }
 
@@ -7241,7 +7240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .captureBaseline(let baseline):
                 self.retryExhaustedTopologyBaseline = baseline
                 SwapLog.append(.debug(
-                    "ACTIVATION_TOPOLOGY_BASELINE_CAPTURED runtimes=\(baseline.topology.runtimes.count)"
+                    "ACTIVATION_TOPOLOGY_BASELINE_CAPTURED runtimes=\(baseline.topology.verifiedTopology.runtimes.count) blockers=\(baseline.topology.blockers.count)"
                 ))
                 return
             case .wait:
@@ -7254,7 +7253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 self.retryExhaustedTopologyBaseline = baseline
                 SwapLog.append(.debug(
-                    "ACTIVATION_TOPOLOGY_RECOVERY_STARTED target=\(target.email) runtimes=\(baseline.topology.runtimes.count)"
+                    "ACTIVATION_TOPOLOGY_RECOVERY_STARTED target=\(target.email) runtimes=\(baseline.topology.verifiedTopology.runtimes.count) blockers=\(baseline.topology.blockers.count)"
                 ))
                 await self.startSameTargetRuntimeRetry(
                     to: target,
@@ -7362,7 +7361,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     struct RetryExhaustedTopologyBaseline: Equatable {
         let targetAccountId: UUID
         let activationGeneration: UUID
-        let topology: CodexLocalCLIRuntimeTopology
+        let topology: CodexLocalCLIRuntimeTopologyObservation
     }
 
     enum RetryExhaustedTopologyDecision: Equatable {
@@ -7374,7 +7373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     nonisolated static func retryExhaustedTopologyDecision(
         state: AccountActivationState?,
         configuredAccountId: UUID?,
-        topology: CodexLocalCLIRuntimeTopology,
+        topology: CodexLocalCLIRuntimeTopologyObservation,
         baseline: RetryExhaustedTopologyBaseline?
     ) -> RetryExhaustedTopologyDecision {
         guard let state,
@@ -7392,10 +7391,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let baseline,
               baseline.targetAccountId == targetAccountId,
               baseline.activationGeneration == state.activationGeneration else {
+            if !state.convergenceBlockers.isEmpty,
+               topology.processSnapshotIsComplete,
+               topology.verifiedTopology.allRuntimesUseManagedRoute,
+               topology.blockers != state.convergenceBlockers {
+                return .recover(targetAccountId, observed)
+            }
             return .captureBaseline(observed)
         }
-        guard topology != baseline.topology,
-              topology.allRuntimesUseManagedRoute else {
+        guard topology.processSnapshotIsComplete,
+              topology.verifiedTopology.allRuntimesUseManagedRoute,
+              topology.blockers != baseline.topology.blockers else {
             return .wait
         }
         return .recover(targetAccountId, observed)
@@ -7635,6 +7641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                 discoveredRuntimeCount: degraded.discoveredRuntimeCount,
                                 acknowledgedRuntimeCount: degraded.acknowledgedRuntimeCount,
                                 detail: degraded.detail ?? .runtimeAcknowledgementIncomplete,
+                                runtimeBlockers: degraded.convergenceBlockers,
                                 authorizeEffect: { state in
                                     failurePermit.authorizes(state: state, at: Date())
                                 }
@@ -7830,6 +7837,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     discoveredRuntimeCount: completion.discoveredRuntimeCount,
                     acknowledgedRuntimeCount: completion.acknowledgedRuntimeCount,
                     detail: .noLocalRuntime,
+                    runtimeBlockers: completion.blockers,
                     authorizeEffect: { current in
                         (operationAuthority?.authorizes() ?? true)
                             && failurePermit.authorizes(state: current, at: Date())
@@ -7852,6 +7860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     discoveredRuntimeCount: completion.discoveredRuntimeCount,
                     acknowledgedRuntimeCount: completion.acknowledgedRuntimeCount,
                     detail: .runtimeAcknowledgementIncomplete,
+                    runtimeBlockers: completion.blockers,
                     authorizeEffect: { current in
                         (operationAuthority?.authorizes() ?? true)
                             && failurePermit.authorizes(state: current, at: Date())

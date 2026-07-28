@@ -11,6 +11,7 @@ struct AccountActivationRuntimeCompletion: Equatable, Sendable {
     let discoveredRuntimeCount: Int
     let acknowledgedRuntimeCount: Int
     let detail: String?
+    let blockers: Set<CodexRuntimeDiscoveryBlocker>
 }
 
 enum AccountActivationConvergenceEvaluator {
@@ -32,6 +33,17 @@ enum AccountActivationConvergenceEvaluator {
                     "cli_acknowledged_\(cliReload.acknowledgedRuntimeCount)_of_\(cliReload.discoveredRuntimeCount)"
                 )
             }
+        }
+        if !cliReload.blockers.isEmpty {
+            let blockerSummary = cliReload.blockers
+                .sorted {
+                    $0.pid == $1.pid
+                        ? $0.reason.rawValue < $1.reason.rawValue
+                        : $0.pid < $1.pid
+                }
+                .map { "pid_\($0.pid)_\($0.reason.rawValue)" }
+                .joined(separator: ";")
+            divergenceDetails.append("cli_blockers_\(blockerSummary)")
         }
 
         switch desktopReload {
@@ -69,7 +81,8 @@ enum AccountActivationConvergenceEvaluator {
             outcome: outcome,
             discoveredRuntimeCount: discoveredRuntimeCount,
             acknowledgedRuntimeCount: acknowledgedRuntimeCount,
-            detail: divergenceDetails.isEmpty ? nil : divergenceDetails.joined(separator: ",")
+            detail: divergenceDetails.isEmpty ? nil : divergenceDetails.joined(separator: ","),
+            blockers: cliReload.blockers
         )
     }
 }

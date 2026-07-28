@@ -63,7 +63,8 @@ struct PopoverAccountHeadingTests {
             detail: nil,
             runtimeEvidenceGeneration: UUID(),
             runtimeEvidenceObservedAt: observedAt,
-            runtimeEvidenceExpiresAt: observedAt.addingTimeInterval(10)
+            runtimeEvidenceExpiresAt: observedAt.addingTimeInterval(10),
+            runtimeBlockers: nil
         )
     }
 }
