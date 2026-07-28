@@ -987,6 +987,14 @@ observe the committed epoch, and only then perform local host convergence. On
 the VPS, the same commands enter the daemon's serialized authority transaction;
 they do not write an independent desired target.
 
+The VPS daemon legitimately holds its cross-process activation lease during a
+poll transaction. A Mac target request that encounters that typed contention
+retries a small bounded number of times with the same request UUID and bounded
+backoff. It never allocates a replacement request ID, so a response loss or
+late first attempt cannot create a second authority transition. Non-contention
+transport failures fail without blind retries, and contention never enters an
+unbounded retry loop.
+
 The Swift app must not require its short-lived evidence lease for the previous
 target to remain current, and it must not keep presenting the previous account
 after the authority and shared files select the new one. It does not rewrite

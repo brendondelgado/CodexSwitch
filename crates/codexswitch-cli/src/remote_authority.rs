@@ -32,6 +32,10 @@ const MAX_COOLDOWN_SECONDS: i64 = 31 * 24 * 60 * 60;
 const LEGACY_REMOTE_ROTATION_JOURNAL_VERSION: u32 = 1;
 const REMOTE_ROTATION_JOURNAL_VERSION: u32 = 2;
 const STATUS_RECONCILIATION_ATTEMPTS: usize = 3;
+const TARGET_REQUEST_CONTENTION_ATTEMPTS: usize = 4;
+const TARGET_REQUEST_CONTENTION_BACKOFF_MILLISECONDS: u64 = 250;
+const RUNTIME_ACTIVATION_BUSY_DETAIL: &str =
+    "runtime activation is busy: another process owns the cross-process runtime-activation lease";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRotationOutcome {
@@ -501,6 +505,29 @@ fn request_target_with(
     reason: &str,
     runner: &RemoteRunner,
 ) -> Result<PoolAuthorityStatus> {
+    request_target_with_retry(
+        config,
+        selector,
+        request_id,
+        expected_epoch,
+        reason,
+        runner,
+        std::thread::sleep,
+    )
+}
+
+fn request_target_with_retry<S>(
+    config: &RemoteAuthorityConfig,
+    selector: &str,
+    request_id: Uuid,
+    expected_epoch: u64,
+    reason: &str,
+    runner: &RemoteRunner,
+    sleep: S,
+) -> Result<PoolAuthorityStatus>
+where
+    S: Fn(Duration),
+{
     parse_selector(selector).map_err(anyhow::Error::msg)?;
     parse_reason(reason).map_err(anyhow::Error::msg)?;
     if expected_epoch == 0 {
@@ -513,9 +540,28 @@ fn request_target_with(
         expected_epoch,
         shell_quote(reason),
     );
+    let mut output = None;
+    for attempt in 0..TARGET_REQUEST_CONTENTION_ATTEMPTS {
+        match runner(config, &command, REQUEST_TIMEOUT) {
+            Ok(bytes) => {
+                output = Some(bytes);
+                break;
+            }
+            Err(error)
+                if remote_runtime_activation_is_busy(&error)
+                    && attempt + 1 < TARGET_REQUEST_CONTENTION_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(
+                    TARGET_REQUEST_CONTENTION_BACKOFF_MILLISECONDS * (attempt as u64 + 1),
+                ));
+            }
+            Err(error) => {
+                return Err(error).context("remote pool-target request transport failed");
+            }
+        }
+    }
     let requested = parse_status(
-        &runner(config, &command, REQUEST_TIMEOUT)
-            .context("remote pool-target request transport failed")?,
+        &output.context("remote pool-target contention retries ended without an outcome")?,
     )?;
     validate_adoptable_status(&requested)?;
     if requested.request_id != request_id
@@ -525,6 +571,10 @@ fn request_target_with(
         bail!("remote pool-target request response did not match the submitted transaction");
     }
     Ok(requested)
+}
+
+fn remote_runtime_activation_is_busy(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains(RUNTIME_ACTIVATION_BUSY_DETAIL)
 }
 
 fn rotate_with(
@@ -1075,6 +1125,96 @@ mod tests {
         assert_eq!(observed.epoch, 2);
         assert_eq!(commands.lock().unwrap().len(), 1);
         assert!(commands.lock().unwrap()[0].contains("request-pool-target"));
+        Ok(())
+    }
+
+    #[test]
+    fn target_request_retries_typed_lease_contention_with_one_request_id() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let config = load_config(&write_config(&temp, true)?)?;
+        let request_id = Uuid::new_v4();
+        let encoded = serde_json::to_vec(&status(4, "provider-target", request_id, Utc::now()))?;
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed_attempts = Arc::clone(&attempts);
+        let runner = move |_config: &RemoteAuthorityConfig, command: &str, _timeout: Duration| {
+            let mut attempts = observed_attempts.lock().unwrap();
+            attempts.push(command.to_string());
+            if attempts.len() < 3 {
+                bail!(
+                    "remote-authority SSH command failed: Error: {}",
+                    RUNTIME_ACTIVATION_BUSY_DETAIL
+                );
+            }
+            Ok(encoded.clone())
+        };
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let observed_delays = Arc::clone(&delays);
+
+        let observed = request_target_with_retry(
+            &config,
+            "provider-target",
+            request_id,
+            3,
+            "manual",
+            &runner,
+            move |delay| observed_delays.lock().unwrap().push(delay),
+        )?;
+
+        assert_eq!(observed.epoch, 4);
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(attempts[0].contains(&request_id.hyphenated().to_string()));
+        assert_eq!(
+            *delays.lock().unwrap(),
+            vec![Duration::from_millis(250), Duration::from_millis(500)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_request_contention_retry_is_bounded() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let config = load_config(&write_config(&temp, true)?)?;
+        let attempts = Arc::new(Mutex::new(0usize));
+        let observed_attempts = Arc::clone(&attempts);
+        let runner = move |_config: &RemoteAuthorityConfig,
+                           _command: &str,
+                           _timeout: Duration|
+              -> Result<Vec<u8>> {
+            *observed_attempts.lock().unwrap() += 1;
+            bail!(
+                "remote-authority SSH command failed: Error: {}",
+                RUNTIME_ACTIVATION_BUSY_DETAIL
+            )
+        };
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let observed_delays = Arc::clone(&delays);
+
+        let error = request_target_with_retry(
+            &config,
+            "provider-target",
+            Uuid::new_v4(),
+            3,
+            "manual",
+            &runner,
+            move |delay| observed_delays.lock().unwrap().push(delay),
+        )
+        .expect_err("persistent contention must remain a bounded failure");
+
+        assert!(format!("{error:#}").contains(RUNTIME_ACTIVATION_BUSY_DETAIL));
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            TARGET_REQUEST_CONTENTION_ATTEMPTS
+        );
+        assert_eq!(
+            *delays.lock().unwrap(),
+            vec![
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_millis(750),
+            ]
+        );
         Ok(())
     }
 

@@ -636,6 +636,11 @@ CodexSwitch must evaluate these independently:
   all agree. The retry must still obtain a fresh ACK bound to the rebased
   generation; mismatched identity, credentials, or journal ownership remains a
   hard barrier.
+- **Remote lease contention:** make the VPS activation lease unavailable for
+  the first target-request attempts and verify that the Mac retries with the
+  same request UUID, then succeeds when the lease becomes available. The retry
+  count and delay must be bounded. Exhausted contention returns a typed failure;
+  unrelated transport errors are not blindly retried.
 - **Operator observation preflight:** `poll` and `redeem-reset` reconcile and
   validate the activation barrier before any provider callback. Transitional or
   unresolved activation state must produce zero quota, inventory, and consume
