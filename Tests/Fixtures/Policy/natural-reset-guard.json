@@ -5,7 +5,7 @@
   "active": {
     "id": "20000000-0000-4000-8000-000000000001",
     "email": "active-pro@example.com",
-    "accessToken": "access-active",
+    "accessToken": "e30.eyJleHAiOjE4OTM0NTYwMDB9.signature",
     "refreshToken": "refresh-active",
     "idToken": "id-active",
     "accountId": "provider-active-pro",
@@ -35,7 +35,7 @@
   "replacement": {
     "id": "20000000-0000-4000-8000-000000000002",
     "email": "ready-plus@example.com",
-    "accessToken": "access-ready",
+    "accessToken": "e30.eyJleHAiOjE4OTM0NTYwMDB9.signature",
     "refreshToken": "refresh-ready",
     "idToken": "id-ready",
     "accountId": "provider-ready-plus",
