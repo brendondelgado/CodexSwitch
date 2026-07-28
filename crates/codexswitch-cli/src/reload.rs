@@ -42,6 +42,12 @@ pub(crate) struct ManagedHeadlessAppServerIdentity {
     pub(crate) kernel_executable_identity: HotSwapKernelExecutableIdentity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedHeadlessAckMaintenance {
+    Current,
+    Renewed { pid: i32 },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReloadSummary {
     pub sighup_sent: Vec<i32>,
@@ -1008,15 +1014,12 @@ pub(crate) fn bind_managed_headless_app_server_identity(
     owner_uid: u32,
     executable: PathBuf,
 ) -> Result<ManagedHeadlessAppServerIdentity> {
-    let processes = discover_codex_app_server_processes()?;
-    let process = processes
-        .iter()
-        .find(|process| process.pid == pid)
+    let process = current_process_identity(pid)
         .context("managed systemd app-server PID was not discovered")?;
     if process.owner_uid != owner_uid || process.executable != executable {
         bail!("managed systemd app-server process does not match unit ownership");
     }
-    managed_headless_identity_for_process(process)
+    managed_headless_identity_for_process(&process)
 }
 
 fn managed_headless_identity_for_process(
@@ -1040,6 +1043,93 @@ fn managed_headless_identity_from_kernel(
         start_identity: process.start_identity.clone(),
         kernel_executable_identity,
     })
+}
+
+fn observe_managed_headless_app_server(
+    expected: &ManagedHeadlessAppServerIdentity,
+) -> Result<(ManagedHeadlessAppServerIdentity, CodexProcess)> {
+    let process = current_process_identity(expected.pid)
+        .context("managed systemd app-server process is no longer running")?;
+    let observed = managed_headless_identity_for_process(&process)?;
+    Ok((observed, process))
+}
+
+pub(crate) fn process_matches_managed_headless_app_server(
+    expected: &ManagedHeadlessAppServerIdentity,
+    process: &CodexProcess,
+) -> bool {
+    managed_headless_identity_for_process(process).is_ok_and(|observed| observed == *expected)
+}
+
+pub(crate) fn maintain_managed_headless_app_server_ack(
+    expected: &ManagedHeadlessAppServerIdentity,
+    auth_path: &Path,
+    minimum_remaining: Duration,
+) -> Result<ManagedHeadlessAckMaintenance> {
+    maintain_managed_headless_app_server_ack_with(
+        expected,
+        || observe_managed_headless_app_server(expected),
+        |process| {
+            process_has_current_hot_swap_ack_for_runtime_with_minimum_remaining(
+                process,
+                auth_path,
+                HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+                minimum_remaining,
+            )
+        },
+        |process| {
+            let guard_identity = expected.clone();
+            let final_identity = expected.clone();
+            reload_discovered_codex_processes(
+                vec![process.clone()],
+                auth_path,
+                None,
+                true,
+                || {
+                    let (observed, _) = observe_managed_headless_app_server(&guard_identity)?;
+                    if observed != guard_identity {
+                        bail!("managed systemd app-server identity changed before SIGHUP");
+                    }
+                    Ok(())
+                },
+                || {
+                    let (observed, process) = observe_managed_headless_app_server(&final_identity)?;
+                    if observed != final_identity {
+                        bail!("managed systemd app-server identity changed after SIGHUP");
+                    }
+                    Ok(vec![process])
+                },
+            )
+        },
+    )
+}
+
+fn maintain_managed_headless_app_server_ack_with<Observe, Ack, Reload>(
+    expected: &ManagedHeadlessAppServerIdentity,
+    observe: Observe,
+    has_current_ack: Ack,
+    reload: Reload,
+) -> Result<ManagedHeadlessAckMaintenance>
+where
+    Observe: FnOnce() -> Result<(ManagedHeadlessAppServerIdentity, CodexProcess)>,
+    Ack: FnOnce(&CodexProcess) -> bool,
+    Reload: FnOnce(&CodexProcess) -> Result<ReloadSummary>,
+{
+    let (observed, process) = observe()?;
+    if observed != *expected {
+        bail!("managed systemd app-server identity changed; refusing readiness renewal");
+    }
+    if has_current_ack(&process) {
+        return Ok(ManagedHeadlessAckMaintenance::Current);
+    }
+    let summary = reload(&process)?;
+    if !summary.verified_hot_swap() {
+        bail!(
+            "managed systemd app-server readiness renewal was not acknowledged: {:?}",
+            summary.skipped
+        );
+    }
+    Ok(ManagedHeadlessAckMaintenance::Renewed { pid: process.pid })
 }
 
 fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<ReloadSummary> {
@@ -1067,12 +1157,58 @@ fn reload_discovered_codex_processes<Guard, Discover>(
     auth_path: &Path,
     receipt_nonce: Option<Uuid>,
     include_app_server: bool,
-    mut before_signal: Guard,
+    before_signal: Guard,
     final_discover: Discover,
 ) -> Result<ReloadSummary>
 where
     Guard: FnMut() -> Result<()>,
     Discover: FnOnce() -> Result<Vec<CodexProcess>>,
+{
+    reload_discovered_codex_processes_with(
+        processes,
+        auth_path,
+        receipt_nonce,
+        include_app_server,
+        before_signal,
+        final_discover,
+        |protected_pids| {
+            if let Some(root) = default_codexswitch_data_path() {
+                prune_hot_swap_artifacts_at(
+                    &root,
+                    SystemTime::now(),
+                    HOT_SWAP_ARTIFACT_RETENTION,
+                    protected_pids,
+                )?;
+            }
+            Ok(())
+        },
+        running_process_has_sighup_support_for_runtime,
+        signal_validated_process,
+        |process, request, runtime_kind, timeout| {
+            wait_for_hot_swap_ack(process, request, runtime_kind, timeout).is_some()
+        },
+    )
+}
+
+fn reload_discovered_codex_processes_with<Guard, Discover, Prune, Markers, Signal, Wait>(
+    processes: Vec<CodexProcess>,
+    auth_path: &Path,
+    receipt_nonce: Option<Uuid>,
+    include_app_server: bool,
+    mut before_signal: Guard,
+    final_discover: Discover,
+    prune_artifacts: Prune,
+    mut marker_support: Markers,
+    mut signal: Signal,
+    mut wait_for_ack: Wait,
+) -> Result<ReloadSummary>
+where
+    Guard: FnMut() -> Result<()>,
+    Discover: FnOnce() -> Result<Vec<CodexProcess>>,
+    Prune: FnOnce(&HashSet<u32>) -> Result<()>,
+    Markers: FnMut(&CodexProcess, HotSwapRuntimeKind) -> Option<HotSwapKernelExecutableIdentity>,
+    Signal: FnMut(&CodexProcess, i32) -> std::io::Result<()>,
+    Wait: FnMut(&CodexProcess, &HotSwapRequest, HotSwapRuntimeKind, Duration) -> bool,
 {
     let mut summary = ReloadSummary {
         receipt_nonce,
@@ -1083,14 +1219,7 @@ where
         .iter()
         .filter_map(|process| u32::try_from(process.pid).ok())
         .collect::<HashSet<_>>();
-    if let Some(root) = default_codexswitch_data_path() {
-        prune_hot_swap_artifacts_at(
-            &root,
-            SystemTime::now(),
-            HOT_SWAP_ARTIFACT_RETENTION,
-            &protected_pids,
-        )?;
-    }
+    prune_artifacts(&protected_pids)?;
     let auth_path = absolute_auth_path(auth_path)?;
     let initial_auth_generation =
         secure_file::observe(&auth_path, HOT_SWAP_AUTH_FILE_MAX_BYTES as usize, false)?
@@ -1103,9 +1232,7 @@ where
                 .push((process.pid, "unsupported Codex runtime kind".to_string()));
             continue;
         };
-        let Some(marker_executable_identity) =
-            running_process_has_sighup_support_for_runtime(process, runtime_kind)
-        else {
+        let Some(marker_executable_identity) = marker_support(process, runtime_kind) else {
             summary.skipped.push((
                 process.pid,
                 "missing runtime-specific SIGHUP hot-swap markers".to_string(),
@@ -1171,12 +1298,10 @@ where
             ));
             continue;
         }
-        let signal_result = signal_validated_process(process, libc::SIGHUP);
+        let signal_result = signal(process, libc::SIGHUP);
         if signal_result.is_ok() {
             summary.sighup_sent.push(process.pid);
-            if wait_for_hot_swap_ack(&process, &request, runtime_kind, Duration::from_secs(5))
-                .is_some()
-            {
+            if wait_for_ack(process, &request, runtime_kind, Duration::from_secs(5)) {
                 summary.signaled.push(process.pid);
                 summary
                     .acknowledged_request_nonces
@@ -1994,6 +2119,20 @@ pub fn process_has_current_hot_swap_ack_for_runtime(
     auth_path: &Path,
     runtime_kind: HotSwapRuntimeKind,
 ) -> bool {
+    process_has_current_hot_swap_ack_for_runtime_with_minimum_remaining(
+        process,
+        auth_path,
+        runtime_kind,
+        Duration::ZERO,
+    )
+}
+
+fn process_has_current_hot_swap_ack_for_runtime_with_minimum_remaining(
+    process: &CodexProcess,
+    auth_path: &Path,
+    runtime_kind: HotSwapRuntimeKind,
+    minimum_remaining: Duration,
+) -> bool {
     if !process_identity_is_current(process) {
         return false;
     }
@@ -2012,11 +2151,12 @@ pub fn process_has_current_hot_swap_ack_for_runtime(
     let Some(ack) = read_hot_swap_ack(&ack_path) else {
         return false;
     };
-    hot_swap_ack_matches_request(
+    hot_swap_ack_matches_request_with_minimum_remaining(
         &ack,
         &request,
         runtime_kind,
         current_unix_timestamp_milliseconds(),
+        minimum_remaining,
     ) && process_identity_is_current(process)
 }
 
@@ -2075,18 +2215,44 @@ fn hot_swap_ack_matches_request(
     runtime_kind: HotSwapRuntimeKind,
     now_milliseconds: u64,
 ) -> bool {
+    hot_swap_ack_matches_request_with_minimum_remaining(
+        ack,
+        request,
+        runtime_kind,
+        now_milliseconds,
+        Duration::ZERO,
+    )
+}
+
+fn hot_swap_ack_matches_request_with_minimum_remaining(
+    ack: &HotSwapAck,
+    request: &HotSwapRequest,
+    runtime_kind: HotSwapRuntimeKind,
+    now_milliseconds: u64,
+    minimum_remaining: Duration,
+) -> bool {
     let expected_fingerprint = request
         .binding
         .auth_file_identity
         .complete_token_fingerprint
         .as_str();
+    let ack_age_milliseconds =
+        now_milliseconds.saturating_sub(ack.acknowledged_at_unix_milliseconds);
+    let freshness_milliseconds =
+        u64::try_from(HOT_SWAP_ACK_FRESHNESS.as_millis()).unwrap_or(u64::MAX);
+    let minimum_remaining_milliseconds =
+        u64::try_from(minimum_remaining.as_millis()).unwrap_or(u64::MAX);
+    let has_minimum_remaining = if minimum_remaining.is_zero() {
+        ack_age_milliseconds <= freshness_milliseconds
+    } else {
+        ack_age_milliseconds.saturating_add(minimum_remaining_milliseconds) < freshness_milliseconds
+    };
     ack.binding == request.binding
         && ack.binding.contract_version == HOT_SWAP_REQUEST_CONTRACT_VERSION
         && ack.binding.runtime_kind == runtime_kind
         && ack.acknowledged_at_unix_milliseconds >= request.binding.issued_at_unix_milliseconds
         && ack.acknowledged_at_unix_milliseconds <= now_milliseconds.saturating_add(60_000)
-        && now_milliseconds.saturating_sub(ack.acknowledged_at_unix_milliseconds)
-            <= HOT_SWAP_ACK_FRESHNESS.as_millis() as u64
+        && has_minimum_remaining
         && ack.loaded_token_fingerprint == expected_fingerprint
         && ack.active_token_fingerprint == expected_fingerprint
         && match runtime_kind {
@@ -3506,6 +3672,185 @@ mod tests {
         Ok(())
     }
 
+    fn managed_headless_test_process(pid: i32, start_identity: &str) -> CodexProcess {
+        CodexProcess {
+            pid,
+            owner_uid: 1001,
+            start_identity: start_identity.to_string(),
+            started_at_unix: 1_000,
+            command_line: "/opt/codex app-server --remote-control --listen ws://127.0.0.1:8390"
+                .to_string(),
+            executable: PathBuf::from("/opt/codex"),
+        }
+    }
+
+    fn managed_headless_test_identity(process: &CodexProcess) -> ManagedHeadlessAppServerIdentity {
+        ManagedHeadlessAppServerIdentity {
+            pid: process.pid,
+            owner_uid: process.owner_uid,
+            executable: process.executable.clone(),
+            start_identity: process.start_identity.clone(),
+            kernel_executable_identity: HotSwapKernelExecutableIdentity {
+                canonical_path: process.executable.display().to_string(),
+                device: 7,
+                inode: u64::try_from(process.pid).unwrap_or_default(),
+            },
+        }
+    }
+
+    #[test]
+    fn managed_headless_pid_restart_renews_the_new_exact_identity() -> Result<()> {
+        let restarted = managed_headless_test_process(84, "linux:restarted");
+        let expected = managed_headless_test_identity(&restarted);
+        let reload_calls = std::cell::Cell::new(0);
+
+        let result = maintain_managed_headless_app_server_ack_with(
+            &expected,
+            || Ok((expected.clone(), restarted.clone())),
+            |_| false,
+            |process| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary {
+                    signaled: vec![process.pid],
+                    topology_verified: true,
+                    ..ReloadSummary::default()
+                })
+            },
+        )?;
+
+        assert_eq!(
+            result,
+            ManagedHeadlessAckMaintenance::Renewed { pid: restarted.pid }
+        );
+        assert_eq!(reload_calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_headless_identity_drift_never_reaches_reload() {
+        let original = managed_headless_test_process(42, "linux:original");
+        let expected = managed_headless_test_identity(&original);
+        let replacement = managed_headless_test_process(42, "linux:replacement");
+        let observed = managed_headless_test_identity(&replacement);
+        let reload_calls = std::cell::Cell::new(0);
+
+        let error = maintain_managed_headless_app_server_ack_with(
+            &expected,
+            || Ok((observed, replacement)),
+            |_| false,
+            |_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(reload_calls.get(), 0);
+    }
+
+    #[test]
+    fn managed_headless_current_ack_does_not_enter_a_signal_loop() -> Result<()> {
+        let process = managed_headless_test_process(42, "linux:current");
+        let expected = managed_headless_test_identity(&process);
+        let reload_calls = std::cell::Cell::new(0);
+
+        for _ in 0..3 {
+            let result = maintain_managed_headless_app_server_ack_with(
+                &expected,
+                || Ok((expected.clone(), process.clone())),
+                |_| true,
+                |_| {
+                    reload_calls.set(reload_calls.get() + 1);
+                    Ok(ReloadSummary::default())
+                },
+            )?;
+            assert_eq!(result, ManagedHeadlessAckMaintenance::Current);
+        }
+
+        assert_eq!(reload_calls.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_managed_headless_patch_support_never_signals() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let auth_path = dir.path().join("auth.json");
+        fs::write(
+            &auth_path,
+            r#"{"tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh","account_id":"provider-account"}}"#,
+        )?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let process = managed_headless_test_process(42, "linux:missing-patch");
+        let final_process = process.clone();
+        let signal_calls = std::cell::Cell::new(0);
+
+        let summary = reload_discovered_codex_processes_with(
+            vec![process],
+            &auth_path,
+            None,
+            true,
+            || Ok(()),
+            || Ok(vec![final_process]),
+            |_| Ok(()),
+            |_, _| None,
+            |_, _| {
+                signal_calls.set(signal_calls.get() + 1);
+                Ok(())
+            },
+            |_, _, _, _| false,
+        )?;
+
+        assert_eq!(signal_calls.get(), 0);
+        assert!(summary.sighup_sent.is_empty());
+        assert!(summary
+            .skipped
+            .iter()
+            .any(|(_, reason)| reason.contains("missing runtime-specific")));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_headless_pre_signal_identity_drift_never_signals() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let auth_path = dir.path().join("auth.json");
+        fs::write(
+            &auth_path,
+            r#"{"tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh","account_id":"provider-account"}}"#,
+        )?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let process = managed_headless_test_process(42, "linux:original");
+        let final_process = process.clone();
+        let kernel_identity = managed_headless_test_identity(&process).kernel_executable_identity;
+        let signal_calls = std::cell::Cell::new(0);
+
+        let summary = reload_discovered_codex_processes_with(
+            vec![process],
+            &auth_path,
+            None,
+            true,
+            || bail!("managed identity changed"),
+            || Ok(vec![final_process]),
+            |_| Ok(()),
+            move |_, _| Some(kernel_identity.clone()),
+            |_, _| {
+                signal_calls.set(signal_calls.get() + 1);
+                Ok(())
+            },
+            |_, _, _, _| false,
+        )?;
+
+        assert_eq!(signal_calls.get(), 0);
+        assert!(summary.sighup_sent.is_empty());
+        assert!(summary
+            .skipped
+            .iter()
+            .any(|(_, reason)| reason.contains("identity changed")));
+        Ok(())
+    }
+
     #[test]
     fn final_topology_revalidation_rejects_exit_appearance_identity_kind_and_stale_ack() {
         let expected_process = CodexProcess {
@@ -3984,6 +4329,37 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_ack_renews_before_the_five_minute_freshness_window_expires() -> Result<()> {
+        let (mut request, mut ack) = shared_v3_fixture()?;
+        request.binding.runtime_kind = HotSwapRuntimeKind::HeadlessRemoteControlAppServer;
+        ack.binding = request.binding.clone();
+        let acknowledged_at = ack.acknowledged_at_unix_milliseconds;
+        let minimum_remaining = Duration::from_secs(60);
+
+        assert!(hot_swap_ack_matches_request_with_minimum_remaining(
+            &ack,
+            &request,
+            HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+            acknowledged_at + Duration::from_secs(239).as_millis() as u64,
+            minimum_remaining,
+        ));
+        assert!(!hot_swap_ack_matches_request_with_minimum_remaining(
+            &ack,
+            &request,
+            HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+            acknowledged_at + Duration::from_secs(240).as_millis() as u64,
+            minimum_remaining,
+        ));
+        assert!(hot_swap_ack_matches_request(
+            &ack,
+            &request,
+            HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+            acknowledged_at + Duration::from_secs(300).as_millis() as u64,
+        ));
         Ok(())
     }
 

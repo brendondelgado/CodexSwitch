@@ -7,16 +7,19 @@ use crate::activation::{
 use crate::auth::{account_token_fingerprint, auth_file_fingerprint};
 #[cfg(not(target_os = "linux"))]
 use crate::bounded_command;
+use crate::codex_update;
 use crate::reload::{
     binary_has_sighup_support_for_runtime, discover_codex_app_server_processes,
     discover_codex_cli_processes, hot_swap_runtime_kind, process_has_current_hot_swap_ack,
-    process_is_sighup_safe_target, CodexProcess, HotSwapRuntimeKind,
+    process_is_sighup_safe_target, process_matches_managed_headless_app_server, CodexProcess,
+    HotSwapRuntimeKind,
 };
 use crate::secure_file;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
+#[cfg(any(test, target_os = "linux"))]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
@@ -194,7 +197,7 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
                 )
             });
             let ack_ready = process_has_current_hot_swap_ack(&process, auth_path);
-            classify_process_readiness(&process, binary_has_markers, ack_ready, false)
+            classify_process_readiness(&process, binary_has_markers, ack_ready, false, true)
         })
         .collect::<Vec<_>>();
 
@@ -205,10 +208,36 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
         ));
     }
 
-    let app_servers = discover_codex_app_server_processes()?
+    let discovered_app_servers = discover_codex_app_server_processes()?;
+    let has_headless_app_server = discovered_app_servers.iter().any(|process| {
+        hot_swap_runtime_kind(process) == Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer)
+    });
+    let verify_managed_headless = cfg!(target_os = "linux") && has_headless_app_server;
+    let managed_headless_identity = if verify_managed_headless {
+        match codex_update::managed_headless_app_server_identity() {
+            Ok(Some(identity)) => Some(identity),
+            Ok(None) => {
+                issues.push(
+                    "headless app-server is running, but the managed systemd unit is inactive"
+                        .to_string(),
+                );
+                None
+            }
+            Err(error) => {
+                issues.push(format!(
+                    "managed headless app-server ownership is unverified: {error:#}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let app_servers = discovered_app_servers
         .into_iter()
         .map(|process| {
-            let binary_has_markers = hot_swap_runtime_kind(&process).is_some_and(|runtime_kind| {
+            let runtime_kind = hot_swap_runtime_kind(&process);
+            let binary_has_markers = runtime_kind.is_some_and(|runtime_kind| {
                 cached_binary_has_sighup_support(
                     &mut binary_marker_cache,
                     &process.executable,
@@ -216,7 +245,18 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
                 )
             });
             let ack_ready = process_has_current_hot_swap_ack(&process, auth_path);
-            classify_process_readiness(&process, binary_has_markers, ack_ready, true)
+            let managed_target_verified = !verify_managed_headless
+                || runtime_kind != Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer)
+                || managed_headless_identity.as_ref().is_some_and(|identity| {
+                    process_matches_managed_headless_app_server(identity, &process)
+                });
+            classify_process_readiness(
+                &process,
+                binary_has_markers,
+                ack_ready,
+                true,
+                managed_target_verified,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -315,14 +355,17 @@ fn classify_process_readiness(
     binary_has_markers: bool,
     ack_ready: bool,
     is_app_server: bool,
+    managed_target_verified: bool,
 ) -> ProcessReadiness {
     let safe_target = if is_app_server {
-        binary_has_markers
+        binary_has_markers && managed_target_verified
     } else {
         process_is_sighup_safe_target(process, binary_has_markers)
     };
     let hot_swap_ready = safe_target && ack_ready;
-    let reason = if !binary_has_markers {
+    let reason = if !managed_target_verified {
+        "headless app-server is not the exact verified systemd-owned runtime".to_string()
+    } else if !binary_has_markers {
         if is_app_server {
             "missing app-server SIGHUP hot-swap markers; restart using patched Codex app-server"
                 .to_string()
@@ -611,7 +654,7 @@ mod tests {
 
     #[test]
     fn markers_without_live_ack_are_not_ready() {
-        let readiness = classify_process_readiness(&process(), true, false, true);
+        let readiness = classify_process_readiness(&process(), true, false, true, true);
 
         assert!(!readiness.hot_swap_ready);
         assert!(readiness.reason.contains("has not acknowledged a reload"));
@@ -619,7 +662,7 @@ mod tests {
 
     #[test]
     fn markers_with_live_ack_are_ready() {
-        let readiness = classify_process_readiness(&process(), true, true, true);
+        let readiness = classify_process_readiness(&process(), true, true, true, true);
 
         assert!(readiness.hot_swap_ready);
         assert!(readiness.reason.contains("live reload acknowledged"));
@@ -627,7 +670,7 @@ mod tests {
 
     #[test]
     fn fresh_app_server_start_after_auth_is_not_ready_without_ack() {
-        let readiness = classify_process_readiness(&process(), true, false, true);
+        let readiness = classify_process_readiness(&process(), true, false, true, true);
 
         assert!(!readiness.hot_swap_ready);
         assert!(readiness.reason.contains("has not acknowledged a reload"));
@@ -637,9 +680,23 @@ mod tests {
     fn readiness_requires_an_account_bearing_runtime() {
         assert!(!account_bearing_runtime_discovered(&[], &[]));
         assert!(account_bearing_runtime_discovered(
-            &[classify_process_readiness(&process(), true, true, false)],
+            &[classify_process_readiness(
+                &process(),
+                true,
+                true,
+                false,
+                true
+            )],
             &[],
         ));
+    }
+
+    #[test]
+    fn headless_readiness_rejects_an_unverified_external_runtime() {
+        let readiness = classify_process_readiness(&process(), true, true, true, false);
+
+        assert!(!readiness.hot_swap_ready);
+        assert!(readiness.reason.contains("exact verified systemd-owned"));
     }
 
     #[test]

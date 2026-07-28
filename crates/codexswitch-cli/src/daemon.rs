@@ -29,13 +29,16 @@ use crate::rate_limit_resets::{
     select_smart_reset_candidate, ConsumeResult, RateLimitResetBank, ResetOrchestrationContext,
     ResetOrchestrationDependencies, ResetQuotaRefreshStrategy,
 };
-use crate::reload::{reload_codex_hot_swap_processes, ReloadSummary};
+use crate::reload::{
+    maintain_managed_headless_app_server_ack, reload_codex_hot_swap_processes,
+    ManagedHeadlessAckMaintenance, ManagedHeadlessAppServerIdentity, ReloadSummary,
+};
 use crate::token_refresh::refresh_account_tokens;
 use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::Value;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const LOW_QUOTA_FAST_POLL_THRESHOLD_PERCENT: f64 = 5.0;
@@ -48,6 +51,8 @@ const INACTIVE_MISSING_QUOTA_POLL_SECONDS: u64 = 30;
 const DEGRADED_ACTIVATION_RETRY_SECONDS: u64 = 60;
 const DEGRADED_ACTIVATION_INACTIVE_QUOTA_POLL_LIMIT: usize = 4;
 const UNIX_TO_SWIFT_REFERENCE_SECONDS: f64 = 978_307_200.0;
+const MANAGED_READINESS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const MANAGED_READINESS_MINIMUM_ACK_REMAINING: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DaemonTick {
@@ -72,6 +77,69 @@ impl DaemonTick {
             ),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct ManagedReadinessCadence {
+    next_due_at: Option<Instant>,
+}
+
+impl ManagedReadinessCadence {
+    fn claim_if_due(&mut self, now: Instant) -> bool {
+        if self.next_due_at.is_some_and(|next_due| now < next_due) {
+            return false;
+        }
+        self.next_due_at = Some(now + MANAGED_READINESS_MAINTENANCE_INTERVAL);
+        true
+    }
+
+    fn time_until_due(&self, now: Instant) -> Duration {
+        self.next_due_at
+            .map(|next_due| next_due.saturating_duration_since(now))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn defer_from(&mut self, completed_at: Instant) {
+        self.next_due_at = Some(completed_at + MANAGED_READINESS_MAINTENANCE_INTERVAL);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedReadinessTick {
+    NotDue,
+    NoManagedRuntime,
+    Current,
+    Renewed { pid: i32 },
+}
+
+fn maintain_managed_readiness_with<CompletedAt, Observe, Maintain>(
+    cadence: &mut ManagedReadinessCadence,
+    now: Instant,
+    completed_at: CompletedAt,
+    observe_managed_runtime: Observe,
+    maintain_ack: Maintain,
+) -> Result<ManagedReadinessTick>
+where
+    CompletedAt: FnOnce() -> Instant,
+    Observe: FnOnce() -> Result<Option<ManagedHeadlessAppServerIdentity>>,
+    Maintain: FnOnce(&ManagedHeadlessAppServerIdentity) -> Result<ManagedHeadlessAckMaintenance>,
+{
+    if !cadence.claim_if_due(now) {
+        return Ok(ManagedReadinessTick::NotDue);
+    }
+    let result = match observe_managed_runtime() {
+        Ok(None) => Ok(ManagedReadinessTick::NoManagedRuntime),
+        Ok(Some(identity)) => match maintain_ack(&identity) {
+            Ok(ManagedHeadlessAckMaintenance::Current) => Ok(ManagedReadinessTick::Current),
+            Ok(ManagedHeadlessAckMaintenance::Renewed { pid }) => {
+                Ok(ManagedReadinessTick::Renewed { pid })
+            }
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    cadence.defer_from(completed_at());
+    result
 }
 
 struct DaemonTickContext<'a> {
@@ -1229,6 +1297,7 @@ fn runtime_block_until(
 
 pub fn run_loop(store_path: &Path, auth_path: &Path, interval: Duration) -> Result<()> {
     let mut was_fast_polling = false;
+    let mut managed_readiness_cadence = ManagedReadinessCadence::default();
     loop {
         if let Err(error) = codex_update::maybe_spawn_daily_auto_install() {
             eprintln!("codex update check failed: {error:#}");
@@ -1250,8 +1319,36 @@ pub fn run_loop(store_path: &Path, auth_path: &Path, interval: Duration) -> Resu
                 reload_codex_hot_swap_processes,
             ),
         );
-        let sleep_interval =
+        let tick_succeeded = tick_result.is_ok();
+        if tick_succeeded {
+            match maintain_managed_readiness_with(
+                &mut managed_readiness_cadence,
+                Instant::now(),
+                Instant::now,
+                codex_update::managed_headless_app_server_identity,
+                |identity| {
+                    maintain_managed_headless_app_server_ack(
+                        identity,
+                        auth_path,
+                        MANAGED_READINESS_MINIMUM_ACK_REMAINING,
+                    )
+                },
+            ) {
+                Ok(ManagedReadinessTick::Renewed { pid }) => {
+                    eprintln!("renewed managed app-server hot-swap readiness for pid {pid}");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("managed app-server readiness maintenance failed: {error:#}");
+                }
+            }
+        }
+        let mut sleep_interval =
             complete_daemon_iteration(tick_result, interval, &mut was_fast_polling);
+        if tick_succeeded {
+            sleep_interval =
+                sleep_interval.min(managed_readiness_cadence.time_until_due(Instant::now()));
+        }
         std::thread::sleep(sleep_interval);
     }
 }
@@ -1290,11 +1387,13 @@ mod tests {
         CodexAccount, QuotaSnapshot, QuotaWindow, QuotaWindowKind, QuotaWindowRateLimitSource,
         QuotaWindowSlot, QuotaWindowSourceMetadata,
     };
+    use crate::reload::HotSwapKernelExecutableIdentity;
     use anyhow::bail;
     use serde_json::json;
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1378,6 +1477,152 @@ mod tests {
             .with_sighup_sent(vec![42])
             .with_signaled(vec![42])
             .with_topology_verified(true)
+    }
+
+    fn managed_readiness_identity(
+        pid: i32,
+        start_identity: &str,
+    ) -> ManagedHeadlessAppServerIdentity {
+        ManagedHeadlessAppServerIdentity {
+            pid,
+            owner_uid: 1001,
+            executable: PathBuf::from("/opt/codex"),
+            start_identity: start_identity.to_string(),
+            kernel_executable_identity: HotSwapKernelExecutableIdentity {
+                canonical_path: "/opt/codex".to_string(),
+                device: 7,
+                inode: u64::try_from(pid).unwrap_or_default(),
+            },
+        }
+    }
+
+    #[test]
+    fn managed_readiness_no_work_tick_advances_cadence() -> Result<()> {
+        let start = Instant::now();
+        let mut cadence = ManagedReadinessCadence::default();
+        let observations = std::cell::Cell::new(0);
+        let maintenance_calls = std::cell::Cell::new(0);
+
+        let mut tick = |now| {
+            maintain_managed_readiness_with(
+                &mut cadence,
+                now,
+                || now,
+                || {
+                    observations.set(observations.get() + 1);
+                    Ok(None)
+                },
+                |_| {
+                    maintenance_calls.set(maintenance_calls.get() + 1);
+                    Ok(ManagedHeadlessAckMaintenance::Current)
+                },
+            )
+        };
+
+        assert_eq!(tick(start)?, ManagedReadinessTick::NoManagedRuntime);
+        assert_eq!(
+            tick(start + Duration::from_secs(59))?,
+            ManagedReadinessTick::NotDue
+        );
+        assert_eq!(
+            tick(start + Duration::from_secs(60))?,
+            ManagedReadinessTick::NoManagedRuntime
+        );
+        assert_eq!(observations.get(), 2);
+        assert_eq!(maintenance_calls.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_readiness_healthy_ticks_do_not_signal_repeatedly() -> Result<()> {
+        let start = Instant::now();
+        let identity = managed_readiness_identity(42, "linux:current");
+        let mut cadence = ManagedReadinessCadence::default();
+        let maintenance_calls = std::cell::Cell::new(0);
+
+        for offset in [0, 5, 10, 59] {
+            let result = maintain_managed_readiness_with(
+                &mut cadence,
+                start + Duration::from_secs(offset),
+                || start + Duration::from_secs(offset),
+                || Ok(Some(identity.clone())),
+                |_| {
+                    maintenance_calls.set(maintenance_calls.get() + 1);
+                    Ok(ManagedHeadlessAckMaintenance::Current)
+                },
+            )?;
+            assert_eq!(
+                result,
+                if offset == 0 {
+                    ManagedReadinessTick::Current
+                } else {
+                    ManagedReadinessTick::NotDue
+                }
+            );
+        }
+
+        assert_eq!(maintenance_calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_readiness_failure_still_advances_cadence() {
+        let start = Instant::now();
+        let identity = managed_readiness_identity(42, "linux:unpatched");
+        let mut cadence = ManagedReadinessCadence::default();
+        let maintenance_calls = std::cell::Cell::new(0);
+
+        let first = maintain_managed_readiness_with(
+            &mut cadence,
+            start,
+            || start + Duration::from_secs(70),
+            || Ok(Some(identity)),
+            |_| {
+                maintenance_calls.set(maintenance_calls.get() + 1);
+                bail!("missing patch support")
+            },
+        );
+        assert!(first.unwrap_err().to_string().contains("missing patch"));
+
+        let second = maintain_managed_readiness_with(
+            &mut cadence,
+            start + Duration::from_secs(71),
+            || panic!("not-due cadence requested a completion timestamp"),
+            || panic!("cadence retry probed before it was due"),
+            |_| panic!("cadence retry maintained before it was due"),
+        );
+        assert_eq!(second.unwrap(), ManagedReadinessTick::NotDue);
+        assert_eq!(maintenance_calls.get(), 1);
+    }
+
+    #[test]
+    fn managed_readiness_detects_a_systemd_pid_restart_on_the_next_due_tick() -> Result<()> {
+        let start = Instant::now();
+        let original = managed_readiness_identity(42, "linux:original");
+        let restarted = managed_readiness_identity(84, "linux:restarted");
+        let mut cadence = ManagedReadinessCadence::default();
+
+        let first = maintain_managed_readiness_with(
+            &mut cadence,
+            start,
+            || start,
+            || Ok(Some(original)),
+            |_| Ok(ManagedHeadlessAckMaintenance::Current),
+        )?;
+        let second = maintain_managed_readiness_with(
+            &mut cadence,
+            start + MANAGED_READINESS_MAINTENANCE_INTERVAL,
+            || start + MANAGED_READINESS_MAINTENANCE_INTERVAL,
+            || Ok(Some(restarted.clone())),
+            |identity| {
+                assert_eq!(identity, &restarted);
+                Ok(ManagedHeadlessAckMaintenance::Renewed { pid: identity.pid })
+            },
+        )?;
+
+        assert_eq!(first, ManagedReadinessTick::Current);
+        assert_eq!(second, ManagedReadinessTick::Renewed { pid: restarted.pid });
+        Ok(())
     }
 
     fn confirm_daemon_activation(store_path: &Path, auth_path: &Path) -> Result<()> {
@@ -2323,7 +2568,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_has_no_periodic_reload_scheduler() {
+    fn daemon_has_no_legacy_broad_ack_bootstrap_scheduler() {
         let source = include_str!("daemon.rs");
         for forbidden in [
             concat!("HOT_SWAP_ACK_", "RENEWAL_INTERVAL"),
@@ -2333,7 +2578,7 @@ mod tests {
         ] {
             assert!(
                 !source.contains(forbidden),
-                "daemon reintroduced periodic runtime signaling through {forbidden}"
+                "daemon reintroduced legacy broad runtime signaling through {forbidden}"
             );
         }
     }

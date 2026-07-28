@@ -11,6 +11,7 @@ toc:
   - Mac Activation Barrier Recovery
   - Rust Activation Barrier Recovery
   - Platform Gates
+  - Managed VPS Readiness Renewal
   - Unified ChatGPT Desktop Bundle
   - Desktop Bridge Verification
   - CLI Update Storage Safety
@@ -565,6 +566,47 @@ CodexSwitch must evaluate these independently:
 - **macOS process discovery:** exclude ChatGPT framework services, renderers, and crash reporters by executable identity. A helper command containing a bundle path that ends in `Codex` is not an interactive CLI and must never be reported or signaled as one.
 - **Cross-owner stale rotation record:** a recognized version-3 legacy degraded-token mismatch may adopt the one exact store/auth active account, but it must reload and acknowledge that account before continuing to a requested replacement. Unrecognized manual-review records remain hard barriers.
 - **VPS SSH transport:** CodexSwitch-managed readiness probes, swap commands, tunnels, and direct remote TTY fallbacks must pass `ControlMaster=no`, `ControlPath=none`, and `ControlPersist=no`. User shell aliases may multiplex, but app-managed Codex transports must not inherit a shared OpenSSH master where unrelated channels can add latency or close the session.
+
+## Managed VPS Readiness Renewal
+
+The Linux daemon maintains readiness for the one managed headless app-server
+owned by `signul-codex-app-server.service`. This maintenance is not generic
+process repair and never targets an external app-server or an interactive CLI.
+
+After a successful primary daemon tick, readiness maintenance runs at most once
+per 60 seconds. The cadence advances when the check finds no work, rejects an
+ineligible runtime, or completes a renewal attempt. A fast quota-poll loop
+therefore cannot become a signal loop.
+
+The daemon renews only when the managed runtime has no valid request-bound ACK
+or when its current ACK will expire before the next ordinary renewal interval.
+Before writing a request or sending `SIGHUP`, it must prove all of the following
+from fresh observations:
+
+1. the systemd unit is active and exposes one nonzero main PID;
+2. process owner, PID, start identity, command shape, and kernel executable
+   identity match the unit observation;
+3. the runtime is the headless remote-control kind;
+4. the kernel-resolved executable contains the complete headless hot-swap marker
+   contract; and
+5. `auth.json` supplies a complete account identity and token fingerprint.
+
+The request nonce binds that exact process identity, kernel executable,
+canonical auth path, provider account, and complete token fingerprint. The
+daemon revalidates the binding immediately before `SIGHUP`, waits no more than
+the bounded ACK deadline, and accepts only the matching headless ACK contract.
+The unit probe has a 15-second command deadline, marker inspection is capped at
+2 GiB in 128 KiB chunks, ACK observation is capped at five seconds, and runtime
+revalidation reads only the unit's exact main PID rather than scanning every
+process for a fallback target.
+Identity drift, missing patch support, an external runtime, an unreadable auth
+source, a skipped target, or an unacknowledged signal remains not ready and
+does not fall back to a broader process scan.
+
+A systemd restart changes PID or start identity and invalidates the prior ACK.
+The next successful, due daemon tick must establish readiness for the new
+managed identity. A healthy current ACK produces no signal. Failed primary
+ticks and unresolved activation barriers do not launch this auxiliary path.
 
 ## Unified ChatGPT Desktop Bundle
 
