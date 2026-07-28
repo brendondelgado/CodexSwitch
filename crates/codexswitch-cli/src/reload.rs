@@ -522,7 +522,7 @@ pub(crate) fn discover_live_prepared_runtime_executables(
     Ok(identities)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn prepared_runtime_process_candidate(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
@@ -530,7 +530,7 @@ fn prepared_runtime_process_candidate(path: &Path) -> bool {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn prepared_runtime_executable_path(path: &Path, prepared_root: &Path) -> bool {
     path.starts_with(prepared_root) && prepared_runtime_process_candidate(path)
 }
