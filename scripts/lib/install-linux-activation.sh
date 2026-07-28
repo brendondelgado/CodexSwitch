@@ -804,6 +804,7 @@ activate_release() {
 
   mkdir -p "$BIN_DIR"
   validate_systemd_preconditions
+  prepare_systemd_start_barriers_for_replacement
   begin_systemd_transaction
   enforce_systemd_transaction_storage_bound
   inject_fault before_journal

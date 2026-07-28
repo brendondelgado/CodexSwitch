@@ -35,6 +35,7 @@ cross_dependencies:
   - ../../scripts/lib/install-linux-release.sh
   - ../../scripts/lib/install-linux-activation-journal.sh
   - ../../scripts/lib/install-linux-systemd-policy.sh
+  - ../../scripts/lib/systemd-start-barrier.py
   - ../../scripts/lib/install-linux-import-transaction.sh
   - ../../scripts/lib/install-linux-systemd-transaction.sh
   - ../../scripts/lib/install-linux-activation.sh
@@ -619,23 +620,43 @@ unrelated. Without that explicit first-install mode, a missing runtime remains
 unknown.
 
 After the initial positive-inactive observations and acquisition of both
-runtime guards, activation writes one token-bound condition drop-in for every
-target and known legacy unit beneath the user manager's high-priority runtime
-control directory. The condition is false while the exact activation lock
-exists. Activation then runs `daemon-reload`, proves every barrier appears in
-the unit's effective `DropInPaths`, and repeats all activity observations before
-the first journaled mutation. A late start is therefore skipped by systemd; a
-start that won before the barrier is active is caught by the second observation.
-The barriers stay loaded through rollback or commit and journal cleanup. They
-are removed, followed by another successful `daemon-reload`, only while both
-runtime guards remain held. Barrier creation never stops, restarts, enables, or
-disables a unit. An active or unknown unit still blocks.
+runtime guards, activation classifies every blocking unit from one successful
+manager observation. A loaded unit receives a token-bound condition drop-in
+beneath the user manager's high-priority runtime control directory. The
+condition is false while the exact activation lock exists. A unit reported as
+`LoadState=not-found` receives an exact runtime mask whose public unit pathname
+is a hard link to an installer-owned symlink inode targeting `/dev/null`.
+Systemd does not merge condition drop-ins into absent units, so an empty
+`DropInPaths` value for `LoadState=not-found` is expected and can never prove a
+barrier. The runtime mask is instead verified as `LoadState=masked` with
+`FragmentPath=/dev/null`.
 
-Each barrier contains the activation-lock PID/start identity/token and has one
-exact repository-owned pathname and byte representation. Existing, linked,
-malformed, foreign-token, partially installed, or manager-invisible barriers
-block for manual review. A crash may leave a valid barrier in place as a
-fail-safe start inhibition; it is never guessed away by an unrelated run.
+Every public drop-in or mask retains a private inode anchor. A versioned owner
+manifest records its unit, kind, public path, anchor path, device/inode
+identity, activation-lock path, and exact PID/start/token owner. Publication
+uses no-replace hard links from those anchors. The manifest is durably updated
+before and during publication, so dead-owner recovery can remove an exact
+partially published set without guessing. Existing public paths, unsafe
+parents, linked manifests, changed identities, foreign tokens, unexpected
+owner-directory entries, and foreign replacement artifacts block for manual
+review and are never removed.
+
+Loaded target units keep condition drop-ins. Before persistent replacement, a
+loaded obsolete unit moves from its condition to an exact runtime mask; the
+cached condition remains effective until `daemon-reload` loads the stronger
+mask. After target fragments have been installed, a first-install target moves
+from its mask to the same token-bound condition; the cached mask remains
+effective until that `daemon-reload` loads the condition. Obsolete units remain
+masked after their fragments are removed. Activation verifies the complete
+manager-visible set after each transition and repeats all activity observations
+before the first journaled mutation.
+
+The barriers stay effective through rollback or commit and journal cleanup.
+They are removed, followed by another successful `daemon-reload`, only while
+both runtime guards remain held. Removal first validates the owner manifest,
+every retained anchor, every public inode, and every exact byte or symlink
+target. Barrier creation never stops, restarts, enables, or disables a unit. An
+active or unknown unit still blocks.
 
 The installer never stops an active session on the operator's behalf. An
 unrecognized CodexSwitch- or Codex-app-server-named unit file also blocks; it is
@@ -760,12 +781,18 @@ ownerless or live-owner lock is never reclaimed.
 
 Token-bound systemd start barriers participate in the same stale-owner
 recovery. Before publishing a replacement activation lock, the installer may
-remove barriers only when the complete required barrier set is present, every
-file is regular and byte-for-byte bound to the validated dead lock owner, and
-the activation lock remains unchanged while the installer holds the filesystem
-mutex. A missing, partial, linked, changed, or live-owner barrier set fails
-closed before activation. After exact removal, the installer reloads the user
-manager and verifies that no managed barrier remains visible before proceeding.
+remove barriers only while holding the filesystem mutex and after proving the
+lock owner is dead. Version-2 recovery validates the exact owner manifest,
+retained inode anchors, and every present public hard link. A manifest in its
+publishing or transitioning phase may name public links that are not present
+yet; every link that is present must still match its recorded anchor identity.
+This makes a crash during multi-unit publication recoverable without adopting a
+foreign path. The activation lock must remain unchanged throughout removal.
+Legacy version-1 all-condition sets remain recoverable only when their complete
+byte-identical set is present. Missing anchors, linked or malformed manifests,
+changed identities, foreign public artifacts, and live owners fail closed.
+After exact removal, the installer reloads the user manager and verifies that
+no owned barrier remains visible before proceeding.
 
 Each systemd transaction also carries a random generation and an HMAC owner
 manifest bound to its exact directory, PID/start identity, activation token,

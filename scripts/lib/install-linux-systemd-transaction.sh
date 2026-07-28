@@ -210,7 +210,9 @@ for parent in sorted(parents, key=lambda value: len(value.parts), reverse=True):
     finally:
         os.close(fd)
 PY
+  prepare_systemd_start_barriers_for_installed_targets
   systemctl --user daemon-reload
+  verify_systemd_start_barriers
   validate_merged_systemd_unit codexswitch.service
   validate_merged_systemd_unit signul-codex-app-server.service
   validate_effective_systemd_resources

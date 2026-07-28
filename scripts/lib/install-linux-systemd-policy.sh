@@ -25,6 +25,109 @@ systemd_start_barrier_path() {
     "${SYSTEMD_START_BARRIER_ROOT:-$(systemd_start_barrier_root)}" "$1"
 }
 
+systemd_start_mask_path() {
+  printf '%s/%s\n' \
+    "${SYSTEMD_START_BARRIER_ROOT:-$(systemd_start_barrier_root)}" "$1"
+}
+
+systemd_start_barrier_helper() {
+  python3 "$SYSTEMD_START_BARRIER_HELPER" "$@"
+}
+
+systemd_unit_load_state() {
+  local unit="$1"
+  local observed=""
+
+  observed="$(systemctl --user show "$unit" -p LoadState --value 2>&1)" || \
+    fail "failed to classify systemd start barrier: unit=$unit output=${observed:-<empty>}"
+  case "$observed" in
+    loaded|not-found) printf '%s\n' "$observed" ;;
+    *) fail "systemd start barrier unit has unsupported load state: unit=$unit LoadState=${observed:-<empty>}" ;;
+  esac
+}
+
+initial_systemd_start_barrier_modes() {
+  local unit=""
+  local load_state=""
+
+  while IFS= read -r unit; do
+    load_state="$(systemd_unit_load_state "$unit")" || return $?
+    case "$load_state" in
+      loaded) printf '%s\tcondition\n' "$unit" ;;
+      not-found) printf '%s\tmask\n' "$unit" ;;
+    esac
+  done < <(activation_blocking_systemd_units)
+}
+
+replacement_systemd_start_barrier_modes() {
+  local unit=""
+  local kind=""
+
+  while IFS= read -r unit; do
+    case "$unit" in
+      codexswitch.service|signul-codex-app-server.service)
+        kind="$(awk -F '\t' -v unit="$unit" '$1 == unit { print $2; found=1 } END { if (!found) exit 1 }' <<< "$SYSTEMD_START_BARRIER_MODES")" || \
+          fail "systemd start barrier mode is missing for target unit: $unit"
+        printf '%s\t%s\n' "$unit" "$kind"
+        ;;
+      *) printf '%s\tmask\n' "$unit" ;;
+    esac
+  done < <(activation_blocking_systemd_units)
+}
+
+installed_systemd_start_barrier_modes() {
+  local unit=""
+
+  while IFS= read -r unit; do
+    case "$unit" in
+      codexswitch.service|signul-codex-app-server.service)
+        printf '%s\tcondition\n' "$unit"
+        ;;
+      *) printf '%s\tmask\n' "$unit" ;;
+    esac
+  done < <(activation_blocking_systemd_units)
+}
+
+transition_systemd_start_barriers() {
+  local desired_modes="$1"
+  local owner_start=""
+  local units=""
+
+  [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "1" ]] || fail "systemd start barriers are not held"
+  owner_start="$(process_start_identity "$$")"
+  units="$(activation_blocking_systemd_units)"
+  systemd_start_barrier_helper transition \
+    --root "$SYSTEMD_START_BARRIER_ROOT" \
+    --activation-lock "$ACTIVATION_LOCK_FILE" \
+    --owner-pid "$$" \
+    --owner-start "$owner_start" \
+    --owner-token "$ACTIVATION_LOCK_TOKEN" \
+    --units "$units" \
+    --modes "$desired_modes" \
+    --read-limit "$STATE_FILE_MAX_BYTES" || \
+    fail "failed to transition exact owned systemd start barriers"
+  SYSTEMD_START_BARRIER_MODES="$desired_modes"
+}
+
+prepare_systemd_start_barriers_for_replacement() {
+  local desired_modes=""
+
+  desired_modes="$(replacement_systemd_start_barrier_modes)"
+  [[ "$desired_modes" == "$SYSTEMD_START_BARRIER_MODES" ]] || {
+    transition_systemd_start_barriers "$desired_modes"
+    systemctl --user daemon-reload || fail "failed to load replacement-safe systemd start barriers"
+  }
+  verify_systemd_start_barriers
+}
+
+prepare_systemd_start_barriers_for_installed_targets() {
+  local desired_modes=""
+
+  desired_modes="$(installed_systemd_start_barrier_modes)"
+  [[ "$desired_modes" == "$SYSTEMD_START_BARRIER_MODES" ]] || \
+    transition_systemd_start_barriers "$desired_modes"
+}
+
 require_activation_systemd_units_inactive() {
   local context="$1"
   local units=""
@@ -85,16 +188,45 @@ PY
 }
 
 verify_systemd_start_barriers() {
+  local owner_start=""
+  local units=""
+  local records=""
+  local reported_modes=""
   local unit=""
+  local kind=""
   local barrier=""
+  local load_state=""
+  local fragment=""
   local observed=""
 
   [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "1" ]] || fail "systemd start barriers are not held"
-  while IFS= read -r unit; do
-    barrier="$(systemd_start_barrier_path "$unit")"
-    observed="$(systemctl --user show "$unit" -p DropInPaths --value 2>&1)" || \
-      fail "failed to read effective start barrier provenance: unit=$unit output=${observed:-<empty>}"
-    python3 - "$observed" "$barrier" <<'PY' || fail "systemd start barrier is not manager-visible: unit=$unit path=$barrier"
+  owner_start="$(process_start_identity "$$")"
+  units="$(activation_blocking_systemd_units)"
+  records="$(systemd_start_barrier_helper status \
+    --root "$SYSTEMD_START_BARRIER_ROOT" \
+    --activation-lock "$ACTIVATION_LOCK_FILE" \
+    --owner-pid "$$" \
+    --owner-start "$owner_start" \
+    --owner-token "$ACTIVATION_LOCK_TOKEN" \
+    --units "$units" \
+    --read-limit "$STATE_FILE_MAX_BYTES")" || \
+    fail "systemd start barrier ownership verification failed"
+  reported_modes="$(awk -F '\t' 'NF == 3 { print $1 "\t" $2; next } { exit 1 }' <<< "$records")" || \
+    fail "systemd start barrier status is malformed"
+  [[ "$reported_modes" == "$SYSTEMD_START_BARRIER_MODES" ]] || \
+    fail "systemd start barrier owner manifest disagrees with the held mode set"
+  while IFS=$'\t' read -r unit kind barrier; do
+    [[ -n "$unit" && -n "$kind" && -n "$barrier" ]] || \
+      fail "systemd start barrier status is malformed"
+    case "$kind" in
+      condition)
+        load_state="$(systemctl --user show "$unit" -p LoadState --value 2>&1)" || \
+          fail "failed to read condition barrier load state: unit=$unit output=${load_state:-<empty>}"
+        [[ "$load_state" == "loaded" ]] || \
+          fail "condition start barrier is not attached to a loaded unit: unit=$unit LoadState=${load_state:-<empty>}"
+        observed="$(systemctl --user show "$unit" -p DropInPaths --value 2>&1)" || \
+          fail "failed to read effective start barrier provenance: unit=$unit output=${observed:-<empty>}"
+        python3 - "$observed" "$barrier" <<'PY' || fail "systemd condition start barrier is not manager-visible: unit=$unit path=$barrier"
 import os
 import sys
 
@@ -105,7 +237,20 @@ if expected not in tokens or len(tokens) != len(set(tokens)):
 if any(not os.path.isabs(token) for token in tokens):
     raise SystemExit(1)
 PY
-  done < <(activation_blocking_systemd_units)
+        ;;
+      mask)
+        load_state="$(systemctl --user show "$unit" -p LoadState --value 2>&1)" || \
+          fail "failed to read mask barrier load state: unit=$unit output=${load_state:-<empty>}"
+        fragment="$(systemctl --user show "$unit" -p FragmentPath --value 2>&1)" || \
+          fail "failed to read mask barrier fragment: unit=$unit output=${fragment:-<empty>}"
+        observed="$(systemctl --user show "$unit" -p DropInPaths --value 2>&1)" || \
+          fail "failed to read mask barrier drop-ins: unit=$unit output=${observed:-<empty>}"
+        [[ "$load_state" == "masked" && "$fragment" == "/dev/null" && -z "$observed" ]] || \
+          fail "systemd mask start barrier is not manager-visible: unit=$unit path=$barrier LoadState=${load_state:-<empty>} FragmentPath=${fragment:-<empty>} DropInPaths=${observed:-<empty>}"
+        ;;
+      *) fail "systemd start barrier status has an unsupported kind: unit=$unit kind=$kind" ;;
+    esac
+  done <<< "$records"
 }
 
 verify_systemd_start_barriers_absent() {
@@ -115,6 +260,10 @@ verify_systemd_start_barriers_absent() {
 
   while IFS= read -r unit; do
     barrier="$(systemd_start_barrier_path "$unit")"
+    [[ ! -e "$barrier" && ! -L "$barrier" ]] || \
+      fail "owned systemd condition start barrier remains on disk: unit=$unit path=$barrier"
+    [[ ! -e "$(systemd_start_mask_path "$unit")" && ! -L "$(systemd_start_mask_path "$unit")" ]] || \
+      fail "owned systemd mask start barrier remains on disk: unit=$unit path=$(systemd_start_mask_path "$unit")"
     observed="$(systemctl --user show "$unit" -p DropInPaths --value 2>&1)" || \
       fail "failed to verify start barrier removal: unit=$unit output=${observed:-<empty>}"
     python3 - "$observed" "$barrier" <<'PY' || fail "systemd start barrier remains manager-visible: unit=$unit path=$barrier"
@@ -129,105 +278,31 @@ PY
 install_systemd_start_barriers() {
   local owner_start=""
   local units=""
+  local modes=""
 
   [[ "$ACTIVATION_LOCK_HELD" == "1" && "$ACTIVATION_LOCK_TOKEN" =~ ^[0-9a-f]{32}$ ]] || \
     fail "systemd start barriers require the durable activation owner"
   [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "0" ]] || fail "systemd start barriers are already held"
+  [[ -f "$SYSTEMD_START_BARRIER_HELPER" && ! -L "$SYSTEMD_START_BARRIER_HELPER" ]] || \
+    fail "systemd start barrier helper is missing or unsafe"
   owner_start="$(process_start_identity "$$")"
   units="$(activation_blocking_systemd_units)"
+  modes="$(initial_systemd_start_barrier_modes)"
   SYSTEMD_START_BARRIER_ROOT="$(systemd_start_barrier_root)"
-  if ! python3 - \
-    "$SYSTEMD_START_BARRIER_ROOT" "$ACTIVATION_LOCK_FILE" "$$" "$owner_start" \
-    "$ACTIVATION_LOCK_TOKEN" "$units" <<'PY'
-import os
-import re
-import stat
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-activation_lock = sys.argv[2]
-owner_pid = sys.argv[3]
-owner_start = sys.argv[4]
-owner_token = sys.argv[5]
-units = [value for value in sys.argv[6].splitlines() if value]
-unit_pattern = re.compile(r"[A-Za-z0-9_.@-]+\.(?:service|socket|path|timer)")
-if not root.is_absolute() or not Path(os.path.realpath(root.parent.parent)) == root.parent.parent:
-    raise SystemExit("systemd runtime control root is not canonical")
-if not units or any(unit_pattern.fullmatch(unit) is None for unit in units):
-    raise SystemExit("systemd start barrier unit list is invalid")
-if any(character.isspace() or character in {'%', '\\', '"'} for character in activation_lock):
-    raise SystemExit("activation lock path cannot be represented safely in a systemd condition")
-
-content = (
-    "# codexswitch-activation-start-barrier-v1\n"
-    f"# owner_pid={owner_pid}\n"
-    f"# owner_start={owner_start}\n"
-    f"# owner_token={owner_token}\n"
-    "[Unit]\n"
-    f"ConditionPathExists=!{activation_lock}\n"
-).encode("utf-8")
-created_files = []
-created_directories = []
-
-
-def ensure_directory(path: Path) -> None:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        path.mkdir(mode=0o700)
-        created_directories.append(path)
-        metadata = path.lstat()
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise RuntimeError(f"start barrier parent is linked or special: {path}")
-
-
-try:
-    ensure_directory(root.parent.parent)
-    ensure_directory(root.parent)
-    ensure_directory(root)
-    for unit in units:
-        dropin = root / f"{unit}.d"
-        ensure_directory(dropin)
-        barrier = dropin / "00-codexswitch-activation-guard.conf"
-        descriptor = os.open(
-            barrier,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-        )
-        created_files.append(barrier)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        directory_fd = os.open(dropin, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(root_fd)
-    finally:
-        os.close(root_fd)
-except Exception:
-    for barrier in reversed(created_files):
-        try:
-            barrier.unlink()
-        except FileNotFoundError:
-            pass
-    for directory in reversed(created_directories):
-        try:
-            directory.rmdir()
-        except OSError:
-            pass
-    raise
-PY
-  then
+  if ! systemd_start_barrier_helper install \
+    --root "$SYSTEMD_START_BARRIER_ROOT" \
+    --activation-lock "$ACTIVATION_LOCK_FILE" \
+    --owner-pid "$$" \
+    --owner-start "$owner_start" \
+    --owner-token "$ACTIVATION_LOCK_TOKEN" \
+    --units "$units" \
+    --modes "$modes" \
+    --read-limit "$STATE_FILE_MAX_BYTES" >/dev/null; then
     SYSTEMD_START_BARRIER_ROOT=""
-    fail "failed to create token-bound systemd start barriers"
+    fail "failed to create exact owned systemd start barriers"
   fi
   SYSTEMD_START_BARRIERS_HELD=1
+  SYSTEMD_START_BARRIER_MODES="$modes"
   systemctl --user daemon-reload || fail "failed to load systemd start barriers"
   verify_systemd_start_barriers
 }
@@ -239,54 +314,19 @@ remove_systemd_start_barriers() {
   [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "1" ]] || return 0
   owner_start="$(process_start_identity "$$")"
   units="$(activation_blocking_systemd_units)"
-  python3 - \
-    "$SYSTEMD_START_BARRIER_ROOT" "$ACTIVATION_LOCK_FILE" "$$" "$owner_start" \
-    "$ACTIVATION_LOCK_TOKEN" "$units" <<'PY' || fail "failed to remove the exact owned systemd start barriers"
-import os
-import stat
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-activation_lock = sys.argv[2]
-owner_pid = sys.argv[3]
-owner_start = sys.argv[4]
-owner_token = sys.argv[5]
-units = [value for value in sys.argv[6].splitlines() if value]
-expected = (
-    "# codexswitch-activation-start-barrier-v1\n"
-    f"# owner_pid={owner_pid}\n"
-    f"# owner_start={owner_start}\n"
-    f"# owner_token={owner_token}\n"
-    "[Unit]\n"
-    f"ConditionPathExists=!{activation_lock}\n"
-).encode("utf-8")
-
-for unit in units:
-    dropin = root / f"{unit}.d"
-    barrier = dropin / "00-codexswitch-activation-guard.conf"
-    metadata = barrier.lstat()
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise SystemExit(f"start barrier is linked or special: {barrier}")
-    if barrier.read_bytes() != expected:
-        raise SystemExit(f"start barrier ownership changed: {barrier}")
-for unit in units:
-    dropin = root / f"{unit}.d"
-    barrier = dropin / "00-codexswitch-activation-guard.conf"
-    barrier.unlink()
-    try:
-        dropin.rmdir()
-    except OSError:
-        pass
-root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-try:
-    os.fsync(root_fd)
-finally:
-    os.close(root_fd)
-PY
+  systemd_start_barrier_helper remove \
+    --root "$SYSTEMD_START_BARRIER_ROOT" \
+    --activation-lock "$ACTIVATION_LOCK_FILE" \
+    --owner-pid "$$" \
+    --owner-start "$owner_start" \
+    --owner-token "$ACTIVATION_LOCK_TOKEN" \
+    --units "$units" \
+    --read-limit "$STATE_FILE_MAX_BYTES" >/dev/null || \
+    fail "failed to remove the exact owned systemd start barriers"
   systemctl --user daemon-reload || fail "failed to unload systemd start barriers"
   verify_systemd_start_barriers_absent
   SYSTEMD_START_BARRIERS_HELD=0
+  SYSTEMD_START_BARRIER_MODES=""
   SYSTEMD_START_BARRIER_ROOT=""
 }
 

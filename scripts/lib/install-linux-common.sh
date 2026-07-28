@@ -367,11 +367,20 @@ PY
 }
 
 observe_managed_systemd_owner() {
+  local activation_mask=""
+
+  if [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "1" ]] && \
+     awk -F '\t' -v unit="$MANAGED_APP_SERVER_UNIT" \
+       '$1 == unit && $2 == "mask" { found=1 } END { exit(found ? 0 : 1) }' \
+       <<< "$SYSTEMD_START_BARRIER_MODES"; then
+    activation_mask="$(systemd_start_mask_path "$MANAGED_APP_SERVER_UNIT")"
+  fi
   python3 "$RUNTIME_OBSERVER_HELPER_ROOT/observe-managed-systemd.py" \
     "$MANAGED_APP_SERVER_UNIT" \
     "$SERVICE_DIR/$MANAGED_APP_SERVER_UNIT" \
     "$RUNTIME_OBSERVATION_TIMEOUT_SECONDS" \
     "$STATE_FILE_MAX_BYTES" \
+    --activation-mask "$activation_mask" \
     /usr/bin/flock --shared --no-fork \
     "$RUNTIME_START_INSTALL_GUARD" \
     /usr/bin/flock --exclusive --nonblock --no-fork \
@@ -607,8 +616,10 @@ acquire_runtime_guards_for_commit() {
   start_runtime_guard_holder
   RUNTIME_GUARDS_HELD=1
   install_systemd_start_barriers
+  inject_fault after_start_barriers
   verify_runtime_guard_identities || fail "runtime guard path identity changed while activation held the descriptors"
   require_activation_systemd_units_inactive final
+  verify_systemd_start_barriers
   require_managed_runtime_inactive final 1
 }
 

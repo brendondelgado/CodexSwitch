@@ -20,6 +20,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install-linux.sh"
 INSTALLER_LIB = ROOT / "scripts" / "lib"
+SYSTEMD_START_BARRIER_HELPER = INSTALLER_LIB / "systemd-start-barrier.py"
 IMPORT_TRANSACTION = INSTALLER_LIB / "install-linux-import-transaction.sh"
 SYSTEMD = ROOT / "crates" / "codexswitch-cli" / "systemd"
 RUNBOOK = ROOT / "docs" / "runbooks" / "linux-repository-deployment.md"
@@ -1067,7 +1068,9 @@ CLI
                  [ ! -e "$state_dir/concurrent-maintenance-attempted" ]; then
                 : > "$state_dir/concurrent-maintenance-attempted"
                 barrier="$runtime_control_dir/codexswitch.service.d/00-codexswitch-activation-guard.conf"
-                if [ -f "$barrier" ] && [ -e "$install_root/.activation.lock" ]; then
+                mask="$runtime_control_dir/codexswitch.service"
+                if { [ -f "$barrier" ] || { [ -L "$mask" ] && [ "$(readlink "$mask")" = /dev/null ]; }; } && \
+                   [ -e "$install_root/.activation.lock" ]; then
                   printf 'systemd-start-blocked\tcodexswitch.service\n' >> "$FAKE_TOOL_LOG"
                 else
                   : > "$state_dir/active/codexswitch.service"
@@ -1278,6 +1281,11 @@ PY
                 active_state=$observation
                 main_pid=0
                 fragment="$service_dir/signul-codex-app-server.service"
+                mask="$runtime_control_dir/signul-codex-app-server.service"
+                if [ -L "$mask" ] && [ "$(readlink "$mask")" = /dev/null ]; then
+                  printf 'LoadState=masked\nActiveState=inactive\nFragmentPath=/dev/null\nExecStart=\nMainPID=0\n'
+                  exit 0
+                fi
                 if [ ! -e "$fragment" ]; then
                   emit_missing_unit_observation "$observation"
                   exit 0
@@ -1308,21 +1316,52 @@ PY
                 exit 0
               fi
               case "$unit:$property" in
-                codexswitch.service:FragmentPath|signul-codex-app-server.service:FragmentPath)
-                  printf '%s/%s\n' "$service_dir" "$unit" ;;
-                codexswitch.service:DropInPaths)
-                  printf '%s' "$service_dir/codexswitch.service.d/10-maintenance-resources.conf"
-                  barrier="$runtime_control_dir/codexswitch.service.d/00-codexswitch-activation-guard.conf"
-                  [ ! -f "$barrier" ] || printf ' %s' "$barrier"
-                  printf '\n' ;;
-                signul-codex-app-server.service:DropInPaths)
-                  printf '%s' "$service_dir/signul-codex-app-server.service.d/10-runtime-resources.conf"
-                  barrier="$runtime_control_dir/signul-codex-app-server.service.d/00-codexswitch-activation-guard.conf"
-                  [ ! -f "$barrier" ] || printf ' %s' "$barrier"
-                  printf '\n' ;;
+                *:LoadState)
+                  mask="$runtime_control_dir/$unit"
+                  if [ -L "$mask" ] && [ "$(readlink "$mask")" = /dev/null ]; then
+                    load_state=masked
+                  elif [ -f "$service_dir/$unit" ]; then
+                    load_state=loaded
+                  else
+                    load_state=not-found
+                  fi
+                  printf 'systemd-load-state\t%s\t%s\n' "$unit" "$load_state" >> "$FAKE_TOOL_LOG"
+                  printf '%s\n' "$load_state"
+                  ;;
+                *:FragmentPath)
+                  mask="$runtime_control_dir/$unit"
+                  if [ -L "$mask" ] && [ "$(readlink "$mask")" = /dev/null ]; then
+                    printf '%s\n' /dev/null
+                  elif [ -f "$service_dir/$unit" ]; then
+                    printf '%s/%s\n' "$service_dir" "$unit"
+                  else
+                    printf '\n'
+                  fi
+                  ;;
                 *:DropInPaths)
+                  mask="$runtime_control_dir/$unit"
                   barrier="$runtime_control_dir/$unit.d/00-codexswitch-activation-guard.conf"
-                  [ ! -f "$barrier" ] || printf '%s\n' "$barrier" ;;
+                  if [ -L "$mask" ] && [ "$(readlink "$mask")" = /dev/null ]; then
+                    printf '\n'
+                  elif [ -f "$service_dir/$unit" ]; then
+                    separator=
+                    case "$unit" in
+                      codexswitch.service)
+                        printf '%s' "$service_dir/codexswitch.service.d/10-maintenance-resources.conf"
+                        separator=' '
+                        ;;
+                      signul-codex-app-server.service)
+                        printf '%s' "$service_dir/signul-codex-app-server.service.d/10-runtime-resources.conf"
+                        separator=' '
+                        ;;
+                    esac
+                    [ ! -f "$barrier" ] || printf '%s%s' "$separator" "$barrier"
+                    printf '\n'
+                  else
+                    # Real systemd ignores drop-ins for LoadState=not-found.
+                    printf '\n'
+                  fi
+                  ;;
                 codexswitch.service:Requires|signul-codex-app-server.service:Requires) echo 'basic.target app.slice' ;;
                 codexswitch.service:Conflicts|signul-codex-app-server.service:Conflicts) echo shutdown.target ;;
                 codexswitch.service:Before|signul-codex-app-server.service:Before) echo shutdown.target ;;
@@ -3166,6 +3205,148 @@ PY
         )
         self.assertFalse(barrier.exists())
         self._assert_no_runtime_action()
+
+    def test_not_found_units_use_masks_and_loaded_units_keep_conditions(self):
+        self._stage()
+        self.service_dir.mkdir(parents=True)
+        (self.service_dir / "codexswitch-daemon.service").write_text(
+            "[Service]\nExecStart=/bin/false\n"
+        )
+        self.tool_log.write_text("")
+
+        self._activate()
+
+        log = self.tool_log.read_text()
+        target_states = [
+            line.split("\t")[2]
+            for line in log.splitlines()
+            if line.startswith("systemd-load-state\tcodexswitch.service\t")
+        ]
+        legacy_states = [
+            line.split("\t")[2]
+            for line in log.splitlines()
+            if line.startswith(
+                "systemd-load-state\tcodexswitch-daemon.service\t"
+            )
+        ]
+        self.assertIn("masked", target_states)
+        self.assertEqual(target_states[-1], "loaded")
+        self.assertEqual(legacy_states[0], "loaded")
+        self.assertIn("masked", legacy_states)
+        self.assertFalse(
+            (
+                self.xdg_runtime_dir
+                / "systemd"
+                / "user.control"
+                / "codexswitch-daemon.service"
+            ).exists()
+        )
+
+    def test_start_barrier_reload_failure_cleans_masks_and_owner_manifest(self):
+        self._stage()
+        self.tool_log.write_text("")
+
+        result = self._activate(
+            extra_env={"FAKE_DAEMON_RELOAD_FAIL_AFTER": "1"},
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed to load systemd start barriers", result.stderr)
+        barrier_root = (
+            self.xdg_runtime_dir / "systemd" / "user.control"
+        )
+        if barrier_root.exists():
+            self.assertFalse(
+                any(
+                    entry.name.startswith(
+                        ".codexswitch-activation-guard-"
+                    )
+                    for entry in barrier_root.iterdir()
+                )
+            )
+            self.assertFalse(
+                any(
+                    entry.is_symlink() and os.readlink(entry) == "/dev/null"
+                    for entry in barrier_root.iterdir()
+                )
+            )
+        self.assertFalse((self.install_root / "current").exists())
+        self._assert_no_runtime_action()
+
+    def test_crashed_start_barrier_owner_is_recovered_before_next_activation(self):
+        self._stage()
+        self.tool_log.write_text("")
+
+        crashed = self._activate(
+            extra_env={
+                "CODEXSWITCH_TEST_MODE": "1",
+                "CODEXSWITCH_TEST_FAULT_POINT": "after_start_barriers",
+                "CODEXSWITCH_TEST_FAULT_MODE": "crash",
+            },
+            check=False,
+        )
+
+        self.assertLess(crashed.returncode, 0)
+        barrier_root = (
+            self.xdg_runtime_dir / "systemd" / "user.control"
+        )
+        self.assertTrue(
+            any(
+                entry.name.startswith(".codexswitch-activation-guard-")
+                for entry in barrier_root.iterdir()
+            )
+        )
+        self.assertTrue((self.install_root / ".activation.lock").is_file())
+
+        recovered = self._activate()
+
+        self.assertEqual(recovered.returncode, 0)
+        self.assertTrue((self.install_root / "current").is_symlink())
+        self.assertFalse((self.install_root / ".activation.lock").exists())
+        self.assertFalse(
+            any(
+                entry.name.startswith(".codexswitch-activation-guard-")
+                for entry in barrier_root.iterdir()
+            )
+        )
+        self.assertGreaterEqual(
+            self.tool_log.read_text().count(
+                "systemctl\t--user daemon-reload"
+            ),
+            4,
+        )
+
+    def test_stale_recovery_rejects_a_foreign_replacement_mask(self):
+        self._stage()
+        crashed = self._activate(
+            extra_env={
+                "CODEXSWITCH_TEST_MODE": "1",
+                "CODEXSWITCH_TEST_FAULT_POINT": "after_start_barriers",
+                "CODEXSWITCH_TEST_FAULT_MODE": "crash",
+            },
+            check=False,
+        )
+        self.assertLess(crashed.returncode, 0)
+        barrier_root = (
+            self.xdg_runtime_dir / "systemd" / "user.control"
+        )
+        mask = barrier_root / "codexswitch-daemon.service"
+        self.assertTrue(mask.is_symlink())
+        mask.unlink()
+        mask.symlink_to("/dev/null")
+
+        result = self._activate(check=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "systemd start barrier public identity changed",
+            result.stderr,
+        )
+        self.assertTrue(mask.is_symlink())
+        self.assertEqual(os.readlink(mask), "/dev/null")
+        self.assertTrue((self.install_root / ".activation.lock").is_file())
+        self.assertFalse((self.install_root / "current").exists())
 
     def test_runtime_guard_symlink_is_rejected_without_following_it(self):
         self._stage()

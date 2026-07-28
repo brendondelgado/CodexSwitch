@@ -13,7 +13,15 @@ unit = sys.argv[1]
 fragment = Path(sys.argv[2])
 timeout_seconds = int(sys.argv[3])
 output_limit = int(sys.argv[4])
-expected_argv = sys.argv[5:]
+remaining_arguments = sys.argv[5:]
+activation_mask = None
+if remaining_arguments[:1] == ["--activation-mask"]:
+    if len(remaining_arguments) < 3:
+        raise SystemExit("activation mask arguments are incomplete")
+    if remaining_arguments[1]:
+        activation_mask = Path(remaining_arguments[1])
+    remaining_arguments = remaining_arguments[2:]
+expected_argv = remaining_arguments
 
 def result(state: str, reason: str) -> None:
     print(f"{state}\t{reason}")
@@ -23,6 +31,21 @@ if not fragment.is_absolute() or Path(os.path.realpath(fragment)) != fragment:
     result("unknown", "fragment-canonical-drift")
 if not expected_argv or not os.path.isabs(expected_argv[0]):
     result("unknown", "expected-execstart-invalid")
+if activation_mask is not None:
+    if (
+        not activation_mask.is_absolute()
+        or Path(os.path.realpath(activation_mask.parent)) != activation_mask.parent
+    ):
+        result("unknown", "activation-mask-canonical-drift")
+    try:
+        mask_metadata = activation_mask.lstat()
+    except OSError as error:
+        result("unknown", f"activation-mask-inspection:{error.__class__.__name__}")
+    if (
+        not stat.S_ISLNK(mask_metadata.st_mode)
+        or os.readlink(activation_mask) != "/dev/null"
+    ):
+        result("unknown", "activation-mask-identity-drift")
 try:
     metadata = fragment.lstat()
 except FileNotFoundError:
@@ -100,6 +123,18 @@ main_pid = properties["MainPID"]
 if not main_pid.isascii() or not main_pid.isdecimal():
     result("unknown", "main-pid-malformed")
 if fragment_absent:
+    if activation_mask is not None:
+        if properties["LoadState"] != "masked":
+            result("unknown", f"activation-mask-load-state-{properties['LoadState']}")
+        if properties["ActiveState"] != "inactive":
+            result("unknown", f"activation-mask-active-state-{properties['ActiveState']}")
+        if properties["FragmentPath"] != "/dev/null":
+            result("unknown", "activation-mask-fragment-drift")
+        if properties["ExecStart"]:
+            result("unknown", "activation-mask-execstart-present")
+        if main_pid != "0":
+            result("unknown", "activation-mask-main-pid")
+        result("inactive", "exact-activation-mask")
     if properties["LoadState"] != "not-found":
         result("unknown", f"missing-fragment-load-state-{properties['LoadState']}")
     if properties["ActiveState"] != "inactive":

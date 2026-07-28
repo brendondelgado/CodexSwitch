@@ -1,11 +1,20 @@
 # shellcheck shell=bash
 # Keep installer ownership observation aligned with the reviewed checked-in unit.
 observe_managed_systemd_owner() {
+  local activation_mask=""
+
+  if [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "1" ]] && \
+     awk -F '\t' -v unit="$MANAGED_APP_SERVER_UNIT" \
+       '$1 == unit && $2 == "mask" { found=1 } END { exit(found ? 0 : 1) }' \
+       <<< "$SYSTEMD_START_BARRIER_MODES"; then
+    activation_mask="$(systemd_start_mask_path "$MANAGED_APP_SERVER_UNIT")"
+  fi
   python3 "$RUNTIME_OBSERVER_HELPER_ROOT/observe-managed-systemd.py" \
     "$MANAGED_APP_SERVER_UNIT" \
     "$SERVICE_DIR/$MANAGED_APP_SERVER_UNIT" \
     "$RUNTIME_OBSERVATION_TIMEOUT_SECONDS" \
     "$STATE_FILE_MAX_BYTES" \
+    --activation-mask "$activation_mask" \
     /usr/bin/flock --shared --no-fork \
     "$RUNTIME_START_INSTALL_GUARD" \
     /usr/bin/flock --exclusive --nonblock --no-fork \
@@ -23,187 +32,14 @@ reconcile_stale_systemd_start_barriers() {
   [[ -e "$ACTIVATION_LOCK_FILE" || -L "$ACTIVATION_LOCK_FILE" ]] || return 0
   barrier_root="$(systemd_start_barrier_root)" || fail "failed to resolve the systemd start barrier root"
   units="$(activation_blocking_systemd_units)" || fail "failed to load the systemd start barrier contract"
-  result="$(python3 - \
-    "$INSTALL_ROOT" "$ACTIVATION_LOCK_FILE" "$barrier_root" "$PROC_ROOT" \
-    "$STATE_FILE_MAX_BYTES" "$units" <<'PY'
-import fcntl
-import os
-import re
-import stat
-import sys
-from pathlib import Path
-
-install_root = Path(sys.argv[1])
-lock_path = Path(sys.argv[2])
-barrier_root = Path(sys.argv[3])
-proc_root = Path(sys.argv[4])
-read_limit = int(sys.argv[5])
-units = [value for value in sys.argv[6].splitlines() if value]
-
-
-def read_regular(path: Path):
-    try:
-        before = path.lstat()
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        return None
-    if before.st_size <= 0 or before.st_size > read_limit:
-        return None
-    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    try:
-        opened = os.fstat(descriptor)
-        identity = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_size)
-        expected_identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_size,
-        )
-        if identity != expected_identity:
-            raise SystemExit(f"stale activation owner changed identity: {path}")
-        data = os.read(descriptor, read_limit + 1)
-        if len(data) > read_limit or os.read(descriptor, 1):
-            raise SystemExit(f"stale activation owner exceeds read bound: {path}")
-    finally:
-        os.close(descriptor)
-    return identity, data
-
-
-def parse_owner(record):
-    if record is None:
-        return None
-    _identity, data = record
-    try:
-        lines = data.decode("utf-8").splitlines()
-    except UnicodeDecodeError:
-        return None
-    fields = {}
-    for line in lines:
-        parts = line.split("\t", 1)
-        if len(parts) != 2 or parts[0] in fields:
-            return None
-        fields[parts[0]] = parts[1]
-    if set(fields) != {"format", "pid", "start", "token"}:
-        return None
-    if fields["format"] != "codexswitch-activation-lock-v1":
-        return None
-    if re.fullmatch(r"[1-9][0-9]*", fields["pid"]) is None:
-        return None
-    if re.fullmatch(r"(?:UNKNOWN|[0-9]+)", fields["start"]) is None:
-        return None
-    if re.fullmatch(r"[0-9a-f]{32}", fields["token"]) is None:
-        return None
-    return fields
-
-
-def owner_is_live(owner) -> bool:
-    pid = int(owner["pid"])
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    if owner["start"] == "UNKNOWN":
-        return True
-    try:
-        value = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, PermissionError, OSError):
-        return False
-    fields = value[value.rfind(")") + 2 :].split()
-    observed = fields[19] if len(fields) > 19 else "UNKNOWN"
-    return observed == owner["start"]
-
-
-if not install_root.is_absolute() or Path(os.path.realpath(install_root)) != install_root:
-    raise SystemExit("activation mutex root is not canonical")
-if not barrier_root.is_absolute() or Path(os.path.realpath(barrier_root)) != barrier_root:
-    raise SystemExit("systemd start barrier root is not canonical")
-if not units or len(units) != len(set(units)):
-    raise SystemExit("systemd start barrier unit contract is invalid")
-
-mutex = os.open(
-    install_root,
-    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-)
-try:
-    fcntl.flock(mutex, fcntl.LOCK_EX)
-    lock_record = read_regular(lock_path)
-    owner = parse_owner(lock_record)
-    if owner is None:
-        print("unverified")
-        raise SystemExit(0)
-    if owner_is_live(owner):
-        print("live")
-        raise SystemExit(0)
-
-    barriers = [
-        barrier_root / f"{unit}.d" / "00-codexswitch-activation-guard.conf"
-        for unit in units
-    ]
-    present = [os.path.lexists(path) for path in barriers]
-    if not any(present):
-        print("absent")
-        raise SystemExit(0)
-    if not all(present):
-        raise SystemExit("stale systemd start barrier set is incomplete")
-
-    expected = (
-        "# codexswitch-activation-start-barrier-v1\n"
-        f"# owner_pid={owner['pid']}\n"
-        f"# owner_start={owner['start']}\n"
-        f"# owner_token={owner['token']}\n"
-        "[Unit]\n"
-        f"ConditionPathExists=!{lock_path}\n"
-    ).encode("utf-8")
-    identities = {}
-    for path in barriers:
-        parent = path.parent
-        metadata = parent.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise SystemExit(f"stale systemd start barrier parent is unsafe: {parent}")
-        if Path(os.path.realpath(parent)) != parent:
-            raise SystemExit(f"stale systemd start barrier parent is not canonical: {parent}")
-        record = read_regular(path)
-        if record is None or record[1] != expected:
-            raise SystemExit(f"stale systemd start barrier ownership changed: {path}")
-        identities[path] = record[0]
-
-    if read_regular(lock_path) != lock_record:
-        raise SystemExit("stale activation owner changed before barrier removal")
-    for path in barriers:
-        metadata = path.lstat()
-        identity = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size)
-        if identity != identities[path]:
-            raise SystemExit(f"stale systemd start barrier changed identity: {path}")
-    for path in barriers:
-        path.unlink()
-        directory = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-        try:
-            path.parent.rmdir()
-        except OSError:
-            pass
-    root_descriptor = os.open(
-        barrier_root,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
-    try:
-        os.fsync(root_descriptor)
-    finally:
-        os.close(root_descriptor)
-    print("removed")
-finally:
-    os.close(mutex)
-PY
-)" || fail "stale systemd start barrier reconciliation failed"
+  result="$(systemd_start_barrier_helper reconcile \
+    --install-root "$INSTALL_ROOT" \
+    --activation-lock "$ACTIVATION_LOCK_FILE" \
+    --root "$barrier_root" \
+    --proc-root "$PROC_ROOT" \
+    --units "$units" \
+    --read-limit "$STATE_FILE_MAX_BYTES")" || \
+    fail "stale systemd start barrier reconciliation failed"
 
   case "$result" in
     absent|live|unverified) return 0 ;;

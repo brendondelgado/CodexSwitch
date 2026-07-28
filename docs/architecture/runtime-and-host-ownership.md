@@ -55,6 +55,7 @@ cross_dependencies:
   - ../../scripts/codex-vps
   - ../../scripts/patch-asar.py
   - ../../scripts/test_patch_asar.py
+  - ../../scripts/lib/systemd-start-barrier.py
   - macos-runtime-discovery.md
   - macos-runtime-artifact.md
   - system-overview.md
@@ -1208,6 +1209,23 @@ actor boundary on every supported Swift 6 toolchain.
 - Activation occurs only through the deployment runbook after readiness and
   deployment-quiescence checks. Quiescence does not relax the runtime ACK
   contract.
+- Linux activation prevents a systemd start race with a manager-visible,
+  token-owned barrier for every activation-blocking unit. A loaded unit uses a
+  false condition drop-in. A `LoadState=not-found` unit uses an exact runtime
+  mask to `/dev/null`, because systemd does not merge a drop-in into an absent
+  unit and therefore does not report that drop-in in `DropInPaths`.
+- Barrier publication retains a private inode anchor and an owner manifest
+  bound to the activation-lock PID, start identity, and token. Cleanup,
+  rollback, commit, and dead-owner recovery remove a public drop-in or mask
+  only when its filesystem identity still matches that anchor. Partial
+  publication is recoverable; a linked, replaced, unowned, or foreign artifact
+  is preserved and blocks for review.
+- Loaded units that will remain installed keep condition drop-ins. A loaded
+  obsolete unit transitions from its condition to an exact mask before its
+  persistent fragment is removed. A first-install target transitions from its
+  mask to a condition after the owned fragment is installed. Each transition
+  preserves the old manager state until the same `daemon-reload` makes the new
+  barrier effective, so no startable interval is introduced.
 
 ## Remote Session Contract
 
