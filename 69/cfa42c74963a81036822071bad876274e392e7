@@ -1,0 +1,27 @@
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_5e943329e94b6f 1293-1297
+scripts/lib/install-linux-systemd-policy.sh
+  s_70c8e194852bb5::t_5e943329e94b6f 248-250
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_5e943329e94b6f 74,632-636
+scripts/lib/observe-managed-systemd.py
+  s_70c8e194852bb5::t_5e943329e94b6f 131
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_5e943329e94b6f 1286-1291,1339-1343
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "69cfa42c74963a81036822071bad876274e392e7",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
