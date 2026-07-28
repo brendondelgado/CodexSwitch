@@ -1504,7 +1504,9 @@ Every future hot-swap change must include tests for:
 - Prepared-generation retention cannot remove a generation while a live
   `codex` or `codex-code-mode-host` process holds its executable path/inode or
   shared runtime lease. Tests cover both executable names, inode replacement,
-  inventory failure before mutation, and the launch-versus-delete lease race.
+  inventory failure before mutation, the launch-versus-delete lease race, and
+  an already-unlinked historical attempt whose live mapped executable no longer
+  has an on-disk generation to retain.
 - Artifact scans stop at deterministic entry/time/memory budgets, generated
   request readers cap bytes before allocation, and reset-journal tests prove
   descriptor-anchored generation CAS, exact readback, symlink rejection, and

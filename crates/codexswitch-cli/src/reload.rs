@@ -480,12 +480,25 @@ pub(crate) fn discover_live_prepared_runtime_executables(
 
     let mut identities = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let process = enrich_macos_process_identity(candidate.clone()).with_context(|| {
-            format!(
-                "live Codex pid {} could not be classified before prepared runtime retention",
-                candidate.pid
-            )
-        })?;
+        if !prepared_runtime_executable_path(&candidate.executable, &canonical_root) {
+            continue;
+        }
+        let process = match enrich_macos_process_identity(candidate.clone()) {
+            Some(process) => process,
+            None if unlinked_prepared_runtime_generation_is_absent(
+                &candidate.executable,
+                &canonical_root,
+            )? =>
+            {
+                continue;
+            }
+            None => {
+                bail!(
+                    "live Codex pid {} could not be classified before prepared runtime retention",
+                    candidate.pid
+                )
+            }
+        };
         if !prepared_runtime_executable_path(&process.executable, &canonical_root) {
             continue;
         }
@@ -520,6 +533,38 @@ fn prepared_runtime_process_candidate(path: &Path) -> bool {
 #[cfg(target_os = "macos")]
 fn prepared_runtime_executable_path(path: &Path, prepared_root: &Path) -> bool {
     path.starts_with(prepared_root) && prepared_runtime_process_candidate(path)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn unlinked_prepared_runtime_generation_is_absent(
+    executable: &Path,
+    prepared_root: &Path,
+) -> Result<bool> {
+    if !prepared_runtime_executable_path(executable, prepared_root) {
+        return Ok(false);
+    }
+    let Some(generation) = executable.parent() else {
+        return Ok(false);
+    };
+    let valid_attempt_shape = generation
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(|parent| parent == prepared_root)
+        && generation.file_name().is_some()
+        && generation.parent().and_then(Path::file_name).is_some();
+    if !valid_attempt_shape {
+        return Ok(false);
+    }
+    match fs::symlink_metadata(generation) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect unclassifiable prepared runtime generation {}",
+                generation.display()
+            )
+        }),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4857,6 +4902,42 @@ mod tests {
         };
 
         assert!(!process_identity_matches(&expected, &reused));
+    }
+
+    #[test]
+    fn absent_attempt_generation_does_not_block_prepared_runtime_retention() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let prepared_root = dir.path().join("prepared-codex");
+        fs::create_dir_all(prepared_root.join("0.144.4"))?;
+        let executable = prepared_root.join("0.144.4/removed-attempt/codex");
+
+        assert!(unlinked_prepared_runtime_generation_is_absent(
+            &executable,
+            &prepared_root
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_or_unrelated_generation_still_blocks_unclassifiable_runtime() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let prepared_root = dir.path().join("prepared-codex");
+        let existing = prepared_root.join("0.144.4/existing-attempt");
+        fs::create_dir_all(&existing)?;
+
+        assert!(!unlinked_prepared_runtime_generation_is_absent(
+            &existing.join("codex"),
+            &prepared_root
+        )?);
+        assert!(!unlinked_prepared_runtime_generation_is_absent(
+            &prepared_root.join("0.144.4/codex"),
+            &prepared_root
+        )?);
+        assert!(!unlinked_prepared_runtime_generation_is_absent(
+            &dir.path().join("outside/0.144.4/removed-attempt/codex"),
+            &prepared_root
+        )?);
+        Ok(())
     }
 
     #[test]

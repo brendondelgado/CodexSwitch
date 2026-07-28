@@ -23,7 +23,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-13
+  last_updated: 2026-07-28
 ---
 
 # macOS CLI Launcher
@@ -134,6 +134,15 @@ launchers. A shared lease or matching live `codex` /
 `codex-code-mode-host` mapping protects the complete generation. Inventory or
 lease uncertainty fails before any retention mutation. This closes both the
 already-running case and the launch-versus-retention race.
+
+A historical process may outlive an attempt directory that an older updater
+already unlinked. macOS then keeps the mapped executable alive while
+`proc_pidpath` returns `ENOENT`. Retention may ignore that process only when its
+command path names a valid attempt beneath the canonical prepared root and the
+exact attempt directory is proven absent with a no-follow metadata check.
+There is no remaining on-disk generation to protect. An existing attempt,
+unexpected path shape, or metadata error remains a fail-closed inventory
+failure.
 
 ## Repair And Verification
 
