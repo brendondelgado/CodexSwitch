@@ -1,0 +1,29 @@
+Tests/CodexSwitchTests/RateLimitResetServiceTests.swift
+  s_70c8e194852bb5::t_0d23682e301350 2214,2217-2219
+  s_70c8e194852bb5::t_74a3a012641a56 2215
+Tests/CodexSwitchTests/ReliabilityPolicyTests.swift
+  s_70c8e194852bb5::t_0d23682e301350 121-123,422-424
+Tests/CodexSwitchTests/AccountManagerTests.swift
+  s_70c8e194852bb5::t_0d23682e301350 15-16,19,27,32,34,85,107
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_0d23682e301350 319-321,361
+  s_70c8e194852bb5::t_d1813d5c430c94 255,257,259
+Tests/CodexSwitchTests/TestInferenceToken.swift
+  s_70c8e194852bb5::t_0d23682e301350 1-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "d0cefbf76977415e257488e34b91ac5ebc384044",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
