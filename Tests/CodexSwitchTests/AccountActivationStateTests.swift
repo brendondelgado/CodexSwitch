@@ -528,6 +528,74 @@ struct AccountActivationStateTests {
         #expect(failed.automaticRetryTarget(at: now.addingTimeInterval(40)) == target)
     }
 
+    @Test("Final topology revalidation failure advances backoff and preserves evidence")
+    func finalTopologyRevalidationFailureAdvancesBackoff() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let target = UUID()
+        let generation = UUID()
+        let blocker = CodexRuntimeDiscoveryBlocker(
+            pid: 34_449,
+            reason: .kernelExecutableUnavailable
+        )
+        let now = Date(timeIntervalSince1970: 1_800_000_625)
+        let coordinator = AccountActivationCoordinator(
+            url: url,
+            baseRetryInterval: 10,
+            maximumRetryInterval: 40
+        )
+
+        _ = try await coordinator.beginPreparing(
+            targetAccountId: target,
+            kind: .automatic,
+            requestedActivationGeneration: generation,
+            at: now
+        )
+        _ = try await coordinator.markCommittedDegraded(
+            targetAccountId: target,
+            discoveredRuntimeCount: 3,
+            acknowledgedRuntimeCount: 2,
+            detail: .runtimeConfirmationPending,
+            runtimeBlockers: [blocker],
+            at: now
+        )
+
+        let failedAt = now.addingTimeInterval(1)
+        let failed = try await coordinator.recordRuntimeRevalidationFailure(
+            targetAccountId: target,
+            expectedActivationGeneration: generation,
+            authorizeEffect: { _ in true },
+            at: failedAt
+        )
+
+        #expect(failed.phase == .committedDegraded)
+        #expect(failed.runtimeCurrentAccountId == nil)
+        #expect(failed.detail == .runtimeConfirmationPending)
+        #expect(failed.activationGeneration == generation)
+        #expect(failed.retryAttempt == 1)
+        #expect(failed.discoveredRuntimeCount == 3)
+        #expect(failed.acknowledgedRuntimeCount == 2)
+        #expect(failed.convergenceBlockers == [blocker])
+        #expect(failed.nextRetryAt == failedAt.addingTimeInterval(10))
+        #expect(failed.automaticRetryTarget(
+            at: failedAt.addingTimeInterval(9.999)
+        ) == nil)
+        #expect(failed.automaticRetryTarget(
+            at: failedAt.addingTimeInterval(10)
+        ) == target)
+
+        let persistedBytes = try Data(contentsOf: url)
+        await #expect(throws: AccountActivationCoordinatorError.authorizationRevoked) {
+            try await coordinator.recordRuntimeRevalidationFailure(
+                targetAccountId: target,
+                expectedActivationGeneration: generation,
+                authorizeEffect: { _ in false },
+                at: failedAt.addingTimeInterval(20)
+            )
+        }
+        #expect(try Data(contentsOf: url) == persistedBytes)
+    }
+
     @Test("Legacy retry-limit review migrates without granting confirmation")
     func legacyRetryLimitReviewMigratesToRecoverableDegraded() async throws {
         let url = temporaryJournalURL()

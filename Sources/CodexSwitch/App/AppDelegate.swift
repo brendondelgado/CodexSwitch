@@ -7488,6 +7488,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         swapConvergenceTask = nil
     }
 
+    private enum RuntimeRevalidationFailurePersistence: String {
+        case recorded
+        case recordedNotPublished = "recorded_not_published"
+        case authorizationLost = "authorization_lost"
+        case stateChanged = "state_changed"
+        case failed
+    }
+
+    private func persistRuntimeRevalidationFailure(
+        target: CodexAccount,
+        prepared: PreparedAccountActivation,
+        operationAuthority: PoolAuthorityOperationAuthority?
+    ) async -> RuntimeRevalidationFailurePersistence {
+        guard let degraded = accountManager.activationState,
+              degraded.phase == .committedDegraded,
+              degraded.configuredAccountId == target.id,
+              degraded.activationGeneration == prepared.activationGeneration else {
+            return .stateChanged
+        }
+        guard operationAuthority?.authorizes() ?? true,
+              let failurePermit = await activationEffectPermit(
+                prepared,
+                targetAccountId: target.id,
+                requiredPhase: .committedDegraded,
+                configuredAccountId: target.id
+              ),
+              operationAuthority?.authorizes() ?? true else {
+            return .authorizationLost
+        }
+
+        do {
+            let failed = try await accountActivationCoordinator
+                .recordRuntimeRevalidationFailure(
+                    targetAccountId: target.id,
+                    expectedActivationGeneration: prepared.activationGeneration,
+                    authorizeEffect: { state in
+                        (operationAuthority?.authorizes() ?? true)
+                            && failurePermit.authorizes(
+                                state: state,
+                                at: Date()
+                            )
+                    }
+                )
+            guard operationAuthority?.authorizes() ?? true,
+                  await activationWorkIsCurrent(
+                    prepared,
+                    targetAccountId: target.id,
+                    operationAuthority: operationAuthority
+                  ) else {
+                return .recordedNotPublished
+            }
+            accountManager.publishActivationState(failed)
+            return .recorded
+        } catch {
+            let authorityIsCurrent = operationAuthority?.authorizes() ?? true
+            let activationIsCurrent: Bool
+            if authorityIsCurrent {
+                activationIsCurrent = await activationWorkIsCurrent(
+                    prepared,
+                    targetAccountId: target.id,
+                    operationAuthority: operationAuthority
+                )
+            } else {
+                activationIsCurrent = false
+            }
+
+            let failure: RuntimeRevalidationFailurePersistence
+            switch error as? AccountActivationCoordinatorError {
+            case .authorizationRevoked?:
+                failure = .authorizationLost
+            case .invalidTransition?:
+                failure = .stateChanged
+            default:
+                failure = authorityIsCurrent ? .failed : .authorizationLost
+                if activationIsCurrent {
+                    await enterActivationManualReview(
+                        targetAccountId: target.id,
+                        detail: .runtimeEvidencePersistFailed
+                    )
+                }
+            }
+            SwapLog.append(.debug(
+                "SWAP_CONFIRMATION_FAILURE_PERSIST_FAILED target=\(target.email) outcome=\(failure.rawValue) error=\(error.localizedDescription)"
+            ))
+            return failure
+        }
+    }
+
     private func finishSwapRuntimeConvergence(
         from: CodexAccount,
         to: CodexAccount,
@@ -7703,10 +7791,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     swapConvergenceTask = nil
                     return
                 case .blocked(.runtimeRevalidation):
+                    let failurePersistence =
+                        await persistRuntimeRevalidationFailure(
+                            target: to,
+                            prepared: prepared,
+                            operationAuthority: operationAuthority
+                        )
                     pendingSwapTargetAccountId = nil
                     swapConvergenceTask = nil
                     SwapLog.append(.debug(
-                        "SWAP_CONFIRMATION_BLOCKED target=\(to.email) reason=runtime_topology_changed_before_publish"
+                        "SWAP_CONFIRMATION_BLOCKED target=\(to.email) reason=runtime_topology_changed_before_publish failure_persistence=\(failurePersistence.rawValue)"
                     ))
                     return
                 case .blocked(.journalPersistence):

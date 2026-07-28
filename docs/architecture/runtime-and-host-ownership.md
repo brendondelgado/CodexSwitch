@@ -509,6 +509,16 @@ and proves that at least one expected live local runtime still reports the targe
 with complete evidence. A changed or unreadable durable source, missing runtime,
 incomplete discovery, stale snapshot, or generation change cannot be confirmed.
 
+If the runtime topology changes during final confirmation revalidation, the
+same operation must persist a convergence failure before releasing its pending
+target. The transition retains the current degraded journal's activation
+generation, typed blockers, and discovered/acknowledged counts, increments its
+saturating retry counter, and advances `nextRetryAt` through capped backoff.
+Both the pool-operation authority and activation-effect permit are rechecked
+under the journal transaction. Authorization loss changes no journal bytes;
+an authorized persistence failure remains fail-closed. The monitor cannot start
+another reload or signal attempt before the new deadline.
+
 Immediately before every automatic swap, plan-upgrade activation, active-token
 refresh effect, reset-redemption decision, and reset POST, the owner obtains a
 new verified-local-runtime snapshot. One typed permit binds that evidence to the

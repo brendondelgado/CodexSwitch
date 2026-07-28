@@ -337,27 +337,75 @@ actor AccountActivationCoordinator {
                     "runtime failure does not match committed activation"
                 )
             }
-            let nextAttempt = min(
-                current.retryAttempt + 1,
-                Self.maximumRetryAttempt
-            )
-            let delay = Self.retryDelay(
-                attempt: nextAttempt,
-                base: baseRetryInterval,
-                maximum: maximumRetryInterval
-            )
-            return .committedDegraded(
+            return advancingConvergenceFailure(
+                current: current,
                 targetAccountId: targetAccountId,
                 detail: detail,
-                activationGeneration: current.activationGeneration,
-                retryAttempt: nextAttempt,
-                nextRetryAt: date.addingTimeInterval(delay),
                 discoveredRuntimeCount: discoveredRuntimeCount,
                 acknowledgedRuntimeCount: acknowledgedRuntimeCount,
                 runtimeBlockers: runtimeBlockers,
                 at: date
             )
         }
+    }
+
+    @discardableResult
+    func recordRuntimeRevalidationFailure(
+        targetAccountId: UUID,
+        expectedActivationGeneration: UUID,
+        authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
+        at date: Date = Date()
+    ) throws -> AccountActivationState {
+        try transition(authorizeEffect: authorizeEffect) { current in
+            guard let current,
+                  current.phase == .committedDegraded,
+                  current.configuredAccountId == targetAccountId,
+                  current.activationGeneration == expectedActivationGeneration else {
+                throw AccountActivationCoordinatorError.invalidTransition(
+                    "runtime revalidation failure does not match committed activation"
+                )
+            }
+            return advancingConvergenceFailure(
+                current: current,
+                targetAccountId: targetAccountId,
+                detail: .runtimeConfirmationPending,
+                discoveredRuntimeCount: current.discoveredRuntimeCount,
+                acknowledgedRuntimeCount: current.acknowledgedRuntimeCount,
+                runtimeBlockers: current.convergenceBlockers,
+                at: date
+            )
+        }
+    }
+
+    private func advancingConvergenceFailure(
+        current: AccountActivationState,
+        targetAccountId: UUID,
+        detail: AccountActivationDetail,
+        discoveredRuntimeCount: Int,
+        acknowledgedRuntimeCount: Int,
+        runtimeBlockers: Set<CodexRuntimeDiscoveryBlocker>,
+        at date: Date
+    ) -> AccountActivationState {
+        let nextAttempt = min(
+            current.retryAttempt + 1,
+            Self.maximumRetryAttempt
+        )
+        let delay = Self.retryDelay(
+            attempt: nextAttempt,
+            base: baseRetryInterval,
+            maximum: maximumRetryInterval
+        )
+        return .committedDegraded(
+            targetAccountId: targetAccountId,
+            detail: detail,
+            activationGeneration: current.activationGeneration,
+            retryAttempt: nextAttempt,
+            nextRetryAt: date.addingTimeInterval(delay),
+            discoveredRuntimeCount: discoveredRuntimeCount,
+            acknowledgedRuntimeCount: acknowledgedRuntimeCount,
+            runtimeBlockers: runtimeBlockers,
+            at: date
+        )
     }
 
     private func migrateLegacyRetryLimitReview(

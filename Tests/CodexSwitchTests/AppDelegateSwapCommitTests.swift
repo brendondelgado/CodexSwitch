@@ -457,6 +457,41 @@ struct AppDelegateSwapCommitTests {
         #expect(persistenceCalls.read() == 0)
     }
 
+    @Test("Final runtime topology rejection routes through durable retry backoff")
+    func runtimeRevalidationFailureUsesCoordinator() throws {
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/App/AppDelegate.swift",
+            encoding: .utf8
+        )
+        let start = try #require(
+            source.range(of: "case .blocked(.runtimeRevalidation):")
+        )
+        let end = try #require(
+            source.range(
+                of: "case .blocked(.journalPersistence):",
+                range: start.upperBound..<source.endIndex
+            )
+        )
+        let branch = source[start.lowerBound..<end.lowerBound]
+        let helperStart = try #require(
+            source.range(of: "private func persistRuntimeRevalidationFailure(")
+        )
+        let helperEnd = try #require(
+            source.range(
+                of: "private func finishSwapRuntimeConvergence(",
+                range: helperStart.upperBound..<source.endIndex
+            )
+        )
+        let helper = source[helperStart.lowerBound..<helperEnd.lowerBound]
+
+        #expect(branch.contains("persistRuntimeRevalidationFailure("))
+        #expect(helper.contains(".recordRuntimeRevalidationFailure("))
+        #expect(helper.contains("expectedActivationGeneration: prepared"))
+        #expect(helper.contains("operationAuthority?.authorizes()"))
+        #expect(helper.contains("failurePermit.authorizes("))
+        #expect(helper.contains("accountManager.publishActivationState(failed)"))
+    }
+
     @Test("Auth readback verifies the complete token set")
     func authReadbackVerifiesCompleteTokenSet() throws {
         let account = makeAccount()

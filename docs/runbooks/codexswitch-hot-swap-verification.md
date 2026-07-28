@@ -458,6 +458,13 @@ confirmation or degraded journal update succeeds under the original
 cross-process lease. The convergence implementation must not use a detached
 task.
 
+Change the verified runtime topology after final confirmation authorization but
+before journal publication. Confirmation must remain fail-closed, and the same
+authorized operation must record one convergence failure on the existing
+generation while preserving its typed blockers and runtime counts. Verify the
+attempt counter and `nextRetryAt` advance, then run monitor ticks before that
+deadline and prove they produce no reload, SIGHUP, or additional journal write.
+
 Force more than four consecutive discovery or acknowledgement failures for the
 same activation generation. Every result must remain `CommittedDegraded`, the
 attempt counter must increase until its schema bound and then saturate, and
