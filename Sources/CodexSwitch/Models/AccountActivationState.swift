@@ -34,16 +34,7 @@ enum AccountActivationDetail: String, Codable, Equatable, Sendable {
     case fileCommitFailed = "activation_file_commit_failed"
 
     var allowsManualSameTargetRetry: Bool {
-        switch self {
-        case .automaticRetryLimitReached, .durableConfigurationChanged:
-            return true
-        default:
-            return false
-        }
-    }
-
-    var allowsManualCrossTargetEscape: Bool {
-        self == .automaticRetryLimitReached
+        self == .durableConfigurationChanged
     }
 
     var allowsLaunchSameTargetRecovery: Bool {
@@ -161,9 +152,6 @@ struct AccountActivationState: Codable, Equatable, Sendable {
                 if configuredAccountId == accountId,
                    detail.allowsManualSameTargetRetry {
                     return .retrySameTarget
-                }
-                if detail.allowsManualCrossTargetEscape {
-                    return .beginActivation
                 }
             }
             return .blocked("Mac activation state needs manual review; account changes are paused")

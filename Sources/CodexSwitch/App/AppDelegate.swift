@@ -243,7 +243,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     nonisolated static let rateLimitResetDecisionFreshnessInterval: TimeInterval = 60
     nonisolated static let configMaintenanceInterval: TimeInterval = 15 * 60
     nonisolated static let linuxDevboxCredentialSyncRetryDelay: TimeInterval = 5
-    nonisolated static let retryExhaustedTopologyCheckInterval: TimeInterval = 15
     nonisolated static let automaticPolicyGateTimeout: TimeInterval = 30
 
     // Set in applicationDidFinishLaunching before any other access
@@ -373,9 +372,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var automaticPolicyGateTask: Task<Void, Never>?
     private var automaticPolicyGateWatchdogTask: Task<Void, Never>?
     private var automaticPolicyLeaseState = AccountAutomaticPolicyLeaseState()
-    private var retryExhaustedTopologyCheckTask: Task<Void, Never>?
-    private var lastRetryExhaustedTopologyCheckAt: Date?
-    private var retryExhaustedTopologyBaseline: RetryExhaustedTopologyBaseline?
     private var quotaPollingReconciliationTask: Task<Void, Never>?
     private var isExiting = false
     private var terminationFlushTask: Task<Void, Never>?
@@ -537,7 +533,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.scheduleGlobalCLIRepairIfNeeded()
                     self?.scheduleAutomaticCodexUpdateIfNeeded()
                     self?.scheduleCodexBrowserSessionRepairIfNeeded()
-                    self?.scheduleRetryExhaustedTopologyRecoveryIfNeeded()
                     self?.reconcileQuotaPollingIfNeeded()
                     CLIStatusChecker.refresh(activeAccountId: self?.accountManager.configuredAccount?.accountId) { [weak self] in
                         self?.updatePopoverContent()
@@ -7202,67 +7197,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         await startSameTargetRuntimeRetry(to: target, source: "launch_recovery")
     }
 
-    private func scheduleRetryExhaustedTopologyRecoveryIfNeeded(
-        at date: Date = Date()
-    ) {
-        guard !isExiting,
-              retryExhaustedTopologyCheckTask == nil,
-              pendingSwapTargetAccountId == nil,
-              swapConvergenceTask == nil,
-              accountManager.activationState?.phase == .manualReview,
-              accountManager.activationState?.detail == .automaticRetryLimitReached,
-              lastRetryExhaustedTopologyCheckAt.map({
-                  date.timeIntervalSince($0) >= Self.retryExhaustedTopologyCheckInterval
-              }) ?? true else {
-            return
-        }
-        lastRetryExhaustedTopologyCheckAt = date
-        retryExhaustedTopologyCheckTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.retryExhaustedTopologyCheckTask = nil }
-            let topology = await Task.detached(priority: .utility) {
-                SwapEngine.localCLIRuntimeTopology()
-            }.value
-            guard !Task.isCancelled,
-                  !self.isExiting,
-                  self.pendingSwapTargetAccountId == nil,
-                  self.swapConvergenceTask == nil else {
-                return
-            }
-
-            let decision = Self.retryExhaustedTopologyDecision(
-                state: self.accountManager.activationState,
-                configuredAccountId: self.accountManager.configuredAccount?.id,
-                topology: topology,
-                baseline: self.retryExhaustedTopologyBaseline
-            )
-            switch decision {
-            case .captureBaseline(let baseline):
-                self.retryExhaustedTopologyBaseline = baseline
-                SwapLog.append(.debug(
-                    "ACTIVATION_TOPOLOGY_BASELINE_CAPTURED runtimes=\(baseline.topology.verifiedTopology.runtimes.count) blockers=\(baseline.topology.blockers.count)"
-                ))
-                return
-            case .wait:
-                return
-            case .recover(let targetAccountId, let baseline):
-                guard let target = self.accountManager.accounts.first(where: {
-                    $0.id == targetAccountId
-                }) else {
-                    return
-                }
-                self.retryExhaustedTopologyBaseline = baseline
-                SwapLog.append(.debug(
-                    "ACTIVATION_TOPOLOGY_RECOVERY_STARTED target=\(target.email) runtimes=\(baseline.topology.verifiedTopology.runtimes.count) blockers=\(baseline.topology.blockers.count)"
-                ))
-                await self.startSameTargetRuntimeRetry(
-                    to: target,
-                    source: "runtime_topology_recovery"
-                )
-            }
-        }
-    }
-
     nonisolated static func manualReviewLaunchRecoveryTarget(
         state: AccountActivationState?,
         configuredAccountId: UUID?
@@ -7356,55 +7290,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return nil
         }
         return target
-    }
-
-    struct RetryExhaustedTopologyBaseline: Equatable {
-        let targetAccountId: UUID
-        let activationGeneration: UUID
-        let topology: CodexLocalCLIRuntimeTopologyObservation
-    }
-
-    enum RetryExhaustedTopologyDecision: Equatable {
-        case captureBaseline(RetryExhaustedTopologyBaseline)
-        case wait
-        case recover(UUID, RetryExhaustedTopologyBaseline)
-    }
-
-    nonisolated static func retryExhaustedTopologyDecision(
-        state: AccountActivationState?,
-        configuredAccountId: UUID?,
-        topology: CodexLocalCLIRuntimeTopologyObservation,
-        baseline: RetryExhaustedTopologyBaseline?
-    ) -> RetryExhaustedTopologyDecision {
-        guard let state,
-              state.phase == .manualReview,
-              state.detail == .automaticRetryLimitReached,
-              let targetAccountId = state.configuredAccountId,
-              targetAccountId == configuredAccountId else {
-            return .wait
-        }
-        let observed = RetryExhaustedTopologyBaseline(
-            targetAccountId: targetAccountId,
-            activationGeneration: state.activationGeneration,
-            topology: topology
-        )
-        guard let baseline,
-              baseline.targetAccountId == targetAccountId,
-              baseline.activationGeneration == state.activationGeneration else {
-            if !state.convergenceBlockers.isEmpty,
-               topology.processSnapshotIsComplete,
-               topology.verifiedTopology.allRuntimesUseManagedRoute,
-               topology.blockers != state.convergenceBlockers {
-                return .recover(targetAccountId, observed)
-            }
-            return .captureBaseline(observed)
-        }
-        guard topology.processSnapshotIsComplete,
-              topology.verifiedTopology.allRuntimesUseManagedRoute,
-              topology.blockers != baseline.topology.blockers else {
-            return .wait
-        }
-        return .recover(targetAccountId, observed)
     }
 
     private func beginSameTargetRuntimeRetry(to target: CodexAccount, source: String) {
@@ -8366,8 +8251,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         automaticPolicyGateWatchdogTask?.cancel()
         automaticPolicyGateWatchdogTask = nil
         automaticPolicyLeaseState.cancel()
-        retryExhaustedTopologyCheckTask?.cancel()
-        retryExhaustedTopologyCheckTask = nil
         quotaPollingReconciliationTask?.cancel()
         quotaPollingReconciliationTask = nil
         automaticCodexUpdateTask?.cancel()

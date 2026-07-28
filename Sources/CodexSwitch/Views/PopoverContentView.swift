@@ -61,7 +61,7 @@ struct PopoverContentView: View {
         case .committedDegraded:
             return "Mac local: runtime reload incomplete; restart Codex required"
         case .manualReview where state.detail == .automaticRetryLimitReached:
-            return "Mac local: retry limit reached; manual retry or restart required"
+            return "Mac local: legacy retry state pending recovery"
         case .manualReview where state.detail == .durableConfigurationChanged:
             return "Mac local: stored account changed; verify and retry current account"
         case .manualReview:

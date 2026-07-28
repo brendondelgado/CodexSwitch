@@ -87,18 +87,19 @@ identity-binding failure has a different safety shape. CodexSwitch may persist
 requests, signal, and collect acknowledgements for every independently verified
 survivor because each signal still carries its own complete authorization.
 The unbindable PID remains a typed blocker, the reload summary remains failed,
-and activation remains `CommittedDegraded` or retry-exhausted `ManualReview`
-until that PID exits or becomes verifiable. One stale process must not prevent a
-healthy process from adopting already-committed credentials.
+and activation remains `CommittedDegraded` until that PID exits or becomes
+verifiable. Repeated transient failures use capped backoff and a saturating
+attempt counter; they never become `ManualReview` because of their count. One
+stale process must not prevent a healthy process from adopting
+already-committed credentials.
 
-Retry-exhausted recovery observes a typed topology containing both verified
-runtimes and the exact blocker set. The persisted retry-exhausted blocker set
-is the baseline across restarts; a legacy journal without typed blockers uses
-its first observation as a non-mutating baseline. A changed or empty blocker
-set may grant one fresh, bounded same-target retry generation; an unchanged
-blocker set grants none. Unsafe process enumeration never authorizes recovery.
-Existing ACKs for the same credential and process binding are reused, so
-blocker recovery does not reload an already-acknowledged desktop bridge.
+Recovery observes a typed topology containing both verified runtimes and the
+exact blocker set. The blocker set and activation generation survive every
+retry and restart. A changed or empty blocker set may make a later attempt
+actionable, but an unchanged set is retried only at the bounded journal cadence.
+Unsafe process enumeration never authorizes confirmation. Existing ACKs for the
+same credential and process binding are reused, so blocker recovery does not
+reload an already-acknowledged desktop bridge.
 
 ## Reload Binding
 
@@ -291,16 +292,14 @@ executable vnode. The normal v3 request, SIGHUP, and CLI-shaped ACK remain
 mandatory. Historical or unverified runtimes are not eligible; they require one
 exit and resume into the current managed runtime.
 
-When retry exhaustion is caused by a historical CLI, CodexSwitch observes the
-exact local CLI topology off the main actor at a throttled cadence. It may reset
-the same-target retry budget once for each newly observed topology only after
-every discovered CLI resolves to the current managed runtime. A stable failing
-topology never creates an unbounded retry loop. App launch alone is not a
-topology change: retry-exhausted manual review survives relaunch without a
-desktop JSON-RPC send. The first passive observation after entering or
-reloading that manual-review state establishes a non-mutating topology
-baseline scoped to that activation generation and target. Only a later distinct
-fully managed topology may authorize recovery.
+When a historical CLI blocks convergence, each due same-target attempt observes
+the exact local CLI topology off the main actor. The attempt counter never
+resets because topology changed; it saturates while `nextRetryAt` uses the
+capped retry interval. A stable failing topology therefore cannot create an
+unbounded busy loop. A valid legacy
+`automatic_retry_limit_reached` journal is migrated on load to the same
+activation generation with its typed blockers and counts intact. App launch
+alone does not authorize confirmation or an immediate desktop JSON-RPC send.
 
 Desktop JSON-RPC mutation participates in that same admitted operation. PID
 admission is acquired before typed runtime or listening-port discovery. Each

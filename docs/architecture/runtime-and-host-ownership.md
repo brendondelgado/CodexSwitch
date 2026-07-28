@@ -302,14 +302,25 @@ inspection and blocks mutation rather than being replaced with a guessed state.
 `Preparing`, `CommittedDegraded`, and `ManualReview` are activation barriers.
 While a barrier exists, automatic account swaps, reset redemption, and plan
 upgrade activation are blocked. A committed degraded barrier permits a reload
-retry for its same configured target, with bounded backoff and a small fixed
-automatic-attempt ceiling. Automatic entry through token refresh,
+retry for its same configured target with bounded exponential backoff capped at
+a fixed maximum interval. Automatic entry through token refresh,
 reauthentication, external-auth reconciliation, or ordinary convergence retry
 preserves the same target's monotonically increasing attempt count; it cannot
-reset the count by returning to `Preparing`. Exhausting the ceiling enters
-`ManualReview` while retaining the final discovered and acknowledged runtime
-counts. The UI must present that partial convergence explicitly; it must not
-collapse verified progress into a generic zero-runtime or "no swaps" state.
+reset the count by returning to `Preparing`. The persisted counter saturates at
+its schema maximum and the retry remains `CommittedDegraded` indefinitely;
+transient runtime discovery or acknowledgement incompleteness never becomes
+`ManualReview` merely because it recurs. The UI must present partial convergence
+explicitly; it must not collapse verified progress into a generic zero-runtime
+or "no swaps" state.
+
+Historical journals may contain `ManualReview` with
+`automatic_retry_limit_reached` from the removed four-attempt ceiling. Loading
+exactly that valid legacy state atomically migrates it to same-generation
+`CommittedDegraded`, preserves its configured target, typed runtime blockers,
+attempt counter, and discovered/acknowledged counts, and schedules the next
+attempt through the normal capped backoff. Migration never publishes
+`Confirmed`. Every other `ManualReview` reason and every corrupt or
+contradictory journal remains a hard barrier.
 
 External-auth observation treats a concurrent file replacement, an unavailable
 read, and ordinary content changes inside an opened ancestor directory as
@@ -402,14 +413,12 @@ it never clears the barrier from observation alone.
 
 An explicit operator request may escape a valid `CommittedDegraded` barrier by
 selecting another account only after the VPS authority has committed a newer
-epoch naming that account. It may also escape `ManualReview` only when that
-state was produced by the bounded automatic-retry ceiling and the authority
-target agrees. The request starts a fresh `Preparing` generation for the
-authority-selected target and must still commit and read back the complete
-account store and `auth.json` before runtime convergence begins. Automatic
-requests remain blocked, same-target clicks remain reconciliation retries, and
-corrupt, unreadable, ambiguous, or inconsistent manual-review states remain
-hard barriers.
+epoch naming that account. The request starts a fresh `Preparing` generation
+for the authority-selected target and must still commit and read back the
+complete account store and `auth.json` before runtime convergence begins.
+Automatic requests remain blocked, same-target clicks remain reconciliation
+retries, and corrupt, unreadable, ambiguous, or inconsistent manual-review
+states remain hard barriers.
 
 A `durable_configuration_changed` review is a narrower recoverable case. It may
 start only an explicit or one-shot launch reconciliation for the same configured
@@ -756,13 +765,13 @@ The Mac may publish runtime-current only when at least one expected live runtime
 acknowledges the complete target and every discovered target acknowledges. No
 runtime is an explicit configured-only degraded result, never confirmation.
 
-Retry exhaustion is scoped to one activation generation and one typed blocker
-set. The journaled blocker set remains the baseline across restarts; legacy
-journals without one capture the first passive observation instead. A later
-blocker-set change or exit may create one new bounded retry generation for the
-same target; an unchanged set cannot loop. Recovery reuses current
-process-bound ACKs and must not send desktop JSON-RPC or SIGHUP again to an
-already-acknowledged bridge.
+Retry cadence is scoped to one activation generation and preserves its typed
+blocker set across restarts. Repeated failures retain the generation and blocker
+evidence while the persisted attempt counter and exponential delay saturate at
+their independent bounds. A blocker-set change or process exit may make a later
+attempt actionable, but does not reset the attempt counter or create a new
+generation. Recovery reuses current process-bound ACKs and must not send desktop
+JSON-RPC or SIGHUP again to an already-acknowledged bridge.
 
 ## Hot-Swap Reliability Closure
 
@@ -939,16 +948,17 @@ Logs distinguish reused evidence from a newly sent SIGHUP. A retry targets only
 missing runtimes, so one unsupported or unacknowledged historical CLI cannot
 cause repeated desktop auth notifications, window refreshes, or composer loss
 in a runtime that already converged.
-After that process exits, a throttled topology-change check may re-arm the
-exhausted same-target convergence once without relaunching CodexSwitch. The
-check is observational; the subsequent mutation path still performs full route,
-hash, vnode, request, signal, and ACK verification.
-App launch must preserve a same-target `automatic_retry_limit_reached` journal
-as durable manual review. Relaunching CodexSwitch, reinstalling the menu app, or
-finishing bridge installation is not new runtime evidence and must not reset the
-retry budget or send desktop JSON-RPC. Only an explicit manual retry, verified
-external-auth recovery, or a newly observed fully managed runtime topology may
-re-arm convergence; an unchanged failing topology remains paused.
+After that process exits, the next due convergence attempt observes the changed
+topology and may converge without relaunching CodexSwitch. There is no separate
+retry-exhaustion topology watcher or second recovery clock. Every attempt still
+performs full route, hash, vnode, request, signal, and ACK verification, and an
+unchanged failing topology is retried only when the journal's capped
+`nextRetryAt` is due.
+App launch atomically migrates a valid historical
+`automatic_retry_limit_reached` review to same-generation
+`CommittedDegraded`. Relaunching CodexSwitch, reinstalling the menu app, or
+finishing bridge installation must not reset the attempt counter, discard typed
+blockers, or send desktop JSON-RPC before the migrated retry deadline.
 The VPS daemon may hold the account-store lock only for a bounded read,
 generation revalidation, journal transition, or atomic commit. Provider quota
 requests, reset-inventory requests, token refresh, process discovery, signals,

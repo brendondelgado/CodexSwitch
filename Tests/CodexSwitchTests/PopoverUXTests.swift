@@ -4,13 +4,13 @@ import Testing
 
 @Suite("Popover UX")
 struct PopoverUXTests {
-    @Test("Retry exhaustion shows retained partial runtime convergence")
+    @Test("Legacy retry-limit state shows retained partial runtime convergence")
     @MainActor
     func retryExhaustionShowsPartialRuntimeProgress() {
         let state = AccountActivationState.manualReview(
             targetAccountId: UUID(),
             detail: .automaticRetryLimitReached,
-            retryAttempt: AccountActivationCoordinator.maximumAutomaticRetryAttempts,
+            retryAttempt: AccountActivationCoordinator.legacyAutomaticRetryLimit,
             discoveredRuntimeCount: 3,
             acknowledgedRuntimeCount: 2,
             at: Date()

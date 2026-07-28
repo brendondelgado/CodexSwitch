@@ -436,6 +436,20 @@ confirmation or degraded journal update succeeds under the original
 cross-process lease. The convergence implementation must not use a detached
 task.
 
+Force more than four consecutive discovery or acknowledgement failures for the
+same activation generation. Every result must remain `CommittedDegraded`, the
+attempt counter must increase until its schema bound and then saturate, and
+`nextRetryAt` must advance using exponential backoff capped at the configured
+maximum interval. Before each deadline, repeated monitor ticks must perform no
+reload mutation and no journal write.
+
+Seed a valid historical `ManualReview` journal whose detail is
+`automatic_retry_limit_reached`, then launch the coordinator. Verify one atomic
+migration to `CommittedDegraded` preserves the target, activation generation,
+typed blockers, attempt counter, and runtime counts; schedules a bounded retry;
+and does not publish runtime-current state. Repeat with every other
+`ManualReview` reason and verify its bytes and barrier remain unchanged.
+
 A short runtime-evidence lease expiring is not itself an activation failure.
 Observe at least two lease-expiry intervals after a successful desktop swap and
 verify that CodexSwitch performs read-only evidence refreshes without another
@@ -525,7 +539,10 @@ CodexSwitch must evaluate these independently:
   `daemonRunning` doctor field reports whether the local platform coordinator
   is present, not authority ownership.
 - **Mac CLI first ACK:** a current attested managed CLI may receive its first request only when its route, hashes, read-only files, owner, and running executable vnode all match. A historical runtime without the v3 CLI contract requires one exit and resume.
-- **Retry-exhausted CLI recovery:** topology observation runs off the main actor and is throttled. Once historical CLIs are gone, one new all-managed topology may re-arm same-target convergence; an unchanged failing topology must not loop.
+- **Degraded CLI recovery:** each due convergence attempt observes topology off
+  the main actor. Historical CLIs remain typed blockers; once they exit, the
+  next due attempt may converge. The attempt counter and backoff saturate, so an
+  unchanged failing topology cannot busy-loop.
 - **Desktop code-mode helper:** `codex-code-mode-host` is a worker owned by the desktop app-server, not an independent interactive CLI. It must not appear as a Mac CLI readiness blocker or receive a standalone auth-reload signal; readiness follows its parent app-server.
 - **Mac remote client:** a `codex --remote` process on the Mac is a transport client, not the account-bearing app-server. It must not be treated as the VPS hot-swap target.
 - **Linux VPS app-server:** ordinary VPS app-servers, including the SSH `unix://` daemon, remain strict `external-app-server` targets and must prove frontend delivery. Only the positively classified port-8390 `headless-remote-control-app-server` retains the broader headless idle contract; SSH/Unix transport or missing frontends do not promote an ordinary external app-server into it.
@@ -1045,10 +1062,10 @@ or request another pool target. With a configured VPS, that target request goes
 to the VPS authority before any Mac credential mutation. Hover and tooltip
 helpers must be declared non-hit-testable so they cannot intercept that control.
 
-The control must remain available while an automatic-retry-limit
-`ManualReview` barrier is visible. A successful press must produce activation
-journal evidence; a visual highlight change without a new activation generation
-is not proof that the request ran.
+The control must remain available while a same-target `CommittedDegraded`
+barrier is visible. A successful press must produce activation journal evidence;
+a visual highlight change without a new activation generation is not proof that
+the request ran.
 
 The manual switch revalidates exact durable source credentials but does not
 require the old runtime to be current. It must receive the idempotent authority
@@ -1255,12 +1272,11 @@ Before claiming hot-swap is fixed or ready:
   including when ChatGPT itself is closed.
 - [ ] The Swift managed-launcher fixture uses real tab bytes and contains no
   literal `\t` indentation sequences, matching the Rust-generated launcher.
-- [ ] Relaunching or reinstalling CodexSwitch preserves a same-target
-  `automatic_retry_limit_reached` journal without resetting its retry budget or
-  sending desktop JSON-RPC. Only an explicit manual retry, verified external
-  auth recovery, or a newly observed fully managed runtime topology may re-arm
-  convergence. The topology watcher's first post-launch observation only
-  captures its baseline and performs no mutation.
+- [ ] Relaunching or reinstalling CodexSwitch migrates a valid same-target
+  `automatic_retry_limit_reached` journal to `CommittedDegraded` while
+  preserving its activation generation, attempt counter, typed blockers, and
+  partial ACK counts. It schedules the next attempt at capped backoff and sends
+  no desktop JSON-RPC before that deadline.
 - [ ] Each live target has a fresh `.codexswitch/hotswap-ack/<pid>.json` acknowledgement.
 - [ ] Desktop discovery admits only an explicit loopback WebSocket app-server
   that owns its listening TCP socket. A concurrent managed
@@ -1272,7 +1288,9 @@ Before claiming hot-swap is fixed or ready:
 - [ ] The Rust readiness path accepts a Swift UUID request nonce when the full version-3 binding matches, and rejects empty, oversized, whitespace, or control-character nonces.
 - [ ] ChatGPT framework helpers and crash reporters do not appear in CLI readiness or restart target lists.
 - [ ] A first-ACK CLI canary succeeds for the current managed runtime, while a historical or non-route runtime is skipped and remains restart-required.
-- [ ] Exiting the final historical CLI and resuming through the managed launcher re-arms an exhausted same-target journal without relaunching CodexSwitch.
+- [ ] Exiting the final historical CLI and resuming through the managed
+  launcher lets the next due same-target attempt converge without relaunching
+  CodexSwitch or resetting its attempt counter.
 - [ ] The installed desktop version matches the latest official appcast release, or a newer signed release is staged for the next safe quit.
 - [ ] The installed ASAR contains exactly one Fast compatibility marker declaration, and the patched renderer still honors an explicit `featureRequirements.fast_mode == false` prohibition.
 - [ ] The installed ASAR contains `CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3`, `CODEXSWITCH_AUTH_EVENT_DEDUPE_V1`, `CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1`, and `CODEXSWITCH_AUTH_TRANSITION_V2` exactly once each, contains no nested legacy WeakMap helper, and executable fixtures prove subscriber invalidations coalesce while rapid distinct `chatgpt` events still produce distinguishable newest-account results. A same-account auth notification must produce no redundant account-read fanout, stale null overwrite, `_invalidateAccountQueries is not defined`, provider unmount, route remount, tokenless `401`, or window reload.
@@ -1283,7 +1301,8 @@ Before claiming hot-swap is fixed or ready:
 - [ ] A forced rotation advances the authority epoch once, changes each
   required host to the authority target, and signals the expected process count.
 - [ ] From `CommittedDegraded`, an explicit cross-target operator selection starts a fresh activation while automatic rotation remains blocked.
-- [ ] From retry-exhausted `ManualReview`, an explicit cross-target operator selection can recover; every other manual-review reason remains blocked.
+- [ ] Repeated transient convergence failures never enter `ManualReview`;
+  corrupt, inconsistent, or contradictory manual-review reasons remain blocked.
 - [ ] A manual cross-account switch can leave an unconfirmed source runtime when the account store and `auth.json` still agree exactly.
 - [ ] A pre-mutation authorization failure restores the prior activation journal instead of pinning manual review to an uncommitted target.
 - [ ] Launch recovery repairs `activation_file_commit_failed` only when the account store and `auth.json` agree on one known account, and publishes configured-only state.
@@ -1335,7 +1354,8 @@ Every future hot-swap change must include tests for:
   a refactor cannot reintroduce the close-before-SIGHUP race.
 - A desktop bridge PID acknowledged by the desktop transaction is excluded from
   interactive-CLI discovery. When it is the only exact-name `codex` process, a
-  `1/1` desktop acknowledgement converges instead of entering retry exhaustion.
+  `1/1` desktop acknowledgement converges instead of scheduling another
+  degraded retry.
 - Poll generations clean up only their own task record, cancelled generations
   cannot publish, and periodic reconciliation restarts a missing eligible poll
   exactly once while preserving intentional hard-runtime blocks.
@@ -1365,9 +1385,9 @@ Every future hot-swap change must include tests for:
   writes requests, signals, and collects ACKs for every independently verified
   CLI. The typed blocker remains in convergence evidence and prevents
   `Confirmed`; malformed or ambiguous enumeration still sends zero signals.
-- Retry-exhausted Mac recovery captures a typed blocker baseline and grants one
-  bounded same-target retry only when that blocker set changes or exits.
-  Reused desktop ACK evidence produces no repeated desktop JSON-RPC or SIGHUP.
+- Degraded Mac recovery retains typed blockers and its activation generation
+  across every capped retry. Reused desktop ACK evidence produces no repeated
+  desktop JSON-RPC or SIGHUP.
 - An external app-server rejects every ACK whose runtime kind is not
   `external-app-server`; every other runtime kind likewise rejects an
   `external-app-server` ACK, and a local interactive CLI accepts only its

@@ -132,11 +132,11 @@ struct AppDelegateSwapCommitTests {
         #expect(source.contains("ACTIVATION_FILE_COMMIT_FAILURE_RECOVERED"))
     }
 
-    @Test("Launch recovery preserves exhausted retries and requires a durable target")
+    @Test("Launch recovery does not bypass legacy retry-limit migration")
     func launchRecoveryRequiresExactRecoverableTarget() {
         let target = UUID()
         let other = UUID()
-        let exhausted = AccountActivationState.manualReview(
+        let legacyRetryLimit = AccountActivationState.manualReview(
             targetAccountId: target,
             detail: .automaticRetryLimitReached,
             retryAttempt: 4,
@@ -155,7 +155,7 @@ struct AppDelegateSwapCommitTests {
         )
 
         #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
-            state: exhausted,
+            state: legacyRetryLimit,
             configuredAccountId: target
         ) == nil)
         #expect(AppDelegate.manualReviewLaunchRecoveryTarget(
@@ -178,136 +178,6 @@ struct AppDelegateSwapCommitTests {
             .allowsLaunchSameTargetRecovery)
         #expect(AccountActivationDetail.durableConfigurationChanged
             .allowsLaunchSameTargetRecovery)
-    }
-
-    @Test("Retry exhaustion recovers once when the typed blocker set changes")
-    func topologyRecoveryRequiresChangedBlockerSet() {
-        let target = UUID()
-        let staleBlocker = CodexRuntimeDiscoveryBlocker(
-            pid: 34449,
-            reason: .kernelExecutableUnavailable
-        )
-        let replacementBlocker = CodexRuntimeDiscoveryBlocker(
-            pid: 45550,
-            reason: .processIdentityUnavailable
-        )
-        let exhausted = AccountActivationState.manualReview(
-            targetAccountId: target,
-            detail: .automaticRetryLimitReached,
-            retryAttempt: 4,
-            discoveredRuntimeCount: 2,
-            acknowledgedRuntimeCount: 1,
-            runtimeBlockers: [staleBlocker],
-            at: Date()
-        )
-        let unmanagedTopology = CodexLocalCLIRuntimeTopology(
-            runtimes: [],
-            allRuntimesUseManagedRoute: false
-        )
-        let managedTopology = CodexLocalCLIRuntimeTopology(
-            runtimes: [],
-            allRuntimesUseManagedRoute: true
-        )
-        let unsafe = CodexLocalCLIRuntimeTopologyObservation.incomplete(
-            CodexIncompleteLocalCLIRuntimeTopology(
-                verifiedTopology: managedTopology,
-                blockers: [replacementBlocker],
-                processSnapshotIsComplete: false
-            )
-        )
-        let stale = CodexLocalCLIRuntimeTopologyObservation.incomplete(
-            CodexIncompleteLocalCLIRuntimeTopology(
-                verifiedTopology: managedTopology,
-                blockers: [staleBlocker],
-                processSnapshotIsComplete: true
-            )
-        )
-        let replacement = CodexLocalCLIRuntimeTopologyObservation.incomplete(
-            CodexIncompleteLocalCLIRuntimeTopology(
-                verifiedTopology: managedTopology,
-                blockers: [replacementBlocker],
-                processSnapshotIsComplete: true
-            )
-        )
-        let managed = CodexLocalCLIRuntimeTopologyObservation.complete(managedTopology)
-        let unmanaged = CodexLocalCLIRuntimeTopologyObservation.complete(unmanagedTopology)
-        let staleBlockerBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
-            targetAccountId: target,
-            activationGeneration: exhausted.activationGeneration,
-            topology: stale
-        )
-        let managedBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
-            targetAccountId: target,
-            activationGeneration: exhausted.activationGeneration,
-            topology: managed
-        )
-        let staleBaseline = AppDelegate.RetryExhaustedTopologyBaseline(
-            targetAccountId: target,
-            activationGeneration: UUID(),
-            topology: unmanaged
-        )
-
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: stale,
-            baseline: nil
-        ) == .captureBaseline(staleBlockerBaseline))
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: managed,
-            baseline: managedBaseline
-        ) == .wait)
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: managed,
-            baseline: staleBaseline
-        ) == .recover(target, managedBaseline))
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: managed,
-            baseline: staleBlockerBaseline
-        ) == .recover(target, managedBaseline))
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: replacement,
-            baseline: staleBlockerBaseline
-        ) == .recover(
-            target,
-            AppDelegate.RetryExhaustedTopologyBaseline(
-                targetAccountId: target,
-                activationGeneration: exhausted.activationGeneration,
-                topology: replacement
-            )
-        ))
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: stale,
-            baseline: staleBlockerBaseline
-        ) == .wait)
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: unsafe,
-            baseline: staleBlockerBaseline
-        ) == .wait)
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: managed,
-            baseline: nil
-        ) == .recover(target, managedBaseline))
-        #expect(AppDelegate.retryExhaustedTopologyDecision(
-            state: exhausted,
-            configuredAccountId: target,
-            topology: unmanaged,
-            baseline: staleBlockerBaseline
-        ) == .wait)
     }
 
     @Test("Launch waits for bridge installation before retry recovery")

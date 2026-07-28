@@ -427,97 +427,175 @@ struct AccountActivationStateTests {
         #expect(preparing.blocksAutomaticMutations)
     }
 
-    @Test("Automatic retries stop at the ceiling and manual same-target retry resets them")
-    func retryCeilingRequiresManualSameTargetReset() async throws {
+    @Test("Transient convergence failures remain recoverable beyond the former retry limit")
+    func repeatedConvergenceFailuresRemainDegraded() async throws {
         let url = temporaryJournalURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let target = UUID()
-        let other = UUID()
-        let coordinator = AccountActivationCoordinator(url: url)
+        let generation = UUID()
+        let blocker = CodexRuntimeDiscoveryBlocker(
+            pid: 34_449,
+            reason: .kernelExecutableUnavailable
+        )
+        let start = Date(timeIntervalSince1970: 1_800_000_500)
+        let coordinator = AccountActivationCoordinator(
+            url: url,
+            baseRetryInterval: 10,
+            maximumRetryInterval: 40
+        )
 
-        _ = try await coordinator.beginPreparing(targetAccountId: target, kind: .automatic)
+        _ = try await coordinator.beginPreparing(
+            targetAccountId: target,
+            kind: .automatic,
+            requestedActivationGeneration: generation,
+            at: start
+        )
         _ = try await coordinator.markCommittedDegraded(
             targetAccountId: target,
             discoveredRuntimeCount: 0,
             acknowledgedRuntimeCount: 0,
-            detail: .runtimeConfirmationPending
+            detail: .runtimeConfirmationPending,
+            at: start
         )
 
         var state = try await coordinator.load()!
-        for _ in 0..<AccountActivationCoordinator.maximumAutomaticRetryAttempts {
+        for attempt in 1...8 {
+            let failureAt = start.addingTimeInterval(TimeInterval(attempt))
             state = try await coordinator.recordConvergenceFailure(
                 targetAccountId: target,
                 discoveredRuntimeCount: 2,
                 acknowledgedRuntimeCount: 1,
-                detail: .runtimeAcknowledgementIncomplete
+                detail: .runtimeAcknowledgementIncomplete,
+                runtimeBlockers: [blocker],
+                at: failureAt
             )
+            #expect(state.phase == .committedDegraded)
+            #expect(state.activationGeneration == generation)
+            #expect(state.retryAttempt == attempt)
+            #expect(state.convergenceBlockers == [blocker])
         }
 
-        #expect(state.phase == .manualReview)
-        #expect(state.detail == .automaticRetryLimitReached)
+        #expect(state.phase == .committedDegraded)
+        #expect(state.detail == .runtimeAcknowledgementIncomplete)
         #expect(state.discoveredRuntimeCount == 2)
         #expect(state.acknowledgedRuntimeCount == 1)
-        #expect(state.automaticRetryTarget(at: .distantFuture) == nil)
-        #expect(state.decision(
-            forRequestedTarget: target,
-            kind: .manual
-        ) == .retrySameTarget)
-        #expect(state.decision(
-            forRequestedTarget: other,
-            kind: .manual
-        ) == .beginActivation)
-
-        let reset = try await coordinator.resetForManualSameTargetRetry(
-            targetAccountId: target
-        )
-        #expect(reset.phase == .committedDegraded)
-        #expect(reset.retryAttempt == 0)
-        #expect(reset.discoveredRuntimeCount == 0)
-        #expect(reset.acknowledgedRuntimeCount == 0)
-        #expect(reset.automaticRetryTarget(at: reset.updatedAt) == target)
+        #expect(state.nextRetryAt == start.addingTimeInterval(48))
+        #expect(state.automaticRetryTarget(
+            at: start.addingTimeInterval(47.999)
+        ) == nil)
+        #expect(state.automaticRetryTarget(
+            at: start.addingTimeInterval(48)
+        ) == target)
     }
 
-    @Test("Retry-exhausted manual review permits a fresh operator target")
-    func retryExhaustionPermitsCrossTargetRecovery() async throws {
+    @Test("Retry attempt and scheduling saturate without a busy loop")
+    func retryAttemptAndSchedulingSaturate() async throws {
         let url = temporaryJournalURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let target = UUID()
-        let replacement = UUID()
         let generation = UUID()
-        let coordinator = AccountActivationCoordinator(url: url)
+        let now = Date(timeIntervalSince1970: 1_800_000_600)
+        let saturated = AccountActivationState.committedDegraded(
+            targetAccountId: target,
+            detail: .runtimeAcknowledgementIncomplete,
+            activationGeneration: generation,
+            retryAttempt: AccountActivationCoordinator.maximumRetryAttempt,
+            nextRetryAt: now,
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0,
+            at: now
+        )
+        try await seedJournal(saturated, at: url)
+        let coordinator = AccountActivationCoordinator(
+            url: url,
+            baseRetryInterval: 10,
+            maximumRetryInterval: 40
+        )
 
-        _ = try await coordinator.beginPreparing(targetAccountId: target, kind: .automatic)
-        _ = try await coordinator.markCommittedDegraded(
+        let failed = try await coordinator.recordConvergenceFailure(
             targetAccountId: target,
             discoveredRuntimeCount: 1,
             acknowledgedRuntimeCount: 0,
-            detail: .runtimeAcknowledgementIncomplete
+            detail: .runtimeAcknowledgementIncomplete,
+            at: now
         )
-        for _ in 0..<AccountActivationCoordinator.maximumAutomaticRetryAttempts {
-            _ = try await coordinator.recordConvergenceFailure(
-                targetAccountId: target,
-                discoveredRuntimeCount: 1,
-                acknowledgedRuntimeCount: 0,
-                detail: .runtimeAcknowledgementIncomplete
-            )
-        }
 
-        let decision = try await coordinator.beginAuthorizedCredentialMutation(
-            targetAccountId: replacement,
-            kind: .manual,
-            requestedActivationGeneration: generation
+        #expect(failed.phase == .committedDegraded)
+        #expect(failed.activationGeneration == generation)
+        #expect(failed.retryAttempt == AccountActivationCoordinator.maximumRetryAttempt)
+        #expect(failed.nextRetryAt == now.addingTimeInterval(40))
+        #expect(failed.automaticRetryTarget(at: now.addingTimeInterval(39.999)) == nil)
+        #expect(failed.automaticRetryTarget(at: now.addingTimeInterval(40)) == target)
+    }
+
+    @Test("Legacy retry-limit review migrates without granting confirmation")
+    func legacyRetryLimitReviewMigratesToRecoverableDegraded() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let target = UUID()
+        let generation = UUID()
+        let blocker = CodexRuntimeDiscoveryBlocker(
+            pid: 34_449,
+            reason: .kernelExecutableUnavailable
         )
-        guard case .prepared(let preparing, let previousState) = decision else {
-            Issue.record("Retry-exhausted state must permit explicit operator recovery")
-            return
-        }
-        #expect(previousState?.phase == .manualReview)
-        #expect(previousState?.detail == .automaticRetryLimitReached)
-        #expect(previousState?.configuredAccountId == target)
-        #expect(preparing.phase == .preparing)
-        #expect(preparing.configuredAccountId == replacement)
-        #expect(preparing.activationGeneration == generation)
-        #expect(try await coordinator.load() == preparing)
+        let historical = AccountActivationState.manualReview(
+            targetAccountId: target,
+            detail: .automaticRetryLimitReached,
+            activationGeneration: generation,
+            retryAttempt: 4,
+            discoveredRuntimeCount: 2,
+            acknowledgedRuntimeCount: 1,
+            runtimeBlockers: [blocker],
+            at: Date(timeIntervalSince1970: 1_800_000_650)
+        )
+        try await seedJournal(historical, at: url)
+        let migratedAt = Date(timeIntervalSince1970: 1_800_000_700)
+        let coordinator = AccountActivationCoordinator(
+            url: url,
+            baseRetryInterval: 10,
+            maximumRetryInterval: 40
+        )
+
+        let migrated = try #require(try await coordinator.load(at: migratedAt))
+
+        #expect(migrated.phase == .committedDegraded)
+        #expect(migrated.activationGeneration == generation)
+        #expect(migrated.configuredAccountId == target)
+        #expect(migrated.runtimeCurrentAccountId == nil)
+        #expect(migrated.detail == .runtimeAcknowledgementIncomplete)
+        #expect(migrated.retryAttempt == 4)
+        #expect(migrated.discoveredRuntimeCount == 2)
+        #expect(migrated.acknowledgedRuntimeCount == 1)
+        #expect(migrated.convergenceBlockers == [blocker])
+        #expect(migrated.nextRetryAt == migratedAt.addingTimeInterval(40))
+        #expect(migrated.automaticRetryTarget(
+            at: migratedAt.addingTimeInterval(39.999)
+        ) == nil)
+        #expect(migrated.automaticRetryTarget(
+            at: migratedAt.addingTimeInterval(40)
+        ) == target)
+        #expect(try await coordinator.load(at: migratedAt.addingTimeInterval(1)) == migrated)
+    }
+
+    @Test("Unrelated manual-review reasons never auto-recover")
+    func unrelatedManualReviewDoesNotMigrate() async throws {
+        let url = temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let target = UUID()
+        let review = AccountActivationState.manualReview(
+            targetAccountId: target,
+            detail: .configuredFilesInconsistent,
+            activationGeneration: UUID(),
+            at: Date(timeIntervalSince1970: 1_800_000_750)
+        )
+        try await seedJournal(review, at: url)
+        let originalBytes = try Data(contentsOf: url)
+        let coordinator = AccountActivationCoordinator(url: url)
+
+        #expect(try await coordinator.load(
+            at: Date(timeIntervalSince1970: 1_800_000_800)
+        ) == review)
+        #expect(try Data(contentsOf: url) == originalBytes)
     }
 
     @Test("Unsafe manual-review reasons still block cross-target changes")
@@ -935,6 +1013,23 @@ struct AccountActivationStateTests {
         makeSecureTestFileURL(
             prefix: "codexswitch-account-activation",
             fileName: "account-activation.json"
+        )
+    }
+
+    private func seedJournal(
+        _ state: AccountActivationState,
+        at url: URL
+    ) async throws {
+        let target = try #require(state.configuredAccountId)
+        let coordinator = AccountActivationCoordinator(url: url)
+        _ = try await coordinator.bootstrapCommittedDegraded(
+            targetAccountId: target,
+            detail: .runtimeConfirmationPending,
+            at: state.updatedAt
+        )
+        try overwriteSecureTestFile(
+            try JSONEncoder().encode(state),
+            atPath: url.path
         )
     }
 }

@@ -42,7 +42,7 @@ actor AccountActivationCoordinator {
     static let maximumDetailBytes = 512
     static let maximumRuntimeCount = 256
     static let maximumRetryAttempt = 10_000
-    static let maximumAutomaticRetryAttempts = 4
+    static let legacyAutomaticRetryLimit = 4
     static let runtimeEvidenceLifetime: TimeInterval = 10
 
     let url: URL
@@ -72,8 +72,13 @@ actor AccountActivationCoordinator {
         )
     }
 
-    func load() throws -> AccountActivationState? {
-        try loadDurableState()
+    func load(at date: Date = Date()) throws -> AccountActivationState? {
+        let state = try loadDurableState()
+        guard state?.phase == .manualReview,
+              state?.detail == .automaticRetryLimitReached else {
+            return state
+        }
+        return try migrateLegacyRetryLimitReview(at: date)
     }
 
     nonisolated func loadDurableState() throws -> AccountActivationState? {
@@ -332,19 +337,10 @@ actor AccountActivationCoordinator {
                     "runtime failure does not match committed activation"
                 )
             }
-            let nextAttempt = current.retryAttempt + 1
-            if nextAttempt >= Self.maximumAutomaticRetryAttempts {
-                return .manualReview(
-                    targetAccountId: targetAccountId,
-                    detail: .automaticRetryLimitReached,
-                    activationGeneration: current.activationGeneration,
-                    retryAttempt: nextAttempt,
-                    discoveredRuntimeCount: discoveredRuntimeCount,
-                    acknowledgedRuntimeCount: acknowledgedRuntimeCount,
-                    runtimeBlockers: runtimeBlockers,
-                    at: date
-                )
-            }
+            let nextAttempt = min(
+                current.retryAttempt + 1,
+                Self.maximumRetryAttempt
+            )
             let delay = Self.retryDelay(
                 attempt: nextAttempt,
                 base: baseRetryInterval,
@@ -361,6 +357,65 @@ actor AccountActivationCoordinator {
                 runtimeBlockers: runtimeBlockers,
                 at: date
             )
+        }
+    }
+
+    private func migrateLegacyRetryLimitReview(
+        at date: Date
+    ) throws -> AccountActivationState? {
+        try withRuntimeLease {
+            try transaction.withExclusiveLock { lockedFile in
+                let snapshot = try lockedFile.read()
+                guard let current = try Self.decode(snapshot.bytes) else {
+                    return nil
+                }
+                guard current.phase == .manualReview,
+                      current.detail == .automaticRetryLimitReached else {
+                    return current
+                }
+                guard let targetAccountId = current.configuredAccountId else {
+                    throw AccountActivationCoordinatorError.corruptJournal(
+                        "retry-limit review is missing its target"
+                    )
+                }
+                let retryAttempt = min(
+                    max(current.retryAttempt, Self.legacyAutomaticRetryLimit),
+                    Self.maximumRetryAttempt
+                )
+                let detail: AccountActivationDetail
+                if current.discoveredRuntimeCount == 0 {
+                    detail = .noLocalRuntime
+                } else if current.acknowledgedRuntimeCount
+                            < current.discoveredRuntimeCount {
+                    detail = .runtimeAcknowledgementIncomplete
+                } else {
+                    detail = .runtimeConfirmationPending
+                }
+                let migrated = AccountActivationState.committedDegraded(
+                    targetAccountId: targetAccountId,
+                    detail: detail,
+                    activationGeneration: current.activationGeneration,
+                    retryAttempt: retryAttempt,
+                    nextRetryAt: date.addingTimeInterval(Self.retryDelay(
+                        attempt: retryAttempt,
+                        base: baseRetryInterval,
+                        maximum: maximumRetryInterval
+                    )),
+                    discoveredRuntimeCount: current.discoveredRuntimeCount,
+                    acknowledgedRuntimeCount: current.acknowledgedRuntimeCount,
+                    runtimeBlockers: current.convergenceBlockers,
+                    at: date
+                )
+                try Self.validate(migrated)
+                let readback = try lockedFile.replace(
+                    try Self.encode(migrated),
+                    expectedGeneration: snapshot.generation
+                )
+                guard try Self.decode(readback.bytes) == migrated else {
+                    throw AccountActivationCoordinatorError.readbackMismatch
+                }
+                return migrated
+            }
         }
     }
 
@@ -752,7 +807,7 @@ actor AccountActivationCoordinator {
         case .preparing:
             guard state.configuredAccountId != nil,
                   state.runtimeCurrentAccountId == nil,
-                  (0..<maximumAutomaticRetryAttempts).contains(state.retryAttempt),
+                  (0..<legacyAutomaticRetryLimit).contains(state.retryAttempt),
                   state.nextRetryAt == nil,
                   state.discoveredRuntimeCount == 0,
                   state.acknowledgedRuntimeCount == 0,
@@ -765,7 +820,7 @@ actor AccountActivationCoordinator {
         case .committedDegraded:
             guard state.configuredAccountId != nil,
                   state.runtimeCurrentAccountId == nil,
-                  (0..<maximumAutomaticRetryAttempts).contains(state.retryAttempt),
+                  (0...maximumRetryAttempt).contains(state.retryAttempt),
                   let nextRetryAt = state.nextRetryAt,
                   nextRetryAt >= state.updatedAt,
                   state.runtimeEvidenceGeneration == nil,
@@ -801,7 +856,7 @@ actor AccountActivationCoordinator {
             }
             if state.detail == .automaticRetryLimitReached,
                (state.configuredAccountId == nil
-                    || state.retryAttempt < maximumAutomaticRetryAttempts) {
+                    || state.retryAttempt < legacyAutomaticRetryLimit) {
                 throw AccountActivationCoordinatorError.corruptJournal(
                     "retry-limit review is missing its target"
                 )
