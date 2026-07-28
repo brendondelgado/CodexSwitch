@@ -1,0 +1,26 @@
+crates/codexswitch-cli/src/activation.rs
+  s_70c8e194852bb5::t_ce922e776c6de0 3291-3345
+  s_70c8e194852bb5::t_9486dee341232f 3221-3290
+  s_70c8e194852bb5::t_d3a6d73600acde 858,1023
+  s_70c8e194852bb5::t_86a5a2329e18ce 869-872,884-932
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_843f0358658859 957-967
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_843f0358658859 631-638
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "2b120e8f78f17fe10178de92e8b6e6c7856727e6",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
