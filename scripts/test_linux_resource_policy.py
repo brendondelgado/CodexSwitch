@@ -3639,7 +3639,10 @@ PY
         lock.write_text("")
         result = self._activate(check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("activation lock has no durable owner record", result.stderr)
+        self.assertIn(
+            "systemd start barrier file exceeds its read bound", result.stderr
+        )
+        self.assertIn("stale systemd start barrier reconciliation failed", result.stderr)
         self.assertFalse((self.install_root / "current").exists())
         lock.unlink()
 
