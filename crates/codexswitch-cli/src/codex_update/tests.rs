@@ -4566,6 +4566,8 @@ async fn run_turn() {
 
         let patched = fs::read_to_string(turn_dir.join("turn.rs")).unwrap();
         assert!(patched.contains("codexswitch_rotate_after_usage_limit"));
+        assert!(patched.contains("codexswitch-runtime-interrupted-turn-v3"));
+        assert!(!patched.contains("codexswitch-runtime-interrupted-turn-v2"));
         assert!(patched.contains("codexswitch_usage_limit_retry_attempted"));
         assert!(patched.contains("codexswitch_rotate_after_auth_failure"));
         assert!(patched.contains("codexswitch_auth_reload_retry_attempted"));
@@ -4625,6 +4627,30 @@ async fn run_turn() {
             .map(|offset| rotation_start + offset)
             .unwrap();
         let rotation_source = &patched[rotation_start..rotation_end];
+        assert!(patched.contains("const CODEXSWITCH_ROTATION_MAX_ATTEMPTS: usize = 3;"));
+        assert!(patched.contains("async fn codexswitch_retry_rotation_attempt("));
+        assert!(patched.contains("async fn codexswitch_run_rotation_attempt("));
+        assert!(rotation_source.contains("let mut codexswitch_rotation_attempt = 0;"));
+        assert!(patched.contains("\"transport failure or timeout\""));
+        assert!(patched.contains("\"malformed or unverified rotation response\""));
+        assert!(patched.contains("\"missing exact post-rotation request or ACK\""));
+        assert_eq!(
+            rotation_source
+                .matches("codexswitch_new_receipt_nonce()")
+                .count(),
+            1,
+            "all bounded attempts must retain one receipt"
+        );
+        let receipt_index = rotation_source
+            .find("let Some(receipt_nonce) = codexswitch_new_receipt_nonce()")
+            .unwrap();
+        let attempt_loop_index = rotation_source
+            .find("let mut codexswitch_rotation_attempt = 0;")
+            .unwrap();
+        assert!(
+            receipt_index < attempt_loop_index,
+            "the durable receipt must be created before bounded retries"
+        );
         assert_eq!(
             rotation_source
                 .matches("codexswitch_reload_auth_json_verified(&auth_path)")
@@ -5222,6 +5248,8 @@ async fn codexswitch_rotate_after_usage_limit(_sess: &Session, _turn_context: &T
     false
 }
 
+// codexswitch-runtime-interrupted-turn-v2
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 async fn run_turn() {
     let mut retries = 0;
@@ -5258,6 +5286,8 @@ async fn run_turn() {
         patch_codex_source(source_dir).unwrap();
 
         let patched = fs::read_to_string(turn_dir.join("turn.rs")).unwrap();
+        assert!(patched.contains("codexswitch-runtime-interrupted-turn-v3"));
+        assert!(!patched.contains("codexswitch-runtime-interrupted-turn-v2"));
         assert_eq!(
             patched
                 .matches("async fn codexswitch_rotate_after_usage_limit")

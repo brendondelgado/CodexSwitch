@@ -1,4 +1,4 @@
-const INTERRUPTED_TURN_TEMPLATE_MARKER: &str = "codexswitch-runtime-interrupted-turn-v2";
+const INTERRUPTED_TURN_TEMPLATE_MARKER: &str = "codexswitch-runtime-interrupted-turn-v3";
 
 fn patch_turn_rotation_templates(path: &Path) -> Result<()> {
     patch_turn_rotation_dependencies(path)?;
@@ -734,6 +734,90 @@ async fn codexswitch_reload_changed_external_auth(
 }
 
 #[cfg(unix)]
+const CODEXSWITCH_ROTATION_MAX_ATTEMPTS: usize = 3;
+
+#[cfg(unix)]
+async fn codexswitch_retry_rotation_attempt(attempt: usize, failure: &str) -> bool {
+    if attempt + 1 >= CODEXSWITCH_ROTATION_MAX_ATTEMPTS {
+        warn!(
+            "CodexSwitch interrupted-turn rotation exhausted {} attempts after {}",
+            CODEXSWITCH_ROTATION_MAX_ATTEMPTS,
+            failure
+        );
+        return false;
+    }
+    let delay_milliseconds = 250_u64.saturating_mul((attempt + 1) as u64);
+    warn!(
+        "CodexSwitch interrupted-turn rotation attempt {} failed after {}; reconciling the same durable operation",
+        attempt + 1,
+        failure
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(delay_milliseconds)).await;
+    true
+}
+
+#[cfg(unix)]
+async fn codexswitch_run_rotation_attempt(
+    control_execution_path: &std::path::Path,
+    control_cli: &CodexSwitchControlCli,
+    auth_path: &std::path::Path,
+    receipt_nonce: &str,
+    reason: &str,
+    cooldown_seconds: &str,
+    observed_fingerprint: &str,
+) -> Result<(CodexSwitchRotationProof, CodexSwitchOwnHandoff), &'static str> {
+    let Some(rotation_started_at) = codexswitch_now_milliseconds() else {
+        return Err("unavailable rotation clock");
+    };
+    let mut command = tokio::process::Command::new(control_execution_path);
+    command
+        .arg("--auth")
+        .arg(&auth_path)
+        .arg("rotate-now")
+        .arg("--receipt-nonce")
+        .arg(receipt_nonce)
+        .arg("--reason")
+        .arg(reason)
+        .arg("--cooldown-seconds")
+        .arg(cooldown_seconds)
+        .arg("--json");
+    let Some(output) = codexswitch_run_bounded_rotation(command, control_cli).await else {
+        return Err("transport failure or timeout");
+    };
+    if !output.status.success() {
+        warn!(
+            "CodexSwitch interrupted-turn rotation exited with status {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err("unsuccessful control response");
+    }
+    let Some(proof) = codexswitch_verified_rotation_result(&output, auth_path, receipt_nonce) else {
+        return Err("malformed or unverified rotation response");
+    };
+    if proof.fingerprint == observed_fingerprint {
+        return Err("unchanged token fingerprint");
+    }
+    let Some(own_handoff) = codexswitch_verified_own_handoff_v3(
+        Some(auth_path),
+        Some(receipt_nonce),
+        Some(&proof.fingerprint),
+        Some(rotation_started_at),
+        false,
+    ) else {
+        return Err("missing exact post-rotation request or ACK");
+    };
+    if !proof
+        .acknowledged_request_nonces
+        .iter()
+        .any(|nonce| nonce == &own_handoff.request_nonce)
+    {
+        return Err("missing own ACK nonce in rotation response");
+    }
+    Ok((proof, own_handoff))
+}
+
+#[cfg(unix)]
 async fn codexswitch_rotate_after_failure(
     sess: &Session,
     turn_context: &TurnContext,
@@ -778,65 +862,32 @@ async fn codexswitch_rotate_after_failure(
         warn!("CodexSwitch interrupted-turn rotation could not generate a receipt UUID");
         return false;
     };
-    let Some(rotation_started_at) = codexswitch_now_milliseconds() else {
-        return false;
-    };
     let Some(control_execution_path) = control_cli.execution_path() else {
         warn!("CodexSwitch interrupted-turn rotation could not bind the opened control executable");
         return false;
     };
-    let mut command = tokio::process::Command::new(control_execution_path);
-    command
-        .arg("--auth")
-        .arg(&auth_path)
-        .arg("rotate-now")
-        .arg("--receipt-nonce")
-        .arg(&receipt_nonce)
-        .arg("--reason")
-        .arg(reason)
-        .arg("--cooldown-seconds")
-        .arg(cooldown_seconds)
-        .arg("--json");
-    let Some(output) = codexswitch_run_bounded_rotation(command, &control_cli).await else {
-        warn!("CodexSwitch interrupted-turn rotation failed or timed out");
-        return false;
+    let mut codexswitch_rotation_attempt = 0;
+    let (proof, own_handoff) = loop {
+        match codexswitch_run_rotation_attempt(
+            &control_execution_path,
+            &control_cli,
+            &auth_path,
+            &receipt_nonce,
+            reason,
+            cooldown_seconds,
+            &observed_fingerprint,
+        )
+        .await
+        {
+            Ok(proof) => break proof,
+            Err(failure) => {
+                if !codexswitch_retry_rotation_attempt(codexswitch_rotation_attempt, failure).await {
+                    return false;
+                }
+                codexswitch_rotation_attempt += 1;
+            }
+        }
     };
-    if !output.status.success() {
-        warn!(
-            "CodexSwitch interrupted-turn rotation exited with status {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return false;
-    }
-    let Some(proof) =
-        codexswitch_verified_rotation_result(&output, &auth_path, &receipt_nonce)
-    else {
-        warn!("CodexSwitch interrupted-turn rotation report did not prove the receipt contract");
-        return false;
-    };
-    if proof.fingerprint == observed_fingerprint {
-        warn!("CodexSwitch interrupted-turn rotation did not change the token fingerprint");
-        return false;
-    }
-    let Some(own_handoff) = codexswitch_verified_own_handoff_v3(
-        Some(&auth_path),
-        Some(&receipt_nonce),
-        Some(&proof.fingerprint),
-        Some(rotation_started_at),
-        false,
-    ) else {
-        warn!("CodexSwitch interrupted turn could not verify its exact post-rotation request and ACK");
-        return false;
-    };
-    if !proof
-        .acknowledged_request_nonces
-        .iter()
-        .any(|nonce| nonce == &own_handoff.request_nonce)
-    {
-        warn!("CodexSwitch interrupted turn own ACK nonce was absent from the rotation report");
-        return false;
-    }
     let manager_already_matches_handoff = codexswitch_auth_handoff_matches(
         auth_manager.codexswitch_auth_fingerprint().as_deref(),
         auth_manager.codexswitch_provider_account_id().as_deref(),
@@ -952,7 +1003,7 @@ fn codexswitch_is_auth_invalidated_error(_error: &CodexErr) -> bool {
     false
 }
 
-// codexswitch-runtime-interrupted-turn-v2
+// codexswitch-runtime-interrupted-turn-v3
 
 "#;
 

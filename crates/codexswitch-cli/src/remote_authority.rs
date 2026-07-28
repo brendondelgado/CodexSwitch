@@ -62,6 +62,22 @@ struct RemoteRotationJournal {
     state: RemoteRotationJournalState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteRotationIntent {
+    reason: String,
+    cooldown_seconds: i64,
+    allow_banked_reset: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteRotationPreparation {
+    Ready(RemoteRotationJournal),
+    Conflicting {
+        pending: RemoteRotationJournal,
+        requested: RemoteRotationIntent,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteRotateReport {
@@ -147,8 +163,12 @@ pub fn rotate(
     allow_banked_reset: bool,
 ) -> Result<RemoteRotationOutcome> {
     let config = load_default_config()?;
-    let pending = begin_or_resume_rotation(reason, cooldown_seconds, allow_banked_reset)?;
-    rotate_with(&config, &pending, &run_ssh)
+    match begin_or_resume_rotation(reason, cooldown_seconds, allow_banked_reset)? {
+        RemoteRotationPreparation::Ready(pending) => rotate_with(&config, &pending, &run_ssh),
+        RemoteRotationPreparation::Conflicting { pending, requested } => {
+            reconcile_conflicting_rotation_with(&config, &pending, &requested, &run_ssh)
+        }
+    }
 }
 
 pub fn mark_rotation_locally_converged(operation_id: Uuid) -> Result<()> {
@@ -183,7 +203,7 @@ fn begin_or_resume_rotation(
     reason: &str,
     cooldown_seconds: i64,
     allow_banked_reset: bool,
-) -> Result<RemoteRotationJournal> {
+) -> Result<RemoteRotationPreparation> {
     begin_or_resume_rotation_at(
         &default_rotation_journal_path()?,
         reason,
@@ -197,11 +217,16 @@ fn begin_or_resume_rotation_at(
     reason: &str,
     cooldown_seconds: i64,
     allow_banked_reset: bool,
-) -> Result<RemoteRotationJournal> {
+) -> Result<RemoteRotationPreparation> {
     parse_reason(reason).map_err(anyhow::Error::msg)?;
     if !(0..=MAX_COOLDOWN_SECONDS).contains(&cooldown_seconds) {
         bail!("remote rotation cooldown is outside the supported range");
     }
+    let requested = RemoteRotationIntent {
+        reason: reason.to_string(),
+        cooldown_seconds,
+        allow_banked_reset,
+    };
     let file = secure_file::lock(path, true)
         .context("failed to lock the remote rotation transport journal")?;
     let snapshot = file
@@ -217,7 +242,13 @@ fn begin_or_resume_rotation_at(
     if let Some(existing) = existing {
         validate_rotation_journal(&existing)?;
         if existing.state == RemoteRotationJournalState::Pending {
-            return Ok(existing);
+            if rotation_journal_matches_intent(&existing, &requested) {
+                return Ok(RemoteRotationPreparation::Ready(existing));
+            }
+            return Ok(RemoteRotationPreparation::Conflicting {
+                pending: existing,
+                requested,
+            });
         }
     }
 
@@ -240,7 +271,16 @@ fn begin_or_resume_rotation_at(
         REMOTE_ROTATION_JOURNAL_MAX_BYTES,
     )
     .context("failed to commit remote rotation transport journal")?;
-    Ok(journal)
+    Ok(RemoteRotationPreparation::Ready(journal))
+}
+
+fn rotation_journal_matches_intent(
+    journal: &RemoteRotationJournal,
+    intent: &RemoteRotationIntent,
+) -> bool {
+    journal.reason == intent.reason
+        && journal.cooldown_seconds == intent.cooldown_seconds
+        && journal.allow_banked_reset == intent.allow_banked_reset
 }
 
 fn mark_rotation_locally_converged_at(path: &Path, operation_id: Uuid) -> Result<()> {
@@ -332,7 +372,7 @@ fn rotate_with(
     runner: &RemoteRunner,
 ) -> Result<RemoteRotationOutcome> {
     let observed = fetch_reconciled_status_with(config, runner)?;
-    if let Some(outcome) = completed_rotation_outcome(&observed, pending.operation_id)? {
+    if let Some(outcome) = completed_rotation_outcome_for_pending(&observed, pending)? {
         return Ok(outcome);
     }
 
@@ -353,7 +393,7 @@ fn rotate_with(
                     "remote rotation outcome is unknown after transport failure: {transport_error:#}"
                 )
             })?;
-            if let Some(outcome) = completed_rotation_outcome(&reconciled, pending.operation_id)? {
+            if let Some(outcome) = completed_rotation_outcome_for_pending(&reconciled, pending)? {
                 return Ok(outcome);
             }
             return Err(transport_error).context(
@@ -371,7 +411,7 @@ fn rotate_with(
         bail!("remote rotation report operation ID does not match the durable request");
     }
     let status = fetch_reconciled_status_with(config, runner)?;
-    let outcome = completed_rotation_outcome(&status, pending.operation_id)?
+    let outcome = completed_rotation_outcome_for_pending(&status, pending)?
         .context("remote authority did not durably complete the rotation operation")?;
     if report.used_banked_reset != outcome.used_banked_reset
         || report.banked_resets_remaining != outcome.banked_resets_remaining
@@ -380,6 +420,33 @@ fn rotate_with(
         bail!("remote rotation report does not match the durable authority outcome");
     }
     Ok(outcome)
+}
+
+fn reconcile_conflicting_rotation_with(
+    config: &RemoteAuthorityConfig,
+    pending: &RemoteRotationJournal,
+    requested: &RemoteRotationIntent,
+    runner: &RemoteRunner,
+) -> Result<RemoteRotationOutcome> {
+    let observed = fetch_reconciled_status_with(config, runner).with_context(|| {
+        format!(
+            "pending remote rotation {} has different semantics and remains unknown because read-only reconciliation failed",
+            pending.operation_id
+        )
+    })?;
+    if let Some(outcome) = completed_rotation_outcome_for_pending(&observed, pending)? {
+        return Ok(outcome);
+    }
+    bail!(
+        "pending remote rotation {} reason={} cooldown_seconds={} allow_banked_reset={} remains unresolved after read-only reconciliation; refusing mismatched request reason={} cooldown_seconds={} allow_banked_reset={}",
+        pending.operation_id,
+        pending.reason,
+        pending.cooldown_seconds,
+        pending.allow_banked_reset,
+        requested.reason,
+        requested.cooldown_seconds,
+        requested.allow_banked_reset
+    )
 }
 
 fn fetch_reconciled_status_with(
@@ -434,6 +501,28 @@ fn completed_rotation_outcome(
         banked_resets_remaining: operation.banked_resets_remaining,
         reset_reason,
     }))
+}
+
+fn completed_rotation_outcome_for_pending(
+    status: &PoolAuthorityStatus,
+    pending: &RemoteRotationJournal,
+) -> Result<Option<RemoteRotationOutcome>> {
+    if let Some(operation) = status
+        .rotation_operations
+        .iter()
+        .find(|operation| operation.operation_id == pending.operation_id)
+    {
+        if operation.reason != pending.reason
+            || operation.cooldown_seconds != pending.cooldown_seconds
+            || operation.allow_banked_reset != pending.allow_banked_reset
+        {
+            bail!(
+                "remote rotation operation {} does not match its durable local semantics",
+                pending.operation_id
+            );
+        }
+    }
+    completed_rotation_outcome(status, pending.operation_id)
 }
 
 fn parse_smart_reset_reason(value: &str) -> Result<SmartResetReason> {
@@ -853,17 +942,133 @@ mod tests {
     }
 
     #[test]
-    fn pending_rotation_journal_reuses_operation_until_local_convergence() -> Result<()> {
+    fn pending_rotation_journal_reuses_only_exact_semantic_match() -> Result<()> {
         let temp = secure_temp_dir()?;
         let path = temp.path().join("remote-rotation.json");
-        let first = begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true)?;
-        let resumed = begin_or_resume_rotation_at(&path, "different_reason", 90, false)?;
+        let RemoteRotationPreparation::Ready(first) =
+            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true)?
+        else {
+            panic!("first rotation must create a ready operation");
+        };
+        let RemoteRotationPreparation::Ready(resumed) =
+            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true)?
+        else {
+            panic!("exact semantic match must resume the pending operation");
+        };
         assert_eq!(resumed, first);
 
+        for (reason, cooldown_seconds, allow_banked_reset) in [
+            ("token_expired", 18_000, true),
+            ("usage_limit", 90, true),
+            ("usage_limit", 18_000, false),
+        ] {
+            let RemoteRotationPreparation::Conflicting { pending, requested } =
+                begin_or_resume_rotation_at(&path, reason, cooldown_seconds, allow_banked_reset)?
+            else {
+                panic!("each semantic mismatch must reject pending-operation reuse");
+            };
+            assert_eq!(pending, first);
+            assert_eq!(requested.reason, reason);
+            assert_eq!(requested.cooldown_seconds, cooldown_seconds);
+            assert_eq!(requested.allow_banked_reset, allow_banked_reset);
+        }
+
         mark_rotation_locally_converged_at(&path, first.operation_id)?;
-        let next = begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true)?;
+        let RemoteRotationPreparation::Ready(next) =
+            begin_or_resume_rotation_at(&path, "usage_limit", 18_000, true)?
+        else {
+            panic!("locally converged operation must permit a new operation");
+        };
         assert_ne!(next.operation_id, first.operation_id);
         assert_eq!(next.state, RemoteRotationJournalState::Pending);
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_pending_rotation_reconciles_read_only_then_fails_unknown() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let config = load_config(&write_config(&temp, true)?)?;
+        let pending = RemoteRotationJournal {
+            version: REMOTE_ROTATION_JOURNAL_VERSION,
+            operation_id: Uuid::new_v4(),
+            reason: "usage_limit".to_string(),
+            cooldown_seconds: 18_000,
+            allow_banked_reset: true,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: RemoteRotationJournalState::Pending,
+        };
+        let requested = RemoteRotationIntent {
+            reason: "token_expired".to_string(),
+            cooldown_seconds: 90,
+            allow_banked_reset: false,
+        };
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let observed_commands = Arc::clone(&commands);
+        let runner = move |_config: &RemoteAuthorityConfig, command: &str, _timeout: Duration| {
+            observed_commands.lock().unwrap().push(command.to_string());
+            Ok(serde_json::to_vec(&status(
+                3,
+                "provider-current",
+                Uuid::new_v4(),
+                Utc::now(),
+            ))?)
+        };
+
+        let error = reconcile_conflicting_rotation_with(&config, &pending, &requested, &runner)
+            .expect_err("unresolved conflicting operation must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("remains unresolved after read-only reconciliation"));
+        assert_eq!(commands.lock().unwrap().len(), 1);
+        assert!(commands.lock().unwrap()[0].contains("pool-authority-status"));
+        assert!(!commands.lock().unwrap()[0].contains("rotate-now"));
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_pending_rotation_returns_completed_prior_outcome_without_mutation() -> Result<()>
+    {
+        let temp = secure_temp_dir()?;
+        let config = load_config(&write_config(&temp, true)?)?;
+        let operation_id = Uuid::new_v4();
+        let pending = RemoteRotationJournal {
+            version: REMOTE_ROTATION_JOURNAL_VERSION,
+            operation_id,
+            reason: "usage_limit".to_string(),
+            cooldown_seconds: 18_000,
+            allow_banked_reset: true,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: RemoteRotationJournalState::Pending,
+        };
+        let requested = RemoteRotationIntent {
+            reason: "token_expired".to_string(),
+            cooldown_seconds: 90,
+            allow_banked_reset: false,
+        };
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let observed_commands = Arc::clone(&commands);
+        let runner = move |_config: &RemoteAuthorityConfig, command: &str, _timeout: Duration| {
+            observed_commands.lock().unwrap().push(command.to_string());
+            let mut observed = status(4, "provider-pro", Uuid::new_v4(), Utc::now());
+            observed.rotation_operations.push(completed_operation(
+                operation_id,
+                "provider-pro",
+                true,
+                Some(1),
+                Some("preserve_faster_tier"),
+            ));
+            Ok(serde_json::to_vec(&observed)?)
+        };
+
+        let outcome = reconcile_conflicting_rotation_with(&config, &pending, &requested, &runner)?;
+
+        assert_eq!(outcome.operation_id, operation_id);
+        assert!(outcome.used_banked_reset);
+        assert_eq!(commands.lock().unwrap().len(), 1);
+        assert!(!commands.lock().unwrap()[0].contains("rotate-now"));
         Ok(())
     }
 
@@ -964,6 +1169,56 @@ mod tests {
         assert_eq!(replay.operation_id, operation_id);
         assert_eq!(*mutation_count.lock().unwrap(), 1);
         assert_eq!(replay.banked_resets_remaining, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_response_retry_reuses_operation_and_cannot_spend_second_reset() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let config = load_config(&write_config(&temp, true)?)?;
+        let operation_id = Uuid::new_v4();
+        let pending = RemoteRotationJournal {
+            version: REMOTE_ROTATION_JOURNAL_VERSION,
+            operation_id,
+            reason: "usage_limit".to_string(),
+            cooldown_seconds: 18_000,
+            allow_banked_reset: true,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: RemoteRotationJournalState::Pending,
+        };
+        let committed = Arc::new(Mutex::new(false));
+        let mutation_count = Arc::new(Mutex::new(0usize));
+        let observed_committed = Arc::clone(&committed);
+        let observed_mutations = Arc::clone(&mutation_count);
+        let runner = move |_config: &RemoteAuthorityConfig, command: &str, _timeout: Duration| {
+            if command.contains("rotate-now") {
+                *observed_mutations.lock().unwrap() += 1;
+                *observed_committed.lock().unwrap() = true;
+                return Ok(b"{malformed".to_vec());
+            }
+            let mut observed = status(5, "provider-pro", Uuid::new_v4(), Utc::now());
+            if *observed_committed.lock().unwrap() {
+                observed.rotation_operations.push(completed_operation(
+                    operation_id,
+                    "provider-pro",
+                    true,
+                    Some(1),
+                    Some("runtime_usage_limit_no_replacement"),
+                ));
+            }
+            Ok(serde_json::to_vec(&observed)?)
+        };
+
+        let first = rotate_with(&config, &pending, &runner)
+            .expect_err("malformed first response must be rejected");
+        assert!(format!("{first:#}").contains("remote rotation report is malformed"));
+        let replay = rotate_with(&config, &pending, &runner)?;
+
+        assert_eq!(replay.operation_id, operation_id);
+        assert!(replay.used_banked_reset);
+        assert_eq!(replay.banked_resets_remaining, Some(1));
+        assert_eq!(*mutation_count.lock().unwrap(), 1);
         Ok(())
     }
 

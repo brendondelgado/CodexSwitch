@@ -731,7 +731,6 @@ where
         store_path,
         auth_path,
         status,
-        false,
         &fetch_remote,
         reload,
     )?;
@@ -760,7 +759,6 @@ fn converge_local_to_remote_authority_with<F, R>(
     store_path: &Path,
     auth_path: &Path,
     initial_status: PoolAuthorityStatus,
-    force_first_reload: bool,
     fetch_remote: &F,
     reload: &R,
 ) -> Result<(RemoteLocalAdoption, PoolAuthorityStatus)>
@@ -769,14 +767,12 @@ where
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
     let mut desired = resolve_committed_remote_status_with(initial_status, fetch_remote)?;
-    let mut force_reload = force_first_reload;
     for _ in 0..REMOTE_AUTHORITY_RECONCILIATION_ATTEMPTS {
         let adoption = adopt_remote_provider_under_runtime_lease(
             runtime_lease,
             store_path,
             auth_path,
             &desired.desired_provider_account_id,
-            force_reload,
             reload,
         )?;
         let observed = resolve_committed_remote_status_with(fetch_remote()?, fetch_remote)?;
@@ -792,7 +788,6 @@ where
             return Ok((adoption, observed));
         }
         desired = observed;
-        force_reload = true;
     }
     bail!("remote pool authority kept advancing during bounded local adoption")
 }
@@ -802,7 +797,6 @@ fn adopt_remote_provider_under_runtime_lease<R>(
     store_path: &Path,
     auth_path: &Path,
     desired_provider_account_id: &str,
-    force_reload: bool,
     reload: &R,
 ) -> Result<RemoteLocalAdoption>
 where
@@ -825,17 +819,6 @@ where
         .find(|account| account.account_id == desired_provider_account_id)
         .cloned()
         .context("remote-authority target is absent from the local account store")?;
-    let already_configured = active_account(&snapshot.accounts).map(|account| account.id)
-        == Some(target.id)
-        && auth::auth_file_matches_account(auth_path, &target);
-    if already_configured && !force_reload {
-        return Ok(RemoteLocalAdoption {
-            target,
-            activation_state: ActivationState::Confirmed,
-            reload: ReloadSummary::default().with_topology_verified(true),
-            reload_attempted: false,
-        });
-    }
 
     let mut generation = snapshot.generation;
     let mut accounts = snapshot.accounts;
@@ -1912,26 +1895,12 @@ where
 
     let remote = rotate_remote(reason, cooldown_seconds, allow_banked_reset)?;
     let status = resolve_committed_remote_status_with(remote.status.clone(), &fetch_remote)?;
-    let pre_adoption_target = before
-        .accounts
-        .iter()
-        .find(|account| account.account_id == status.desired_provider_account_id)
-        .context("remote-authority target is absent from the local account store")?;
-    if receipt_nonce.is_some()
-        && pre_adoption_target.id == previous.id
-        && auth::auth_file_matches_account(auth_path, pre_adoption_target)
-    {
-        bail!(
-            "remote authority retained the current local credentials; receipt-bound rotation cannot advance"
-        );
-    }
 
     let (adoption, final_status) = converge_local_to_remote_authority_with(
         &runtime_lease,
         store_path,
         auth_path,
         status,
-        true,
         &fetch_remote,
         reload,
     )?;
@@ -3023,6 +2992,104 @@ mod tests {
     }
 
     #[test]
+    fn already_configured_remote_target_still_requires_fresh_runtime_ack() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let request_id = Uuid::new_v4();
+        let stable = remote_status(
+            2,
+            PoolAuthorityPhase::Stable,
+            &active.account_id,
+            request_id,
+        );
+        let reload_count = Arc::new(Mutex::new(0usize));
+        let observed_reloads = Arc::clone(&reload_count);
+
+        let final_status = request_pool_target_via_remote_with(
+            &store_path,
+            &auth_path,
+            &active.account_id,
+            request_id,
+            1,
+            "manual_cli_swap",
+            {
+                let stable = stable.clone();
+                move |_provider_id, _request_id, _expected_epoch, _reason| Ok(stable.clone())
+            },
+            {
+                let stable = stable.clone();
+                move || Ok(stable.clone())
+            },
+            &move |_path| {
+                *observed_reloads.lock().unwrap() += 1;
+                Ok(verified_reload_summary())
+            },
+        )?;
+
+        assert_eq!(final_status.desired_provider_account_id, active.account_id);
+        assert_eq!(*reload_count.lock().unwrap(), 1);
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .context("activation record disappeared")?
+                .state,
+            ActivationState::Confirmed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn already_configured_remote_target_without_runtime_is_degraded_not_confirmed() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let request_id = Uuid::new_v4();
+        let stable = remote_status(
+            2,
+            PoolAuthorityPhase::Stable,
+            &active.account_id,
+            request_id,
+        );
+
+        let error = request_pool_target_via_remote_with(
+            &store_path,
+            &auth_path,
+            &active.account_id,
+            request_id,
+            1,
+            "manual_cli_swap",
+            {
+                let stable = stable.clone();
+                move |_provider_id, _request_id, _expected_epoch, _reason| Ok(stable.clone())
+            },
+            {
+                let stable = stable.clone();
+                move || Ok(stable.clone())
+            },
+            &|_path| Ok(ReloadSummary::default().with_topology_verified(true)),
+        )
+        .expect_err("configured files without a runtime ACK must fail closed");
+
+        assert!(format!("{error:#}").contains("CommittedDegraded"));
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            activation::read_activation_record(&store_lock)?
+                .context("activation record disappeared")?
+                .state,
+            ActivationState::CommittedDegraded
+        );
+        assert!(auth::auth_file_matches_account(&auth_path, &active));
+        Ok(())
+    }
+
+    #[test]
     fn committed_degraded_remote_target_is_adopted_without_local_authority() -> Result<()> {
         let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
@@ -3960,6 +4027,116 @@ mod tests {
         assert!(error.to_string().contains("requires live runtime reload"));
         assert_eq!(fs::read(&store_path)?, store_before);
         assert_eq!(fs::read(&auth_path)?, auth_before);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_rotation_retry_reloads_same_target_for_fresh_receipt_ack() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let target = account("target@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, target.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let operation_id = Uuid::new_v4();
+        let receipt_nonce = Uuid::new_v4();
+        let status = remote_status(
+            2,
+            PoolAuthorityPhase::Stable,
+            &target.account_id,
+            Uuid::new_v4(),
+        );
+        let remote = remote_authority::RemoteRotationOutcome {
+            status: status.clone(),
+            operation_id,
+            reason: "usage_limit".to_string(),
+            used_banked_reset: true,
+            banked_resets_remaining: Some(1),
+            reset_reason: Some(SmartResetReason::RuntimeUsageLimitNoReplacement),
+        };
+        let reload_calls = Arc::new(Mutex::new(0usize));
+        let observed_reloads = Arc::clone(&reload_calls);
+        let mark_calls = Arc::new(Mutex::new(Vec::new()));
+        let observed_marks = Arc::clone(&mark_calls);
+
+        let first = rotate_now_via_remote_with(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 18_000,
+                reload_processes: true,
+                allow_banked_reset: true,
+                operation_id: None,
+                receipt_nonce: Some(receipt_nonce),
+            },
+            {
+                let remote = remote.clone();
+                move |_reason, _cooldown, _allow_reset| Ok(remote.clone())
+            },
+            {
+                let status = status.clone();
+                move || Ok(status.clone())
+            },
+            {
+                let observed_marks = Arc::clone(&observed_marks);
+                move |operation_id| {
+                    observed_marks.lock().unwrap().push(operation_id);
+                    Ok(())
+                }
+            },
+            &move |_path| {
+                *observed_reloads.lock().unwrap() += 1;
+                Ok(verified_reload_summary())
+            },
+        )
+        .expect_err("first attempt without receipt evidence must fail closed");
+
+        assert!(format!("{first:#}").contains("did not preserve the requested receipt nonce"));
+        assert!(auth::auth_file_matches_account(&auth_path, &target));
+        assert!(mark_calls.lock().unwrap().is_empty());
+        assert_eq!(*reload_calls.lock().unwrap(), 1);
+
+        let retry_reload_calls = Arc::new(Mutex::new(0usize));
+        let observed_retry_reloads = Arc::clone(&retry_reload_calls);
+        let second = rotate_now_via_remote_with(
+            RotateNowContext {
+                store_path: &store_path,
+                auth_path: &auth_path,
+                reason: "usage_limit",
+                cooldown_seconds: 18_000,
+                reload_processes: true,
+                allow_banked_reset: true,
+                operation_id: None,
+                receipt_nonce: Some(receipt_nonce),
+            },
+            {
+                let remote = remote.clone();
+                move |_reason, _cooldown, _allow_reset| Ok(remote.clone())
+            },
+            {
+                let status = status.clone();
+                move || Ok(status.clone())
+            },
+            {
+                let observed_marks = Arc::clone(&mark_calls);
+                move |operation_id| {
+                    observed_marks.lock().unwrap().push(operation_id);
+                    Ok(())
+                }
+            },
+            &move |_path| {
+                *observed_retry_reloads.lock().unwrap() += 1;
+                Ok(verified_receipt_reload_summary(receipt_nonce))
+            },
+        )?;
+
+        assert_eq!(second.operation_id, Some(operation_id));
+        assert_eq!(second.next_email, target.email);
+        assert!(second.runtime_converged);
+        assert_eq!(*retry_reload_calls.lock().unwrap(), 1);
+        assert_eq!(*mark_calls.lock().unwrap(), vec![operation_id]);
         Ok(())
     }
 

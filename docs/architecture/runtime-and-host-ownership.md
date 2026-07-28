@@ -148,11 +148,23 @@ After an unknown SSH outcome, the Mac performs read-only status reconciliation
 before retrying; it never submits a second banked-reset effect merely because a
 response was lost. The local operation becomes complete only after Mac
 credentials and runtime acknowledgement converge to the recorded VPS target.
+Interrupted-turn recovery may retry transient transport, timeout, malformed
+response, or missing-ACK failures within the original turn, but every bounded
+attempt retains the same receipt and durable rotation operation. A pending
+operation is reusable only when reason, cooldown, and banked-reset permission
+all match. A semantic mismatch first performs read-only reconciliation: a
+completed prior operation may be locally converged, while an unresolved prior
+operation blocks the new request without submitting either operation again.
 
 Mac adoption requires one fresh, internally consistent observation whose
 authority epoch, desired provider identity, request result, and VPS readiness
 identity agree. Email is presentation metadata only. A stale, unreachable,
 malformed, duplicate, or contradictory observation authorizes no Mac mutation.
+Matching account-store and `auth.json` credentials prove only that the target is
+configured. Adoption still requires a fresh reload of every discovered managed
+runtime and an exact target acknowledgement. With no managed runtime, adoption
+remains file-only/degraded; incomplete acknowledgement is degraded. Neither
+state may be reported or persisted as runtime `Confirmed`.
 
 ## Pool Authority State Machine
 
