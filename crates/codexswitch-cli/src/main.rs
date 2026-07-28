@@ -2308,7 +2308,11 @@ where
     let previous_token_hash_prefix = token_hash_prefix(&accounts[active_index].access_token);
 
     let fallback_until = Utc::now() + ChronoDuration::seconds(cooldown_seconds.max(60));
-    if reason == "usage_limit" {
+    if reason == "usage_limit"
+        && accounts[active_index].has_usable_inference_token_at(Utc::now())
+        && (!accounts[active_index].runtime_unusable()
+            || accounts[active_index].runtime_block_is_usage_limit())
+    {
         // A typed runtime usage-limit response is newer and more authoritative
         // than the separately cached quota endpoint. Refresh the active account
         // for reset timing and bank policy, but never let a healthy-looking poll
@@ -2620,12 +2624,15 @@ where
 {
     let mut observations = CurrentQuotaObservations::new(Utc::now());
     for account in accounts.iter_mut().filter(|account| !account.is_active) {
-        if account.runtime_unusable() {
+        let now = Utc::now();
+        if account.runtime_unusable_at(now) || !account.has_usable_inference_token_at(now) {
             continue;
         }
         if let Ok(result) = fetch_quota_fn(account) {
             apply_fetch_result(account, result);
-            observations.record_success(account);
+            if quota_availability_at(account, Utc::now()) == QuotaAvailability::Usable {
+                observations.record_success(account);
+            }
         }
     }
     observations
@@ -2907,7 +2914,9 @@ mod tests {
         CodexAccount {
             id: Uuid::new_v4(),
             email: email.to_string(),
-            access_token: format!("access-{email}"),
+            access_token: account_store::test_inference_token(
+                Utc::now() + ChronoDuration::hours(1),
+            ),
             refresh_token: format!("refresh-{email}"),
             id_token: format!("id-{email}"),
             account_id: email.to_string(),
@@ -4628,6 +4637,82 @@ mod tests {
         assert_eq!(
             active_account(&stored).map(|account| account.email.as_str()),
             Some("replacement@example.com")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_rotate_rejects_freshly_confirmed_red_candidate() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let replacement = account("red@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+
+        let error = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "usage_limit",
+            21_600,
+            true,
+            |account| {
+                let mut result = fetch_from_account(account)?;
+                if account.email == "red@example.com" {
+                    result.snapshot.weekly_mut().unwrap().used_percent = 100.0;
+                    result.snapshot.allowed = Some(false);
+                    result.snapshot.limit_reached = Some(true);
+                }
+                Ok(result)
+            },
+            |_| Ok(verified_reload_summary()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("no freshly confirmed usable replacement"));
+        assert_eq!(
+            active_account(&load_accounts(&store_path)?).map(|account| account.email.as_str()),
+            Some("active@example.com")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_rotate_rejects_green_quota_for_expired_inference_token() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let mut replacement = account("expired@example.com", false, 10.0, 10.0);
+        replacement.access_token =
+            account_store::test_inference_token(Utc::now() - ChronoDuration::seconds(1));
+        save_accounts(&store_path, &[active, replacement])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let candidate_fetches = Arc::new(Mutex::new(0usize));
+        let candidate_fetches_for_closure = Arc::clone(&candidate_fetches);
+
+        let error = rotate_now_with(
+            &store_path,
+            &auth_path,
+            "usage_limit",
+            21_600,
+            true,
+            move |account| {
+                if account.email == "expired@example.com" {
+                    *candidate_fetches_for_closure.lock().unwrap() += 1;
+                }
+                fetch_from_account(account)
+            },
+            |_| Ok(verified_reload_summary()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("no freshly confirmed usable replacement"));
+        assert_eq!(*candidate_fetches.lock().unwrap(), 0);
+        assert_eq!(
+            active_account(&load_accounts(&store_path)?).map(|account| account.email.as_str()),
+            Some("active@example.com")
         );
         Ok(())
     }

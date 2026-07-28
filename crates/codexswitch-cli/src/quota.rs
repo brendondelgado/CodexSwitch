@@ -141,6 +141,8 @@ pub fn parse_usage_response(data: &[u8]) -> Result<FetchResult> {
 }
 
 pub fn apply_fetch_result(account: &mut CodexAccount, result: FetchResult) {
+    let preserve_non_quota_runtime_block =
+        account.runtime_unusable() && !account.runtime_block_is_usage_limit();
     let fetched_at = swift_reference_value(result.snapshot.fetched_at);
     let plan_type = result.plan_type;
     account.has_active_subscription = Some(plan_has_active_subscription(&plan_type));
@@ -151,8 +153,10 @@ pub fn apply_fetch_result(account: &mut CodexAccount, result: FetchResult) {
     account.quota_snapshot = Some(result.snapshot);
     account.plan_type = Some(plan_type);
     account.last_refreshed = Some(fetched_at);
-    account.runtime_unusable_until = None;
-    account.runtime_unusable_reason = None;
+    if !preserve_non_quota_runtime_block {
+        account.runtime_unusable_until = None;
+        account.runtime_unusable_reason = None;
+    }
 }
 
 fn plan_has_active_subscription(plan_type: &str) -> bool {
@@ -562,6 +566,51 @@ mod tests {
 
         assert_eq!(account.runtime_unusable_until, None);
         assert_eq!(account.runtime_unusable_reason, None);
+        assert!(account.quota_snapshot.is_some());
+    }
+
+    #[test]
+    fn successful_fetch_result_preserves_current_token_expired_block() {
+        let mut account = CodexAccount {
+            id: Uuid::new_v4(),
+            email: "expired@example.com".to_string(),
+            access_token: "expired-access".to_string(),
+            refresh_token: "invalid-refresh".to_string(),
+            id_token: "id".to_string(),
+            account_id: "expired@example.com".to_string(),
+            quota_snapshot: None,
+            plan_type: Some("pro".to_string()),
+            last_refreshed: None,
+            subscription_renews_at: None,
+            subscription_expires_at: None,
+            subscription_will_renew: None,
+            has_active_subscription: Some(true),
+            five_hour_primed_at: None,
+            runtime_unusable_until: Some(Utc::now() + chrono::Duration::days(30)),
+            runtime_unusable_reason: Some("token_expired".to_string()),
+            rate_limit_reset_bank: None,
+            is_active: false,
+        };
+        let result = parse_usage_response(
+            br#"{
+              "plan_type":"pro",
+              "rate_limit":{
+                "allowed":true,
+                "limit_reached":false,
+                "primary_window":{"used_percent":1.0,"limit_window_seconds":18000,"reset_at":1893456000},
+                "secondary_window":{"used_percent":2.0,"limit_window_seconds":604800,"reset_at":1894060800}
+              }
+            }"#,
+        )
+        .unwrap();
+
+        apply_fetch_result(&mut account, result);
+
+        assert_eq!(
+            account.runtime_unusable_reason.as_deref(),
+            Some("token_expired")
+        );
+        assert!(account.runtime_unusable());
         assert!(account.quota_snapshot.is_some());
     }
 

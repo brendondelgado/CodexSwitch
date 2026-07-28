@@ -1,6 +1,10 @@
 import Foundation
+import CoreFoundation
 
 struct CodexAccount: Codable, Identifiable, Sendable {
+    private static let inferenceTokenSafetyWindow: TimeInterval = 5 * 60
+    private static let maximumInferenceTokenPayloadBytes = 64 * 1_024
+
     let id: UUID
     var email: String
     var accessToken: String
@@ -50,11 +54,27 @@ struct CodexAccount: Codable, Identifiable, Sendable {
     }
 
     func isImmediatelyUsableReplacement(at now: Date) -> Bool {
+        isRuntimeImmediatelyUsable(at: now)
+    }
+
+    var isRuntimeImmediatelyUsable: Bool {
+        isRuntimeImmediatelyUsable(at: Date())
+    }
+
+    func isRuntimeImmediatelyUsable(at now: Date) -> Bool {
         guard hasCompleteRuntimeCredentials,
+              hasUsableInferenceToken(at: now),
               !isRuntimeUnusable(at: now) else {
             return false
         }
         return isQuotaImmediatelyUsable(at: now)
+    }
+
+    func hasUsableInferenceToken(at now: Date) -> Bool {
+        guard let expiresAt = Self.inferenceTokenExpiration(accessToken) else {
+            return false
+        }
+        return expiresAt > now.addingTimeInterval(Self.inferenceTokenSafetyWindow)
     }
 
     var isQuotaImmediatelyUsable: Bool {
@@ -138,6 +158,30 @@ struct CodexAccount: Codable, Identifiable, Sendable {
             || reason.contains("reauth")
             || reason.contains("unauthorized")
             || reason.contains("authentication")
+    }
+
+    private static func inferenceTokenExpiration(_ token: String) -> Date? {
+        let segments = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count == 3,
+              !segments[1].isEmpty,
+              segments[1].utf8.count <= maximumInferenceTokenPayloadBytes * 2 else {
+            return nil
+        }
+        var encoded = String(segments[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let padding = (4 - encoded.count % 4) % 4
+        encoded.append(String(repeating: "=", count: padding))
+        guard let data = Data(base64Encoded: encoded),
+              data.count <= maximumInferenceTokenPayloadBytes,
+              let claims = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let expiration = claims["exp"] as? NSNumber,
+              CFGetTypeID(expiration) != CFBooleanGetTypeID() else {
+            return nil
+        }
+        let timestamp = expiration.doubleValue
+        guard timestamp.isFinite else { return nil }
+        return Date(timeIntervalSince1970: timestamp)
     }
 
     var runtimeStatusText: String? {

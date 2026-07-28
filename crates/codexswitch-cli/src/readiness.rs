@@ -73,13 +73,19 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
             let accounts = snapshot.accounts;
             account_count = accounts.len();
             if let Some(active) = active_account(&accounts) {
+                let now = Utc::now();
                 active_email = Some(active.email.clone());
                 active_token_fingerprint = account_token_fingerprint(active);
                 active_confirmation_account = Some(active.clone());
                 if active_token_fingerprint.is_none() {
                     issues.push("active account has incomplete token material".to_string());
                 }
-                active_availability = quota_availability_at(active, Utc::now());
+                if !active.has_usable_inference_token_at(now) {
+                    issues.push(
+                        "active inference token is expired or inside the safety window".to_string(),
+                    );
+                }
+                active_availability = quota_availability_at(active, now);
             }
             ready_candidate_count = accounts
                 .iter()

@@ -1022,8 +1022,19 @@ where
     F: Fn(&CodexAccount) -> Result<FetchResult>,
     T: Fn(&mut CodexAccount) -> Result<()>,
 {
+    let now = Utc::now();
+    if account.runtime_unusable_at(now) && account.runtime_block_is_token_expired() {
+        bail!(
+            "current token_expired runtime block suppresses quota and refresh retry for {}",
+            account.email
+        );
+    }
     match fetch_quota_fn(account) {
-        Ok(result) => Ok(result),
+        Ok(result) if account.has_usable_inference_token_at(Utc::now()) => Ok(result),
+        Ok(_) => bail!(
+            "inference token expired or is inside the safety window for {}",
+            account.email
+        ),
         Err(error)
             if poll_error_runtime_block(&error).map(|(reason, _)| reason)
                 == Some("token_expired") =>
@@ -1041,6 +1052,12 @@ where
                     "failed to refresh expired access token for {}",
                     account.email
                 )));
+            }
+            if !account.has_usable_inference_token_at(Utc::now()) {
+                bail!(
+                    "refreshed inference token expired or is inside the safety window for {}",
+                    account.email
+                );
             }
             fetch_quota_fn(account)
         }
@@ -1198,9 +1215,14 @@ fn refresh_stale_reset_bank_observations<B>(
     B: Fn(&CodexAccount) -> Result<RateLimitResetBank>,
 {
     for account in accounts {
+        let snapshot_is_blocked = real_quota_snapshot(account)
+            .is_some_and(|snapshot| snapshot.availability_at(now) == QuotaAvailability::Blocked);
+        let runtime_allows_reset_provider_io =
+            !account.runtime_unusable_at(now) || account.runtime_block_is_usage_limit();
         let resettable = account.plan_priority() >= 2
-            && (quota_availability_at(account, now) == QuotaAvailability::Blocked
-                || account.runtime_block_is_usage_limit());
+            && account.has_usable_inference_token_at(now)
+            && runtime_allows_reset_provider_io
+            && (snapshot_is_blocked || account.runtime_block_is_usage_limit());
         let bank_is_stale = account
             .rate_limit_reset_bank
             .as_ref()
@@ -1224,7 +1246,7 @@ fn should_probe_inactive_account(account: &CodexAccount, now: chrono::DateTime<U
     if account.is_active {
         return false;
     }
-    if account.runtime_unusable() && !account.runtime_block_is_usage_limit() {
+    if account.runtime_unusable_at(now) && !account.runtime_block_is_usage_limit() {
         return false;
     }
     let availability = quota_availability_at(account, now);
@@ -1448,7 +1470,9 @@ mod tests {
         CodexAccount {
             id: Uuid::new_v4(),
             email: email.to_string(),
-            access_token: format!("access-{email}"),
+            access_token: crate::account_store::test_inference_token(
+                Utc::now() + ChronoDuration::hours(1),
+            ),
             refresh_token: format!("refresh-{email}"),
             id_token: format!("id-{email}"),
             account_id: email.to_string(),
@@ -2125,7 +2149,9 @@ mod tests {
                 ready_fetch(account)
             },
             move |account| {
-                account.access_token = "fresh-access".to_string();
+                account.access_token = crate::account_store::test_inference_token(
+                    Utc::now() + ChronoDuration::hours(1),
+                );
                 account.refresh_token = "fresh-refresh".to_string();
                 *refreshed_for_closure.lock().unwrap() = true;
                 Ok(())
@@ -2144,7 +2170,7 @@ mod tests {
             .iter()
             .find(|account| account.email == "expired@example.com")
             .unwrap();
-        assert_eq!(active.access_token, "fresh-access");
+        assert!(active.has_usable_inference_token_at(Utc::now()));
         assert_eq!(active.refresh_token, "fresh-refresh");
         assert_eq!(active.runtime_unusable_reason.as_deref(), None);
         let auth: serde_json::Value = serde_json::from_slice(&std::fs::read(auth_path)?)?;
@@ -2156,9 +2182,39 @@ mod tests {
         assert_eq!(
             auth.pointer("/tokens/access_token")
                 .and_then(|value| value.as_str()),
-            Some("fresh-access")
+            Some(active.access_token.as_str())
         );
         Ok(())
+    }
+
+    #[test]
+    fn current_token_expired_block_suppresses_quota_and_refresh_provider_io() {
+        let now = Utc::now();
+        let mut blocked = account("blocked@example.com", true, 10.0, 10.0);
+        mark_runtime_unusable(
+            &mut blocked,
+            "token_expired",
+            now + ChronoDuration::days(30),
+        );
+        let calls = Arc::new(Mutex::new((0usize, 0usize)));
+        let fetch_calls = Arc::clone(&calls);
+        let refresh_calls = Arc::clone(&calls);
+
+        let error = fetch_quota_with_refresh(
+            &mut blocked,
+            &move |_| {
+                fetch_calls.lock().unwrap().0 += 1;
+                bail!("quota provider must not be called")
+            },
+            &move |_| {
+                refresh_calls.lock().unwrap().1 += 1;
+                bail!("refresh provider must not be called")
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("suppresses quota and refresh retry"));
+        assert_eq!(*calls.lock().unwrap(), (0, 0));
     }
 
     #[test]
@@ -3290,6 +3346,32 @@ mod tests {
             now + ChronoDuration::seconds(INACTIVE_EXHAUSTED_PLAN_UPGRADE_POLL_SECONDS as i64)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn token_expired_block_suppresses_reset_bank_provider_io() {
+        let now = Utc::now();
+        let mut blocked = account("blocked@example.com", false, 100.0, 100.0);
+        blocked.plan_type = Some("pro".to_string());
+        mark_runtime_unusable(
+            &mut blocked,
+            "token_expired",
+            now + ChronoDuration::days(30),
+        );
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_for_closure = Arc::clone(&calls);
+
+        refresh_stale_reset_bank_observations(
+            std::slice::from_mut(&mut blocked),
+            now,
+            &move |_| {
+                *calls_for_closure.lock().unwrap() += 1;
+                Ok(reset_bank(1, now))
+            },
+        );
+
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert!(blocked.rate_limit_reset_bank.is_none());
     }
 
     #[test]

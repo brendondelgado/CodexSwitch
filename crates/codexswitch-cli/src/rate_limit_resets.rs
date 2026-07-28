@@ -2585,7 +2585,9 @@ mod tests {
         CodexAccount {
             id: Uuid::new_v4(),
             email: email.to_string(),
-            access_token: format!("access-{email}"),
+            access_token: crate::account_store::test_inference_token(
+                Utc::now() + ChronoDuration::hours(1),
+            ),
             refresh_token: format!("refresh-{email}"),
             id_token: format!("id-{email}"),
             account_id: email.to_string(),

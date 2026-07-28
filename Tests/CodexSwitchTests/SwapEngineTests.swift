@@ -236,6 +236,40 @@ struct SwapEngineTests {
         #expect(SwapEngine.selectOptimalAccount(from: incomplete, now: now) == nil)
     }
 
+    @Test("Replacement eligibility rejects expired and near-expiry inference tokens")
+    func replacementEligibilityRequiresSafeInferenceTokenLifetime() {
+        let now = Date(timeIntervalSince1970: 2_100_000_000)
+        let snapshot = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: now,
+            windows: [
+                quotaWindow(
+                    kind: .weekly,
+                    usedPercent: 20,
+                    resetsAt: now.addingTimeInterval(604_800)
+                ),
+            ]
+        )
+        var expired = account(email: "expired@example.com", snapshot: snapshot)
+        expired.accessToken = inferenceToken(expiresAt: now.addingTimeInterval(-1))
+        var safetyBoundary = account(email: "boundary@example.com", snapshot: snapshot)
+        safetyBoundary.accessToken = inferenceToken(expiresAt: now.addingTimeInterval(300))
+        var safelyUsable = account(email: "usable@example.com", snapshot: snapshot)
+        safelyUsable.accessToken = inferenceToken(expiresAt: now.addingTimeInterval(301))
+
+        #expect(!expired.hasUsableInferenceToken(at: now))
+        #expect(!expired.isImmediatelyUsableReplacement(at: now))
+        #expect(!safetyBoundary.hasUsableInferenceToken(at: now))
+        #expect(!safetyBoundary.isImmediatelyUsableReplacement(at: now))
+        #expect(safelyUsable.hasUsableInferenceToken(at: now))
+        #expect(safelyUsable.isImmediatelyUsableReplacement(at: now))
+        #expect(SwapEngine.selectOptimalAccount(
+            from: [expired, safetyBoundary, safelyUsable],
+            now: now
+        )?.id == safelyUsable.id)
+    }
+
     @Test("Replacement eligibility rejects every active runtime block")
     func replacementEligibilityUsesRuntimeStateAtDecisionTime() {
         let now = Date(timeIntervalSince1970: 2_100_000_000)
@@ -282,7 +316,7 @@ struct SwapEngineTests {
     ) -> CodexAccount {
         CodexAccount(
             email: email,
-            accessToken: "access",
+            accessToken: inferenceToken(expiresAt: snapshot.fetchedAt.addingTimeInterval(3_600)),
             refreshToken: "refresh",
             idToken: "id",
             accountId: email,
@@ -322,7 +356,7 @@ struct SwapEngineTests {
         CodexAccount(
             id: id,
             email: "test-\(id.uuidString.prefix(4))@test.com",
-            accessToken: "t",
+            accessToken: inferenceToken(expiresAt: Date().addingTimeInterval(3_600)),
             refreshToken: "r",
             idToken: "i",
             accountId: "acc-\(id.uuidString.prefix(8))",
@@ -344,6 +378,18 @@ struct SwapEngineTests {
             planType: planType,
             isActive: isActive
         )
+    }
+
+    private func inferenceToken(expiresAt: Date) -> String {
+        let payload = try! JSONSerialization.data(
+            withJSONObject: ["exp": Int(expiresAt.timeIntervalSince1970)]
+        )
+        let encoded = payload
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "e30.\(encoded).signature"
     }
 
     private func signalIdentity(

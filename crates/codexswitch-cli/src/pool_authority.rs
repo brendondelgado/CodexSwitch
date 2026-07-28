@@ -333,6 +333,15 @@ impl PoolAuthorityLock {
             {
                 bail!("rotation operation ID was reused with different request content");
             }
+        }
+        if reconcile_superseded_non_reset_rotation(&mut record) {
+            self.commit(record.clone())?;
+        }
+        if let Some(existing) = record
+            .rotation_operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+        {
             let disposition = match existing.phase {
                 PoolRotationOperationPhase::Started => RotationOperationDisposition::Recover,
                 PoolRotationOperationPhase::Completed => RotationOperationDisposition::Replay,
@@ -426,6 +435,9 @@ impl PoolAuthorityLock {
         record.phase = phase;
         record.detail = detail;
         record.updated_at = Utc::now();
+        if phase == PoolAuthorityPhase::Stable {
+            reconcile_superseded_non_reset_rotation(&mut record);
+        }
         self.commit(record.clone())?;
         Ok(record)
     }
@@ -525,6 +537,34 @@ fn validate_record(record: &PoolAuthorityRecord) -> Result<()> {
         bail!("pool-authority timestamps are inconsistent");
     }
     Ok(())
+}
+
+fn reconcile_superseded_non_reset_rotation(record: &mut PoolAuthorityRecord) -> bool {
+    if record.phase != PoolAuthorityPhase::Stable {
+        return false;
+    }
+    let Some(operation) = record
+        .rotation_operations
+        .iter_mut()
+        .find(|operation| operation.phase == PoolRotationOperationPhase::Started)
+    else {
+        return false;
+    };
+    if operation.allow_banked_reset
+        || record.request_id == operation.operation_id
+        || record.requested_at <= operation.started_at
+        || record.previous_provider_account_id == record.desired_provider_account_id
+    {
+        return false;
+    }
+
+    operation.phase = PoolRotationOperationPhase::Completed;
+    operation.updated_at = Utc::now();
+    operation.target_provider_account_id = Some(record.desired_provider_account_id.clone());
+    operation.used_banked_reset = Some(false);
+    operation.banked_resets_remaining = None;
+    operation.reset_reason = None;
+    true
 }
 
 fn validate_rotation_operation(operation: &PoolRotationOperation) -> Result<()> {
@@ -796,6 +836,140 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("bootstrap epoch is 1"));
         assert!(!pool_authority_path(&store_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn newer_stable_request_completes_superseded_non_reset_rotation() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let active = account("active@example.com", true);
+        let target = account("target@example.com", false);
+        save_accounts(&store_path, &[active.clone(), target.clone()])?;
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let mut authority =
+            PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, &store_path)?;
+        authority.bootstrap_from_active(&[active, target.clone()])?;
+
+        let operation_id = Uuid::new_v4();
+        authority.begin_rotation_operation(operation_id, "usage_limit", 18_000, false)?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let manual_request_id = Uuid::new_v4();
+        authority.begin_target_request(
+            &target.account_id,
+            manual_request_id,
+            1,
+            "swift_manual_selection",
+        )?;
+        authority.mark_stable()?;
+
+        let before_invalid_replay = authority.require_record()?.clone();
+        assert_eq!(
+            before_invalid_replay.rotation_operations[0].phase,
+            PoolRotationOperationPhase::Completed,
+            "stable cross-target convergence must resolve the older operation atomically"
+        );
+        let error = authority
+            .begin_rotation_operation(operation_id, "token_invalidated", 18_000, false)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reused with different request content"));
+        assert_eq!(
+            authority.require_record()?,
+            &before_invalid_replay,
+            "invalid operation reuse must not perform supersession recovery"
+        );
+
+        let (disposition, operation) =
+            authority.begin_rotation_operation(operation_id, "usage_limit", 18_000, false)?;
+        assert_eq!(disposition, RotationOperationDisposition::Replay);
+        assert_eq!(operation.phase, PoolRotationOperationPhase::Completed);
+        assert_eq!(
+            operation.target_provider_account_id.as_deref(),
+            Some(target.account_id.as_str())
+        );
+        assert_eq!(operation.used_banked_reset, Some(false));
+        assert_eq!(
+            authority.require_record()?.request_id,
+            manual_request_id,
+            "operation reconciliation must not replace newer authority"
+        );
+
+        let next_operation_id = Uuid::new_v4();
+        let (disposition, next) = authority.begin_rotation_operation(
+            next_operation_id,
+            "token_invalidated",
+            300,
+            false,
+        )?;
+        assert_eq!(disposition, RotationOperationDisposition::Started);
+        assert_eq!(next.operation_id, next_operation_id);
+        Ok(())
+    }
+
+    #[test]
+    fn newer_stable_request_does_not_guess_reset_capable_operation_outcome() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let active = account("active@example.com", true);
+        let target = account("target@example.com", false);
+        save_accounts(&store_path, &[active.clone(), target.clone()])?;
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let mut authority =
+            PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, &store_path)?;
+        authority.bootstrap_from_active(&[active, target.clone()])?;
+
+        let operation_id = Uuid::new_v4();
+        authority.begin_rotation_operation(operation_id, "usage_limit", 18_000, true)?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        authority.begin_target_request(
+            &target.account_id,
+            Uuid::new_v4(),
+            1,
+            "swift_manual_selection",
+        )?;
+        authority.mark_stable()?;
+
+        let error = authority
+            .begin_rotation_operation(Uuid::new_v4(), "token_invalidated", 300, false)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("remains incomplete; a different operation is blocked"));
+        let (disposition, operation) =
+            authority.begin_rotation_operation(operation_id, "usage_limit", 18_000, true)?;
+        assert_eq!(disposition, RotationOperationDisposition::Recover);
+        assert_eq!(operation.phase, PoolRotationOperationPhase::Started);
+        Ok(())
+    }
+
+    #[test]
+    fn newer_same_target_request_does_not_complete_non_reset_rotation() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let active = account("active@example.com", true);
+        save_accounts(&store_path, std::slice::from_ref(&active))?;
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let mut authority =
+            PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, &store_path)?;
+        authority.bootstrap_from_active(std::slice::from_ref(&active))?;
+
+        let operation_id = Uuid::new_v4();
+        authority.begin_rotation_operation(operation_id, "usage_limit", 18_000, false)?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let (disposition, _) = authority.begin_target_request(
+            &active.account_id,
+            Uuid::new_v4(),
+            1,
+            "swift_manual_selection",
+        )?;
+        assert_eq!(disposition, TargetRequestDisposition::AlreadyStable);
+
+        let (disposition, operation) =
+            authority.begin_rotation_operation(operation_id, "usage_limit", 18_000, false)?;
+        assert_eq!(disposition, RotationOperationDisposition::Recover);
+        assert_eq!(operation.phase, PoolRotationOperationPhase::Started);
         Ok(())
     }
 }

@@ -3581,7 +3581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         if case .usageUnavailable = error,
                            let account = self?.accountManager.accounts.first(where: { $0.id == id }),
                            let snapshot = account.realQuotaSnapshot,
-                           account.isQuotaImmediatelyUsable(at: Date()),
+                           account.isRuntimeImmediatelyUsable(at: Date()),
                            snapshot.isImmediatelyUsable {
                             self?.accountManager.clearPollingError(for: id)
                             SwapLog.append(.debug("POLL_USAGE_UNAVAILABLE_SUPPRESSED account=\(email) reason=trusted_real_snapshot"))
@@ -5753,7 +5753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
               let snapshot = active.realQuotaSnapshot else {
             return false
         }
-        return active.isQuotaImmediatelyUsable(at: now)
+        return active.isRuntimeImmediatelyUsable(at: now)
             && snapshot.isImmediatelyUsable
     }
 
@@ -5813,7 +5813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .usageUnavailable(let accountId):
             guard active.id == accountId else { return }
             if let snapshot = active.realQuotaSnapshot,
-               active.isQuotaImmediatelyUsable(at: now),
+               active.isRuntimeImmediatelyUsable(at: now),
                snapshot.isImmediatelyUsable {
                 SwapLog.append(.debug(
                     "AUTO_SWAP_USAGE_UNAVAILABLE_SKIPPED active=\(active.email) reason=trusted_healthy_snapshot"

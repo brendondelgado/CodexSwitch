@@ -179,6 +179,16 @@ reconciliation: a completed prior operation may be locally converged, while an
 unresolved prior operation blocks the new request without submitting either
 operation again.
 
+A newer stable cross-target authority request may supersede an older
+nonterminal rotation only when the rotation explicitly prohibited banked-reset
+use and the authority request was recorded after the rotation began. The VPS
+atomically records that stable authority target as the rotation outcome before
+replaying or admitting a new operation. A same-target request does not qualify.
+This lets an interrupted runtime adopt a later manual switch without selecting
+another account. A rotation that permitted banked-reset use remains nonterminal
+until its exact operation ID reconciles, because an irreversible reset result
+must never be inferred from a later authority change.
+
 Mac adoption requires one fresh, internally consistent observation whose
 authority epoch, desired provider identity, request result, and VPS readiness
 identity agree. Email is presentation metadata only. A stale, unreachable,
@@ -902,6 +912,12 @@ probe, a durable activation barrier, a missing acknowledgement, or freshness
 expiry invalidates a prior green result immediately. The UI may retain the last
 payload for diagnosis only when it is visibly stale and cannot contribute to
 pooled readiness or account-current claims.
+
+Credential readiness also requires a parseable inference-token JWT whose
+expiration remains outside the shared five-minute safety window. Matching token
+fingerprints prove generation equality, not token usability. Helpers serving
+Clodex or another runtime fail closed with a non-secret stale/expired-generation
+diagnostic when this check fails; they never emit the rejected credential.
 
 Observation commands do not acquire create-if-missing mutation locks, repair
 file modes, save updater reconciliation, signal processes, or change account

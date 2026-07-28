@@ -1,4 +1,6 @@
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -18,6 +20,8 @@ use crate::rate_limit_resets::RateLimitResetBank;
 const AUTO_SWAP_DISPLAYED_ONE_PERCENT_THRESHOLD: f64 = 2.0;
 const RESET_TIE_FIVE_HOUR_TOLERANCE: f64 = 2.0;
 const RESET_TIE_WEEKLY_TOLERANCE: f64 = 5.0;
+pub const INFERENCE_TOKEN_SAFETY_WINDOW: ChronoDuration = ChronoDuration::minutes(5);
+const INFERENCE_TOKEN_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
 const UNIX_TO_SWIFT_REFERENCE_SECONDS: i64 = 978_307_200;
 pub const QUOTA_OBSERVATION_MAX_AGE: ChronoDuration = ChronoDuration::minutes(15);
 const ACCOUNT_STORE_FILE_MODE: u32 = 0o600;
@@ -677,11 +681,59 @@ impl CodexAccount {
             .map(normalized_runtime_reason_is_usage_limit)
             .unwrap_or(false)
     }
+
+    pub fn runtime_block_is_token_expired(&self) -> bool {
+        self.runtime_unusable_reason
+            .as_deref()
+            .map(normalized_runtime_reason_is_token_expired)
+            .unwrap_or(false)
+    }
+
+    pub fn has_usable_inference_token_at(&self, now: DateTime<Utc>) -> bool {
+        inference_token_expiration(&self.access_token)
+            .is_some_and(|expires_at| expires_at > now + INFERENCE_TOKEN_SAFETY_WINDOW)
+    }
 }
 
 fn normalized_runtime_reason_is_usage_limit(reason: &str) -> bool {
     let normalized = reason.trim().to_ascii_lowercase().replace(['-', ' '], "_");
     normalized.contains("usage_limit") || normalized.contains("insufficient_quota")
+}
+
+fn normalized_runtime_reason_is_token_expired(reason: &str) -> bool {
+    let normalized = reason.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    normalized.contains("token_expired")
+        || normalized.contains("token_invalidated")
+        || normalized.contains("refresh_token_reused")
+        || normalized.contains("invalid_refresh_token")
+}
+
+pub fn inference_token_expiration(token: &str) -> Option<DateTime<Utc>> {
+    let mut segments = token.split('.');
+    segments.next()?;
+    let payload = segments.next()?;
+    segments.next()?;
+    if segments.next().is_some()
+        || payload.is_empty()
+        || payload.len() > INFERENCE_TOKEN_PAYLOAD_MAX_BYTES.saturating_mul(2)
+    {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| URL_SAFE.decode(payload))
+        .ok()?;
+    if decoded.len() > INFERENCE_TOKEN_PAYLOAD_MAX_BYTES {
+        return None;
+    }
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let expiration = claims.get("exp")?.as_i64().or_else(|| {
+        claims
+            .get("exp")?
+            .as_u64()
+            .and_then(|value| i64::try_from(value).ok())
+    })?;
+    DateTime::from_timestamp(expiration, 0)
 }
 
 fn plan_matches(normalized: &str, plan: &str) -> bool {
@@ -1630,6 +1682,9 @@ pub fn quota_availability_at(account: &CodexAccount, now: DateTime<Utc>) -> Quot
     if !account.has_complete_token_material() {
         return QuotaAvailability::Unknown;
     }
+    if !account.has_usable_inference_token_at(now) {
+        return QuotaAvailability::Blocked;
+    }
     if account.runtime_unusable_at(now) {
         return QuotaAvailability::Blocked;
     }
@@ -1649,6 +1704,15 @@ impl CodexAccount {
         .iter()
         .all(|value| !value.trim().is_empty())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_inference_token(expires_at: DateTime<Utc>) -> String {
+    let payload = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({ "exp": expires_at.timestamp() }))
+            .expect("test inference token payload must encode"),
+    );
+    format!("e30.{payload}.signature")
 }
 
 pub fn score(account: &CodexAccount, now: DateTime<Utc>) -> f64 {
@@ -1903,7 +1967,7 @@ mod tests {
         CodexAccount {
             id: Uuid::new_v4(),
             email: email.to_string(),
-            access_token: "access".to_string(),
+            access_token: test_inference_token(Utc::now() + ChronoDuration::hours(1)),
             refresh_token: "refresh".to_string(),
             id_token: "id".to_string(),
             account_id: email.to_string(),
@@ -2662,6 +2726,47 @@ mod tests {
             expected.first().copied()
         );
         Ok(())
+    }
+
+    #[test]
+    fn green_quota_cannot_authorize_expired_or_near_expiry_inference_token() {
+        let now = Utc::now();
+        let mut active = account("active@example.com", 10.0, 10.0, true);
+        active.access_token = test_inference_token(now + ChronoDuration::hours(1));
+        let mut candidate = account("candidate@example.com", 10.0, 10.0, false);
+        candidate.access_token = test_inference_token(now - ChronoDuration::seconds(1));
+        candidate.quota_snapshot.as_mut().unwrap().fetched_at = now;
+        let mut observations = CurrentQuotaObservations::new(now - ChronoDuration::seconds(1));
+        assert!(observations.record_success(&candidate));
+
+        assert_eq!(
+            quota_availability_at(&candidate, now),
+            QuotaAvailability::Blocked
+        );
+        assert!(select_auto_swap_candidate_from_observations(
+            &[active.clone(), candidate.clone()],
+            &observations,
+            now,
+        )
+        .is_none());
+
+        candidate.access_token = test_inference_token(now + INFERENCE_TOKEN_SAFETY_WINDOW);
+        assert_eq!(
+            quota_availability_at(&candidate, now),
+            QuotaAvailability::Blocked
+        );
+        candidate.access_token =
+            test_inference_token(now + INFERENCE_TOKEN_SAFETY_WINDOW + ChronoDuration::seconds(1));
+        assert_eq!(
+            quota_availability_at(&candidate, now),
+            QuotaAvailability::Usable
+        );
+
+        candidate.access_token = "not-a-jwt".to_string();
+        assert_eq!(
+            quota_availability_at(&candidate, now),
+            QuotaAvailability::Blocked
+        );
     }
 
     #[test]

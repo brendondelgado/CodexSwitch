@@ -20,19 +20,22 @@ cross_dependencies:
   - system-overview.md
   - runtime-and-host-ownership.md
   - ../../Sources/CodexSwitch/Models/QuotaSnapshot.swift
+  - ../../Sources/CodexSwitch/Models/CodexAccount.swift
   - ../../Sources/CodexSwitch/Services/UsageResponseParser.swift
   - ../../Sources/CodexSwitch/Services/SwapEngine.swift
   - ../../Sources/CodexSwitch/Services/RateLimitResetService.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../crates/codexswitch-cli/src/quota.rs
+  - ../../crates/codexswitch-cli/src/account_store.rs
   - ../../crates/codexswitch-cli/src/daemon.rs
+  - ../../crates/codexswitch-cli/src/main.rs
   - ../../crates/codexswitch-cli/src/rate_limit_resets.rs
   - ../codexswitch-banked-resets.md
   - ../codexswitch-quota-priming.md
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-27
+  last_updated: 2026-07-28
 ---
 
 # Quota And Reset Policy
@@ -123,6 +126,20 @@ does not advance that account's quota freshness. A required rotation is
 different: before ranking a destination, CodexSwitch refreshes every candidate
 whose current observation cannot safely authorize selection.
 
+Quota success does not prove inference readiness. Every active-readiness,
+failover, plan-upgrade, reset-conservation, and diagnostic candidate check must
+also parse the account's inference access-token JWT and require an `exp` value
+strictly beyond the shared five-minute safety window. Missing, malformed,
+expired, or near-expiry inference-token evidence is fail-closed even when quota
+is fresh and green. A failed quota probe never preserves candidate eligibility
+from an older snapshot.
+
+A current non-quota runtime block is negative evidence. In particular, an
+account blocked as `token_expired` is not polled or refreshed again until the
+block expires or an imported credential generation replaces that account
+record. This prevents a daemon tick from retrying the same rejected refresh
+token across active and inactive candidates.
+
 ## Candidate Ranking
 
 The policy optimizes for fast inference first, usable capacity second, and churn avoidance third.
@@ -150,7 +167,10 @@ Within the same tier and reset cost, prefer:
 5. Fewer recent activations and a stable cooldown.
 6. Deterministic account identity as a final tie-breaker.
 
-Never switch to a candidate already inside the same exhaustion threshold that triggered the swap.
+Never switch to a candidate already inside the same exhaustion threshold that
+triggered the swap. Denied, zero-capacity, stale, failed-poll, token-expired, and
+near-expiry candidates are ineligible regardless of plan tier or prior cached
+quota.
 
 ## Banked Reset Policy
 

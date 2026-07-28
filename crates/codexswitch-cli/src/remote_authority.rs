@@ -1292,6 +1292,50 @@ mod tests {
     }
 
     #[test]
+    fn superseded_non_reset_operation_replays_newer_stable_authority_without_mutation() -> Result<()>
+    {
+        let temp = secure_temp_dir()?;
+        let config = load_config(&write_config(&temp, true)?)?;
+        let operation_id = Uuid::new_v4();
+        let now = Utc::now();
+        let pending = RemoteRotationJournal {
+            version: REMOTE_ROTATION_JOURNAL_VERSION,
+            operation_id,
+            reason: "usage_limit".to_string(),
+            cooldown_seconds: 18_000,
+            allow_banked_reset: false,
+            started_at: now - ChronoDuration::minutes(5),
+            updated_at: now - ChronoDuration::minutes(5),
+            state: RemoteRotationJournalState::Pending,
+            caller_receipt_nonce: Some(Uuid::new_v4()),
+        };
+        let command_count = Arc::new(Mutex::new(0usize));
+        let observed_command_count = Arc::clone(&command_count);
+        let runner = move |_config: &RemoteAuthorityConfig, command: &str, _timeout: Duration| {
+            if command.contains("rotate-now") {
+                *observed_command_count.lock().unwrap() += 1;
+                bail!("completed superseded operation must not be submitted again");
+            }
+            let mut observed = status(8, "provider-manual", Uuid::new_v4(), Utc::now());
+            let mut completed =
+                completed_operation(operation_id, "provider-manual", false, None, None);
+            completed.allow_banked_reset = false;
+            observed.rotation_operations.push(completed);
+            Ok(serde_json::to_vec(&observed)?)
+        };
+
+        let outcome = rotate_with(&config, &pending, &runner)?;
+        assert_eq!(outcome.operation_id, operation_id);
+        assert_eq!(
+            outcome.status.desired_provider_account_id,
+            "provider-manual"
+        );
+        assert!(!outcome.used_banked_reset);
+        assert_eq!(*command_count.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn caller_validation_retries_reuse_one_operation_mutation_and_reset() -> Result<()> {
         let temp = secure_temp_dir()?;
         let path = temp.path().join("remote-rotation.json");
