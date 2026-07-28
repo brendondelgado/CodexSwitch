@@ -24,6 +24,8 @@ TEMPLATE_SUFFIX = '\n"#;'
 CONTROL_PLACEHOLDER = "/* CODEXSWITCH_CONTROL_SOURCE */"
 ROTATION_START = "#[cfg(unix)]\nasync fn codexswitch_rotate_after_failure("
 ROTATION_END = "\n#[cfg(unix)]\nasync fn codexswitch_rotate_after_usage_limit("
+ATTEMPT_START = "#[cfg(unix)]\nasync fn codexswitch_run_rotation_attempt("
+ATTEMPT_END = "\n#[cfg(unix)]\nasync fn codexswitch_rotate_after_failure("
 
 
 PRELUDE = r'''
@@ -143,6 +145,7 @@ const OLD_ACCOUNT: &str = "old-account";
 const NEW_ACCOUNT: &str = "new-account";
 const RECEIPT_NONCE: &str = "37f84870-9b39-45ae-aee9-3e0a63e1f989";
 const REQUEST_NONCE: &str = "1a7c3ffb-bfd8-4719-9b45-c2e350469d9c";
+const OPERATION_ID: &str = "8ea9f0b8-d4fb-4748-9328-b04eb85ce3f8";
 
 #[derive(Clone)]
 struct AuthState {
@@ -227,6 +230,7 @@ enum EventMsg {
 static AUTH_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 static AUTH_MANAGER: OnceLock<Arc<AuthManager>> = OnceLock::new();
 static EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ACKNOWLEDGEMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl Session {
     async fn send_event(&self, _turn_context: &TurnContext, event: EventMsg) {
@@ -285,6 +289,8 @@ fn codexswitch_verified_own_handoff_v3(
 }
 
 struct CodexSwitchRotationProof {
+    operation_id: Option<String>,
+    caller_acceptance_required: bool,
     fingerprint: String,
     acknowledged_request_nonces: Vec<String>,
 }
@@ -298,6 +304,8 @@ fn codexswitch_verified_rotation_result(
     assert_eq!(Some(auth_path), AUTH_PATH.get().map(std::path::PathBuf::as_path));
     assert_eq!(receipt_nonce, RECEIPT_NONCE);
     Some(CodexSwitchRotationProof {
+        operation_id: Some(OPERATION_ID.to_string()),
+        caller_acceptance_required: true,
         fingerprint: NEW_FINGERPRINT.to_string(),
         acknowledged_request_nonces: vec![format!("{RECEIPT_NONCE}:{REQUEST_NONCE}")],
     })
@@ -347,6 +355,33 @@ async fn codexswitch_run_bounded_rotation(
         stdout: b"{}".to_vec(),
         stderr: Vec::new(),
     })
+}
+
+async fn codexswitch_retry_rotation_attempt(_attempt: usize, failure: &str) -> bool {
+    panic!("successful generated rotation unexpectedly retried: {failure}")
+}
+
+async fn codexswitch_acknowledge_remote_rotation(
+    _control_execution_path: &std::path::Path,
+    control_cli: &CodexSwitchControlCli,
+    proof: &CodexSwitchRotationProof,
+    receipt_nonce: &str,
+) -> bool {
+    assert!(control_cli.is_still_current());
+    assert_eq!(proof.operation_id.as_deref(), Some(OPERATION_ID));
+    assert!(proof.caller_acceptance_required);
+    assert_eq!(receipt_nonce, RECEIPT_NONCE);
+    let manager = AUTH_MANAGER.get().expect("auth manager");
+    assert_eq!(
+        manager.codexswitch_auth_fingerprint().as_deref(),
+        Some(NEW_FINGERPRINT),
+    );
+    assert_eq!(
+        manager.codexswitch_provider_account_id().as_deref(),
+        Some(NEW_ACCOUNT),
+    );
+    ACKNOWLEDGEMENT_COUNT.fetch_add(1, Ordering::SeqCst);
+    true
 }
 '''
 
@@ -536,6 +571,7 @@ fn main() {
         "an AuthManager already converged by runtime reload must not be reloaded again",
     );
     assert_eq!(EVENT_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(ACKNOWLEDGEMENT_COUNT.load(Ordering::SeqCst), 1);
 
     std::fs::remove_file(&fixture.current).expect("remove current link");
     symlink("releases/replaced-release", &fixture.current).expect("replace current link");
@@ -568,6 +604,9 @@ def generated_contract_source():
     rotation_start = rendered.index(ROTATION_START)
     rotation_end = rendered.index(ROTATION_END, rotation_start)
     rotation = rendered[rotation_start:rotation_end]
+    attempt_start = rendered.index(ATTEMPT_START)
+    attempt_end = rendered.index(ATTEMPT_END, attempt_start)
+    rotation_attempt = rendered[attempt_start:attempt_end]
     required_fragments = (
         "codexswitch_control_cli()",
         "codexswitch_auth_handoff_matches(",
@@ -576,7 +615,17 @@ def generated_contract_source():
     for fragment in required_fragments:
         if fragment not in rotation:
             raise AssertionError(f"generated rotation contract is missing {fragment!r}")
-    return PRELUDE + "\n" + control + "\n\n" + rotation + "\n" + POSTLUDE
+    return (
+        PRELUDE
+        + "\n"
+        + control
+        + "\n\n"
+        + rotation_attempt
+        + "\n\n"
+        + rotation
+        + "\n"
+        + POSTLUDE
+    )
 
 
 def run_linux_contract(source):
