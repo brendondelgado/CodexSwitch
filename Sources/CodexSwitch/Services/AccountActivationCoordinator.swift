@@ -156,7 +156,7 @@ actor AccountActivationCoordinator {
             let snapshot = try lockedFile.read()
             let current = try Self.decode(snapshot.bytes)
             let effective: AccountActivationState?
-            if kind == .manual,
+            if kind.permitsOperatorRecovery,
                let current,
                current.phase == .confirmed,
                !current.authorizesAutomaticMutations(at: date) {

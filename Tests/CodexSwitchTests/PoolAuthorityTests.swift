@@ -74,6 +74,7 @@ struct PoolAuthorityTests {
         state.adoptionDecision(
           for: value,
           localProviderAccountId: "provider-a",
+          runtimeConvergedForObservation: false,
           knownProviderAccountIds: ["provider-a", "provider-b"],
           permitsConverging: false,
           now: now
@@ -82,11 +83,76 @@ struct PoolAuthorityTests {
         state.adoptionDecision(
           for: value,
           localProviderAccountId: "provider-a",
+          runtimeConvergedForObservation: false,
           knownProviderAccountIds: ["provider-a", "provider-b"],
           permitsConverging: false,
           now: now
         ) == .ignoreRepeated)
     }
+  }
+
+  @Test("provider equality is current only with explicit runtime convergence")
+  func providerEqualConfirmedRuntimeIsAlreadyCurrent() throws {
+    let now = Date(timeIntervalSince1970: 22_000)
+    var state = PoolAuthorityClientState()
+    let value = try observation(observedAt: now, updatedAt: now)
+
+    #expect(state.adoptionDecision(
+      for: value,
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: true,
+      knownProviderAccountIds: ["provider-a", "provider-b"],
+      permitsConverging: false,
+      now: now
+    ) == .alreadyCurrent)
+  }
+
+  @Test("provider-equal degraded runtime requests same-target adoption")
+  func providerEqualDegradedRuntimeAdopts() throws {
+    let now = Date(timeIntervalSince1970: 23_000)
+    var state = PoolAuthorityClientState()
+    let value = try observation(observedAt: now, updatedAt: now)
+
+    #expect(state.adoptionDecision(
+      for: value,
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
+      knownProviderAccountIds: ["provider-a", "provider-b"],
+      permitsConverging: false,
+      now: now
+    ) == .adopt(value))
+  }
+
+  @Test("provider-equal manual-review runtime remains automatically retryable")
+  func providerEqualManualReviewRuntimeAdopts() throws {
+    let now = Date(timeIntervalSince1970: 23_500)
+    var state = PoolAuthorityClientState()
+    let value = try observation(observedAt: now, updatedAt: now)
+
+    #expect(state.adoptionDecision(
+      for: value,
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
+      knownProviderAccountIds: ["provider-a", "provider-b"],
+      permitsConverging: false,
+      now: now
+    ) == .adopt(value))
+  }
+
+  @Test("stale or mismatched local evidence cannot authorize provider equality")
+  func providerEqualStaleOrMismatchedEvidenceAdopts() throws {
+    let now = Date(timeIntervalSince1970: 24_000)
+    var state = PoolAuthorityClientState()
+    let value = try observation(observedAt: now, updatedAt: now)
+
+    #expect(state.adoptionDecision(
+      for: value,
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
+      knownProviderAccountIds: ["provider-a", "provider-b"],
+      permitsConverging: false,
+      now: now
+    ) == .adopt(value))
   }
 
   @Test("failed same-epoch adoption retries after bounded backoff")
@@ -101,14 +167,16 @@ struct PoolAuthorityTests {
 
     #expect(state.adoptionDecision(
       for: value,
-      localProviderAccountId: "provider-a",
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
       knownProviderAccountIds: ["provider-a", "provider-b"],
       permitsConverging: false,
       now: now
     ) == .adopt(value))
     #expect(state.adoptionDecision(
       for: value,
-      localProviderAccountId: "provider-a",
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
       knownProviderAccountIds: ["provider-a", "provider-b"],
       permitsConverging: false,
       now: now
@@ -117,14 +185,16 @@ struct PoolAuthorityTests {
     state.finishAdoption(epoch: 6, succeeded: false, at: now)
     #expect(state.adoptionDecision(
       for: value,
-      localProviderAccountId: "provider-a",
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
       knownProviderAccountIds: ["provider-a", "provider-b"],
       permitsConverging: false,
       now: now.addingTimeInterval(4)
     ) == .ignoreRepeated)
     #expect(state.adoptionDecision(
       for: value,
-      localProviderAccountId: "provider-a",
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
       knownProviderAccountIds: ["provider-a", "provider-b"],
       permitsConverging: false,
       now: now.addingTimeInterval(5)
@@ -150,6 +220,7 @@ struct PoolAuthorityTests {
     _ = state.adoptionDecision(
       for: b,
       localProviderAccountId: "provider-a",
+      runtimeConvergedForObservation: false,
       knownProviderAccountIds: ["provider-a", "provider-b", "provider-c"],
       permitsConverging: false,
       now: now
@@ -158,6 +229,7 @@ struct PoolAuthorityTests {
     #expect(state.adoptionDecision(
       for: c,
       localProviderAccountId: "provider-a",
+      runtimeConvergedForObservation: false,
       knownProviderAccountIds: ["provider-a", "provider-b", "provider-c"],
       permitsConverging: false,
       now: now.addingTimeInterval(1)
@@ -167,6 +239,7 @@ struct PoolAuthorityTests {
     #expect(state.adoptionDecision(
       for: c,
       localProviderAccountId: "provider-a",
+      runtimeConvergedForObservation: false,
       knownProviderAccountIds: ["provider-a", "provider-b", "provider-c"],
       permitsConverging: false,
       now: now.addingTimeInterval(2)
@@ -186,6 +259,7 @@ struct PoolAuthorityTests {
     _ = state.adoptionDecision(
       for: current,
       localProviderAccountId: "provider-a",
+      runtimeConvergedForObservation: false,
       knownProviderAccountIds: ["provider-a", "provider-b"],
       permitsConverging: false,
       now: now
@@ -207,6 +281,7 @@ struct PoolAuthorityTests {
       state.adoptionDecision(
         for: staleEpoch,
         localProviderAccountId: "provider-b",
+        runtimeConvergedForObservation: false,
         knownProviderAccountIds: ["provider-a", "provider-b"],
         permitsConverging: false,
         now: now
@@ -215,6 +290,7 @@ struct PoolAuthorityTests {
       state.adoptionDecision(
         for: staleRead,
         localProviderAccountId: "provider-b",
+        runtimeConvergedForObservation: false,
         knownProviderAccountIds: ["provider-a", "provider-b"],
         permitsConverging: false,
         now: now
@@ -500,14 +576,32 @@ struct PoolAuthorityTests {
 
   @Test("newer authority revokes an older local operation generation")
   func operationAuthorityIsRevocable() {
+    let now = Date(timeIntervalSince1970: 60_000)
     let authority = PoolAuthorityOperationAuthority(
       epoch: 3,
-      providerAccountId: "provider-a"
+      providerAccountId: "provider-a",
+      expiresAt: now.addingTimeInterval(30)
     )
 
-    #expect(authority.authorizes())
+    #expect(authority.authorizes(at: now))
     authority.revoke()
-    #expect(!authority.authorizes())
+    #expect(!authority.authorizes(at: now))
+  }
+
+  @Test("operation authority expires with the accepted observation")
+  func operationAuthorityExpiresAtObservationDeadline() {
+    let now = Date(timeIntervalSince1970: 61_000)
+    let deadline = now.addingTimeInterval(
+      PoolAuthorityObservation.maximumFreshnessAge
+    )
+    let authority = PoolAuthorityOperationAuthority(
+      epoch: 4,
+      providerAccountId: "provider-b",
+      expiresAt: deadline
+    )
+
+    #expect(authority.authorizes(at: deadline))
+    #expect(!authority.authorizes(at: deadline.addingTimeInterval(0.001)))
   }
 
   private func isolatedDefaults() -> UserDefaults {

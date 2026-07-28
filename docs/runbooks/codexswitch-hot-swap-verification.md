@@ -339,6 +339,28 @@ Swift handoff:
 5. The Codex/ChatGPT PID is unchanged and the log does not repeat
    `ACTIVATION_CREDENTIAL_MUTATION_BLOCKED ... source=external-auth`.
 
+For a provider-equal authority observation, inspect the Swift activation
+journal before accepting an `alreadyCurrent` result:
+
+1. `phase` is `confirmed`.
+2. `configuredAccountId` and `runtimeCurrentAccountId` both identify the unique
+   local account for the authority's provider identifier.
+3. Runtime evidence has not expired and still represents complete concrete
+   desktop and CLI acknowledgements.
+4. The current pool-authority operation witness exactly matches the observed
+   epoch and provider identifier. After a menu-app restart, expect one fresh
+   same-target convergence because that in-memory witness is intentionally
+   absent.
+5. The witness deadline is the observation's original `observedAt + 30s`, and
+   the final mutation/reload checks occur no later than that deadline.
+
+If any item is missing or mismatched, the expected result is one same-target
+runtime convergence attempt under the existing activation lease. Matching
+`accounts.json` and `auth.json` alone is not success. Confirm that the attempt
+emits desktop and CLI reload evidence, retains degraded or manual-review state
+on incomplete acknowledgement, observes retry backoff on repeated status
+polls, and stops retrying once a fresh exactly bound `Confirmed` record exists.
+
 The handoff may only adopt a store already switched for the same fresh
 authority epoch. It must not infer authority from credential files, rewrite a
 mismatched store, clear a manual-review barrier, or treat durable file agreement
@@ -1031,6 +1053,11 @@ is never an authority channel.
   target and request same-target Mac convergence. A readiness check, account
   bundle, active email, quota movement, or stale `/status` banner cannot select
   a target or advance the epoch.
+- A provider-equal observation is already current only when the Mac activation
+  journal has fresh `Confirmed` runtime evidence for the exact local account and
+  the current operation witness matches that authority epoch and provider.
+  Degraded, manual-review, expired, unwitnessed, or mismatched evidence must use
+  same-target convergence and its bounded backoff.
 - One continuous VPS-not-ready incident may enqueue at most one persisted Mac notification, including across menu-app relaunches. The request uses one stable identifier so Notification Center replaces rather than accumulates the incident. Persist the incident claim before submitting the asynchronous Notification Center request so a relaunch cannot enter a pre-callback duplication gap.
 - A verified ready result or disabling the monitor clears the incident claim and immediately removes any matching delivered or pending notification. Notification add/remove handoffs are serialized: a new incident cannot submit its fixed-ID request until prior cleanup returns, while a late successful callback removes the request again only when no newer durable generation owns that identifier. A failed enqueue clears only its own generation so the next readiness observation can retry; repeated unhealthy observations are therefore safe retry opportunities, not additional notifications.
 - On upgrade, a persisted claim from the preceding array-based latch is promoted to the durable generation latch before notification submission and the legacy key is removed. This preserves one continuous incident across the migration instead of emitting one additional alert.

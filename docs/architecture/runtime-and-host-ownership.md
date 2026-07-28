@@ -167,6 +167,25 @@ runtime and an exact target acknowledgement. With no managed runtime, adoption
 remains file-only/degraded; incomplete acknowledgement is degraded. Neither
 state may be reported or persisted as runtime `Confirmed`.
 
+Provider equality is not an adoption shortcut. The Mac may classify an
+authority observation as already current only when its activation journal is
+`Confirmed`, its runtime evidence is still fresh, its configured and runtime
+local account identifiers name the unique account for the desired provider,
+and the current authority operation witness matches that observation's exact
+epoch and provider identifier. Missing, stale, degraded, manual-review, or
+mismatched evidence requests same-target runtime convergence through the normal
+activation lease and acknowledgement path. A process restart intentionally
+discards the in-memory witness and requires one fresh same-target convergence.
+Repeated observations obey the existing in-flight and retry backoff guards;
+they do not accept matching files as confirmation, invent a confirmation, or
+create a reload loop after exact convergence is confirmed.
+
+The in-memory operation witness expires at the accepted observation's original
+freshness deadline (`observedAt` plus the 30-second maximum age). It does not
+receive a new 30-second lease when asynchronous work starts. Every mutation,
+reload, and confirmation authorization check fails after that deadline; a later
+fresh observation must create a new witness before work can continue.
+
 ## Pool Authority State Machine
 
 ```text
@@ -226,6 +245,14 @@ authority evidence to its existing local account identifier, store generation,
 complete token fingerprint, runtime targets, and acknowledgements. A host may
 retry convergence for that same epoch, but it may not select a different target
 as local recovery.
+
+The Mac adoption decision receives runtime convergence as an explicit input. It
+is true only when the activation journal has fresh `Confirmed` evidence for the
+exact configured local account and the current authority operation witness
+matches the observed epoch and provider. A host-local `Confirmed` record without
+that exact witness is not proof that the current pool-authority epoch has
+converged. The Mac therefore performs a same-target desktop and CLI reload
+instead of accepting file equality.
 
 The Mac invariant is simple: every active credential mutation is
 configured-only until fresh runtime convergence is journaled. This includes an

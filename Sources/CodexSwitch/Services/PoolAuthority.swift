@@ -292,6 +292,7 @@ struct PoolAuthorityClientState: Equatable, Sendable {
   mutating func adoptionDecision(
     for observation: PoolAuthorityObservation,
     localProviderAccountId: String?,
+    runtimeConvergedForObservation: Bool,
     knownProviderAccountIds: [String],
     permitsConverging: Bool,
     now: Date
@@ -304,7 +305,9 @@ struct PoolAuthorityClientState: Equatable, Sendable {
     ) {
       return .rejected(rejection)
     }
-    if localProviderAccountId == observation.desiredProviderAccountId {
+    if localProviderAccountId == observation.desiredProviderAccountId,
+      runtimeConvergedForObservation
+    {
       finishAdoption(epoch: observation.epoch, succeeded: true, at: now)
       return .alreadyCurrent
     }
@@ -430,20 +433,27 @@ final class PoolAuthorityOperationAuthority: @unchecked Sendable {
   let generation: UUID
   let epoch: UInt64
   let providerAccountId: String
+  let expiresAt: Date
 
   private let lock = NSLock()
   private var revoked = false
 
-  init(epoch: UInt64, providerAccountId: String, generation: UUID = UUID()) {
+  init(
+    epoch: UInt64,
+    providerAccountId: String,
+    expiresAt: Date,
+    generation: UUID = UUID()
+  ) {
     self.generation = generation
     self.epoch = epoch
     self.providerAccountId = providerAccountId
+    self.expiresAt = expiresAt
   }
 
-  func authorizes() -> Bool {
+  func authorizes(at now: Date = Date()) -> Bool {
     lock.lock()
     defer { lock.unlock() }
-    return !revoked
+    return !revoked && now <= expiresAt
   }
 
   func revoke() {

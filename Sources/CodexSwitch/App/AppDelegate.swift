@@ -6113,7 +6113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) {
                 await startSameTargetRuntimeRetry(
                     to: target,
-                    source: requestKind == .poolAuthority ? "pool-authority" : "manual"
+                    source: requestKind == .poolAuthority ? "pool-authority" : "manual",
+                    operationAuthority: operationAuthority
                 )
             }
             return false
@@ -6473,17 +6474,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         permitsConverging: Bool,
         automaticPolicyLease: AccountAutomaticPolicyLease? = nil
     ) {
+        let now = Date()
+        let configuredAccount = accountManager.configuredAccount
+        let operationWitness = poolAuthorityOperationAuthority
+        let runtimeConvergedForObservation =
+            configuredAccount?.normalizedProviderAccountId
+                == observation.desiredProviderAccountId
+            && configuredAccount.map {
+                accountManager.activationState?.runtimeIsCurrent(
+                    for: $0.id,
+                    at: now
+                ) == true
+            } == true
+            && operationWitness?.epoch == observation.epoch
+            && operationWitness?.providerAccountId
+                == observation.desiredProviderAccountId
+            && operationWitness?.authorizes() == true
         let knownProviderAccountIds = accountManager.accounts.compactMap(
             \.normalizedProviderAccountId
         )
         let decision = LinuxDevboxMonitor.poolAuthorityAdoptionDecision(
             state: &poolAuthorityClientState,
             observation: observation,
-            localProviderAccountId: accountManager.configuredAccount?
+            localProviderAccountId: configuredAccount?
                 .normalizedProviderAccountId,
+            runtimeConvergedForObservation: runtimeConvergedForObservation,
             knownProviderAccountIds: knownProviderAccountIds,
             permitsConverging: permitsConverging,
-            now: Date()
+            now: now
         )
         if case .rejected = decision {
             // Invalid observations never become presentation authority.
@@ -6509,7 +6527,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         let operationAuthority = PoolAuthorityOperationAuthority(
             epoch: observation.epoch,
-            providerAccountId: observation.desiredProviderAccountId
+            providerAccountId: observation.desiredProviderAccountId,
+            expiresAt: observation.observedAt.addingTimeInterval(
+                PoolAuthorityObservation.maximumFreshnessAge
+            )
         )
         poolAuthorityOperationAuthority = operationAuthority
 
@@ -6522,14 +6543,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.poolAuthorityClientState.finishAdoption(
                     epoch: observation.epoch,
                     succeeded: false,
-                    at: Date()
-                )
-                return
-            }
-            if from.id == target.id {
-                self.poolAuthorityClientState.finishAdoption(
-                    epoch: observation.epoch,
-                    succeeded: true,
                     at: Date()
                 )
                 return
@@ -7299,8 +7312,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    private func startSameTargetRuntimeRetry(to target: CodexAccount, source: String) async {
+    private func startSameTargetRuntimeRetry(
+        to target: CodexAccount,
+        source: String,
+        operationAuthority: PoolAuthorityOperationAuthority? = nil
+    ) async {
         guard !isExiting,
+              operationAuthority?.authorizes() ?? true,
               swapConvergenceTask == nil,
               pendingSwapTargetAccountId == nil,
               accountManager.configuredAccount?.id == target.id,
@@ -7309,6 +7327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         let resetsRetryBudget = source == "manual"
+            || source == "pool-authority"
             || source == "launch_recovery"
             || source == "runtime_topology_recovery"
         let recoversExternalAuthBarrier = source == "external_auth_recovered"
@@ -7320,7 +7339,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             targetAccountId: target.id,
             activationGeneration: activationGeneration
         ) { [weak self] lease in
-            guard let self, !self.isExiting else { return false }
+            guard let self,
+                  !self.isExiting,
+                  operationAuthority?.authorizes() ?? true else {
+                return false
+            }
             do {
                 if startsFreshGeneration {
                     if recoversExternalAuthBarrier {
@@ -7353,6 +7376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                         targetAccountId: target.id,
                                         activationGeneration: activationGeneration
                                     )
+                                        && (operationAuthority?.authorizes() ?? true)
                                         && state?.configuredAccountId == target.id
                                         && state?.phase == .manualReview
                                         && state?.detail?
@@ -7370,6 +7394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                         targetAccountId: target.id,
                                         activationGeneration: activationGeneration
                                     )
+                                        && (operationAuthority?.authorizes() ?? true)
                                         && state?.configuredAccountId == target.id
                                         && state.map {
                                             $0.phase == .committedDegraded
@@ -7404,6 +7429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
             guard await self.durableConfiguredFilesMatch(target),
                   !self.isExiting,
+                  operationAuthority?.authorizes() ?? true,
                   await self.accountMutationTransaction.owns(lease),
                   self.accountManager.activationState?.phase == .committedDegraded,
                   self.accountManager.activationState?.configuredAccountId == target.id,
@@ -7436,10 +7462,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             await self.beginRuntimeConvergence(
                 from: target,
                 to: target,
-                reason: .manual,
+                reason: source == "pool-authority" ? .poolAuthority : .manual,
                 swapStart: Date(),
                 prepared: prepared,
-                recordsSwap: false
+                recordsSwap: false,
+                operationAuthority: operationAuthority
             )
             return true
         }

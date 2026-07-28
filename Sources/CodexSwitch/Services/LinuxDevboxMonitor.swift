@@ -1461,6 +1461,7 @@ enum LinuxDevboxMonitor {
         state: inout PoolAuthorityClientState,
         observation: PoolAuthorityObservation,
         localProviderAccountId: String?,
+        runtimeConvergedForObservation: Bool,
         knownProviderAccountIds: [String],
         permitsConverging: Bool,
         now: Date
@@ -1468,6 +1469,7 @@ enum LinuxDevboxMonitor {
         state.adoptionDecision(
             for: observation,
             localProviderAccountId: localProviderAccountId,
+            runtimeConvergedForObservation: runtimeConvergedForObservation,
             knownProviderAccountIds: knownProviderAccountIds,
             permitsConverging: permitsConverging,
             now: now

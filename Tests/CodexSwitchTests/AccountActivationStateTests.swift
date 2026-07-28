@@ -959,7 +959,7 @@ struct AccountActivationStateTests {
 
         let sameTarget = try await coordinator.beginAuthorizedCredentialMutation(
             targetAccountId: target,
-            kind: .manual,
+            kind: .poolAuthority,
             at: now.addingTimeInterval(71)
         )
         guard case .retrySameTarget(let degraded) = sameTarget else {
