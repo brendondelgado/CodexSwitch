@@ -252,11 +252,11 @@ struct SwapEngineTests {
             ]
         )
         var expired = account(email: "expired@example.com", snapshot: snapshot)
-        expired.accessToken = inferenceToken(expiresAt: now.addingTimeInterval(-1))
+        expired.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(-1))
         var safetyBoundary = account(email: "boundary@example.com", snapshot: snapshot)
-        safetyBoundary.accessToken = inferenceToken(expiresAt: now.addingTimeInterval(300))
+        safetyBoundary.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(300))
         var safelyUsable = account(email: "usable@example.com", snapshot: snapshot)
-        safelyUsable.accessToken = inferenceToken(expiresAt: now.addingTimeInterval(301))
+        safelyUsable.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(301))
 
         #expect(!expired.hasUsableInferenceToken(at: now))
         #expect(!expired.isImmediatelyUsableReplacement(at: now))
@@ -316,7 +316,9 @@ struct SwapEngineTests {
     ) -> CodexAccount {
         CodexAccount(
             email: email,
-            accessToken: inferenceToken(expiresAt: snapshot.fetchedAt.addingTimeInterval(3_600)),
+            accessToken: testInferenceToken(
+                expiresAt: snapshot.fetchedAt.addingTimeInterval(3_600)
+            ),
             refreshToken: "refresh",
             idToken: "id",
             accountId: email,
@@ -356,7 +358,7 @@ struct SwapEngineTests {
         CodexAccount(
             id: id,
             email: "test-\(id.uuidString.prefix(4))@test.com",
-            accessToken: inferenceToken(expiresAt: Date().addingTimeInterval(3_600)),
+            accessToken: testInferenceToken(expiresAt: Date().addingTimeInterval(3_600)),
             refreshToken: "r",
             idToken: "i",
             accountId: "acc-\(id.uuidString.prefix(8))",
@@ -378,18 +380,6 @@ struct SwapEngineTests {
             planType: planType,
             isActive: isActive
         )
-    }
-
-    private func inferenceToken(expiresAt: Date) -> String {
-        let payload = try! JSONSerialization.data(
-            withJSONObject: ["exp": Int(expiresAt.timeIntervalSince1970)]
-        )
-        let encoded = payload
-            .base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        return "e30.\(encoded).signature"
     }
 
     private func signalIdentity(

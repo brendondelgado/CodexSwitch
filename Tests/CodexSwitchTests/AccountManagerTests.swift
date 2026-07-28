@@ -12,10 +12,11 @@ struct AccountManagerTests {
         planType: String,
         isActive: Bool = false
     ) -> CodexAccount {
-        CodexAccount(
+        let now = Date()
+        return CodexAccount(
             id: id,
             email: "test-\(id.uuidString.prefix(4))@test.com",
-            accessToken: "t",
+            accessToken: testInferenceToken(expiresAt: now.addingTimeInterval(3_600)),
             refreshToken: "r",
             idToken: "i",
             accountId: "acc-\(id.uuidString.prefix(8))",
@@ -23,14 +24,14 @@ struct AccountManagerTests {
                 fiveHour: QuotaWindow(
                     usedPercent: 100 - fiveHourRemaining,
                     windowDurationMins: 300,
-                    resetsAt: Date().addingTimeInterval(3600)
+                    resetsAt: now.addingTimeInterval(3_600)
                 ),
                 weekly: QuotaWindow(
                     usedPercent: 100 - weeklyRemaining,
                     windowDurationMins: 10080,
-                    resetsAt: Date().addingTimeInterval(14400)
+                    resetsAt: now.addingTimeInterval(14_400)
                 ),
-                fetchedAt: Date()
+                fetchedAt: now
             ),
             planType: planType,
             isActive: isActive
@@ -81,7 +82,7 @@ struct AccountManagerTests {
         let now = Date()
         let weeklyOnly = CodexAccount(
             email: "weekly@test.com",
-            accessToken: "access",
+            accessToken: testInferenceToken(expiresAt: now.addingTimeInterval(3_600)),
             refreshToken: "refresh",
             idToken: "id",
             accountId: "weekly",
@@ -103,7 +104,7 @@ struct AccountManagerTests {
         )
         let windowless = CodexAccount(
             email: "unknown@test.com",
-            accessToken: "access",
+            accessToken: testInferenceToken(expiresAt: now.addingTimeInterval(3_600)),
             refreshToken: "refresh",
             idToken: "id",
             accountId: "unknown",

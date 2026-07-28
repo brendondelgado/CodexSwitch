@@ -2211,9 +2211,12 @@ struct RateLimitResetServiceTests {
         snapshot: QuotaSnapshot? = nil,
         planType: String = "pro"
     ) -> CodexAccount {
-        CodexAccount(
+        let tokenReferenceDate = snapshot?.fetchedAt ?? Date()
+        return CodexAccount(
             email: email,
-            accessToken: "access-token",
+            accessToken: testInferenceToken(
+                expiresAt: tokenReferenceDate.addingTimeInterval(3_600)
+            ),
             refreshToken: "refresh-token",
             idToken: "id-token",
             accountId: "account-id-\(email)",

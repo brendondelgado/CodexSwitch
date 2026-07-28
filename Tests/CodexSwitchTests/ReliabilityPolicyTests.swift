@@ -118,7 +118,9 @@ struct QuotaFreshnessPolicyTests {
     ) -> CodexAccount {
         CodexAccount(
             email: email,
-            accessToken: "access",
+            accessToken: testInferenceToken(
+                expiresAt: snapshot.fetchedAt.addingTimeInterval(3_600)
+            ),
             refreshToken: "refresh",
             idToken: "id",
             accountId: email,
@@ -417,7 +419,9 @@ struct RateLimitResetPolicyAuditTests {
         CodexAccount(
             id: id,
             email: email,
-            accessToken: "access",
+            accessToken: testInferenceToken(
+                expiresAt: snapshot.fetchedAt.addingTimeInterval(3_600)
+            ),
             refreshToken: "refresh",
             idToken: "id",
             accountId: providerAccountId,
