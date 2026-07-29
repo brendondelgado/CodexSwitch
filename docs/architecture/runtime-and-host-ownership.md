@@ -469,14 +469,13 @@ recovered under that same lease after the bounded grace interval. Matching
 timestamp by itself, prevents Rust and Swift from replacing the same per-PID
 request with different nonces.
 
-Every Swift account-store mutation, including a telemetry merge or termination
-flush, must acquire that same lease or inherit live task-local ownership from
-the enclosing Swift activation transaction. Contention is retryable and must
-leave `accounts.json` unchanged. The account-store lock still provides the
-generation CAS and telemetry merge, while the activation lease prevents a
-semantically harmless telemetry generation from invalidating a Rust
-commit-plus-reload transaction during its unlocked runtime acknowledgement
-window.
+Every Swift telemetry merge, including a termination flush, must acquire that
+same lease or inherit live task-local ownership from an enclosing Swift
+activation transaction. Contention is retryable and must leave `accounts.json`
+unchanged. The account-store lock still provides the generation CAS and
+telemetry merge, while the activation lease prevents a semantically harmless
+telemetry generation from invalidating a Rust commit-plus-reload transaction
+during its unlocked runtime acknowledgement window.
 
 Periodic Linux managed-readiness maintenance is also a runtime-convergence
 owner. Before observing the managed process or touching request/ACK files, it

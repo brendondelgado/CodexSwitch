@@ -1626,36 +1626,22 @@ struct KeychainStoreTests {
         }
         #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == before)
 
+        try AccountActivationCrossProcessLeaseContext.$heldLease.withValue(held) {
+            switch try store.saveTelemetry([telemetry]) {
+            case .persisted(let persisted):
+                #expect(persisted.first?.planType == "pro")
+            case .discardedCredentialDrift:
+                Issue.record("Inherited lease ownership should permit telemetry")
+            }
+        }
         held.release()
+        telemetry.planType = "team"
         switch try store.saveTelemetry([telemetry]) {
         case .persisted(let persisted):
-            #expect(persisted.first?.planType == "pro")
+            #expect(persisted.first?.planType == "team")
         case .discardedCredentialDrift:
             Issue.record("Current telemetry should persist after lease release")
         }
-    }
-
-    @Test("Durable account mutations inherit an enclosing activation lease")
-    func durableMutationInheritsRuntimeActivationLease() throws {
-        let path = makeStorePath()
-        let store = KeychainStore(
-            service: "CodexSwitch-Test-\(UUID().uuidString)",
-            storePath: path
-        )
-        let leaseURL = URL(fileURLWithPath: path)
-            .deletingLastPathComponent()
-            .appendingPathComponent("accounts.runtime-activation.lock")
-        let held = try #require(
-            try AccountActivationCrossProcessLease.acquire(at: leaseURL)
-        )
-        let account = activeAccount(accountId: "inherited-runtime-lease")
-
-        try AccountActivationCrossProcessLeaseContext.$heldLease.withValue(held) {
-            try store.saveAll([account])
-        }
-        #expect(try store.loadAll().map(\.accountId) == ["inherited-runtime-lease"])
-
-        held.release()
     }
 
     @Test("Conditional mutation cannot overwrite a newer active selection")
