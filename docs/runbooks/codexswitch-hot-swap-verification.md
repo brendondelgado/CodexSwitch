@@ -400,8 +400,12 @@ outer existing-ACK check.
 The handoff may only adopt a store already switched for the same fresh
 authority epoch. It must not infer authority from credential files, rewrite a
 mismatched store, clear a manual-review barrier, or treat durable file agreement
-as an ACK. Verify that a
-queued Swift telemetry flush cannot restore the prior active account after
+as an ACK. After one successful adoption, poll the same authority epoch beyond
+the short runtime-evidence expiry. No new JSON-RPC request or SIGHUP may occur
+while the durable activation remains `Confirmed` for the same provider. Then
+degrade the local activation or advance the epoch and verify that adoption
+becomes actionable again. Verify that a queued Swift telemetry flush cannot
+restore the prior active account after
 adoption and that no Swift account-store write occurs during the adoption
 barrier. A stale periodic or termination snapshot must log
 `ACCOUNTS_TELEMETRY_DISCARDED` and leave the CLI-selected credentials and active

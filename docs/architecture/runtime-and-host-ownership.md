@@ -1021,6 +1021,14 @@ observe the committed epoch, and only then perform local host convergence. On
 the VPS, the same commands enter the daemon's serialized authority transaction;
 they do not write an independent desired target.
 
+After the Mac successfully converges one authority epoch, the pool-authority
+client remembers that epoch and provider for the lifetime of the menu process.
+Later status reads for the same epoch are idempotent while the durable local
+activation remains `Confirmed` for that provider, even after its short
+automatic-mutation evidence lease expires. A degraded or mismatched durable
+activation invalidates that shortcut and requires normal same-target
+convergence; an epoch or provider change can never reuse the prior proof.
+
 The VPS daemon legitimately holds its cross-process activation lease during a
 poll transaction. A Mac target request that encounters that typed contention
 retries a small bounded number of times with the same request UUID and bounded

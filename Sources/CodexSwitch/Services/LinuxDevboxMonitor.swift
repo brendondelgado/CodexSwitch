@@ -1462,6 +1462,7 @@ enum LinuxDevboxMonitor {
         observation: PoolAuthorityObservation,
         localProviderAccountId: String?,
         runtimeConvergedForObservation: Bool,
+        runtimeRemainsConfirmedForObservation: Bool = false,
         knownProviderAccountIds: [String],
         permitsConverging: Bool,
         now: Date
@@ -1470,6 +1471,8 @@ enum LinuxDevboxMonitor {
             for: observation,
             localProviderAccountId: localProviderAccountId,
             runtimeConvergedForObservation: runtimeConvergedForObservation,
+            runtimeRemainsConfirmedForObservation:
+                runtimeRemainsConfirmedForObservation,
             knownProviderAccountIds: knownProviderAccountIds,
             permitsConverging: permitsConverging,
             now: now

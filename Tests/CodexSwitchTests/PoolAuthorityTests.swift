@@ -123,6 +123,44 @@ struct PoolAuthorityTests {
     ) == .adopt(value))
   }
 
+  @Test("successful epoch remains idempotent after the short evidence lease expires")
+  func successfulEpochDoesNotReadoptWhileDurablyConfirmed() throws {
+    let now = Date(timeIntervalSince1970: 23_250)
+    var state = PoolAuthorityClientState()
+    let value = try observation(observedAt: now, updatedAt: now)
+
+    #expect(state.adoptionDecision(
+      for: value,
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
+      runtimeRemainsConfirmedForObservation: true,
+      knownProviderAccountIds: ["provider-a", "provider-b"],
+      permitsConverging: false,
+      now: now
+    ) == .adopt(value))
+    state.finishAdoption(epoch: value.epoch, succeeded: true, at: now)
+
+    #expect(state.adoptionDecision(
+      for: value,
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
+      runtimeRemainsConfirmedForObservation: true,
+      knownProviderAccountIds: ["provider-a", "provider-b"],
+      permitsConverging: false,
+      now: now.addingTimeInterval(20)
+    ) == .alreadyCurrent)
+
+    #expect(state.adoptionDecision(
+      for: value,
+      localProviderAccountId: "provider-b",
+      runtimeConvergedForObservation: false,
+      runtimeRemainsConfirmedForObservation: false,
+      knownProviderAccountIds: ["provider-a", "provider-b"],
+      permitsConverging: false,
+      now: now.addingTimeInterval(21)
+    ) == .adopt(value))
+  }
+
   @Test("provider-equal manual-review runtime remains automatically retryable")
   func providerEqualManualReviewRuntimeAdopts() throws {
     let now = Date(timeIntervalSince1970: 23_500)

@@ -288,11 +288,14 @@ struct PoolAuthorityClientState: Equatable, Sendable {
   private(set) var adoptionInFlightEpoch: UInt64?
   private(set) var adoptionFailureCount = 0
   private(set) var nextAdoptionRetryAt: Date?
+  private(set) var lastSuccessfulAdoptionEpoch: UInt64?
+  private(set) var lastSuccessfulProviderAccountId: String?
 
   mutating func adoptionDecision(
     for observation: PoolAuthorityObservation,
     localProviderAccountId: String?,
     runtimeConvergedForObservation: Bool,
+    runtimeRemainsConfirmedForObservation: Bool = false,
     knownProviderAccountIds: [String],
     permitsConverging: Bool,
     now: Date
@@ -305,10 +308,18 @@ struct PoolAuthorityClientState: Equatable, Sendable {
     ) {
       return .rejected(rejection)
     }
-    if localProviderAccountId == observation.desiredProviderAccountId,
-      runtimeConvergedForObservation
-    {
+    let localProviderIsDesired =
+      localProviderAccountId == observation.desiredProviderAccountId
+    if localProviderIsDesired, runtimeConvergedForObservation {
+      recordSuccessfulAdoption(of: observation)
       finishAdoption(epoch: observation.epoch, succeeded: true, at: now)
+      return .alreadyCurrent
+    }
+    if localProviderIsDesired,
+      runtimeRemainsConfirmedForObservation,
+      lastSuccessfulAdoptionEpoch == observation.epoch,
+      lastSuccessfulProviderAccountId == observation.desiredProviderAccountId
+    {
       return .alreadyCurrent
     }
     if observation.phase == .converging, !permitsConverging {
@@ -340,6 +351,9 @@ struct PoolAuthorityClientState: Equatable, Sendable {
     guard adoptionInFlightEpoch == epoch else { return }
     adoptionInFlightEpoch = nil
     if succeeded {
+      if let latestObservation, latestObservation.epoch == epoch {
+        recordSuccessfulAdoption(of: latestObservation)
+      }
       adoptionFailureCount = 0
       nextAdoptionRetryAt = nil
       return
@@ -426,6 +440,15 @@ struct PoolAuthorityClientState: Equatable, Sendable {
     adoptionInFlightEpoch = nil
     adoptionFailureCount = 0
     nextAdoptionRetryAt = nil
+    lastSuccessfulAdoptionEpoch = nil
+    lastSuccessfulProviderAccountId = nil
+  }
+
+  private mutating func recordSuccessfulAdoption(
+    of observation: PoolAuthorityObservation
+  ) {
+    lastSuccessfulAdoptionEpoch = observation.epoch
+    lastSuccessfulProviderAccountId = observation.desiredProviderAccountId
   }
 }
 

@@ -6117,7 +6117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .retrySameTarget:
             if requestKind.permitsOperatorRecovery,
                let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) {
-                await startSameTargetRuntimeRetry(
+                return await startSameTargetRuntimeRetry(
                     to: target,
                     source: requestKind == .poolAuthority ? "pool-authority" : "manual",
                     operationAuthority: operationAuthority
@@ -6483,9 +6483,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let now = Date()
         let configuredAccount = accountManager.configuredAccount
         let operationWitness = poolAuthorityOperationAuthority
-        let runtimeConvergedForObservation =
+        let runtimeRemainsConfirmedForObservation =
             configuredAccount?.normalizedProviderAccountId
                 == observation.desiredProviderAccountId
+            && configuredAccount.map {
+                let activationState = accountManager.activationState
+                return activationState?.phase == .confirmed
+                    && activationState?.configuredAccountId == $0.id
+                    && activationState?.runtimeCurrentAccountId == $0.id
+            } == true
+        let runtimeConvergedForObservation =
+            runtimeRemainsConfirmedForObservation
             && configuredAccount.map {
                 accountManager.activationState?.runtimeIsCurrent(
                     for: $0.id,
@@ -6505,6 +6513,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             localProviderAccountId: configuredAccount?
                 .normalizedProviderAccountId,
             runtimeConvergedForObservation: runtimeConvergedForObservation,
+            runtimeRemainsConfirmedForObservation:
+                runtimeRemainsConfirmedForObservation,
             knownProviderAccountIds: knownProviderAccountIds,
             permitsConverging: permitsConverging,
             now: now
@@ -7318,18 +7328,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    @discardableResult
     private func startSameTargetRuntimeRetry(
         to target: CodexAccount,
         source: String,
         operationAuthority: PoolAuthorityOperationAuthority? = nil
-    ) async {
+    ) async -> Bool {
         guard !isExiting,
               operationAuthority?.authorizes() ?? true,
               swapConvergenceTask == nil,
               pendingSwapTargetAccountId == nil,
               accountManager.configuredAccount?.id == target.id,
               accountManager.activationState?.configuredAccountId == target.id else {
-            return
+            return false
         }
 
         let resetsRetryBudget = source == "manual"
@@ -7474,12 +7485,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 recordsSwap: false,
                 operationAuthority: operationAuthority
             )
-            return true
+            return self.accountManager.activationState?.runtimeIsCurrent(
+                for: target.id,
+                at: Date()
+            ) == true
         }
         guard scoped != nil else {
             accountManager.publishActivationNotice("Another account mutation is already in progress")
-            return
+            return false
         }
+        return scoped == true
     }
 
     private func abandonSwapRuntimeConvergence(
