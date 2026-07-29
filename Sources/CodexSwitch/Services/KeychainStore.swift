@@ -94,20 +94,22 @@ struct KeychainStore: Sendable {
     }
 
     func save(_ account: CodexAccount) throws {
-        try withExclusiveLock { lockedFile in
-            let snapshot = try loadSnapshotOrMigrate(lockedFile: lockedFile)
-            var accounts = snapshot.accounts
-            // Deduplicate by accountId (OpenAI account UUID), not local id.
-            if let index = accounts.firstIndex(where: { $0.accountId == account.accountId }) {
-                accounts[index] = account
-            } else {
-                accounts.append(account)
+        try withAccountMutationLease {
+            try withExclusiveLock { lockedFile in
+                let snapshot = try loadSnapshotOrMigrate(lockedFile: lockedFile)
+                var accounts = snapshot.accounts
+                // Deduplicate by accountId (OpenAI account UUID), not local id.
+                if let index = accounts.firstIndex(where: { $0.accountId == account.accountId }) {
+                    accounts[index] = account
+                } else {
+                    accounts.append(account)
+                }
+                _ = try commit(
+                    accounts,
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
             }
-            _ = try commit(
-                accounts,
-                expectedGeneration: snapshot.generation,
-                lockedFile: lockedFile
-            )
         }
     }
 
@@ -145,88 +147,96 @@ struct KeychainStore: Sendable {
     }
 
     func delete(_ accountId: UUID) throws {
-        try withExclusiveLock { lockedFile in
-            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
-            if snapshot.bytes != nil {
-                let remaining = snapshot.accounts.filter { $0.id != accountId }
+        try withAccountMutationLease {
+            try withExclusiveLock { lockedFile in
+                let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+                if snapshot.bytes != nil {
+                    let remaining = snapshot.accounts.filter { $0.id != accountId }
+                    if remaining.isEmpty {
+                        try deleteStore(
+                            expectedGeneration: snapshot.generation,
+                            lockedFile: lockedFile
+                        )
+                        try deleteLegacyKeychainItem()
+                    } else {
+                        _ = try commit(
+                            remaining,
+                            expectedGeneration: snapshot.generation,
+                            lockedFile: lockedFile
+                        )
+                        try deleteLegacyKeychainItem()
+                    }
+                    return
+                }
+
+                guard let legacyAccounts = try decodedLegacyAccounts(),
+                      legacyAccounts.contains(where: { $0.id == accountId }) else {
+                    return
+                }
+
+                let remaining = legacyAccounts.filter { $0.id != accountId }
                 if remaining.isEmpty {
                     try deleteStore(
                         expectedGeneration: snapshot.generation,
                         lockedFile: lockedFile
                     )
-                    try deleteLegacyKeychainItem()
                 } else {
                     _ = try commit(
                         remaining,
                         expectedGeneration: snapshot.generation,
                         lockedFile: lockedFile
                     )
-                    try deleteLegacyKeychainItem()
                 }
-                return
+                try deleteLegacyKeychainItem()
             }
-
-            guard let legacyAccounts = try decodedLegacyAccounts(),
-                  legacyAccounts.contains(where: { $0.id == accountId }) else {
-                return
-            }
-
-            let remaining = legacyAccounts.filter { $0.id != accountId }
-            if remaining.isEmpty {
-                try deleteStore(
-                    expectedGeneration: snapshot.generation,
-                    lockedFile: lockedFile
-                )
-            } else {
-                _ = try commit(
-                    remaining,
-                    expectedGeneration: snapshot.generation,
-                    lockedFile: lockedFile
-                )
-            }
-            try deleteLegacyKeychainItem()
         }
     }
 
     func deleteAll() throws {
-        try withExclusiveLock { lockedFile in
-            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
-            try deleteStore(
-                expectedGeneration: snapshot.generation,
-                lockedFile: lockedFile
-            )
-            try deleteLegacyKeychainItem()
+        try withAccountMutationLease {
+            try withExclusiveLock { lockedFile in
+                let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+                try deleteStore(
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
+                try deleteLegacyKeychainItem()
+            }
         }
     }
 
     func deleteAll(
         ifCredentialAuthorityMatches expectedAccounts: [CodexAccount]
     ) throws -> AccountTelemetryPersistenceOutcome {
-        try withExclusiveLock { lockedFile in
-            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
-            guard Self.credentialAuthorityMatches(
-                snapshot.accounts,
-                expectedAccounts
-            ) else {
-                return .discardedCredentialDrift(snapshot.accounts)
+        try withAccountMutationLease {
+            try withExclusiveLock { lockedFile in
+                let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+                guard Self.credentialAuthorityMatches(
+                    snapshot.accounts,
+                    expectedAccounts
+                ) else {
+                    return .discardedCredentialDrift(snapshot.accounts)
+                }
+                try deleteStore(
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
+                try deleteLegacyKeychainItem()
+                return .persisted([])
             }
-            try deleteStore(
-                expectedGeneration: snapshot.generation,
-                lockedFile: lockedFile
-            )
-            try deleteLegacyKeychainItem()
-            return .persisted([])
         }
     }
 
     func saveAll(_ accounts: [CodexAccount]) throws {
-        try withExclusiveLock { lockedFile in
-            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
-            _ = try commit(
-                accounts,
-                expectedGeneration: snapshot.generation,
-                lockedFile: lockedFile
-            )
+        try withAccountMutationLease {
+            try withExclusiveLock { lockedFile in
+                let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+                _ = try commit(
+                    accounts,
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
+            }
         }
     }
 
@@ -234,40 +244,67 @@ struct KeychainStore: Sendable {
         _ accounts: [CodexAccount],
         ifCredentialAuthorityMatches expectedAccounts: [CodexAccount]
     ) throws -> AccountTelemetryPersistenceOutcome {
-        try withExclusiveLock { lockedFile in
-            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
-            guard Self.credentialAuthorityMatches(
-                snapshot.accounts,
-                expectedAccounts
-            ) else {
-                return .discardedCredentialDrift(snapshot.accounts)
+        try withAccountMutationLease {
+            try withExclusiveLock { lockedFile in
+                let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+                guard Self.credentialAuthorityMatches(
+                    snapshot.accounts,
+                    expectedAccounts
+                ) else {
+                    return .discardedCredentialDrift(snapshot.accounts)
+                }
+                let committed = try commit(
+                    accounts,
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
+                return .persisted(committed.accounts)
             }
-            let committed = try commit(
-                accounts,
-                expectedGeneration: snapshot.generation,
-                lockedFile: lockedFile
-            )
-            return .persisted(committed.accounts)
         }
     }
 
     func saveTelemetry(
         _ observedAccounts: [CodexAccount]
     ) throws -> AccountTelemetryPersistenceOutcome {
-        try withExclusiveLock { lockedFile in
-            let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
-            guard let merged = Self.mergingTelemetry(
-                from: observedAccounts,
-                into: snapshot.accounts
-            ) else {
-                return .discardedCredentialDrift(snapshot.accounts)
+        try withAccountMutationLease {
+            try withExclusiveLock { lockedFile in
+                let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+                guard let merged = Self.mergingTelemetry(
+                    from: observedAccounts,
+                    into: snapshot.accounts
+                ) else {
+                    return .discardedCredentialDrift(snapshot.accounts)
+                }
+                let committed = try commit(
+                    merged,
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
+                return .persisted(committed.accounts)
             }
-            let committed = try commit(
-                merged,
-                expectedGeneration: snapshot.generation,
-                lockedFile: lockedFile
-            )
-            return .persisted(committed.accounts)
+        }
+    }
+
+    private func withAccountMutationLease<T>(
+        _ operation: () throws -> T
+    ) throws -> T {
+        let leaseURL = URL(fileURLWithPath: storePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("accounts.runtime-activation.lock")
+        if AccountActivationCrossProcessLeaseContext.holds(leaseURL) {
+            return try operation()
+        }
+        guard let crossProcessLease =
+                AccountActivationCrossProcessLease.acquireForAccountMutation(
+                    at: leaseURL
+                ) else {
+            throw KeychainError.runtimeActivationLeaseUnavailable(path: leaseURL.path)
+        }
+        defer { crossProcessLease.release() }
+        return try AccountActivationCrossProcessLeaseContext.$heldLease.withValue(
+            crossProcessLease
+        ) {
+            try operation()
         }
     }
 

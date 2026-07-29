@@ -428,6 +428,12 @@ release it and verify the operation becomes immediately eligible. A
 `CommittedDegraded` or aged `FileOnly` journal is not exclusive ownership
 evidence by itself.
 
+While Rust holds that lease across an unlocked runtime reload, queue a Swift
+quota telemetry write and a termination flush. Both must leave `accounts.json`
+byte-for-byte unchanged and remain retryable. After the Rust owner releases the
+lease, the next Swift flush may merge telemetry under the account-store lock
+without changing credentials or the active selection.
+
 Hold that lease while Swift observes absent or invalid external auth and verify
 the activation journal bytes do not change to `ManualReview`. Release the lease
 and verify the same transition succeeds. Repeat with a missing `accounts.json`
