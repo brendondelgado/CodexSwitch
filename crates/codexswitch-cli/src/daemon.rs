@@ -2872,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_same_target_confirmed_generation_reconverges_before_provider_io() -> Result<()> {
+    fn telemetry_only_confirmed_generation_drift_stays_current() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
         let auth_path = temp.path().join("auth.json");
@@ -2925,19 +2925,19 @@ mod tests {
 
         assert!(!tick.swapped);
         assert_eq!(*fetch_calls.lock().unwrap(), 1);
-        assert_eq!(*reload_calls.lock().unwrap(), 1);
+        assert_eq!(*reload_calls.lock().unwrap(), 0);
         let store_lock = lock_account_store(&store_path)?;
         let current = store_lock.load()?;
-        let repaired = crate::activation::read_activation_record(&store_lock)?
-            .context("same-target repair did not leave a durable activation record")?;
+        let confirmed = crate::activation::read_activation_record(&store_lock)?
+            .context("telemetry drift lost the durable activation record")?;
         assert_eq!(
-            repaired.state,
+            confirmed.state,
             crate::activation::ActivationState::Confirmed
         );
-        assert_eq!(repaired.target_account_id, active.account_id);
-        assert_eq!(repaired.store_generation, current.generation.as_str());
+        assert_eq!(confirmed.target_account_id, active.account_id);
+        assert_ne!(confirmed.store_generation, current.generation.as_str());
         assert_eq!(
-            repaired.auth_fingerprint,
+            confirmed.auth_fingerprint,
             crate::auth::account_token_fingerprint(&active)
         );
         Ok(())

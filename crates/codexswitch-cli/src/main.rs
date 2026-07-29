@@ -3278,7 +3278,7 @@ mod tests {
         Missing,
         Malformed,
         UnknownKind,
-        StaleGeneration,
+        CredentialFingerprintMismatch,
         IncompleteTransition,
     }
 
@@ -3308,8 +3308,8 @@ mod tests {
             ("malformed", BlockedProviderIoActivation::Malformed),
             ("unknown-kind", BlockedProviderIoActivation::UnknownKind),
             (
-                "stale-generation",
-                BlockedProviderIoActivation::StaleGeneration,
+                "credential-fingerprint-mismatch",
+                BlockedProviderIoActivation::CredentialFingerprintMismatch,
             ),
             (
                 "incomplete-transition",
@@ -3364,8 +3364,8 @@ mod tests {
             BlockedProviderIoActivation::UnknownKind => {
                 record.kind = activation::ActivationKind::Unknown;
             }
-            BlockedProviderIoActivation::StaleGeneration => {
-                record.store_generation = "stale-generation".to_string();
+            BlockedProviderIoActivation::CredentialFingerprintMismatch => {
+                record.auth_fingerprint = Some("stale-fingerprint".to_string());
             }
             BlockedProviderIoActivation::IncompleteTransition => {
                 record.base_store_generation = Some(record.store_generation.clone());
