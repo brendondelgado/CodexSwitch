@@ -2935,7 +2935,7 @@ mod tests {
             crate::activation::ActivationState::Confirmed
         );
         assert_eq!(confirmed.target_account_id, active.account_id);
-        assert_ne!(confirmed.store_generation, current.generation.as_str());
+        assert_eq!(confirmed.store_generation, current.generation.as_str());
         assert_eq!(
             confirmed.auth_fingerprint,
             crate::auth::account_token_fingerprint(&active)
