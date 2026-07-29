@@ -3992,7 +3992,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 inventoryIsFresh: Self.rateLimitResetBankIsFresh(
                     bank,
                     at: now,
-                    requiresDecisionEvidence: false
+                    requiresDecisionEvidence: true
                 ),
                 inventoryExists: bank != nil,
                 inventoryHasExpiredAvailableCredit: hasExpiredAvailableCredit,

@@ -664,6 +664,18 @@ struct RateLimitResetPresentationTests {
                 == "Reset inventory is last-known and unverified; refresh it before redeeming"
         )
 
+        let disconnectedHandler = RateLimitResetContextMenuPresentation.resolve(
+            account: pro,
+            inventory: .current(availableCount: 1, nextExpiration: expiration),
+            redemptionHandlerAvailable: false,
+            now: now
+        )
+        #expect(!disconnectedHandler.isEnabled)
+        #expect(
+            disconnectedHandler.unavailableReason
+                == "Reset redemption is unavailable in this view"
+        )
+
         var free = makeAccount(
             email: "free@example.com",
             providerAccountId: "free",

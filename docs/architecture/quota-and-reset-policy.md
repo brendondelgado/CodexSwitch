@@ -35,8 +35,9 @@ cross_dependencies:
   - ../codexswitch-banked-resets.md
   - ../codexswitch-quota-priming.md
 version_control:
-  branch: incident/quota-auth-reload-20260729
-  status: canonical-target
+  branch: main
+  commit: pending
+  status: canonical
   last_updated: 2026-07-29
 ---
 
@@ -446,6 +447,13 @@ capacity without implying another client redeemed a credit, so it updates the
 inventory and urgency presentation without creating an external-redemption
 hold.
 
+The five-minute background freshness bound controls cache reuse and refresh
+scheduling only. UI labels such as `current` and `verified`, account-card reset
+counts, and expiration urgency use the same at-most-sixty-second evidence bound
+as manual redemption. Once that bound passes, the UI renders the count as
+last-known/unverified, disables redemption, and suppresses actionable expiration
+urgency until a fresh observation arrives.
+
 ## Presentation Rules
 
 - Render only observed windows.
@@ -463,6 +471,8 @@ hold.
   attempts, and active local or external holds keep unavailable actions disabled
   with an explicit
   reason.
+- A missing redemption handler is an unavailable action, not an enabled menu
+  item that silently does nothing.
 - Show reset attempt states such as pending reconciliation rather than guessing success.
 - Show stale or unknown observations as stale or unknown, never as zero or full.
 - When the provider reports global exhaustion and still supplies quota windows,

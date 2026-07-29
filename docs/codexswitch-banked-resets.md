@@ -264,9 +264,12 @@ duplicate enqueue for the same key; failure releases the claim for a later retry
 
 Each account persists a sanitized reset bank with the count, credit status,
 expiration metadata, and fetch time. The Mac uses a five-minute background
-freshness window and at-most-sixty-second decision evidence. Ranking
-observations must never overwrite the durable "before" bank used to detect an
-external redemption.
+freshness window for cache reuse and refresh scheduling, but UI `current` and
+`verified` labels, expiration urgency, and redemption all require
+at-most-sixty-second evidence. Older cached counts are
+last-known/unverified and cannot authorize redemption. Ranking observations
+must never overwrite the durable "before" bank used to detect an external
+redemption.
 
 Timestamp freshness alone is insufficient. Cached inventory is current only
 when its complete available-credit list still matches the count at the current

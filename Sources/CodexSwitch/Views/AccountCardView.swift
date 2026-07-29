@@ -588,6 +588,7 @@ struct AccountCardView: View {
                 account: account,
                 inventory: rateLimitResetPresentation,
                 coordinatorAuthorization: rateLimitResetCoordinatorAuthorization,
+                redemptionHandlerAvailable: onRedeemReset != nil,
                 now: Date()
             )
 

@@ -269,9 +269,10 @@ struct AccountCardViewTests {
         #expect(menuSource.contains("Button(resetPresentation.menuItemTitle)"))
         #expect(menuSource.contains("isConfirmingResetRedemption = true"))
         #expect(menuSource.contains("resetPresentation.unavailableReason"))
+        #expect(menuSource.contains("redemptionHandlerAvailable: onRedeemReset != nil"))
         #expect(menuSource.contains(".disabled(true)"))
         #expect(!menuSource.contains("handleConfirmedResetRedemption"))
-        #expect(!menuSource.contains("onRedeemReset"))
+        #expect(!menuSource.contains("onRedeemReset()"))
     }
 
     @Test("Redemption tooltip uses the policy's unavailable reason")

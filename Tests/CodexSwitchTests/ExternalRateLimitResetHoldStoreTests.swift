@@ -252,6 +252,10 @@ struct ExternalRateLimitResetHoldStoreTests {
     @Test("Background and redemption decisions use distinct freshness bounds")
     func resetBankFreshnessPolicy() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
+        #expect(
+            RateLimitResetInventoryObservation.presentationMaximumAge
+                == AppDelegate.rateLimitResetDecisionFreshnessInterval
+        )
         let bank = resetBank(
             availableCount: 1,
             totalEarnedCount: 1,

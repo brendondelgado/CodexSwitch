@@ -79,7 +79,7 @@ struct VerifiedRateLimitResetCount: Equatable, Sendable {
 }
 
 struct RateLimitResetInventoryObservation: Equatable, Sendable {
-    static let presentationMaximumAge: TimeInterval = 5 * 60
+    static let presentationMaximumAge: TimeInterval = 60
 
     let freshness: RateLimitResetInventoryFreshness
     let verifiedCount: VerifiedRateLimitResetCount?
@@ -363,6 +363,7 @@ struct RateLimitResetContextMenuPresentation: Equatable, Sendable {
         account: CodexAccount,
         inventory: RateLimitResetInventoryPresentation?,
         coordinatorAuthorization: RateLimitResetCoordinatorAuthorization = .authorized,
+        redemptionHandlerAvailable: Bool = true,
         now: Date
     ) -> Self {
         let action = RateLimitResetRedemptionActionPresentation.resolve(
@@ -371,6 +372,14 @@ struct RateLimitResetContextMenuPresentation: Equatable, Sendable {
             coordinatorAuthorization: coordinatorAuthorization,
             now: now
         )
+        guard redemptionHandlerAvailable else {
+            return Self(
+                title: "Redeem banked reset for \(account.email)",
+                isEnabled: false,
+                unavailableReason: "Reset redemption is unavailable in this view"
+            )
+        }
+
         return Self(
             title: "Redeem banked reset for \(account.email)",
             isEnabled: action.isEnabled,
