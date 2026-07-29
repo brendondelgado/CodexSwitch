@@ -6,9 +6,9 @@
 //! continues to suppress redemption across process restarts.
 
 use crate::account_store::{
-    quota_availability_at, real_quota_snapshot, AccountStoreGeneration, AccountStoreLock,
-    CodexAccount, CurrentQuotaObservations, QuotaAvailability, QuotaWindowKind,
-    QuotaWindowRateLimitSource, QuotaWindowSlot,
+    normalize_provider_account_id, quota_availability_at, real_quota_snapshot,
+    AccountStoreGeneration, AccountStoreLock, CodexAccount, CurrentQuotaObservations,
+    QuotaAvailability, QuotaWindowKind, QuotaWindowRateLimitSource, QuotaWindowSlot,
 };
 use crate::activation::acquire_provider_io_lease;
 use crate::secure_file::{self, SecureFileGeneration, SecureFileLock};
@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -28,6 +29,7 @@ pub const RESET_BANK_REFRESH_INTERVAL: ChronoDuration = ChronoDuration::minutes(
 pub const RESET_RECONCILIATION_INTERVAL: ChronoDuration = ChronoDuration::minutes(2);
 const EXPIRING_SOON_INTERVAL: ChronoDuration = ChronoDuration::hours(24);
 const NATURAL_RESET_PROTECTION_INTERVAL: ChronoDuration = ChronoDuration::hours(24);
+const FINAL_SUBMISSION_EVIDENCE_MAX_AGE: ChronoDuration = ChronoDuration::seconds(10);
 const RESET_ATTEMPT_JOURNAL_VERSION: u32 = 3;
 const RESET_ATTEMPT_JOURNAL_VERSION_1: u32 = 1;
 const RESET_ATTEMPT_JOURNAL_VERSION_2: u32 = 2;
@@ -39,6 +41,62 @@ const RESET_ATTEMPT_JOURNAL_MAX_BYTES: usize = 256 * 1_024;
 const RESET_GENERATION_MAX_BYTES: usize = 128;
 const RESET_IDENTIFIER_MAX_BYTES: usize = 512;
 const RESET_MANUAL_REVIEW_REASON_MAX_BYTES: usize = 2_048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitResetFetchFailureKind {
+    Authentication,
+    RateLimited,
+    Unsupported,
+    MalformedResponse,
+    Provider,
+}
+
+#[derive(Debug)]
+pub struct RateLimitResetFetchError {
+    kind: RateLimitResetFetchFailureKind,
+    status: Option<u16>,
+    detail: Option<String>,
+}
+
+impl RateLimitResetFetchError {
+    fn http(kind: RateLimitResetFetchFailureKind, status: u16) -> Self {
+        Self {
+            kind,
+            status: Some(status),
+            detail: None,
+        }
+    }
+
+    fn malformed(error: &anyhow::Error) -> Self {
+        Self {
+            kind: RateLimitResetFetchFailureKind::MalformedResponse,
+            status: Some(200),
+            detail: Some(format!("{error:#}")),
+        }
+    }
+
+    pub fn kind(&self) -> RateLimitResetFetchFailureKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for RateLimitResetFetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.status, self.detail.as_deref()) {
+            (Some(status), Some(detail)) => {
+                write!(
+                    formatter,
+                    "reset-bank HTTP {status} response was invalid: {detail}"
+                )
+            }
+            (Some(status), None) => write!(formatter, "reset-bank API returned HTTP {status}"),
+            (None, Some(detail)) => write!(formatter, "reset-bank request failed: {detail}"),
+            (None, None) => formatter.write_str("reset-bank request failed"),
+        }
+    }
+}
+
+impl std::error::Error for RateLimitResetFetchError {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,9 +166,13 @@ impl RateLimitResetBank {
         self.available_count > 0 && self.oldest_expiring_available_credit(now).is_some()
     }
 
-    pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_fresh_at(&self, now: DateTime<Utc>) -> bool {
         let age = now.signed_duration_since(self.fetched_at);
-        age < ChronoDuration::zero() || age >= RESET_BANK_REFRESH_INTERVAL
+        age >= ChronoDuration::zero() && age < RESET_BANK_REFRESH_INTERVAL
+    }
+
+    pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
+        !self.is_fresh_at(now)
     }
 }
 
@@ -212,6 +274,17 @@ pub(crate) fn select_smart_reset_candidate(
         .iter()
         .enumerate()
         .filter_map(|(account_index, account)| {
+            if account.plan_priority() <= 1
+                || !account.has_complete_token_material()
+                || !account.has_usable_inference_token_at(now)
+            {
+                return None;
+            }
+            if account_index != active_index
+                && !observations.is_some_and(|observations| observations.contains(account))
+            {
+                return None;
+            }
             let bank = account.rate_limit_reset_bank.as_ref()?;
             let runtime_usage_limit = (account_index == active_index && direct_runtime_usage_limit)
                 || (account.runtime_unusable_at(now) && account.runtime_block_is_usage_limit());
@@ -220,6 +293,7 @@ pub(crate) fn select_smart_reset_candidate(
                 accounts,
                 bank,
                 runtime_usage_limit,
+                false,
                 now,
                 observations,
             )?;
@@ -271,13 +345,18 @@ fn smart_reset_reason(
     direct_runtime_usage_limit: bool,
     now: DateTime<Utc>,
 ) -> Option<SmartResetReason> {
+    let mut observations = CurrentQuotaObservations::new(DateTime::<Utc>::MIN_UTC);
+    for account in accounts.iter().filter(|account| !account.is_active) {
+        observations.record_success(account);
+    }
     smart_reset_reason_with_observations(
         candidate,
         accounts,
         bank,
         direct_runtime_usage_limit,
+        false,
         now,
-        None,
+        Some(&observations),
     )
 }
 
@@ -286,10 +365,16 @@ fn smart_reset_reason_with_observations(
     accounts: &[CodexAccount],
     bank: &RateLimitResetBank,
     direct_runtime_usage_limit: bool,
+    operator_demand: bool,
     now: DateTime<Utc>,
     observations: Option<&CurrentQuotaObservations>,
 ) -> Option<SmartResetReason> {
-    if bank.is_stale(now) || !bank.has_available_reset(now) {
+    if candidate.plan_priority() <= 1
+        || !candidate.has_complete_token_material()
+        || !candidate.has_usable_inference_token_at(now)
+        || bank.is_stale(now)
+        || !bank.has_available_reset(now)
+    {
         return None;
     }
 
@@ -297,8 +382,8 @@ fn smart_reset_reason_with_observations(
         .iter()
         .filter(|account| {
             account.id != candidate.id
-                && observations
-                    .is_none_or(|observations| account.is_active || observations.contains(account))
+                && (account.is_active
+                    || observations.is_some_and(|observations| observations.contains(account)))
                 && quota_availability_at(account, now) == QuotaAvailability::Usable
         })
         .collect::<Vec<_>>();
@@ -308,13 +393,12 @@ fn smart_reset_reason_with_observations(
         .any(|account| account.plan_priority() >= candidate.plan_priority());
     let snapshot = real_quota_snapshot(candidate)?;
     let quota_availability = quota_availability_at(candidate, now);
-    if quota_availability == QuotaAvailability::Unknown
+    if quota_availability != QuotaAvailability::Blocked
         || snapshot.has_expired_exhausted_window(now)
         || (snapshot.five_hour().is_none() && snapshot.weekly().is_none())
     {
         return None;
     }
-    let quota_blocked = quota_availability == QuotaAvailability::Blocked;
     let weekly_at_threshold = snapshot
         .weekly()
         .map(|window| snapshot.is_denied() || window.should_auto_swap_away())
@@ -336,7 +420,8 @@ fn smart_reset_reason_with_observations(
 
     // A banked reset does not move the scheduled natural reset. Preserve it
     // when another account can carry traffic through a near-term recovery.
-    if ready_replacement_exists
+    if !direct_runtime_usage_limit
+        && !operator_demand
         && blocking_natural_reset_at(candidate, now)
             .is_some_and(|reset_at| reset_at <= now + NATURAL_RESET_PROTECTION_INTERVAL)
     {
@@ -349,7 +434,7 @@ fn smart_reset_reason_with_observations(
 
     // A higher-tier account may spend its own reset before falling to a lower
     // tier, provided the natural reset is not close enough to protect.
-    if ready_replacement_exists && (quota_blocked || direct_runtime_usage_limit) {
+    if ready_replacement_exists {
         return Some(SmartResetReason::PreserveFasterTier);
     }
 
@@ -359,7 +444,7 @@ fn smart_reset_reason_with_observations(
     if weekly_at_threshold && !ready_replacement_exists {
         return Some(SmartResetReason::WeeklyExhausted);
     }
-    if quota_blocked && !ready_replacement_exists {
+    if !ready_replacement_exists {
         return Some(SmartResetReason::NoImmediatelyUsableAccount);
     }
 
@@ -947,12 +1032,14 @@ where
         && direct_runtime_usage_limit)
         || (accounts[reset_account_index].runtime_unusable_at(decision_now)
             && accounts[reset_account_index].runtime_block_is_usage_limit());
+    let operator_demand = (!pool_wide && allow_reset) || operation_id.is_some();
     let reason = allow_reset.then(|| {
         smart_reset_reason_with_observations(
             &accounts[reset_account_index],
             accounts,
             &observed_bank,
             reset_account_runtime_usage_limit,
+            operator_demand,
             decision_now,
             candidate_observations,
         )
@@ -974,6 +1061,7 @@ where
         ),
         &mut validate_provider_io,
         operation_id,
+        true,
     )?;
 
     let completion = if flow.is_usable_success() {
@@ -1023,7 +1111,13 @@ where
     Q: FnMut(&mut CodexAccount) -> Result<()>,
     C: FnMut(&CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
 {
-    reconcile_or_attempt_reset_with_provider_guard(context, dependencies, |_| Ok(()))
+    reconcile_or_attempt_reset_with_provider_guard_and_request_id(
+        context,
+        dependencies,
+        |_| Ok(()),
+        None,
+        false,
+    )
 }
 
 pub fn reconcile_or_attempt_reset_with_provider_guard<B, Q, C, V>(
@@ -1042,6 +1136,7 @@ where
         dependencies,
         validate_provider_io,
         None,
+        true,
     )
 }
 
@@ -1050,6 +1145,7 @@ fn reconcile_or_attempt_reset_with_provider_guard_and_request_id<B, Q, C, V>(
     dependencies: ResetReconciliationDependencies<B, Q, C>,
     mut validate_provider_io: V,
     preferred_request_id: Option<Uuid>,
+    enforce_final_authorization: bool,
 ) -> Result<ResetFlowResult>
 where
     B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
@@ -1079,6 +1175,7 @@ where
         now,
         dependencies,
         &mut validate_provider_io,
+        enforce_final_authorization,
     )?;
     *account = working_account;
     Ok(flow)
@@ -1096,6 +1193,7 @@ fn reconcile_or_attempt_reset_inner<B, Q, C, V>(
     now: DateTime<Utc>,
     dependencies: ResetReconciliationDependencies<B, Q, C>,
     validate_provider_io: &mut V,
+    enforce_final_authorization: bool,
 ) -> Result<ResetFlowResult>
 where
     B: FnMut(&CodexAccount) -> Result<RateLimitResetBank>,
@@ -1137,9 +1235,7 @@ where
             });
             if let Some(index) = preferred_attempt {
                 let attempt = &journal.attempts[index];
-                if attempt.account_id != account.account_id
-                    && attempt.local_account_id != account.id
-                {
+                if !reset_attempt_matches_account(attempt, account) {
                     bail!(
                         "reset operation ID {} belongs to a different provider account",
                         attempt.request_id
@@ -1148,8 +1244,7 @@ where
             }
             let mut active_attempt = preferred_attempt.or_else(|| {
                 journal.attempts.iter().rposition(|attempt| {
-                    (attempt.account_id == account.account_id
-                        || attempt.local_account_id == account.id)
+                    reset_attempt_matches_account(attempt, account)
                         && attempt.state.suppresses_redemption()
                 })
             });
@@ -1193,6 +1288,15 @@ where
             if !attempt_reset || !observed_bank.has_available_reset(now) {
                 return Ok(ResetPreparation::NoAttempt);
             }
+            if !account.has_complete_token_material() {
+                bail!("reset submission requires complete runtime credentials");
+            }
+            if !account.has_usable_inference_token_at(now) {
+                bail!("reset submission requires a usable inference token");
+            }
+            if quota_availability_at(account, now) != QuotaAvailability::Blocked {
+                bail!("reset submission requires fresh independently blocked quota");
+            }
 
             let selected_credit_id = observed_bank
                 .oldest_expiring_available_credit(now)
@@ -1208,11 +1312,6 @@ where
                 ResetAttemptOrigin::LocalRequest,
                 ResetAttemptState::Prepared,
             ));
-            let attempt_index = journal.attempts.len() - 1;
-            journal.attempts[attempt_index].submitted_at = Some(now);
-
-            // A crash after this durable write is intentionally uncertain.
-            // Every replay observes this exact attempt and cannot repeat the POST.
             journal_transaction.save(&mut journal, now)?;
             if let Some(manual_review) = journal.manual_review.as_ref() {
                 return Ok(ResetPreparation::Suppressed(manual_review.reason.clone()));
@@ -1298,9 +1397,148 @@ where
                 .context("reset provider submission gate changed immediately before POST");
         }
     };
+    let prepared_quota_fetched_at =
+        real_quota_snapshot(account).map(|snapshot| snapshot.fetched_at);
+    let final_authorization =
+        (|| -> Result<(CodexAccount, RateLimitResetBank, Option<DateTime<Utc>>)> {
+            if !enforce_final_authorization {
+                return Ok((account.clone(), submitted_bank.clone(), None));
+            }
+            let mut refreshed_account = account.clone();
+            with_account_store_unlocked(store_lock, expected_store_generation, || {
+                refresh_quota(&mut refreshed_account)
+            })??;
+            validate_reset_provider_io(store_lock, expected_store_generation, validate_provider_io)
+                .context("reset activation guard changed after final quota refresh")?;
+            let authorization_now = Utc::now();
+            if !refreshed_account.has_complete_token_material() {
+                bail!("final reset authorization requires complete runtime credentials");
+            }
+            if !refreshed_account.has_usable_inference_token_at(authorization_now) {
+                bail!("final reset authorization requires a usable inference token");
+            }
+            if refreshed_account.plan_priority() <= 1 {
+                bail!("reset redemption requires a paid account");
+            }
+            if normalize_provider_account_id(&refreshed_account.account_id)
+                != normalize_provider_account_id(&account.account_id)
+            {
+                bail!("provider account identity changed during final reset authorization");
+            }
+            let refreshed_snapshot = real_quota_snapshot(&refreshed_account)
+                .context("final reset authorization returned no quota snapshot")?;
+            let final_quota_fetched_at = refreshed_snapshot.fetched_at;
+            if prepared_quota_fetched_at
+                .is_some_and(|prepared_at| refreshed_snapshot.fetched_at <= prepared_at)
+            {
+                bail!("final reset authorization did not return a newer quota observation");
+            }
+            if quota_availability_at(&refreshed_account, authorization_now)
+                != QuotaAvailability::Blocked
+            {
+                bail!("final reset authorization did not confirm currently blocked quota");
+            }
+
+            let final_bank =
+                with_account_store_unlocked(store_lock, expected_store_generation, || {
+                    fetch_bank(&refreshed_account)
+                })??;
+            validate_reset_provider_io(store_lock, expected_store_generation, validate_provider_io)
+                .context("reset activation guard changed after final inventory refresh")?;
+            let final_authorization_now = Utc::now();
+            if !refreshed_account.has_usable_inference_token_at(final_authorization_now) {
+                bail!(
+                    "final reset authorization inference token became unusable before submission"
+                );
+            }
+            if quota_availability_at(&refreshed_account, final_authorization_now)
+                != QuotaAvailability::Blocked
+            {
+                bail!("final reset authorization no longer confirms currently blocked quota");
+            }
+            let inventory_now = final_authorization_now.max(final_bank.fetched_at);
+            if !exact_available_inventory_matches(&submitted_bank, &final_bank, inventory_now) {
+                bail!("final reset inventory did not exactly match the prepared available credits");
+            }
+            Ok((refreshed_account, final_bank, Some(final_quota_fetched_at)))
+        })();
+    let (refreshed_account, final_bank, final_quota_fetched_at) = match final_authorization {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            drop(provider_io_lease);
+            let detail = format!("reset provider submission was cancelled before POST: {error:#}");
+            with_account_store_unlocked(store_lock, expected_store_generation, || {
+                update_exact_reset_attempt(
+                    &journal_path,
+                    &expected_attempt,
+                    now,
+                    |journal, attempt_index| {
+                        let attempt = &mut journal.attempts[attempt_index];
+                        attempt.state = ResetAttemptState::TerminalNotApplied;
+                        attempt.last_error = Some(detail.clone());
+                    },
+                )
+            })??;
+            return Err(error).context("final reset authorization failed before POST");
+        }
+    };
+    *account = refreshed_account;
+    account.rate_limit_reset_bank = Some(final_bank.clone());
+    let submitted_at = if enforce_final_authorization {
+        Utc::now()
+    } else {
+        now
+    };
+    expected_attempt = with_account_store_unlocked(store_lock, expected_store_generation, || {
+        update_exact_reset_attempt(
+            &journal_path,
+            &expected_attempt,
+            submitted_at,
+            |journal, attempt_index| {
+                journal.attempts[attempt_index].submitted_at = Some(submitted_at);
+            },
+        )
+    })??;
+    validate_reset_provider_io(store_lock, expected_store_generation, validate_provider_io)
+        .context("reset activation guard changed after durable submission authorization")?;
+    with_account_store_unlocked(store_lock, expected_store_generation, || {
+        revalidate_exact_reset_attempt(&journal_path, &expected_attempt, submitted_at)
+    })??;
+    let consume_started_at = Utc::now();
+    if !account.has_usable_inference_token_at(consume_started_at)
+        || final_quota_fetched_at.is_some_and(|quota_fetched_at| {
+            !final_reset_evidence_is_current(
+                quota_fetched_at,
+                final_bank.fetched_at,
+                consume_started_at,
+            )
+        })
+    {
+        drop(provider_io_lease);
+        let detail = if !account.has_usable_inference_token_at(consume_started_at) {
+            "reset provider submission was cancelled because its inference token was no longer usable"
+                .to_string()
+        } else {
+            "reset provider submission was cancelled because final quota or inventory evidence exceeded the ten-second deadline"
+                .to_string()
+        };
+        with_account_store_unlocked(store_lock, expected_store_generation, || {
+            update_exact_reset_attempt(
+                &journal_path,
+                &expected_attempt,
+                consume_started_at,
+                |journal, attempt_index| {
+                    let attempt = &mut journal.attempts[attempt_index];
+                    attempt.state = ResetAttemptState::TerminalNotApplied;
+                    attempt.last_error = Some(detail.clone());
+                },
+            )
+        })??;
+        bail!(detail);
+    }
     let consume_result =
         with_account_store_unlocked(store_lock, expected_store_generation, || {
-            consume(account, &submitted_bank, request_id)
+            consume(account, &final_bank, request_id)
         })?;
     drop(provider_io_lease);
 
@@ -1430,7 +1668,7 @@ fn new_reset_attempt(
         .map(str::to_string)
         .collect();
     ResetAttempt {
-        account_id: account.account_id.clone(),
+        account_id: normalize_provider_account_id(&account.account_id).unwrap_or_default(),
         local_account_id: account.id,
         stable_owner: Some(reset_attempt_owner(account)),
         selected_credit_id,
@@ -1680,6 +1918,38 @@ fn inventory_is_consumed(
     observed_ids == expected_ids
 }
 
+fn exact_available_inventory_matches(
+    prepared: &RateLimitResetBank,
+    observed: &RateLimitResetBank,
+    now: DateTime<Utc>,
+) -> bool {
+    if prepared.available_count != observed.available_count
+        || prepared.total_earned_count != observed.total_earned_count
+    {
+        return false;
+    }
+    let Some(prepared_credits) = prepared.structurally_valid_available_credits(now) else {
+        return false;
+    };
+    let Some(observed_credits) = observed.structurally_valid_available_credits(now) else {
+        return false;
+    };
+    prepared_credits == observed_credits
+}
+
+fn final_reset_evidence_is_current(
+    quota_fetched_at: DateTime<Utc>,
+    inventory_fetched_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    [quota_fetched_at, inventory_fetched_at]
+        .into_iter()
+        .all(|fetched_at| {
+            let age = now.signed_duration_since(fetched_at);
+            age >= ChronoDuration::zero() && age <= FINAL_SUBMISSION_EVIDENCE_MAX_AGE
+        })
+}
+
 fn reset_attempt_has_complete_inventory_evidence(attempt: &ResetAttempt) -> bool {
     let Some(selected_credit_id) = attempt
         .selected_credit_id
@@ -1813,9 +2083,17 @@ fn reset_attempt_owner(account: &CodexAccount) -> String {
 }
 
 fn reset_attempt_owner_from_account_id(account_id: &str) -> String {
+    let normalized = normalize_provider_account_id(account_id).unwrap_or_default();
     let mut digest = DigestContext::new(&SHA256);
-    update_generation_digest(&mut digest, account_id.as_bytes());
+    update_generation_digest(&mut digest, normalized.as_bytes());
     finish_generation_digest(digest)
+}
+
+fn reset_attempt_matches_account(attempt: &ResetAttempt, account: &CodexAccount) -> bool {
+    let provider_matches = normalize_provider_account_id(&attempt.account_id)
+        .zip(normalize_provider_account_id(&account.account_id))
+        .is_some_and(|(attempt_id, account_id)| attempt_id == account_id);
+    provider_matches || attempt.local_account_id == account.id
 }
 
 fn quota_evidence_generation(account: &CodexAccount) -> String {
@@ -1981,9 +2259,20 @@ fn decode_reset_attempt_journal(
         );
     }
     let original_version = journal.version;
-    if original_version == RESET_ATTEMPT_JOURNAL_VERSION_1 {
-        for attempt in &mut journal.attempts {
-            attempt.stable_owner = Some(reset_attempt_owner_from_account_id(&attempt.account_id));
+    let mut invalid_provider_identities = 0;
+    let mut normalized_provider_identities = 0;
+    for attempt in &mut journal.attempts {
+        if let Some(normalized) = normalize_provider_account_id(&attempt.account_id) {
+            let normalized_owner = reset_attempt_owner_from_account_id(&normalized);
+            if attempt.account_id != normalized
+                || attempt.stable_owner.as_deref() != Some(normalized_owner.as_str())
+            {
+                normalized_provider_identities += 1;
+            }
+            attempt.account_id = normalized;
+            attempt.stable_owner = Some(normalized_owner);
+        } else {
+            invalid_provider_identities += 1;
         }
     }
     journal.version = RESET_ATTEMPT_JOURNAL_VERSION;
@@ -2035,9 +2324,21 @@ fn decode_reset_attempt_journal(
             ),
         );
     }
+    if invalid_provider_identities > 0 {
+        mark_reset_journal_manual_review(
+            &mut journal,
+            now,
+            0,
+            format!(
+                "{invalid_provider_identities} reset attempt(s) lack a canonical provider identity; manual review is required"
+            ),
+        );
+    }
     Ok((
         journal,
         original_version != RESET_ATTEMPT_JOURNAL_VERSION
+            || normalized_provider_identities > 0
+            || invalid_provider_identities > 0
             || truncated_fields > 0
             || incomplete_quota_evidence > 0
             || incomplete_inventory_evidence > 0,
@@ -2364,19 +2665,28 @@ where
     let response = fetch(account)?;
     let fetched_at = completed_at();
     match response.status {
-        200 => parse_reset_bank(&response.body, fetched_at),
-        401 => bail!(
-            "token expired while fetching reset bank for {}",
-            account.email
-        ),
-        429 => bail!(
-            "rate limited while fetching reset bank for {}",
-            account.email
-        ),
-        status => bail!(
-            "reset-bank API returned HTTP {status} for {}",
-            account.email
-        ),
+        200 => parse_reset_bank(&response.body, fetched_at)
+            .map_err(|error| RateLimitResetFetchError::malformed(&error).into()),
+        401 | 403 => Err(RateLimitResetFetchError::http(
+            RateLimitResetFetchFailureKind::Authentication,
+            response.status,
+        )
+        .into()),
+        404 => Err(RateLimitResetFetchError::http(
+            RateLimitResetFetchFailureKind::Unsupported,
+            response.status,
+        )
+        .into()),
+        429 => Err(RateLimitResetFetchError::http(
+            RateLimitResetFetchFailureKind::RateLimited,
+            response.status,
+        )
+        .into()),
+        status => Err(RateLimitResetFetchError::http(
+            RateLimitResetFetchFailureKind::Provider,
+            status,
+        )
+        .into()),
     }
 }
 
@@ -2445,6 +2755,24 @@ fn consume_rate_limit_reset_with<F>(
 where
     F: FnOnce(&CodexAccount, &ConsumeRequest<'_>) -> Result<HttpResponse>,
 {
+    if !account.has_complete_token_material() {
+        bail!(
+            "reset consume transport requires complete runtime credentials for {}",
+            account.email
+        );
+    }
+    if !account.has_usable_inference_token_at(now) {
+        bail!(
+            "reset consume transport requires a usable inference token for {}",
+            account.email
+        );
+    }
+    if quota_availability_at(account, now) != QuotaAvailability::Blocked {
+        bail!(
+            "reset consume transport requires fresh independently blocked quota for {}",
+            account.email
+        );
+    }
     if !bank.has_available_reset(now) {
         bail!(
             "reset bank has no concrete unexpired available credit for {}",
@@ -2682,6 +3010,14 @@ mod tests {
         account
     }
 
+    fn current_observations(accounts: &[CodexAccount]) -> CurrentQuotaObservations {
+        let mut observations = CurrentQuotaObservations::new(DateTime::<Utc>::MIN_UTC);
+        for account in accounts.iter().filter(|account| !account.is_active) {
+            assert!(observations.record_success(account));
+        }
+        observations
+    }
+
     fn consumed_bank(mut bank: RateLimitResetBank, now: DateTime<Utc>) -> RateLimitResetBank {
         bank.available_count = bank.available_count.saturating_sub(1);
         bank.fetched_at = now;
@@ -2904,6 +3240,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("decode reset-bank"));
+        assert_eq!(
+            error
+                .downcast_ref::<RateLimitResetFetchError>()
+                .map(RateLimitResetFetchError::kind),
+            Some(RateLimitResetFetchFailureKind::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn reset_bank_http_failures_have_typed_retry_semantics() {
+        for (status, expected) in [
+            (401, RateLimitResetFetchFailureKind::Authentication),
+            (403, RateLimitResetFetchFailureKind::Authentication),
+            (404, RateLimitResetFetchFailureKind::Unsupported),
+            (429, RateLimitResetFetchFailureKind::RateLimited),
+            (503, RateLimitResetFetchFailureKind::Provider),
+        ] {
+            let error = fetch_rate_limit_reset_bank_with(
+                &account("a@example.com", true, 10.0, 10.0),
+                |_| {
+                    Ok(HttpResponse {
+                        status,
+                        body: Vec::new(),
+                    })
+                },
+                Utc::now,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<RateLimitResetFetchError>()
+                    .map(RateLimitResetFetchError::kind),
+                Some(expected),
+                "unexpected failure class for HTTP {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_bank_403_is_authentication_until_unsupported_is_proven() {
+        for body in [
+            Vec::new(),
+            br#"{"detail":"forbidden"}"#.to_vec(),
+            br#"{"error":{"message":"access denied"}}"#.to_vec(),
+        ] {
+            let error = fetch_rate_limit_reset_bank_with(
+                &account("a@example.com", true, 10.0, 10.0),
+                |_| Ok(HttpResponse { status: 403, body }),
+                Utc::now,
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error
+                    .downcast_ref::<RateLimitResetFetchError>()
+                    .map(RateLimitResetFetchError::kind),
+                Some(RateLimitResetFetchFailureKind::Authentication)
+            );
+        }
     }
 
     #[test]
@@ -3095,13 +3490,55 @@ mod tests {
             now,
         );
         let accounts = vec![active_plus, exhausted_pro];
+        let observations = current_observations(&accounts);
 
         assert_eq!(
-            select_smart_reset_candidate(&accounts, 0, false, now, None),
+            select_smart_reset_candidate(&accounts, 0, false, now, Some(&observations)),
             Some(SmartResetCandidate {
                 account_index: 1,
                 reason: SmartResetReason::PreserveFasterTier,
             })
+        );
+    }
+
+    #[test]
+    fn pool_selector_requires_current_quota_and_reset_inventory_for_inactive_account() {
+        let now = fixed_policy_now();
+        let active_plus = policy_account(
+            "plus@example.com",
+            true,
+            "plus",
+            20.0,
+            ChronoDuration::days(3),
+            false,
+            now,
+        );
+        let mut exhausted_pro = policy_account(
+            "pro@example.com",
+            false,
+            "pro",
+            100.0,
+            ChronoDuration::hours(36),
+            true,
+            now,
+        );
+        let accounts = vec![active_plus.clone(), exhausted_pro.clone()];
+
+        assert_eq!(
+            select_smart_reset_candidate(&accounts, 0, false, now, None),
+            None
+        );
+
+        exhausted_pro
+            .rate_limit_reset_bank
+            .as_mut()
+            .unwrap()
+            .fetched_at = now - RESET_BANK_REFRESH_INTERVAL;
+        let stale_accounts = vec![active_plus, exhausted_pro];
+        let observations = current_observations(&stale_accounts);
+        assert_eq!(
+            select_smart_reset_candidate(&stale_accounts, 0, false, now, Some(&observations),),
+            None
         );
     }
 
@@ -3138,9 +3575,10 @@ mod tests {
                 now,
             );
             let accounts = vec![active_plus.clone(), exhausted_pro];
+            let observations = current_observations(&accounts);
 
             assert_eq!(
-                select_smart_reset_candidate(&accounts, 0, false, now, None),
+                select_smart_reset_candidate(&accounts, 0, false, now, Some(&observations)),
                 expected
             );
         }
@@ -3189,9 +3627,11 @@ mod tests {
             true,
             now,
         );
+        let accounts = vec![active_pro, exhausted_plus];
+        let observations = current_observations(&accounts);
 
         assert_eq!(
-            select_smart_reset_candidate(&[active_pro, exhausted_plus], 0, false, now, None),
+            select_smart_reset_candidate(&accounts, 0, false, now, Some(&observations)),
             None
         );
     }
@@ -3226,15 +3666,11 @@ mod tests {
             false,
             now,
         );
+        let accounts = vec![active_plus, exhausted_pro, usable_pro];
+        let observations = current_observations(&accounts);
 
         assert_eq!(
-            select_smart_reset_candidate(
-                &[active_plus, exhausted_pro, usable_pro],
-                0,
-                false,
-                now,
-                None,
-            ),
+            select_smart_reset_candidate(&accounts, 0, false, now, Some(&observations)),
             None
         );
     }
@@ -3288,14 +3724,16 @@ mod tests {
             alpha_pro.clone(),
         ];
         let reverse = vec![active_free, alpha_pro, zulu_pro, exhausted_plus];
+        let forward_observations = current_observations(&forward);
+        let reverse_observations = current_observations(&reverse);
 
         assert_eq!(
-            select_smart_reset_candidate(&forward, 0, false, now, None)
+            select_smart_reset_candidate(&forward, 0, false, now, Some(&forward_observations))
                 .map(|candidate| forward[candidate.account_index].email.as_str()),
             Some("zulu@example.com")
         );
         assert_eq!(
-            select_smart_reset_candidate(&reverse, 0, false, now, None)
+            select_smart_reset_candidate(&reverse, 0, false, now, Some(&reverse_observations))
                 .map(|candidate| reverse[candidate.account_index].email.as_str()),
             Some("zulu@example.com")
         );
@@ -3388,7 +3826,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_exhaustion_overrides_near_natural_reset_protection() {
+    fn pool_exhaustion_does_not_override_near_natural_reset_during_routine_polling() {
         let now = Utc::now();
         let mut active = account("active@example.com", true, 10.0, 100.0);
         active
@@ -3408,7 +3846,7 @@ mod tests {
                 false,
                 now,
             ),
-            Some(SmartResetReason::WeeklyExhausted)
+            None
         );
     }
 
@@ -3489,7 +3927,7 @@ mod tests {
     }
 
     #[test]
-    fn no_ready_replacement_spends_reset_for_exhausted_window() {
+    fn routine_polling_preserves_reset_inside_natural_recovery_guard() {
         let now = Utc::now();
         let active = account("active@example.com", true, 100.0, 20.0);
         let blocked = account("blocked@example.com", false, 100.0, 100.0);
@@ -3501,14 +3939,15 @@ mod tests {
                 false,
                 now,
             ),
-            Some(SmartResetReason::NoImmediatelyUsableAccount)
+            None
         );
     }
 
     #[test]
-    fn direct_runtime_limit_requires_no_ready_replacement() {
+    fn direct_runtime_limit_may_override_natural_recovery_guard() {
         let now = Utc::now();
-        let active = account("active@example.com", true, 10.0, 10.0);
+        let active = account("active@example.com", true, 100.0, 20.0);
+
         assert_eq!(
             smart_reset_reason(
                 &active,
@@ -3518,6 +3957,23 @@ mod tests {
                 now,
             ),
             Some(SmartResetReason::RuntimeUsageLimitNoReplacement)
+        );
+    }
+
+    #[test]
+    fn direct_runtime_limit_requires_no_ready_replacement() {
+        let now = Utc::now();
+        let active = account("active@example.com", true, 10.0, 100.0);
+        let replacement = account("ready@example.com", false, 10.0, 10.0);
+        assert_eq!(
+            smart_reset_reason(
+                &active,
+                &[active.clone(), replacement],
+                &bank(now, &[ChronoDuration::days(10)]),
+                true,
+                now,
+            ),
+            None
         );
     }
 
@@ -3557,7 +4013,7 @@ mod tests {
     }
 
     #[test]
-    fn expiring_credit_is_used_for_five_hour_exhaustion_without_replacement() {
+    fn expiring_credit_does_not_bypass_natural_recovery_guard_during_routine_polling() {
         let now = Utc::now();
         let active = account("active@example.com", true, 100.0, 20.0);
 
@@ -3569,8 +4025,166 @@ mod tests {
                 false,
                 now,
             ),
-            Some(SmartResetReason::ExpiringSoon)
+            None
         );
+    }
+
+    #[test]
+    fn free_account_is_never_an_automatic_reset_candidate() {
+        let now = fixed_policy_now();
+        let mut free = policy_account(
+            "free@example.com",
+            true,
+            "free",
+            100.0,
+            ChronoDuration::days(3),
+            true,
+            now,
+        );
+        free.rate_limit_reset_bank = Some(bank(now, &[ChronoDuration::days(10)]));
+        let observations = current_observations(std::slice::from_ref(&free));
+
+        assert_eq!(
+            select_smart_reset_candidate(
+                std::slice::from_ref(&free),
+                0,
+                true,
+                now,
+                Some(&observations),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_or_token_blocked_account_is_never_a_reset_candidate() {
+        let now = Utc::now();
+        let mut expired = policy_account(
+            "expired@example.com",
+            true,
+            "pro",
+            100.0,
+            ChronoDuration::days(3),
+            true,
+            now,
+        );
+        expired.access_token =
+            crate::account_store::test_inference_token(now - ChronoDuration::seconds(1));
+        assert_eq!(
+            quota_availability_at(&expired, now),
+            QuotaAvailability::Unknown
+        );
+        assert_eq!(
+            select_smart_reset_candidate(std::slice::from_ref(&expired), 0, true, now, None),
+            None
+        );
+
+        let mut token_blocked = policy_account(
+            "blocked@example.com",
+            true,
+            "pro",
+            100.0,
+            ChronoDuration::days(3),
+            true,
+            now,
+        );
+        crate::account_store::mark_runtime_unusable(
+            &mut token_blocked,
+            "token_expired",
+            now + ChronoDuration::days(30),
+        );
+        assert_eq!(
+            quota_availability_at(&token_blocked, now),
+            QuotaAvailability::Unknown
+        );
+        assert_eq!(
+            select_smart_reset_candidate(std::slice::from_ref(&token_blocked), 0, true, now, None),
+            None
+        );
+    }
+
+    #[test]
+    fn green_quota_with_expired_jwt_never_reaches_consume_transport() {
+        let now = Utc::now();
+        let mut expired = account("expired@example.com", true, 10.0, 10.0);
+        expired.quota_snapshot.as_mut().unwrap().fetched_at = now;
+        expired.access_token =
+            crate::account_store::test_inference_token(now - ChronoDuration::seconds(1));
+        let transport_calls = Arc::new(Mutex::new(0usize));
+        let transport_calls_for_closure = Arc::clone(&transport_calls);
+
+        let error = consume_rate_limit_reset_with(
+            &expired,
+            &bank(now, &[ChronoDuration::days(10)]),
+            now,
+            Uuid::new_v4(),
+            move |_account, _request| {
+                *transport_calls_for_closure.lock().unwrap() += 1;
+                bail!("expired inference token must stop before transport")
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("usable inference token"));
+        assert_eq!(*transport_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn token_expired_runtime_block_suppresses_reset_submission() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = Utc::now();
+        let observed_bank = bank(now, &[ChronoDuration::days(10)]);
+        let mut blocked = account("blocked@example.com", true, 100.0, 100.0);
+        blocked.quota_snapshot.as_mut().unwrap().fetched_at = now;
+        crate::account_store::mark_runtime_unusable(
+            &mut blocked,
+            "token_expired",
+            now + ChronoDuration::days(30),
+        );
+        let direct_transport_calls = Arc::new(Mutex::new(0usize));
+        let direct_transport_calls_for_closure = Arc::clone(&direct_transport_calls);
+        let direct_error = consume_rate_limit_reset_with(
+            &blocked,
+            &observed_bank,
+            now,
+            Uuid::new_v4(),
+            move |_account, _request| {
+                *direct_transport_calls_for_closure.lock().unwrap() += 1;
+                bail!("token_expired runtime block must stop before direct transport")
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{direct_error:#}").contains("independently blocked quota"));
+        assert_eq!(*direct_transport_calls.lock().unwrap(), 0);
+
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_closure = Arc::clone(&consume_calls);
+
+        let error = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut blocked,
+                previous_bank: None,
+                observed_bank,
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| bail!("token_expired block must stop before inventory refresh"),
+                |_account| bail!("token_expired block must stop before quota refresh"),
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_closure.lock().unwrap() += 1;
+                    bail!("token_expired block must stop before consume")
+                },
+            ),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("independently blocked quota"));
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        Ok(())
     }
 
     #[test]
@@ -3664,6 +4278,266 @@ mod tests {
         assert_eq!(
             callback_order.lock().unwrap().as_slice(),
             &["consume", "bank", "quota"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalized_provider_identity_suppresses_duplicate_redemption_after_readd() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let journal_path = reset_attempt_journal_path(&store_path);
+        let now = Utc::now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let mut original = account("original@example.com", true, 100.0, 100.0);
+        original.account_id = "Provider-Account-ID".to_string();
+        make_quota_precede_attempt(&mut original, now);
+        let mut attempt = new_reset_attempt(
+            &original,
+            &initial_bank,
+            Some("credit-0".to_string()),
+            Uuid::new_v4(),
+            now,
+            ResetAttemptOrigin::LocalRequest,
+            ResetAttemptState::Uncertain,
+        );
+        attempt.account_id = "  PROVIDER-ACCOUNT-ID  ".to_string();
+        attempt.local_account_id = Uuid::new_v4();
+        let mut journal = ResetAttemptJournal {
+            version: RESET_ATTEMPT_JOURNAL_VERSION,
+            attempts: vec![attempt],
+            manual_review: None,
+        };
+        save_reset_attempt_journal(&journal_path, &mut journal, now)?;
+
+        let store_lock = lock_account_store(&store_path)?;
+        let mut readded = account("readded@example.com", true, 100.0, 100.0);
+        readded.account_id = "provider-account-id".to_string();
+        make_quota_precede_attempt(&mut readded, now);
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_callback = Arc::clone(&consume_calls);
+        let flow = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut readded,
+                previous_bank: None,
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| Ok(initial_bank.clone()),
+                |_account| Ok(()),
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_callback.lock().unwrap() += 1;
+                    bail!("normalized duplicate must not submit another reset")
+                },
+            ),
+        )?;
+
+        assert!(flow.suppresses_redemption());
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn final_authorization_rejects_changed_inventory_before_post() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = Utc::now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let mut changed_bank = initial_bank.clone();
+        changed_bank.credits[0].id = "replacement-credit".to_string();
+        let mut account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut account, now);
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_callback = Arc::clone(&consume_calls);
+
+        let error = reconcile_or_attempt_reset_with_provider_guard(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: None,
+                observed_bank: initial_bank,
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                |_account| {
+                    let mut bank = changed_bank.clone();
+                    bank.fetched_at = Utc::now();
+                    Ok(bank)
+                },
+                |account| {
+                    account.quota_snapshot.as_mut().unwrap().fetched_at = Utc::now();
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_callback.lock().unwrap() += 1;
+                    bail!("changed final inventory must not reach POST")
+                },
+            ),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("did not exactly match"));
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        let journal = load_reset_attempt_journal(&reset_attempt_journal_path(&store_path))?;
+        assert_eq!(
+            journal.attempts[0].state,
+            ResetAttemptState::TerminalNotApplied
+        );
+        assert!(journal.attempts[0].submitted_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn final_authorization_rejects_quota_that_is_no_longer_blocked() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = Utc::now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let mut account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut account, now);
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let bank_calls_for_callback = Arc::clone(&bank_calls);
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_callback = Arc::clone(&consume_calls);
+
+        let error = reconcile_or_attempt_reset_with_provider_guard(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: None,
+                observed_bank: initial_bank,
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                move |_account| {
+                    *bank_calls_for_callback.lock().unwrap() += 1;
+                    bail!("usable final quota must stop before inventory fetch")
+                },
+                |account| {
+                    make_quota_usable(account, Utc::now());
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_callback.lock().unwrap() += 1;
+                    bail!("usable final quota must not reach POST")
+                },
+            ),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("currently blocked quota"));
+        assert_eq!(*bank_calls.lock().unwrap(), 0);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn final_authorization_rejects_expired_inference_token_before_post() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = Utc::now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let mut account = account("active@example.com", true, 100.0, 100.0);
+        account.quota_snapshot.as_mut().unwrap().fetched_at = now - ChronoDuration::seconds(2);
+        let bank_calls = Arc::new(Mutex::new(0usize));
+        let bank_calls_for_closure = Arc::clone(&bank_calls);
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_closure = Arc::clone(&consume_calls);
+
+        let error = reconcile_or_attempt_reset_with_provider_guard(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: None,
+                observed_bank: initial_bank,
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                move |_account| {
+                    *bank_calls_for_closure.lock().unwrap() += 1;
+                    bail!("expired final token must stop before inventory refresh")
+                },
+                |account| {
+                    account.quota_snapshot.as_mut().unwrap().fetched_at = Utc::now();
+                    account.access_token = crate::account_store::test_inference_token(
+                        Utc::now() - ChronoDuration::seconds(1),
+                    );
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_closure.lock().unwrap() += 1;
+                    bail!("expired final token must not reach POST")
+                },
+            ),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("usable inference token"));
+        assert_eq!(*bank_calls.lock().unwrap(), 0);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn final_evidence_older_than_ten_seconds_expires_before_consume() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = Utc::now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let final_bank = initial_bank.clone();
+        let mut account = account("active@example.com", true, 100.0, 100.0);
+        account.quota_snapshot.as_mut().unwrap().fetched_at = now - ChronoDuration::seconds(20);
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls_for_closure = Arc::clone(&consume_calls);
+
+        let error = reconcile_or_attempt_reset_with_provider_guard(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: None,
+                observed_bank: initial_bank,
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                move |_account| {
+                    let mut bank = final_bank.clone();
+                    bank.fetched_at = Utc::now();
+                    Ok(bank)
+                },
+                |account| {
+                    account.quota_snapshot.as_mut().unwrap().fetched_at =
+                        Utc::now() - ChronoDuration::seconds(11);
+                    Ok(())
+                },
+                move |_account, _bank, _request_id| {
+                    *consume_calls_for_closure.lock().unwrap() += 1;
+                    bail!("expired final evidence must not reach POST")
+                },
+            ),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("ten-second deadline"));
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        let journal = load_reset_attempt_journal(&reset_attempt_journal_path(&store_path))?;
+        assert_eq!(
+            journal.attempts[0].state,
+            ResetAttemptState::TerminalNotApplied
         );
         Ok(())
     }

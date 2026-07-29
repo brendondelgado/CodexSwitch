@@ -4,6 +4,74 @@ import Testing
 
 @Suite("Linux devbox monitor")
 struct LinuxDevboxMonitorTests {
+    @Test("reset authority migration is sticky and fails closed")
+    func resetAuthorityMigrationIsStickyAndFailsClosed() throws {
+        let suiteName = "LinuxDevboxMonitorTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        defaults.set("authority.example.test", forKey: "linuxDevboxHost")
+        defaults.set("codex", forKey: "linuxDevboxUser")
+        defaults.set(22, forKey: "linuxDevboxSSHPort")
+        defaults.set(
+            AutomaticRateLimitResetOwner.macStandalone.rawValue,
+            forKey: LinuxDevboxMonitorSettings.resetAuthorityModeDefaultsKey
+        )
+
+        let migrated = LinuxDevboxMonitor.settings(from: defaults)
+        #expect(migrated.effectiveResetAuthorityMode == .vpsAuthority)
+        #expect(defaults.string(
+            forKey: LinuxDevboxMonitorSettings.resetAuthorityModeDefaultsKey
+        ) == AutomaticRateLimitResetOwner.vpsAuthority.rawValue)
+
+        defaults.set(" invalid host ", forKey: "linuxDevboxHost")
+        let corruptedEndpoint = LinuxDevboxMonitor.settings(from: defaults)
+        #expect(!corruptedEndpoint.hasRemoteAuthorityEndpoint)
+        #expect(corruptedEndpoint.usesVPSResetAuthority)
+        #expect(!corruptedEndpoint.hasUsableVPSResetAuthorityTransport)
+
+        defaults.removeObject(forKey: LinuxDevboxMonitorSettings.resetAuthorityModeDefaultsKey)
+        let missingMode = LinuxDevboxMonitor.settings(from: defaults)
+        #expect(missingMode.usesVPSResetAuthority)
+        #expect(defaults.string(
+            forKey: LinuxDevboxMonitorSettings.resetAuthorityModeDefaultsKey
+        ) == AutomaticRateLimitResetOwner.vpsAuthority.rawValue)
+
+        defaults.set(
+            AutomaticRateLimitResetOwner.macStandalone.rawValue,
+            forKey: LinuxDevboxMonitorSettings.resetAuthorityModeDefaultsKey
+        )
+        let explicitStandalone = LinuxDevboxMonitor.settings(from: defaults)
+        #expect(explicitStandalone.effectiveResetAuthorityMode == .macStandalone)
+        #expect(!explicitStandalone.usesVPSResetAuthority)
+    }
+
+    @Test("invalid VPS endpoint rejects every reset transport without fallback")
+    func invalidVPSEndpointRejectsResetTransports() {
+        let settings = LinuxDevboxMonitorSettings(
+            enabled: false,
+            host: " invalid host ",
+            user: "codex",
+            sshKeyPath: "~/.ssh/id_ed25519",
+            port: 22,
+            resetAuthorityMode: .vpsAuthority
+        )
+
+        guard case .failure(let observationFailure) = LinuxDevboxMonitor
+            .automaticResetPolicy(settings: settings),
+              case .failure(let mutationFailure) = LinuxDevboxMonitor
+            .setAutomaticResetPolicy(settings: settings, enabled: true),
+              case .failure(let redemptionFailure) = LinuxDevboxMonitor
+            .redeemReset(settings: settings, providerAccountId: "provider-id") else {
+            Issue.record("Expected every unavailable VPS reset transport to fail closed")
+            return
+        }
+        #expect(observationFailure.disposition == .rejected)
+        #expect(mutationFailure.disposition == .rejected)
+        #expect(redemptionFailure.disposition == .rejected)
+    }
+
     @Test("remote session detection includes Codex app VPS remote client")
     func remoteSessionDetectionIncludesCodexAppVPSRemoteClient() {
         let output = """
@@ -323,6 +391,64 @@ struct LinuxDevboxMonitorTests {
         ))
 
         #expect(before != after)
+    }
+
+    @Test("credential convergence requires the complete non-secret evidence set")
+    func credentialStateEvidenceRequiresExactConvergence() throws {
+        var accounts = [
+            CodexAccount(
+                email: "active@example.com",
+                accessToken: "active-access",
+                refreshToken: "active-refresh",
+                idToken: "active-id",
+                accountId: "active-account",
+                isActive: true
+            ),
+            CodexAccount(
+                email: "inactive@example.com",
+                accessToken: "inactive-access",
+                refreshToken: "inactive-refresh",
+                idToken: "inactive-id",
+                accountId: "inactive-account",
+                isActive: false
+            ),
+        ]
+        let matching = LinuxDevboxCredentialStateEvidence(
+            accountIdentityFingerprint: LinuxDevboxMonitor
+                .credentialAccountIdentityFingerprint(accounts: accounts),
+            credentialSetFingerprint: try #require(
+                LinuxDevboxMonitor.credentialSetFingerprint(accounts: accounts)
+            ),
+            activeProviderAccountId: "active-account",
+            activeTokenHashPrefix: try #require(
+                LinuxDevboxMonitor.activeTokenHashPrefix(accounts: accounts)
+            ),
+            authMatchesActiveStoreToken: true
+        )
+
+        #expect(LinuxDevboxMonitor.credentialStateEvidenceMatches(
+            accounts: accounts,
+            observed: matching
+        ))
+
+        let convergedAccounts = accounts
+        accounts[1].refreshToken = "rotated-inactive-refresh"
+        #expect(!LinuxDevboxMonitor.credentialStateEvidenceMatches(
+            accounts: accounts,
+            observed: matching
+        ))
+
+        let authMismatch = LinuxDevboxCredentialStateEvidence(
+            accountIdentityFingerprint: matching.accountIdentityFingerprint,
+            credentialSetFingerprint: matching.credentialSetFingerprint,
+            activeProviderAccountId: matching.activeProviderAccountId,
+            activeTokenHashPrefix: matching.activeTokenHashPrefix,
+            authMatchesActiveStoreToken: false
+        )
+        #expect(!LinuxDevboxMonitor.credentialStateEvidenceMatches(
+            accounts: convergedAccounts,
+            observed: authMismatch
+        ))
     }
 
     @Test("remote credential evidence matches the local token-free fingerprint")
@@ -668,6 +794,276 @@ struct LinuxDevboxMonitorTests {
         #expect(!command.contains("--ignore-expiry"))
     }
 
+    @Test("manual reset command uses one normalized shell-quoted provider ID")
+    func manualResetCommandUsesExactNormalizedProviderID() throws {
+        let command = try #require(LinuxDevboxMonitor.remoteManualResetCommand(
+            providerAccountId: "  Provider'ID  "
+        ))
+
+        #expect(command == "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli redeem-reset 'provider'\\''id' --json")
+        #expect(!command.contains("Provider"))
+    }
+
+    @Test("manual reset decodes a bounded non-secret success result")
+    func manualResetDecodesSuccessResult() throws {
+        let executionToken = "reset-success"
+        let executionMarker = LinuxDevboxMonitor.remoteExecutionMarker(
+            executionToken: executionToken
+        )
+        let completionMarker = LinuxDevboxMonitor.remoteCompletionMarker(
+            executionToken: executionToken
+        )
+        let json = """
+        {
+          "account": "not-returned@example.com",
+          "accountId": "PROVIDER-ACCOUNT-ID",
+          "wasActive": false,
+          "submittedReset": true,
+          "previousBankedResets": 3,
+          "bankedResetsRemaining": 2,
+          "remainingPercent": 100
+        }
+        """
+
+        let result = LinuxDevboxMonitor.redeemResetWithCandidates(
+            [["fixture"]],
+            providerAccountId: "provider-account-id",
+            executionToken: executionToken
+        ) { _, arguments, timeout in
+            #expect(timeout == LinuxDevboxMonitor.manualResetTimeout)
+            #expect(arguments.last?.contains("codexswitch-cli redeem-reset") == true)
+            return ProcessRunResult(
+                terminationStatus: 0,
+                stdout: Data(json.utf8),
+                stderr: Data("\(executionMarker)\n\(completionMarker) 0\n".utf8),
+                timedOut: false
+            )
+        }
+
+        let success = try result.get()
+        #expect(success.providerAccountId == "provider-account-id")
+        #expect(!success.wasActive)
+        #expect(success.submittedReset)
+        #expect(success.previousBankedResets == 3)
+        #expect(success.bankedResetsRemaining == 2)
+        #expect(success.remainingPercent == 100)
+    }
+
+    @Test("manual reset retries only when the prior SSH process never started")
+    func manualResetRetriesOnlyNotStartedCandidate() throws {
+        let executionToken = "reset-not-started"
+        let executionMarker = LinuxDevboxMonitor.remoteExecutionMarker(
+            executionToken: executionToken
+        )
+        let completionMarker = LinuxDevboxMonitor.remoteCompletionMarker(
+            executionToken: executionToken
+        )
+        var calls = 0
+        let result = LinuxDevboxMonitor.redeemResetWithCandidates(
+            [["first"], ["second"]],
+            providerAccountId: "provider-account-id",
+            executionToken: executionToken
+        ) { _, _, _ in
+            calls += 1
+            if calls == 1 {
+                return ProcessRunResult(
+                    terminationStatus: -1,
+                    stdout: Data(),
+                    stderr: Data("The SSH executable could not be launched\n".utf8),
+                    timedOut: false
+                )
+            }
+            return ProcessRunResult(
+                terminationStatus: 0,
+                stdout: Data("""
+                {"accountId":"provider-account-id","wasActive":false,"submittedReset":false,"previousBankedResets":2,"bankedResetsRemaining":2,"remainingPercent":100}
+                """.utf8),
+                stderr: Data("\(executionMarker)\n\(completionMarker) 0\n".utf8),
+                timedOut: false
+            )
+        }
+
+        #expect(calls == 2)
+        #expect(try result.get().bankedResetsRemaining == 2)
+
+        var failedLaunchCalls = 0
+        let failedLaunch = LinuxDevboxMonitor.redeemResetWithCandidates(
+            [["first"], ["second"]],
+            providerAccountId: "provider-account-id",
+            executionToken: "reset-never-started"
+        ) { _, _, _ in
+            failedLaunchCalls += 1
+            return ProcessRunResult(
+                terminationStatus: -1,
+                stdout: Data(),
+                stderr: Data("The SSH executable could not be launched\n".utf8),
+                timedOut: false
+            )
+        }
+        #expect(failedLaunchCalls == 2)
+        guard case .failure(let failure) = failedLaunch else {
+            Issue.record("Expected a pre-execution failure")
+            return
+        }
+        #expect(failure.disposition == .retryablePreExecution)
+        #expect(failure.disposition.allowsAutomaticRetry)
+    }
+
+    @Test("manual reset never replays a started timeout and reports outcome unknown")
+    func manualResetStartedTimeoutIsOutcomeUnknown() {
+        let executionToken = "reset-timeout"
+        let executionMarker = LinuxDevboxMonitor.remoteExecutionMarker(
+            executionToken: executionToken
+        )
+        var calls = 0
+        let result = LinuxDevboxMonitor.redeemResetWithCandidates(
+            [["first"], ["second"]],
+            providerAccountId: "provider-account-id",
+            executionToken: executionToken
+        ) { _, _, _ in
+            calls += 1
+            return ProcessRunResult(
+                terminationStatus: -1,
+                stdout: Data(),
+                stderr: Data("\(executionMarker)\n".utf8),
+                timedOut: true
+            )
+        }
+
+        #expect(calls == 1)
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected an outcome-unknown failure")
+            return
+        }
+        #expect(failure.disposition == .outcomeUnknown)
+        #expect(!failure.disposition.allowsAutomaticRetry)
+    }
+
+    @Test("automatic-reset policy commands match the VPS CLI contract")
+    func automaticResetPolicyCommandsMatchContract() {
+        #expect(LinuxDevboxMonitor.remoteAutomaticResetPolicyGetCommand()
+            == "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy get --json")
+        #expect(LinuxDevboxMonitor.remoteAutomaticResetPolicySetCommand(enabled: true)
+            == "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy set enabled --json")
+        #expect(LinuxDevboxMonitor.remoteAutomaticResetPolicySetCommand(enabled: false)
+            == "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy set disabled --json")
+    }
+
+    @Test("automatic-reset policy decoding is fail closed")
+    func automaticResetPolicyDecodingIsFailClosed() throws {
+        let configured = LinuxDevboxMonitor.decodeAutomaticResetPolicyObservation(Data("""
+        {"schemaVersion":1,"automaticRateLimitResetRedemption":true,"state":"configured","authority":"vps"}
+        """.utf8))
+        #expect(try configured.get().automaticRateLimitResetRedemption)
+
+        for json in [
+            "{\"schemaVersion\":2,\"automaticRateLimitResetRedemption\":true,\"state\":\"configured\",\"authority\":\"vps\"}",
+            "{\"schemaVersion\":1,\"automaticRateLimitResetRedemption\":true,\"state\":\"missing\",\"authority\":\"vps\"}",
+            "{\"schemaVersion\":1,\"automaticRateLimitResetRedemption\":false,\"state\":\"configured\",\"authority\":\"mac\"}",
+        ] {
+            guard case .failure = LinuxDevboxMonitor.decodeAutomaticResetPolicyObservation(
+                Data(json.utf8)
+            ) else {
+                Issue.record("Expected invalid automatic-reset policy response")
+                continue
+            }
+        }
+    }
+
+    @Test("automatic-reset policy set retries only before execution")
+    func automaticResetPolicySetRetriesOnlyBeforeExecution() throws {
+        let executionToken = "policy-pre-execution"
+        let completionMarker = LinuxDevboxMonitor.remoteCompletionMarker(
+            executionToken: executionToken
+        )
+        var calls = 0
+        let result = LinuxDevboxMonitor.setAutomaticResetPolicyWithCandidates(
+            [["first"], ["second"]],
+            enabled: true,
+            executionToken: executionToken
+        ) { _, _, timeout in
+            calls += 1
+            #expect(timeout == LinuxDevboxMonitor.automaticResetPolicyTimeout)
+            if calls == 1 {
+                return ProcessRunResult(
+                    terminationStatus: -1,
+                    stdout: Data(),
+                    stderr: Data("The SSH executable could not be launched\n".utf8),
+                    timedOut: false
+                )
+            }
+            return ProcessRunResult(
+                terminationStatus: 0,
+                stdout: Data("""
+                {"schemaVersion":1,"automaticRateLimitResetRedemption":true,"state":"configured","authority":"vps"}
+                """.utf8),
+                stderr: Data("\(completionMarker) 0\n".utf8),
+                timedOut: false
+            )
+        }
+
+        #expect(calls == 2)
+        #expect(try result.get().automaticRateLimitResetRedemption)
+    }
+
+    @Test("automatic-reset policy set never replays an ambiguous started request")
+    func automaticResetPolicySetDoesNotReplayAmbiguousStartedRequest() {
+        let executionToken = "policy-ambiguous"
+        let executionMarker = LinuxDevboxMonitor.remoteExecutionMarker(
+            executionToken: executionToken
+        )
+        var calls = 0
+        let result = LinuxDevboxMonitor.setAutomaticResetPolicyWithCandidates(
+            [["first"], ["second"]],
+            enabled: true,
+            executionToken: executionToken
+        ) { _, _, _ in
+            calls += 1
+            return ProcessRunResult(
+                terminationStatus: -1,
+                stdout: Data(),
+                stderr: Data("\(executionMarker)\n".utf8),
+                timedOut: true
+            )
+        }
+
+        #expect(calls == 1)
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected an outcome-unknown policy failure")
+            return
+        }
+        #expect(failure.disposition == .outcomeUnknown)
+        #expect(!failure.disposition.allowsAutomaticMutationRetry)
+    }
+
+    @Test("automatic-reset policy set requires the requested authoritative value")
+    func automaticResetPolicySetRequiresRequestedValue() {
+        let executionToken = "policy-mismatch"
+        let completionMarker = LinuxDevboxMonitor.remoteCompletionMarker(
+            executionToken: executionToken
+        )
+        let result = LinuxDevboxMonitor.setAutomaticResetPolicyWithCandidates(
+            [["fixture"]],
+            enabled: true,
+            executionToken: executionToken
+        ) { _, _, _ in
+            ProcessRunResult(
+                terminationStatus: 0,
+                stdout: Data("""
+                {"schemaVersion":1,"automaticRateLimitResetRedemption":false,"state":"configured","authority":"vps"}
+                """.utf8),
+                stderr: Data("\(completionMarker) 0\n".utf8),
+                timedOut: false
+            )
+        }
+
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected an outcome-unknown policy mismatch")
+            return
+        }
+        #expect(failure.disposition == .outcomeUnknown)
+    }
+
     @Test("mutating SSH retries only a definite pre-execution transport failure")
     func mutatingSSHOnlyRetriesPreExecutionTransportFailure() {
         var calls = 0
@@ -909,6 +1305,7 @@ struct LinuxDevboxMonitorTests {
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "quota-update"))
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "quota-primed"))
         #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "subscription-info"))
+        #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "authority-reconciliation"))
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "linux-devbox-interactive-sync"))
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "token-refresh-failed"))
     }
@@ -921,9 +1318,11 @@ struct LinuxDevboxMonitorTests {
         #expect(AppDelegate.shouldBypassLinuxDevboxCredentialSyncThrottle(for: "swap"))
         #expect(!AppDelegate.shouldBypassLinuxDevboxCredentialSyncThrottle(for: "load-restore"))
         #expect(!AppDelegate.shouldBypassLinuxDevboxCredentialSyncThrottle(for: "subscription-info"))
+        #expect(!AppDelegate.shouldBypassLinuxDevboxCredentialSyncThrottle(for: "authority-reconciliation"))
         #expect(AppDelegate.linuxDevboxCredentialSyncThrottleInterval(for: "quota-update") == 60)
         #expect(AppDelegate.linuxDevboxCredentialSyncThrottleInterval(for: "queued-after-quota-update") == 60)
         #expect(AppDelegate.linuxDevboxCredentialSyncThrottleInterval(for: "load-restore") == 10 * 60)
+        #expect(AppDelegate.linuxDevboxCredentialSyncThrottleInterval(for: "authority-reconciliation") == 60)
     }
 
     @Test("reauth validation rejects auth failures but tolerates transient usage errors")

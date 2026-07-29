@@ -170,15 +170,17 @@ struct AppDelegateNotificationTests {
         #expect(manager.vpsRuntimePresentation(for: account, now: now) == .unknown)
     }
 
-    @Test("Active reauthentication requires exact stable provider identity")
-    func activeReauthenticationRejectsSameEmailWithDifferentProviderID() {
-        let original = CodexAccount(
+    @Test("Reauthentication mismatch fails closed without producing a replacement")
+    func reauthenticationMismatchPreservesOriginalRecord() {
+        var original = CodexAccount(
             email: "same@example.com",
             accessToken: "old-access",
             refreshToken: "old-refresh",
             idToken: "old-id",
             accountId: "provider-a"
         )
+        original.runtimeUnusableUntil = Date(timeIntervalSince1970: 1_900_000_000)
+        original.runtimeUnusableReason = "token_expired"
         let replacement = CodexAccount(
             email: original.email,
             accessToken: "new-access",
@@ -186,11 +188,166 @@ struct AppDelegateNotificationTests {
             idToken: "new-id",
             accountId: "provider-b"
         )
+        let before = original
 
-        #expect(!AppDelegate.reauthenticationPreservesStableProviderIdentity(
+        let candidate = AppDelegate.reauthenticatedAccountCandidate(
             original: original,
             observed: replacement
+        )
+
+        #expect(candidate == nil)
+        #expect(original.id == before.id)
+        #expect(original.accountId == before.accountId)
+        #expect(original.accessToken == before.accessToken)
+        #expect(original.refreshToken == before.refreshToken)
+        #expect(original.idToken == before.idToken)
+        #expect(original.runtimeUnusableUntil == before.runtimeUnusableUntil)
+        #expect(original.runtimeUnusableReason == before.runtimeUnusableReason)
+    }
+
+    @Test("Reauthentication for the same provider replaces credentials on the original record")
+    func sameAccountReauthenticationProducesCredentialReplacement() throws {
+        var original = CodexAccount(
+            email: "old@example.com",
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            idToken: "old-id",
+            accountId: "provider-a"
+        )
+        original.isActive = true
+        original.runtimeUnusableUntil = Date(timeIntervalSince1970: 1_900_000_000)
+        original.runtimeUnusableReason = "token_expired"
+        let refreshedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let observed = CodexAccount(
+            email: "current@example.com",
+            accessToken: "new-access",
+            refreshToken: "new-refresh",
+            idToken: "new-id",
+            accountId: original.accountId,
+            lastRefreshed: refreshedAt
+        )
+
+        let candidate = try #require(AppDelegate.reauthenticatedAccountCandidate(
+            original: original,
+            observed: observed
         ))
+
+        #expect(candidate.id == original.id)
+        #expect(candidate.isActive)
+        #expect(candidate.accountId == original.accountId)
+        #expect(candidate.email == observed.email)
+        #expect(candidate.accessToken == observed.accessToken)
+        #expect(candidate.refreshToken == observed.refreshToken)
+        #expect(candidate.idToken == observed.idToken)
+        #expect(candidate.lastRefreshed == refreshedAt)
+        #expect(candidate.runtimeUnusableUntil == nil)
+        #expect(candidate.runtimeUnusableReason == nil)
+    }
+
+    @Test("Reauthentication refuses an incomplete credential set")
+    func reauthenticationRejectsIncompleteCredentials() {
+        let original = CodexAccount(
+            email: "same@example.com",
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            idToken: "old-id",
+            accountId: "provider-a"
+        )
+        let incomplete = CodexAccount(
+            email: original.email,
+            accessToken: "new-access",
+            refreshToken: "",
+            idToken: "new-id",
+            accountId: original.accountId
+        )
+
+        #expect(AppDelegate.reauthenticatedAccountCandidate(
+            original: original,
+            observed: incomplete
+        ) == nil)
+    }
+
+    @Test("Inactive reauthentication stages one complete credential snapshot")
+    func inactiveReauthenticationStagesAtomicSnapshot() throws {
+        let active = CodexAccount(
+            email: "active@example.com",
+            accessToken: "active-access",
+            refreshToken: "active-refresh",
+            idToken: "active-id",
+            accountId: "provider-active",
+            isActive: true
+        )
+        var original = CodexAccount(
+            email: "old@example.com",
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            idToken: "old-id",
+            accountId: "provider-a"
+        )
+        original.runtimeUnusableUntil = Date(timeIntervalSince1970: 1_900_000_000)
+        original.runtimeUnusableReason = "token_expired"
+        let observed = CodexAccount(
+            email: "current@example.com",
+            accessToken: "new-access",
+            refreshToken: "new-refresh",
+            idToken: "new-id",
+            accountId: original.accountId,
+            lastRefreshed: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        let candidate = try #require(AppDelegate.reauthenticatedAccountCandidate(
+            original: original,
+            observed: observed
+        ))
+
+        let snapshot = try #require(AppDelegate.inactiveReauthenticationSnapshot(
+            accounts: [active, original],
+            original: original,
+            candidate: candidate
+        ))
+        let replacement = try #require(snapshot.first(where: { $0.id == original.id }))
+        let unchangedActive = try #require(snapshot.first(where: { $0.id == active.id }))
+
+        #expect(unchangedActive.accessToken == active.accessToken)
+        #expect(unchangedActive.refreshToken == active.refreshToken)
+        #expect(unchangedActive.idToken == active.idToken)
+        #expect(replacement.accessToken == observed.accessToken)
+        #expect(replacement.refreshToken == observed.refreshToken)
+        #expect(replacement.idToken == observed.idToken)
+        #expect(replacement.runtimeUnusableUntil == nil)
+        #expect(replacement.runtimeUnusableReason == nil)
+    }
+
+    @Test("Inactive reauthentication rejects credential drift during OAuth")
+    func inactiveReauthenticationRejectsConcurrentCredentialChange() throws {
+        let original = CodexAccount(
+            email: "old@example.com",
+            accessToken: "old-access",
+            refreshToken: "old-refresh",
+            idToken: "old-id",
+            accountId: "provider-a"
+        )
+        var concurrentlyRefreshed = original
+        concurrentlyRefreshed.accessToken = "concurrent-access"
+        concurrentlyRefreshed.refreshToken = "concurrent-refresh"
+        let observed = CodexAccount(
+            email: original.email,
+            accessToken: "oauth-access",
+            refreshToken: "oauth-refresh",
+            idToken: "oauth-id",
+            accountId: original.accountId
+        )
+        let candidate = try #require(AppDelegate.reauthenticatedAccountCandidate(
+            original: original,
+            observed: observed
+        ))
+
+        #expect(AppDelegate.inactiveReauthenticationSnapshot(
+            accounts: [concurrentlyRefreshed],
+            original: original,
+            candidate: candidate
+        ) == nil)
+        #expect(concurrentlyRefreshed.accessToken == "concurrent-access")
+        #expect(concurrentlyRefreshed.refreshToken == "concurrent-refresh")
     }
 
     @Test("Duplicate active login proves runtime against pre-mutation credentials")

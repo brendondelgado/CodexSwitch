@@ -41,6 +41,88 @@ struct AccountHostOwnershipPresentationTests {
         #expect(convergence.vps == .converged)
     }
 
+    @Test("Contradictory local active flags cannot override authority")
+    func contradictoryLocalFlagsCannotSelectAnotherAccount() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let firstLocal = makeAccount(email: "first-local@example.com", active: true)
+        let secondLocal = makeAccount(email: "second-local@example.com", active: true)
+        let authority = makeAccount(email: "authority@example.com", active: false)
+        manager.accounts = [firstLocal, secondLocal, authority]
+        manager.publishPoolAuthorityObservation(try PoolAuthorityObservation(
+            epoch: 11,
+            phase: .stable,
+            desiredProviderAccountId: authority.accountId,
+            requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            reason: "test",
+            observedAt: now,
+            updatedAt: now,
+            previousProviderAccountId: firstLocal.accountId,
+            detail: nil
+        ))
+
+        #expect(manager.activeAccountReadModel(at: now).providerAccountId
+            == authority.accountId)
+        #expect(manager.logicalActiveAccount(at: now)?.id == authority.id)
+        #expect(manager.sortedAccounts.first?.id == authority.id)
+        #expect(manager.accounts.filter { manager.isPoolTarget($0, at: now) }.map(\.id)
+            == [authority.id])
+
+        manager.publishPoolAuthorityObservation(try PoolAuthorityObservation(
+            epoch: 11,
+            phase: .stable,
+            desiredProviderAccountId: firstLocal.accountId,
+            requestId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            reason: "invalid same-epoch target change",
+            observedAt: now.addingTimeInterval(1),
+            updatedAt: now.addingTimeInterval(1),
+            previousProviderAccountId: authority.accountId,
+            detail: nil
+        ))
+        #expect(manager.activeAccountReadModel(at: now).providerAccountId
+            == authority.accountId)
+
+        manager.accounts[0].quotaSnapshot = quotaSnapshot()
+        manager.accounts[2].isActive = false
+        #expect(manager.logicalActiveAccount(at: now)?.id == authority.id)
+        #expect(manager.accounts.filter { manager.isPoolTarget($0, at: now) }.map(\.id)
+            == [authority.id])
+    }
+
+    @Test("Transport-only authority configuration is stale until readiness agrees")
+    func transportOnlyConfigurationFailsClosed() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let authority = makeAccount(email: "authority@example.com")
+        manager.accounts = [authority]
+        manager.publishRemoteAuthorityEndpointConfigured(true)
+        manager.publishPoolAuthorityObservation(try PoolAuthorityObservation(
+            epoch: 12,
+            phase: .stable,
+            desiredProviderAccountId: authority.accountId,
+            requestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            reason: "test",
+            observedAt: now,
+            updatedAt: now,
+            previousProviderAccountId: nil,
+            detail: nil
+        ))
+
+        #expect(manager.linuxDevboxStatus.state == .notConfigured)
+        #expect(manager.activeAccountReadModel(at: now).freshness == .stale)
+        #expect(manager.logicalActiveAccount(at: now)?.id == authority.id)
+
+        manager.linuxDevboxStatus = readyStatus(
+            activeEmail: authority.email,
+            providerAccountId: authority.accountId
+        )
+        #expect(manager.activeAccountReadModel(at: now).freshness == .current)
+
+        manager.publishRemoteAuthorityEndpointConfigured(false)
+        #expect(manager.activeAccountReadModel(at: now).freshness == .stale)
+        #expect(manager.logicalActiveAccount(at: now)?.id == authority.id)
+    }
+
     @Test("Stale or disconnected authority keeps target but fails host health closed")
     func staleAuthorityKeepsIdentityWithoutClaimingHealth() throws {
         let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
@@ -73,6 +155,14 @@ struct AccountHostOwnershipPresentationTests {
             forPoolTarget: authority,
             now: now
         ).vps == .unknown)
+
+        manager.clearPoolAuthorityObservation()
+        let staleRead = manager.activeAccountReadModel(at: now)
+        #expect(staleRead.providerAccountId == authority.accountId)
+        #expect(staleRead.epoch == 10)
+        #expect(staleRead.freshness == .stale)
+        #expect(manager.logicalActiveAccount(at: now)?.id == authority.id)
+        #expect(!manager.isPoolTarget(mac, at: now))
 
         manager.linuxDevboxStatus = LinuxDevboxStatus(
             state: .failed,

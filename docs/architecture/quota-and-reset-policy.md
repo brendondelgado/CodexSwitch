@@ -5,6 +5,7 @@ toc:
   - Quota And Reset Policy
   - Purpose
   - Quota Model
+  - Contradictory Provider Evidence
   - Weekly-only Operation
   - Account Usability
   - Background Polling
@@ -24,6 +25,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/UsageResponseParser.swift
   - ../../Sources/CodexSwitch/Services/SwapEngine.swift
   - ../../Sources/CodexSwitch/Services/RateLimitResetService.swift
+  - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../crates/codexswitch-cli/src/quota.rs
   - ../../crates/codexswitch-cli/src/account_store.rs
@@ -33,9 +35,9 @@ cross_dependencies:
   - ../codexswitch-banked-resets.md
   - ../codexswitch-quota-priming.md
 version_control:
-  branch: main
+  branch: incident/quota-auth-reload-20260729
   status: canonical-target
-  last_updated: 2026-07-28
+  last_updated: 2026-07-29
 ---
 
 # Quota And Reset Policy
@@ -61,6 +63,32 @@ The effective remaining capacity for an allowed account is the minimum remaining
 
 All policy decisions use one injected `now` and one quota maximum age of 15 minutes. This covers the normal ten-minute relaxed polling interval plus scheduling and network jitter, while a missed relaxed poll makes the snapshot stale before a second full interval elapses; urgent polling updates sooner. An observation is fresh from its fetch instant through exactly that boundary; future-dated or older observations are stale. Freshness is policy input, not presentation state.
 
+## Contradictory Provider Evidence
+
+Quota eligibility is fail-closed and negative evidence has precedence. Provider
+fields are independent observations, not overrides for one another:
+
+- `allowed == false` or `limitReached == true` blocks the snapshot.
+- Any recognized policy window with `hardLimitReached == true` blocks the
+  snapshot, even when `allowed == true` or `limitReached == false`.
+- Any recognized policy window with `usedPercent >= 100` has definitive zero
+  capacity and blocks the snapshot, even when `allowed == true`,
+  `limitReached == false`, or `hardLimitReached == false`.
+- A stale or future-dated snapshot is ineligible regardless of its last-known
+  allowance or remaining percentage.
+- A recognized window with a non-finite or negative usage percentage is
+  malformed and cannot authorize activation. It remains diagnostic evidence;
+  malformed data is not rewritten as provider-confirmed exhaustion.
+- A window whose reset boundary has passed is no longer evidence about the
+  current quota cycle and cannot authorize activation until it is refreshed.
+- A snapshot without a recognized five-hour or weekly window is ineligible for
+  activation. `allowed == true` alone does not manufacture measurable capacity;
+  unknown windows remain diagnostic-only.
+
+Contradictory observations are preserved for diagnostics, but they are never
+resolved in the optimistic direction. Every selection surface must consume the
+same derived eligibility result rather than rereading raw provider booleans.
+
 Each non-blocked account has one generation-owned poll task. Replacing a poll
 cancels the old generation, and callbacks from a cancelled or superseded
 generation are discarded before they reach account state. The Mac coordinator
@@ -82,7 +110,8 @@ The service may temporarily omit the five-hour window for paid accounts. In that
 - The UI hides the five-hour meter rather than displaying zero, 100 percent, unknown-as-full, or a placeholder countdown.
 - Legacy two-window cache files may be read, but new state is written using the optional-window schema.
 
-If no recognized quota window and no global allowance signal is present, the account state is unknown, not available.
+If no recognized quota window is present, the account state is unknown and not
+available for activation, even when a global allowance signal is positive.
 
 ## Account Usability
 
@@ -93,6 +122,11 @@ An account is immediately usable only when all are true:
 3. The provider has not explicitly denied usage.
 4. Every present blocking window is above the active exhaustion threshold.
 5. No unresolved reset or activation operation owns the account.
+
+The quota portion of this decision additionally requires at least one
+recognized policy window and no contradictory definitive exhaustion evidence.
+For weekly-only operation, one fresh weekly window with remaining capacity
+satisfies that requirement; a five-hour window is not required.
 
 Unknown and stale accounts are observable but cannot outrank confirmed usable accounts.
 
@@ -133,6 +167,15 @@ strictly beyond the shared five-minute safety window. Missing, malformed,
 expired, or near-expiry inference-token evidence is fail-closed even when quota
 is fresh and green. A failed quota probe never preserves candidate eligibility
 from an older snapshot.
+
+Before quota provider I/O, an account without a usable inference JWT receives
+exactly one proactive credential refresh. CodexSwitch validates the replacement
+against the same safety window before issuing the quota request. Merely entering
+the safety window, or a refresh that returns no usable replacement, does not
+create the durable 30-day `token_expired` quarantine; that quarantine requires
+provider authentication evidence such as an HTTP 401. A current durable
+`token_expired` block still suppresses repeated refresh attempts until its
+credential generation changes.
 
 A current non-quota runtime block is negative evidence. In particular, an
 account blocked as `token_expired` is not polled or refreshed again until the
@@ -184,7 +227,11 @@ Before redemption:
 4. Evaluate usable Pro accounts, then usable Plus accounts, including the authority-selected target.
 5. Evaluate time until natural recovery.
 
-A reset is normally suppressed when the account's natural weekly recovery is within 24 hours. It may be used inside that guard only when all higher-priority capacity is unavailable and work requires capacity now. The decision and exception reason must be recorded.
+A reset is suppressed when the account's natural recovery is within 24 hours
+during routine polling, even when the pool is otherwise exhausted or the credit
+expires soon. Only a direct runtime usage-limit event or an explicit operator
+redemption request may assert that work requires capacity now and override this
+guard. The decision and exception reason must be recorded.
 
 This avoids spending a reset shortly before a natural reset that will happen independently and would make the banked reset wasteful.
 
@@ -192,7 +239,17 @@ A stale positive snapshot cannot authorize selection or activation. A stale deni
 
 ## Durable Redemption
 
-When a VPS is configured, its daemon is the sole automatic redemption owner as
+Reset ownership is a persisted authority mode independent of endpoint validity:
+`standaloneMac` or `vpsAuthority`. A valid remote endpoint migrates and persists
+`vpsAuthority`. Missing, unknown, or malformed authority state also resolves to
+`vpsAuthority`; it never grants the Mac permission to spend a reset. Once VPS
+ownership is recorded, later host, user, port, or key-path corruption leaves
+ownership on the VPS and makes both manual and automatic Mac reset actions fail
+closed. `standaloneMac` is available only through an explicit stored authority
+selection while no valid remote endpoint exists. Adding a valid endpoint
+forces the mode back to `vpsAuthority`, preventing concurrent reset owners.
+
+When VPS authority is selected, its daemon is the sole automatic redemption owner as
 part of the same serialized policy domain that owns rotation. Mac automatic
 policy and manual controls submit requests through the SSH CLI transport and
 adopt the returned authority observation. If the configured VPS is unavailable,
@@ -200,6 +257,42 @@ the Mac fails closed without redeeming, selecting, or activating another
 account. A deliberately unconfigured standalone Mac may use the same journaled
 domain locally, but it cannot run concurrently as a second owner of a configured
 VPS pool.
+
+The production VPS daemon reads automatic-redemption permission on every tick
+from the secure authority-owned sibling file `daemon-policy.json` next to the
+account store. Missing, malformed, unsupported-version, oversized, insecure, or
+unreadable policy state disables automatic redemption while leaving quota
+observation and ordinary rotation available. Writes use the shared secure-file
+lock, generation compare-and-swap, atomic rename, directory sync, and exact-byte
+readback. The daemon never substitutes a compiled default of enabled, and a
+Mac-local preference is not authority for the VPS process.
+
+`codexswitch-cli automatic-reset-policy get --json` observes that authority
+without mutation. `codexswitch-cli automatic-reset-policy set enabled --json`
+and `... set disabled --json` atomically replace the authority policy. JSON uses
+schema version 1 and returns `automaticRateLimitResetRedemption`, `state`
+(`configured`, `missing`, or `invalid`), and `authority` (`vps`). A missing or
+invalid observation always reports an effective value of `false`; filesystem
+security or I/O failures return a nonzero command result rather than pretending
+the preference changed.
+
+The `automatic-reset-policy` command is available only on the Linux VPS. A
+macOS invocation fails before reading or writing `daemon-policy.json`; Mac UI
+and automation must invoke the command through the bounded VPS transport and
+must never present a Mac-local policy file as VPS authority.
+
+When VPS authority is selected, the Mac Settings toggle renders only
+this VPS observation; its standalone `UserDefaults` preference is neither shown
+as VPS truth nor submitted to the daemon. If its transport endpoint is missing
+or invalid, the toggle is disabled and no local fallback is offered. Reads and writes use bounded SSH
+output and validated schema-version-1 JSON. A toggle write uses the mutating SSH
+envelope and may try another transport only when the prior local process
+provably never started. A started timeout, missing completion marker, truncated
+response, or unverified response is outcome-unknown and is never replayed
+automatically. A successful write is followed by a separate read-only `get`
+reconciliation before the UI reports the current VPS value. Until a valid VPS
+observation exists, the remote toggle displays disabled and rejects mutation.
+An unconfigured standalone Mac continues to use its local preference.
 
 `codexswitch-cli redeem-reset <account>` is the manual entrypoint. On a
 configured Mac it submits one idempotent request to the VPS daemon; on the VPS
@@ -214,6 +307,23 @@ account, a free account, an unknown or stale quota, or an unresolved prior
 attempt fails closed without sending a consume request. The command may still
 reconcile an existing journaled attempt after quota becomes usable; that replay
 is observation-only and cannot submit another credit.
+
+The Mac manual-control transport invokes `codexswitch-cli redeem-reset
+<provider-account-id> --json` through the bounded mutating SSH envelope. It
+normalizes and shell-quotes one exact stable provider account ID before launch,
+accepts only a bounded non-secret response whose account ID matches that target,
+and may try another SSH transport candidate only when the local runner proves
+the prior candidate never started. A timeout, missing completion marker,
+connection loss, or any other failure after launch is outcome-unknown and is
+never replayed automatically. The caller must reconcile durable VPS reset and
+quota state before offering another manual submission.
+
+Reset-inventory provider backoff is scoped to the exact normalized account and
+credential generation. Every inventory call, including final orchestration for
+an inactive candidate, checks that account's backoff immediately before I/O.
+An authentication block on the active account cannot suppress evaluation of a
+different eligible account, and an inactive account's own block cannot be
+bypassed by a cached inventory observation.
 
 Reset redemption is a journaled state machine:
 

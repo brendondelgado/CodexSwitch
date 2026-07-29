@@ -118,6 +118,91 @@ struct AccountManagerSyncTests {
         #expect(defaults.string(forKey: "activeAccountId") == localActive.id.uuidString)
     }
 
+    @Test("Authoritative VPS telemetry projects without changing credentials or selection")
+    @MainActor func authoritativeVPSTelemetryPreservesCredentialsAndSelection() {
+        let defaults = isolatedDefaults()
+        let manager = AccountManager(userDefaults: defaults)
+        let now = Date()
+        let selected = CodexAccount(
+            email: "selected@test.com",
+            accessToken: "selected-access",
+            refreshToken: "selected-refresh",
+            idToken: "selected-id",
+            accountId: "acc-selected",
+            isActive: true
+        )
+        let target = CodexAccount(
+            email: "local-target@test.com",
+            accessToken: "target-access",
+            refreshToken: "target-refresh",
+            idToken: "target-id",
+            accountId: "  PROVIDER-TARGET  "
+        )
+        manager.addAccount(selected)
+        manager.addAccount(target)
+        manager.setConfiguredAccount(selected.id)
+
+        let quota = quotaSnapshot(
+            fiveHourRemaining: 44,
+            weeklyRemaining: 31,
+            fetchedAt: now.addingTimeInterval(-10)
+        )
+        let blockedUntil = now.addingTimeInterval(3_600)
+        let resetBank = RateLimitResetBank(
+            availableCount: 1,
+            totalEarnedCount: 1,
+            credits: [
+                RateLimitResetCredit(
+                    id: "reset-one",
+                    resetType: "usage",
+                    status: "available",
+                    grantedAt: now.addingTimeInterval(-60),
+                    expiresAt: now.addingTimeInterval(86_400),
+                    redeemedAt: nil,
+                    title: nil,
+                    description: nil
+                ),
+            ],
+            fetchedAt: now.addingTimeInterval(-5)
+        )
+        let result = manager.applyLinuxDevboxAccountStates(
+            [
+                LinuxDevboxAccountState(
+                    email: "remote-target@test.com",
+                    providerAccountId: "provider-target",
+                    isActive: true,
+                    quotaSnapshot: quota,
+                    planType: "pro",
+                    lastRefreshed: quota.fetchedAt,
+                    subscriptionRenewsAt: now.addingTimeInterval(86_400),
+                    subscriptionExpiresAt: nil,
+                    subscriptionWillRenew: true,
+                    hasActiveSubscription: true,
+                    rateLimitResetBank: resetBank,
+                    runtimeUnusableUntil: blockedUntil,
+                    runtimeUnusableReason: "usage_limit"
+                ),
+            ],
+            observedAt: now
+        )
+
+        let projected = manager.accounts.first { $0.id == target.id }
+        #expect(result.stateChanged)
+        #expect(projected?.quotaSnapshot == quota)
+        #expect(projected?.planType == "pro")
+        #expect(projected?.rateLimitResetBank == resetBank)
+        #expect(projected?.runtimeUnusableUntil == blockedUntil)
+        #expect(projected?.runtimeUnusableReason == "usage_limit")
+        #expect(projected?.id == target.id)
+        #expect(projected?.email == target.email)
+        #expect(projected?.accessToken == "target-access")
+        #expect(projected?.refreshToken == "target-refresh")
+        #expect(projected?.idToken == "target-id")
+        #expect(projected?.isActive == false)
+        #expect(manager.configuredAccount?.id == selected.id)
+        #expect(defaults.string(forKey: "activeAccountId") == selected.id.uuidString)
+    }
+
     @Test("Linux devbox stale account state cannot overwrite fresher local quota")
     @MainActor func linuxDevboxStaleAccountStateCannotOverwriteFresherLocalQuota() {
         let defaults = isolatedDefaults()
@@ -148,6 +233,7 @@ struct AccountManagerSyncTests {
         _ = manager.applyLinuxDevboxAccountStates([
             LinuxDevboxAccountState(
                 email: "brenchat7795@gmail.com",
+                providerAccountId: "acc-brenchat",
                 isActive: true,
                 quotaSnapshot: staleSnapshot,
                 planType: "pro",
@@ -165,6 +251,185 @@ struct AccountManagerSyncTests {
         #expect(manager.accounts.first?.quotaSnapshot?.weekly?.remainingPercent == 99)
         #expect(manager.accounts.first?.lastRefreshed == freshSnapshot.fetchedAt)
         #expect(manager.linuxDevboxAccountStates.first?.quotaSnapshot == staleSnapshot)
+    }
+
+    @Test("Duplicate canonical provider identity rejects the whole projection")
+    @MainActor func duplicateProviderIdentityRejectsProjection() {
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let now = Date(timeIntervalSince1970: 1_777_200_000)
+        let account = CodexAccount(
+            email: "account@test.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "provider-one",
+            planType: "plus"
+        )
+        manager.addAccount(account)
+        let first = quotaSnapshot(
+            fiveHourRemaining: 50,
+            weeklyRemaining: 50,
+            fetchedAt: now.addingTimeInterval(-10)
+        )
+        let second = quotaSnapshot(
+            fiveHourRemaining: 1,
+            weeklyRemaining: 1,
+            fetchedAt: now.addingTimeInterval(-5)
+        )
+
+        let changed = manager.projectAuthoritativeLinuxDevboxTelemetry(
+            from: [
+                LinuxDevboxAccountState(
+                    email: "first@test.com",
+                    providerAccountId: " PROVIDER-ONE ",
+                    isActive: true,
+                    quotaSnapshot: first,
+                    planType: "pro",
+                    lastRefreshed: first.fetchedAt,
+                    subscriptionRenewsAt: nil,
+                    subscriptionExpiresAt: nil,
+                    subscriptionWillRenew: true,
+                    hasActiveSubscription: true
+                ),
+                LinuxDevboxAccountState(
+                    email: "second@test.com",
+                    providerAccountId: "provider-one",
+                    isActive: false,
+                    quotaSnapshot: second,
+                    planType: "pro",
+                    lastRefreshed: second.fetchedAt,
+                    subscriptionRenewsAt: nil,
+                    subscriptionExpiresAt: nil,
+                    subscriptionWillRenew: true,
+                    hasActiveSubscription: true
+                ),
+            ],
+            observedAt: now,
+            now: now
+        )
+
+        #expect(!changed)
+        #expect(manager.accounts.first?.quotaSnapshot == nil)
+        #expect(manager.accounts.first?.planType == "plus")
+    }
+
+    @Test("Future and malformed authoritative observations fail closed")
+    @MainActor func futureAndMalformedAuthoritativeObservationsFailClosed() {
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let now = Date(timeIntervalSince1970: 1_777_200_000)
+        let account = CodexAccount(
+            email: "guarded@test.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "guarded-provider",
+            planType: "plus"
+        )
+        manager.addAccount(account)
+        let validQuota = quotaSnapshot(
+            fiveHourRemaining: 70,
+            weeklyRemaining: 80,
+            fetchedAt: now
+        )
+        let malformedQuota = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: now,
+            windows: [
+                QuotaWindow(
+                    kind: .weekly,
+                    durationSeconds: 7 * 24 * 60 * 60,
+                    usedPercent: .nan,
+                    resetsAt: now.addingTimeInterval(86_400),
+                    source: QuotaWindowSourceMetadata(
+                        rateLimit: .main,
+                        slot: .primary
+                    )
+                ),
+            ]
+        )
+
+        func state(with quota: QuotaSnapshot) -> LinuxDevboxAccountState {
+            LinuxDevboxAccountState(
+                email: "guarded@test.com",
+                providerAccountId: "guarded-provider",
+                isActive: false,
+                quotaSnapshot: quota,
+                planType: "pro",
+                lastRefreshed: quota.fetchedAt,
+                subscriptionRenewsAt: nil,
+                subscriptionExpiresAt: nil,
+                subscriptionWillRenew: true,
+                hasActiveSubscription: true
+            )
+        }
+
+        #expect(!manager.projectAuthoritativeLinuxDevboxTelemetry(
+            from: [state(with: validQuota)],
+            observedAt: now.addingTimeInterval(1),
+            now: now
+        ))
+        #expect(!manager.projectAuthoritativeLinuxDevboxTelemetry(
+            from: [state(with: malformedQuota)],
+            observedAt: now,
+            now: now
+        ))
+        #expect(manager.accounts.first?.quotaSnapshot == nil)
+        #expect(manager.accounts.first?.planType == "plus")
+    }
+
+    @Test("Weekly-only authoritative quota projects without inventing five-hour usage")
+    @MainActor func weeklyOnlyAuthoritativeQuotaProjects() {
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let now = Date(timeIntervalSince1970: 1_777_200_000)
+        let account = CodexAccount(
+            email: "weekly@test.com",
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: "id",
+            accountId: "weekly-provider"
+        )
+        manager.addAccount(account)
+        let weeklyOnly = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: now.addingTimeInterval(-5),
+            windows: [
+                QuotaWindow(
+                    kind: .weekly,
+                    durationSeconds: 7 * 24 * 60 * 60,
+                    usedPercent: 37,
+                    resetsAt: now.addingTimeInterval(86_400),
+                    source: QuotaWindowSourceMetadata(
+                        rateLimit: .main,
+                        slot: .primary
+                    )
+                ),
+            ]
+        )
+
+        let changed = manager.projectAuthoritativeLinuxDevboxTelemetry(
+            from: [
+                LinuxDevboxAccountState(
+                    email: "weekly@test.com",
+                    providerAccountId: "WEEKLY-PROVIDER",
+                    isActive: false,
+                    quotaSnapshot: weeklyOnly,
+                    planType: "pro",
+                    lastRefreshed: weeklyOnly.fetchedAt,
+                    subscriptionRenewsAt: nil,
+                    subscriptionExpiresAt: nil,
+                    subscriptionWillRenew: true,
+                    hasActiveSubscription: true
+                ),
+            ],
+            observedAt: now,
+            now: now
+        )
+
+        #expect(changed)
+        #expect(manager.accounts.first?.quotaSnapshot?.fiveHour == nil)
+        #expect(manager.accounts.first?.quotaSnapshot?.weekly?.remainingPercent == 63)
     }
 
     @Test("Linux devbox placeholder quota cannot overwrite real local quota")
@@ -795,8 +1060,8 @@ struct AccountManagerSyncTests {
         #expect(manager.accounts.first?.quotaSnapshot?.fiveHour == nil)
     }
 
-    @Test("Sorted accounts keep the configured account first")
-    @MainActor func sortedAccountsKeepConfiguredAccountFirst() {
+    @Test("Sorted accounts do not treat a local active flag as pool authority")
+    @MainActor func sortedAccountsIgnoreLocalActiveFlagWithoutAuthority() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
         let exhaustedPro = CodexAccount(
@@ -823,8 +1088,8 @@ struct AccountManagerSyncTests {
         manager.addAccount(usablePlus)
         manager.setConfiguredAccount(exhaustedPro.id)
 
-        #expect(manager.sortedAccounts.first?.id == exhaustedPro.id)
-        #expect(manager.sortedAccounts.dropFirst().first?.id == usablePlus.id)
+        #expect(manager.sortedAccounts.first?.id == usablePlus.id)
+        #expect(manager.sortedAccounts.dropFirst().first?.id == exhaustedPro.id)
     }
 
     @Test("Inactive imported credentials refresh an existing account")

@@ -7,6 +7,7 @@ toc:
   - Responsibility Boundary
   - System Topology
   - Core State
+  - Active Account Read Model
   - Shared Account-Store Protocol
   - Control Flow
   - Component Map
@@ -36,7 +37,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-27
+  last_updated: 2026-07-29
 ---
 
 # CodexSwitch System Overview
@@ -106,9 +107,10 @@ authority-selected target.
 
 An account has a stable local identity, provider account identity when known,
 plan, complete token bundle, quota snapshot, reset inventory, health state, and
-an active flag. A non-empty account store has exactly one active account. When
-VPS authority is configured, that active flag is a host-local projection of the
-fresh authority target, not an independent selection.
+an active flag. A non-empty account store has exactly one active account. That
+flag is a host-local credential projection used to verify activation commits;
+it is never an independent source for the logical active account shown by the
+product.
 
 ### Quota Snapshot
 
@@ -135,9 +137,52 @@ stale expected epoch is rejected without changing authority or host credentials.
 The Mac SSH transport config is token-free, mode `0600`, and separate from
 readiness-notification enablement.
 
+### Active Account Read Model
+
+Every Mac presentation surface consumes one immutable active-account read
+model derived only from the last accepted pool-authority observation. The model
+contains exactly one provider account identifier, its monotonically increasing
+authority epoch, and a freshness state (`current`, `stale`, or `unavailable`).
+It never inspects account `isActive` flags, list position, quota movement,
+runtime-current evidence, or plan ranking to choose an identity.
+
+- A current observation exposes its provider identity and epoch as `current`
+  only while authority transport and readiness configuration coherently report
+  available. A fresh cached observation behind a disabled or unavailable
+  readiness path is presented as `stale`, not current.
+- When that observation ages out or authority transport becomes unavailable,
+  the same provider identity and epoch remain visible as `stale`. Staleness may
+  change styling and health text, but it cannot select or highlight a different
+  account.
+- Before any authority observation has been accepted, the model is
+  `unavailable` and has no identity. The UI must show an unavailable target; it
+  must not fall back to a locally configured account.
+- A provider identity resolves to an account only when exactly one account
+  record matches it. Missing or duplicate matches fail closed and produce no
+  logical active account.
+- Account ordering may place the resolved authority target first, but ordering
+  cannot create a target. Likewise, local activation and runtime evidence are
+  convergence details for that target, not alternative active-account sources.
+
+This distinction lets local credentials and runtimes remain operational during
+an authority outage without presenting their incidental state as pool truth.
+
+One `authorityConfigured` predicate, derived from a valid remote endpoint,
+governs transport publication, authority polling, credential convergence, and
+readiness. The `Notify when VPS auto-swap is not ready` preference controls
+notifications only; disabling that preference cannot disable credential sync
+while leaving authority mutation enabled. A periodic authority reconciliation
+compares non-secret account, credential-set, active-provider, and active-token
+fingerprints before creating an encrypted bundle. Matching evidence performs no
+remote mutation; mismatched evidence enters the normal journaled encrypted
+credential-sync transaction.
+
 ### Reset Attempt
 
 A reset attempt records account identity, selected credit, request identity, starting inventory and quota generations, owner, timestamp, and reconciliation state before any network mutation occurs.
+When a remote authority endpoint exists, the VPS daemon is the sole automatic
+reset owner and the Mac cannot start a local automatic attempt. A standalone
+Mac with no remote authority endpoint may own local automatic redemption.
 
 ## Shared Account-Store Protocol
 

@@ -53,6 +53,8 @@ final class AccountManager {
     var uiRefreshRevision: Int = 0
     private(set) var poolAuthorityObservation: PoolAuthorityObservation?
     private(set) var remoteAuthorityEndpointConfigured = false
+    private var retainedPoolAuthorityObservation: PoolAuthorityObservation?
+    private var linuxDevboxTelemetryObservedAtByProviderAccountId: [String: Date] = [:]
 
     private let userDefaults: UserDefaults
     init(userDefaults: UserDefaults = .standard) {
@@ -63,31 +65,73 @@ final class AccountManager {
         accounts.first(where: \.isActive)
     }
 
-    var poolTargetAccount: CodexAccount? {
-        if let providerAccountId = poolAuthorityObservation?
-            .desiredProviderAccountId {
-            let matches = accounts.filter {
-                $0.normalizedProviderAccountId == providerAccountId
+    func activeAccountReadModel(at now: Date = Date()) -> ActiveAccountReadModel {
+        if let poolAuthorityObservation {
+            let observed = ActiveAccountReadModel(
+                lastObservation: poolAuthorityObservation,
+                now: now
+            )
+            guard observed.freshness == .current,
+                  remoteAuthorityEndpointConfigured,
+                  linuxDevboxStatus.state == .ready else {
+                return ActiveAccountReadModel(
+                    providerAccountId: poolAuthorityObservation.desiredProviderAccountId,
+                    epoch: poolAuthorityObservation.epoch,
+                    freshness: .stale
+                )
             }
-            return matches.count == 1 ? matches[0] : nil
+            return observed
         }
-        return remoteAuthorityEndpointConfigured ? nil : configuredAccount
+        guard let retainedPoolAuthorityObservation else { return .unavailable }
+        return ActiveAccountReadModel(
+            providerAccountId: retainedPoolAuthorityObservation.desiredProviderAccountId,
+            epoch: retainedPoolAuthorityObservation.epoch,
+            freshness: .stale
+        )
     }
 
-    func isPoolTarget(_ account: CodexAccount) -> Bool {
-        poolTargetAccount?.id == account.id
+    func logicalActiveAccount(
+        using readModel: ActiveAccountReadModel
+    ) -> CodexAccount? {
+        guard let providerAccountId = readModel.providerAccountId else { return nil }
+        let matches = accounts.filter {
+            $0.normalizedProviderAccountId == providerAccountId
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    func logicalActiveAccount(at now: Date = Date()) -> CodexAccount? {
+        logicalActiveAccount(using: activeAccountReadModel(at: now))
+    }
+
+    var poolTargetAccount: CodexAccount? {
+        logicalActiveAccount()
+    }
+
+    func isPoolTarget(
+        _ account: CodexAccount,
+        using readModel: ActiveAccountReadModel
+    ) -> Bool {
+        logicalActiveAccount(using: readModel)?.id == account.id
+    }
+
+    func isPoolTarget(_ account: CodexAccount, at now: Date = Date()) -> Bool {
+        isPoolTarget(account, using: activeAccountReadModel(at: now))
     }
 
     func publishPoolAuthorityObservation(
         _ observation: PoolAuthorityObservation
     ) {
-        guard poolAuthorityObservation.map({
-            observation.epoch >= $0.epoch
-        }) ?? true else {
+        let existing = poolAuthorityObservation ?? retainedPoolAuthorityObservation
+        guard Self.authorityObservationCanReplace(
+            existing: existing,
+            with: observation
+        ) else {
             return
         }
         remoteAuthorityEndpointConfigured = true
         poolAuthorityObservation = observation
+        retainedPoolAuthorityObservation = observation
         uiRefreshRevision &+= 1
     }
 
@@ -98,8 +142,27 @@ final class AccountManager {
     }
 
     func clearPoolAuthorityObservation() {
+        if let poolAuthorityObservation {
+            retainedPoolAuthorityObservation = poolAuthorityObservation
+        }
         poolAuthorityObservation = nil
         uiRefreshRevision &+= 1
+    }
+
+    private static func authorityObservationCanReplace(
+        existing: PoolAuthorityObservation?,
+        with candidate: PoolAuthorityObservation
+    ) -> Bool {
+        guard let existing else { return true }
+        guard candidate.epoch >= existing.epoch else { return false }
+        guard candidate.epoch == existing.epoch else { return true }
+        guard candidate.desiredProviderAccountId
+            == existing.desiredProviderAccountId,
+              candidate.updatedAt >= existing.updatedAt else {
+            return false
+        }
+        return candidate.updatedAt != existing.updatedAt
+            || candidate.observedAt >= existing.observedAt
     }
 
     var runtimeCurrentAccount: CodexAccount? {
@@ -158,7 +221,7 @@ final class AccountManager {
         forPoolTarget account: CodexAccount,
         now: Date = Date()
     ) -> AccountHostConvergencePresentation {
-        guard isPoolTarget(account) else {
+        guard isPoolTarget(account, at: now) else {
             return AccountHostConvergencePresentation(mac: .unknown, vps: .unknown)
         }
 
@@ -273,11 +336,18 @@ final class AccountManager {
 
     var sortedAccounts: [CodexAccount] {
         let now = Date()
+        let readModel = activeAccountReadModel(at: now)
+        return sortedAccounts(using: readModel, now: now)
+    }
+
+    func sortedAccounts(
+        using readModel: ActiveAccountReadModel,
+        now: Date
+    ) -> [CodexAccount] {
         return accounts.sorted { a, b in
-            let aIsPoolTarget = isPoolTarget(a)
-            let bIsPoolTarget = isPoolTarget(b)
+            let aIsPoolTarget = isPoolTarget(a, using: readModel)
+            let bIsPoolTarget = isPoolTarget(b, using: readModel)
             if aIsPoolTarget != bIsPoolTarget { return aIsPoolTarget }
-            if a.isActive != b.isActive { return a.isActive }
             let aImmediatelyUsable = SwapEngine.isImmediatelyUsable(a, now: now)
             let bImmediatelyUsable = SwapEngine.isImmediatelyUsable(b, now: now)
             if aImmediatelyUsable != bImmediatelyUsable {
@@ -437,10 +507,195 @@ final class AccountManager {
         let presentationStates = states.sorted {
             $0.email.localizedCaseInsensitiveCompare($1.email) == .orderedAscending
         }
+        let telemetryChanged = projectAuthoritativeLinuxDevboxTelemetry(
+            from: states,
+            observedAt: observedAt
+        )
         let stateChanged = presentationStates != linuxDevboxAccountStates
+            || telemetryChanged
         linuxDevboxAccountStates = presentationStates
         linuxDevboxAccountStatesObservedAt = observedAt
         return LinuxDevboxAccountApplyResult(stateChanged: stateChanged)
+    }
+
+    /// Projects fresh VPS-owned telemetry without adopting remote credentials or selection state.
+    @discardableResult
+    func projectAuthoritativeLinuxDevboxTelemetry(
+        from states: [LinuxDevboxAccountState],
+        observedAt: Date,
+        now: Date = Date()
+    ) -> Bool {
+        guard QuotaFreshnessPolicy.isFresh(fetchedAt: observedAt, now: now) else {
+            return false
+        }
+
+        let remoteIdentities = states.map {
+            Self.canonicalRemoteProviderAccountId($0.providerAccountId)
+        }
+        guard remoteIdentities.allSatisfy({ $0 != nil }) else { return false }
+        let providerAccountIds = remoteIdentities.compactMap { $0 }
+        guard Set(providerAccountIds).count == providerAccountIds.count else { return false }
+
+        let localIdentities = accounts.map(\.normalizedProviderAccountId)
+        guard localIdentities.allSatisfy({ $0 != nil }) else { return false }
+        let localProviderAccountIds = localIdentities.compactMap { $0 }
+        guard Set(localProviderAccountIds).count == localProviderAccountIds.count else {
+            return false
+        }
+        let localIndexByProviderAccountId = Dictionary(
+            uniqueKeysWithValues: zip(localProviderAccountIds, accounts.indices)
+        )
+
+        var projectedAccounts = accounts
+        var projectedObservationDates = linuxDevboxTelemetryObservedAtByProviderAccountId
+        var changed = false
+
+        for (state, providerAccountId) in zip(states, providerAccountIds) {
+            guard let index = localIndexByProviderAccountId[providerAccountId] else {
+                continue
+            }
+            guard observedAt > (projectedObservationDates[providerAccountId] ?? .distantPast),
+                  Self.isValidAuthoritativeTelemetry(state, observedAt: observedAt, now: now) else {
+                continue
+            }
+
+            let current = projectedAccounts[index]
+            var projected = current
+
+            if let quota = state.quotaSnapshot,
+               quota.fetchedAt > (current.quotaSnapshot?.fetchedAt ?? .distantPast) {
+                projected.quotaSnapshot = quota
+                projected.lastRefreshed = max(
+                    projected.lastRefreshed ?? .distantPast,
+                    quota.fetchedAt
+                )
+            }
+
+            if Self.hasSubscriptionTelemetry(state),
+               let telemetryRefreshedAt = state.lastRefreshed,
+               telemetryRefreshedAt > (current.lastRefreshed ?? .distantPast) {
+                projected.planType = state.planType
+                projected.subscriptionRenewsAt = state.subscriptionRenewsAt
+                projected.subscriptionExpiresAt = state.subscriptionExpiresAt
+                projected.subscriptionWillRenew = state.subscriptionWillRenew
+                projected.hasActiveSubscription = state.hasActiveSubscription
+                projected.lastRefreshed = max(
+                    projected.lastRefreshed ?? .distantPast,
+                    telemetryRefreshedAt
+                )
+            }
+
+            if let bank = state.rateLimitResetBank,
+               bank.fetchedAt > (current.rateLimitResetBank?.fetchedAt ?? .distantPast) {
+                projected.rateLimitResetBank = bank
+            }
+
+            projected.runtimeUnusableUntil = state.runtimeUnusableUntil
+            projected.runtimeUnusableReason = state.runtimeUnusableReason
+
+            if Self.telemetryDiffers(projected, from: current) {
+                projectedAccounts[index] = projected
+                changed = true
+            }
+            projectedObservationDates[providerAccountId] = observedAt
+        }
+
+        if changed {
+            accounts = projectedAccounts
+        }
+        linuxDevboxTelemetryObservedAtByProviderAccountId = projectedObservationDates
+        return changed
+    }
+
+    private static func canonicalRemoteProviderAccountId(_ value: String?) -> String? {
+        guard let bounded = boundedRemoteProviderAccountId(value) else { return nil }
+        let normalized = bounded
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .precomposedStringWithCanonicalMapping
+            .lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func isValidAuthoritativeTelemetry(
+        _ state: LinuxDevboxAccountState,
+        observedAt: Date,
+        now: Date
+    ) -> Bool {
+        if let quota = state.quotaSnapshot {
+            guard quota.fetchedAt <= observedAt,
+                  quota.isFresh(at: now),
+                  !quota.hasExpiredPolicyWindow(at: now),
+                  !quota.hasBackendUsagePlaceholder,
+                  !quota.hasInvalidPolicyEvidence,
+                  quota.isDenied || !quota.policyWindows.isEmpty else {
+                return false
+            }
+        }
+
+        if hasSubscriptionTelemetry(state) {
+            guard let refreshedAt = state.lastRefreshed,
+                  refreshedAt <= observedAt,
+                  QuotaFreshnessPolicy.isFresh(fetchedAt: refreshedAt, now: now),
+                  state.planType.map({
+                      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  }) ?? true,
+                  [state.subscriptionRenewsAt, state.subscriptionExpiresAt]
+                    .compactMap({ $0 })
+                    .allSatisfy({ $0.timeIntervalSinceReferenceDate.isFinite }) else {
+                return false
+            }
+        }
+
+        if let bank = state.rateLimitResetBank {
+            guard bank.fetchedAt <= observedAt,
+                  bank.isFresh(at: now),
+                  bank.structurallyValidAvailableCredits(at: now) != nil else {
+                return false
+            }
+        }
+
+        switch (state.runtimeUnusableUntil, state.runtimeUnusableReason) {
+        case (nil, nil):
+            break
+        case let (until?, reason?):
+            let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard until > now,
+                  until.timeIntervalSinceReferenceDate.isFinite,
+                  !normalizedReason.isEmpty,
+                  normalizedReason.lengthOfBytes(using: .utf8) <= 256,
+                  normalizedReason.unicodeScalars.allSatisfy({
+                      $0.value >= 32 && $0.value != 127
+                  }) else {
+                return false
+            }
+        default:
+            return false
+        }
+        return true
+    }
+
+    private static func hasSubscriptionTelemetry(_ state: LinuxDevboxAccountState) -> Bool {
+        state.planType != nil
+            || state.subscriptionRenewsAt != nil
+            || state.subscriptionExpiresAt != nil
+            || state.subscriptionWillRenew != nil
+            || state.hasActiveSubscription != nil
+    }
+
+    private static func telemetryDiffers(
+        _ projected: CodexAccount,
+        from current: CodexAccount
+    ) -> Bool {
+        projected.quotaSnapshot != current.quotaSnapshot
+            || projected.planType != current.planType
+            || projected.lastRefreshed != current.lastRefreshed
+            || projected.subscriptionRenewsAt != current.subscriptionRenewsAt
+            || projected.subscriptionExpiresAt != current.subscriptionExpiresAt
+            || projected.subscriptionWillRenew != current.subscriptionWillRenew
+            || projected.hasActiveSubscription != current.hasActiveSubscription
+            || projected.rateLimitResetBank != current.rateLimitResetBank
+            || projected.runtimeUnusableUntil != current.runtimeUnusableUntil
+            || projected.runtimeUnusableReason != current.runtimeUnusableReason
     }
 
     /// One-shot startup hydration. It cannot overwrite an already configured in-memory store.

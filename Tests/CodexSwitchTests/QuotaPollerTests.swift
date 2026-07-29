@@ -35,7 +35,11 @@ struct QuotaPollerTests {
 
     @Test("Weekly window in primary slot stays weekly and missing five-hour stays absent")
     func parseWeeklyPrimary() throws {
-        let result = try UsageResponseParser.parse(try fixture(named: "weekly-primary"))
+        let fetchedAt = Date(timeIntervalSince1970: 1_779_000_000)
+        let result = try UsageResponseParser.parse(
+            try fixture(named: "weekly-primary"),
+            fetchedAt: fetchedAt
+        )
         let weekly = try #require(result.snapshot.weekly)
 
         #expect(result.snapshot.windows.count == 1)
@@ -43,6 +47,7 @@ struct QuotaPollerTests {
         #expect(weekly.kind == .weekly)
         #expect(weekly.usedPercent == 37)
         #expect(weekly.source.slot == .primary)
+        #expect(result.snapshot.isImmediatelyUsable(at: fetchedAt))
     }
 
     @Test("Weekly window in secondary slot is classified by duration")
@@ -152,6 +157,10 @@ struct QuotaPollerTests {
         #expect(result.snapshot.limitReached == false)
         #expect(weekly.usedPercent == 100)
         #expect(weekly.remainingPercent == 0)
+        #expect(result.snapshot.hasDefinitiveExhaustion)
+        #expect(result.snapshot.needsSwap)
+        #expect(!result.snapshot.isImmediatelyUsable)
+        #expect(!result.snapshot.isImmediatelyUsable(at: result.snapshot.fetchedAt))
     }
 
     private func assertCodexAdditionalSelection(fixtureName: String) throws {

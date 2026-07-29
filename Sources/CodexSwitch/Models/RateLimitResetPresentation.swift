@@ -7,12 +7,17 @@ enum RateLimitResetInventoryPresentation: Equatable, Sendable {
     case externalHold(until: Date)
     case refreshing
     case stale(lastKnownCount: Int)
+    case expired(lastKnownCount: Int)
+    case unknown(lastKnownCount: Int)
     case current(availableCount: Int, nextExpiration: Date?)
 
     static func resolve(
         availableCount: Int,
         nextExpiration: Date?,
         inventoryIsFresh: Bool,
+        inventoryExists: Bool = true,
+        inventoryHasExpiredAvailableCredit: Bool = false,
+        inventoryIsStructurallyValid: Bool = true,
         isRedeeming: Bool = false,
         isReconciling: Bool = false,
         error: String? = nil,
@@ -36,12 +41,182 @@ enum RateLimitResetInventoryPresentation: Equatable, Sendable {
         if isRefreshing {
             return .refreshing
         }
+        guard inventoryExists else {
+            return .unknown(lastKnownCount: normalizedCount)
+        }
+        if inventoryHasExpiredAvailableCredit {
+            return .expired(lastKnownCount: normalizedCount)
+        }
+        guard inventoryIsStructurallyValid else {
+            return .unknown(lastKnownCount: normalizedCount)
+        }
         guard inventoryIsFresh else {
             return .stale(lastKnownCount: normalizedCount)
         }
         return .current(
             availableCount: normalizedCount,
             nextExpiration: normalizedCount > 0 ? nextExpiration : nil
+        )
+    }
+}
+
+enum RateLimitResetInventoryFreshness: Equatable, Sendable {
+    case current
+    case stale
+    case expired
+    case refreshFailed
+    case unknown
+    case pending
+
+    var authorizesCount: Bool {
+        self == .current
+    }
+}
+
+struct VerifiedRateLimitResetCount: Equatable, Sendable {
+    let availableCount: Int
+    let fetchedAt: Date
+}
+
+struct RateLimitResetInventoryObservation: Equatable, Sendable {
+    static let presentationMaximumAge: TimeInterval = 5 * 60
+
+    let freshness: RateLimitResetInventoryFreshness
+    let verifiedCount: VerifiedRateLimitResetCount?
+    let lastKnownCount: Int
+    let fetchedAt: Date?
+    let nextExpiration: Date?
+    let failureMessage: String?
+
+    static func resolve(
+        presentation: RateLimitResetInventoryPresentation?,
+        bank: RateLimitResetBank?,
+        now: Date
+    ) -> Self {
+        let normalizedBankCount = max(0, bank?.availableCount ?? 0)
+
+        guard let presentation else {
+            return Self(
+                freshness: .unknown,
+                verifiedCount: nil,
+                lastKnownCount: normalizedBankCount,
+                fetchedAt: bank?.fetchedAt,
+                nextExpiration: nil,
+                failureMessage: nil
+            )
+        }
+
+        switch presentation {
+        case .current(let availableCount, let nextExpiration):
+            let normalizedCount = max(0, availableCount)
+            guard let bank,
+                  bank.availableCount == normalizedCount,
+                  bank.isFresh(at: now, maxAge: presentationMaximumAge),
+                  bank.structurallyValidAvailableCredits(at: now) != nil,
+                  normalizedCount == 0 || nextExpiration == bank.nextExpiration(at: now) else {
+                return nonCurrentObservation(
+                    for: bank,
+                    lastKnownCount: normalizedCount,
+                    now: now
+                )
+            }
+            return Self(
+                freshness: .current,
+                verifiedCount: VerifiedRateLimitResetCount(
+                    availableCount: normalizedCount,
+                    fetchedAt: bank.fetchedAt
+                ),
+                lastKnownCount: normalizedCount,
+                fetchedAt: bank.fetchedAt,
+                nextExpiration: normalizedCount > 0 ? nextExpiration : nil,
+                failureMessage: nil
+            )
+        case .error(let message, let lastKnownCount):
+            return Self(
+                freshness: message.hasPrefix("Reset inventory")
+                    ? .refreshFailed
+                    : .pending,
+                verifiedCount: nil,
+                lastKnownCount: max(0, lastKnownCount),
+                fetchedAt: bank?.fetchedAt,
+                nextExpiration: nil,
+                failureMessage: message
+            )
+        case .stale(let lastKnownCount):
+            return nonCurrentObservation(
+                for: bank,
+                lastKnownCount: max(0, lastKnownCount),
+                now: now
+            )
+        case .expired(let lastKnownCount):
+            return Self(
+                freshness: .expired,
+                verifiedCount: nil,
+                lastKnownCount: max(0, lastKnownCount),
+                fetchedAt: bank?.fetchedAt,
+                nextExpiration: nil,
+                failureMessage: nil
+            )
+        case .unknown(let lastKnownCount):
+            return Self(
+                freshness: .unknown,
+                verifiedCount: nil,
+                lastKnownCount: max(0, lastKnownCount),
+                fetchedAt: bank?.fetchedAt,
+                nextExpiration: nil,
+                failureMessage: nil
+            )
+        case .redeeming, .reconciling, .externalHold, .refreshing:
+            return Self(
+                freshness: .pending,
+                verifiedCount: nil,
+                lastKnownCount: normalizedBankCount,
+                fetchedAt: bank?.fetchedAt,
+                nextExpiration: nil,
+                failureMessage: nil
+            )
+        }
+    }
+
+    private static func nonCurrentObservation(
+        for bank: RateLimitResetBank?,
+        lastKnownCount: Int,
+        now: Date
+    ) -> Self {
+        guard let bank else {
+            return Self(
+                freshness: .unknown,
+                verifiedCount: nil,
+                lastKnownCount: max(0, lastKnownCount),
+                fetchedAt: nil,
+                nextExpiration: nil,
+                failureMessage: nil
+            )
+        }
+
+        let hasNaturallyExpiredCredit = bank.credits.contains { credit in
+            credit.isAvailable
+                && credit.expiresAt.map { $0 <= now } == true
+        }
+        let bankIsTimestampFresh = bank.isFresh(
+            at: now,
+            maxAge: presentationMaximumAge
+        )
+        let freshness: RateLimitResetInventoryFreshness
+        if hasNaturallyExpiredCredit {
+            freshness = .expired
+        } else if bankIsTimestampFresh {
+            freshness = .unknown
+        } else {
+            freshness = .stale
+        }
+        return Self(
+            freshness: freshness,
+            verifiedCount: nil,
+            lastKnownCount: max(0, lastKnownCount),
+            fetchedAt: bank.fetchedAt,
+            nextExpiration: nil,
+            failureMessage: nil
         )
     }
 }
@@ -105,7 +280,7 @@ struct RateLimitResetRedemptionActionPresentation: Equatable, Sendable {
             inventoryReason = hasCurrentReset ? nil : "No current banked reset is available"
         case .error(let message, _):
             hasCurrentReset = false
-            inventoryReason = "Reset inventory error: \(message)"
+            inventoryReason = "Reset inventory is unverified because refresh failed; refresh it before redeeming: \(message)"
         case .redeeming:
             hasCurrentReset = false
             inventoryReason = "A banked reset is already being redeemed"
@@ -120,7 +295,13 @@ struct RateLimitResetRedemptionActionPresentation: Equatable, Sendable {
             inventoryReason = "Reset inventory is refreshing"
         case .stale:
             hasCurrentReset = false
-            inventoryReason = "Reset inventory is stale"
+            inventoryReason = "Reset inventory is last-known and unverified; refresh it before redeeming"
+        case .expired:
+            hasCurrentReset = false
+            inventoryReason = "Banked reset inventory has expired; refresh it before redeeming"
+        case .unknown:
+            hasCurrentReset = false
+            inventoryReason = "Reset inventory has not been verified; refresh it before redeeming"
         case nil:
             hasCurrentReset = false
             inventoryReason = "Reset inventory is unavailable"
@@ -146,9 +327,14 @@ struct RateLimitResetRedemptionActionPresentation: Equatable, Sendable {
         }
 
         guard hasCurrentReset, policyAllowsRedemption else {
+            let staleCurrentInventoryReason = hasCurrentReset
+                && policyReason == "No fresh banked reset is available"
+                ? "Reset inventory is last-known and unverified; refresh it before redeeming"
+                : nil
             return Self(
                 isEnabled: false,
                 helpText: inventoryReason
+                    ?? staleCurrentInventoryReason
                     ?? policyReason
                     ?? "Manual reset redemption is unavailable"
             )
@@ -157,6 +343,38 @@ struct RateLimitResetRedemptionActionPresentation: Equatable, Sendable {
         return Self(
             isEnabled: true,
             helpText: "Redeem the oldest-expiring banked reset after confirmation"
+        )
+    }
+}
+
+/// The account-card context menu uses the same guarded manual-redemption contract
+/// as the button flow. Building this value never submits or redeems a reset.
+struct RateLimitResetContextMenuPresentation: Equatable, Sendable {
+    let title: String
+    let isEnabled: Bool
+    let unavailableReason: String?
+
+    var menuItemTitle: String {
+        guard let unavailableReason else { return title }
+        return "\(title) - \(unavailableReason)"
+    }
+
+    static func resolve(
+        account: CodexAccount,
+        inventory: RateLimitResetInventoryPresentation?,
+        coordinatorAuthorization: RateLimitResetCoordinatorAuthorization = .authorized,
+        now: Date
+    ) -> Self {
+        let action = RateLimitResetRedemptionActionPresentation.resolve(
+            account: account,
+            inventory: inventory,
+            coordinatorAuthorization: coordinatorAuthorization,
+            now: now
+        )
+        return Self(
+            title: "Redeem banked reset for \(account.email)",
+            isEnabled: action.isEnabled,
+            unavailableReason: action.isEnabled ? nil : action.helpText
         )
     }
 }
@@ -256,7 +474,7 @@ struct RateLimitResetOverviewItem: Identifiable, Equatable, Sendable {
                         errorMessage: message
                     )
                 )
-            case .redeeming, .reconciling, .externalHold, .refreshing, .stale:
+            case .redeeming, .reconciling, .externalHold, .refreshing, .stale, .expired, .unknown:
                 return nil
             }
         }
@@ -281,9 +499,51 @@ struct PooledRateLimitResetPresentation: Equatable, Sendable {
     let nextCurrentExpiration: Date?
     let pendingAccountCount: Int
     let staleAccountCount: Int
+    let expiredAccountCount: Int
+    let refreshFailedAccountCount: Int
+    let unknownAccountCount: Int
+    let currentCountFetchedAt: Date?
+
+    init(
+        currentAvailableCount: Int,
+        nextCurrentExpiration: Date?,
+        pendingAccountCount: Int,
+        staleAccountCount: Int,
+        expiredAccountCount: Int = 0,
+        refreshFailedAccountCount: Int = 0,
+        unknownAccountCount: Int = 0,
+        currentCountFetchedAt: Date? = nil
+    ) {
+        self.currentAvailableCount = max(0, currentAvailableCount)
+        self.nextCurrentExpiration = nextCurrentExpiration
+        self.pendingAccountCount = max(0, pendingAccountCount)
+        self.staleAccountCount = max(0, staleAccountCount)
+        self.expiredAccountCount = max(0, expiredAccountCount)
+        self.refreshFailedAccountCount = max(0, refreshFailedAccountCount)
+        self.unknownAccountCount = max(0, unknownAccountCount)
+        self.currentCountFetchedAt = currentCountFetchedAt
+    }
 
     var hasIncompleteInventory: Bool {
-        pendingAccountCount > 0 || staleAccountCount > 0
+        pendingAccountCount > 0
+            || staleAccountCount > 0
+            || expiredAccountCount > 0
+            || refreshFailedAccountCount > 0
+            || unknownAccountCount > 0
+    }
+
+    static func summarize(
+        accounts: [CodexAccount],
+        presentations: [UUID: RateLimitResetInventoryPresentation],
+        now: Date
+    ) -> Self {
+        summarize(accounts.map { account in
+            RateLimitResetInventoryObservation.resolve(
+                presentation: presentations[account.id],
+                bank: account.rateLimitResetBank,
+                now: now
+            )
+        })
     }
 
     static func summarize(
@@ -303,6 +563,8 @@ struct PooledRateLimitResetPresentation: Equatable, Sendable {
                 }
             case .stale, .error:
                 staleAccountCount += 1
+            case .expired, .unknown:
+                staleAccountCount += 1
             case .redeeming, .reconciling, .externalHold, .refreshing:
                 pendingAccountCount += 1
             }
@@ -313,6 +575,56 @@ struct PooledRateLimitResetPresentation: Equatable, Sendable {
             nextCurrentExpiration: currentExpirations.min(),
             pendingAccountCount: pendingAccountCount,
             staleAccountCount: staleAccountCount
+        )
+    }
+
+    private static func summarize(
+        _ observations: [RateLimitResetInventoryObservation]
+    ) -> Self {
+        var currentAvailableCount = 0
+        var currentExpirations: [Date] = []
+        var currentFetchedDates: [Date] = []
+        var pendingAccountCount = 0
+        var staleAccountCount = 0
+        var expiredAccountCount = 0
+        var refreshFailedAccountCount = 0
+        var unknownAccountCount = 0
+
+        for observation in observations {
+            switch observation.freshness {
+            case .current:
+                guard let verifiedCount = observation.verifiedCount else {
+                    unknownAccountCount += 1
+                    continue
+                }
+                currentAvailableCount += verifiedCount.availableCount
+                currentFetchedDates.append(verifiedCount.fetchedAt)
+                if verifiedCount.availableCount > 0,
+                   let nextExpiration = observation.nextExpiration {
+                    currentExpirations.append(nextExpiration)
+                }
+            case .stale:
+                staleAccountCount += 1
+            case .expired:
+                expiredAccountCount += 1
+            case .refreshFailed:
+                refreshFailedAccountCount += 1
+            case .unknown:
+                unknownAccountCount += 1
+            case .pending:
+                pendingAccountCount += 1
+            }
+        }
+
+        return Self(
+            currentAvailableCount: currentAvailableCount,
+            nextCurrentExpiration: currentExpirations.min(),
+            pendingAccountCount: pendingAccountCount,
+            staleAccountCount: staleAccountCount,
+            expiredAccountCount: expiredAccountCount,
+            refreshFailedAccountCount: refreshFailedAccountCount,
+            unknownAccountCount: unknownAccountCount,
+            currentCountFetchedAt: currentFetchedDates.min()
         )
     }
 }

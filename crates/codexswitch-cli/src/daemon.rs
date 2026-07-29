@@ -1,6 +1,6 @@
 use crate::account_store::{
-    active_account, lock_account_store, mark_runtime_unusable, quota_availability_at,
-    real_quota_snapshot, select_auto_swap_candidate_from_observations,
+    active_account, lock_account_store, mark_runtime_unusable, normalize_provider_account_id,
+    quota_availability_at, real_quota_snapshot, select_auto_swap_candidate_from_observations,
     select_plan_upgrade_candidate, select_plan_upgrade_candidate_from_observations,
     usage_limit_runtime_block_until, AccountStoreGeneration, AccountStoreSnapshot, CodexAccount,
     CurrentQuotaObservations, QuotaAvailability,
@@ -26,9 +26,10 @@ use crate::codex_update;
 use crate::pool_authority::{PoolAuthorityLock, PoolAuthorityPhase, TargetRequestDisposition};
 use crate::quota::{apply_fetch_result, fetch_quota, FetchResult};
 use crate::rate_limit_resets::{
-    fetch_rate_limit_reset_bank, orchestrate_pool_reset_with_selection_and_provider_guard,
-    select_smart_reset_candidate, ConsumeResult, RateLimitResetBank, ResetOrchestrationContext,
-    ResetOrchestrationDependencies, ResetQuotaRefreshStrategy,
+    consume_rate_limit_reset, fetch_rate_limit_reset_bank,
+    orchestrate_pool_reset_with_selection_and_provider_guard, select_smart_reset_candidate,
+    ConsumeResult, RateLimitResetBank, RateLimitResetFetchError, RateLimitResetFetchFailureKind,
+    ResetOrchestrationContext, ResetOrchestrationDependencies, ResetQuotaRefreshStrategy,
 };
 use crate::reload::{
     maintain_managed_headless_app_server_ack, reload_codex_hot_swap_processes,
@@ -37,8 +38,13 @@ use crate::reload::{
 use crate::token_refresh::refresh_account_tokens;
 use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
+use ring::digest::{Context as DigestContext, SHA256};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -54,6 +60,57 @@ const DEGRADED_ACTIVATION_INACTIVE_QUOTA_POLL_LIMIT: usize = 4;
 const UNIX_TO_SWIFT_REFERENCE_SECONDS: f64 = 978_307_200.0;
 const MANAGED_READINESS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MANAGED_READINESS_MINIMUM_ACK_REMAINING: Duration = Duration::from_secs(60);
+const RESET_BANK_RATE_LIMIT_BACKOFF: ChronoDuration = ChronoDuration::minutes(15);
+const RESET_BANK_UNSUPPORTED_BACKOFF: ChronoDuration = ChronoDuration::hours(1);
+const RESET_BANK_MALFORMED_RESPONSE_BACKOFF: ChronoDuration = ChronoDuration::minutes(30);
+const RESET_BANK_TRANSIENT_MAX_BACKOFF: ChronoDuration = ChronoDuration::minutes(30);
+const RESET_CANDIDATE_OBSERVATION_INTERVAL: ChronoDuration = ChronoDuration::minutes(1);
+const DAEMON_POLICY_SCHEMA_VERSION: u32 = 1;
+const DAEMON_POLICY_MAX_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DaemonPolicyDocument {
+    schema_version: u32,
+    automatic_rate_limit_reset_redemption: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticResetPolicyState {
+    Configured,
+    Missing,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomaticResetPolicyObservation {
+    pub schema_version: u32,
+    pub automatic_rate_limit_reset_redemption: bool,
+    pub state: AutomaticResetPolicyState,
+    pub authority: &'static str,
+}
+
+impl AutomaticResetPolicyObservation {
+    fn configured(enabled: bool) -> Self {
+        Self {
+            schema_version: DAEMON_POLICY_SCHEMA_VERSION,
+            automatic_rate_limit_reset_redemption: enabled,
+            state: AutomaticResetPolicyState::Configured,
+            authority: "vps",
+        }
+    }
+
+    fn fail_closed(state: AutomaticResetPolicyState) -> Self {
+        Self {
+            schema_version: DAEMON_POLICY_SCHEMA_VERSION,
+            automatic_rate_limit_reset_redemption: false,
+            state,
+            authority: "vps",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DaemonTick {
@@ -181,6 +238,177 @@ struct DaemonTickContext<'a> {
     auth_path: &'a Path,
     base_interval: Duration,
     consume_banked_resets: bool,
+    reset_bank_refresh_backoff: Option<&'a RefCell<ResetBankRefreshBackoff>>,
+}
+
+#[derive(Debug)]
+struct ResetBankRefreshFailure {
+    credential_generation: [u8; 32],
+    consecutive_failures: u32,
+    retry_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+struct ResetBankRefreshDeferred;
+
+impl fmt::Display for ResetBankRefreshDeferred {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("reset-bank refresh is deferred by provider backoff")
+    }
+}
+
+impl std::error::Error for ResetBankRefreshDeferred {}
+
+#[derive(Debug, Default)]
+struct ResetBankRefreshBackoff {
+    failures: HashMap<Uuid, ResetBankRefreshFailure>,
+}
+
+impl ResetBankRefreshBackoff {
+    fn should_attempt(&mut self, account: &CodexAccount, now: chrono::DateTime<Utc>) -> bool {
+        let credential_generation = reset_bank_credential_generation(account);
+        if account.runtime_unusable_at(now) && account.runtime_block_is_token_expired() {
+            match self.failures.get(&account.id) {
+                Some(failure) if failure.credential_generation != credential_generation => {
+                    self.failures.remove(&account.id);
+                    return true;
+                }
+                Some(_) => return false,
+                None => {
+                    self.failures.insert(
+                        account.id,
+                        ResetBankRefreshFailure {
+                            credential_generation,
+                            consecutive_failures: 1,
+                            retry_at: None,
+                        },
+                    );
+                    return false;
+                }
+            }
+        }
+        let Some(failure) = self.failures.get(&account.id) else {
+            return true;
+        };
+        if failure.credential_generation != credential_generation {
+            self.failures.remove(&account.id);
+            return true;
+        }
+        failure.retry_at.is_some_and(|retry_at| now >= retry_at)
+    }
+
+    fn record_success(&mut self, account: &CodexAccount) {
+        self.failures.remove(&account.id);
+    }
+
+    fn record_failure(
+        &mut self,
+        account: &CodexAccount,
+        error: &anyhow::Error,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<chrono::DateTime<Utc>> {
+        let credential_generation = reset_bank_credential_generation(account);
+        let consecutive_failures = self
+            .failures
+            .get(&account.id)
+            .filter(|failure| failure.credential_generation == credential_generation)
+            .map(|failure| failure.consecutive_failures.saturating_add(1))
+            .unwrap_or(1);
+        let retry_at =
+            reset_bank_failure_backoff(error, consecutive_failures).map(|backoff| now + backoff);
+        self.failures.insert(
+            account.id,
+            ResetBankRefreshFailure {
+                credential_generation,
+                consecutive_failures,
+                retry_at,
+            },
+        );
+        retry_at
+    }
+}
+
+fn fetch_reset_bank_with_backoff<B>(
+    account: &CodexAccount,
+    backoff: &RefCell<ResetBankRefreshBackoff>,
+    fetch_reset_bank: &B,
+) -> Result<RateLimitResetBank>
+where
+    B: Fn(&CodexAccount) -> Result<RateLimitResetBank>,
+{
+    let now = Utc::now();
+    if !backoff.borrow_mut().should_attempt(account, now) {
+        return Err(ResetBankRefreshDeferred.into());
+    }
+
+    match fetch_reset_bank(account) {
+        Ok(bank) => {
+            backoff.borrow_mut().record_success(account);
+            Ok(bank)
+        }
+        Err(error) => {
+            let retry_at = backoff.borrow_mut().record_failure(account, &error, now);
+            let retry_detail = retry_at
+                .map(|retry_at| format!("until {retry_at}"))
+                .unwrap_or_else(|| "until the credential generation changes".to_string());
+            Err(error).with_context(|| format!("reset-bank refresh deferred {retry_detail}"))
+        }
+    }
+}
+
+fn reset_bank_credential_generation(account: &CodexAccount) -> [u8; 32] {
+    let mut digest = DigestContext::new(&SHA256);
+    let provider_id = normalize_provider_account_id(&account.account_id).unwrap_or_default();
+    digest.update(provider_id.as_bytes());
+    digest.update(&[0]);
+    digest.update(account.access_token.as_bytes());
+    digest.update(&[0]);
+    digest.update(account.refresh_token.as_bytes());
+    let value = digest.finish();
+    let mut generation = [0_u8; 32];
+    generation.copy_from_slice(value.as_ref());
+    generation
+}
+
+fn reset_bank_failure_backoff(
+    error: &anyhow::Error,
+    consecutive_failures: u32,
+) -> Option<ChronoDuration> {
+    if let Some(fetch_error) = error.downcast_ref::<RateLimitResetFetchError>() {
+        return match fetch_error.kind() {
+            RateLimitResetFetchFailureKind::Authentication => None,
+            RateLimitResetFetchFailureKind::RateLimited => Some(RESET_BANK_RATE_LIMIT_BACKOFF),
+            RateLimitResetFetchFailureKind::Unsupported => Some(RESET_BANK_UNSUPPORTED_BACKOFF),
+            RateLimitResetFetchFailureKind::MalformedResponse => {
+                Some(RESET_BANK_MALFORMED_RESPONSE_BACKOFF)
+            }
+            RateLimitResetFetchFailureKind::Provider => {
+                Some(transient_reset_bank_backoff(consecutive_failures))
+            }
+        };
+    }
+
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if message.contains("token expired") || message.contains("http 401") {
+        return None;
+    }
+    if message.contains("rate limited") || message.contains("http 429") {
+        return Some(RESET_BANK_RATE_LIMIT_BACKOFF);
+    }
+    if message.contains("http 403") || message.contains("http 404") {
+        return Some(RESET_BANK_UNSUPPORTED_BACKOFF);
+    }
+
+    Some(transient_reset_bank_backoff(consecutive_failures))
+}
+
+fn transient_reset_bank_backoff(consecutive_failures: u32) -> ChronoDuration {
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    let multiplier = 1_i64 << exponent;
+    std::cmp::min(
+        ChronoDuration::minutes(multiplier),
+        RESET_BANK_TRANSIENT_MAX_BACKOFF,
+    )
 }
 
 struct DaemonTickDependencies<F, T, B, C, R> {
@@ -331,6 +559,7 @@ where
             auth_path,
             base_interval,
             consume_banked_resets: false,
+            reset_bank_refresh_backoff: None,
         },
         DaemonTickDependencies::new(
             fetch_quota_fn,
@@ -367,11 +596,15 @@ where
         auth_path,
         base_interval,
         consume_banked_resets,
+        reset_bank_refresh_backoff,
     } = context;
+    let local_reset_bank_refresh_backoff = RefCell::new(ResetBankRefreshBackoff::default());
+    let reset_bank_refresh_backoff =
+        reset_bank_refresh_backoff.unwrap_or(&local_reset_bank_refresh_backoff);
     let DaemonTickDependencies {
         fetch_quota: fetch_quota_fn,
         refresh_tokens: refresh_token_fn,
-        fetch_reset_bank: fetch_reset_bank_fn,
+        fetch_reset_bank: provider_fetch_reset_bank_fn,
         consume_reset: consume_reset_fn,
         reload: reload_fn,
     } = dependencies;
@@ -452,7 +685,11 @@ where
     let fetch_reset_bank_fn = |account: &CodexAccount| {
         validate_provider_io_activation(store_path, auth_path, &activation_guard)
             .context("daemon activation changed before reset-bank provider I/O")?;
-        fetch_reset_bank_fn(account)
+        fetch_reset_bank_with_backoff(
+            account,
+            reset_bank_refresh_backoff,
+            &provider_fetch_reset_bank_fn,
+        )
     };
     let consume_reset_fn = |account: &CodexAccount, bank: &RateLimitResetBank, request_id: Uuid| {
         validate_provider_io_activation(store_path, auth_path, &activation_guard)
@@ -510,17 +747,49 @@ where
         );
     }
 
+    let previous_reset_banks = accounts
+        .iter()
+        .map(|account| account.rate_limit_reset_bank.clone())
+        .collect::<Vec<_>>();
+    let reset_bank_observations = if consume_banked_resets {
+        refresh_stale_reset_bank_observations(
+            &mut accounts,
+            Utc::now(),
+            reset_bank_refresh_backoff,
+            &fetch_reset_bank_fn,
+        )
+    } else {
+        HashSet::new()
+    };
+
     let now = Utc::now();
     let active_availability = quota_availability_at(&accounts[active_index], now);
     let active_is_blocked = active_availability == QuotaAvailability::Blocked;
     let cached_plan_upgrade_exists = !force_swap
         && active_availability == QuotaAvailability::Usable
         && select_plan_upgrade_candidate(&accounts, now).is_some();
+    let reset_candidate_observation_due = consume_banked_resets
+        && accounts.iter().enumerate().any(|(index, account)| {
+            index != active_index
+                && account
+                    .rate_limit_reset_bank
+                    .as_ref()
+                    .is_some_and(|bank| bank.is_fresh_at(now) && bank.has_available_reset(now))
+                && (quota_availability_at(account, now) != QuotaAvailability::Usable
+                    || account.runtime_block_is_usage_limit())
+                && (reset_bank_observations.contains(&account.id)
+                    || real_quota_snapshot(account).is_none_or(|snapshot| {
+                        !snapshot.is_fresh_at(now)
+                            || now.signed_duration_since(snapshot.fetched_at)
+                                >= RESET_CANDIDATE_OBSERVATION_INTERVAL
+                    }))
+        });
     // A required rotation still needs current observations from every candidate;
     // stale quota and plan ranks cannot safely authorize a short-circuit.
     let candidate_observations = (force_swap
         || active_availability != QuotaAvailability::Usable
-        || cached_plan_upgrade_exists)
+        || cached_plan_upgrade_exists
+        || reset_candidate_observation_due)
         .then(|| refresh_rotation_candidates(&mut accounts, &fetch_quota_fn, &refresh_token_fn));
 
     let plan_upgrade_target = if !force_swap && active_availability == QuotaAvailability::Usable {
@@ -542,25 +811,21 @@ where
         None
     };
 
-    let mut reset_selection_accounts = accounts.clone();
-    if consume_banked_resets {
-        refresh_stale_reset_bank_observations(
-            &mut reset_selection_accounts,
-            Utc::now(),
-            &fetch_reset_bank_fn,
-        );
-    }
+    let reset_selection_accounts = accounts.clone();
 
     let previous_reset_bank = accounts[active_index].rate_limit_reset_bank.as_ref();
-    let cached_reset_candidate_exists = consume_banked_resets
-        && select_smart_reset_candidate(
-            &reset_selection_accounts,
-            active_index,
-            direct_runtime_usage_limit,
-            Utc::now(),
-            candidate_observations.as_ref(),
-        )
-        .is_some();
+    let cached_reset_candidate = consume_banked_resets
+        .then(|| {
+            select_smart_reset_candidate(
+                &reset_selection_accounts,
+                active_index,
+                direct_runtime_usage_limit,
+                Utc::now(),
+                candidate_observations.as_ref(),
+            )
+        })
+        .flatten();
+    let cached_reset_candidate_exists = cached_reset_candidate.is_some();
     let should_refresh_reset_bank = previous_reset_bank
         .as_ref()
         .map(|bank| bank.is_stale(Utc::now()))
@@ -569,9 +834,14 @@ where
         || direct_runtime_usage_limit
         || cached_reset_candidate_exists;
     if should_refresh_reset_bank {
-        // The production daemon never consumes a reset. Fetch its active
-        // inventory before entering the journal transaction so network I/O
-        // cannot monopolize the account-store lock.
+        let reset_account_index = cached_reset_candidate
+            .as_ref()
+            .map(|candidate| candidate.account_index)
+            .unwrap_or(active_index);
+        accounts[reset_account_index].rate_limit_reset_bank =
+            previous_reset_banks[reset_account_index].clone();
+        // Prefetch observation-only inventory before entering the journal
+        // transaction so provider I/O cannot monopolize the account-store lock.
         let mut prefetched_active_bank =
             (!consume_banked_resets).then(|| fetch_reset_bank_fn(&accounts[active_index]));
         let reset_result = {
@@ -1029,15 +1299,39 @@ where
             account.email
         );
     }
+
+    let proactively_refreshed = if account.has_usable_inference_token_at(now) {
+        false
+    } else {
+        eprintln!(
+            "inference credential for {} is not usable beyond the safety window; refreshing before quota I/O",
+            account.email
+        );
+        refresh_token_fn(account).with_context(|| {
+            format!(
+                "failed to proactively refresh inference credential for {}",
+                account.email
+            )
+        })?;
+        if !account.has_usable_inference_token_at(Utc::now()) {
+            bail!(
+                "credential refresh did not produce a usable inference credential for {}",
+                account.email
+            );
+        }
+        true
+    };
+
     match fetch_quota_fn(account) {
         Ok(result) if account.has_usable_inference_token_at(Utc::now()) => Ok(result),
         Ok(_) => bail!(
-            "inference token expired or is inside the safety window for {}",
+            "inference credential entered the safety window during quota I/O for {}",
             account.email
         ),
         Err(error)
-            if poll_error_runtime_block(&error).map(|(reason, _)| reason)
-                == Some("token_expired") =>
+            if !proactively_refreshed
+                && poll_error_runtime_block(&error).map(|(reason, _)| reason)
+                    == Some("token_expired") =>
         {
             eprintln!(
                 "quota poll for {} hit expired access token; refreshing token and retrying once",
@@ -1055,11 +1349,18 @@ where
             }
             if !account.has_usable_inference_token_at(Utc::now()) {
                 bail!(
-                    "refreshed inference token expired or is inside the safety window for {}",
+                    "credential refresh did not produce a usable inference credential for {}",
                     account.email
                 );
             }
-            fetch_quota_fn(account)
+            match fetch_quota_fn(account) {
+                Ok(result) if account.has_usable_inference_token_at(Utc::now()) => Ok(result),
+                Ok(_) => bail!(
+                    "inference credential entered the safety window during quota I/O for {}",
+                    account.email
+                ),
+                Err(error) => Err(error),
+            }
         }
         Err(error) => Err(error),
     }
@@ -1210,36 +1511,46 @@ fn inactive_watch_account_index(
 fn refresh_stale_reset_bank_observations<B>(
     accounts: &mut [CodexAccount],
     now: chrono::DateTime<Utc>,
+    reset_bank_refresh_backoff: &RefCell<ResetBankRefreshBackoff>,
     fetch_reset_bank: &B,
-) where
+) -> HashSet<Uuid>
+where
     B: Fn(&CodexAccount) -> Result<RateLimitResetBank>,
 {
+    let mut refreshed = HashSet::new();
     for account in accounts {
         let snapshot_is_blocked = real_quota_snapshot(account)
             .is_some_and(|snapshot| snapshot.availability_at(now) == QuotaAvailability::Blocked);
-        let runtime_allows_reset_provider_io =
-            !account.runtime_unusable_at(now) || account.runtime_block_is_usage_limit();
         let resettable = account.plan_priority() >= 2
             && account.has_usable_inference_token_at(now)
-            && runtime_allows_reset_provider_io
             && (snapshot_is_blocked || account.runtime_block_is_usage_limit());
         let bank_is_stale = account
             .rate_limit_reset_bank
             .as_ref()
             .map(|bank| bank.is_stale(now))
             .unwrap_or(true);
-        if !resettable || !bank_is_stale {
+        if !resettable
+            || !bank_is_stale
+            || !reset_bank_refresh_backoff
+                .borrow_mut()
+                .should_attempt(account, now)
+        {
             continue;
         }
 
         match fetch_reset_bank(account) {
-            Ok(bank) => account.rate_limit_reset_bank = Some(bank),
+            Ok(bank) => {
+                account.rate_limit_reset_bank = Some(bank);
+                refreshed.insert(account.id);
+            }
+            Err(error) if error.downcast_ref::<ResetBankRefreshDeferred>().is_some() => {}
             Err(error) => eprintln!(
                 "warning: failed to refresh reset bank for blocked account {}: {error:#}",
                 account.email
             ),
         }
     }
+    refreshed
 }
 
 fn should_probe_inactive_account(account: &CodexAccount, now: chrono::DateTime<Utc>) -> bool {
@@ -1351,10 +1662,92 @@ fn runtime_block_until(
     }
 }
 
+fn daemon_owner_lease_path(store_path: &Path) -> std::path::PathBuf {
+    store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("daemon-owner.lock")
+}
+
+fn acquire_daemon_owner_lease(store_path: &Path) -> Result<crate::secure_file::SecureFileLock> {
+    crate::secure_file::try_lock(&daemon_owner_lease_path(store_path), true)?
+        .context("another CodexSwitch daemon already owns this account store")
+}
+
+pub fn automatic_reset_policy_path(store_path: &Path) -> PathBuf {
+    store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("daemon-policy.json")
+}
+
+pub fn observe_automatic_reset_policy(
+    store_path: &Path,
+) -> Result<AutomaticResetPolicyObservation> {
+    let snapshot = crate::secure_file::observe(
+        &automatic_reset_policy_path(store_path),
+        DAEMON_POLICY_MAX_BYTES,
+        true,
+    )?;
+    let Some(bytes) = snapshot.bytes() else {
+        return Ok(AutomaticResetPolicyObservation::fail_closed(
+            AutomaticResetPolicyState::Missing,
+        ));
+    };
+    let Ok(document) = serde_json::from_slice::<DaemonPolicyDocument>(bytes) else {
+        return Ok(AutomaticResetPolicyObservation::fail_closed(
+            AutomaticResetPolicyState::Invalid,
+        ));
+    };
+    if document.schema_version != DAEMON_POLICY_SCHEMA_VERSION {
+        return Ok(AutomaticResetPolicyObservation::fail_closed(
+            AutomaticResetPolicyState::Invalid,
+        ));
+    }
+    Ok(AutomaticResetPolicyObservation::configured(
+        document.automatic_rate_limit_reset_redemption,
+    ))
+}
+
+pub fn set_automatic_reset_policy(
+    store_path: &Path,
+    enabled: bool,
+) -> Result<AutomaticResetPolicyObservation> {
+    let path = automatic_reset_policy_path(store_path);
+    let lock = crate::secure_file::lock(&path, true)?;
+    let current = lock.load(DAEMON_POLICY_MAX_BYTES, true)?;
+    let document = DaemonPolicyDocument {
+        schema_version: DAEMON_POLICY_SCHEMA_VERSION,
+        automatic_rate_limit_reset_redemption: enabled,
+    };
+    let data = serde_json::to_vec_pretty(&document)
+        .context("failed to encode automatic banked-reset policy")?;
+    let committed = lock.commit(current.generation(), &data, DAEMON_POLICY_MAX_BYTES)?;
+    let readback: DaemonPolicyDocument = serde_json::from_slice(
+        committed
+            .bytes()
+            .context("automatic banked-reset policy disappeared after commit")?,
+    )
+    .context("automatic banked-reset policy readback was invalid")?;
+    if readback != document {
+        bail!("automatic banked-reset policy readback did not match committed value");
+    }
+    Ok(AutomaticResetPolicyObservation::configured(enabled))
+}
+
+fn automatic_reset_policy_for_tick(store_path: &Path) -> bool {
+    observe_automatic_reset_policy(store_path)
+        .map(|observation| observation.automatic_rate_limit_reset_redemption)
+        .unwrap_or(false)
+}
+
 pub fn run_loop(store_path: &Path, auth_path: &Path, interval: Duration) -> Result<()> {
+    let _daemon_owner_lease = acquire_daemon_owner_lease(store_path)?;
     let mut was_fast_polling = false;
     let mut managed_readiness_cadence = ManagedReadinessCadence::default();
+    let reset_bank_refresh_backoff = RefCell::new(ResetBankRefreshBackoff::default());
     loop {
+        let consume_banked_resets = automatic_reset_policy_for_tick(store_path);
         if let Err(error) = codex_update::maybe_spawn_daily_auto_install() {
             eprintln!("codex update check failed: {error:#}");
         }
@@ -1363,15 +1756,14 @@ pub fn run_loop(store_path: &Path, auth_path: &Path, interval: Duration) -> Resu
                 store_path,
                 auth_path,
                 base_interval: interval,
-                consume_banked_resets: false,
+                consume_banked_resets,
+                reset_bank_refresh_backoff: Some(&reset_bank_refresh_backoff),
             },
             DaemonTickDependencies::new(
                 fetch_quota,
                 refresh_account_tokens,
                 fetch_rate_limit_reset_bank,
-                |_account, _bank, _request_id| {
-                    bail!("automatic banked reset redemption is disabled in the daemon")
-                },
+                consume_rate_limit_reset,
                 reload_codex_hot_swap_processes,
             ),
         );
@@ -1906,6 +2298,25 @@ mod tests {
         }
     }
 
+    fn consumed_reset_bank(
+        mut bank: RateLimitResetBank,
+        credit_id: &str,
+        fetched_at: chrono::DateTime<Utc>,
+    ) -> RateLimitResetBank {
+        bank.available_count = bank.available_count.saturating_sub(1);
+        bank.fetched_at = fetched_at;
+        if let Some(credit) = bank
+            .credits
+            .iter_mut()
+            .find(|credit| credit.id == credit_id)
+        {
+            credit.status = "redeemed".to_string();
+            credit.redeem_started_at = Some(fetched_at);
+            credit.redeemed_at = Some(fetched_at);
+        }
+        bank
+    }
+
     fn set_weekly_reset_after(
         account: &mut CodexAccount,
         now: chrono::DateTime<Utc>,
@@ -1937,6 +2348,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: true,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 {
@@ -2218,6 +2630,70 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_inference_credentials_refresh_once_before_quota_io() -> Result<()> {
+        let now = Utc::now();
+        let unsafe_tokens = [
+            String::new(),
+            "malformed-token".to_string(),
+            crate::account_store::test_inference_token(now - ChronoDuration::minutes(1)),
+            crate::account_store::test_inference_token(now + ChronoDuration::minutes(4)),
+        ];
+
+        for unsafe_token in unsafe_tokens {
+            let mut candidate = account("candidate@example.com", true, 10.0, 10.0);
+            candidate.access_token = unsafe_token;
+            let calls = Arc::new(Mutex::new((0usize, 0usize)));
+            let fetch_calls = Arc::clone(&calls);
+            let refresh_calls = Arc::clone(&calls);
+
+            fetch_quota_with_refresh(
+                &mut candidate,
+                &move |account| {
+                    fetch_calls.lock().unwrap().0 += 1;
+                    assert!(account.has_usable_inference_token_at(Utc::now()));
+                    ready_fetch(account)
+                },
+                &move |account| {
+                    refresh_calls.lock().unwrap().1 += 1;
+                    account.access_token = crate::account_store::test_inference_token(
+                        Utc::now() + ChronoDuration::hours(1),
+                    );
+                    Ok(())
+                },
+            )?;
+
+            assert_eq!(*calls.lock().unwrap(), (1, 1));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unusable_refresh_result_never_polls_or_creates_token_expired_quarantine() {
+        let mut candidate = account("candidate@example.com", true, 10.0, 10.0);
+        candidate.access_token = "malformed-token".to_string();
+        let calls = Arc::new(Mutex::new((0usize, 0usize)));
+        let fetch_calls = Arc::clone(&calls);
+        let refresh_calls = Arc::clone(&calls);
+
+        let error = fetch_quota_with_refresh(
+            &mut candidate,
+            &move |_| {
+                fetch_calls.lock().unwrap().0 += 1;
+                bail!("quota provider must not be called")
+            },
+            &move |_| {
+                refresh_calls.lock().unwrap().1 += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(*calls.lock().unwrap(), (0, 1));
+        assert!(format!("{error:#}").contains("did not produce a usable inference credential"));
+        assert!(poll_error_runtime_block(&error).is_none());
+    }
+
+    #[test]
     fn active_token_expired_rotates_when_refresh_fails() -> Result<()> {
         let temp = TempDir::new()?;
         let store_path = temp.path().join("accounts.json");
@@ -2433,6 +2909,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: false,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 move |account| {
@@ -2613,6 +3090,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(5),
                 consume_banked_resets: false,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 move |account| {
@@ -3349,9 +3827,10 @@ mod tests {
     }
 
     #[test]
-    fn token_expired_block_suppresses_reset_bank_provider_io() {
-        let now = Utc::now();
+    fn token_expired_inactive_reset_poll_waits_for_credential_generation_change() {
         let mut blocked = account("blocked@example.com", false, 100.0, 100.0);
+        let now = Utc::now();
+        blocked.quota_snapshot.as_mut().unwrap().fetched_at = now;
         blocked.plan_type = Some("pro".to_string());
         mark_runtime_unusable(
             &mut blocked,
@@ -3360,10 +3839,12 @@ mod tests {
         );
         let calls = Arc::new(Mutex::new(0usize));
         let calls_for_closure = Arc::clone(&calls);
+        let backoff = RefCell::new(ResetBankRefreshBackoff::default());
 
         refresh_stale_reset_bank_observations(
             std::slice::from_mut(&mut blocked),
             now,
+            &backoff,
             &move |_| {
                 *calls_for_closure.lock().unwrap() += 1;
                 Ok(reset_bank(1, now))
@@ -3372,6 +3853,189 @@ mod tests {
 
         assert_eq!(*calls.lock().unwrap(), 0);
         assert!(blocked.rate_limit_reset_bank.is_none());
+
+        blocked.access_token =
+            crate::account_store::test_inference_token(now + ChronoDuration::hours(2));
+        let calls_for_reopened_closure = Arc::clone(&calls);
+        refresh_stale_reset_bank_observations(
+            std::slice::from_mut(&mut blocked),
+            now,
+            &backoff,
+            &move |_| {
+                *calls_for_reopened_closure.lock().unwrap() += 1;
+                Ok(reset_bank(1, now))
+            },
+        );
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(blocked.rate_limit_reset_bank.is_some());
+    }
+
+    #[test]
+    fn reset_bank_failures_back_off_and_credential_rotation_reopens_refresh() {
+        let now = Utc::now();
+        let mut account = account("reset@example.com", false, 100.0, 100.0);
+        let mut backoff = ResetBankRefreshBackoff::default();
+        let auth_error = anyhow::anyhow!("reset-bank API returned HTTP 401");
+
+        assert!(backoff.should_attempt(&account, now));
+        assert_eq!(backoff.record_failure(&account, &auth_error, now), None);
+        assert!(!backoff.should_attempt(&account, now + ChronoDuration::days(365)));
+
+        backoff.record_failure(&account, &auth_error, now);
+        account.access_token =
+            crate::account_store::test_inference_token(now + ChronoDuration::hours(2));
+        assert!(backoff.should_attempt(&account, now));
+    }
+
+    #[test]
+    fn active_reset_auth_backoff_does_not_starve_an_inactive_account() -> Result<()> {
+        let now = Utc::now();
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let inactive = account("inactive@example.com", false, 100.0, 100.0);
+        let backoff = RefCell::new(ResetBankRefreshBackoff::default());
+        backoff.borrow_mut().record_failure(
+            &active,
+            &anyhow::anyhow!("reset-bank API returned HTTP 401"),
+            now,
+        );
+        assert!(!backoff.borrow_mut().should_attempt(&active, now));
+
+        let bank =
+            fetch_reset_bank_with_backoff(&inactive, &backoff, &|_| Ok(reset_bank(1, Utc::now())))?;
+
+        assert_eq!(bank.available_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_reset_auth_backoff_blocks_every_later_provider_call() {
+        let inactive = account("inactive@example.com", false, 100.0, 100.0);
+        let backoff = RefCell::new(ResetBankRefreshBackoff::default());
+        let calls = Arc::new(Mutex::new(0usize));
+        let first_calls = Arc::clone(&calls);
+        let first_error = fetch_reset_bank_with_backoff(&inactive, &backoff, &move |_| {
+            *first_calls.lock().unwrap() += 1;
+            bail!("reset-bank API returned HTTP 401")
+        })
+        .unwrap_err();
+        assert!(format!("{first_error:#}").contains("credential generation changes"));
+
+        let later_calls = Arc::clone(&calls);
+        let deferred = fetch_reset_bank_with_backoff(&inactive, &backoff, &move |_| {
+            *later_calls.lock().unwrap() += 1;
+            Ok(reset_bank(1, Utc::now()))
+        })
+        .unwrap_err();
+
+        assert!(deferred
+            .downcast_ref::<ResetBankRefreshDeferred>()
+            .is_some());
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn daemon_lifetime_lease_rejects_a_second_coordinator_and_recovers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+
+        let owner = acquire_daemon_owner_lease(&store_path)?;
+        assert!(acquire_daemon_owner_lease(&store_path).is_err());
+        drop(owner);
+        assert!(acquire_daemon_owner_lease(&store_path).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn transient_reset_bank_failures_use_bounded_exponential_backoff() {
+        let now = Utc::now();
+        let account = account("reset@example.com", false, 100.0, 100.0);
+        let mut backoff = ResetBankRefreshBackoff::default();
+        let transient = anyhow::anyhow!("transport error 6");
+
+        for (attempt, expected_minutes) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            assert_eq!(
+                backoff.record_failure(&account, &transient, now),
+                Some(now + ChronoDuration::minutes(expected_minutes)),
+                "unexpected backoff for attempt {}",
+                attempt + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn token_expired_runtime_block_waits_for_credential_generation_change() {
+        let now = Utc::now();
+        let mut account = account("reset@example.com", true, 100.0, 100.0);
+        mark_runtime_unusable(
+            &mut account,
+            "token_expired",
+            now + ChronoDuration::days(30),
+        );
+        let mut backoff = ResetBankRefreshBackoff::default();
+
+        assert!(!backoff.should_attempt(&account, now));
+        assert!(!backoff.should_attempt(&account, now + ChronoDuration::days(29)));
+        account.account_id = "  RESET@EXAMPLE.COM  ".to_string();
+        assert!(!backoff.should_attempt(&account, now));
+
+        account.access_token =
+            crate::account_store::test_inference_token(now + ChronoDuration::hours(2));
+        assert!(backoff.should_attempt(&account, now));
+    }
+
+    #[test]
+    fn automatic_reset_policy_missing_and_invalid_state_fail_closed() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let missing = observe_automatic_reset_policy(&store_path)?;
+        assert_eq!(missing.state, AutomaticResetPolicyState::Missing);
+        assert!(!missing.automatic_rate_limit_reset_redemption);
+        assert!(!automatic_reset_policy_for_tick(&store_path));
+
+        let policy_path = automatic_reset_policy_path(&store_path);
+        std::fs::write(&policy_path, b"not-json")?;
+        std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o600))?;
+        let invalid = observe_automatic_reset_policy(&store_path)?;
+        assert_eq!(invalid.state, AutomaticResetPolicyState::Invalid);
+        assert!(!invalid.automatic_rate_limit_reset_redemption);
+        assert!(!automatic_reset_policy_for_tick(&store_path));
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_reset_policy_writes_atomically_with_secure_readback() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let enabled = set_automatic_reset_policy(&store_path, true)?;
+        assert_eq!(enabled.state, AutomaticResetPolicyState::Configured);
+        assert!(enabled.automatic_rate_limit_reset_redemption);
+        assert_eq!(observe_automatic_reset_policy(&store_path)?, enabled);
+
+        let policy_path = automatic_reset_policy_path(&store_path);
+        let mode = std::fs::metadata(&policy_path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!std::fs::read_dir(temp.path())?.any(|entry| {
+            entry
+                .ok()
+                .is_some_and(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+        }));
+
+        let disabled = set_automatic_reset_policy(&store_path, false)?;
+        assert!(!disabled.automatic_rate_limit_reset_redemption);
+        assert_eq!(observe_automatic_reset_policy(&store_path)?, disabled);
+        Ok(())
+    }
+
+    #[test]
+    fn next_tick_observes_automatic_reset_policy_change_without_restart() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+
+        set_automatic_reset_policy(&store_path, false)?;
+        assert!(!automatic_reset_policy_for_tick(&store_path));
+        set_automatic_reset_policy(&store_path, true)?;
+        assert!(automatic_reset_policy_for_tick(&store_path));
+        Ok(())
     }
 
     #[test]
@@ -3507,6 +4171,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: false,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 ready_fetch,
@@ -3558,6 +4223,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: false,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 ready_fetch,
@@ -3623,6 +4289,9 @@ mod tests {
         let bank_fetches_for_closure = Arc::clone(&bank_fetches);
         let consume_calls = Arc::new(Mutex::new(0usize));
         let consume_calls_for_closure = Arc::clone(&consume_calls);
+        let initial_bank = reset_bank(1, Utc::now());
+        let initial_bank_for_fetch = initial_bank.clone();
+        let consumed_bank_for_fetch = consumed_reset_bank(initial_bank, "credit-0", Utc::now());
         let quota_store_path = store_path.clone();
         let bank_store_path = store_path.clone();
         let consume_store_path = store_path.clone();
@@ -3633,6 +4302,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: true,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 move |account| {
@@ -3642,7 +4312,7 @@ mod tests {
                     if account.email == "active@example.com" {
                         let mut calls = active_fetches_for_closure.lock().unwrap();
                         *calls += 1;
-                        if *calls > 1 {
+                        if *calls > 2 {
                             let five_hour = result.snapshot.five_hour_mut().unwrap();
                             five_hour.used_percent = 0.0;
                             five_hour.hard_limit_reached = false;
@@ -3661,7 +4331,13 @@ mod tests {
                     assert_runtime_activation_lease_busy(&bank_store_path)?;
                     let mut calls = bank_fetches_for_closure.lock().unwrap();
                     *calls += 1;
-                    Ok(reset_bank(u32::from(*calls == 1), Utc::now()))
+                    let mut bank = if *calls <= 2 {
+                        initial_bank_for_fetch.clone()
+                    } else {
+                        consumed_bank_for_fetch.clone()
+                    };
+                    bank.fetched_at = Utc::now();
+                    Ok(bank)
                 },
                 move |_account, _bank, _request_id| {
                     assert_store_lock_available(&consume_store_path)?;
@@ -3681,8 +4357,8 @@ mod tests {
 
         assert!(!tick.swapped);
         assert_eq!(*consume_calls.lock().unwrap(), 1);
-        assert_eq!(*bank_fetches.lock().unwrap(), 2);
-        assert_eq!(*active_fetches.lock().unwrap(), 2);
+        assert_eq!(*bank_fetches.lock().unwrap(), 3);
+        assert_eq!(*active_fetches.lock().unwrap(), 3);
         let stored = load_accounts(&store_path)?;
         let active = active_account(&stored).unwrap();
         assert_eq!(active.email, "active@example.com");
@@ -3729,6 +4405,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: true,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 ready_fetch,
@@ -3783,12 +4460,16 @@ mod tests {
         let bank_fetches_for_closure = Arc::clone(&bank_fetches);
         let consumed_accounts = Arc::new(Mutex::new(Vec::new()));
         let consumed_accounts_for_closure = Arc::clone(&consumed_accounts);
+        let initial_bank = reset_bank(1, Utc::now());
+        let initial_bank_for_fetch = initial_bank.clone();
+        let consumed_bank_for_fetch = consumed_reset_bank(initial_bank, "credit-0", Utc::now());
         let tick = run_once_report_with_resets(
             DaemonTickContext {
                 store_path: &store_path,
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: true,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 move |account| {
@@ -3796,14 +4477,16 @@ mod tests {
                     if account.email == "pro@example.com" {
                         let mut calls = pro_quota_fetches_for_closure.lock().unwrap();
                         *calls += 1;
-                        let five_hour = result.snapshot.five_hour_mut().unwrap();
-                        five_hour.used_percent = 0.0;
-                        five_hour.hard_limit_reached = false;
-                        let weekly = result.snapshot.weekly_mut().unwrap();
-                        weekly.used_percent = 0.0;
-                        weekly.hard_limit_reached = false;
-                        result.snapshot.allowed = Some(true);
-                        result.snapshot.limit_reached = Some(false);
+                        if *calls > 2 {
+                            let five_hour = result.snapshot.five_hour_mut().unwrap();
+                            five_hour.used_percent = 0.0;
+                            five_hour.hard_limit_reached = false;
+                            let weekly = result.snapshot.weekly_mut().unwrap();
+                            weekly.used_percent = 0.0;
+                            weekly.hard_limit_reached = false;
+                            result.snapshot.allowed = Some(true);
+                            result.snapshot.limit_reached = Some(false);
+                        }
                         result.snapshot.fetched_at = Utc::now();
                     }
                     Ok(result)
@@ -3813,7 +4496,13 @@ mod tests {
                     assert_eq!(account.email, "pro@example.com");
                     let mut calls = bank_fetches_for_closure.lock().unwrap();
                     *calls += 1;
-                    Ok(reset_bank(u32::from(*calls == 1), Utc::now()))
+                    let mut bank = if *calls <= 2 {
+                        initial_bank_for_fetch.clone()
+                    } else {
+                        consumed_bank_for_fetch.clone()
+                    };
+                    bank.fetched_at = Utc::now();
+                    Ok(bank)
                 },
                 move |account, _bank, _request_id| {
                     consumed_accounts_for_closure
@@ -3830,8 +4519,8 @@ mod tests {
         )?;
 
         assert!(tick.swapped);
-        assert_eq!(*pro_quota_fetches.lock().unwrap(), 1);
-        assert_eq!(*bank_fetches.lock().unwrap(), 2);
+        assert_eq!(*pro_quota_fetches.lock().unwrap(), 3);
+        assert_eq!(*bank_fetches.lock().unwrap(), 3);
         assert_eq!(
             consumed_accounts.lock().unwrap().as_slice(),
             &["pro@example.com".to_string()]
@@ -3882,6 +4571,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: true,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 ready_fetch,
@@ -3944,6 +4634,7 @@ mod tests {
                 auth_path: &auth_path,
                 base_interval: Duration::from_secs(300),
                 consume_banked_resets: true,
+                reset_bank_refresh_backoff: None,
             },
             DaemonTickDependencies::new(
                 ready_fetch,

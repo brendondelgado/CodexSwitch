@@ -175,7 +175,234 @@ struct QuotaModelTests {
         #expect(snapshot.blockingWindows.isEmpty)
         #expect(!snapshot.needsSwap)
         #expect(snapshot.isImmediatelyUsable)
+        #expect(snapshot.isImmediatelyUsable(at: fetchedAt))
         #expect(snapshot.nextRecoveryAt == nil)
+    }
+
+    @Test("Allowed true cannot override a weekly window at zero capacity")
+    func allowedTrueCannotOverrideDefinitiveExhaustion() {
+        let fetchedAt = Date(timeIntervalSince1970: 1_777_000_000)
+        let weekly = QuotaWindow(
+            kind: .weekly,
+            durationSeconds: 604_800,
+            usedPercent: 100,
+            resetsAt: fetchedAt.addingTimeInterval(400_000),
+            source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+        )
+        let snapshot = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: fetchedAt,
+            windows: [weekly]
+        )
+
+        #expect(!snapshot.isDenied)
+        #expect(weekly.isDefinitivelyExhausted)
+        #expect(snapshot.hasDefinitiveExhaustion)
+        #expect(snapshot.minimumRemainingPercent == 0)
+        #expect(snapshot.needsSwap)
+        #expect(!snapshot.isImmediatelyUsable)
+        #expect(!snapshot.isImmediatelyUsable(at: fetchedAt))
+    }
+
+    @Test("Optimistic global fields cannot override a recognized hard limit")
+    func optimisticGlobalFieldsCannotOverrideHardLimit() {
+        let fetchedAt = Date(timeIntervalSince1970: 1_777_000_000)
+        let weekly = QuotaWindow(
+            kind: .weekly,
+            durationSeconds: 604_800,
+            usedPercent: 0,
+            resetsAt: fetchedAt.addingTimeInterval(400_000),
+            source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary),
+            hardLimitReached: true
+        )
+        let snapshot = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: fetchedAt,
+            windows: [weekly]
+        )
+
+        #expect(!snapshot.isDenied)
+        #expect(weekly.isDefinitivelyExhausted)
+        #expect(snapshot.hasDefinitiveExhaustion)
+        #expect(snapshot.blockingWindows == [weekly])
+        #expect(snapshot.needsSwap)
+        #expect(!snapshot.isImmediatelyUsable(at: fetchedAt))
+    }
+
+    @Test("Either global denial signal overrides contradictory allowance")
+    func globalDenialSignalsFailClosedIndependently() {
+        let now = Date(timeIntervalSince1970: 1_777_000_000)
+        let weekly = QuotaWindow(
+            kind: .weekly,
+            durationSeconds: 604_800,
+            usedPercent: 10,
+            resetsAt: now.addingTimeInterval(400_000),
+            source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+        )
+        let limitReachedContradiction = QuotaSnapshot(
+            allowed: true,
+            limitReached: true,
+            fetchedAt: now,
+            windows: [weekly]
+        )
+        let allowanceContradiction = QuotaSnapshot(
+            allowed: false,
+            limitReached: false,
+            fetchedAt: now,
+            windows: [weekly]
+        )
+
+        for snapshot in [limitReachedContradiction, allowanceContradiction] {
+            #expect(snapshot.isDenied)
+            #expect(snapshot.hasDefinitiveExhaustion)
+            #expect(snapshot.needsSwap)
+            #expect(!snapshot.isImmediatelyUsable(at: now))
+        }
+    }
+
+    @Test("Stale positive snapshots are ineligible at the snapshot boundary")
+    func stalePositiveSnapshotIsIneligible() {
+        let now = Date(timeIntervalSince1970: 1_777_000_000)
+        let fetchedAt = now.addingTimeInterval(-QuotaFreshnessPolicy.maximumSnapshotAge - 1)
+        let weekly = QuotaWindow(
+            kind: .weekly,
+            durationSeconds: 604_800,
+            usedPercent: 10,
+            resetsAt: now.addingTimeInterval(400_000),
+            source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+        )
+        let snapshot = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: fetchedAt,
+            windows: [weekly]
+        )
+
+        #expect(snapshot.isImmediatelyUsable)
+        #expect(!snapshot.isFresh(at: now))
+        #expect(!snapshot.isImmediatelyUsable(at: now))
+    }
+
+    @Test("Freshness boundary is inclusive and future observations fail closed")
+    func freshnessBoundariesAreDeterministic() {
+        let now = Date(timeIntervalSince1970: 1_777_000_000)
+        let weekly = QuotaWindow(
+            kind: .weekly,
+            durationSeconds: 604_800,
+            usedPercent: 10,
+            resetsAt: now.addingTimeInterval(400_000),
+            source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+        )
+        let atBoundary = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: now.addingTimeInterval(-QuotaFreshnessPolicy.maximumSnapshotAge),
+            windows: [weekly]
+        )
+        let futureDated = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: now.addingTimeInterval(1),
+            windows: [weekly]
+        )
+
+        #expect(atBoundary.isImmediatelyUsable(at: now))
+        #expect(!futureDated.isFresh(at: now))
+        #expect(!futureDated.isImmediatelyUsable(at: now))
+    }
+
+    @Test("Expired quota-cycle evidence cannot authorize routing")
+    func expiredQuotaCycleIsIneligible() {
+        let now = Date(timeIntervalSince1970: 1_777_000_000)
+        let weekly = QuotaWindow(
+            kind: .weekly,
+            durationSeconds: 604_800,
+            usedPercent: 10,
+            resetsAt: now,
+            source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+        )
+        let snapshot = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: now.addingTimeInterval(-10),
+            windows: [weekly]
+        )
+
+        #expect(snapshot.isFresh(at: now))
+        #expect(snapshot.hasExpiredPolicyWindow(at: now))
+        #expect(!snapshot.isImmediatelyUsable(at: now))
+    }
+
+    @Test("Malformed recognized usage fails closed without fabricating exhaustion")
+    func malformedRecognizedUsageIsIneligible() {
+        let now = Date(timeIntervalSince1970: 1_777_000_000)
+        for usedPercent in [-1, Double.nan, Double.infinity] {
+            let malformedWeekly = QuotaWindow(
+                kind: .weekly,
+                durationSeconds: 604_800,
+                usedPercent: usedPercent,
+                resetsAt: now.addingTimeInterval(400_000),
+                source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+            )
+            let snapshot = QuotaSnapshot(
+                allowed: true,
+                limitReached: false,
+                fetchedAt: now,
+                windows: [malformedWeekly]
+            )
+
+            #expect(!malformedWeekly.hasValidUsageObservation)
+            #expect(!malformedWeekly.isDefinitivelyExhausted)
+            #expect(!malformedWeekly.shouldAutoSwapAway)
+            #expect(snapshot.hasInvalidPolicyEvidence)
+            #expect(!snapshot.hasDefinitiveExhaustion)
+            #expect(snapshot.minimumRemainingPercent == nil)
+            #expect(!snapshot.needsSwap)
+            #expect(!snapshot.isImmediatelyUsable)
+            #expect(!snapshot.isImmediatelyUsable(at: now))
+        }
+    }
+
+    @Test("Allowed true cannot override a recognized low-capacity exhausted window")
+    func allowedTrueCannotOverrideThresholdExhaustion() {
+        let now = Date(timeIntervalSince1970: 1_777_000_000)
+        let weekly = QuotaWindow(
+            kind: .weekly,
+            durationSeconds: 604_800,
+            usedPercent: 99.2,
+            resetsAt: now.addingTimeInterval(400_000),
+            source: QuotaWindowSourceMetadata(rateLimit: .main, slot: .primary)
+        )
+        let snapshot = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: now,
+            windows: [weekly]
+        )
+
+        #expect(!weekly.isDefinitivelyExhausted)
+        #expect(weekly.isExhausted)
+        #expect(weekly.shouldAutoSwapAway)
+        #expect(snapshot.needsSwap)
+        #expect(!snapshot.isImmediatelyUsable(at: now))
+    }
+
+    @Test("Positive global allowance without policy windows is ineligible")
+    func positiveAllowanceWithoutPolicyWindowsIsIneligible() {
+        let now = Date(timeIntervalSince1970: 1_777_000_000)
+        let snapshot = QuotaSnapshot(
+            allowed: true,
+            limitReached: false,
+            fetchedAt: now,
+            windows: []
+        )
+
+        #expect(snapshot.policyWindows.isEmpty)
+        #expect(!snapshot.hasDefinitiveExhaustion)
+        #expect(!snapshot.isImmediatelyUsable)
+        #expect(!snapshot.isImmediatelyUsable(at: now))
     }
 
     @Test("Recovery waits for every blocking window on the account")

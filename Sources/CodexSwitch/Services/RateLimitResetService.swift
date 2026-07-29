@@ -38,6 +38,176 @@ enum RateLimitResetServiceError: Error, Sendable, Equatable {
     case transport(String)
 }
 
+extension RateLimitResetServiceError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "Reset inventory returned an invalid response"
+        case .httpError(let statusCode):
+            return "Reset inventory request failed (HTTP \(statusCode))"
+        case .malformedInventory:
+            return "Reset inventory response was malformed"
+        case .malformedConsumeResponse:
+            return "Reset redemption response was malformed"
+        case .missingCreditIdentifier:
+            return "Reset inventory credit identifier is missing"
+        case .creditAlreadySucceeded:
+            return "This banked reset was already redeemed"
+        case .unresolvedAttempt:
+            return "A banked reset is awaiting reconciliation"
+        case .submissionUnauthorized:
+            return "Reset redemption is not authorized"
+        case .journalUnavailable(let message):
+            return "Reset journal is unavailable: \(message)"
+        case .transport(let message):
+            return "Reset inventory transport failed: \(message)"
+        }
+    }
+}
+
+enum RateLimitResetFailureClassification: String, Equatable, Sendable {
+    case authentication
+    case rateLimited
+    case unsupported
+    case malformed
+    case transient
+}
+
+struct RateLimitResetRetryDecision: Equatable, Sendable {
+    let classification: RateLimitResetFailureClassification
+    let retryAt: Date?
+    let waitsForCredentialChange: Bool
+
+    var permitsAutomaticRetry: Bool {
+        retryAt != nil && !waitsForCredentialChange
+    }
+}
+
+struct RateLimitResetFailureState: Equatable, Sendable {
+    let credentialFingerprint: String?
+    let consecutiveFailureCount: Int
+    let decision: RateLimitResetRetryDecision
+
+    func blocksRetry(
+        currentCredentialFingerprint: String?,
+        now: Date
+    ) -> Bool {
+        if decision.waitsForCredentialChange {
+            return currentCredentialFingerprint == credentialFingerprint
+        }
+        return decision.retryAt.map { $0 > now } ?? false
+    }
+}
+
+enum RateLimitResetFailurePolicy {
+    static let rateLimitedRetryInterval: TimeInterval = 15 * 60
+    static let unsupportedRetryInterval: TimeInterval = 6 * 60 * 60
+    static let malformedRetryInterval: TimeInterval = 30 * 60
+    static let transientInitialRetryInterval: TimeInterval = 60
+    static let transientMaximumRetryInterval: TimeInterval = 30 * 60
+
+    static func classify(
+        _ error: RateLimitResetServiceError
+    ) -> RateLimitResetFailureClassification {
+        switch error {
+        case .httpError(401), .httpError(403), .submissionUnauthorized:
+            return .authentication
+        case .httpError(429):
+            return .rateLimited
+        case .httpError(501):
+            return .unsupported
+        case .httpError(let statusCode) where (400..<500).contains(statusCode):
+            return .unsupported
+        case .invalidResponse, .malformedInventory, .malformedConsumeResponse,
+             .missingCreditIdentifier:
+            return .malformed
+        case .httpError, .transport, .journalUnavailable, .unresolvedAttempt,
+             .creditAlreadySucceeded:
+            return .transient
+        }
+    }
+
+    static func retryDecision(
+        for error: RateLimitResetServiceError,
+        consecutiveFailureCount: Int,
+        now: Date
+    ) -> RateLimitResetRetryDecision {
+        let classification = classify(error)
+        switch classification {
+        case .authentication:
+            return RateLimitResetRetryDecision(
+                classification: classification,
+                retryAt: nil,
+                waitsForCredentialChange: true
+            )
+        case .rateLimited:
+            return retryDecision(
+                classification: classification,
+                after: rateLimitedRetryInterval,
+                now: now
+            )
+        case .unsupported:
+            return retryDecision(
+                classification: classification,
+                after: unsupportedRetryInterval,
+                now: now
+            )
+        case .malformed:
+            return retryDecision(
+                classification: classification,
+                after: malformedRetryInterval,
+                now: now
+            )
+        case .transient:
+            let exponent = min(max(0, consecutiveFailureCount - 1), 10)
+            let interval = min(
+                transientMaximumRetryInterval,
+                transientInitialRetryInterval * pow(2, Double(exponent))
+            )
+            return retryDecision(
+                classification: classification,
+                after: interval,
+                now: now
+            )
+        }
+    }
+
+    static func updatedState(
+        for error: RateLimitResetServiceError,
+        credentialFingerprint: String?,
+        previous: RateLimitResetFailureState?,
+        now: Date
+    ) -> RateLimitResetFailureState {
+        let failureCount: Int
+        if previous?.credentialFingerprint == credentialFingerprint {
+            failureCount = (previous?.consecutiveFailureCount ?? 0) + 1
+        } else {
+            failureCount = 1
+        }
+        return RateLimitResetFailureState(
+            credentialFingerprint: credentialFingerprint,
+            consecutiveFailureCount: failureCount,
+            decision: retryDecision(
+                for: error,
+                consecutiveFailureCount: failureCount,
+                now: now
+            )
+        )
+    }
+
+    private static func retryDecision(
+        classification: RateLimitResetFailureClassification,
+        after interval: TimeInterval,
+        now: Date
+    ) -> RateLimitResetRetryDecision {
+        RateLimitResetRetryDecision(
+            classification: classification,
+            retryAt: now.addingTimeInterval(interval),
+            waitsForCredentialChange: false
+        )
+    }
+}
+
 enum RateLimitResetConsumeResult: Sendable, Equatable {
     case reconciliationRequired(UUID)
     case noCredit
@@ -489,6 +659,7 @@ actor RateLimitResetService {
         submissionWillStart: @escaping SubmissionWillStart = { _ in }
     ) async throws -> RateLimitResetConsumeResult {
         guard account.hasCompleteRuntimeCredentials,
+              account.hasUsableInferenceToken(at: now),
               let providerAccountId = account.normalizedProviderAccountId else {
             throw RateLimitResetServiceError.submissionUnauthorized
         }

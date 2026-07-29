@@ -225,19 +225,24 @@ impl ReloadSummary {
             return true;
         };
         if self.generated_request_nonces.is_empty()
-            || self.generated_request_nonces.len() != self.sighup_sent.len()
             || self.generated_request_nonces.len() != self.signaled.len()
             || self.generated_request_nonces.len() != self.acknowledged_request_nonces.len()
+            || self.sighup_sent.len() > self.signaled.len()
             || !self.restarted.is_empty()
         {
             return false;
         }
+        let signaled = self.signaled.iter().collect::<HashSet<_>>();
+        let sighup_sent = self.sighup_sent.iter().collect::<HashSet<_>>();
         let generated = self.generated_request_nonces.iter().collect::<HashSet<_>>();
         let acknowledged = self
             .acknowledged_request_nonces
             .iter()
             .collect::<HashSet<_>>();
-        generated.len() == self.generated_request_nonces.len()
+        signaled.len() == self.signaled.len()
+            && sighup_sent.len() == self.sighup_sent.len()
+            && sighup_sent.is_subset(&signaled)
+            && generated.len() == self.generated_request_nonces.len()
             && acknowledged.len() == self.acknowledged_request_nonces.len()
             && generated == acknowledged
             && generated
@@ -270,6 +275,7 @@ const GOAL_PURSUING_MARKER: &[u8] = b"Pursuing goal";
 const GOAL_SET_MARKER: &[u8] = b"thread/goal/set";
 const HOT_SWAP_ARTIFACT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const HOT_SWAP_ACK_FRESHNESS: Duration = Duration::from_secs(5 * 60);
+const HOT_SWAP_ACK_REUSE_MINIMUM_REMAINING: Duration = Duration::from_secs(15);
 const HOT_SWAP_ARTIFACT_MAX_SCAN: usize = 20_000;
 const HOT_SWAP_ARTIFACT_MAX_REMOVALS: usize = 2_048;
 const HOT_SWAP_ARTIFACT_MAX_COUNT: usize = 512;
@@ -1884,7 +1890,22 @@ where
     Discover: FnOnce() -> Result<Vec<CodexProcess>>,
 {
     #[cfg(target_os = "macos")]
-    let mut managed_desktop_session = ManagedDesktopBridgeSession::open(&processes, auth_path)?;
+    let managed_desktop_requires_reload = processes.iter().any(|process| {
+        hot_swap_runtime_kind(process) == Some(HotSwapRuntimeKind::ManagedDesktopBridge)
+            && reusable_hot_swap_request(
+                process,
+                auth_path,
+                HotSwapRuntimeKind::ManagedDesktopBridge,
+                receipt_nonce,
+            )
+            .is_none()
+    });
+    #[cfg(target_os = "macos")]
+    let mut managed_desktop_session = if managed_desktop_requires_reload {
+        ManagedDesktopBridgeSession::open(&processes, auth_path)?
+    } else {
+        None
+    };
     let summary = reload_discovered_codex_processes_with(
         processes,
         auth_path,
@@ -1903,6 +1924,12 @@ where
             }
             Ok(())
         },
+        |process, auth_path, runtime_kind, receipt_nonce| {
+            reusable_hot_swap_request(process, auth_path, runtime_kind, receipt_nonce)
+        },
+        write_hot_swap_request_for_receipt,
+        process_identity_is_current,
+        hot_swap_binding_matches_current,
         running_process_has_sighup_support_for_runtime,
         signal_validated_process,
         |process, request, runtime_kind, timeout| {
@@ -1911,14 +1938,25 @@ where
     )?;
     #[cfg(target_os = "macos")]
     if let Some(session) = managed_desktop_session.as_mut() {
-        if summary.signaled.contains(&session.process.pid) {
+        if summary.sighup_sent.contains(&session.process.pid) {
             session.verify_reloaded_account(auth_path)?;
         }
     }
     Ok(summary)
 }
 
-fn reload_discovered_codex_processes_with<Guard, Discover, Prune, Markers, Signal, Wait>(
+fn reload_discovered_codex_processes_with<
+    Guard,
+    Discover,
+    Prune,
+    Reuse,
+    WriteRequest,
+    Current,
+    Binding,
+    Markers,
+    Signal,
+    Wait,
+>(
     processes: Vec<CodexProcess>,
     auth_path: &Path,
     receipt_nonce: Option<Uuid>,
@@ -1926,6 +1964,10 @@ fn reload_discovered_codex_processes_with<Guard, Discover, Prune, Markers, Signa
     mut before_signal: Guard,
     final_discover: Discover,
     prune_artifacts: Prune,
+    mut reusable_request: Reuse,
+    mut write_request: WriteRequest,
+    mut process_is_current: Current,
+    mut binding_is_current: Binding,
     mut marker_support: Markers,
     mut signal: Signal,
     mut wait_for_ack: Wait,
@@ -1934,6 +1976,16 @@ where
     Guard: FnMut() -> Result<()>,
     Discover: FnOnce() -> Result<Vec<CodexProcess>>,
     Prune: FnOnce(&HashSet<u32>) -> Result<()>,
+    Reuse: FnMut(&CodexProcess, &Path, HotSwapRuntimeKind, Option<Uuid>) -> Option<HotSwapRequest>,
+    WriteRequest: FnMut(
+        &CodexProcess,
+        &Path,
+        HotSwapRuntimeKind,
+        Option<Uuid>,
+        &HotSwapKernelExecutableIdentity,
+    ) -> Result<HotSwapRequest>,
+    Current: FnMut(&CodexProcess) -> bool,
+    Binding: FnMut(&HotSwapBinding, &CodexProcess, &Path, HotSwapRuntimeKind) -> bool,
     Markers: FnMut(&CodexProcess, HotSwapRuntimeKind) -> Option<HotSwapKernelExecutableIdentity>,
     Signal: FnMut(&CodexProcess, i32) -> std::io::Result<()>,
     Wait: FnMut(&CodexProcess, &HotSwapRequest, HotSwapRuntimeKind, Duration) -> bool,
@@ -1960,6 +2012,17 @@ where
                 .push((process.pid, "unsupported Codex runtime kind".to_string()));
             continue;
         };
+        if let Some(request) = reusable_request(process, &auth_path, runtime_kind, receipt_nonce) {
+            summary.signaled.push(process.pid);
+            summary
+                .generated_request_nonces
+                .push(request.binding.request_nonce.clone());
+            summary
+                .acknowledged_request_nonces
+                .push(request.binding.request_nonce.clone());
+            generated_requests.push((process.pid, request, runtime_kind));
+            continue;
+        }
         let Some(marker_executable_identity) = marker_support(process, runtime_kind) else {
             summary.skipped.push((
                 process.pid,
@@ -1974,7 +2037,7 @@ where
             ));
             continue;
         }
-        let request = match write_hot_swap_request_for_receipt(
+        let request = match write_request(
             process,
             &auth_path,
             runtime_kind,
@@ -1997,7 +2060,7 @@ where
         if let Some(ack_path) = hot_swap_ack_path(process.pid) {
             let _ = fs::remove_file(ack_path);
         }
-        if !process_identity_is_current(&process) {
+        if !process_is_current(process) {
             summary.skipped.push((
                 process.pid,
                 "process identity changed before SIGHUP; refusing to signal reused pid".to_string(),
@@ -2012,12 +2075,7 @@ where
             continue;
         }
         if hot_swap_runtime_kind(process) != Some(runtime_kind)
-            || !hot_swap_binding_matches_current(
-                &request.binding,
-                process,
-                &auth_path,
-                runtime_kind,
-            )
+            || !binding_is_current(&request.binding, process, &auth_path, runtime_kind)
         {
             summary.skipped.push((
                 process.pid,
@@ -2847,12 +2905,7 @@ pub fn process_has_current_hot_swap_ack_for_runtime(
     auth_path: &Path,
     runtime_kind: HotSwapRuntimeKind,
 ) -> bool {
-    process_has_current_hot_swap_ack_for_runtime_with_minimum_remaining(
-        process,
-        auth_path,
-        runtime_kind,
-        Duration::ZERO,
-    )
+    reusable_hot_swap_request(process, auth_path, runtime_kind, None).is_some()
 }
 
 fn process_has_current_hot_swap_ack_for_runtime_with_minimum_remaining(
@@ -2886,6 +2939,45 @@ fn process_has_current_hot_swap_ack_for_runtime_with_minimum_remaining(
         current_unix_timestamp_milliseconds(),
         minimum_remaining,
     ) && process_identity_is_current(process)
+}
+
+fn reusable_hot_swap_request(
+    process: &CodexProcess,
+    auth_path: &Path,
+    runtime_kind: HotSwapRuntimeKind,
+    receipt_nonce: Option<Uuid>,
+) -> Option<HotSwapRequest> {
+    if !process_identity_is_current(process) {
+        return None;
+    }
+    let (Some(ack_path), Some(request_path)) = (
+        hot_swap_ack_path(process.pid),
+        hot_swap_request_path(process.pid),
+    ) else {
+        return None;
+    };
+    let request = read_hot_swap_request(&request_path)?;
+    if receipt_nonce.is_some_and(|receipt| {
+        !hot_swap_request_nonce_matches_receipt(&request.binding.request_nonce, receipt)
+    }) || !hot_swap_binding_matches_current(&request.binding, process, auth_path, runtime_kind)
+    {
+        return None;
+    }
+    let acknowledgement = read_hot_swap_ack(&ack_path)?;
+    if !hot_swap_ack_matches_request_with_minimum_remaining(
+        &acknowledgement,
+        &request,
+        runtime_kind,
+        current_unix_timestamp_milliseconds(),
+        HOT_SWAP_ACK_REUSE_MINIMUM_REMAINING,
+    ) || !process_identity_is_current(process)
+    {
+        return None;
+    }
+    (read_hot_swap_request(&request_path).as_ref() == Some(&request)
+        && read_hot_swap_ack(&ack_path).as_ref() == Some(&acknowledgement)
+        && process_identity_is_current(process))
+    .then_some(request)
 }
 
 fn process_has_hot_swap_ack_for_request(
@@ -4699,6 +4791,10 @@ mod tests {
             || Ok(()),
             || Ok(vec![final_process]),
             |_| Ok(()),
+            |_, _, _, _| None,
+            |_, _, _, _, _| bail!("request write must not run without marker support"),
+            |_| true,
+            |_, _, _, _| true,
             |_, _| None,
             |_, _| {
                 signal_calls.set(signal_calls.get() + 1);
@@ -4739,6 +4835,10 @@ mod tests {
             || bail!("managed identity changed"),
             || Ok(vec![final_process]),
             |_| Ok(()),
+            |_, _, _, _| None,
+            |_, _, _, _, _| bail!("request write must not run after guard rejection"),
+            |_| true,
+            |_, _, _, _| true,
             move |_, _| Some(kernel_identity.clone()),
             |_, _| {
                 signal_calls.set(signal_calls.get() + 1);
@@ -4753,6 +4853,102 @@ mod tests {
             .skipped
             .iter()
             .any(|(_, reason)| reason.contains("identity changed")));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_retry_reuses_exact_ack_and_signals_only_missing_runtime() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let auth_path = dir.path().join("auth.json");
+        fs::write(
+            &auth_path,
+            r#"{"tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh","account_id":"provider-account"}}"#,
+        )?;
+        fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        let receipt = Uuid::new_v4();
+        let process = |pid: i32| CodexProcess {
+            pid,
+            owner_uid: 501,
+            start_identity: format!("macos:{pid}"),
+            started_at_unix: u64::try_from(pid).unwrap_or_default(),
+            command_line: "/tmp/codex".to_string(),
+            executable: PathBuf::from("/tmp/codex"),
+        };
+        let acknowledged = process(42);
+        let missing = process(43);
+        let request = |process: &CodexProcess| HotSwapRequest {
+            binding: HotSwapBinding {
+                contract_version: HOT_SWAP_REQUEST_CONTRACT_VERSION,
+                process_identity: HotSwapProcessIdentity {
+                    pid: process.pid,
+                    owner_uid: process.owner_uid,
+                    executable_path: process.executable.display().to_string(),
+                    start_seconds: process.started_at_unix,
+                    start_microseconds: 0,
+                },
+                kernel_executable_identity: HotSwapKernelExecutableIdentity {
+                    canonical_path: process.executable.display().to_string(),
+                    device: 7,
+                    inode: u64::try_from(process.pid).unwrap_or_default(),
+                },
+                runtime_kind: HotSwapRuntimeKind::LocalInteractiveCli,
+                auth_file_identity: HotSwapAuthFileIdentity {
+                    canonical_path: auth_path.display().to_string(),
+                    device: 8,
+                    inode: 9,
+                    account_id: "provider-account".to_string(),
+                    complete_token_fingerprint: "a".repeat(64),
+                },
+                request_nonce: next_hot_swap_request_nonce_for_receipt(receipt),
+                issued_at_unix_milliseconds: current_unix_timestamp_milliseconds(),
+            },
+        };
+        let reused_request = request(&acknowledged);
+        let missing_request = request(&missing);
+        let signal_calls = std::cell::RefCell::new(Vec::new());
+        let guard_calls = std::cell::Cell::new(0);
+
+        let summary = reload_discovered_codex_processes_with(
+            vec![acknowledged.clone(), missing.clone()],
+            &auth_path,
+            Some(receipt),
+            false,
+            || {
+                guard_calls.set(guard_calls.get() + 1);
+                Ok(())
+            },
+            || bail!("skip final topology for the retry-planning fixture"),
+            |_| Ok(()),
+            |process, _, _, _| (process.pid == acknowledged.pid).then(|| reused_request.clone()),
+            |process, _, _, _, _| {
+                if process.pid == missing.pid {
+                    Ok(missing_request.clone())
+                } else {
+                    bail!("acknowledged runtime request must not be replaced")
+                }
+            },
+            |_| true,
+            |_, _, _, _| true,
+            |process, _| {
+                Some(HotSwapKernelExecutableIdentity {
+                    canonical_path: process.executable.display().to_string(),
+                    device: 7,
+                    inode: u64::try_from(process.pid).unwrap_or_default(),
+                })
+            },
+            |process, _| {
+                signal_calls.borrow_mut().push(process.pid);
+                Ok(())
+            },
+            |_, _, _, _| true,
+        )?;
+
+        assert_eq!(signal_calls.into_inner(), vec![missing.pid]);
+        assert_eq!(summary.sighup_sent, vec![missing.pid]);
+        assert_eq!(summary.signaled, vec![acknowledged.pid, missing.pid]);
+        assert_eq!(guard_calls.get(), 2);
+        assert!(summary.receipt_proof_is_complete());
         Ok(())
     }
 

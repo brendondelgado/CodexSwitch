@@ -4,6 +4,7 @@ import SwiftUI
 struct AccountCardView: View {
     let account: CodexAccount
     var isConfigured: Bool = false
+    var poolTargetFreshness: ActiveAccountAuthorityFreshness = .current
     var pollingError: String? = nil
     var rateLimitResetPresentation: RateLimitResetInventoryPresentation? = nil
     var rateLimitResetCoordinatorAuthorization: RateLimitResetCoordinatorAuthorization = .authorized
@@ -16,6 +17,23 @@ struct AccountCardView: View {
     private static let activeGreen = Color(red: 0.15, green: 0.68, blue: 0.25)
     static let poolTargetLabel = "Pool Target"
     static let switchPoolTargetLabel = "Switch pool target to this account"
+
+    static func poolTargetLabel(
+        for freshness: ActiveAccountAuthorityFreshness
+    ) -> String {
+        switch freshness {
+        case .current:
+            return poolTargetLabel
+        case .stale:
+            return "Pool Target (stale)"
+        case .unavailable:
+            return "Pool Target unavailable"
+        }
+    }
+
+    private var poolTargetAccent: Color {
+        poolTargetFreshness == .stale ? .orange : Self.activeGreen
+    }
     private static let renewalFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.setLocalizedDateFormatFromTemplate("MMM d")
@@ -52,6 +70,7 @@ struct AccountCardView: View {
     private var statusDot: Color {
         if needsReauthentication { return .red }
         if account.hasHardRuntimeBlock { return .orange }
+        if isConfigured && poolTargetFreshness == .stale { return .orange }
         if isConfigured && account.quotaSnapshot?.hasBackendUsagePlaceholder == true { return .orange }
         guard let snapshot = account.realQuotaSnapshot else {
             return account.quotaSnapshot?.hasBackendUsagePlaceholder == true ? .orange : .gray
@@ -64,7 +83,7 @@ struct AccountCardView: View {
         if let weekly = snapshot.weekly, weekly.effectiveRemainingPercent < 20 { return .orange }
         if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 20 }) { return .orange }
         if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 50 }) { return .yellow }
-        return isConfigured ? Self.activeGreen : .gray.opacity(0.4)
+        return isConfigured ? poolTargetAccent : .gray.opacity(0.4)
     }
 
     private var statusDotLabel: String {
@@ -85,7 +104,7 @@ struct AccountCardView: View {
             return "\(QuotaWindowDisplay.label(for: exhausted)) exhausted"
         }
         if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 20 }) { return "Low quota" }
-        return isConfigured ? Self.poolTargetLabel : "Idle"
+        return isConfigured ? Self.poolTargetLabel(for: poolTargetFreshness) : "Idle"
     }
 
     /// Higher contrast styles for the pool target card.
@@ -166,7 +185,21 @@ struct AccountCardView: View {
             color = .orange
             systemImage = "clock.badge.exclamationmark.fill"
             urgency = nil
-            help = "Last-known reset inventory"
+            help = "Last-known reset inventory is unverified"
+        case .expired:
+            nextExpirationText = nil
+            holdUntilText = nil
+            color = .red
+            systemImage = "clock.badge.xmark.fill"
+            urgency = nil
+            help = "Banked reset inventory has expired and cannot be redeemed"
+        case .unknown:
+            nextExpirationText = nil
+            holdUntilText = nil
+            color = .secondary
+            systemImage = "questionmark.circle.fill"
+            urgency = nil
+            help = "Reset inventory has not been verified"
         case .externalHold(let until):
             nextExpirationText = nil
             holdUntilText = Self.resetHoldFormatter.string(from: until)
@@ -221,14 +254,20 @@ struct AccountCardView: View {
         case .reconciling:
             return "Reconciling reset inventory"
         case .error(let message, let lastKnownCount):
-            return "Reset error: \(message) • last-known: \(resetCountText(lastKnownCount))"
+            return "Reset error: \(message) • last-known/unverified: \(resetCountText(lastKnownCount))"
         case .externalHold:
             return holdUntilText.map { "Reset hold until \($0)" }
                 ?? "Reset redemption on hold"
         case .refreshing:
             return "Refreshing reset inventory"
         case .stale(let lastKnownCount):
-            return "Last-known: \(resetCountText(lastKnownCount))"
+            return "Last-known/unverified: \(resetCountText(lastKnownCount))"
+        case .expired(let lastKnownCount):
+            return "Expired/unavailable: \(resetCountText(lastKnownCount))"
+        case .unknown(let lastKnownCount):
+            return lastKnownCount > 0
+                ? "Not verified • last-known: \(resetCountText(lastKnownCount))"
+                : "Reset inventory not verified"
         case .current(let availableCount, _):
             var text = resetCountText(availableCount)
             if let nextExpirationText {
@@ -362,9 +401,12 @@ struct AccountCardView: View {
 
 
             if isConfigured {
-                Label(Self.poolTargetLabel, systemImage: "scope")
+                Label(
+                    Self.poolTargetLabel(for: poolTargetFreshness),
+                    systemImage: "scope"
+                )
                     .font(.system(size: 8.5, weight: .semibold))
-                    .foregroundStyle(Self.activeGreen)
+                    .foregroundStyle(poolTargetAccent)
                     .lineLimit(1)
             }
 
@@ -514,7 +556,7 @@ struct AccountCardView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(
-                    isConfigured ? Self.activeGreen : Color.primary.opacity(0.1),
+                    isConfigured ? poolTargetAccent : Color.primary.opacity(0.1),
                     lineWidth: isConfigured ? 2.5 : 1
                 )
         }
@@ -542,6 +584,13 @@ struct AccountCardView: View {
             _ = handlePrimaryClick()
         }
         .contextMenu {
+            let resetPresentation = RateLimitResetContextMenuPresentation.resolve(
+                account: account,
+                inventory: rateLimitResetPresentation,
+                coordinatorAuthorization: rateLimitResetCoordinatorAuthorization,
+                now: Date()
+            )
+
             if needsReauthentication {
                 Button("Reauthenticate") {
                     onReauthenticate?()
@@ -551,6 +600,18 @@ struct AccountCardView: View {
                 Button(Self.switchPoolTargetLabel) {
                     onForceSwap?()
                 }
+            }
+            if resetPresentation.isEnabled {
+                Button(resetPresentation.menuItemTitle) {
+                    isConfirmingResetRedemption = true
+                }
+            } else {
+                Button(resetPresentation.menuItemTitle) {}
+                    .disabled(true)
+                    .help(
+                        resetPresentation.unavailableReason
+                            ?? "Manual reset redemption is unavailable"
+                    )
             }
             Button("Copy email") {
                 NSPasteboard.general.clearContents()

@@ -207,6 +207,8 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         self.assertNotIn("systemctl --user restart", text)
         self.assertNotIn("systemctl --user stop", text)
         self.assertNotIn("systemctl --user daemon-reload || true", text)
+        self.assertIn("CODEXSWITCH_STOP_DAEMON", text)
+        self.assertIn("independent positive quiescence proof", text)
 
     def test_python_observer_treats_exact_managed_argv_on_replaced_inode_as_unknown(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3440,6 +3442,21 @@ PY
             1,
         )
         self.assertNotRegex(log, r"(?m)^systemctl\t--user (?:stop|restart)(?:\s|$)")
+
+    def test_activation_rejects_stop_compatibility_flag_before_mutation(self):
+        self.tool_log.write_text("")
+
+        result = self._activate(
+            extra_env={"CODEXSWITCH_STOP_APP_SERVER": "1"},
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("independent positive quiescence proof", result.stderr)
+        self.assertNotRegex(
+            self.tool_log.read_text(),
+            r"(?m)^systemctl\t--user (?:stop|restart)(?:\s|$)",
+        )
 
     def test_import_digest_and_failure_roll_back_the_complete_transaction(self):
         self._seed_systemd_state(include_target_enablement=False)

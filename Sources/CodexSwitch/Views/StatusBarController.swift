@@ -27,34 +27,23 @@ final class StatusBarController {
         return rate > 0 ? window.effectiveRemainingPercent / rate : .infinity
     }
 
-    static func accountScopeLabel(
-        configuredAccountId: UUID,
-        runtimeCurrentAccountId: UUID?
-    ) -> String {
-        runtimeCurrentAccountId == configuredAccountId
-            ? "Mac Configured; Mac Runtime Current"
-            : "Mac Configured; Mac Runtime Not Current"
-    }
-
-    static func displayAccount(
-        configuredAccount: CodexAccount?,
-        poolTargetAccount: CodexAccount?,
-        remoteAuthorityEndpointConfigured: Bool,
-        authorityIsFresh: Bool
-    ) -> CodexAccount? {
-        guard remoteAuthorityEndpointConfigured else {
-            return configuredAccount
-        }
-        return authorityIsFresh ? poolTargetAccount : nil
-    }
-
     static func poolTargetScopeLabel(
         poolTargetAccountId: UUID,
-        runtimeCurrentAccountId: UUID?
+        runtimeCurrentAccountId: UUID?,
+        freshness: ActiveAccountAuthorityFreshness = .current
     ) -> String {
-        runtimeCurrentAccountId == poolTargetAccountId
-            ? "Pool Target; Mac Runtime Current"
-            : "Pool Target; Mac Runtime Not Current"
+        let target: String
+        switch freshness {
+        case .current:
+            target = "Pool Target"
+        case .stale:
+            target = "Pool Target (stale)"
+        case .unavailable:
+            target = "Pool Target unavailable"
+        }
+        return runtimeCurrentAccountId == poolTargetAccountId
+            ? "\(target); Mac Runtime Current"
+            : "\(target); Mac Runtime Not Current"
     }
 
     /// Update the menu bar icon — circular ring with percentage
@@ -68,29 +57,21 @@ final class StatusBarController {
         }
 
         let now = Date()
-        let usesRemoteAuthority = manager.remoteAuthorityEndpointConfigured
-        let authorityIsFresh = manager.poolAuthorityObservation?.isFresh(at: now) == true
-        guard let displayedAccount = Self.displayAccount(
-            configuredAccount: manager.configuredAccount,
-            poolTargetAccount: manager.poolTargetAccount,
-            remoteAuthorityEndpointConfigured: usesRemoteAuthority,
-            authorityIsFresh: authorityIsFresh
+        let readModel = manager.activeAccountReadModel(at: now)
+        guard let displayedAccount = manager.logicalActiveAccount(
+            using: readModel
         ) else {
-            button.toolTip = usesRemoteAuthority
-                ? "Pool target synchronizing"
-                : "Rate limits unavailable"
+            button.toolTip = readModel.freshness == .unavailable
+                ? "Pool authority unavailable"
+                : "Pool target missing or ambiguous"
             applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "...")
             return
         }
-        let scope = usesRemoteAuthority
-            ? Self.poolTargetScopeLabel(
-                poolTargetAccountId: displayedAccount.id,
-                runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id
-            )
-            : Self.accountScopeLabel(
-                configuredAccountId: displayedAccount.id,
-                runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id
-            )
+        let scope = Self.poolTargetScopeLabel(
+            poolTargetAccountId: displayedAccount.id,
+            runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id,
+            freshness: readModel.freshness
+        )
 
         guard let snapshot = displayedAccount.realQuotaSnapshot else {
             button.toolTip = "\(scope): rate limits unavailable"

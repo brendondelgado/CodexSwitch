@@ -84,7 +84,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-28
+  last_updated: 2026-07-29
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -615,6 +615,15 @@ CodexSwitch must evaluate these independently:
   the VPS daemon authority when a VPS is configured. The compatibility
   `daemonRunning` doctor field reports whether the local platform coordinator
   is present, not authority ownership.
+- **Linux coordinator readiness:** `daemonRunning` requires the exact active
+  `codexswitch.service` user unit, its canonical regular non-symlink fragment,
+  and a same-user `MainPID` whose executable and exact `codexswitch-cli daemon`
+  argument vector match the managed runtime. A transient unit, emergency
+  binary, manually launched daemon, or arbitrary same-user process must never
+  satisfy readiness merely because its command line contains those words. The
+  daemon also holds one secure lifetime owner lease for its account store; a
+  second managed, transient, or manual daemon fails at startup before polling,
+  selecting, refreshing credentials, or spending a reset.
 - **Mac CLI first ACK:** a current attested managed CLI may receive its first request only when its route, hashes, read-only files, owner, and running executable vnode all match. A historical runtime without the v3 CLI contract requires one exit and resume.
 - **Degraded CLI recovery:** each due convergence attempt observes topology off
   the main actor. Historical CLIs remain typed blockers; once they exit, the

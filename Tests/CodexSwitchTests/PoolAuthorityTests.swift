@@ -37,6 +37,40 @@ struct PoolAuthorityTests {
     #expect(value.isFresh(at: now))
   }
 
+  @Test("credential sync preserves observed VPS active identity until stable convergence")
+  func credentialSyncRequiresStableRuntimeAgreement() throws {
+    let now = Date(timeIntervalSince1970: 10_000)
+    for phase in [PoolAuthorityPhase.converging, .degraded] {
+      let transitional = try observation(
+        phase: phase,
+        target: "provider-b",
+        observedAt: now,
+        updatedAt: now
+      )
+      #expect(AppDelegate.linuxDevboxCredentialSyncProviderAccountId(
+        authorityObservation: transitional,
+        observedRemoteProviderAccountId: "provider-a",
+        now: now
+      ) == "provider-a")
+    }
+
+    let stable = try observation(
+      target: "provider-b",
+      observedAt: now,
+      updatedAt: now
+    )
+    #expect(AppDelegate.linuxDevboxCredentialSyncProviderAccountId(
+      authorityObservation: stable,
+      observedRemoteProviderAccountId: "provider-a",
+      now: now
+    ) == "provider-a")
+    #expect(AppDelegate.linuxDevboxCredentialSyncProviderAccountId(
+      authorityObservation: stable,
+      observedRemoteProviderAccountId: "provider-b",
+      now: now
+    ) == "provider-b")
+  }
+
   @Test("JSON requires the server-generated observedAt field")
   func decodingRequiresObservedAt() {
     let json = """
@@ -359,7 +393,8 @@ struct PoolAuthorityTests {
     )
     var state = PoolAuthorityClientState()
 
-    #expect(!settings.isConfigured)
+    #expect(settings.isConfigured)
+    #expect(!settings.readinessNotificationsEnabled)
     #expect(settings.hasRemoteAuthorityEndpoint)
     #expect(AppDelegate.swapRequiresRemoteAuthority(settings))
     #expect(state.remoteFirstDecision(
@@ -370,9 +405,9 @@ struct PoolAuthorityTests {
     ) == .failClosed("authority status is unavailable"))
   }
 
-  @Test("authority endpoint suppresses local UI fallback before first status")
+  @Test("logical active account never falls back to a local active flag")
   @MainActor
-  func authorityEndpointSuppressesConfiguredAccountFallback() {
+  func logicalActiveAccountRequiresAuthorityIdentity() {
     let manager = AccountManager(userDefaults: isolatedDefaults())
     let account = CodexAccount(
       email: "local@example.com",
@@ -384,10 +419,48 @@ struct PoolAuthorityTests {
     )
     manager.accounts = [account]
 
-    #expect(manager.poolTargetAccount?.id == account.id)
+    #expect(manager.activeAccountReadModel().freshness == .unavailable)
+    #expect(manager.poolTargetAccount == nil)
+    #expect(!manager.isPoolTarget(account))
     manager.publishRemoteAuthorityEndpointConfigured(true)
     #expect(manager.poolTargetAccount == nil)
     #expect(!manager.isPoolTarget(account))
+  }
+
+  @Test("active-account read model retains one stale authority identity")
+  func activeAccountReadModelRetainsStaleIdentity() throws {
+    let observedAt = Date(timeIntervalSince1970: 50_000)
+    let value = try observation(
+      epoch: 22,
+      target: "provider-authority",
+      observedAt: observedAt,
+      updatedAt: observedAt
+    )
+
+    let current = ActiveAccountReadModel(
+      lastObservation: value,
+      now: observedAt
+    )
+    let stale = ActiveAccountReadModel(
+      lastObservation: value,
+      now: observedAt.addingTimeInterval(
+        PoolAuthorityObservation.maximumFreshnessAge + 1
+      )
+    )
+    let unavailable = ActiveAccountReadModel(
+      lastObservation: nil,
+      now: observedAt
+    )
+
+    #expect(current.providerAccountId == "provider-authority")
+    #expect(current.epoch == 22)
+    #expect(current.freshness == .current)
+    #expect(stale.providerAccountId == current.providerAccountId)
+    #expect(stale.epoch == current.epoch)
+    #expect(stale.freshness == .stale)
+    #expect(unavailable.providerAccountId == nil)
+    #expect(unavailable.epoch == nil)
+    #expect(unavailable.freshness == .unavailable)
   }
 
   @Test("remote authority transport config is token-free and mode 0600")

@@ -27,7 +27,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-21
+  last_updated: 2026-07-29
 ---
 
 # CodexSwitch Banked Resets
@@ -82,11 +82,14 @@ and fall back to ordinary account rotation when they change or fail.
 ## Automatic Redemption Policy
 
 Automatic redemption on its designated owner follows a conservation policy.
-The Mac menu app is the only automatic owner. The VPS daemon cannot consume
-banked resets automatically. A reset candidate may be active or inactive, but
-it must have a fresh quota observation with a resettable usage limit and a
-fresh bank containing at least one available, unexpired credit. CodexSwitch
-selects the oldest-expiring credit for the chosen account.
+In a configured Mac/VPS pool, the VPS daemon is the sole automatic owner. The
+Mac may observe inventory and request or adopt a VPS authority operation, but it
+must never submit a local automatic consume request. A standalone Mac with no
+remote authority endpoint is the local automatic owner. A reset candidate may
+be active or inactive, but it must have a fresh quota observation with a
+resettable usage limit and a fresh bank containing at least one available,
+unexpired credit. CodexSwitch selects the oldest-expiring credit for the chosen
+account.
 
 A natural quota reset does not move when a banked reset is consumed. Spending a
 credit shortly before that scheduled recovery therefore discards capacity. When
@@ -136,11 +139,17 @@ redemption never removes or mutates bank inventory.
 ## Redemption Ownership
 
 Exactly one process may own automatic reset redemption for an account pool.
-For the normal mirrored Mac/VPS deployment, the CodexSwitch Mac menu app is the
-owner. The VPS daemon continues to poll quota and rotate accounts, but automatic
-reset redemption has no daemon opt-in. Automatic in-turn recovery calls
-`rotate-now` without reset ownership and therefore rotates only. Manual CLI
-redemption remains available for an operator-controlled recovery through
+For the normal mirrored Mac/VPS deployment, the configured VPS daemon is that
+owner. Its journaled `rotate-now --allow-banked-reset` path owns selection,
+submission, reconciliation, and resulting authority transition. The Mac menu
+app must disable its local automatic path whenever a valid remote authority
+endpoint exists, including the transitional configuration where transport is
+present but readiness is disabled. It may adopt the resulting authority epoch;
+if no supported remote automatic operation is available, it fails closed and
+does not fall back to local consumption. Only a standalone Mac with no remote
+authority endpoint may own local automatic redemption.
+
+Manual CLI redemption remains an explicit operator-controlled recovery through
 `redeem-reset <account>`. That command accepts one exact blocked paid account,
 requires its complete runtime credential set and normalized stable provider
 identity, consumes at most one credit, never activates the account, and replays
@@ -153,10 +162,9 @@ must therefore assert which host owns redemption before enabling it.
 
 This failure mode was observed on 2026-07-12: the VPS daemon reported a reset
 at 09:08:24 UTC with two credits remaining, then the Mac began another
-redemption at 09:08:26 UTC and reported one remaining. The VPS daemon started
-on 2026-07-13 at 07:09:48 UTC runs without reset redemption. Removing the daemon
-opt-in makes that single-owner boundary structural rather than configuration
-advice.
+redemption at 09:08:26 UTC and reported one remaining. The durable correction
+is not a deployment convention: both Mac policy admission and the Mac mutation
+boundary reject local automatic submission whenever remote authority exists.
 
 As defense in depth, every fresh inventory passes one transition classifier
 before replacing the previous authoritative bank. The decision baseline is not
@@ -185,14 +193,21 @@ consume another credit using the quota snapshot that preceded the change.
 ## Manual Redemption And Expiration Alerts
 
 Each eligible account card exposes one reset icon button. It is enabled only
-for a fresh blocked paid account with complete runtime credentials and a fresh
-available reset. An available credit must have a normalized identifier and an
+for a fresh blocked paid account with complete runtime credentials, an
+inference JWT valid beyond the safety window, and a fresh available reset. An
+available credit must have a normalized identifier and an
 explicit future expiration; missing or expired expiration evidence makes the
 inventory malformed and cannot authorize redemption. The confirmation names the
 account, spends its oldest-expiring available credit, and explicitly states that
-the configured account will not change. Redeeming, reconciling,
-error, stale, and external-hold states replace the action until the durable
-journal proves another submission is safe.
+the configured account will not change. Redeeming, reconciling, refresh-failed,
+last-known/unverified, expired/unavailable, not-verified, and external-hold
+states replace the action until the durable journal proves another submission
+is safe. No non-current count is presented as spendable inventory.
+
+The account-card context menu resolves the same guarded manual-redemption
+presentation. An enabled item opens that existing confirmation dialog; it never
+redeems directly. A disabled item includes the exact unavailability reason in
+its title and help text.
 
 Manual intent is persisted with the reset attempt. While that attempt is
 unresolved and after it reconciles, routine plan-upgrade logic must not switch
@@ -297,8 +312,9 @@ contradictions, malformed responses,
 uncertain-request reconciliation, and consume response codes. Pure policy tests
 must prove that an inactive exhausted Pro ranks ahead of an active usable Plus,
 while a near natural reset or another usable Pro prevents redemption.
-Cross-host tests must prove that the daemon exposes no automatic redemption
-option. Mac tests must prove that an external
+Cross-host tests must prove that a configured daemon is the sole automatic
+owner, a remote-configured Mac rejects local automatic submission, and a
+standalone Mac may retain local ownership. Mac tests must prove that an external
 inventory decrement survives restart and blocks a second redemption for 15
 minutes, while newer usable quota evidence may clear the hold early.
 Mac tests must also prove that manual redemption can use a lease-only durable

@@ -1029,7 +1029,10 @@ private enum BankedResetHarness {
         CodexAccount(
             id: id,
             email: email,
-            accessToken: "access-token",
+            accessToken: inferenceToken(
+                expiresAt: max(snapshot?.fetchedAt ?? Date(), Date())
+                    .addingTimeInterval(24 * 60 * 60)
+            ),
             refreshToken: "refresh-token",
             idToken: "id-token",
             accountId: "account-id-\(email)",
@@ -1037,6 +1040,17 @@ private enum BankedResetHarness {
             planType: planType,
             isActive: email == "active@example.com"
         )
+    }
+
+    private static func inferenceToken(expiresAt: Date) -> String {
+        let payload = try! JSONSerialization.data(withJSONObject: [
+            "exp": expiresAt.timeIntervalSince1970,
+        ])
+        let encoded = payload.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "e30.\(encoded).signature"
     }
 
     private static func snapshot(

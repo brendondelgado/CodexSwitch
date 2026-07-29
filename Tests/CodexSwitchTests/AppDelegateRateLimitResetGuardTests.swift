@@ -376,11 +376,50 @@ struct AppDelegateRateLimitResetGuardTests {
     func externalHoldStateFailsClosed() {
         #expect(AppDelegate.automaticRateLimitResetRedemptionIsEnabled(
             preferenceEnabled: true,
-            externalHoldStateIsReadable: true
+            externalHoldStateIsReadable: true,
+            authorityMode: .macStandalone
         ))
         #expect(!AppDelegate.automaticRateLimitResetRedemptionIsEnabled(
             preferenceEnabled: true,
-            externalHoldStateIsReadable: false
+            externalHoldStateIsReadable: false,
+            authorityMode: .macStandalone
+        ))
+    }
+
+    @Test("Remote authority is the sole automatic reset owner")
+    func remoteAuthorityPreventsMacAutomaticRedemption() {
+        let transportOnly = LinuxDevboxMonitorSettings(
+            enabled: false,
+            host: "authority.example.test",
+            user: "codex",
+            sshKeyPath: "~/.ssh/id_ed25519",
+            port: 22
+        )
+
+        #expect(transportOnly.isConfigured)
+        #expect(!transportOnly.readinessNotificationsEnabled)
+        #expect(transportOnly.hasRemoteAuthorityEndpoint)
+        #expect(AppDelegate.automaticRateLimitResetOwner(
+            authorityMode: .macStandalone
+        ) == .macStandalone)
+        #expect(AppDelegate.automaticRateLimitResetOwner(
+            authorityMode: transportOnly.effectiveResetAuthorityMode
+        ) == .vpsAuthority)
+        #expect(AppDelegate.automaticRateLimitResetRedemptionIsEnabled(
+            preferenceEnabled: true,
+            externalHoldStateIsReadable: true,
+            authorityMode: .macStandalone
+        ))
+        #expect(!AppDelegate.automaticRateLimitResetRedemptionIsEnabled(
+            preferenceEnabled: true,
+            externalHoldStateIsReadable: true,
+            authorityMode: .vpsAuthority
+        ))
+        #expect(AppDelegate.localRateLimitResetSubmissionIsAuthorized(
+            authorityMode: .macStandalone
+        ))
+        #expect(!AppDelegate.localRateLimitResetSubmissionIsAuthorized(
+            authorityMode: .vpsAuthority
         ))
     }
 
@@ -388,6 +427,19 @@ struct AppDelegateRateLimitResetGuardTests {
     func unreadableResetJournalFailsClosed() {
         #expect(AppDelegate.rateLimitResetJournalAllowsAutomaticRouting(isReadable: true))
         #expect(!AppDelegate.rateLimitResetJournalAllowsAutomaticRouting(isReadable: false))
+    }
+
+    @Test("Reset revalidation maps quota authentication failures to credential gating")
+    func resetRevalidationClassifiesPollerAuthenticationFailures() {
+        #expect(AppDelegate.rateLimitResetServiceError(for: PollerError.tokenExpired)
+            == .httpError(401))
+        #expect(AppDelegate.rateLimitResetServiceError(for: PollerError.httpError(403))
+            == .httpError(403))
+        #expect(AppDelegate.rateLimitResetServiceError(for: PollerError.rateLimited)
+            == .httpError(429))
+        #expect(RateLimitResetFailurePolicy.classify(
+            AppDelegate.rateLimitResetServiceError(for: PollerError.tokenExpired)
+        ) == .authentication)
     }
 
     @Test("Manual redemption accepts durable committed state without weakening automatic redemption")

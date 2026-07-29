@@ -7,7 +7,7 @@
       "used_percent": 33,
       "limit_window_seconds": 86400,
       "reset_after_seconds": 72000,
-      "reset_at": 1780536593
+      "reset_at": 4102444800
     }
   },
   "additional_rate_limits": [
@@ -21,7 +21,7 @@
           "used_percent": 19,
           "limit_window_seconds": 604800,
           "reset_after_seconds": 500000,
-          "reset_at": 1781036593
+          "reset_at": 4102444800
         }
       }
     }

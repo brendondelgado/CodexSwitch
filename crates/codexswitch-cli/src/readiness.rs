@@ -5,7 +5,6 @@ use crate::activation::{
     activation_record_confirms_current, read_activation_record_for_store, ActivationState,
 };
 use crate::auth::{account_token_fingerprint, auth_file_fingerprint};
-#[cfg(not(target_os = "linux"))]
 use crate::bounded_command;
 use crate::codex_update;
 use crate::reload::{
@@ -22,11 +21,11 @@ use std::collections::HashMap;
 #[cfg(any(test, target_os = "linux"))]
 use std::fs;
 #[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-#[cfg(not(target_os = "linux"))]
 use std::process::Command;
-#[cfg(not(target_os = "linux"))]
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,7 +180,15 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
     };
     let activation_barrier = !activation_barrier_clear;
 
-    let daemon_running = daemon_is_running()?;
+    let daemon_running = match daemon_is_running() {
+        Ok(running) => running,
+        Err(error) => {
+            issues.push(format!(
+                "managed CodexSwitch coordinator ownership could not be verified: {error:#}"
+            ));
+            false
+        }
+    };
     if !daemon_running {
         issues.push(if cfg!(target_os = "macos") {
             "CodexSwitch menu coordinator is not running".to_string()
@@ -412,7 +419,7 @@ fn daemon_is_running() -> Result<bool> {
 fn daemon_discovery_dispatch() -> DaemonDiscoveryFn {
     #[cfg(target_os = "linux")]
     {
-        daemon_is_running_via_procfs
+        daemon_is_running_via_systemd
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -421,41 +428,124 @@ fn daemon_discovery_dispatch() -> DaemonDiscoveryFn {
 }
 
 #[cfg(target_os = "linux")]
-fn daemon_is_running_via_procfs() -> Result<bool> {
-    let current_uid = unsafe { libc_geteuid() };
-    for entry in fs::read_dir("/proc").context("failed to read /proc")? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Ok(pid) = name.parse::<i32>() else {
-            continue;
-        };
-        if pid == std::process::id() as i32 {
-            continue;
-        }
-        let proc_dir = entry.path();
-        let Ok(metadata) = fs::metadata(&proc_dir) else {
-            continue;
-        };
-        if metadata.uid() != current_uid {
-            continue;
-        }
-        let command_line = fs::read(proc_dir.join("cmdline"))
-            .map(|data| {
-                String::from_utf8_lossy(&data)
-                    .split('\0')
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-        if is_codexswitch_daemon_command_line(&command_line) {
-            return Ok(true);
+fn daemon_is_running_via_systemd() -> Result<bool> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .context("HOME is unavailable for managed daemon verification")?;
+    let expected_fragment = home.join(".config/systemd/user/codexswitch.service");
+    let current_executable = fs::canonicalize(std::env::current_exe()?)
+        .context("failed to resolve the current CodexSwitch executable")?;
+    let output = bounded_command::output(
+        Command::new("systemctl")
+            .arg("--user")
+            .arg("show")
+            .arg("codexswitch.service")
+            .args([
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=FragmentPath",
+                "--property=MainPID",
+            ]),
+        Duration::from_secs(3),
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .context("failed to inspect the exact managed codexswitch.service unit")?;
+    if !output.status.success() {
+        anyhow::bail!("systemctl exited with {}", output.status);
+    }
+    if !output.stderr.is_empty() {
+        anyhow::bail!("systemctl emitted stderr while verifying codexswitch.service");
+    }
+    managed_daemon_is_running_from_systemd_output(&output.stdout, &expected_fragment, |pid| {
+        linux_process_matches_managed_daemon(pid, &current_executable)
+    })
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn managed_daemon_is_running_from_systemd_output<Verify>(
+    output: &[u8],
+    expected_fragment: &Path,
+    verify_process: Verify,
+) -> Result<bool>
+where
+    Verify: FnOnce(i32) -> Result<bool>,
+{
+    let output = std::str::from_utf8(output).context("systemctl output was not UTF-8")?;
+    let mut properties = HashMap::new();
+    for line in output.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .context("systemctl returned malformed property output")?;
+        if properties.insert(key, value).is_some() {
+            anyhow::bail!("systemctl returned duplicate property {key}");
         }
     }
-    Ok(false)
+    for property in ["LoadState", "ActiveState", "FragmentPath", "MainPID"] {
+        if !properties.contains_key(property) {
+            anyhow::bail!("systemctl omitted {property}");
+        }
+    }
+    if properties.len() != 4 {
+        anyhow::bail!("systemctl returned unexpected properties");
+    }
+    if properties["LoadState"] != "loaded" {
+        return Ok(false);
+    }
+    if Path::new(properties["FragmentPath"]) != expected_fragment {
+        anyhow::bail!("codexswitch.service fragment provenance drifted");
+    }
+    let metadata = fs::symlink_metadata(expected_fragment).with_context(|| {
+        format!(
+            "failed to inspect managed service fragment {}",
+            expected_fragment.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!("managed service fragment is not a regular non-symlink file");
+    }
+    let pid = properties["MainPID"]
+        .parse::<i32>()
+        .context("systemd MainPID was invalid")?;
+    match properties["ActiveState"] {
+        "inactive" if pid == 0 => Ok(false),
+        "active" | "activating" | "reloading" if pid > 0 => {
+            if verify_process(pid)? {
+                Ok(true)
+            } else {
+                anyhow::bail!("codexswitch.service MainPID does not match the managed executable")
+            }
+        }
+        state => anyhow::bail!(
+            "codexswitch.service reported inconsistent state {state:?} with MainPID {pid}"
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_matches_managed_daemon(pid: i32, expected_executable: &Path) -> Result<bool> {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let metadata = fs::metadata(&proc_dir)
+        .with_context(|| format!("failed to inspect codexswitch.service MainPID {pid}"))?;
+    if metadata.uid() != unsafe { libc_geteuid() } {
+        return Ok(false);
+    }
+    let executable = fs::canonicalize(proc_dir.join("exe"))
+        .with_context(|| format!("failed to resolve codexswitch.service MainPID {pid}"))?;
+    if executable != expected_executable {
+        return Ok(false);
+    }
+    let command_line = fs::read(proc_dir.join("cmdline"))
+        .with_context(|| format!("failed to read codexswitch.service MainPID {pid}"))?;
+    let arguments = command_line
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect::<Vec<_>>();
+    let argv0_matches = arguments.first().is_some_and(|argument| {
+        fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(argument)))
+            .is_ok_and(|path| path == expected_executable)
+    });
+    Ok(arguments.len() == 2 && argv0_matches && arguments[1] == b"daemon")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -780,6 +870,73 @@ invalid row
     }
 
     #[test]
+    fn linux_readiness_requires_the_exact_managed_systemd_unit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fragment = dir.path().join("codexswitch.service");
+        fs::write(
+            &fragment,
+            b"[Service]\nExecStart=/managed/codexswitch-cli daemon\n",
+        )?;
+        let active = format!(
+            "LoadState=loaded\nActiveState=active\nFragmentPath={}\nMainPID=4242\n",
+            fragment.display()
+        );
+        assert!(managed_daemon_is_running_from_systemd_output(
+            active.as_bytes(),
+            &fragment,
+            |pid| Ok(pid == 4242),
+        )?);
+
+        let inactive = format!(
+            "LoadState=loaded\nActiveState=inactive\nFragmentPath={}\nMainPID=0\n",
+            fragment.display()
+        );
+        let mut inspected_unmanaged_process = false;
+        assert!(!managed_daemon_is_running_from_systemd_output(
+            inactive.as_bytes(),
+            &fragment,
+            |_| {
+                inspected_unmanaged_process = true;
+                Ok(true)
+            },
+        )?);
+        assert!(!inspected_unmanaged_process);
+        Ok(())
+    }
+
+    #[test]
+    fn linux_readiness_rejects_fragment_or_main_pid_identity_drift() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fragment = dir.path().join("codexswitch.service");
+        fs::write(&fragment, b"[Service]\n")?;
+        let wrong_fragment = dir.path().join("codexswitch-emergency.service");
+        fs::write(&wrong_fragment, b"[Service]\n")?;
+
+        let drifted_fragment = format!(
+            "LoadState=loaded\nActiveState=active\nFragmentPath={}\nMainPID=4242\n",
+            wrong_fragment.display()
+        );
+        assert!(managed_daemon_is_running_from_systemd_output(
+            drifted_fragment.as_bytes(),
+            &fragment,
+            |_| Ok(true),
+        )
+        .is_err());
+
+        let drifted_pid = format!(
+            "LoadState=loaded\nActiveState=active\nFragmentPath={}\nMainPID=4242\n",
+            fragment.display()
+        );
+        assert!(managed_daemon_is_running_from_systemd_output(
+            drifted_pid.as_bytes(),
+            &fragment,
+            |_| Ok(false),
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn ps_daemon_parser_recognizes_the_macos_menu_coordinator() {
         let ps_output = "\
   510  501 /Applications/CodexSwitch.app/Contents/MacOS/CodexSwitch
@@ -805,7 +962,10 @@ invalid row
         let selected = daemon_discovery_dispatch() as *const () as usize;
 
         #[cfg(target_os = "linux")]
-        assert_eq!(selected, daemon_is_running_via_procfs as *const () as usize);
+        assert_eq!(
+            selected,
+            daemon_is_running_via_systemd as *const () as usize
+        );
         #[cfg(not(target_os = "linux"))]
         assert_eq!(selected, daemon_is_running_via_ps as *const () as usize);
     }

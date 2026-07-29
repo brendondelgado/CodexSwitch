@@ -55,6 +55,7 @@ cross_dependencies:
   - ../../scripts/codex-vps
   - ../../scripts/patch-asar.py
   - ../../scripts/test_patch_asar.py
+  - ../../scripts/lib/install-linux-common.sh
   - ../../scripts/lib/systemd-start-barrier.py
   - macos-runtime-discovery.md
   - macos-runtime-artifact.md
@@ -64,7 +65,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-28
+  last_updated: 2026-07-29
 ---
 
 # Runtime And Host Ownership
@@ -142,6 +143,14 @@ path. The menu app publishes it atomically whenever endpoint settings change,
 even when readiness notifications are disabled. The Rust client honors normal
 OpenSSH host aliases while overriding batch mode, identity selection, host-key
 checking, connection attempts, and timeouts.
+
+Banked-reset ownership is not inferred from whether that transport currently
+parses. The persisted `standaloneMac` or `vpsAuthority` mode is the authority
+source. Valid remote configuration migrates to `vpsAuthority`; missing or
+invalid mode also fails closed to VPS ownership. Endpoint corruption therefore
+blocks remote reset transport without authorizing a Mac-local manual or
+automatic fallback. Standalone ownership requires an explicit stored selection
+and no valid remote endpoint.
 
 Runtime-triggered remote rotations also use a durable Mac operation journal and
 a bounded VPS operation history. A retry reuses the same operation identifier.
@@ -1122,6 +1131,18 @@ Logs distinguish reused evidence from a newly sent SIGHUP. A retry targets only
 missing runtimes, so one unsupported or unacknowledged historical CLI cannot
 cause repeated desktop auth notifications, window refreshes, or composer loss
 in a runtime that already converged.
+An automatic retry may reuse an acknowledgement only after revalidating that
+same PID, process start identity, owner, runtime kind, kernel executable
+identity, executable vnode, canonical auth-file identity, provider account,
+complete token fingerprint, request nonce, and ACK freshness. Receipt-bound
+handoffs additionally require the existing request nonce to remain bound to the
+same caller receipt. A PID-only match, a newly started replacement process, or
+an ACK for another credential generation is never reusable. Partial convergence
+therefore remains `CommittedDegraded`; the next due attempt preserves every
+still-valid acknowledgement and writes a new request or sends SIGHUP only to
+the exact verified runtimes still missing evidence. The retry never kills,
+restarts, or broadly signals a session, and an identity change remains degraded
+until fresh discovery can converge that new exact runtime.
 After that process exits, the next due convergence attempt observes the changed
 topology and may converge without relaunching CodexSwitch. There is no separate
 retry-exhaustion topology watcher or second recovery clock. Every attempt still
@@ -1391,8 +1412,13 @@ actor boundary on every supported Swift 6 toolchain.
   `releases` directory; the next activation normalizes it to the relative form.
 - Build and preparation use bounded memory and storage away from live runtime paths.
 - Activation occurs only through the deployment runbook after readiness and
-  deployment-quiescence checks. Quiescence does not relax the runtime ACK
-  contract.
+  deployment-quiescence checks. Positive quiescence means every managed
+  account-bearing runtime and activation-blocking unit is independently
+  observed inactive both before and after the continuously held runtime guards.
+  Active, unknown, incomplete, or identity-drifted evidence blocks activation.
+  Deployment accepts no stop or restart compatibility flag and never obtains
+  quiescence by stopping an owner itself; an operator must establish the idle
+  boundary separately. Quiescence does not relax the runtime ACK contract.
 - Linux activation prevents a systemd start race with a manager-visible,
   token-owned barrier for every activation-blocking unit. A loaded unit uses a
   false condition drop-in. A `LoadState=not-found` unit uses an exact runtime

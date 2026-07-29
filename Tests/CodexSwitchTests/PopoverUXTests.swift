@@ -47,7 +47,7 @@ struct PopoverUXTests {
             contentsOfFile: "Sources/CodexSwitch/Views/PopoverContentView.swift",
             encoding: .utf8
         )
-        #expect(source?.contains("Text(\"Pool Target\")") == true)
+        #expect(source?.contains("Text(Self.poolTargetLabel(") == true)
         #expect(source?.contains("Self.macConvergenceLabel") == true)
         #expect(source?.contains("Self.vpsConvergenceLabel") == true)
     }
@@ -226,8 +226,14 @@ struct PopoverUXTests {
         let absent = PopoverContentView.nextWeeklyResetAccount(from: [denied, windowless], now: now)
         #expect(absent?.account.email == "denied@example.com")
         let next = PopoverContentView.nextWeeklyResetAccount(from: [denied, windowless, exhausted], now: now)
+        let authorityFiltered = PopoverContentView.nextWeeklyResetAccount(
+            from: [denied, windowless, exhausted],
+            activeProviderAccountId: denied.accountId,
+            now: now
+        )
         let exhaustedSummary = PooledUsageMeterView.stateSummary(for: [exhausted])
         #expect(next != nil)
+        #expect(authorityFiltered?.account.id == exhausted.id)
         #expect(exhaustedSummary.deniedCount == 0)
         #expect(exhaustedSummary.exhaustedCount == 1)
         #expect(exhaustedSummary.unknownCount == 0)

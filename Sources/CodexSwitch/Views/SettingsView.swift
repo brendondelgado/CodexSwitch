@@ -16,8 +16,11 @@ struct SettingsView: View {
     @AppStorage("linuxDevboxUser") private var linuxDevboxUser = ""
     @AppStorage("linuxDevboxSSHKeyPath") private var linuxDevboxSSHKeyPath = ""
     @AppStorage("linuxDevboxSSHPort") private var linuxDevboxSSHPort = 22
+    @AppStorage(LinuxDevboxMonitorSettings.resetAuthorityModeDefaultsKey)
+    private var resetAuthorityModeRawValue = AutomaticRateLimitResetOwner.vpsAuthority.rawValue
 
     var accounts: [CodexAccount] = []
+    var rateLimitResetPresentations: [UUID: RateLimitResetInventoryPresentation] = [:]
     var onRemoveAllAccounts: (() -> Void)?
     @ObservedObject var desktopUpdateCoordinator: CodexDesktopUpdateCoordinator
     var onInstallDesktopUpdate: (() -> Void)?
@@ -35,6 +38,11 @@ struct SettingsView: View {
     @State private var linuxExportError: String?
     @State private var linuxMonitorResult: String?
     @State private var linuxMonitorHealthy: Bool?
+    @State private var remoteAutomaticResetPolicy: LinuxDevboxAutomaticResetPolicyObservation?
+    @State private var remoteAutomaticResetPolicyStatus: String?
+    @State private var remoteAutomaticResetPolicyStatusIsError = false
+    @State private var remoteAutomaticResetPolicyIsBusy = false
+    @State private var remoteAutomaticResetPolicyRequestGeneration: UInt64 = 0
 
     private static let lastCheckedFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -69,7 +77,70 @@ struct SettingsView: View {
             }
 
             Section("Banked Resets") {
-                Toggle("Automatically use banked resets", isOn: $automaticRateLimitResetRedemption)
+                Picker(
+                    "Reset authority",
+                    selection: Binding(
+                        get: { automaticResetAuthorityMode },
+                        set: { updateAutomaticResetAuthorityMode(to: $0) }
+                    )
+                ) {
+                    Text("VPS").tag(AutomaticRateLimitResetOwner.vpsAuthority)
+                    Text("This Mac").tag(AutomaticRateLimitResetOwner.macStandalone)
+                }
+                .pickerStyle(.segmented)
+                .disabled(linuxDevboxSettings.hasRemoteAuthorityEndpoint)
+
+                HStack {
+                    Toggle(
+                        "Automatically use banked resets",
+                        isOn: Binding(
+                            get: { automaticResetPolicyToggleValue },
+                            set: { updateAutomaticResetPolicy(to: $0) }
+                        )
+                    )
+                    .disabled(!automaticResetPolicyToggleAllowsMutation)
+
+                    if linuxDevboxSettings.usesVPSResetAuthority {
+                        if remoteAutomaticResetPolicyIsBusy {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Button {
+                                Task { await refreshAutomaticResetPolicy() }
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Refresh VPS automatic-reset policy")
+                        }
+                    }
+                }
+
+                if linuxDevboxSettings.usesVPSResetAuthority,
+                   let remoteAutomaticResetPolicyStatus {
+                    Text(remoteAutomaticResetPolicyStatus)
+                        .font(.caption)
+                        .foregroundStyle(
+                            remoteAutomaticResetPolicyStatusIsError ? .red : .secondary
+                        )
+                }
+                Label(
+                    PooledUsageMeterView.routingTierStatusText(for: accounts),
+                    systemImage: "list.number"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Label(
+                    Self.resetInventoryStatusText(
+                        accounts: accounts,
+                        presentations: rateLimitResetPresentations,
+                        now: Date()
+                    ),
+                    systemImage: "arrow.counterclockwise.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Section("Codex CLI") {
@@ -342,7 +413,7 @@ struct SettingsView: View {
                 Button("Test VPS Readiness") {
                     testLinuxDevboxMonitor()
                 }
-                .disabled(!linuxDevboxMonitorEnabled)
+                .disabled(!linuxDevboxSettings.isConfigured)
 
                 if let linuxMonitorResult {
                     Text(linuxMonitorResult)
@@ -395,6 +466,61 @@ struct SettingsView: View {
             appManagementPermissionRequired =
                 DesktopPatchManager.appManagementPermissionRequired
         }
+        .onChange(of: linuxDevboxSettings.hasRemoteAuthorityEndpoint) { _, isConfigured in
+            if isConfigured {
+                resetAuthorityModeRawValue = AutomaticRateLimitResetOwner.vpsAuthority.rawValue
+            }
+        }
+        .task(id: linuxDevboxSettings) {
+            await refreshAutomaticResetPolicy()
+        }
+    }
+
+    static func resetInventoryStatusText(
+        accounts: [CodexAccount],
+        presentations: [UUID: RateLimitResetInventoryPresentation],
+        now: Date
+    ) -> String {
+        let resolvedPresentations = Dictionary(uniqueKeysWithValues: accounts.map { account in
+            if let presentation = presentations[account.id] {
+                return (account.id, presentation)
+            }
+            let bank = account.rateLimitResetBank
+            let hasExpiredAvailableCredit = bank?.credits.contains { credit in
+                credit.isAvailable && credit.expiresAt.map { $0 <= now } == true
+            } ?? false
+            return (
+                account.id,
+                RateLimitResetInventoryPresentation.resolve(
+                    availableCount: bank?.availableCount ?? 0,
+                    nextExpiration: bank?.nextExpiration(at: now),
+                    inventoryIsFresh: bank.map {
+                        $0.isFresh(
+                            at: now,
+                            maxAge: RateLimitResetInventoryObservation.presentationMaximumAge
+                        ) && $0.structurallyValidAvailableCredits(at: now) != nil
+                    } ?? false,
+                    inventoryExists: bank != nil,
+                    inventoryHasExpiredAvailableCredit: hasExpiredAvailableCredit,
+                    inventoryIsStructurallyValid: bank.map {
+                        $0.structurallyValidAvailableCredits(at: now) != nil
+                    } ?? false,
+                    now: now
+                )
+            )
+        })
+        let summary = PooledRateLimitResetPresentation.summarize(
+            accounts: accounts,
+            presentations: resolvedPresentations,
+            now: now
+        )
+        return PooledUsageMeterView.rateLimitResetStatusText(
+            for: summary,
+            nextExpirationText: nil,
+            fetchedAtText: summary.currentCountFetchedAt.map {
+                PooledUsageMeterView.inventoryAgeText(fetchedAt: $0, now: now)
+            }
+        )
     }
 
     private var desktopUpdateStatusColor: Color {
@@ -448,13 +574,7 @@ struct SettingsView: View {
     }
 
     private func testLinuxDevboxMonitor() {
-        let settings = LinuxDevboxMonitorSettings(
-            enabled: linuxDevboxMonitorEnabled,
-            host: linuxDevboxHost,
-            user: linuxDevboxUser,
-            sshKeyPath: linuxDevboxSSHKeyPath,
-            port: linuxDevboxSSHPort
-        )
+        let settings = linuxDevboxSettings
         Task.detached {
             let result = LinuxDevboxMonitor.check(settings: settings)
             await MainActor.run {
@@ -468,5 +588,194 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    static func automaticResetPolicyToggleValue(
+        localPreference: Bool,
+        settings: LinuxDevboxMonitorSettings,
+        remoteObservation: LinuxDevboxAutomaticResetPolicyObservation?
+    ) -> Bool {
+        guard settings.usesVPSResetAuthority else {
+            return localPreference
+        }
+        return remoteObservation?.automaticRateLimitResetRedemption ?? false
+    }
+
+    static func automaticResetPolicyToggleAllowsMutation(
+        settings: LinuxDevboxMonitorSettings,
+        remoteObservation: LinuxDevboxAutomaticResetPolicyObservation?,
+        isBusy: Bool
+    ) -> Bool {
+        guard !isBusy else { return false }
+        guard settings.usesVPSResetAuthority else { return true }
+        return settings.hasUsableVPSResetAuthorityTransport
+            && remoteObservation != nil
+    }
+
+    private var automaticResetPolicyToggleValue: Bool {
+        Self.automaticResetPolicyToggleValue(
+            localPreference: automaticRateLimitResetRedemption,
+            settings: linuxDevboxSettings,
+            remoteObservation: remoteAutomaticResetPolicy
+        )
+    }
+
+    private var automaticResetPolicyToggleAllowsMutation: Bool {
+        Self.automaticResetPolicyToggleAllowsMutation(
+            settings: linuxDevboxSettings,
+            remoteObservation: remoteAutomaticResetPolicy,
+            isBusy: remoteAutomaticResetPolicyIsBusy
+        )
+    }
+
+    @MainActor
+    private func refreshAutomaticResetPolicy() async {
+        let settings = linuxDevboxSettings
+        remoteAutomaticResetPolicyRequestGeneration &+= 1
+        let generation = remoteAutomaticResetPolicyRequestGeneration
+
+        guard settings.usesVPSResetAuthority else {
+            remoteAutomaticResetPolicy = nil
+            remoteAutomaticResetPolicyStatus = nil
+            remoteAutomaticResetPolicyStatusIsError = false
+            remoteAutomaticResetPolicyIsBusy = false
+            return
+        }
+
+        guard settings.hasRemoteAuthorityEndpoint else {
+            remoteAutomaticResetPolicy = nil
+            remoteAutomaticResetPolicyStatus =
+                "VPS reset authority endpoint is unavailable; local fallback is disabled"
+            remoteAutomaticResetPolicyStatusIsError = true
+            remoteAutomaticResetPolicyIsBusy = false
+            return
+        }
+
+        remoteAutomaticResetPolicyIsBusy = true
+        remoteAutomaticResetPolicyStatus = "Reading automatic-reset policy from VPS..."
+        remoteAutomaticResetPolicyStatusIsError = false
+        let result = await Task.detached {
+            LinuxDevboxMonitor.automaticResetPolicy(settings: settings)
+        }.value
+        guard generation == remoteAutomaticResetPolicyRequestGeneration,
+              settings == linuxDevboxSettings else {
+            return
+        }
+        applyAutomaticResetPolicyResult(result)
+    }
+
+    private func updateAutomaticResetPolicy(to enabled: Bool) {
+        let settings = linuxDevboxSettings
+        guard settings.usesVPSResetAuthority else {
+            automaticRateLimitResetRedemption = enabled
+            return
+        }
+        guard settings.hasUsableVPSResetAuthorityTransport,
+              remoteAutomaticResetPolicy != nil,
+              !remoteAutomaticResetPolicyIsBusy else {
+            return
+        }
+
+        remoteAutomaticResetPolicyRequestGeneration &+= 1
+        let generation = remoteAutomaticResetPolicyRequestGeneration
+        remoteAutomaticResetPolicyIsBusy = true
+        remoteAutomaticResetPolicyStatus = "Updating VPS automatic-reset policy..."
+        remoteAutomaticResetPolicyStatusIsError = false
+        Task {
+            let mutation = await Task.detached {
+                LinuxDevboxMonitor.setAutomaticResetPolicy(
+                    settings: settings,
+                    enabled: enabled
+                )
+            }.value
+            guard generation == remoteAutomaticResetPolicyRequestGeneration,
+                  settings == linuxDevboxSettings else {
+                return
+            }
+
+            switch mutation {
+            case .success(let observation):
+                remoteAutomaticResetPolicy = observation
+                remoteAutomaticResetPolicyStatus = "VPS policy changed; verifying..."
+                let refreshed = await Task.detached {
+                    LinuxDevboxMonitor.automaticResetPolicy(settings: settings)
+                }.value
+                guard generation == remoteAutomaticResetPolicyRequestGeneration,
+                      settings == linuxDevboxSettings else {
+                    return
+                }
+                switch refreshed {
+                case .success:
+                    applyAutomaticResetPolicyResult(refreshed)
+                case .failure:
+                    remoteAutomaticResetPolicyIsBusy = false
+                    remoteAutomaticResetPolicyStatus = "VPS policy changed, but verification failed"
+                    remoteAutomaticResetPolicyStatusIsError = true
+                }
+            case .failure(let failure):
+                if failure.disposition == .outcomeUnknown {
+                    remoteAutomaticResetPolicy = nil
+                }
+                remoteAutomaticResetPolicyIsBusy = false
+                remoteAutomaticResetPolicyStatus = failure.message
+                remoteAutomaticResetPolicyStatusIsError = true
+            }
+        }
+    }
+
+    private func applyAutomaticResetPolicyResult(
+        _ result: Result<
+            LinuxDevboxAutomaticResetPolicyObservation,
+            LinuxDevboxAutomaticResetPolicyFailure
+        >
+    ) {
+        remoteAutomaticResetPolicyIsBusy = false
+        switch result {
+        case .success(let observation):
+            remoteAutomaticResetPolicy = observation
+            remoteAutomaticResetPolicyStatusIsError = false
+            switch observation.state {
+            case .configured:
+                let state = observation.automaticRateLimitResetRedemption
+                    ? "enabled"
+                    : "disabled"
+                remoteAutomaticResetPolicyStatus = "VPS automatic-reset policy is \(state)"
+            case .missing:
+                remoteAutomaticResetPolicyStatus = "VPS policy is not configured; automatic resets are disabled"
+            case .invalid:
+                remoteAutomaticResetPolicyStatus = "VPS policy is invalid; automatic resets are disabled"
+                remoteAutomaticResetPolicyStatusIsError = true
+            }
+        case .failure(let failure):
+            remoteAutomaticResetPolicy = nil
+            remoteAutomaticResetPolicyStatus = failure.message
+            remoteAutomaticResetPolicyStatusIsError = true
+        }
+    }
+
+    private var automaticResetAuthorityMode: AutomaticRateLimitResetOwner {
+        linuxDevboxSettings.effectiveResetAuthorityMode
+    }
+
+    private func updateAutomaticResetAuthorityMode(
+        to mode: AutomaticRateLimitResetOwner
+    ) {
+        guard !linuxDevboxSettings.hasRemoteAuthorityEndpoint || mode == .vpsAuthority else {
+            return
+        }
+        resetAuthorityModeRawValue = mode.rawValue
+    }
+
+    private var linuxDevboxSettings: LinuxDevboxMonitorSettings {
+        LinuxDevboxMonitorSettings(
+            enabled: linuxDevboxMonitorEnabled,
+            host: linuxDevboxHost,
+            user: linuxDevboxUser,
+            sshKeyPath: linuxDevboxSSHKeyPath,
+            port: linuxDevboxSSHPort,
+            resetAuthorityMode: AutomaticRateLimitResetOwner(
+                rawValue: resetAuthorityModeRawValue
+            ) ?? .vpsAuthority
+        )
     }
 }

@@ -367,6 +367,10 @@ impl QuotaWindow {
         )
     }
 
+    fn has_valid_usage_observation(&self) -> bool {
+        self.used_percent.is_finite() && self.used_percent >= 0.0
+    }
+
     pub fn remaining_percent(&self) -> f64 {
         (100.0 - self.used_percent).max(0.0)
     }
@@ -382,14 +386,16 @@ impl QuotaWindow {
     pub fn is_exhausted(&self) -> bool {
         self.has_valid_duration()
             && self.is_known()
-            && (self.hard_limit_reached || self.remaining_percent() < 1.0)
+            && (self.hard_limit_reached
+                || (self.has_valid_usage_observation() && self.remaining_percent() < 1.0))
     }
 
     pub fn should_auto_swap_away(&self) -> bool {
         self.has_valid_duration()
             && self.is_known()
             && (self.hard_limit_reached
-                || self.remaining_percent() < AUTO_SWAP_DISPLAYED_ONE_PERCENT_THRESHOLD)
+                || (self.has_valid_usage_observation()
+                    && self.remaining_percent() < AUTO_SWAP_DISPLAYED_ONE_PERCENT_THRESHOLD))
     }
 
     fn looks_like_backend_usage_placeholder(&self, fetched_at: Option<f64>) -> bool {
@@ -452,13 +458,22 @@ impl QuotaSnapshot {
         windows.into_iter().map(|(_, window)| window).collect()
     }
 
-    pub fn is_denied(&self) -> bool {
+    fn provider_denied(&self) -> bool {
         self.allowed == Some(false) || self.limit_reached == Some(true)
+    }
+
+    /// Provider flags are advisory. A known zero-capacity window is denied for
+    /// routing even when the provider returns `allowed=true`.
+    pub fn is_denied(&self) -> bool {
+        self.provider_denied()
+            || self.windows.iter().any(|window| {
+                window.has_valid_duration() && window.is_known() && window.is_exhausted()
+            })
     }
 
     pub fn blocking_windows(&self) -> Vec<&QuotaWindow> {
         let windows = self.ordered_windows();
-        if self.is_denied() {
+        if self.provider_denied() {
             return windows
                 .into_iter()
                 .filter(|window| window.is_known())
@@ -490,7 +505,22 @@ impl QuotaSnapshot {
         if !self.is_fresh_at(now) {
             return QuotaAvailability::Unknown;
         }
-        if self.is_denied() || !self.blocking_windows().is_empty() {
+        if self.windows.iter().any(|window| {
+            window.has_valid_duration() && window.is_known() && window.resets_at <= now
+        }) {
+            return QuotaAvailability::Unknown;
+        }
+        if self.is_denied() {
+            return QuotaAvailability::Blocked;
+        }
+        if self.windows.iter().any(|window| {
+            window.has_valid_duration()
+                && window.is_known()
+                && !window.has_valid_usage_observation()
+        }) {
+            return QuotaAvailability::Unknown;
+        }
+        if !self.blocking_windows().is_empty() {
             return QuotaAvailability::Blocked;
         }
         if self
@@ -1605,12 +1635,19 @@ pub fn validate_accounts(accounts: &[CodexAccount]) -> Result<()> {
         if account.id.is_nil() || !local_ids.insert(account.id) {
             bail!("account store contains a missing or duplicate local account identity");
         }
-        let provider_id = account.account_id.trim();
-        if provider_id.is_empty() || !provider_ids.insert(provider_id.to_string()) {
+        let Some(provider_id) = normalize_provider_account_id(&account.account_id) else {
+            bail!("account store contains a missing provider account identity");
+        };
+        if !provider_ids.insert(provider_id) {
             bail!("account store contains a missing or duplicate provider account identity");
         }
     }
     Ok(())
+}
+
+pub(crate) fn normalize_provider_account_id(account_id: &str) -> Option<String> {
+    let normalized = account_id.trim().to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 pub fn remove_placeholder_quota_snapshots(accounts: &[CodexAccount]) -> Vec<CodexAccount> {
@@ -1644,12 +1681,16 @@ pub fn active_account(accounts: &[CodexAccount]) -> Option<&CodexAccount> {
 }
 
 pub fn resolve_account_selector(accounts: &[CodexAccount], selector: &str) -> Result<Uuid> {
+    let trimmed_selector = selector.trim();
+    let normalized_provider_selector = normalize_provider_account_id(trimmed_selector);
     let matches = accounts
         .iter()
         .filter(|account| {
-            account.account_id == selector
-                || account.email.eq_ignore_ascii_case(selector)
-                || account.id.to_string() == selector
+            normalize_provider_account_id(&account.account_id)
+                .zip(normalized_provider_selector.as_ref())
+                .is_some_and(|(stored, selected)| stored == selected.as_str())
+                || account.email.eq_ignore_ascii_case(trimmed_selector)
+                || account.id.to_string() == trimmed_selector
         })
         .map(|account| account.id)
         .collect::<HashSet<_>>();
@@ -1683,14 +1724,18 @@ pub fn quota_availability_at(account: &CodexAccount, now: DateTime<Utc>) -> Quot
         return QuotaAvailability::Unknown;
     }
     if !account.has_usable_inference_token_at(now) {
-        return QuotaAvailability::Blocked;
+        return QuotaAvailability::Unknown;
     }
-    if account.runtime_unusable_at(now) {
-        return QuotaAvailability::Blocked;
-    }
-    real_quota_snapshot(account)
+    let quota_availability = real_quota_snapshot(account)
         .map(|snapshot| snapshot.availability_at(now))
-        .unwrap_or(QuotaAvailability::Unknown)
+        .unwrap_or(QuotaAvailability::Unknown);
+    if account.runtime_unusable_at(now)
+        && (!account.runtime_block_is_usage_limit()
+            || quota_availability != QuotaAvailability::Blocked)
+    {
+        return QuotaAvailability::Unknown;
+    }
+    quota_availability
 }
 
 impl CodexAccount {
@@ -1802,6 +1847,10 @@ fn candidate_cmp(
     right: &CodexAccount,
     now: DateTime<Utc>,
 ) -> std::cmp::Ordering {
+    let plan_order = left.plan_priority().cmp(&right.plan_priority());
+    if plan_order != std::cmp::Ordering::Equal {
+        return plan_order;
+    }
     if should_use_five_hour_reset_tiebreaker(left, right) {
         let left_reset = reset_timestamp(real_quota_snapshot(left).unwrap().five_hour().unwrap());
         let right_reset = reset_timestamp(real_quota_snapshot(right).unwrap().five_hour().unwrap());
@@ -1865,17 +1914,6 @@ pub fn usage_limit_runtime_block_until(
 pub fn mark_runtime_unusable(account: &mut CodexAccount, reason: &str, until: DateTime<Utc>) {
     account.runtime_unusable_until = Some(until);
     account.runtime_unusable_reason = Some(reason.to_string());
-
-    if normalized_runtime_reason_is_usage_limit(reason) {
-        let snapshot = account.quota_snapshot.get_or_insert_with(|| QuotaSnapshot {
-            allowed: Some(false),
-            limit_reached: Some(true),
-            fetched_at: Utc::now(),
-            windows: Vec::new(),
-        });
-        snapshot.allowed = Some(false);
-        snapshot.limit_reached = Some(true);
-    }
 }
 
 #[cfg(test)]
@@ -2004,7 +2042,7 @@ mod tests {
             kind,
             duration_seconds,
             used_percent,
-            resets_at: DateTime::<Utc>::from_timestamp(978_307_200, 0).unwrap(),
+            resets_at: DateTime::<Utc>::from_timestamp(4_102_444_800, 0).unwrap(),
             source: QuotaWindowSourceMetadata::new(
                 QuotaWindowRateLimitSource::Main,
                 QuotaWindowSlot::Primary,
@@ -2141,6 +2179,20 @@ mod tests {
     }
 
     #[test]
+    fn expired_quota_window_is_unknown_even_when_usage_looks_usable() {
+        let now = Utc::now();
+        let mut candidate = account_with_plan("expired@example.com", 10.0, 20.0, true, "pro");
+        let snapshot = candidate.quota_snapshot.as_mut().unwrap();
+        snapshot.fetched_at = now;
+        snapshot.weekly_mut().unwrap().resets_at = now - ChronoDuration::seconds(1);
+
+        assert_eq!(
+            quota_availability_at(&candidate, now),
+            QuotaAvailability::Unknown
+        );
+    }
+
+    #[test]
     fn save_accounts_removes_placeholder_quota_snapshots() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store_path = dir.path().join("accounts.json");
@@ -2168,20 +2220,31 @@ mod tests {
             account_with_plan("later@example.com", 0.0, 47.0, false, "plus");
         let mut earlier_reset_slightly_less_weekly =
             account_with_plan("earlier@example.com", 0.0, 48.0, false, "plus");
+        let now = Utc::now();
+        later_reset_slightly_more_weekly
+            .quota_snapshot
+            .as_mut()
+            .unwrap()
+            .fetched_at = now;
+        earlier_reset_slightly_less_weekly
+            .quota_snapshot
+            .as_mut()
+            .unwrap()
+            .fetched_at = now;
         later_reset_slightly_more_weekly
             .quota_snapshot
             .as_mut()
             .unwrap()
             .five_hour_mut()
             .unwrap()
-            .resets_at = datetime_from_swift_value(&json!(14_400.0)).unwrap();
+            .resets_at = now + ChronoDuration::hours(4);
         earlier_reset_slightly_less_weekly
             .quota_snapshot
             .as_mut()
             .unwrap()
             .five_hour_mut()
             .unwrap()
-            .resets_at = datetime_from_swift_value(&json!(600.0)).unwrap();
+            .resets_at = now + ChronoDuration::minutes(10);
 
         assert_eq!(
             select_auto_swap_candidate(
@@ -2190,7 +2253,7 @@ mod tests {
                     later_reset_slightly_more_weekly,
                     earlier_reset_slightly_less_weekly,
                 ],
-                Utc::now(),
+                now,
             )
             .map(|account| account.email.as_str()),
             Some("earlier@example.com")
@@ -2204,25 +2267,36 @@ mod tests {
             account_with_plan("earlier-low@example.com", 0.0, 60.0, false, "plus");
         let mut later_reset_high_weekly =
             account_with_plan("later-high@example.com", 0.0, 20.0, false, "plus");
+        let now = Utc::now();
+        earlier_reset_low_weekly
+            .quota_snapshot
+            .as_mut()
+            .unwrap()
+            .fetched_at = now;
+        later_reset_high_weekly
+            .quota_snapshot
+            .as_mut()
+            .unwrap()
+            .fetched_at = now;
         earlier_reset_low_weekly
             .quota_snapshot
             .as_mut()
             .unwrap()
             .five_hour_mut()
             .unwrap()
-            .resets_at = datetime_from_swift_value(&json!(600.0)).unwrap();
+            .resets_at = now + ChronoDuration::minutes(10);
         later_reset_high_weekly
             .quota_snapshot
             .as_mut()
             .unwrap()
             .five_hour_mut()
             .unwrap()
-            .resets_at = datetime_from_swift_value(&json!(14_400.0)).unwrap();
+            .resets_at = now + ChronoDuration::hours(4);
 
         assert_eq!(
             select_auto_swap_candidate(
                 &[active, earlier_reset_low_weekly, later_reset_high_weekly],
-                Utc::now(),
+                now,
             )
             .map(|account| account.email.as_str()),
             Some("later-high@example.com")
@@ -2595,7 +2669,7 @@ mod tests {
         assert!(activate_account(&mut [first.clone(), second], first.id).is_err());
 
         let mut duplicate_provider = account("other@example.com", 10.0, 10.0, false);
-        duplicate_provider.account_id = first.account_id.clone();
+        duplicate_provider.account_id = format!("  {}  ", first.account_id.to_ascii_uppercase());
         assert!(validate_accounts(&[first, duplicate_provider]).is_err());
     }
 
@@ -2635,6 +2709,19 @@ mod tests {
             account("same@example.com", 10.0, 10.0, false),
         ];
         assert!(resolve_account_selector(&accounts, "same@example.com").is_err());
+    }
+
+    #[test]
+    fn provider_selector_normalizes_both_stored_and_supplied_identifiers() -> Result<()> {
+        let mut selected = account("selected@example.com", 10.0, 10.0, true);
+        selected.account_id = "  Provider-Account-ID  ".to_string();
+        let expected = selected.id;
+
+        assert_eq!(
+            resolve_account_selector(&[selected], " provider-account-id ")?,
+            expected
+        );
+        Ok(())
     }
 
     #[test]
@@ -2741,7 +2828,7 @@ mod tests {
 
         assert_eq!(
             quota_availability_at(&candidate, now),
-            QuotaAvailability::Blocked
+            QuotaAvailability::Unknown
         );
         assert!(select_auto_swap_candidate_from_observations(
             &[active.clone(), candidate.clone()],
@@ -2753,7 +2840,7 @@ mod tests {
         candidate.access_token = test_inference_token(now + INFERENCE_TOKEN_SAFETY_WINDOW);
         assert_eq!(
             quota_availability_at(&candidate, now),
-            QuotaAvailability::Blocked
+            QuotaAvailability::Unknown
         );
         candidate.access_token =
             test_inference_token(now + INFERENCE_TOKEN_SAFETY_WINDOW + ChronoDuration::seconds(1));
@@ -2765,7 +2852,7 @@ mod tests {
         candidate.access_token = "not-a-jwt".to_string();
         assert_eq!(
             quota_availability_at(&candidate, now),
-            QuotaAvailability::Blocked
+            QuotaAvailability::Unknown
         );
     }
 
@@ -2926,6 +3013,84 @@ mod tests {
     }
 
     #[test]
+    fn allowed_true_never_overrides_zero_capacity() {
+        let now = Utc::now();
+        let active = account_with_plan("active@example.com", 100.0, 100.0, true, "pro");
+        let mut contradictory =
+            account_with_plan("contradictory@example.com", 0.0, 100.0, false, "pro");
+        let snapshot = contradictory.quota_snapshot.as_mut().unwrap();
+        snapshot.allowed = Some(true);
+        snapshot.limit_reached = Some(false);
+        snapshot.fetched_at = now;
+
+        assert!(snapshot.is_denied());
+        assert_eq!(snapshot.minimum_remaining_percent(), Some(0.0));
+        assert_eq!(
+            quota_availability_at(&contradictory, now),
+            QuotaAvailability::Blocked
+        );
+
+        let mut observations = CurrentQuotaObservations::new(now);
+        assert!(observations.record_success(&contradictory));
+        assert!(select_auto_swap_candidate_from_observations(
+            &[active, contradictory],
+            &observations,
+            now,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn invalid_usage_observation_fails_closed() {
+        let now = Utc::now();
+        let mut candidate = account("candidate@example.com", 10.0, 10.0, false);
+        candidate
+            .quota_snapshot
+            .as_mut()
+            .unwrap()
+            .weekly_mut()
+            .unwrap()
+            .used_percent = -1.0;
+
+        assert_eq!(
+            quota_availability_at(&candidate, now),
+            QuotaAvailability::Unknown
+        );
+        assert_eq!(score(&candidate, now), -1.0);
+    }
+
+    #[test]
+    fn free_capacity_is_an_absolute_last_resort_after_verified_paid_capacity() {
+        let active = account_with_plan("active@example.com", 100.0, 100.0, true, "pro");
+        let free = account_with_plan("free@example.com", 0.0, 0.0, false, "free");
+        let plus = account_with_plan("plus@example.com", 98.0, 98.0, false, "plus");
+        let pro = account_with_plan("pro@example.com", 98.0, 98.0, false, "pro");
+        let now = Utc::now();
+
+        let accounts = vec![active, free, plus, pro];
+        let mut observations = CurrentQuotaObservations::new(now - ChronoDuration::seconds(1));
+        for account in accounts.iter().filter(|account| !account.is_active) {
+            assert!(observations.record_success(account));
+        }
+
+        assert_eq!(
+            select_auto_swap_candidate_from_observations(&accounts, &observations, now)
+                .map(|account| account.email.as_str()),
+            Some("pro@example.com")
+        );
+        assert_eq!(
+            select_auto_swap_candidate_from_observations(&accounts[..3], &observations, now)
+                .map(|account| account.email.as_str()),
+            Some("plus@example.com")
+        );
+        assert_eq!(
+            select_auto_swap_candidate_from_observations(&accounts[..2], &observations, now)
+                .map(|account| account.email.as_str()),
+            Some("free@example.com")
+        );
+    }
+
+    #[test]
     fn unknown_only_snapshot_is_diagnostic_not_candidate_capacity() -> Result<()> {
         let active = account("active@example.com", 100.0, 100.0, true);
         let mut unknown = account_with_plan("unknown@example.com", 10.0, 10.0, false, "pro");
@@ -3023,22 +3188,50 @@ mod tests {
     }
 
     #[test]
-    fn runtime_usage_limit_without_telemetry_fabricates_no_windows() {
-        let mut blocked = account("blocked@example.com", 10.0, 10.0, false);
-        blocked.quota_snapshot = None;
-
+    fn runtime_blocks_never_fabricate_quota_exhaustion() {
+        let now = Utc::now();
+        let mut missing = account("missing@example.com", 10.0, 10.0, false);
+        missing.quota_snapshot = None;
         mark_runtime_unusable(
-            &mut blocked,
+            &mut missing,
             "usage_limit",
-            Utc::now() + chrono::Duration::hours(5),
+            now + chrono::Duration::hours(5),
+        );
+        assert!(missing.quota_snapshot.is_none());
+        assert_eq!(
+            quota_availability_at(&missing, now),
+            QuotaAvailability::Unknown
         );
 
-        let snapshot = blocked.quota_snapshot.as_ref().unwrap();
-        assert!(snapshot.is_denied());
-        assert!(snapshot.windows.is_empty());
+        let mut green = account("green@example.com", 10.0, 10.0, false);
+        green.quota_snapshot.as_mut().unwrap().fetched_at = now;
+        mark_runtime_unusable(&mut green, "usage_limit", now + chrono::Duration::hours(5));
+        assert_eq!(green.quota_snapshot.as_ref().unwrap().allowed, Some(true));
         assert_eq!(
-            snapshot.availability_at(Utc::now()),
+            quota_availability_at(&green, now),
+            QuotaAvailability::Unknown
+        );
+
+        let mut exhausted = account("exhausted@example.com", 100.0, 100.0, false);
+        exhausted.quota_snapshot.as_mut().unwrap().fetched_at = now;
+        mark_runtime_unusable(
+            &mut exhausted,
+            "usage_limit",
+            now + chrono::Duration::hours(5),
+        );
+        assert_eq!(
+            quota_availability_at(&exhausted, now),
             QuotaAvailability::Blocked
+        );
+
+        mark_runtime_unusable(
+            &mut exhausted,
+            "token_expired",
+            now + chrono::Duration::days(30),
+        );
+        assert_eq!(
+            quota_availability_at(&exhausted, now),
+            QuotaAvailability::Unknown
         );
     }
 

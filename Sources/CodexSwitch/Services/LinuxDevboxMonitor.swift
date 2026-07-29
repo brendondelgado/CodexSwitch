@@ -3,25 +3,64 @@ import Darwin
 import Foundation
 import Security
 
+enum AutomaticRateLimitResetOwner: String, Codable, Equatable, Hashable, Sendable {
+    case macStandalone = "standaloneMac"
+    case vpsAuthority
+}
+
 struct LinuxDevboxMonitorSettings: Equatable, Sendable {
     static let maximumHostBytes = 253
     static let maximumUserBytes = 64
     static let maximumSSHKeyPathBytes = 4 * 1_024
+    static let resetAuthorityModeDefaultsKey = "rateLimitResetAuthorityMode"
 
     let enabled: Bool
     let host: String
     let user: String
     let sshKeyPath: String
     let port: Int
+    let resetAuthorityMode: AutomaticRateLimitResetOwner
+
+    init(
+        enabled: Bool,
+        host: String,
+        user: String,
+        sshKeyPath: String,
+        port: Int,
+        resetAuthorityMode: AutomaticRateLimitResetOwner = .vpsAuthority
+    ) {
+        self.enabled = enabled
+        self.host = host
+        self.user = user
+        self.sshKeyPath = sshKeyPath
+        self.port = port
+        self.resetAuthorityMode = resetAuthorityMode
+    }
 
     var isConfigured: Bool {
-        enabled && hasRemoteAuthorityEndpoint
+        hasRemoteAuthorityEndpoint
+    }
+
+    var readinessNotificationsEnabled: Bool {
+        enabled && isConfigured
     }
 
     var hasRemoteAuthorityEndpoint: Bool {
         Self.isValidHost(host)
             && Self.isValidUser(user)
             && (1...65_535).contains(port)
+    }
+
+    var effectiveResetAuthorityMode: AutomaticRateLimitResetOwner {
+        hasRemoteAuthorityEndpoint ? .vpsAuthority : resetAuthorityMode
+    }
+
+    var usesVPSResetAuthority: Bool {
+        effectiveResetAuthorityMode == .vpsAuthority
+    }
+
+    var hasUsableVPSResetAuthorityTransport: Bool {
+        usesVPSResetAuthority && hasRemoteAuthorityEndpoint
     }
 
     fileprivate static func isBoundedPrintable(
@@ -448,6 +487,58 @@ struct LinuxDevboxMonitorFailure: Error, Equatable, Sendable {
     }
 }
 
+enum LinuxDevboxManualResetFailureDisposition: Equatable, Sendable {
+    case rejected
+    case retryablePreExecution
+    case outcomeUnknown
+
+    var allowsAutomaticRetry: Bool {
+        self == .retryablePreExecution
+    }
+}
+
+struct LinuxDevboxManualResetFailure: Error, Equatable, Sendable {
+    let message: String
+    let disposition: LinuxDevboxManualResetFailureDisposition
+}
+
+struct LinuxDevboxManualResetResult: Equatable, Sendable {
+    let providerAccountId: String
+    let wasActive: Bool
+    let submittedReset: Bool
+    let previousBankedResets: Int
+    let bankedResetsRemaining: Int
+    let remainingPercent: Double?
+}
+
+enum LinuxDevboxAutomaticResetPolicyState: String, Decodable, Equatable, Sendable {
+    case configured
+    case missing
+    case invalid
+}
+
+struct LinuxDevboxAutomaticResetPolicyObservation: Decodable, Equatable, Sendable {
+    let schemaVersion: Int
+    let automaticRateLimitResetRedemption: Bool
+    let state: LinuxDevboxAutomaticResetPolicyState
+    let authority: String
+}
+
+enum LinuxDevboxAutomaticResetPolicyFailureDisposition: Equatable, Sendable {
+    case rejected
+    case retryablePreExecution
+    case outcomeUnknown
+
+    var allowsAutomaticMutationRetry: Bool {
+        self == .retryablePreExecution
+    }
+}
+
+struct LinuxDevboxAutomaticResetPolicyFailure: Error, Equatable, Sendable {
+    let message: String
+    let disposition: LinuxDevboxAutomaticResetPolicyFailureDisposition
+}
+
 struct LinuxDevboxCredentialStateEvidence: Equatable, Sendable {
     let accountIdentityFingerprint: String
     let credentialSetFingerprint: String
@@ -689,6 +780,10 @@ enum LinuxDevboxCredentialSyncReconciliation: Equatable, Sendable {
 
 enum LinuxDevboxMonitor {
     static let maximumRemoteProviderAccountIdBytes = 256
+    static let maximumManualResetResultBytes = 16 * 1_024
+    static let maximumAutomaticResetPolicyResultBytes = 16 * 1_024
+    static let manualResetTimeout: TimeInterval = 3 * 60
+    static let automaticResetPolicyTimeout: TimeInterval = 30
 
     enum SSHRetryPolicy: Equatable, Sendable {
         case readOnly
@@ -704,6 +799,15 @@ enum LinuxDevboxMonitor {
     private struct SSHCommandOutcome: Sendable {
         let result: ProcessRunResult
         let executionState: RemoteCommandExecutionState
+    }
+
+    private struct RemoteManualResetResponse: Decodable, Sendable {
+        let accountId: String
+        let wasActive: Bool
+        let submittedReset: Bool
+        let previousBankedResets: Int
+        let bankedResetsRemaining: Int
+        let remainingPercent: Double?
     }
 
     enum RemotePollingMode: Equatable, Sendable {
@@ -862,6 +966,24 @@ enum LinuxDevboxMonitor {
         return String(hasher.finalize().map { String(format: "%02x", $0) }.joined().prefix(12))
     }
 
+    static func credentialStateEvidenceMatches(
+        accounts: [CodexAccount],
+        observed: LinuxDevboxCredentialStateEvidence
+    ) -> Bool {
+        guard let active = accounts.first(where: \.isActive),
+              accounts.filter(\.isActive).count == 1,
+              let credentialSetFingerprint = credentialSetFingerprint(accounts: accounts),
+              let activeTokenHashPrefix = activeTokenHashPrefix(accounts: accounts) else {
+            return false
+        }
+        return observed.accountIdentityFingerprint
+                == credentialAccountIdentityFingerprint(accounts: accounts)
+            && observed.credentialSetFingerprint == credentialSetFingerprint
+            && observed.activeProviderAccountId == active.accountId
+            && observed.activeTokenHashPrefix == activeTokenHashPrefix
+            && observed.authMatchesActiveStoreToken
+    }
+
     static func makeCredentialSyncOperation(
         settings: LinuxDevboxMonitorSettings,
         accounts: [CodexAccount],
@@ -1003,12 +1125,36 @@ enum LinuxDevboxMonitor {
     }
 
     static func settings(from defaults: UserDefaults = .standard) -> LinuxDevboxMonitorSettings {
-        LinuxDevboxMonitorSettings(
+        let endpointSettings = LinuxDevboxMonitorSettings(
             enabled: defaults.bool(forKey: "linuxDevboxMonitorEnabled"),
             host: defaults.string(forKey: "linuxDevboxHost") ?? "",
             user: defaults.string(forKey: "linuxDevboxUser") ?? "",
             sshKeyPath: defaults.string(forKey: "linuxDevboxSSHKeyPath") ?? "",
-            port: max(defaults.integer(forKey: "linuxDevboxSSHPort"), 22)
+            port: max(defaults.integer(forKey: "linuxDevboxSSHPort"), 22),
+            resetAuthorityMode: .vpsAuthority
+        )
+        let storedMode = defaults.string(
+            forKey: LinuxDevboxMonitorSettings.resetAuthorityModeDefaultsKey
+        ).flatMap(AutomaticRateLimitResetOwner.init(rawValue:))
+        let mode: AutomaticRateLimitResetOwner
+        if endpointSettings.hasRemoteAuthorityEndpoint {
+            mode = .vpsAuthority
+        } else {
+            mode = storedMode ?? .vpsAuthority
+        }
+        if storedMode != mode {
+            defaults.set(
+                mode.rawValue,
+                forKey: LinuxDevboxMonitorSettings.resetAuthorityModeDefaultsKey
+            )
+        }
+        return LinuxDevboxMonitorSettings(
+            enabled: endpointSettings.enabled,
+            host: endpointSettings.host,
+            user: endpointSettings.user,
+            sshKeyPath: endpointSettings.sshKeyPath,
+            port: endpointSettings.port,
+            resetAuthorityMode: mode
         )
     }
 
@@ -1527,6 +1673,275 @@ enum LinuxDevboxMonitor {
             ))
         }
         return .success(resolution(observation))
+    }
+
+    static func redeemReset(
+        settings: LinuxDevboxMonitorSettings,
+        providerAccountId: String
+    ) -> Result<LinuxDevboxManualResetResult, LinuxDevboxManualResetFailure> {
+        guard settings.hasUsableVPSResetAuthorityTransport else {
+            return .failure(LinuxDevboxManualResetFailure(
+                message: "VPS reset authority transport is unavailable; local fallback is disabled",
+                disposition: .rejected
+            ))
+        }
+        return redeemResetWithCandidates(
+            sshArgumentCandidates(settings: settings),
+            providerAccountId: providerAccountId
+        ) { executableURL, arguments, timeout in
+            ProcessRunner.run(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: timeout,
+                maxOutputBytes: maximumManualResetResultBytes
+            )
+        }
+    }
+
+    static func automaticResetPolicy(
+        settings: LinuxDevboxMonitorSettings
+    ) -> Result<LinuxDevboxAutomaticResetPolicyObservation, LinuxDevboxAutomaticResetPolicyFailure> {
+        guard settings.hasUsableVPSResetAuthorityTransport else {
+            return .failure(LinuxDevboxAutomaticResetPolicyFailure(
+                message: "VPS reset authority transport is unavailable; local fallback is disabled",
+                disposition: .rejected
+            ))
+        }
+        return automaticResetPolicyWithCandidates(
+            sshArgumentCandidates(settings: settings)
+        ) { executableURL, arguments, timeout in
+            ProcessRunner.run(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: timeout,
+                maxOutputBytes: maximumAutomaticResetPolicyResultBytes
+            )
+        }
+    }
+
+    static func automaticResetPolicyWithCandidates(
+        _ candidates: [[String]],
+        executionToken: String = UUID().uuidString.lowercased(),
+        runner: (URL, [String], TimeInterval) -> ProcessRunResult
+    ) -> Result<LinuxDevboxAutomaticResetPolicyObservation, LinuxDevboxAutomaticResetPolicyFailure> {
+        let outcome = runSSHOutcomeWithCandidates(
+            candidates,
+            remoteCommand: remoteAutomaticResetPolicyGetCommand(),
+            timeout: automaticResetPolicyTimeout,
+            retryPolicy: .readOnly,
+            executionToken: executionToken,
+            runner: runner
+        )
+        let result = outcome.result
+        guard outcome.executionState == .completed,
+              !result.timedOut,
+              result.terminationStatus == 0,
+              !result.stdoutTruncated,
+              !result.stderrTruncated,
+              result.stdout.count <= maximumAutomaticResetPolicyResultBytes else {
+            return .failure(LinuxDevboxAutomaticResetPolicyFailure(
+                message: "Could not read the VPS automatic-reset policy",
+                disposition: .retryablePreExecution
+            ))
+        }
+        return decodeAutomaticResetPolicyObservation(result.stdout)
+    }
+
+    static func setAutomaticResetPolicy(
+        settings: LinuxDevboxMonitorSettings,
+        enabled: Bool
+    ) -> Result<LinuxDevboxAutomaticResetPolicyObservation, LinuxDevboxAutomaticResetPolicyFailure> {
+        guard settings.hasUsableVPSResetAuthorityTransport else {
+            return .failure(LinuxDevboxAutomaticResetPolicyFailure(
+                message: "VPS reset authority transport is unavailable; local fallback is disabled",
+                disposition: .rejected
+            ))
+        }
+        return setAutomaticResetPolicyWithCandidates(
+            sshArgumentCandidates(settings: settings),
+            enabled: enabled
+        ) { executableURL, arguments, timeout in
+            ProcessRunner.run(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: timeout,
+                maxOutputBytes: maximumAutomaticResetPolicyResultBytes
+            )
+        }
+    }
+
+    static func setAutomaticResetPolicyWithCandidates(
+        _ candidates: [[String]],
+        enabled: Bool,
+        executionToken: String = UUID().uuidString.lowercased(),
+        runner: (URL, [String], TimeInterval) -> ProcessRunResult
+    ) -> Result<LinuxDevboxAutomaticResetPolicyObservation, LinuxDevboxAutomaticResetPolicyFailure> {
+        let outcome = runSSHOutcomeWithCandidates(
+            candidates,
+            remoteCommand: remoteAutomaticResetPolicySetCommand(enabled: enabled),
+            timeout: automaticResetPolicyTimeout,
+            retryPolicy: .preExecutionTransportOnly,
+            executionToken: executionToken,
+            runner: runner
+        )
+        let result = outcome.result
+
+        guard outcome.executionState != .notStarted else {
+            return .failure(LinuxDevboxAutomaticResetPolicyFailure(
+                message: "VPS automatic-reset policy update did not start",
+                disposition: .retryablePreExecution
+            ))
+        }
+        guard outcome.executionState == .completed,
+              !result.timedOut,
+              result.terminationStatus == 0,
+              !result.stdoutTruncated,
+              !result.stderrTruncated,
+              result.stdout.count <= maximumAutomaticResetPolicyResultBytes else {
+            return .failure(LinuxDevboxAutomaticResetPolicyFailure(
+                message: "VPS automatic-reset policy outcome is unknown; refresh before changing it again",
+                disposition: .outcomeUnknown
+            ))
+        }
+
+        switch decodeAutomaticResetPolicyObservation(result.stdout) {
+        case .success(let observation)
+            where observation.state == .configured
+                && observation.automaticRateLimitResetRedemption == enabled:
+            return .success(observation)
+        case .success, .failure:
+            return .failure(LinuxDevboxAutomaticResetPolicyFailure(
+                message: "VPS automatic-reset policy response could not prove the requested value; refresh before changing it again",
+                disposition: .outcomeUnknown
+            ))
+        }
+    }
+
+    static func decodeAutomaticResetPolicyObservation(
+        _ data: Data
+    ) -> Result<LinuxDevboxAutomaticResetPolicyObservation, LinuxDevboxAutomaticResetPolicyFailure> {
+        guard data.count <= maximumAutomaticResetPolicyResultBytes else {
+            return .failure(LinuxDevboxAutomaticResetPolicyFailure(
+                message: "VPS automatic-reset policy response is invalid",
+                disposition: .rejected
+            ))
+        }
+        do {
+            let observation = try JSONDecoder().decode(
+                LinuxDevboxAutomaticResetPolicyObservation.self,
+                from: data
+            )
+            guard observation.schemaVersion == 1,
+                  observation.authority == "vps",
+                  observation.state == .configured
+                    || !observation.automaticRateLimitResetRedemption else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: [],
+                    debugDescription: "Automatic-reset policy failed validation"
+                ))
+            }
+            return .success(observation)
+        } catch {
+            return .failure(LinuxDevboxAutomaticResetPolicyFailure(
+                message: "VPS automatic-reset policy response is invalid",
+                disposition: .rejected
+            ))
+        }
+    }
+
+    static func redeemResetWithCandidates(
+        _ candidates: [[String]],
+        providerAccountId: String,
+        executionToken: String = UUID().uuidString.lowercased(),
+        runner: (URL, [String], TimeInterval) -> ProcessRunResult
+    ) -> Result<LinuxDevboxManualResetResult, LinuxDevboxManualResetFailure> {
+        guard let normalizedProviderAccountId = normalizedRemoteProviderAccountId(
+            providerAccountId
+        ), let command = remoteManualResetCommand(
+            providerAccountId: normalizedProviderAccountId
+        ) else {
+            return .failure(LinuxDevboxManualResetFailure(
+                message: "Manual reset requires one stable provider account ID",
+                disposition: .rejected
+            ))
+        }
+
+        let outcome = runSSHOutcomeWithCandidates(
+            candidates,
+            remoteCommand: command,
+            timeout: manualResetTimeout,
+            retryPolicy: .preExecutionTransportOnly,
+            executionToken: executionToken,
+            runner: runner
+        )
+        let result = outcome.result
+
+        guard outcome.executionState != .notStarted else {
+            return .failure(LinuxDevboxManualResetFailure(
+                message: "Manual reset request did not start",
+                disposition: .retryablePreExecution
+            ))
+        }
+        guard outcome.executionState == .completed,
+              !result.timedOut,
+              result.terminationStatus == 0,
+              !result.stdoutTruncated,
+              !result.stderrTruncated,
+              result.stdout.count <= maximumManualResetResultBytes else {
+            return .failure(LinuxDevboxManualResetFailure(
+                message: "Manual reset outcome is unknown; reconcile VPS reset state before retrying",
+                disposition: .outcomeUnknown
+            ))
+        }
+
+        return decodeManualResetResult(
+            result.stdout,
+            expectedProviderAccountId: normalizedProviderAccountId
+        )
+    }
+
+    static func decodeManualResetResult(
+        _ data: Data,
+        expectedProviderAccountId: String
+    ) -> Result<LinuxDevboxManualResetResult, LinuxDevboxManualResetFailure> {
+        guard data.count <= maximumManualResetResultBytes,
+              let expectedProviderAccountId = normalizedRemoteProviderAccountId(
+                expectedProviderAccountId
+              ) else {
+            return .failure(LinuxDevboxManualResetFailure(
+                message: "Manual reset result is invalid; reconcile VPS reset state before retrying",
+                disposition: .outcomeUnknown
+            ))
+        }
+
+        do {
+            let response = try JSONDecoder().decode(RemoteManualResetResponse.self, from: data)
+            guard let responseProviderAccountId = normalizedRemoteProviderAccountId(
+                response.accountId
+            ), responseProviderAccountId == expectedProviderAccountId,
+                  response.previousBankedResets >= 0,
+                  response.bankedResetsRemaining >= 0,
+                  response.bankedResetsRemaining <= response.previousBankedResets,
+                  response.remainingPercent.map({ $0.isFinite && (0...100).contains($0) }) ?? true else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: [],
+                    debugDescription: "Manual reset result failed validation"
+                ))
+            }
+            return .success(LinuxDevboxManualResetResult(
+                providerAccountId: responseProviderAccountId,
+                wasActive: response.wasActive,
+                submittedReset: response.submittedReset,
+                previousBankedResets: response.previousBankedResets,
+                bankedResetsRemaining: response.bankedResetsRemaining,
+                remainingPercent: response.remainingPercent
+            ))
+        } catch {
+            return .failure(LinuxDevboxManualResetFailure(
+                message: "Manual reset result is invalid; reconcile VPS reset state before retrying",
+                disposition: .outcomeUnknown
+            ))
+        }
     }
 
     static func pollAccount(
@@ -2271,6 +2686,35 @@ enum LinuxDevboxMonitor {
 
     static func remotePoolTargetRequestCommand(_ request: PoolAuthorityRequest) -> String {
         "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli request-pool-target \(shellQuote(request.selector)) --request-id \(shellQuote(request.requestId)) --expected-epoch \(request.expectedEpoch) --reason \(shellQuote(request.reason)) --json"
+    }
+
+    static func normalizedRemoteProviderAccountId(_ value: String) -> String? {
+        guard let normalized = RateLimitResetProviderAccountIdentity.normalize(value),
+              LinuxDevboxMonitorSettings.isBoundedPrintable(
+                normalized,
+                maximumBytes: maximumRemoteProviderAccountIdBytes
+              ) else {
+            return nil
+        }
+        return normalized
+    }
+
+    static func remoteManualResetCommand(providerAccountId: String) -> String? {
+        guard let providerAccountId = normalizedRemoteProviderAccountId(
+            providerAccountId
+        ) else {
+            return nil
+        }
+        return "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli redeem-reset \(shellQuote(providerAccountId)) --json"
+    }
+
+    static func remoteAutomaticResetPolicyGetCommand() -> String {
+        "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy get --json"
+    }
+
+    static func remoteAutomaticResetPolicySetCommand(enabled: Bool) -> String {
+        let state = enabled ? "enabled" : "disabled"
+        return "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy set \(state) --json"
     }
 
     static func scpArgumentCandidates(settings: LinuxDevboxMonitorSettings) -> [[String]] {

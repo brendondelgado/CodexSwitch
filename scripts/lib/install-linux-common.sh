@@ -795,8 +795,11 @@ validate_configuration() {
   if [[ "$ACTIVATE" == "1" ]]; then
     require_reviewed_runtime_provenance
   fi
-  if [[ "${CODEXSWITCH_RESTART_DAEMON:-0}" != "0" || "${CODEXSWITCH_RESTART_APP_SERVER:-0}" != "0" ]]; then
-    fail "restart flags are obsolete; activation never restarts a runtime (use an explicit post-commit CODEXSWITCH_START_* flag only for a positively inactive owner)"
+  if [[ "${CODEXSWITCH_STOP_DAEMON:-0}" != "0" ||
+        "${CODEXSWITCH_STOP_APP_SERVER:-0}" != "0" ||
+        "${CODEXSWITCH_RESTART_DAEMON:-0}" != "0" ||
+        "${CODEXSWITCH_RESTART_APP_SERVER:-0}" != "0" ]]; then
+    fail "stop/restart flags are prohibited; activation requires independent positive quiescence proof and never stops or restarts a runtime"
   fi
   if [[ -n "$TEST_PROCESS_START_IDENTITY" ]]; then
     [[ "$TEST_MODE" == "1" && "$TEST_PROCESS_START_IDENTITY" =~ ^[1-9][0-9]*$ ]] || fail "CODEXSWITCH_TEST_PROCESS_START_IDENTITY requires test mode and a numeric identity"

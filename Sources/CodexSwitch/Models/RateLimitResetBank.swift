@@ -128,6 +128,9 @@ enum RateLimitResetPolicy {
         guard account.hasCompleteRuntimeCredentials else {
             return "Complete runtime credentials are required to redeem a reset"
         }
+        guard account.hasUsableInferenceToken(at: now) else {
+            return "Refresh this account's credentials before redeeming a reset"
+        }
         guard let bank,
               bank.isFresh(at: now),
               bank.hasAvailableReset(at: now) else {
@@ -210,6 +213,7 @@ enum RateLimitResetPolicy {
     ) -> RateLimitResetRedemptionReason? {
         guard account.planPriority > 1,
               account.hasCompleteRuntimeCredentials,
+              account.hasUsableInferenceToken(at: now),
               bank.isFresh(at: now),
               bank.hasAvailableReset(at: now),
               let snapshot = account.realQuotaSnapshot(at: now),

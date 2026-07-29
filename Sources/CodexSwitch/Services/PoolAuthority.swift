@@ -214,6 +214,57 @@ struct PoolAuthorityObservation: Codable, Equatable, Sendable {
   }
 }
 
+enum ActiveAccountAuthorityFreshness: Equatable, Sendable {
+  case current
+  case stale
+  case unavailable
+}
+
+struct ActiveAccountReadModel: Equatable, Sendable {
+  let providerAccountId: String?
+  let epoch: UInt64?
+  let freshness: ActiveAccountAuthorityFreshness
+
+  static let unavailable = ActiveAccountReadModel(
+    providerAccountId: nil,
+    epoch: nil,
+    freshness: .unavailable
+  )
+
+  init(
+    providerAccountId: String,
+    epoch: UInt64,
+    freshness: ActiveAccountAuthorityFreshness
+  ) {
+    precondition(freshness != .unavailable)
+    self.providerAccountId = providerAccountId
+    self.epoch = epoch
+    self.freshness = freshness
+  }
+
+  init(lastObservation: PoolAuthorityObservation?, now: Date) {
+    guard let lastObservation else {
+      self = .unavailable
+      return
+    }
+    self.init(
+      providerAccountId: lastObservation.desiredProviderAccountId,
+      epoch: lastObservation.epoch,
+      freshness: lastObservation.isFresh(at: now) ? .current : .stale
+    )
+  }
+
+  private init(
+    providerAccountId: String?,
+    epoch: UInt64?,
+    freshness: ActiveAccountAuthorityFreshness
+  ) {
+    self.providerAccountId = providerAccountId
+    self.epoch = epoch
+    self.freshness = freshness
+  }
+}
+
 struct PoolAuthorityRequest: Equatable, Sendable {
   let selector: String
   let requestId: String

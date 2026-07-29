@@ -4,6 +4,125 @@ import Testing
 
 @Suite("Banked rate-limit resets")
 struct RateLimitResetServiceTests {
+    @Test("Reset failures have stable typed classifications")
+    func classifiesResetFailures() {
+        #expect(RateLimitResetFailurePolicy.classify(.httpError(401)) == .authentication)
+        #expect(RateLimitResetFailurePolicy.classify(.httpError(403)) == .authentication)
+        #expect(RateLimitResetFailurePolicy.classify(.submissionUnauthorized) == .authentication)
+        #expect(RateLimitResetFailurePolicy.classify(.httpError(429)) == .rateLimited)
+        #expect(RateLimitResetFailurePolicy.classify(.httpError(404)) == .unsupported)
+        #expect(RateLimitResetFailurePolicy.classify(.httpError(405)) == .unsupported)
+        #expect(RateLimitResetFailurePolicy.classify(.httpError(501)) == .unsupported)
+        #expect(RateLimitResetFailurePolicy.classify(.invalidResponse) == .malformed)
+        #expect(RateLimitResetFailurePolicy.classify(.malformedInventory) == .malformed)
+        #expect(RateLimitResetFailurePolicy.classify(.transport("offline")) == .transient)
+        #expect(RateLimitResetFailurePolicy.classify(.httpError(503)) == .transient)
+    }
+
+    @Test("Authentication failures wait for credential change")
+    func authenticationFailureBackoff() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let decision = RateLimitResetFailurePolicy.retryDecision(
+            for: .httpError(401),
+            consecutiveFailureCount: 99,
+            now: now
+        )
+
+        #expect(decision.classification == .authentication)
+        #expect(decision.retryAt == nil)
+        #expect(decision.waitsForCredentialChange)
+        #expect(!decision.permitsAutomaticRetry)
+    }
+
+    @Test("Authentication retry stays blocked until the credential generation changes")
+    func authenticationFailureStateTracksCredentialGeneration() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = RateLimitResetFailurePolicy.updatedState(
+            for: .httpError(401),
+            credentialFingerprint: "generation-a",
+            previous: nil,
+            now: now
+        )
+        let repeated = RateLimitResetFailurePolicy.updatedState(
+            for: .httpError(401),
+            credentialFingerprint: "generation-a",
+            previous: first,
+            now: now.addingTimeInterval(60)
+        )
+
+        #expect(first.blocksRetry(
+            currentCredentialFingerprint: "generation-a",
+            now: now.addingTimeInterval(86_400)
+        ))
+        #expect(!first.blocksRetry(
+            currentCredentialFingerprint: "generation-b",
+            now: now
+        ))
+        #expect(repeated.consecutiveFailureCount == 2)
+
+        let newGeneration = RateLimitResetFailurePolicy.updatedState(
+            for: .transport("offline"),
+            credentialFingerprint: "generation-b",
+            previous: repeated,
+            now: now
+        )
+        #expect(newGeneration.consecutiveFailureCount == 1)
+    }
+
+    @Test("Rate-limit, unsupported, and malformed failures use bounded delays")
+    func nonTransientFailureBackoff() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        #expect(RateLimitResetFailurePolicy.retryDecision(
+            for: .httpError(429),
+            consecutiveFailureCount: 1,
+            now: now
+        ).retryAt == now.addingTimeInterval(15 * 60))
+        #expect(RateLimitResetFailurePolicy.retryDecision(
+            for: .httpError(404),
+            consecutiveFailureCount: 1,
+            now: now
+        ).retryAt == now.addingTimeInterval(6 * 60 * 60))
+        #expect(RateLimitResetFailurePolicy.retryDecision(
+            for: .malformedInventory,
+            consecutiveFailureCount: 1,
+            now: now
+        ).retryAt == now.addingTimeInterval(30 * 60))
+    }
+
+    @Test("Transient failures back off exponentially and stop growing")
+    func transientFailureBackoff() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        #expect(RateLimitResetFailurePolicy.retryDecision(
+            for: .transport("offline"),
+            consecutiveFailureCount: 1,
+            now: now
+        ).retryAt == now.addingTimeInterval(60))
+        #expect(RateLimitResetFailurePolicy.retryDecision(
+            for: .transport("offline"),
+            consecutiveFailureCount: 3,
+            now: now
+        ).retryAt == now.addingTimeInterval(240))
+        #expect(RateLimitResetFailurePolicy.retryDecision(
+            for: .transport("offline"),
+            consecutiveFailureCount: 20,
+            now: now
+        ).retryAt == now.addingTimeInterval(30 * 60))
+    }
+
+    @Test("Reset service errors expose useful diagnostics instead of enum ordinals")
+    func resetErrorsHaveReadableDescriptions() {
+        #expect(
+            RateLimitResetServiceError.malformedInventory.localizedDescription
+                == "Reset inventory response was malformed"
+        )
+        #expect(
+            RateLimitResetServiceError.httpError(429).localizedDescription
+                == "Reset inventory request failed (HTTP 429)"
+        )
+    }
+
     @Test("Inventory parses fractional dates and chooses the oldest expiration")
     func parsesInventoryAndOrdersCredits() async throws {
         let data = Data(
@@ -975,6 +1094,35 @@ struct RateLimitResetServiceTests {
         let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
         var account = Self.account()
         account.refreshToken = " "
+
+        await #expect(throws: RateLimitResetServiceError.submissionUnauthorized) {
+            try await service.consume(
+                for: account,
+                bank: Self.bank(now: now, expiresIn: 86_400),
+                now: now
+            )
+        }
+        #expect(harness.requestBodies().isEmpty)
+        #expect(try await service.allAttempts().isEmpty)
+    }
+
+    @Test("Consume rejects an expired or near-expiry inference token before journal or transport")
+    func consumeRejectsUnsafeInferenceToken() async throws {
+        let journalURL = Self.temporaryJournalURL()
+        defer { try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent()) }
+        let harness = ResetTransportHarness([
+            .response(RateLimitResetHTTPResponse(
+                statusCode: 200,
+                data: Data("{\"code\":\"reset\"}".utf8)
+            )),
+        ])
+        let service = RateLimitResetService(
+            transport: { request in try harness.send(request) },
+            journalURL: journalURL
+        )
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        var account = Self.account()
+        account.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(300))
 
         await #expect(throws: RateLimitResetServiceError.submissionUnauthorized) {
             try await service.consume(

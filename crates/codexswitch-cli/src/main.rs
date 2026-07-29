@@ -43,7 +43,7 @@ use activation::{
 use anyhow::{bail, Context, Result};
 use auth::default_auth_path;
 use chrono::{Duration as ChronoDuration, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use import::prepare_import_bundle;
 use pool_authority::{
     observe_status as observe_pool_authority_status, parse_reason as parse_pool_authority_reason,
@@ -202,6 +202,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Observe or atomically update the VPS-owned automatic reset policy.
+    AutomaticResetPolicy {
+        #[command(subcommand)]
+        command: AutomaticResetPolicyCommand,
+    },
     RotateNow {
         #[arg(long, default_value = "external_runtime_failure")]
         reason: String,
@@ -272,6 +277,32 @@ enum Command {
         #[arg(long)]
         replace_npm_vendor: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AutomaticResetPolicyCommand {
+    Get {
+        #[arg(long)]
+        json: bool,
+    },
+    Set {
+        #[arg(value_enum)]
+        state: AutomaticResetPolicyValue,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AutomaticResetPolicyValue {
+    Enabled,
+    Disabled,
+}
+
+impl AutomaticResetPolicyValue {
+    fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
 }
 
 fn main() -> Result<()> {
@@ -351,6 +382,7 @@ fn main() -> Result<()> {
         Command::RedeemReset { account, json } => {
             redeem_reset(&store_path, &auth_path, &account, json)
         }
+        Command::AutomaticResetPolicy { command } => automatic_reset_policy(&store_path, command),
         Command::RotateNow {
             reason,
             cooldown_seconds,
@@ -406,6 +438,46 @@ fn run_daemon(store_path: &Path, auth_path: &Path, interval_seconds: u64) -> Res
     {
         daemon::run_loop(store_path, auth_path, Duration::from_secs(interval_seconds))
     }
+}
+
+fn automatic_reset_policy(store_path: &Path, command: AutomaticResetPolicyCommand) -> Result<()> {
+    automatic_reset_policy_for_target_os(store_path, command, std::env::consts::OS)
+}
+
+fn automatic_reset_policy_for_target_os(
+    store_path: &Path,
+    command: AutomaticResetPolicyCommand,
+    target_os: &str,
+) -> Result<()> {
+    if target_os != "linux" {
+        bail!(
+            "automatic-reset-policy is owned by the Linux VPS; invoke it through the VPS transport"
+        );
+    }
+
+    let (observation, json) = match command {
+        AutomaticResetPolicyCommand::Get { json } => {
+            (daemon::observe_automatic_reset_policy(store_path)?, json)
+        }
+        AutomaticResetPolicyCommand::Set { state, json } => (
+            daemon::set_automatic_reset_policy(store_path, state.is_enabled())?,
+            json,
+        ),
+    };
+    if json {
+        println!("{}", serde_json::to_string(&observation)?);
+    } else {
+        let effective = if observation.automatic_rate_limit_reset_redemption {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        println!(
+            "automatic banked resets: {effective} ({:?}, {} authority)",
+            observation.state, observation.authority
+        );
+    }
+    Ok(())
 }
 
 fn import_accounts(
@@ -3435,6 +3507,21 @@ mod tests {
         }
     }
 
+    fn consumed_reset_bank(mut bank: RateLimitResetBank, credit_id: &str) -> RateLimitResetBank {
+        bank.available_count = bank.available_count.saturating_sub(1);
+        bank.fetched_at = Utc::now();
+        if let Some(credit) = bank
+            .credits
+            .iter_mut()
+            .find(|credit| credit.id == credit_id)
+        {
+            credit.status = "redeemed".to_string();
+            credit.redeem_started_at = Some(bank.fetched_at);
+            credit.redeemed_at = Some(bank.fetched_at);
+        }
+        bank
+    }
+
     #[test]
     fn poll_releases_store_lock_and_advances_matching_confirmation() -> Result<()> {
         let temp = secure_temp_dir()?;
@@ -4261,6 +4348,102 @@ mod tests {
                 json: true,
             } if account == "pro@example.com"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_reset_policy_cli_and_json_contract_are_stable() -> Result<()> {
+        let get =
+            Args::try_parse_from(["codexswitch-cli", "automatic-reset-policy", "get", "--json"])?;
+        assert!(matches!(
+            get.command,
+            Command::AutomaticResetPolicy {
+                command: AutomaticResetPolicyCommand::Get { json: true }
+            }
+        ));
+        let set = Args::try_parse_from([
+            "codexswitch-cli",
+            "automatic-reset-policy",
+            "set",
+            "enabled",
+            "--json",
+        ])?;
+        assert!(matches!(
+            set.command,
+            Command::AutomaticResetPolicy {
+                command: AutomaticResetPolicyCommand::Set {
+                    state: AutomaticResetPolicyValue::Enabled,
+                    json: true,
+                }
+            }
+        ));
+
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let missing = daemon::observe_automatic_reset_policy(&store_path)?;
+        assert_eq!(
+            serde_json::to_value(missing)?,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "automaticRateLimitResetRedemption": false,
+                "state": "missing",
+                "authority": "vps"
+            })
+        );
+        let configured = daemon::set_automatic_reset_policy(&store_path, true)?;
+        assert_eq!(
+            serde_json::to_value(configured)?,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "automaticRateLimitResetRedemption": true,
+                "state": "configured",
+                "authority": "vps"
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_reset_policy_rejects_macos_before_storage_access() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let policy_path = daemon::automatic_reset_policy_path(&store_path);
+
+        let error = automatic_reset_policy_for_target_os(
+            &store_path,
+            AutomaticResetPolicyCommand::Set {
+                state: AutomaticResetPolicyValue::Enabled,
+                json: true,
+            },
+            "macos",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("owned by the Linux VPS"));
+        assert!(!policy_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_reset_policy_linux_boundary_reaches_vps_store() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+
+        automatic_reset_policy_for_target_os(
+            &store_path,
+            AutomaticResetPolicyCommand::Set {
+                state: AutomaticResetPolicyValue::Enabled,
+                json: true,
+            },
+            "linux",
+        )?;
+
+        let observation = daemon::observe_automatic_reset_policy(&store_path)?;
+        assert!(observation.automatic_rate_limit_reset_redemption);
+        assert_eq!(
+            observation.state,
+            daemon::AutomaticResetPolicyState::Configured
+        );
         Ok(())
     }
 
@@ -5248,6 +5431,9 @@ mod tests {
         let bank_fetches_for_closure = Arc::clone(&bank_fetches);
         let consume_calls = Arc::new(Mutex::new(0usize));
         let consume_calls_for_closure = Arc::clone(&consume_calls);
+        let initial_bank = reset_bank(&["credit-0"]);
+        let initial_bank_for_fetch = initial_bank.clone();
+        let consumed_bank_for_fetch = consumed_reset_bank(initial_bank, "credit-0");
         let quota_store_path = store_path.clone();
         let bank_store_path = store_path.clone();
         let consume_store_path = store_path.clone();
@@ -5271,7 +5457,7 @@ mod tests {
                     if account.email == "active@example.com" {
                         let mut calls = active_fetches_for_closure.lock().unwrap();
                         *calls += 1;
-                        if *calls > 1 {
+                        if *calls > 2 {
                             let five_hour = result.snapshot.five_hour_mut().unwrap();
                             five_hour.used_percent = 0.0;
                             five_hour.hard_limit_reached = false;
@@ -5289,25 +5475,13 @@ mod tests {
                     assert_runtime_activation_lease_busy(&bank_store_path)?;
                     let mut calls = bank_fetches_for_closure.lock().unwrap();
                     *calls += 1;
-                    let available_count = u32::from(*calls == 1);
-                    Ok(RateLimitResetBank {
-                        available_count,
-                        total_earned_count: 1,
-                        credits: (0..available_count)
-                            .map(|index| rate_limit_resets::RateLimitResetCredit {
-                                id: format!("credit-{index}"),
-                                reset_type: Some("full".to_string()),
-                                status: "available".to_string(),
-                                granted_at: Some(Utc::now() - chrono::Duration::days(1)),
-                                expires_at: Some(Utc::now() + chrono::Duration::days(10)),
-                                redeem_started_at: None,
-                                redeemed_at: None,
-                                title: Some("Full reset".to_string()),
-                                description: None,
-                            })
-                            .collect(),
-                        fetched_at: Utc::now(),
-                    })
+                    let mut bank = if *calls <= 2 {
+                        initial_bank_for_fetch.clone()
+                    } else {
+                        consumed_bank_for_fetch.clone()
+                    };
+                    bank.fetched_at = Utc::now();
+                    Ok(bank)
                 },
                 move |_account, _bank, _request_id| {
                     assert_store_lock_available(&consume_store_path)?;
@@ -5331,8 +5505,8 @@ mod tests {
         assert_eq!(report.next_email, "active@example.com");
         assert_eq!(report.banked_resets_remaining, Some(0));
         assert_eq!(*consume_calls.lock().unwrap(), 1);
-        assert_eq!(*bank_fetches.lock().unwrap(), 2);
-        assert_eq!(*active_fetches.lock().unwrap(), 2);
+        assert_eq!(*bank_fetches.lock().unwrap(), 3);
+        assert_eq!(*active_fetches.lock().unwrap(), 3);
         let stored = load_accounts(&store_path)?;
         let active = active_account(&stored).unwrap();
         assert_eq!(active.email, "active@example.com");
@@ -5367,6 +5541,9 @@ mod tests {
         let active_fetches = Arc::new(Mutex::new(0usize));
         let bank_fetches = Arc::new(Mutex::new(0usize));
         let consume_calls = Arc::new(Mutex::new(0usize));
+        let initial_bank = reset_bank(&["credit-a"]);
+        let initial_bank_for_fetch = initial_bank.clone();
+        let consumed_bank_for_fetch = consumed_reset_bank(initial_bank, "credit-a");
         let error = rotate_now_with_resets(
             RotateNowContext {
                 store_path: &store_path,
@@ -5386,7 +5563,7 @@ mod tests {
                         if account.email == "active@example.com" {
                             let mut calls = active_fetches.lock().unwrap();
                             *calls += 1;
-                            if *calls > 1 {
+                            if *calls > 2 {
                                 for window in &mut result.snapshot.windows {
                                     window.used_percent = 0.0;
                                     window.hard_limit_reached = false;
@@ -5403,7 +5580,13 @@ mod tests {
                     move |_account| {
                         let mut calls = bank_fetches.lock().unwrap();
                         *calls += 1;
-                        Ok(reset_bank(if *calls == 1 { &["credit-a"] } else { &[] }))
+                        let mut bank = if *calls <= 2 {
+                            initial_bank_for_fetch.clone()
+                        } else {
+                            consumed_bank_for_fetch.clone()
+                        };
+                        bank.fetched_at = Utc::now();
+                        Ok(bank)
                     }
                 },
                 {
@@ -5423,6 +5606,8 @@ mod tests {
 
         assert!(format!("{error:#}").contains("activation did not publish as swapped"));
         assert_eq!(*consume_calls.lock().unwrap(), 1);
+        assert_eq!(*bank_fetches.lock().unwrap(), 3);
+        assert_eq!(*active_fetches.lock().unwrap(), 3);
         let store_lock = lock_account_store(&store_path)?;
         assert_eq!(
             activation::read_activation_record(&store_lock)?
@@ -5756,6 +5941,9 @@ mod tests {
         let quota_fetches = Arc::new(Mutex::new(0usize));
         let bank_fetches = Arc::new(Mutex::new(0usize));
         let consume_calls = Arc::new(Mutex::new(0usize));
+        let initial_bank = reset_bank(&["credit-a", "credit-b"]);
+        let initial_bank_for_fetch = initial_bank.clone();
+        let consumed_bank_for_fetch = consumed_reset_bank(initial_bank, "credit-a");
         let quota_store_path = store_path.clone();
         let bank_store_path = store_path.clone();
         let consume_store_path = store_path.clone();
@@ -5771,7 +5959,7 @@ mod tests {
                     let mut result = fetch_from_account(account)?;
                     let mut calls = quota_fetches.lock().unwrap();
                     *calls += 1;
-                    if *calls > 1 {
+                    if *calls > 2 {
                         for window in &mut result.snapshot.windows {
                             window.used_percent = 0.0;
                             window.hard_limit_reached = false;
@@ -5789,11 +5977,13 @@ mod tests {
                     assert_runtime_activation_lease_busy(&bank_store_path)?;
                     let mut calls = bank_fetches.lock().unwrap();
                     *calls += 1;
-                    Ok(if *calls == 1 {
-                        reset_bank(&["credit-a", "credit-b"])
+                    let mut bank = if *calls <= 2 {
+                        initial_bank_for_fetch.clone()
                     } else {
-                        reset_bank(&["credit-b"])
-                    })
+                        consumed_bank_for_fetch.clone()
+                    };
+                    bank.fetched_at = Utc::now();
+                    Ok(bank)
                 }
             },
             {
@@ -5815,8 +6005,8 @@ mod tests {
         assert!(report.submitted_reset);
         assert_eq!(report.previous_banked_resets, 2);
         assert_eq!(report.banked_resets_remaining, 1);
-        assert_eq!(*quota_fetches.lock().unwrap(), 2);
-        assert_eq!(*bank_fetches.lock().unwrap(), 2);
+        assert_eq!(*quota_fetches.lock().unwrap(), 3);
+        assert_eq!(*bank_fetches.lock().unwrap(), 3);
         assert_eq!(*consume_calls.lock().unwrap(), 1);
         assert_eq!(fs::read(&auth_path)?, auth_before);
 
@@ -5942,6 +6132,10 @@ mod tests {
 
         let consume_calls = Arc::new(Mutex::new(0usize));
         let bank_fetches = Arc::new(Mutex::new(0usize));
+        let initial_bank = reset_bank(&["credit-a"]);
+        let consumed_bank = consumed_reset_bank(initial_bank.clone(), "credit-a");
+        let initial_bank_for_fetch = initial_bank.clone();
+        let consumed_bank_for_fetch = consumed_bank.clone();
         let first_error = redeem_reset_with(
             &store_path,
             &auth_path,
@@ -5952,11 +6146,13 @@ mod tests {
                 move |_account| {
                     let mut calls = bank_fetches.lock().unwrap();
                     *calls += 1;
-                    Ok(if *calls == 1 {
-                        reset_bank(&["credit-a"])
+                    let mut bank = if *calls <= 2 {
+                        initial_bank_for_fetch.clone()
                     } else {
-                        reset_bank(&[])
-                    })
+                        consumed_bank_for_fetch.clone()
+                    };
+                    bank.fetched_at = Utc::now();
+                    Ok(bank)
                 }
             },
             {
@@ -5988,7 +6184,11 @@ mod tests {
                 result.snapshot.limit_reached = Some(false);
                 Ok(result)
             },
-            |_account| Ok(reset_bank(&[])),
+            move |_account| {
+                let mut bank = consumed_bank.clone();
+                bank.fetched_at = Utc::now();
+                Ok(bank)
+            },
             {
                 let consume_calls = Arc::clone(&consume_calls);
                 move |_account, _bank, _request_id| {

@@ -122,13 +122,24 @@ struct QuotaSnapshot: Codable, Sendable, Equatable {
         allowed == false || limitReached == true
     }
 
+    /// Negative quota evidence always wins over optimistic provider booleans.
+    var hasDefinitiveExhaustion: Bool {
+        isDenied || policyWindows.contains(where: \.isDefinitivelyExhausted)
+    }
+
+    /// Malformed recognized windows are retained for diagnostics but cannot authorize routing.
+    var hasInvalidPolicyEvidence: Bool {
+        policyWindows.contains(where: { !$0.hasValidUsageObservation })
+    }
+
     var blockingWindows: [QuotaWindow] {
         if isDenied { return orderedPolicyWindows }
         return orderedPolicyWindows.filter(\.shouldAutoSwapAway)
     }
 
     var minimumRemainingPercent: Double? {
-        if isDenied { return 0 }
+        if hasDefinitiveExhaustion { return 0 }
+        if hasInvalidPolicyEvidence { return nil }
         return policyWindows.map(\.effectiveRemainingPercent).min()
     }
 
@@ -139,11 +150,25 @@ struct QuotaSnapshot: Codable, Sendable, Equatable {
     }
 
     var needsSwap: Bool {
-        isDenied || !blockingWindows.isEmpty
+        hasDefinitiveExhaustion || !blockingWindows.isEmpty
     }
 
     var isImmediatelyUsable: Bool {
-        !isDenied && !policyWindows.isEmpty && blockingWindows.isEmpty
+        !hasDefinitiveExhaustion
+            && !hasInvalidPolicyEvidence
+            && !policyWindows.isEmpty
+            && blockingWindows.isEmpty
+    }
+
+    /// Activation eligibility includes freshness and quota-cycle validity.
+    func isImmediatelyUsable(at now: Date) -> Bool {
+        isFresh(at: now)
+            && !hasExpiredPolicyWindow(at: now)
+            && isImmediatelyUsable
+    }
+
+    func hasExpiredPolicyWindow(at now: Date) -> Bool {
+        policyWindows.contains(where: { $0.resetsAt <= now })
     }
 
     var nextRecoveryAt: Date? {
@@ -379,7 +404,13 @@ struct QuotaWindow: Codable, Sendable, Equatable {
     var remainingPercent: Double { max(0, 100 - usedPercent) }
     var effectiveRemainingPercent: Double { isExhausted ? 0 : remainingPercent }
     var timeUntilReset: TimeInterval { resetsAt.timeIntervalSinceNow }
-    var isExhausted: Bool { hardLimitReached || remainingPercent < 1 }
+    var hasValidUsageObservation: Bool { usedPercent.isFinite && usedPercent >= 0 }
+    var isDefinitivelyExhausted: Bool {
+        hardLimitReached || (hasValidUsageObservation && usedPercent >= 100)
+    }
+    var isExhausted: Bool {
+        isDefinitivelyExhausted || (hasValidUsageObservation && remainingPercent < 1)
+    }
     func needsResetConfirmation(now: Date = Date()) -> Bool {
         isExhausted && resetsAt <= now
     }
@@ -387,7 +418,8 @@ struct QuotaWindow: Codable, Sendable, Equatable {
         isExhausted && resetsAt <= now.addingTimeInterval(-staleAfter)
     }
     var shouldAutoSwapAway: Bool {
-        hardLimitReached || remainingPercent < Self.autoSwapThresholdPercent
+        isDefinitivelyExhausted
+            || (hasValidUsageObservation && remainingPercent < Self.autoSwapThresholdPercent)
     }
 
     func looksLikeBackendUsagePlaceholder(fetchedAt: Date, tolerance: TimeInterval = 10) -> Bool {

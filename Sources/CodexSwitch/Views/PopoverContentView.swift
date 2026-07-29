@@ -26,21 +26,6 @@ struct PopoverContentView: View {
         }
     }
 
-    static func accountHeading(
-        activationState: AccountActivationState? = nil,
-        configuredAccountId: UUID? = nil,
-        now: Date = Date()
-    ) -> String {
-        guard let configuredAccountId,
-              activationState?.runtimeIsCurrent(
-                  for: configuredAccountId,
-                  at: now
-              ) == true else {
-            return "Mac Configured Account"
-        }
-        return "Mac Runtime Current"
-    }
-
     static func activationStatusLabel(for state: AccountActivationState) -> String? {
         if state.phase != .confirmed,
            state.discoveredRuntimeCount > 0,
@@ -86,6 +71,19 @@ struct PopoverContentView: View {
         hostConvergenceLabel(host: "VPS", state: state)
     }
 
+    static func poolTargetLabel(
+        for freshness: ActiveAccountAuthorityFreshness
+    ) -> String {
+        switch freshness {
+        case .current:
+            return "Pool Target"
+        case .stale:
+            return "Pool Target (stale)"
+        case .unavailable:
+            return "Pool Target unavailable"
+        }
+    }
+
     private static func hostConvergenceLabel(
         host: String,
         state: AccountHostConvergenceState
@@ -124,11 +122,12 @@ struct PopoverContentView: View {
     /// Find the non-active account whose weekly resets soonest (for "Next Available" fallback)
     static func nextWeeklyResetAccount(
         from accounts: [CodexAccount],
+        activeProviderAccountId: String? = nil,
         now: Date = Date()
     ) -> (account: CodexAccount, formattedTime: String)? {
         let candidates = accounts
             .compactMap { account -> (CodexAccount, TimeInterval)? in
-                guard !account.isActive,
+                guard account.normalizedProviderAccountId != activeProviderAccountId,
                       let snapshot = account.realQuotaSnapshot,
                       let weekly = snapshot.weekly,
                       snapshot.isDenied || weekly.isExhausted else {
@@ -170,21 +169,37 @@ struct PopoverContentView: View {
 
     var body: some View {
         let _ = manager.uiRefreshRevision
+        let now = Date()
+        let activeAccountReadModel = manager.activeAccountReadModel(at: now)
+        let logicalActiveAccount = manager.logicalActiveAccount(
+            using: activeAccountReadModel
+        )
+        let displayedAccounts = manager.sortedAccounts(
+            using: activeAccountReadModel,
+            now: now
+        )
         let resetOverviewItems = RateLimitResetOverviewItem.make(
-            accounts: manager.sortedAccounts,
+            accounts: displayedAccounts,
             presentations: manager.rateLimitResetPresentations,
-            now: Date()
+            now: now
         )
         VStack(spacing: 0) {
             HStack {
                 Text("CodexSwitch")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                if let configured = manager.poolTargetAccount {
-                    Text("Pool target: \(configured.email)")
+                if let configured = logicalActiveAccount {
+                    Text("\(Self.poolTargetLabel(for: activeAccountReadModel.freshness)): \(configured.email)")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                } else {
+                    Text(Self.poolTargetLabel(
+                        for: activeAccountReadModel.freshness
+                    ))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
                 }
                 VStack(spacing: 1) {
                     Button(action: onOpenSettings) {
@@ -246,10 +261,14 @@ struct PopoverContentView: View {
                         .padding(.horizontal, 20)
                     } else {
                         LazyVGrid(columns: columns, spacing: 8) {
-                            ForEach(manager.sortedAccounts) { account in
+                            ForEach(displayedAccounts) { account in
                                 AccountCardView(
                                     account: account,
-                                    isConfigured: manager.isPoolTarget(account),
+                                    isConfigured: manager.isPoolTarget(
+                                        account,
+                                        using: activeAccountReadModel
+                                    ),
+                                    poolTargetFreshness: activeAccountReadModel.freshness,
                                     pollingError: manager.pollingErrors[account.id],
                                     rateLimitResetPresentation: manager.rateLimitResetPresentations[account.id],
                                     rateLimitResetCoordinatorAuthorization:
@@ -284,22 +303,25 @@ struct PopoverContentView: View {
                     }
 
                     // Current account + CLI status + Next up
-                    if let active = manager.poolTargetAccount {
+                    if let active = logicalActiveAccount {
                         let cliStatus = CLIStatusChecker.cachedCLIStatus
                         let desktopStatus = CLIStatusChecker.cachedDesktopStatus
                         let runtimeCurrent = manager.runtimeCurrentAccount?.id == active.id
                         let convergence = manager.hostConvergencePresentation(
-                            forPoolTarget: active
+                            forPoolTarget: active,
+                            now: now
                         )
                         Divider()
 
                         // One authority target, with host convergence shown globally.
                         HStack(spacing: 6) {
                             Image(systemName: "scope")
-                                .foregroundStyle(.green)
+                                .foregroundStyle(activeAccountReadModel.freshness == .stale ? .orange : .green)
                                 .font(.system(size: 11))
                             VStack(alignment: .leading, spacing: 1) {
-                                Text("Pool Target")
+                                Text(Self.poolTargetLabel(
+                                    for: activeAccountReadModel.freshness
+                                ))
                                     .font(.system(size: 8.5, weight: .medium))
                                     .foregroundStyle(.secondary)
                                 Text(active.email)
@@ -490,7 +512,10 @@ struct PopoverContentView: View {
                         .padding(.horizontal, 12)
                         .padding(.top, 4)
                         .padding(.bottom, 6)
-                    } else if let nextReset = Self.nextWeeklyResetAccount(from: manager.accounts) {
+                    } else if let nextReset = Self.nextWeeklyResetAccount(
+                        from: manager.accounts,
+                        activeProviderAccountId: activeAccountReadModel.providerAccountId
+                    ) {
                         // All accounts weekly-exhausted — show which resets first
                         HStack(spacing: 6) {
                             Image(systemName: "clock.arrow.circlepath")
@@ -605,17 +630,17 @@ private struct RateLimitResetOverviewRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
-                Text("Error • \(item.availableCount) last-known • \(errorMessage)")
+                Text("Error • \(item.availableCount) last-known/unverified • \(errorMessage)")
                     .foregroundStyle(.red)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
             .font(.system(size: 9, weight: .medium))
-            .help("Reset inventory error for \(item.accountEmail): \(errorMessage). Last-known count: \(item.availableCount)")
+            .help("Reset inventory error for \(item.accountEmail): \(errorMessage). Last-known/unverified count: \(item.availableCount)")
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(
                 "Reset inventory error for \(item.accountEmail): \(errorMessage). "
-                    + "Last-known count: \(item.availableCount)"
+                    + "Last-known/unverified count: \(item.availableCount)"
             )
         } else if let expiration = item.expiration, let urgency = item.urgency {
             HStack(spacing: 5) {

@@ -223,7 +223,10 @@ struct AccountCardViewTests {
 
         let errorAction = errorView.resetRedemptionActionPresentation(at: now)
         #expect(!errorAction.isEnabled)
-        #expect(errorAction.helpText == "Reset inventory error: Inventory request failed")
+        #expect(
+            errorAction.helpText
+                == "Reset inventory is unverified because refresh failed; refresh it before redeeming: Inventory request failed"
+        )
         #expect(!errorView.handleConfirmedResetRedemption(at: now))
         #expect(!didRedeem)
 
@@ -247,6 +250,28 @@ struct AccountCardViewTests {
         #expect(blockedAction.helpText == "Another reset redemption is already in progress")
         #expect(!coordinatorBlockedView.handleConfirmedResetRedemption(at: now))
         #expect(!didRedeem)
+    }
+
+    @Test("Context-menu redemption opens confirmation and never redeems directly")
+    func contextMenuRedemptionUsesConfirmationFlow() throws {
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/Views/AccountCardView.swift",
+            encoding: .utf8
+        )
+        let menuStart = try #require(source.range(of: ".contextMenu {"))
+        let confirmationStart = try #require(source.range(
+            of: ".confirmationDialog(",
+            range: menuStart.upperBound..<source.endIndex
+        ))
+        let menuSource = source[menuStart.lowerBound..<confirmationStart.lowerBound]
+
+        #expect(menuSource.contains("RateLimitResetContextMenuPresentation.resolve("))
+        #expect(menuSource.contains("Button(resetPresentation.menuItemTitle)"))
+        #expect(menuSource.contains("isConfirmingResetRedemption = true"))
+        #expect(menuSource.contains("resetPresentation.unavailableReason"))
+        #expect(menuSource.contains(".disabled(true)"))
+        #expect(!menuSource.contains("handleConfirmedResetRedemption"))
+        #expect(!menuSource.contains("onRedeemReset"))
     }
 
     @Test("Redemption tooltip uses the policy's unavailable reason")

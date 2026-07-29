@@ -69,7 +69,9 @@ struct PooledUsageMeterView: View {
 
     private var rateLimitResetSummary: PooledRateLimitResetPresentation {
         PooledRateLimitResetPresentation.summarize(
-            accounts.compactMap { rateLimitResetPresentations[$0.id] }
+            accounts: accounts,
+            presentations: rateLimitResetPresentations,
+            now: Date()
         )
     }
 
@@ -367,15 +369,27 @@ struct PooledUsageMeterView: View {
                 }
             }
 
+            HStack(spacing: 4) {
+                Image(systemName: "list.number")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                Text(Self.routingTierStatusText(for: accounts))
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .help("Free accounts are eligible only after verified paid capacity is unavailable")
+
             if rateLimitResetSummary.currentAvailableCount > 0
+                || rateLimitResetSummary.currentCountFetchedAt != nil
                 || rateLimitResetSummary.hasIncompleteInventory {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.counterclockwise.circle.fill")
                         .font(.system(size: 9))
-                        .foregroundStyle(.teal)
+                        .foregroundStyle(rateLimitResetStatusColor)
                     Text(rateLimitResetStatusText)
                         .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(rateLimitResetStatusColor)
                         .lineLimit(1)
                 }
                 .help("Reset inventory across the account pool")
@@ -393,30 +407,65 @@ struct PooledUsageMeterView: View {
             for: rateLimitResetSummary,
             nextExpirationText: rateLimitResetSummary.nextCurrentExpiration.map {
                 Self.bankedResetExpiryFormatter.string(from: $0)
+            },
+            fetchedAtText: rateLimitResetSummary.currentCountFetchedAt.map {
+                Self.inventoryAgeText(fetchedAt: $0, now: Date())
             }
         )
     }
 
+    private var rateLimitResetStatusColor: Color {
+        if rateLimitResetSummary.refreshFailedAccountCount > 0 { return .red }
+        if rateLimitResetSummary.hasIncompleteInventory { return .orange }
+        return .teal
+    }
+
     static func rateLimitResetStatusText(
         for summary: PooledRateLimitResetPresentation,
-        nextExpirationText: String? = nil
+        nextExpirationText: String? = nil,
+        fetchedAtText: String? = nil
     ) -> String {
         let count = summary.currentAvailableCount
         let noun = count == 1 ? "reset" : "resets"
-        var parts = [summary.hasIncompleteInventory
-            ? "\(count) current \(noun)"
-            : "\(count) banked \(noun)"]
+        var parts = ["\(count) verified \(noun)"]
 
         if count > 0, let nextExpirationText {
             parts.append("next expires \(nextExpirationText)")
+        }
+        if let fetchedAtText {
+            parts.append("checked \(fetchedAtText)")
         }
         if summary.pendingAccountCount > 0 {
             parts.append("\(summary.pendingAccountCount) pending")
         }
         if summary.staleAccountCount > 0 {
-            parts.append("\(summary.staleAccountCount) stale")
+            parts.append("\(summary.staleAccountCount) last-known/unverified")
+        }
+        if summary.expiredAccountCount > 0 {
+            parts.append("\(summary.expiredAccountCount) expired")
+        }
+        if summary.refreshFailedAccountCount > 0 {
+            parts.append("\(summary.refreshFailedAccountCount) refresh failed")
+        }
+        if summary.unknownAccountCount > 0 {
+            parts.append("\(summary.unknownAccountCount) not checked")
         }
         return parts.joined(separator: " • ")
+    }
+
+    static func inventoryAgeText(fetchedAt: Date, now: Date) -> String {
+        let age = max(0, now.timeIntervalSince(fetchedAt))
+        if age < 60 { return "just now" }
+        if age < 3_600 { return "\(Int(age / 60))m ago" }
+        if age < 86_400 { return "\(Int(age / 3_600))h ago" }
+        return "\(Int(age / 86_400))d ago"
+    }
+
+    static func routingTierStatusText(for accounts: [CodexAccount]) -> String {
+        let proCount = accounts.filter { $0.planPriority >= 3 }.count
+        let plusCount = accounts.filter { $0.planPriority == 2 }.count
+        let freeCount = accounts.filter { $0.planPriority <= 1 }.count
+        return "Routing: \(proCount) Pro > \(plusCount) Plus > \(freeCount) Free (last resort)"
     }
 
     private func costComparison(fiveHour: PooledMetric, weekly: PooledMetric) -> some View {
