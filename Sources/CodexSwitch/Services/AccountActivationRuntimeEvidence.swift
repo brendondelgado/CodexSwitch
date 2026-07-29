@@ -94,6 +94,8 @@ struct AccountActivationRuntimeSnapshotSet: Sendable {
 }
 
 enum AccountActivationRuntimeEvidencePreflight {
+    static let requiresFreshAcknowledgements = true
+
     static func performRenewal(
         desktopReload: @Sendable () async -> DesktopReloadResult,
         cliReload: @Sendable () async -> CodexReloadSummary

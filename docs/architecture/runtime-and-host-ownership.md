@@ -417,6 +417,10 @@ remains a separate external-auth transaction and cannot claim that a Rust CLI
 handoff already committed. After a verified Rust CLI commit, the Swift
 coordinator enters a fresh activation generation and requires normal runtime
 convergence; file agreement alone never produces `Confirmed`.
+That convergence renewal must mint a new request and acknowledgement for every
+discovered runtime. The five-minute passive acknowledgement window is a
+read-only health optimization; it cannot satisfy a new activation generation
+whose runtime-evidence lease lasts at most thirty seconds.
 
 An external handoff may replace an expired `Confirmed` lease or escape a
 `CommittedDegraded` record in the same narrow ways as an explicit operator
@@ -970,14 +974,15 @@ barrier continues to block every account mutation until runtime convergence is
 confirmed. `FileOnly`, `ManualReview`, corrupt journal, and unreadable-state
 failures do not receive this observational exception.
 
-Those permitted telemetry writes can advance the account-store generation
-without changing the selected provider or credential set. A validated remote
-authority adoption may rebase a `CommittedDegraded` rotation record to that
-new generation only when the authority target is the sole active account, the
-target is unique in the local store, `auth.json` exactly matches its complete
-token set, the journal fingerprint still matches, and the current-version
-journal has no rollback or owned-generation payload. The rebased record remains
-`CommittedDegraded` and must obtain a fresh generation-bound runtime
+Those permitted telemetry writes can advance the account-store byte generation
+without changing the selected provider or credential set. A terminal
+`Confirmed` record therefore remains current across telemetry-only byte drift
+when the sole active provider, complete active token fingerprint, exact
+`auth.json` fingerprint, current journal schema, and rollback-free terminal
+shape all still agree. Full byte-generation equality remains mandatory while a
+credential mutation, rollback, provider-I/O operation, or runtime convergence
+transaction is in flight. A `CommittedDegraded` record may still be rebased only
+through the validated authority path and must obtain a fresh runtime
 acknowledgement before becoming `Confirmed`. Any identity, token, journal, or
 rollback divergence remains a hard barrier.
 

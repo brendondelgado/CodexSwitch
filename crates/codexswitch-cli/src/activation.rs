@@ -2602,7 +2602,7 @@ fn observe_activation_record_for_store(store_path: &Path) -> Result<ObservedActi
 pub(crate) fn activation_record_confirms_current(
     record: &ActivationRecord,
     active: &CodexAccount,
-    generation: &AccountStoreGeneration,
+    _generation: &AccountStoreGeneration,
     auth_fingerprint: Option<&str>,
 ) -> bool {
     let Some(active_fingerprint) = complete_account_token_fingerprint(active) else {
@@ -2612,7 +2612,6 @@ pub(crate) fn activation_record_confirms_current(
         && record.state == ActivationState::Confirmed
         && record.kind != ActivationKind::Unknown
         && record.target_account_id == active.account_id
-        && record.store_generation == generation.as_str()
         && record.auth_fingerprint.as_deref() == Some(active_fingerprint.as_str())
         && record.base_store_generation.is_none()
         && record.owned_store_generation.is_none()
@@ -3586,7 +3585,7 @@ mod tests {
         record.target_account_id = active.account_id.clone();
         record.store_generation = "stale-generation".to_string();
         write_activation_record(&store_lock, &record)?;
-        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_err());
+        assert!(require_current_activation_confirmation(&store_path, &auth_path).is_ok());
         record.store_generation = snapshot.generation.as_str().to_string();
         record.auth_fingerprint = Some("stale-fingerprint".to_string());
         write_activation_record(&store_lock, &record)?;

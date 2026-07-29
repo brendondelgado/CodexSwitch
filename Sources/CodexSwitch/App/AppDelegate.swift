@@ -2437,6 +2437,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         }
                         return await DesktopRuntimeReloadClient().reloadAuth(
                             account: account,
+                            reuseExistingAcknowledgement:
+                                !AccountActivationRuntimeEvidencePreflight
+                                    .requiresFreshAcknowledgements,
                             authorizeEffect: {
                                 policyAuthority?.authorizes() ?? true
                             }
@@ -2452,6 +2455,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         }
                         return await Task.detached(priority: .userInitiated) {
                             SwapEngine.signalCodexReload(
+                                reuseExistingAcknowledgement:
+                                    !AccountActivationRuntimeEvidencePreflight
+                                        .requiresFreshAcknowledgements,
                                 authorizeEffect: {
                                     policyAuthority?.authorizes() ?? true
                                 }

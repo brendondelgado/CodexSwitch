@@ -13,6 +13,11 @@ struct AccountActivationRuntimeEvidenceTests {
         completeTokenFingerprint: String(repeating: "a", count: 64)
     )
 
+    @Test("Activation renewal never reuses passive health acknowledgements")
+    func activationRenewalRequiresFreshAcknowledgements() {
+        #expect(AccountActivationRuntimeEvidencePreflight.requiresFreshAcknowledgements)
+    }
+
     @Test("No live runtime is configured-only evidence, never confirmation")
     func noRuntimeDeniesConfirmation() {
         let decision = AccountActivationRuntimeEvidenceEvaluator.evaluate(

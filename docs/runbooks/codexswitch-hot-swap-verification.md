@@ -389,6 +389,11 @@ runtime convergence attempt under the existing activation lease. Matching
 emits desktop and CLI reload evidence, retains degraded or manual-review state
 on incomplete acknowledgement, observes retry backoff on repeated status
 polls, and stops retrying once a fresh exactly bound `Confirmed` record exists.
+The confirmation attempt must disable existing-ACK reuse for both desktop and
+CLI runtimes. Reproduce an ACK older than the thirty-second evidence lease but
+younger than the five-minute passive-health window: one retry must write a new
+nonce, receive a new ACK, and confirm instead of repeatedly reusing and then
+rejecting the older ACK.
 
 The handoff may only adopt a store already switched for the same fresh
 authority epoch. It must not infer authority from credential files, rewrite a
@@ -620,14 +625,13 @@ CodexSwitch must evaluate these independently:
   running executable, opened without following a mutable path and proven to be
   a regular file. A FIFO, symlink, device/inode change, or unavailable
   `/proc/<pid>/exe` blocks reload rather than falling back to the pathname.
-- **Generation continuity:** quota and reset observation commits must either
-  advance a matching `Confirmed` activation to the exact new account-store
-  generation or leave a durable barrier. Reconciliation validates `Confirmed`
-  records too; a store/journal split cannot be treated as ready. A stale
-  `Confirmed` record may self-repair only when its target still names the sole
-  active account and that account's complete current token set exactly matches
-  `auth.json`; the coordinator must downgrade through `CommittedDegraded`,
-  obtain a fresh generation-bound runtime ACK, and only then republish
+- **Generation continuity:** quota and reset observation commits may advance
+  the account-store byte generation without invalidating a terminal
+  `Confirmed` record when the sole active provider and complete store/auth token
+  fingerprint still match its rollback-free current-version identity.
+  Reconciliation validates those semantic invariants. A provider, selection,
+  token, rollback, or schema mismatch must downgrade through
+  `CommittedDegraded`, obtain a fresh runtime ACK, and only then republish
   `Confirmed`. Cross-account or divergent state performs zero provider I/O and
   zero runtime reload.
 - **Degraded authority telemetry rebase:** after an allowed observational quota

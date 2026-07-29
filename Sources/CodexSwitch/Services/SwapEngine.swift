@@ -798,6 +798,7 @@ enum SwapEngine {
     @discardableResult
     static func signalCodexReload(
         excludingRuntimePIDs: Set<Int32> = [],
+        reuseExistingAcknowledgement: Bool = true,
         authorizeEffect: @Sendable () -> Bool = { true }
     ) -> CodexReloadSummary {
         guard authorizeEffect() else {
@@ -927,11 +928,12 @@ enum SwapEngine {
                 return supported
             },
             alreadyAcknowledged: { binding in
-                startupAcknowledgement(
-                    matching: binding,
-                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
-                    now: Date()
-                ) != nil
+                reuseExistingAcknowledgement
+                    && startupAcknowledgement(
+                        matching: binding,
+                        homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
+                        now: Date()
+                    ) != nil
             },
             bindingIsCurrent: { reloadBindingIsCurrent($0) },
             persistRequest: { authorizeEffect() && persistReloadRequest($0) },
