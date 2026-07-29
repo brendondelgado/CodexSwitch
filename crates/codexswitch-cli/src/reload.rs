@@ -4,6 +4,10 @@ use crate::auth::auth_file_fingerprint;
 use crate::bounded_command;
 use crate::secure_file::{self, SecureFileGeneration};
 use anyhow::{bail, Context, Result};
+#[cfg(any(target_os = "macos", test))]
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+#[cfg(any(target_os = "macos", test))]
+use base64::Engine as _;
 #[cfg(any(not(target_os = "linux"), test))]
 use chrono::{Local, NaiveDateTime, TimeZone};
 use ring::digest::{Context as DigestContext, SHA256};
@@ -1416,6 +1420,8 @@ where
 
 #[cfg(any(target_os = "macos", test))]
 const MANAGED_DESKTOP_BRIDGE_RPC_MAX_BYTES: usize = 256 * 1024;
+#[cfg(any(target_os = "macos", test))]
+const MANAGED_DESKTOP_JWT_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "macos")]
 const MANAGED_DESKTOP_BRIDGE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1431,6 +1437,8 @@ struct ManagedDesktopAuthTokens {
     access_token: String,
     refresh_token: String,
     account_id: String,
+    email: Option<String>,
+    plan_type: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1485,7 +1493,7 @@ impl ManagedDesktopBridgeSession {
         validate_managed_desktop_rpc_success(&response, 1, "account/login/start")?;
         let account_read = managed_desktop_account_read_request(2);
         let response = managed_desktop_rpc(&mut websocket, &account_read, 2)?;
-        validate_managed_desktop_account_read(&response, &tokens.account_id, 2)?;
+        validate_managed_desktop_account_read(&response, &tokens, 2)?;
 
         if !process_identity_is_current(process)
             || hot_swap_runtime_kind(process) != Some(HotSwapRuntimeKind::ManagedDesktopBridge)
@@ -1506,10 +1514,10 @@ impl ManagedDesktopBridgeSession {
         {
             bail!("managed desktop bridge identity changed before account verification");
         }
-        let expected_account_id = hot_swap_auth_file_identity(auth_path)?.account_id;
+        let expected = managed_desktop_auth_tokens(auth_path)?;
         let request = managed_desktop_account_read_request(3);
         let response = managed_desktop_rpc(&mut self.websocket, &request, 3)?;
-        validate_managed_desktop_account_read(&response, &expected_account_id, 3)?;
+        validate_managed_desktop_account_read(&response, &expected, 3)?;
         if !process_identity_is_current(&self.process) {
             bail!("managed desktop bridge identity changed after account verification");
         }
@@ -1563,6 +1571,8 @@ fn managed_desktop_auth_tokens(auth_path: &Path) -> Result<ManagedDesktopAuthTok
         access_token: read_token("access_token")?,
         refresh_token: read_token("refresh_token")?,
         account_id: read_token("account_id")?,
+        email: None,
+        plan_type: None,
     };
     complete_token_fingerprint(
         &result.id_token,
@@ -1571,7 +1581,49 @@ fn managed_desktop_auth_tokens(auth_path: &Path) -> Result<ManagedDesktopAuthTok
         &result.account_id,
     )
     .context("auth file has incomplete token material")?;
-    Ok(result)
+    let id_claims = managed_desktop_jwt_claims(&result.id_token, "id token")?;
+    let access_claims = managed_desktop_jwt_claims(&result.access_token, "access token")?;
+    let claimed_account_ids = [
+        managed_desktop_auth_claim(&id_claims, "chatgpt_account_id"),
+        managed_desktop_auth_claim(&access_claims, "chatgpt_account_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<HashSet<_>>();
+    if claimed_account_ids.len() > 1
+        || claimed_account_ids
+            .iter()
+            .next()
+            .is_some_and(|claimed| *claimed != result.account_id.as_str())
+    {
+        bail!("auth token account identity is missing or inconsistent");
+    }
+
+    let email = unique_managed_desktop_identity_value(
+        [
+            id_claims.get("email").and_then(serde_json::Value::as_str),
+            access_claims
+                .get("https://api.openai.com/profile")
+                .and_then(|profile| profile.get("email"))
+                .and_then(serde_json::Value::as_str),
+        ],
+        normalized_managed_desktop_email,
+        "email",
+    )?;
+    let plan_type = unique_managed_desktop_identity_value(
+        [
+            managed_desktop_auth_claim(&id_claims, "chatgpt_plan_type"),
+            managed_desktop_auth_claim(&access_claims, "chatgpt_plan_type"),
+        ],
+        normalized_managed_desktop_plan,
+        "plan",
+    )?;
+
+    Ok(ManagedDesktopAuthTokens {
+        email,
+        plan_type,
+        ..result
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1667,7 +1719,7 @@ fn validate_managed_desktop_rpc_success(
 #[cfg(any(target_os = "macos", test))]
 fn validate_managed_desktop_account_read(
     response: &serde_json::Value,
-    expected_account_id: &str,
+    expected: &ManagedDesktopAuthTokens,
     expected_id: i64,
 ) -> Result<()> {
     validate_managed_desktop_rpc_success(response, expected_id, "account/read")?;
@@ -1684,13 +1736,119 @@ fn validate_managed_desktop_account_read(
         .filter_map(|key| account.get(key).and_then(serde_json::Value::as_str))
         .filter(|account_id| !account_id.is_empty())
         .collect::<HashSet<_>>();
-    if account_ids.len() != 1 {
-        bail!("managed desktop account/read identity was missing or ambiguous");
+    if account_ids.len() > 1 {
+        bail!("managed desktop account/read identity was ambiguous");
     }
-    if account_ids.iter().next().copied() != Some(expected_account_id) {
-        bail!("managed desktop account/read identity did not match auth.json");
+    let mut matched_identity = false;
+    if let Some(account_id) = account_ids.iter().next().copied() {
+        if account_id != expected.account_id {
+            bail!("managed desktop account/read identity did not match auth.json");
+        }
+        matched_identity = true;
+    }
+
+    let response_email = account
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalized_managed_desktop_email);
+    if let (Some(expected_email), Some(response_email)) =
+        (expected.email.as_deref(), response_email.as_deref())
+    {
+        if expected_email != response_email {
+            bail!("managed desktop account/read email did not match auth.json");
+        }
+        matched_identity = true;
+    }
+    if !matched_identity {
+        bail!("managed desktop account/read identity was missing");
+    }
+
+    let response_plan = account
+        .get("planType")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalized_managed_desktop_plan);
+    if let (Some(expected_plan), Some(response_plan)) =
+        (expected.plan_type.as_deref(), response_plan.as_deref())
+    {
+        if expected_plan != response_plan {
+            bail!("managed desktop account/read plan did not match auth.json");
+        }
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn managed_desktop_jwt_claims(token: &str, label: &str) -> Result<serde_json::Value> {
+    let mut segments = token.split('.');
+    segments.next().context("auth token has no header")?;
+    let payload = segments.next().context("auth token has no payload")?;
+    segments.next().context("auth token has no signature")?;
+    if segments.next().is_some()
+        || payload.is_empty()
+        || payload.len() > MANAGED_DESKTOP_JWT_PAYLOAD_MAX_BYTES.saturating_mul(2)
+    {
+        bail!("{label} has an invalid JWT shape");
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| URL_SAFE.decode(payload))
+        .with_context(|| format!("{label} payload is not base64url"))?;
+    if decoded.len() > MANAGED_DESKTOP_JWT_PAYLOAD_MAX_BYTES {
+        bail!("{label} payload exceeded its byte limit");
+    }
+    serde_json::from_slice(&decoded).with_context(|| format!("{label} payload is not JSON"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn managed_desktop_auth_claim<'a>(claims: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get(key))
+        .and_then(serde_json::Value::as_str)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn unique_managed_desktop_identity_value<'a, const N: usize>(
+    values: [Option<&'a str>; N],
+    normalize: fn(&str) -> Option<String>,
+    label: &str,
+) -> Result<Option<String>> {
+    let values = values
+        .into_iter()
+        .flatten()
+        .filter_map(normalize)
+        .collect::<HashSet<_>>();
+    if values.len() > 1 {
+        bail!("auth token {label} identity is inconsistent");
+    }
+    Ok(values.into_iter().next())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn normalized_managed_desktop_email(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn normalized_managed_desktop_plan(value: &str) -> Option<String> {
+    let mut normalized = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if normalized.is_empty() || normalized == "unknown" {
+        return None;
+    }
+    if let Some(without_prefix) = normalized.strip_prefix("chatgpt_") {
+        normalized = without_prefix.to_string();
+    }
+    if normalized == "prolite" {
+        return Some("pro_lite".to_string());
+    }
+    for suffix in ["_monthly", "_annual", "_yearly"] {
+        if let Some(without_suffix) = normalized.strip_suffix(suffix) {
+            normalized = without_suffix.to_string();
+            break;
+        }
+    }
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn reload_codex_processes(include_app_server: bool, auth_path: &Path) -> Result<ReloadSummary> {
@@ -3800,6 +3958,8 @@ mod tests {
             access_token: "access".to_string(),
             refresh_token: "refresh".to_string(),
             account_id: "acct-current".to_string(),
+            email: Some("person@example.com".to_string()),
+            plan_type: Some("pro".to_string()),
         };
         let login = managed_desktop_login_request(&tokens);
         assert_eq!(login["method"], "account/login/start");
@@ -3816,6 +3976,14 @@ mod tests {
 
     #[test]
     fn managed_desktop_account_verification_accepts_aliases_and_rejects_drift() -> Result<()> {
+        let expected = ManagedDesktopAuthTokens {
+            id_token: "identity".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            account_id: "acct-current".to_string(),
+            email: Some("person@example.com".to_string()),
+            plan_type: Some("pro".to_string()),
+        };
         for key in ["chatgptAccountId", "accountId", "account_id"] {
             let mut account = serde_json::Map::new();
             account.insert("type".to_string(), serde_json::json!("chatgpt"));
@@ -3824,8 +3992,20 @@ mod tests {
                 "id": 2,
                 "result": { "account": account }
             });
-            validate_managed_desktop_account_read(&response, "acct-current", 2)?;
+            validate_managed_desktop_account_read(&response, &expected, 2)?;
         }
+
+        let email_only = serde_json::json!({
+            "id": 2,
+            "result": {
+                "account": {
+                    "type": "chatgpt",
+                    "email": " Person@Example.com ",
+                    "planType": "chatgpt_pro_monthly"
+                }
+            }
+        });
+        validate_managed_desktop_account_read(&email_only, &expected, 2)?;
 
         let mismatch = serde_json::json!({
             "id": 2,
@@ -3836,7 +4016,7 @@ mod tests {
                 }
             }
         });
-        assert!(validate_managed_desktop_account_read(&mismatch, "acct-current", 2).is_err());
+        assert!(validate_managed_desktop_account_read(&mismatch, &expected, 2).is_err());
 
         let ambiguous = serde_json::json!({
             "id": 2,
@@ -3848,7 +4028,42 @@ mod tests {
                 }
             }
         });
-        assert!(validate_managed_desktop_account_read(&ambiguous, "acct-current", 2).is_err());
+        assert!(validate_managed_desktop_account_read(&ambiguous, &expected, 2).is_err());
+
+        let email_mismatch = serde_json::json!({
+            "id": 2,
+            "result": {
+                "account": {
+                    "type": "chatgpt",
+                    "email": "other@example.com",
+                    "planType": "pro"
+                }
+            }
+        });
+        assert!(validate_managed_desktop_account_read(&email_mismatch, &expected, 2).is_err());
+
+        let plan_mismatch = serde_json::json!({
+            "id": 2,
+            "result": {
+                "account": {
+                    "type": "chatgpt",
+                    "email": "person@example.com",
+                    "planType": "plus"
+                }
+            }
+        });
+        assert!(validate_managed_desktop_account_read(&plan_mismatch, &expected, 2).is_err());
+
+        let missing = serde_json::json!({
+            "id": 2,
+            "result": {
+                "account": {
+                    "type": "chatgpt",
+                    "planType": "pro"
+                }
+            }
+        });
+        assert!(validate_managed_desktop_account_read(&missing, &expected, 2).is_err());
         assert!(validate_managed_desktop_rpc_success(
             &serde_json::json!({"id": 0, "error": {"message": "no"}}),
             0,

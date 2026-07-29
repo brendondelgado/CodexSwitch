@@ -319,7 +319,9 @@ The desktop JSON-RPC fallback verifies `account/login/start` with a subsequent
 it returns an optional ChatGPT email and plan. Verification therefore requires
 a ChatGPT account, compares normalized email when both sides provide one, and
 compares canonical meaningful plan tiers. It must not claim that account ID was
-verified by this endpoint.
+verified by this endpoint. The Swift menu app and Rust CLI must apply this same
+identity rule; requiring an omitted account ID in only one client is a
+convergence regression.
 
 When convergence is incomplete, the UI must show the one desired target and
 each host's convergence separately. Healthy quota for the target is not
@@ -802,6 +804,12 @@ Expected:
 - one patched `codex` process owns the `LISTEN` socket;
 - ChatGPT has one established connection to that listener;
 - no stale private `codex ... app-server` process remains.
+
+When a runtime install changes the managed launcher to a new prepared
+generation, restart only `com.codexswitch.desktop-app-server-9223` before
+attempting convergence. A bridge still mapped from the previous generation
+must not be mislabeled as an external app-server or allowed to leave a
+`CommittedDegraded` barrier behind.
 
 The ChatGPT desktop log must report:
 
