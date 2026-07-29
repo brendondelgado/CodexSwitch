@@ -420,7 +420,9 @@ convergence; file agreement alone never produces `Confirmed`.
 That convergence renewal must mint a new request and acknowledgement for every
 discovered runtime. The five-minute passive acknowledgement window is a
 read-only health optimization; it cannot satisfy a new activation generation
-whose runtime-evidence lease lasts at most thirty seconds.
+whose runtime-evidence lease lasts at most thirty seconds. The fresh-only
+contract applies through the desktop JSON-RPC client's inner strict app-server
+SIGHUP; no nested reload helper may silently restore passive ACK reuse.
 
 An external handoff may replace an expired `Confirmed` lease or escape a
 `CommittedDegraded` record in the same narrow ways as an explicit operator

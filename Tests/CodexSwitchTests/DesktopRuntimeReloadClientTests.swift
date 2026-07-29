@@ -196,7 +196,7 @@ struct DesktopRuntimeReloadClientTests {
                 #expect(fingerprint == expectedFingerprint)
                 return Set(discovery.targets.map { $0.process.identity.pid })
             },
-            strictReload: { _, _, _, _, _ in
+            strictReload: { _, _, _, _, _, _ in
                 strictReloadCalls.setTrue()
                 return Self.successfulStrictSummary
             }
@@ -217,6 +217,7 @@ struct DesktopRuntimeReloadClientTests {
     @Test("Desktop activation can require a fresh acknowledged reload")
     func desktopActivationBypassesReusableAcknowledgement() async throws {
         let strictReloadCalls = LockedFlag()
+        let strictReloadReuse = LockedTestState<Bool?>(nil)
         let (client, sender) = makeClient(
             responses: [
                 .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
@@ -225,8 +226,9 @@ struct DesktopRuntimeReloadClientTests {
             alreadyAcknowledgedRuntimePIDs: { discovery, _, _, _ in
                 Set(discovery.targets.map { $0.process.identity.pid })
             },
-            strictReload: { _, _, _, _, _ in
+            strictReload: { _, _, _, _, reuseExistingAcknowledgement, _ in
                 strictReloadCalls.setTrue()
+                strictReloadReuse.update { $0 = reuseExistingAcknowledgement }
                 return Self.successfulStrictSummary
             }
         )
@@ -246,6 +248,7 @@ struct DesktopRuntimeReloadClientTests {
         #expect(requestMethod(in: requests[0].payload) == "account/login/start")
         #expect(requestMethod(in: requests[1].payload) == "account/read")
         #expect(strictReloadCalls.value)
+        #expect(strictReloadReuse.read() == false)
     }
 
     @Test("Only desktop runtimes without a target-account ACK are notified")
@@ -258,7 +261,7 @@ struct DesktopRuntimeReloadClientTests {
             ],
             runtimePIDs: [42, 43],
             alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in [42] },
-            strictReload: { discovery, socketBindings, _, _, _ in
+            strictReload: { discovery, socketBindings, _, _, _, _ in
                 strictSocketPorts.update { ports in
                     ports = socketBindings.map(\.port)
                 }
@@ -296,7 +299,7 @@ struct DesktopRuntimeReloadClientTests {
             alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in
                 acknowledgedPIDs.read()
             },
-            strictReload: { discovery, _, _, _, _ in
+            strictReload: { discovery, _, _, _, _, _ in
                 let pids = discovery.targets.map { $0.process.identity.pid }
                 strictReloadedPIDs.update { $0.append(contentsOf: pids) }
                 acknowledgedPIDs.update { $0.formUnion(pids) }
@@ -327,7 +330,7 @@ struct DesktopRuntimeReloadClientTests {
             alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in
                 acknowledgedPIDs.read()
             },
-            strictReload: { discovery, _, _, _, _ in
+            strictReload: { discovery, _, _, _, _, _ in
                 let pids = discovery.targets.map { $0.process.identity.pid }
                 strictReloadedPIDs.update { $0.append(contentsOf: pids) }
                 acknowledgedPIDs.update { $0.formUnion(pids) }
@@ -363,7 +366,7 @@ struct DesktopRuntimeReloadClientTests {
                     authorized.update { $0 = false }
                 }
             },
-            strictReload: { _, _, _, _, _ in
+            strictReload: { _, _, _, _, _, _ in
                 strictReloadCalls.setTrue()
                 return Self.successfulStrictSummary
             }
@@ -402,7 +405,7 @@ struct DesktopRuntimeReloadClientTests {
                     $0.verificationResponseReady = true
                 }
             },
-            strictReload: { _, _, _, _, _ in
+            strictReload: { _, _, _, _, _, _ in
                 strictReloadCalls.setTrue()
                 return Self.successfulStrictSummary
             }
@@ -438,7 +441,7 @@ struct DesktopRuntimeReloadClientTests {
                 .string(#"{"jsonrpc":"2.0","id":1,"result":{"type":"chatgptAuthTokens"}}"#),
                 .string(#"{"jsonrpc":"2.0","id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","chatgptAccountId":"acct_123"},"requiresOpenaiAuth":true}}"#),
             ],
-            strictReload: { _, _, _, _, _ in
+            strictReload: { _, _, _, _, _, _ in
                 CodexReloadSummary(
                     discoveredRuntimeCount: 1,
                     acknowledgedRuntimeCount: 0
@@ -553,7 +556,7 @@ struct DesktopRuntimeReloadClientTests {
         let strictCalls = LockedTestState(0)
         let (client, sender) = makeClient(
             responses: [],
-            strictReload: { _, _, _, _, _ in
+            strictReload: { _, _, _, _, _, _ in
                 strictCalls.update { $0 += 1 }
                 return Self.successfulStrictSummary
             }
@@ -781,7 +784,7 @@ struct DesktopRuntimeReloadClientTests {
                     runtimeTargetIsCurrent: { _, _ in true }
                 )
             },
-            strictReload: { _, _, _, _, _ in
+            strictReload: { _, _, _, _, _, _ in
                 strictCalls.update { $0 += 1 }
                 return Self.successfulStrictSummary
             }
@@ -868,7 +871,7 @@ struct DesktopRuntimeReloadClientTests {
                         && requiredOwnerUID == 501
                 },
                 alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in [] },
-                strictReload: { discovery, socketBindings, _, _, _ in
+                strictReload: { discovery, socketBindings, _, _, _, _ in
                     strictTargetPIDs.update {
                         $0 = discovery.targets.map { $0.process.identity.pid }
                     }
@@ -928,7 +931,7 @@ struct DesktopRuntimeReloadClientTests {
         let (firstClient, _) = makeClient(
             responses: responses,
             gate: gate,
-            strictReload: { _, _, _, _, _ in
+            strictReload: { _, _, _, _, _, _ in
                 firstEnteredACKWait.signal()
                 releaseFirstACKWait.wait()
                 return Self.successfulStrictSummary
@@ -1098,8 +1101,9 @@ struct DesktopRuntimeReloadClientTests {
             [CodexDesktopRuntimeSocketBinding],
             CodexReloadAdmission,
             UInt32,
+            Bool,
             @Sendable () -> Bool
-        ) -> CodexReloadSummary = { _, _, _, _, _ in
+        ) -> CodexReloadSummary = { _, _, _, _, _, _ in
             DesktopRuntimeReloadClientTests.successfulStrictSummary
         }
     ) -> (DesktopRuntimeReloadClient, StubDesktopRuntimeRequestSender) {

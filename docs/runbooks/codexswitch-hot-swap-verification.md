@@ -393,7 +393,9 @@ The confirmation attempt must disable existing-ACK reuse for both desktop and
 CLI runtimes. Reproduce an ACK older than the thirty-second evidence lease but
 younger than the five-minute passive-health window: one retry must write a new
 nonce, receive a new ACK, and confirm instead of repeatedly reusing and then
-rejecting the older ACK.
+rejecting the older ACK. Assert that the desktop JSON-RPC path forwards
+fresh-only mode into its strict app-server SIGHUP helper, not only into its
+outer existing-ACK check.
 
 The handoff may only adopt a store already switched for the same fresh
 authority epoch. It must not infer authority from credential files, rewrite a

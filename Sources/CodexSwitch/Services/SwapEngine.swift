@@ -1075,6 +1075,7 @@ enum SwapEngine {
         admittedDiscoverySnapshot discoverySnapshot: CodexRuntimeDiscoverySnapshot,
         admission: CodexReloadAdmission,
         requiredOwnerUID: UInt32,
+        reuseExistingAcknowledgement: Bool = true,
         authorizeEffect: @Sendable () -> Bool = { true },
         firstAcknowledgementBootstrap: @Sendable (CodexReloadBinding) -> Bool = { _ in false }
     ) -> CodexReloadSummary {
@@ -1118,11 +1119,12 @@ enum SwapEngine {
                 return supported
             },
             alreadyAcknowledged: { binding in
-                startupAcknowledgement(
-                    matching: binding,
-                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
-                    now: Date()
-                ) != nil
+                reuseExistingAcknowledgement
+                    && startupAcknowledgement(
+                        matching: binding,
+                        homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
+                        now: Date()
+                    ) != nil
             },
             bindingIsCurrent: { reloadBindingIsCurrent($0) },
             persistRequest: { authorizeEffect() && persistReloadRequest($0) },

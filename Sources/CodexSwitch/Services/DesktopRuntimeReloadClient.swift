@@ -102,6 +102,7 @@ struct DesktopRuntimeReloadDependencies: Sendable {
         [CodexDesktopRuntimeSocketBinding],
         CodexReloadAdmission,
         UInt32,
+        Bool,
         @Sendable () -> Bool
     ) -> CodexReloadSummary
 }
@@ -361,6 +362,7 @@ struct DesktopRuntimeReloadClient: Sendable {
                         [socketBinding],
                         context.admission,
                         context.requiredOwnerUID,
+                        reuseExistingAcknowledgement,
                         authorizeEffect
                     )
                 }
@@ -804,6 +806,7 @@ struct DesktopRuntimeReloadClient: Sendable {
                 socketBindings,
                 admission,
                 requiredOwnerUID,
+                reuseExistingAcknowledgement,
                 authorizeEffect in
                 let portsByPID = Dictionary(
                     uniqueKeysWithValues: socketBindings.map {
@@ -814,6 +817,7 @@ struct DesktopRuntimeReloadClient: Sendable {
                     admittedDiscoverySnapshot: discovery,
                     admission: admission,
                     requiredOwnerUID: requiredOwnerUID,
+                    reuseExistingAcknowledgement: reuseExistingAcknowledgement,
                     authorizeEffect: authorizeEffect,
                     firstAcknowledgementBootstrap: { binding in
                         guard let port = portsByPID[binding.processIdentity.pid] else {
