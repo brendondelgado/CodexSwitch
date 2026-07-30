@@ -880,6 +880,13 @@ must hold together: the authority names exactly one local provider account;
 account store contains exactly one configured source account and its credentials
 match the in-memory source snapshot; the target differs from that source; and
 the authority operation witness remains current through every file effect. The
+startup restore path may have deliberately cleared the in-memory configured
+flag while preserving the durable source. In that exact state, recovery must
+read the secure durable store, require exactly one configured source, map it to
+exactly one current in-memory account with the same complete credentials, and
+restore only that durable source as the in-memory configured account before the
+activation transaction begins. It must never infer the source from UI ordering,
+`UserDefaults`, or the conflict journal. The
 conflict journal may name the still-durable source or the authority target,
 because the conflict can be recorded on either side of the file-commit boundary;
 a third account is never recoverable. The coordinator then supersedes only that

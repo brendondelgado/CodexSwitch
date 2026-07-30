@@ -9,6 +9,51 @@ struct ExternalAuthConflictRecoveryTests {
     private let providerAccountId = "provider-target"
     private let now = Date(timeIntervalSince1970: 1_800_300_000)
 
+    @Test("Durable source restores an intentionally cleared in-memory selection")
+    func durableSourceRestoresClearedSelection() {
+        var durableSource = makeAccount(id: sourceAccountId, active: true)
+        let inMemorySource = makeAccount(id: sourceAccountId, active: false)
+        let target = makeAccount(id: targetAccountId, active: false)
+
+        let resolved = ExternalAuthConflictRecoveryPolicy.durableSource(
+            durableAccounts: [durableSource, target],
+            inMemoryAccounts: [inMemorySource, target],
+            targetAccountId: targetAccountId
+        )
+        #expect(resolved?.id == sourceAccountId)
+
+        durableSource.accessToken = "changed-access"
+        #expect(ExternalAuthConflictRecoveryPolicy.durableSource(
+            durableAccounts: [durableSource, target],
+            inMemoryAccounts: [inMemorySource, target],
+            targetAccountId: targetAccountId
+        )?.id == nil)
+    }
+
+    @Test("Durable source rejects ambiguous or target-side selections")
+    func durableSourceRejectsAmbiguity() {
+        let source = makeAccount(id: sourceAccountId, active: true)
+        let second = makeAccount(id: UUID(), active: true)
+        let targetActive = makeAccount(id: targetAccountId, active: true)
+        let inMemorySource = makeAccount(id: sourceAccountId, active: false)
+
+        #expect(ExternalAuthConflictRecoveryPolicy.durableSource(
+            durableAccounts: [source, second],
+            inMemoryAccounts: [inMemorySource, second],
+            targetAccountId: targetAccountId
+        )?.id == nil)
+        #expect(ExternalAuthConflictRecoveryPolicy.durableSource(
+            durableAccounts: [targetActive],
+            inMemoryAccounts: [targetActive],
+            targetAccountId: targetAccountId
+        )?.id == nil)
+        #expect(ExternalAuthConflictRecoveryPolicy.durableSource(
+            durableAccounts: [source],
+            inMemoryAccounts: [inMemorySource, inMemorySource],
+            targetAccountId: targetAccountId
+        )?.id == nil)
+    }
+
     @Test("Recovery requires every authority and durable-state proof")
     func policyRequiresCompleteEvidence() {
         let evidence = makeEvidence()
@@ -177,6 +222,18 @@ struct ExternalAuthConflictRecoveryTests {
             durableStoreMatchesSource: durableStoreMatchesSource,
             authMatchesTarget: authMatchesTarget,
             rustHandoffDisposition: rustHandoffDisposition
+        )
+    }
+
+    private func makeAccount(id: UUID, active: Bool) -> CodexAccount {
+        CodexAccount(
+            id: id,
+            email: "\(id.uuidString)@example.com",
+            accessToken: "access-\(id.uuidString)",
+            refreshToken: "refresh-\(id.uuidString)",
+            idToken: "id-\(id.uuidString)",
+            accountId: "provider-\(id.uuidString)",
+            isActive: active
         )
     }
 }

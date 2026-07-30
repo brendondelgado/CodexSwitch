@@ -6968,8 +6968,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self else {
                 return
             }
-            guard operationAuthority.authorizes(),
-                  let from = self.accountManager.configuredAccount else {
+            guard operationAuthority.authorizes() else {
                 self.poolAuthorityClientState.finishAdoption(
                     epoch: observation.epoch,
                     succeeded: false,
@@ -6977,9 +6976,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 )
                 return
             }
-            let recoversExternalAuthConflict: Bool
-            if self.accountManager.activationState?.phase == .manualReview,
-               self.accountManager.activationState?.detail == .externalAuthConflict {
+            let recoversExternalAuthConflict =
+                self.accountManager.activationState?.phase == .manualReview
+                && self.accountManager.activationState?.detail == .externalAuthConflict
+            let from: CodexAccount
+            if let configured = self.accountManager.configuredAccount {
+                from = configured
+            } else if recoversExternalAuthConflict,
+                      let durableSource = await self
+                        .restoreDurableExternalAuthConflictSource(
+                            target: target,
+                            operationAuthority: operationAuthority
+                        ) {
+                from = durableSource
+            } else {
+                self.poolAuthorityClientState.finishAdoption(
+                    epoch: observation.epoch,
+                    succeeded: false,
+                    at: Date()
+                )
+                SwapLog.append(.debug(
+                    "POOL_AUTHORITY_ADOPTION_BLOCKED reason=configured_source_unavailable"
+                ))
+                return
+            }
+            if recoversExternalAuthConflict {
                 let recoveryDecision = await self
                     .poolAuthorityExternalAuthConflictRecoveryDecision(
                         observation: observation,
@@ -6998,9 +7019,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     ))
                     return
                 }
-                recoversExternalAuthConflict = true
-            } else {
-                recoversExternalAuthConflict = false
             }
             let succeeded = await self.withPreparedActiveCredentialMutation(
                 targetAccountId: target.id,
@@ -7029,6 +7047,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 succeeded: succeeded,
                 at: Date()
             )
+        }
+    }
+
+    private func restoreDurableExternalAuthConflictSource(
+        target: CodexAccount,
+        operationAuthority: PoolAuthorityOperationAuthority
+    ) async -> CodexAccount? {
+        guard operationAuthority.authorizes(),
+              accountManager.activationState?.phase == .manualReview,
+              accountManager.activationState?.detail == .externalAuthConflict,
+              accountManager.configuredAccount == nil else {
+            return nil
+        }
+
+        do {
+            let durableAccounts = try await accountPersistence.loadAll()
+            guard operationAuthority.authorizes(),
+                  let source = ExternalAuthConflictRecoveryPolicy.durableSource(
+                      durableAccounts: durableAccounts,
+                      inMemoryAccounts: accountManager.accounts,
+                      targetAccountId: target.id
+                  ) else {
+                return nil
+            }
+            accountManager.setConfiguredAccount(source.id)
+            guard operationAuthority.authorizes(),
+                  accountManager.configuredAccount?.id == source.id,
+                  Self.accountStoreMatches(
+                      account: source,
+                      accounts: durableAccounts
+                  ) else {
+                return nil
+            }
+            SwapLog.append(.debug(
+                "POOL_AUTHORITY_DURABLE_SOURCE_RESTORED source=\(source.id.uuidString) target=\(target.id.uuidString)"
+            ))
+            return accountManager.configuredAccount
+        } catch {
+            SwapLog.append(.debug(
+                "POOL_AUTHORITY_DURABLE_SOURCE_READ_FAILED error=\(error.localizedDescription)"
+            ))
+            return nil
         }
     }
 
