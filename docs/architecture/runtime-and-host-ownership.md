@@ -880,7 +880,16 @@ must hold together: the authority names exactly one local provider account;
 account store contains exactly one configured source account and its credentials
 match the in-memory source snapshot; the target differs from that source; and
 the authority operation witness remains current through every file effect. The
-startup restore path may have deliberately cleared the in-memory configured
+stored target credential generation may lag a newer externally written
+`auth.json` generation. Recovery may merge that observed generation into the
+known target snapshot only when the observed provider identity exactly matches
+the unique authority target, all three credentials are complete, and the
+inference JWT remains valid beyond the safety window. The merge preserves the
+target's local identity and account metadata; the new credentials become
+durable only inside the same account-selection transaction. An expired,
+near-expiry, partial, unknown, or differently identified generation remains a
+hard barrier. The startup restore path may have deliberately cleared the
+in-memory configured
 flag while preserving the durable source. In that exact state, recovery must
 read the secure durable store, require exactly one configured source, map it to
 exactly one current in-memory account with the same complete credentials, and

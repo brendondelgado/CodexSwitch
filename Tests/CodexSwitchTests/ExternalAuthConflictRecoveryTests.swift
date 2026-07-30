@@ -9,6 +9,70 @@ struct ExternalAuthConflictRecoveryTests {
     private let providerAccountId = "provider-target"
     private let now = Date(timeIntervalSince1970: 1_800_300_000)
 
+    @Test("Authority target admits a fresh complete observed token generation")
+    func authorityTargetAdmitsFreshObservedGeneration() {
+        var stored = makeAccount(id: targetAccountId, active: false)
+        stored.accountId = providerAccountId
+        stored.planType = "pro"
+        var observed = makeAccount(id: UUID(), active: false)
+        observed.accountId = providerAccountId
+        observed.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(3_600)
+        )
+        observed.refreshToken = "observed-refresh"
+        observed.idToken = "observed-id"
+
+        let merged = ExternalAuthConflictRecoveryPolicy.authorityTarget(
+            storedTarget: stored,
+            observedAuth: observed,
+            authorityProviderAccountId: providerAccountId,
+            now: now
+        )
+        #expect(merged?.id == stored.id)
+        #expect(merged?.planType == "pro")
+        #expect(merged?.accessToken == observed.accessToken)
+        #expect(merged?.refreshToken == observed.refreshToken)
+        #expect(merged?.idToken == observed.idToken)
+    }
+
+    @Test("Authority target rejects stale, partial, or mismatched generations")
+    func authorityTargetRejectsUnsafeGeneration() {
+        var stored = makeAccount(id: targetAccountId, active: false)
+        stored.accountId = providerAccountId
+        var observed = makeAccount(id: UUID(), active: false)
+        observed.accountId = providerAccountId
+        observed.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(60)
+        )
+
+        #expect(ExternalAuthConflictRecoveryPolicy.authorityTarget(
+            storedTarget: stored,
+            observedAuth: observed,
+            authorityProviderAccountId: providerAccountId,
+            now: now
+        )?.id == nil)
+
+        observed.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(3_600)
+        )
+        observed.refreshToken = ""
+        #expect(ExternalAuthConflictRecoveryPolicy.authorityTarget(
+            storedTarget: stored,
+            observedAuth: observed,
+            authorityProviderAccountId: providerAccountId,
+            now: now
+        )?.id == nil)
+
+        observed.refreshToken = "observed-refresh"
+        observed.accountId = "different-provider"
+        #expect(ExternalAuthConflictRecoveryPolicy.authorityTarget(
+            storedTarget: stored,
+            observedAuth: observed,
+            authorityProviderAccountId: providerAccountId,
+            now: now
+        )?.id == nil)
+    }
+
     @Test("Durable source restores an intentionally cleared in-memory selection")
     func durableSourceRestoresClearedSelection() {
         var durableSource = makeAccount(id: sourceAccountId, active: true)

@@ -30,6 +30,31 @@ struct ExternalAuthConflictRecoveryEvidence: Sendable {
 }
 
 enum ExternalAuthConflictRecoveryPolicy {
+    static func authorityTarget(
+        storedTarget: CodexAccount,
+        observedAuth: CodexAccount,
+        authorityProviderAccountId: String,
+        now: Date
+    ) -> CodexAccount? {
+        guard storedTarget.normalizedProviderAccountId == authorityProviderAccountId,
+              observedAuth.normalizedProviderAccountId == authorityProviderAccountId,
+              observedAuth.hasCompleteRuntimeCredentials,
+              observedAuth.hasUsableInferenceToken(at: now) else {
+            return nil
+        }
+
+        var target = storedTarget
+        target.email = observedAuth.email
+        target.accessToken = observedAuth.accessToken
+        target.refreshToken = observedAuth.refreshToken
+        target.idToken = observedAuth.idToken
+        target.accountId = observedAuth.accountId
+        target.lastRefreshed = observedAuth.lastRefreshed ?? now
+        target.runtimeUnusableUntil = nil
+        target.runtimeUnusableReason = nil
+        return target
+    }
+
     static func durableSource(
         durableAccounts: [CodexAccount],
         inMemoryAccounts: [CodexAccount],

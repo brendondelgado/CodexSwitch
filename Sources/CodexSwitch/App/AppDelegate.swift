@@ -6979,13 +6979,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let recoversExternalAuthConflict =
                 self.accountManager.activationState?.phase == .manualReview
                 && self.accountManager.activationState?.detail == .externalAuthConflict
+            let adoptionTarget: CodexAccount
+            if recoversExternalAuthConflict {
+                guard let observedTarget = await self
+                    .externalAuthConflictAuthorityTarget(
+                        storedTarget: target,
+                        observation: observation,
+                        operationAuthority: operationAuthority
+                    ) else {
+                    self.poolAuthorityClientState.finishAdoption(
+                        epoch: observation.epoch,
+                        succeeded: false,
+                        at: Date()
+                    )
+                    SwapLog.append(.debug(
+                        "POOL_AUTHORITY_EXTERNAL_AUTH_RECOVERY_BLOCKED reason=observed_target_generation"
+                    ))
+                    return
+                }
+                adoptionTarget = observedTarget
+            } else {
+                adoptionTarget = target
+            }
             let from: CodexAccount
             if let configured = self.accountManager.configuredAccount {
                 from = configured
             } else if recoversExternalAuthConflict,
                       let durableSource = await self
                         .restoreDurableExternalAuthConflictSource(
-                            target: target,
+                            target: adoptionTarget,
                             operationAuthority: operationAuthority
                         ) {
                 from = durableSource
@@ -7005,7 +7027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     .poolAuthorityExternalAuthConflictRecoveryDecision(
                         observation: observation,
                         from: from,
-                        to: target,
+                        to: adoptionTarget,
                         operationAuthority: operationAuthority
                     )
                 guard recoveryDecision == .recover else {
@@ -7021,7 +7043,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             let succeeded = await self.withPreparedActiveCredentialMutation(
-                targetAccountId: target.id,
+                targetAccountId: adoptionTarget.id,
                 expectedConfiguredAccountId: from.id,
                 source: "pool-authority",
                 requestKind: .poolAuthority,
@@ -7034,7 +7056,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 return await self.executeSwapTransaction(
                     from: from,
-                    to: target,
+                    to: adoptionTarget,
                     reason: .poolAuthority,
                     swapStart: Date(),
                     prepared: prepared,
@@ -7048,6 +7070,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 at: Date()
             )
         }
+    }
+
+    private func externalAuthConflictAuthorityTarget(
+        storedTarget: CodexAccount,
+        observation: PoolAuthorityObservation,
+        operationAuthority: PoolAuthorityOperationAuthority
+    ) async -> CodexAccount? {
+        guard operationAuthority.authorizes() else { return nil }
+        let authObservation = await Task.detached(priority: .userInitiated) {
+            AccountImporter.observeCurrentAccount(from: Self.codexAuthPath)
+        }.value
+        guard operationAuthority.authorizes(),
+              case .valid(let observedAuth) = authObservation else {
+            return nil
+        }
+        return ExternalAuthConflictRecoveryPolicy.authorityTarget(
+            storedTarget: storedTarget,
+            observedAuth: observedAuth,
+            authorityProviderAccountId: observation.desiredProviderAccountId,
+            now: Date()
+        )
     }
 
     private func restoreDurableExternalAuthConflictSource(
