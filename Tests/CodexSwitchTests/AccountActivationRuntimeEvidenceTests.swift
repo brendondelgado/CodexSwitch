@@ -210,7 +210,7 @@ struct AccountActivationRuntimeEvidenceTests {
             return
         }
         #expect(await fixture.recordedEvents() == ["renew", "capture"])
-        #expect(evidence.observedAt == Date(timeIntervalSince1970: 1_799_999_999))
+        #expect(evidence.observedAt == now)
         #expect(evidence.expiresAt > now)
     }
 
