@@ -4950,6 +4950,27 @@ async fn run_turn() {
     }
 
     #[test]
+    fn interrupted_turn_classifier_matches_upstream_error_representation() {
+        let legacy = interrupted_turn_template(
+            "Err(CodexErr::UsageLimitReached(e)) => return Err(CodexErr::UsageLimitReached(e)),",
+        )
+        .unwrap();
+        assert!(legacy.contains("matches!(error, CodexErr::RefreshTokenFailed(_))"));
+        assert!(!legacy.contains("matches!(error.details(),"));
+
+        let error_details = interrupted_turn_template(
+            "Err(err) => match err.details() { CodexErrorDetails::UsageLimitReached(e) => err }",
+        )
+        .unwrap();
+        assert!(error_details.contains(
+            "matches!(error.details(), CodexErrorDetails::RefreshTokenFailed(_))"
+        ));
+        assert!(!error_details.contains("matches!(error, CodexErr::RefreshTokenFailed(_))"));
+
+        assert!(interrupted_turn_template("Err(err) => err").is_err());
+    }
+
+    #[test]
     fn core_turn_patch_supports_codex_0_146_error_details_classifier() {
         let temp_dir = tempfile::tempdir().unwrap();
         let source_dir = temp_dir.path();
@@ -5024,6 +5045,10 @@ async fn run_turn() {
         let second = fs::read_to_string(turn_dir.join("turn.rs")).unwrap();
 
         assert_eq!(second, first, "the 0.146 turn patch must be idempotent");
+        assert!(second.contains(
+            "matches!(error.details(), CodexErrorDetails::RefreshTokenFailed(_))"
+        ));
+        assert!(!second.contains("matches!(error, CodexErr::RefreshTokenFailed(_))"));
         assert_eq!(
             second
                 .matches("codexswitch_rotate_after_usage_limit(&sess, &turn_context).await")

@@ -44,7 +44,7 @@ fn install_interrupted_turn_template(path: &Path) -> Result<()> {
     .filter_map(|needle| content[..anchor].find(needle))
     .min()
     .unwrap_or(anchor);
-    let interrupted_turn_template = interrupted_turn_template();
+    let interrupted_turn_template = interrupted_turn_template(&content)?;
     let updated = format!(
         "{}{}{}",
         &content[..existing_start],
@@ -55,14 +55,24 @@ fn install_interrupted_turn_template(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn interrupted_turn_template() -> String {
+fn interrupted_turn_template(turn_source: &str) -> Result<String> {
     const CONTROL_SOURCE_PLACEHOLDER: &str = "/* CODEXSWITCH_CONTROL_SOURCE */";
-    let template = INTERRUPTED_TURN_TEMPLATE.replace(
-        CONTROL_SOURCE_PLACEHOLDER,
-        include_str!("source_turn_control.rs"),
-    );
+    const AUTH_CLASSIFIER_PLACEHOLDER: &str = "/* CODEXSWITCH_AUTH_INVALIDATED_CLASSIFIER */";
+    let auth_classifier = if turn_source.contains("Err(err) => match err.details()")
+        && turn_source.contains("CodexErrorDetails::UsageLimitReached")
+    {
+        "matches!(error.details(), CodexErrorDetails::RefreshTokenFailed(_))"
+    } else if turn_source.contains("Err(CodexErr::UsageLimitReached(e))") {
+        "matches!(error, CodexErr::RefreshTokenFailed(_))"
+    } else {
+        bail!("unsupported Codex turn error representation")
+    };
+    let template = INTERRUPTED_TURN_TEMPLATE
+        .replace(CONTROL_SOURCE_PLACEHOLDER, include_str!("source_turn_control.rs"))
+        .replace(AUTH_CLASSIFIER_PLACEHOLDER, auth_classifier);
     debug_assert!(!template.contains(CONTROL_SOURCE_PLACEHOLDER));
-    template
+    debug_assert!(!template.contains(AUTH_CLASSIFIER_PLACEHOLDER));
+    Ok(template)
 }
 
 fn normalize_interrupted_turn_retry_loop(path: &Path) -> Result<()> {
@@ -1142,7 +1152,7 @@ async fn codexswitch_rotate_after_auth_failure(sess: &Session, turn_context: &Tu
 
 #[cfg(unix)]
 fn codexswitch_is_auth_invalidated_error(error: &CodexErr) -> bool {
-    if matches!(error, CodexErr::RefreshTokenFailed(_)) {
+    if /* CODEXSWITCH_AUTH_INVALIDATED_CLASSIFIER */ {
         return true;
     }
     let message = error.to_string().to_ascii_lowercase();

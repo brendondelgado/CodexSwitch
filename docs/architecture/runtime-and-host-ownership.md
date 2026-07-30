@@ -1705,9 +1705,11 @@ Interrupted-turn patching recognizes each supported upstream sampling-loop
 shape explicitly. The pre-0.146 direct error arms and the 0.146-or-later
 `CodexErrorDetails` classifier must both preserve the one-shot usage-limit
 rotation, external-auth reload, and authentication-failure rotation paths. The
-patch transaction fails closed when none of the reviewed shapes match, and a
-generated-source contract fixture covers every supported shape before a runtime
-artifact can be published.
+generated authentication classifier must use the same error representation as
+the detected loop: direct `CodexErr` variants for the legacy shape and
+`error.details()` for 0.146 or later. The patch transaction fails closed when
+none of the reviewed shapes match, and a generated-source contract fixture
+covers every supported shape before a runtime artifact can be published.
 
 Auth-manager patching likewise supports both the optional pre-0.146 route
 configuration and the concrete 0.146-or-later `AuthRouteConfig`. Every
