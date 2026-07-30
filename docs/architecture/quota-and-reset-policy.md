@@ -131,6 +131,16 @@ satisfies that requirement; a five-hour window is not required.
 
 Unknown and stale accounts are observable but cannot outrank confirmed usable accounts.
 
+Free-plan accounts are stored and remain visible, but they are not automatic
+capacity. An account whose normalized provider plan is Free, Free Workspace,
+Guest, or another Free/Guest plan variant is ineligible for automatic rotation,
+automatic plan-upgrade selection, automatic pool fallback, and ready-candidate
+counts even when its quota is fresh and usable. A Free account therefore cannot
+keep readiness green for a blocked active account and cannot become the daemon's
+automatic authority target. This exclusion does not delete or rewrite its
+credentials and does not broaden or narrow the existing explicit operator
+selection contract.
+
 The switching and reset paths share the same candidate eligibility and
 deterministic ranking implementation. When a VPS is configured, the VPS daemon
 is the sole policy and desired-target authority. Mac manual actions, automatic
@@ -214,7 +224,8 @@ Within the same tier and reset cost, prefer:
 Never switch to a candidate already inside the same exhaustion threshold that
 triggered the swap. Denied, zero-capacity, stale, failed-poll, token-expired, and
 near-expiry candidates are ineligible regardless of plan tier or prior cached
-quota.
+quota. Free-plan candidates are also unconditionally ineligible for automatic
+selection: fresh green quota does not make them a last-resort automatic target.
 
 ## Banked Reset Policy
 

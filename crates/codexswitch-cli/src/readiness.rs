@@ -1,5 +1,6 @@
 use crate::account_store::{
-    active_account, load_account_store_snapshot, quota_availability_at, QuotaAvailability,
+    active_account, load_account_store_snapshot, quota_availability_at,
+    ready_automatic_rotation_candidate_count, QuotaAvailability,
 };
 use crate::activation::{
     activation_record_confirms_current, read_activation_record_for_store, ActivationState,
@@ -86,13 +87,7 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
                 }
                 active_availability = quota_availability_at(active, now);
             }
-            ready_candidate_count = accounts
-                .iter()
-                .filter(|account| !account.is_active)
-                .filter(|account| {
-                    quota_availability_at(account, Utc::now()) == QuotaAvailability::Usable
-                })
-                .count();
+            ready_candidate_count = ready_automatic_rotation_candidate_count(&accounts, Utc::now());
             if accounts.is_empty() {
                 issues.push("no accounts imported".to_string());
             }

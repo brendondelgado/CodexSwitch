@@ -19,10 +19,10 @@ mod token_refresh;
 
 use account_store::{
     active_account, default_store_path, load_account_store_snapshot, load_accounts,
-    lock_account_store, mark_runtime_unusable, quota_availability_at, real_quota_snapshot,
-    resolve_account_selector, select_auto_swap_candidate_from_observations,
-    usage_limit_runtime_block_until, validate_accounts, CurrentQuotaObservations,
-    QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
+    lock_account_store, mark_runtime_unusable, quota_availability_at,
+    ready_automatic_rotation_candidate_count, real_quota_snapshot, resolve_account_selector,
+    select_auto_swap_candidate_from_observations, usage_limit_runtime_block_until,
+    validate_accounts, CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
 };
 #[cfg(test)]
 use account_store::{commit_accounts, save_accounts};
@@ -1339,13 +1339,7 @@ fn collect_auth_diagnostics(store_path: &Path, auth_path: &Path) -> Result<AuthD
         auth_token_hash_prefix: auth_info.token_hash_prefix.clone(),
         auth_matches_active_store_token: active_token_fingerprint.is_some()
             && active_token_fingerprint == auth_info.token_fingerprint,
-        ready_candidate_count: accounts
-            .iter()
-            .filter(|account| !account.is_active)
-            .filter(|account| {
-                quota_availability_at(account, Utc::now()) == QuotaAvailability::Usable
-            })
-            .count(),
+        ready_candidate_count: ready_automatic_rotation_candidate_count(&accounts, Utc::now()),
     };
     Ok(diagnostics)
 }
@@ -3886,6 +3880,28 @@ mod tests {
                 !collect_auth_diagnostics(&store_path, &auth_path)?.auth_matches_active_store_token
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn auth_diagnostics_excludes_green_free_accounts_from_ready_candidates() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 100.0, 100.0);
+        let mut free = account("free@example.com", false, 0.0, 0.0);
+        free.plan_type = Some("chatgpt_free".to_string());
+        save_accounts(&store_path, &[active.clone(), free.clone()])?;
+        auth::write_auth_file(&auth_path, &active)?;
+
+        assert_eq!(
+            quota_availability_at(&free, Utc::now()),
+            QuotaAvailability::Usable
+        );
+        assert_eq!(
+            collect_auth_diagnostics(&store_path, &auth_path)?.ready_candidate_count,
+            0
+        );
         Ok(())
     }
 

@@ -232,6 +232,12 @@ struct CodexAccount: Codable, Identifiable, Sendable {
         planPriority <= 1
     }
 
+    var isEligibleForAutomaticRotation: Bool {
+        !["free", "free_workspace", "guest"].contains {
+            isPlan(normalizedPlanType, named: $0)
+        }
+    }
+
     var normalizedProviderAccountId: String? {
         Self.stableIdentityComponent(accountId)
     }

@@ -925,8 +925,8 @@ struct SwapEngineTests {
         #expect(best?.id == other.id)
     }
 
-    @Test("Plan tier outranks raw free-account quota")
-    func planTierOutranksFreeQuota() {
+    @Test("Free-plan quota is excluded from automatic ranking")
+    func freePlanQuotaIsExcludedFromAutomaticRanking() {
         let free = makeAccount(fiveHourRemaining: 100, weeklyRemaining: 100, planType: "free")
         let plus = makeAccount(fiveHourRemaining: 100, weeklyRemaining: 100, planType: "plus")
         let proLite = makeAccount(fiveHourRemaining: 100, weeklyRemaining: 100, planType: "pro_lite")
@@ -946,8 +946,32 @@ struct SwapEngineTests {
         #expect(proLite.planPriority > plus.planPriority)
         #expect(plus.planPriority > free.planPriority)
         #expect(SwapEngine.score(proLite) > SwapEngine.score(plus))
-        #expect(SwapEngine.score(plus) > SwapEngine.score(free))
+        #expect(SwapEngine.score(free) == -1)
         #expect(SwapEngine.score(plusResettingSoon) == -1)
+    }
+
+    @Test("Green Free aliases never become automatic fallback capacity")
+    func greenFreeAliasesNeverBecomeAutomaticFallbackCapacity() {
+        let active = makeAccount(
+            fiveHourRemaining: 0,
+            weeklyRemaining: 0,
+            planType: "pro",
+            isActive: true
+        )
+
+        for planType in ["free", "free_workspace", "ChatGPT Free", "guest"] {
+            let free = makeAccount(
+                fiveHourRemaining: 100,
+                weeklyRemaining: 100,
+                planType: planType
+            )
+
+            #expect(SwapEngine.isImmediatelyUsable(free))
+            #expect(!free.isEligibleForAutomaticRotation)
+            #expect(SwapEngine.score(free) == -1)
+            #expect(SwapEngine.selectOptimalAccount(from: [active, free]) == nil)
+            #expect(SwapEngine.selectAutoSwapCandidate(from: [active, free]) == nil)
+        }
     }
 
     @Test("Pro aliases outrank Plus")

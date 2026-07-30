@@ -697,6 +697,13 @@ impl CodexAccount {
         }
     }
 
+    pub fn is_eligible_for_automatic_rotation(&self) -> bool {
+        let normalized = self.normalized_plan_type();
+        !["free", "free_workspace", "guest"]
+            .iter()
+            .any(|plan| plan_matches(&normalized, plan))
+    }
+
     pub fn runtime_unusable(&self) -> bool {
         self.runtime_unusable_at(Utc::now())
     }
@@ -1761,7 +1768,9 @@ pub(crate) fn test_inference_token(expires_at: DateTime<Utc>) -> String {
 }
 
 pub fn score(account: &CodexAccount, now: DateTime<Utc>) -> f64 {
-    if quota_availability_at(account, now) != QuotaAvailability::Usable {
+    if !account.is_eligible_for_automatic_rotation()
+        || quota_availability_at(account, now) != QuotaAvailability::Usable
+    {
         return -1.0;
     }
 
@@ -1789,6 +1798,25 @@ pub fn score(account: &CodexAccount, now: DateTime<Utc>) -> f64 {
     score
 }
 
+pub fn is_ready_automatic_rotation_candidate_at(
+    account: &CodexAccount,
+    now: DateTime<Utc>,
+) -> bool {
+    !account.is_active
+        && account.is_eligible_for_automatic_rotation()
+        && quota_availability_at(account, now) == QuotaAvailability::Usable
+}
+
+pub fn ready_automatic_rotation_candidate_count(
+    accounts: &[CodexAccount],
+    now: DateTime<Utc>,
+) -> usize {
+    accounts
+        .iter()
+        .filter(|account| is_ready_automatic_rotation_candidate_at(account, now))
+        .count()
+}
+
 #[cfg(test)]
 fn select_auto_swap_candidate(
     accounts: &[CodexAccount],
@@ -1796,8 +1824,7 @@ fn select_auto_swap_candidate(
 ) -> Option<&CodexAccount> {
     accounts
         .iter()
-        .filter(|account| !account.is_active)
-        .filter(|account| quota_availability_at(account, now) == QuotaAvailability::Usable)
+        .filter(|account| is_ready_automatic_rotation_candidate_at(account, now))
         .max_by(|left, right| candidate_cmp(left, right, now))
 }
 
@@ -1808,9 +1835,8 @@ pub fn select_auto_swap_candidate_from_observations<'a>(
 ) -> Option<&'a CodexAccount> {
     accounts
         .iter()
-        .filter(|account| !account.is_active)
+        .filter(|account| is_ready_automatic_rotation_candidate_at(account, now))
         .filter(|account| observations.contains(account))
-        .filter(|account| quota_availability_at(account, now) == QuotaAvailability::Usable)
         .max_by(|left, right| candidate_cmp(left, right, now))
 }
 
@@ -1821,9 +1847,8 @@ pub fn select_plan_upgrade_candidate(
     let active = active_account(accounts)?;
     accounts
         .iter()
-        .filter(|account| !account.is_active)
+        .filter(|account| is_ready_automatic_rotation_candidate_at(account, now))
         .filter(|account| account.plan_priority() > active.plan_priority())
-        .filter(|account| quota_availability_at(account, now) == QuotaAvailability::Usable)
         .max_by(|left, right| candidate_cmp(left, right, now))
 }
 
@@ -1835,10 +1860,9 @@ pub fn select_plan_upgrade_candidate_from_observations<'a>(
     let active = active_account(accounts)?;
     accounts
         .iter()
-        .filter(|account| !account.is_active)
+        .filter(|account| is_ready_automatic_rotation_candidate_at(account, now))
         .filter(|account| observations.contains(account))
         .filter(|account| account.plan_priority() > active.plan_priority())
-        .filter(|account| quota_availability_at(account, now) == QuotaAvailability::Usable)
         .max_by(|left, right| candidate_cmp(left, right, now))
 }
 
@@ -2106,9 +2130,11 @@ mod tests {
         assert_eq!(pro_lite.plan_priority(), 3);
         assert_eq!(plus.plan_priority(), 2);
         assert_eq!(free.plan_priority(), 1);
+        assert!(!free.is_eligible_for_automatic_rotation());
         assert!(score(&pro, Utc::now()) > score(&pro_lite, Utc::now()));
         assert!(score(&pro_lite, Utc::now()) > score(&plus, Utc::now()));
         assert!(score(&plus, Utc::now()) > score(&free, Utc::now()));
+        assert_eq!(score(&free, Utc::now()), -1.0);
         assert_eq!(
             select_auto_swap_candidate(&[active, free, plus, pro_lite, pro], Utc::now())
                 .map(|account| account.email.as_str()),
@@ -2124,11 +2150,21 @@ mod tests {
         let pro = account_with_plan("pro@example.com", 95.0, 50.0, false, "ChatGPT Pro");
         let pro_monthly =
             account_with_plan("monthly@example.com", 95.0, 50.0, false, "pro-monthly");
+        let free_workspace = account_with_plan(
+            "free@example.com",
+            0.0,
+            0.0,
+            false,
+            "chatgpt free workspace",
+        );
+        let guest = account_with_plan("guest@example.com", 0.0, 0.0, false, "guest");
 
         assert_eq!(plus.plan_priority(), 2);
         assert_eq!(pro_lite.plan_priority(), 3);
         assert_eq!(pro.plan_priority(), 4);
         assert_eq!(pro_monthly.plan_priority(), 4);
+        assert!(!free_workspace.is_eligible_for_automatic_rotation());
+        assert!(!guest.is_eligible_for_automatic_rotation());
         assert!(score(&pro, Utc::now()) > score(&plus, Utc::now()));
     }
 
@@ -2796,8 +2832,7 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut candidates = accounts
             .iter()
-            .filter(|account| !account.is_active)
-            .filter(|account| quota_availability_at(account, now) == QuotaAvailability::Usable)
+            .filter(|account| is_ready_automatic_rotation_candidate_at(account, now))
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| candidate_cmp(right, left, now));
 
@@ -3060,7 +3095,7 @@ mod tests {
     }
 
     #[test]
-    fn free_capacity_is_an_absolute_last_resort_after_verified_paid_capacity() {
+    fn green_free_capacity_is_never_an_automatic_rotation_candidate() {
         let active = account_with_plan("active@example.com", 100.0, 100.0, true, "pro");
         let free = account_with_plan("free@example.com", 0.0, 0.0, false, "free");
         let plus = account_with_plan("plus@example.com", 98.0, 98.0, false, "plus");
@@ -3086,8 +3121,18 @@ mod tests {
         assert_eq!(
             select_auto_swap_candidate_from_observations(&accounts[..2], &observations, now)
                 .map(|account| account.email.as_str()),
-            Some("free@example.com")
+            None
         );
+        assert_eq!(
+            quota_availability_at(&accounts[1], now),
+            QuotaAvailability::Usable
+        );
+        assert!(!accounts[1].is_eligible_for_automatic_rotation());
+        assert_eq!(
+            ready_automatic_rotation_candidate_count(&accounts[..2], now),
+            0
+        );
+        assert!(select_auto_swap_candidate(&accounts[..2], now).is_none());
     }
 
     #[test]

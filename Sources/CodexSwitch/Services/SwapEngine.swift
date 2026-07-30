@@ -462,7 +462,8 @@ enum SwapEngine {
     /// Score an account for swap eligibility. Higher = better candidate.
     /// Returns -1 for denied, exhausted, stale, or windowless snapshots.
     static func score(_ account: CodexAccount, now: Date = Date()) -> Double {
-        guard account.isImmediatelyUsableReplacement(at: now),
+        guard account.isEligibleForAutomaticRotation,
+              account.isImmediatelyUsableReplacement(at: now),
               let snapshot = account.realQuotaSnapshot(at: now) else { return -1 }
 
         let planBase = planPriorityBase(for: account)
@@ -494,7 +495,7 @@ enum SwapEngine {
         case 2:
             return 5_000 // Plus/team/business: normal paid working pool
         default:
-            return 100 // Free: usable only after paid accounts are spent/resetting
+            return 100 // Unknown tiers retain deterministic ordering when otherwise eligible
         }
     }
 
@@ -553,6 +554,7 @@ enum SwapEngine {
     ) -> [CodexAccount] {
         accounts
             .filter { !$0.isActive && !excludedAccountIds.contains($0.id) }
+            .filter(\.isEligibleForAutomaticRotation)
             .filter(additionalEligibility)
             .filter { isImmediatelyUsable($0, now: now) }
             .sorted { isBetterCandidate($0, than: $1, now: now) }
