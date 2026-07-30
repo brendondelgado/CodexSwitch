@@ -1,0 +1,61 @@
+Sources/CodexSwitch/Services/AppRelaunchPlanner.swift
+  s_70c8e194852bb5::t_1bd0daaa35a7fd 8-9,23,31,33,35
+Tests/CodexSwitchTests/ExternalAuthConflictRecoveryTests.swift
+  s_70c8e194852bb5::t_06a6452e4735af 98-105,107
+  s_70c8e194852bb5::t_2e384d7692d2df 51-54,78,86-89
+  s_70c8e194852bb5::t_73f2e794046f2c 1-50,55-77,79-85,90-97,106,108-138
+Tests/CodexSwitchTests/AppRelaunchPlannerTests.swift
+  s_70c8e194852bb5::t_3de4695173e859 15-16,20-21
+Tests/CodexSwitchTests/AccountActivationTransactionTests.swift
+  s_70c8e194852bb5::t_3de4695173e859 10,20,42-47,200-207,256-267
+Sources/CodexSwitch/Services/AccountActivationTransaction.swift
+  s_70c8e194852bb5::t_1bd0daaa35a7fd 13,390,619-620
+  s_70c8e194852bb5::t_44ba4b4d223b06 621
+scripts/install-macos-app-artifact.sh
+  s_70c8e194852bb5::t_1bd0daaa35a7fd 581-584
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_1bd0daaa35a7fd 281,450-457,459,463-464,1466-1468,1497,7275,7337,7374-7377,7379-7391
+  s_70c8e194852bb5::t_36d74dce08eef6 6980-7004,7010,7023,7035-7071,7078,7095-7097,7108-7111,7115-7117
+  s_70c8e194852bb5::t_5cbeac48c8fb03 164-168,7274,7340,7378
+  s_70c8e194852bb5::t_1bd1c9fb701d57 6460,6492,6536,6554-6555,6563-6582
+  s_70c8e194852bb5::t_474105cd3281c8 7392
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_61ca632b0a37b4 33,869-890
+  s_70c8e194852bb5::t_59db82be1dea8c 34-35,323-331,354-361
+  s_70c8e194852bb5::t_7fa8c96c7ee493 362
+Sources/CodexSwitch/Services/SingleInstanceLock.swift
+  s_70c8e194852bb5::t_1bd0daaa35a7fd 4-21,52-56,61-69,85
+scripts/test_build_app.py
+  s_70c8e194852bb5::t_3de4695173e859 13-19
+scripts/test_macos_app_artifact.py
+  s_70c8e194852bb5::t_3de4695173e859 226-229
+docs/architecture/macos-cli-launcher.md
+  s_70c8e194852bb5::t_59db82be1dea8c 16-19,30,97-108
+  s_70c8e194852bb5::t_d9a796b1672194 109
+Sources/CodexSwitch/Services/ExternalAuthConflictRecoveryPolicy.swift
+  s_70c8e194852bb5::t_2b28534421aed9 1-63
+scripts/build-app.sh
+  s_70c8e194852bb5::t_1bd0daaa35a7fd 201-202,400-401
+  s_70c8e194852bb5::t_cd93bc4a63cd6b 402-403
+Sources/CodexSwitch/Services/AccountActivationCoordinator.swift
+  s_70c8e194852bb5::t_06a6452e4735af 164-165
+  s_70c8e194852bb5::t_132b5626b5b82b 148-163,166-190
+Tests/CodexSwitchTests/SingleInstanceLockTests.swift
+  s_70c8e194852bb5::t_3de4695173e859 7-19,38-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "842209dba13251343e991aabefa020f34fbe5111",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
