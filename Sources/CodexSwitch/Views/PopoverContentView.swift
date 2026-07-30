@@ -125,10 +125,13 @@ struct PopoverContentView: View {
         activeProviderAccountId: String? = nil,
         now: Date = Date()
     ) -> (account: CodexAccount, formattedTime: String)? {
+        let normalizedActiveProviderAccountId = CodexAccount.normalizedProviderAccountId(
+            activeProviderAccountId
+        )
         let candidates = accounts
             .compactMap { account -> (CodexAccount, TimeInterval)? in
-                guard account.normalizedProviderAccountId != activeProviderAccountId,
-                      let snapshot = account.realQuotaSnapshot,
+                guard account.normalizedProviderAccountId != normalizedActiveProviderAccountId,
+                      let snapshot = account.realQuotaSnapshot(at: now),
                       let weekly = snapshot.weekly,
                       snapshot.isDenied || weekly.isExhausted else {
                     return nil

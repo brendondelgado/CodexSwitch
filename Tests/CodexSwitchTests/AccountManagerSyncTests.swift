@@ -1064,23 +1064,32 @@ struct AccountManagerSyncTests {
     @MainActor func sortedAccountsIgnoreLocalActiveFlagWithoutAuthority() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
         let exhaustedPro = CodexAccount(
             email: "exhausted-pro@test.com",
-            accessToken: "t1",
+            accessToken: testInferenceToken(expiresAt: now.addingTimeInterval(3_600)),
             refreshToken: "r1",
             idToken: "i1",
             accountId: "acc-exhausted",
-            quotaSnapshot: quotaSnapshot(fiveHourRemaining: 0, weeklyRemaining: 90),
+            quotaSnapshot: quotaSnapshot(
+                fiveHourRemaining: 0,
+                weeklyRemaining: 90,
+                fetchedAt: now
+            ),
             planType: "pro",
             isActive: true
         )
         let usablePlus = CodexAccount(
             email: "usable-plus@test.com",
-            accessToken: "t2",
+            accessToken: testInferenceToken(expiresAt: now.addingTimeInterval(3_600)),
             refreshToken: "r2",
             idToken: "i2",
             accountId: "acc-usable",
-            quotaSnapshot: quotaSnapshot(fiveHourRemaining: 80, weeklyRemaining: 80),
+            quotaSnapshot: quotaSnapshot(
+                fiveHourRemaining: 80,
+                weeklyRemaining: 80,
+                fetchedAt: now
+            ),
             planType: "plus"
         )
 
@@ -1088,8 +1097,9 @@ struct AccountManagerSyncTests {
         manager.addAccount(usablePlus)
         manager.setConfiguredAccount(exhaustedPro.id)
 
-        #expect(manager.sortedAccounts.first?.id == usablePlus.id)
-        #expect(manager.sortedAccounts.dropFirst().first?.id == exhaustedPro.id)
+        let sorted = manager.sortedAccounts(using: .unavailable, now: now)
+        #expect(sorted.first?.id == usablePlus.id)
+        #expect(sorted.dropFirst().first?.id == exhaustedPro.id)
     }
 
     @Test("Inactive imported credentials refresh an existing account")

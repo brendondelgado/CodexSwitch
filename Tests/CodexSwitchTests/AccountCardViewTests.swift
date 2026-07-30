@@ -54,7 +54,7 @@ struct AccountCardViewTests {
     private func makeRedeemableAccount(now: Date) -> CodexAccount {
         CodexAccount(
             email: "blocked-pro@example.com",
-            accessToken: "access",
+            accessToken: testInferenceToken(expiresAt: now.addingTimeInterval(3_600)),
             refreshToken: "refresh",
             idToken: "id",
             accountId: "blocked-pro",
@@ -280,6 +280,7 @@ struct AccountCardViewTests {
     func redemptionTooltipUsesPolicyReason() {
         var usableAccount = makeAccount(isActive: false)
         let now = Date().addingTimeInterval(1)
+        usableAccount.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(3_600))
         usableAccount.rateLimitResetBank = makeResetBank(now: now)
         let view = AccountCardView(
             account: usableAccount,

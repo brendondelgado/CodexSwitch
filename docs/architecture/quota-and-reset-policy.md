@@ -483,6 +483,10 @@ reconciliation in progress may use their distinct operational colors.
 
 ## Presentation Rules
 
+- Normalize provider account identifiers through the canonical account identity
+  normalizer before excluding the authority target from reset fallback lists.
+  Presentation code must not compare a normalized stored identifier with raw
+  authority telemetry.
 - Render only observed windows.
 - Render an observation older than the runtime freshness contract as
   `quota=stale`; never print its cached percentages as current capacity.

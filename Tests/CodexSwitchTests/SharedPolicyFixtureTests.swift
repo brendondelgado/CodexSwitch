@@ -290,7 +290,7 @@ private func loadFixture<T: Decodable>(_ name: String) throws -> T {
 private func resetAccount(now: Date) -> CodexAccount {
     CodexAccount(
         email: "fixture@example.com",
-        accessToken: "access-fixture",
+        accessToken: testInferenceToken(expiresAt: now.addingTimeInterval(3_600)),
         refreshToken: "refresh-fixture",
         idToken: "id-fixture",
         accountId: "provider-fixture",

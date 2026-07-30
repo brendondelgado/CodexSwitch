@@ -239,7 +239,11 @@ struct CodexAccount: Codable, Identifiable, Sendable {
     }
 
     var normalizedProviderAccountId: String? {
-        Self.stableIdentityComponent(accountId)
+        Self.normalizedProviderAccountId(accountId)
+    }
+
+    static func normalizedProviderAccountId(_ value: String?) -> String? {
+        value.flatMap(stableIdentityComponent)
     }
 
     func isOrderedBeforeByStableIdentity(_ other: CodexAccount) -> Bool {
