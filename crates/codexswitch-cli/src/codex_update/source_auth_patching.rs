@@ -282,25 +282,25 @@ fn patch_auth_generation_initializers(path: &Path) -> Result<()> {
     let mut updated = String::with_capacity(content.len() + 512);
     let lines = content.lines().collect::<Vec<_>>();
     let mut index = 0;
-    let mut inside_initializer = false;
+    let mut initializer_brace_depth = 0_i64;
     let mut initializer_has_generation = false;
     let mut initializer_has_external_auth = false;
     while index < lines.len() {
         let line = lines[index];
         if line.contains("Self {") {
-            inside_initializer = true;
+            initializer_brace_depth = 0;
             initializer_has_generation = false;
             initializer_has_external_auth = false;
         }
+        let inside_initializer = initializer_brace_depth > 0 || line.contains("Self {");
         if line.contains("auth_generation: AtomicU64::new(0),") {
             initializer_has_generation = true;
         }
         if inside_initializer && line.trim_start().starts_with("external_auth:") {
             initializer_has_external_auth = true;
         }
-        let finishes_initializer = inside_initializer
-            && line.trim_start().starts_with("auth_route_config:");
-        if finishes_initializer
+        if inside_initializer
+            && line.trim_start().starts_with("auth_route_config:")
             && initializer_has_external_auth
             && !initializer_has_generation
         {
@@ -321,8 +321,18 @@ fn patch_auth_generation_initializers(path: &Path) -> Result<()> {
                 initializer_has_generation = true;
             }
         }
-        if finishes_initializer {
-            inside_initializer = false;
+        if inside_initializer {
+            initializer_brace_depth += line
+                .bytes()
+                .map(|byte| match byte {
+                    b'{' => 1,
+                    b'}' => -1,
+                    _ => 0,
+                })
+                .sum::<i64>();
+            if initializer_brace_depth <= 0 {
+                initializer_brace_depth = 0;
+            }
         }
 
         index += 1;

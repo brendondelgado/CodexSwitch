@@ -3936,6 +3936,14 @@ impl CodexAuth {
 impl AuthDotJson {
 }
 
+impl PriorConstructor {
+    fn new() -> Self {
+        Self {
+            value: 1,
+        }
+    }
+}
+
 pub struct AuthManager {
     external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
     auth_route_config: AuthRouteConfig,
