@@ -458,12 +458,28 @@ capacity without implying another client redeemed a credit, so it updates the
 inventory and urgency presentation without creating an external-redemption
 hold.
 
+The provider credit list, not `total_earned_count`, is the redemption safety
+authority. A valid inventory has a nonnegative `available_count` equal to the
+complete set of provider-marked available credits, with unique nonempty
+identifiers and explicit future expirations. `total_earned_count` is optional
+historical telemetry and may be zero while available credits exist; it never
+invalidates an otherwise exact inventory and never authorizes redemption.
+Swift and Rust treat this field independently of available capacity while
+preserving the exact credit-list and count checks.
+
 The five-minute background freshness bound controls cache reuse and refresh
 scheduling only. UI labels such as `current` and `verified`, account-card reset
 counts, and expiration urgency use the same at-most-sixty-second evidence bound
 as manual redemption. Once that bound passes, the UI renders the count as
 last-known/unverified, disables redemption, and suppresses actionable expiration
 urgency until a fresh observation arrives.
+
+Unknown, stale, expired, and refresh-failed reset inventory is neutral
+non-actionable metadata, not an account-health failure. It must not paint an
+account card red or reuse a last-known count as current capacity. Red and
+pulsing reset styling is reserved for a fresh available credit whose verified
+expiration is inside the critical urgency interval. Redemption and
+reconciliation in progress may use their distinct operational colors.
 
 ## Presentation Rules
 

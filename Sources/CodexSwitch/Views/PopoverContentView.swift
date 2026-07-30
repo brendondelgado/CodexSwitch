@@ -78,7 +78,7 @@ struct PopoverContentView: View {
         case .current:
             return "Pool Target"
         case .stale:
-            return "Pool Target (stale)"
+            return "Pool Target"
         case .unavailable:
             return "Pool Target unavailable"
         }
@@ -316,7 +316,7 @@ struct PopoverContentView: View {
                         // One authority target, with host convergence shown globally.
                         HStack(spacing: 6) {
                             Image(systemName: "scope")
-                                .foregroundStyle(activeAccountReadModel.freshness == .stale ? .orange : .green)
+                                .foregroundStyle(.green)
                                 .font(.system(size: 11))
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(Self.poolTargetLabel(
@@ -622,53 +622,31 @@ private struct RateLimitResetOverviewRow: View {
     }()
 
     var body: some View {
-        if let errorMessage = item.errorMessage {
-            HStack(spacing: 5) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                Text(item.accountEmail)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 4)
-                Text("Error • \(item.availableCount) last-known/unverified • \(errorMessage)")
-                    .foregroundStyle(.red)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            .font(.system(size: 9, weight: .medium))
-            .help("Reset inventory error for \(item.accountEmail): \(errorMessage). Last-known/unverified count: \(item.availableCount)")
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(
-                "Reset inventory error for \(item.accountEmail): \(errorMessage). "
-                    + "Last-known/unverified count: \(item.availableCount)"
-            )
-        } else if let expiration = item.expiration, let urgency = item.urgency {
-            HStack(spacing: 5) {
-                Image(systemName: urgency.systemImage)
-                    .foregroundStyle(urgency.presentationColor)
-                Text(item.accountEmail)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 4)
-                Text(
-                    "\(urgency.displayName) • \(item.availableCount) • "
-                        + Self.expirationFormatter.string(from: expiration)
-                )
-                .foregroundStyle(urgency.presentationColor)
+        HStack(spacing: 5) {
+            Image(systemName: item.urgency.systemImage)
+                .foregroundStyle(item.urgency.presentationColor)
+            Text(item.accountEmail)
                 .lineLimit(1)
-            }
-            .font(.system(size: 9, weight: .medium))
-            .rateLimitResetUrgencyPulse(urgency)
-            .help(
-                "\(urgency.accessibilityDescription) for \(item.accountEmail). "
-                    + "Oldest reset expires \(Self.expirationFormatter.string(from: expiration))"
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Text(
+                "\(item.urgency.displayName) • \(item.availableCount) • "
+                    + Self.expirationFormatter.string(from: item.expiration)
             )
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(
-                "\(item.accountEmail), \(item.availableCount) banked resets. "
-                    + "\(urgency.accessibilityDescription). Oldest expires "
-                    + Self.expirationFormatter.string(from: expiration)
-            )
+            .foregroundStyle(item.urgency.presentationColor)
+            .lineLimit(1)
         }
+        .font(.system(size: 9, weight: .medium))
+        .rateLimitResetUrgencyPulse(item.urgency)
+        .help(
+            "\(item.urgency.accessibilityDescription) for \(item.accountEmail). "
+                + "Oldest reset expires \(Self.expirationFormatter.string(from: item.expiration))"
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "\(item.accountEmail), \(item.availableCount) banked resets. "
+                + "\(item.urgency.accessibilityDescription). Oldest expires "
+                + Self.expirationFormatter.string(from: item.expiration)
+        )
     }
 }

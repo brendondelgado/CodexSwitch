@@ -66,8 +66,33 @@ pub struct ActivationRecord {
 
 const ACTIVATION_RECORD_VERSION: u32 = 3;
 const ACTIVATION_RECORD_MAX_BYTES: usize = 1024 * 1024;
+const SWIFT_ACTIVATION_RECORD_VERSION: u32 = 1;
+const SWIFT_ACTIVATION_RECORD_MAX_BYTES: usize = 4 * 1024;
+const SWIFT_REFERENCE_DATE_UNIX_SECONDS: f64 = 978_307_200.0;
+const SWIFT_MAX_RUNTIME_COUNT: usize = 256;
+const SWIFT_HANDOFF_MAX_AGE_SECONDS: f64 = 60.0 * 60.0;
 pub(crate) const LEGACY_DEGRADED_TOKEN_MISMATCH: &str =
     "degraded activation no longer matches the intended store/auth token set; manual review is required";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SwiftActivationWitness {
+    version: u32,
+    phase: String,
+    activation_generation: Uuid,
+    configured_account_id: Option<Uuid>,
+    runtime_current_account_id: Option<Uuid>,
+    updated_at: f64,
+    retry_attempt: usize,
+    next_retry_at: Option<f64>,
+    discovered_runtime_count: usize,
+    acknowledged_runtime_count: usize,
+    detail: Option<String>,
+    runtime_evidence_generation: Option<Uuid>,
+    runtime_evidence_observed_at: Option<f64>,
+    runtime_evidence_expires_at: Option<f64>,
+    runtime_blockers: Option<Vec<serde_json::Value>>,
+}
 
 fn complete_account_token_fingerprint(account: &CodexAccount) -> Option<String> {
     account
@@ -1874,6 +1899,76 @@ where
     )
 }
 
+fn swift_activation_witness_path(store_path: &Path) -> PathBuf {
+    store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("account-activation.json")
+}
+
+fn swift_reference_seconds(date: DateTime<Utc>) -> f64 {
+    date.timestamp() as f64 + f64::from(date.timestamp_subsec_nanos()) / 1_000_000_000.0
+        - SWIFT_REFERENCE_DATE_UNIX_SECONDS
+}
+
+fn swift_witness_confirms_newer_active_handoff(
+    store_lock: &AccountStoreLock,
+    stale_record: &ActivationRecord,
+    active: &CodexAccount,
+) -> Result<bool> {
+    let path = swift_activation_witness_path(store_lock.store_path());
+    let snapshot = secure_file::observe(&path, SWIFT_ACTIVATION_RECORD_MAX_BYTES, true)
+        .with_context(|| {
+            format!(
+                "failed to observe Swift activation witness {}",
+                path.display()
+            )
+        })?;
+    let Some(bytes) = snapshot.bytes() else {
+        return Ok(false);
+    };
+    let witness: SwiftActivationWitness = serde_json::from_slice(bytes).with_context(|| {
+        format!(
+            "failed to decode Swift activation witness {}",
+            path.display()
+        )
+    })?;
+    let Some(observed_at) = witness.runtime_evidence_observed_at else {
+        return Ok(false);
+    };
+    let Some(expires_at) = witness.runtime_evidence_expires_at else {
+        return Ok(false);
+    };
+    let now = swift_reference_seconds(Utc::now());
+    let blockers_are_empty = witness
+        .runtime_blockers
+        .as_ref()
+        .map_or(true, Vec::is_empty);
+    Ok(witness.version == SWIFT_ACTIVATION_RECORD_VERSION
+        && witness.phase == "confirmed"
+        && witness.activation_generation != Uuid::nil()
+        && witness.configured_account_id == Some(active.id)
+        && witness.runtime_current_account_id == Some(active.id)
+        && witness.updated_at.is_finite()
+        && witness.updated_at > swift_reference_seconds(stale_record.updated_at)
+        && witness.updated_at >= now - SWIFT_HANDOFF_MAX_AGE_SECONDS
+        && witness.updated_at <= now + 300.0
+        && witness.retry_attempt == 0
+        && witness.next_retry_at.is_none()
+        && (1..=SWIFT_MAX_RUNTIME_COUNT).contains(&witness.discovered_runtime_count)
+        && witness.acknowledged_runtime_count == witness.discovered_runtime_count
+        && witness.detail.is_none()
+        && witness
+            .runtime_evidence_generation
+            .is_some_and(|value| value != Uuid::nil())
+        && observed_at.is_finite()
+        && expires_at.is_finite()
+        && observed_at <= witness.updated_at
+        && expires_at > witness.updated_at
+        && expires_at > observed_at
+        && blockers_are_empty)
+}
+
 fn reconcile_durable_activation_record_with<R>(
     context: ActivationBarrierContext<'_>,
     reload: &mut R,
@@ -1929,6 +2024,54 @@ where
                 record.auth_fingerprint = Some(target_fingerprint.clone());
                 record.detail = Some(
                     "stale Confirmed activation reconciled from exact same-target store/auth convergence; runtime acknowledgement remains required"
+                        .to_string(),
+                );
+                record.updated_at = Utc::now();
+                write_activation_record(store_lock, &record)?;
+                let outcome = resume_committed_degraded(
+                    DurableConvergenceContext {
+                        store_lock,
+                        generation,
+                        accounts,
+                        auth_path,
+                        target: &target,
+                        target_fingerprint: &target_fingerprint,
+                        reload_enabled,
+                    },
+                    record,
+                    reload,
+                )?;
+                return Ok(Some((target_id, outcome)));
+            }
+            let cross_owner_handoff_is_safe = record.version == ACTIVATION_RECORD_VERSION
+                && record.kind != ActivationKind::Unknown
+                && record.target_account_id != active.account_id
+                && record.base_store_generation.is_none()
+                && record.owned_store_generation.is_none()
+                && record.base_auth_generation.is_none()
+                && record.owned_auth_generation.is_none()
+                && record.rollback.is_none()
+                && active.has_complete_token_material()
+                && auth_file_matches_account(auth_path, active)
+                && swift_witness_confirms_newer_active_handoff(store_lock, &record, active)?;
+            if cross_owner_handoff_is_safe {
+                let target = active.clone();
+                let target_id = target.id;
+                let target_fingerprint = complete_account_token_fingerprint(&target)
+                    .context("Swift activation handoff requires complete token material")?;
+                record.previous_account_id = record.target_account_id;
+                record.target_account_id = target.account_id.clone();
+                record.state = ActivationState::CommittedDegraded;
+                record.kind = ActivationKind::Rotation;
+                record.store_generation = generation.as_str().to_string();
+                record.auth_fingerprint = Some(target_fingerprint.clone());
+                record.base_store_generation = None;
+                record.owned_store_generation = None;
+                record.base_auth_generation = None;
+                record.owned_auth_generation = None;
+                record.rollback = None;
+                record.detail = Some(
+                    "stale Rust confirmation superseded by an exact newer Swift activation witness; fresh runtime acknowledgement remains required"
                         .to_string(),
                 );
                 record.updated_at = Utc::now();
@@ -2984,6 +3127,42 @@ mod tests {
         }
     }
 
+    fn write_swift_activation_witness(
+        store_path: &Path,
+        target: Uuid,
+        updated_at: f64,
+        discovered_runtime_count: usize,
+        acknowledged_runtime_count: usize,
+    ) -> Result<()> {
+        let path = swift_activation_witness_path(store_path);
+        let lock = secure_file::lock(&path, true)?;
+        let current = lock.load(SWIFT_ACTIVATION_RECORD_MAX_BYTES, true)?;
+        let observed_at = updated_at - 1.0;
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": SWIFT_ACTIVATION_RECORD_VERSION,
+            "phase": "confirmed",
+            "activationGeneration": Uuid::new_v4(),
+            "configuredAccountId": target,
+            "runtimeCurrentAccountId": target,
+            "updatedAt": updated_at,
+            "retryAttempt": 0,
+            "nextRetryAt": null,
+            "discoveredRuntimeCount": discovered_runtime_count,
+            "acknowledgedRuntimeCount": acknowledged_runtime_count,
+            "detail": null,
+            "runtimeEvidenceGeneration": Uuid::new_v4(),
+            "runtimeEvidenceObservedAt": observed_at,
+            "runtimeEvidenceExpiresAt": observed_at + 10.0,
+            "runtimeBlockers": null
+        }))?;
+        lock.commit(
+            current.generation(),
+            &bytes,
+            SWIFT_ACTIVATION_RECORD_MAX_BYTES,
+        )?;
+        Ok(())
+    }
+
     fn assert_store_lock_available(store_path: &Path) -> Result<()> {
         let lock_path = store_path.with_extension("json.lock");
         let file = OpenOptions::new().read(true).write(true).open(&lock_path)?;
@@ -3504,6 +3683,200 @@ mod tests {
             Some(active.id)
         );
         assert!(auth_file_matches_account(&auth_path, &active));
+        Ok(())
+    }
+
+    #[test]
+    fn newer_swift_confirmation_reconciles_a_different_stale_rust_target() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let stale_target = account("stale@example.com", false);
+        save_accounts(&store_path, &[active.clone(), stale_target.clone()])?;
+        commit_auth_file(&auth_path, &active)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let mut stale_record = activation_record_ids(
+            ActivationState::Confirmed,
+            &active.account_id,
+            &stale_target.account_id,
+            &snapshot.generation,
+            account_token_fingerprint(&stale_target),
+            None,
+        );
+        stale_record.updated_at = Utc::now() - chrono::Duration::minutes(2);
+        write_activation_record(&store_lock, &stale_record)?;
+        drop(store_lock);
+        write_swift_activation_witness(
+            &store_path,
+            active.id,
+            swift_reference_seconds(Utc::now()),
+            2,
+            2,
+        )?;
+
+        let reload_calls = Cell::new(0usize);
+        let outcome =
+            reconcile_activation_barrier_unlocked(&store_path, &auth_path, true, &|_| {
+                reload_calls.set(reload_calls.get() + 1);
+                Ok(ReloadSummary::default()
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
+            })?
+            .context("Swift handoff did not produce a reconciliation outcome")?;
+
+        assert!(outcome.is_confirmed());
+        assert_eq!(reload_calls.get(), 1);
+        let record = read_activation_record_for_store(&store_path)?
+            .context("reconciled activation record disappeared")?;
+        assert_eq!(record.state, ActivationState::Confirmed);
+        assert_eq!(record.previous_account_id, stale_target.account_id);
+        assert_eq!(record.target_account_id, active.account_id);
+        assert_eq!(
+            record.auth_fingerprint,
+            complete_account_token_fingerprint(&active)
+        );
+        assert!(auth_file_matches_account(&auth_path, &active));
+        Ok(())
+    }
+
+    #[test]
+    fn swift_handoff_rejects_wrong_account_or_incomplete_runtime_evidence() -> Result<()> {
+        for (witness_target_is_active, discovered, acknowledged) in
+            [(false, 2usize, 2usize), (true, 2usize, 1usize)]
+        {
+            let dir = tempfile::tempdir()?;
+            let store_path = dir.path().join("accounts.json");
+            let auth_path = dir.path().join("auth.json");
+            let active = account("active@example.com", true);
+            let stale_target = account("stale@example.com", false);
+            save_accounts(&store_path, &[active.clone(), stale_target.clone()])?;
+            commit_auth_file(&auth_path, &active)?;
+            let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+            let store_lock = lock_account_store(&store_path)?;
+            let mut stale_record = activation_record_ids(
+                ActivationState::Confirmed,
+                &active.account_id,
+                &stale_target.account_id,
+                &snapshot.generation,
+                account_token_fingerprint(&stale_target),
+                None,
+            );
+            stale_record.updated_at = Utc::now() - chrono::Duration::minutes(2);
+            write_activation_record(&store_lock, &stale_record)?;
+            drop(store_lock);
+            let original_journal = fs::read(activation_record_path(&store_path))?;
+            write_swift_activation_witness(
+                &store_path,
+                if witness_target_is_active {
+                    active.id
+                } else {
+                    stale_target.id
+                },
+                swift_reference_seconds(Utc::now()),
+                discovered,
+                acknowledged,
+            )?;
+
+            let reload_calls = Cell::new(0usize);
+            let error =
+                reconcile_activation_barrier_unlocked(&store_path, &auth_path, true, &|_| {
+                    reload_calls.set(reload_calls.get() + 1);
+                    Ok(ReloadSummary::default()
+                        .with_signaled(vec![42])
+                        .with_topology_verified(true))
+                })
+                .expect_err("invalid Swift evidence must preserve the stale Rust barrier");
+
+            assert!(format!("{error:#}").contains("durable Confirmed activation is stale"));
+            assert_eq!(reload_calls.get(), 0);
+            assert_eq!(
+                fs::read(activation_record_path(&store_path))?,
+                original_journal
+            );
+            assert!(auth_file_matches_account(&auth_path, &active));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn swift_handoff_rejects_a_witness_not_newer_than_the_rust_record() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let stale_target = account("stale@example.com", false);
+        save_accounts(&store_path, &[active.clone(), stale_target.clone()])?;
+        commit_auth_file(&auth_path, &active)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let stale_record = activation_record_ids(
+            ActivationState::Confirmed,
+            &active.account_id,
+            &stale_target.account_id,
+            &snapshot.generation,
+            account_token_fingerprint(&stale_target),
+            None,
+        );
+        let rust_updated_at = swift_reference_seconds(stale_record.updated_at);
+        write_activation_record(&store_lock, &stale_record)?;
+        drop(store_lock);
+        let original_journal = fs::read(activation_record_path(&store_path))?;
+        write_swift_activation_witness(&store_path, active.id, rust_updated_at, 1, 1)?;
+
+        let error = reconcile_activation_barrier_unlocked(&store_path, &auth_path, true, &|_| {
+            unreachable!("stale Swift evidence must not trigger a reload")
+        })
+        .expect_err("a non-newer Swift witness must preserve the hard barrier");
+
+        assert!(format!("{error:#}").contains("durable Confirmed activation is stale"));
+        assert_eq!(
+            fs::read(activation_record_path(&store_path))?,
+            original_journal
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn swift_handoff_rejects_a_symlinked_witness_without_mutating_rust_state() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let stale_target = account("stale@example.com", false);
+        save_accounts(&store_path, &[active.clone(), stale_target.clone()])?;
+        commit_auth_file(&auth_path, &active)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        let mut stale_record = activation_record_ids(
+            ActivationState::Confirmed,
+            &active.account_id,
+            &stale_target.account_id,
+            &snapshot.generation,
+            account_token_fingerprint(&stale_target),
+            None,
+        );
+        stale_record.updated_at = Utc::now() - chrono::Duration::minutes(2);
+        write_activation_record(&store_lock, &stale_record)?;
+        drop(store_lock);
+        let original_journal = fs::read(activation_record_path(&store_path))?;
+        let outside = dir.path().join("outside-swift-journal.json");
+        fs::write(&outside, b"{}")?;
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600))?;
+        symlink(&outside, swift_activation_witness_path(&store_path))?;
+
+        assert!(reconcile_activation_barrier_unlocked(
+            &store_path,
+            &auth_path,
+            true,
+            &|_| unreachable!("symlinked Swift evidence must not trigger a reload"),
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(activation_record_path(&store_path))?,
+            original_journal
+        );
         Ok(())
     }
 

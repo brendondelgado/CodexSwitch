@@ -52,11 +52,11 @@ struct PopoverAccountHeadingTests {
             poolTargetAccountId: staleTarget.id,
             runtimeCurrentAccountId: configured.id,
             freshness: .stale
-        ) == "Pool Target (stale); Mac Runtime Not Current")
+        ) == "Pool Target; Mac Runtime Not Current")
         #expect(AccountCardView.poolTargetLabel(for: .stale)
-            == "Pool Target (stale)")
+            == "Pool Target")
         #expect(PopoverContentView.poolTargetLabel(for: .stale)
-            == "Pool Target (stale)")
+            == "Pool Target")
     }
 
     private func account(email: String, isActive: Bool) -> CodexAccount {

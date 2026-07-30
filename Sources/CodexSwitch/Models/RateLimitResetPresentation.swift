@@ -442,13 +442,8 @@ struct RateLimitResetOverviewItem: Identifiable, Equatable, Sendable {
     let id: UUID
     let accountEmail: String
     let availableCount: Int
-    let expiration: Date?
-    let urgency: RateLimitResetExpirationUrgency?
-    let errorMessage: String?
-
-    var isError: Bool {
-        errorMessage != nil
-    }
+    let expiration: Date
+    let urgency: RateLimitResetExpirationUrgency
 
     static func make(
         accounts: [CodexAccount],
@@ -467,38 +462,20 @@ struct RateLimitResetOverviewItem: Identifiable, Equatable, Sendable {
                         accountEmail: account.email,
                         availableCount: availableCount,
                         expiration: expiration,
-                        urgency: .resolve(expiration: expiration, now: now),
-                        errorMessage: nil
+                        urgency: .resolve(expiration: expiration, now: now)
                     )
                 )
-            case .error(let message, let lastKnownCount):
-                return (
-                    account,
-                    Self(
-                        id: account.id,
-                        accountEmail: account.email,
-                        availableCount: max(0, lastKnownCount),
-                        expiration: nil,
-                        urgency: nil,
-                        errorMessage: message
-                    )
-                )
-            case .redeeming, .reconciling, .externalHold, .refreshing, .stale, .expired, .unknown:
+            case .error, .redeeming, .reconciling, .externalHold, .refreshing,
+                 .stale, .expired, .unknown:
                 return nil
             }
         }
 
         return candidates.sorted { lhs, rhs in
-            switch (lhs.1.expiration, rhs.1.expiration) {
-            case let (left?, right?) where left != right:
-                return left < right
-            case (_?, nil):
-                return true
-            case (nil, _?):
-                return false
-            default:
-                return lhs.0.isOrderedBeforeByStableIdentity(rhs.0)
+            guard lhs.1.expiration == rhs.1.expiration else {
+                return lhs.1.expiration < rhs.1.expiration
             }
+            return lhs.0.isOrderedBeforeByStableIdentity(rhs.0)
         }.map(\.1)
     }
 }

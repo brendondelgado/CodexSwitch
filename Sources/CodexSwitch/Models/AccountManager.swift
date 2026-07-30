@@ -174,7 +174,7 @@ final class AccountManager {
     }
 
     static let vpsRuntimeEvidenceFreshnessInterval =
-        LinuxDevboxMonitor.activeRemoteAccountStatePollInterval * 4
+        LinuxDevboxMonitor.readinessEvidenceFreshnessInterval
 
     func vpsRuntimePresentation(
         for account: CodexAccount,

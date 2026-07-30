@@ -116,10 +116,6 @@ impl RateLimitResetBank {
         &self,
         now: DateTime<Utc>,
     ) -> Option<Vec<&RateLimitResetCredit>> {
-        if self.available_count > self.total_earned_count {
-            return None;
-        }
-
         let mut identifiers = std::collections::HashSet::new();
         let mut available = Vec::new();
         for credit in &self.credits {
@@ -3222,6 +3218,35 @@ mod tests {
                 .map(|credit| credit.id.as_str()),
             Some("earlier")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn available_credits_do_not_depend_on_earned_count_telemetry() -> Result<()> {
+        let now = DateTime::parse_from_rfc3339("2026-07-12T12:00:00Z")?.with_timezone(&Utc);
+        let response = json!({
+            "available_count": 1,
+            "total_earned_count": 0,
+            "credits": [{
+                "id": "current-credit",
+                "status": "available",
+                "expires_at": "2026-07-31T12:00:00Z"
+            }]
+        });
+        let parsed = fetch_rate_limit_reset_bank_with(
+            &account("a@example.com", true, 10.0, 10.0),
+            |_| {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&response)?,
+                })
+            },
+            || now,
+        )?;
+
+        assert_eq!(parsed.available_count, 1);
+        assert_eq!(parsed.total_earned_count, 0);
+        assert!(parsed.has_available_reset(now));
         Ok(())
     }
 

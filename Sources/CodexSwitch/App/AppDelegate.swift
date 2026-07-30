@@ -393,6 +393,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var externalHandoffAdoptionInFlight = false
     private var externalAuthReconciliationInFlight = false
     private var externalAuthReconciliationPending = false
+    private var cliActivationHandoffReconciliationInFlight = false
+    private var cliActivationHandoffReconciledGeneration: UUID?
+    private var lastCLIActivationHandoffAttemptAt: Date?
 
     private func installStatusItem() {
         if let existingStatusItem = statusItem {
@@ -542,6 +545,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             writeCrashLog("LAUNCH: all services started, \(accountManager.accounts.count) accounts loaded, configured=\(accountManager.configuredAccount?.email ?? "none")")
 
             CLIStatusChecker.refresh(activeAccountId: accountManager.configuredAccount?.accountId)
+            scheduleCLIActivationHandoffReconciliationIfNeeded()
             iconUpdateTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
                 Task { @MainActor in
                     await self?.reconcileExternalAuthIfNeeded()
@@ -553,6 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.scheduleAutomaticCodexUpdateIfNeeded()
                     self?.scheduleCodexBrowserSessionRepairIfNeeded()
                     self?.reconcileQuotaPollingIfNeeded()
+                    self?.scheduleCLIActivationHandoffReconciliationIfNeeded()
                     CLIStatusChecker.refresh(activeAccountId: self?.accountManager.configuredAccount?.accountId) { [weak self] in
                         self?.updatePopoverContent()
                     }
@@ -8557,6 +8562,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         CLIStatusChecker.refresh(activeAccountId: to.accountId) { [weak self] in
             self?.updatePopoverContent()
         }
+        if case .runtimeCurrent = completion.outcome {
+            scheduleCLIActivationHandoffReconciliationIfNeeded(force: true)
+        }
+    }
+
+    private func scheduleCLIActivationHandoffReconciliationIfNeeded(
+        force: Bool = false,
+        now: Date = Date()
+    ) {
+        guard !isExiting,
+              !cliActivationHandoffReconciliationInFlight,
+              let state = accountManager.activationState,
+              state.phase == .confirmed,
+              let targetAccountId = state.configuredAccountId,
+              state.runtimeCurrentAccountId == targetAccountId,
+              accountManager.configuredAccount?.id == targetAccountId,
+              cliActivationHandoffReconciledGeneration != state.activationGeneration else {
+            return
+        }
+        if !force,
+           let lastCLIActivationHandoffAttemptAt,
+           now.timeIntervalSince(lastCLIActivationHandoffAttemptAt) < 60 {
+            return
+        }
+        let cliPath = CodexVersionChecker.updaterCLIPath
+        guard FileManager.default.isExecutableFile(atPath: cliPath) else { return }
+
+        let activationGeneration = state.activationGeneration
+        lastCLIActivationHandoffAttemptAt = now
+        cliActivationHandoffReconciliationInFlight = true
+        Task { @MainActor [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                ProcessRunner.run(
+                    executableURL: URL(fileURLWithPath: cliPath),
+                    arguments: ["reconcile-activation-handoff", "--json"],
+                    timeout: 20,
+                    maxOutputBytes: 64 * 1024
+                )
+            }.value
+            guard let self else { return }
+            self.cliActivationHandoffReconciliationInFlight = false
+            guard !self.isExiting,
+                  self.accountManager.activationState?.activationGeneration
+                    == activationGeneration else {
+                return
+            }
+            if !result.timedOut, result.terminationStatus == 0 {
+                self.cliActivationHandoffReconciledGeneration = activationGeneration
+                SwapLog.append(.debug(
+                    "CLI_ACTIVATION_HANDOFF_CONFIRMED generation=\(activationGeneration.uuidString)"
+                ))
+                CLIStatusChecker.invalidateForAccountSwap()
+                CLIStatusChecker.refresh(
+                    activeAccountId: self.accountManager.configuredAccount?.accountId
+                ) { [weak self] in
+                    self?.updatePopoverContent()
+                }
+            } else {
+                SwapLog.append(.debug(
+                    "CLI_ACTIVATION_HANDOFF_DEFERRED generation=\(activationGeneration.uuidString) status=\(result.terminationStatus) timed_out=\(result.timedOut)"
+                ))
+            }
+        }
     }
 
     private func forceSwap(to accountId: UUID) {
@@ -9400,7 +9468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 status: accountManager.linuxDevboxStatus,
                 mirrorObservedAt: lastLinuxDevboxAccountMirrorSucceededAt,
                 now: Date(),
-                maximumAge: LinuxDevboxMonitor.activeRemoteAccountStatePollInterval * 4
+                maximumAge: LinuxDevboxMonitor.readinessEvidenceFreshnessInterval
             )
         if !credentialSyncHeld,
            activeSessionRequiresInvalidation {
@@ -9599,7 +9667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         LinuxDevboxStatus.accountMirrorIsFresh(
             observedAt: lastLinuxDevboxAccountMirrorSucceededAt,
             now: now,
-            maximumAge: LinuxDevboxMonitor.activeRemoteAccountStatePollInterval * 4
+            maximumAge: LinuxDevboxMonitor.readinessEvidenceFreshnessInterval
         )
     }
 

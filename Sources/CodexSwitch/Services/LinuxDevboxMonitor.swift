@@ -821,6 +821,8 @@ enum LinuxDevboxMonitor {
     static let remoteCleanupFailureMarker = "__CODEXSWITCH_REMOTE_CLEANUP_FAILED__"
     static let activeRemoteAccountStatePollInterval: TimeInterval = 5
     static let normalReadinessPollInterval: TimeInterval = 60
+    static let readinessEvidenceFreshnessInterval: TimeInterval =
+        normalReadinessPollInterval + 15
     static let automaticCredentialBundleLifetime: TimeInterval = 10 * 60
     static let pollAccountRetryPolicy: SSHRetryPolicy = .preExecutionTransportOnly
     static let poolAuthorityStatusTimeout: TimeInterval = 20

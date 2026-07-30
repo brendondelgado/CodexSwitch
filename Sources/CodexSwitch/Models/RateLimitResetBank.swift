@@ -50,7 +50,6 @@ struct RateLimitResetBank: Codable, Sendable, Equatable {
     ) -> [RateLimitResetCredit]? {
         guard availableCount >= 0,
               totalEarnedCount >= 0,
-              availableCount <= totalEarnedCount,
               !credits.contains(where: { $0.isAvailable && $0.expiresAt == nil }) else {
             return nil
         }

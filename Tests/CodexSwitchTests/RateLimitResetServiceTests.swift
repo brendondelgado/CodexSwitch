@@ -187,6 +187,40 @@ struct RateLimitResetServiceTests {
         }
     }
 
+    @Test("Available credits do not depend on provider earned-count telemetry")
+    func acceptsZeroEarnedCountWithExactAvailableCredits() async throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let data = Data(
+            """
+            {
+              "available_count": 1,
+              "total_earned_count": 0,
+              "credits": [
+                {
+                  "id": "current-credit",
+                  "status": "available",
+                  "expires_at": "2026-07-31T12:00:00Z"
+                }
+              ]
+            }
+            """.utf8
+        )
+        let service = RateLimitResetService { _ in
+            RateLimitResetHTTPResponse(statusCode: 200, data: data)
+        }
+
+        let bank = try await service.fetchBank(
+            for: Self.account(),
+            force: true,
+            now: now,
+            observationCompletedAt: now
+        )
+
+        #expect(bank.availableCount == 1)
+        #expect(bank.totalEarnedCount == 0)
+        #expect(bank.oldestExpiringCredit(at: now)?.id == "current-credit")
+    }
+
     @Test("Timestamp-fresh malformed cached inventory is refreshed")
     func refreshesStructurallyInvalidCachedInventory() async throws {
         let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))

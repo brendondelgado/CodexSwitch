@@ -25,14 +25,14 @@ struct AccountCardView: View {
         case .current:
             return poolTargetLabel
         case .stale:
-            return "Pool Target (stale)"
+            return poolTargetLabel
         case .unavailable:
             return "Pool Target unavailable"
         }
     }
 
     private var poolTargetAccent: Color {
-        poolTargetFreshness == .stale ? .orange : Self.activeGreen
+        Self.activeGreen
     }
     private static let renewalFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -70,7 +70,6 @@ struct AccountCardView: View {
     private var statusDot: Color {
         if needsReauthentication { return .red }
         if account.hasHardRuntimeBlock { return .orange }
-        if isConfigured && poolTargetFreshness == .stale { return .orange }
         if isConfigured && account.quotaSnapshot?.hasBackendUsagePlaceholder == true { return .orange }
         guard let snapshot = account.realQuotaSnapshot else {
             return account.quotaSnapshot?.hasBackendUsagePlaceholder == true ? .orange : .gray
@@ -175,22 +174,22 @@ struct AccountCardView: View {
         case .error(let message, let lastKnownCount):
             nextExpirationText = nil
             holdUntilText = nil
-            color = .red
-            systemImage = "exclamationmark.triangle.fill"
+            color = .secondary
+            systemImage = "exclamationmark.circle"
             urgency = nil
             help = "Reset inventory error: \(message). Last-known count: \(max(0, lastKnownCount))"
         case .stale:
             nextExpirationText = nil
             holdUntilText = nil
-            color = .orange
-            systemImage = "clock.badge.exclamationmark.fill"
+            color = .secondary
+            systemImage = "clock"
             urgency = nil
             help = "Last-known reset inventory is unverified"
         case .expired:
             nextExpirationText = nil
             holdUntilText = nil
-            color = .red
-            systemImage = "clock.badge.xmark.fill"
+            color = .secondary
+            systemImage = "clock"
             urgency = nil
             help = "Banked reset inventory has expired and cannot be redeemed"
         case .unknown:
@@ -253,21 +252,19 @@ struct AccountCardView: View {
             return "Redeeming banked reset"
         case .reconciling:
             return "Reconciling reset inventory"
-        case .error(let message, let lastKnownCount):
-            return "Reset error: \(message) • last-known/unverified: \(resetCountText(lastKnownCount))"
+        case .error:
+            return "Reset inventory unavailable"
         case .externalHold:
             return holdUntilText.map { "Reset hold until \($0)" }
                 ?? "Reset redemption on hold"
         case .refreshing:
             return "Refreshing reset inventory"
-        case .stale(let lastKnownCount):
-            return "Last-known/unverified: \(resetCountText(lastKnownCount))"
-        case .expired(let lastKnownCount):
-            return "Expired/unavailable: \(resetCountText(lastKnownCount))"
-        case .unknown(let lastKnownCount):
-            return lastKnownCount > 0
-                ? "Not verified • last-known: \(resetCountText(lastKnownCount))"
-                : "Reset inventory not verified"
+        case .stale:
+            return "Reset inventory updating"
+        case .expired:
+            return "No current banked resets"
+        case .unknown:
+            return "Reset inventory unavailable"
         case .current(let availableCount, _):
             var text = resetCountText(availableCount)
             if let nextExpirationText {

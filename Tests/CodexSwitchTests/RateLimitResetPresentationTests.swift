@@ -277,7 +277,7 @@ struct RateLimitResetPresentationTests {
         ) == 1)
     }
 
-    @Test("Overview sorts expirations by exact time and account, then errors")
+    @Test("Overview sorts verified expirations and omits inventory errors")
     func overviewSortingAndErrors() throws {
         let early = now.addingTimeInterval(3_600)
         let late = now.addingTimeInterval(7_200)
@@ -297,11 +297,7 @@ struct RateLimitResetPresentationTests {
             now: now
         )
 
-        #expect(items.map(\.id) == [accountA.id, accountB.id, lateAccount.id, errorAccount.id])
-        let errorItem = try #require(items.last)
-        #expect(errorItem.isError)
-        #expect(errorItem.errorMessage == "inventory unavailable")
-        #expect(errorItem.availableCount == 4)
+        #expect(items.map(\.id) == [accountA.id, accountB.id, lateAccount.id])
     }
 
     @Test("Card labels distinguish current, last-known, and pending inventory")
@@ -313,16 +309,16 @@ struct RateLimitResetPresentationTests {
         ) == "2 banked resets • next expires Jul 14")
         #expect(AccountCardView.rateLimitResetText(
             for: .stale(lastKnownCount: 2)
-        ) == "Last-known/unverified: 2 banked resets")
+        ) == "Reset inventory updating")
         #expect(AccountCardView.rateLimitResetText(
             for: .expired(lastKnownCount: 2)
-        ) == "Expired/unavailable: 2 banked resets")
+        ) == "No current banked resets")
         #expect(AccountCardView.rateLimitResetText(
             for: .unknown(lastKnownCount: 0)
-        ) == "Reset inventory not verified")
+        ) == "Reset inventory unavailable")
         #expect(AccountCardView.rateLimitResetText(
             for: .error(message: "Inventory unavailable", lastKnownCount: 2)
-        ) == "Reset error: Inventory unavailable • last-known/unverified: 2 banked resets")
+        ) == "Reset inventory unavailable")
         #expect(AccountCardView.rateLimitResetText(for: .redeeming) == "Redeeming banked reset")
         #expect(AccountCardView.rateLimitResetText(for: .reconciling) == "Reconciling reset inventory")
         #expect(AccountCardView.rateLimitResetText(for: .refreshing) == "Refreshing reset inventory")

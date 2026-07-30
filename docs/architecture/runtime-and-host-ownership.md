@@ -538,6 +538,20 @@ set still match. Recovery enters a fresh same-target `CommittedDegraded`
 generation and requires current runtime acknowledgements before `Confirmed`;
 it never clears the barrier from observation alone.
 
+The Swift and Rust activation journals are independent effect-owner records,
+not competing account authorities. Swift never edits or deletes the Rust
+`accounts.activation.json` journal. When a completed Swift activation makes a
+previous Rust `Confirmed` target stale, Rust may supersede that record only
+from a secure, schema-valid `account-activation.json` witness that names the
+exact active local account, records complete runtime acknowledgements, and is
+newer than the Rust record. The durable account store and complete `auth.json`
+token set must also match that active account exactly. Rust then publishes a
+fresh same-target `CommittedDegraded` record and performs a new bound runtime
+reload; historical Swift evidence alone can never publish Rust `Confirmed`.
+The handoff changes only the Rust journal and is idempotent. A missing,
+malformed, ambiguous, stale, symlinked, or mismatched Swift witness preserves
+the existing hard barrier without changing credentials or either journal.
+
 An explicit operator request may escape a valid `CommittedDegraded` barrier by
 selecting another account only after the VPS authority has committed a newer
 epoch naming that account. The request starts a fresh `Preparing` generation
@@ -1370,7 +1384,10 @@ actor boundary on every supported Swift 6 toolchain.
   a completed frontend write before releasing its transport.
 - Provider quota is shared, while runtime convergence evidence remains
   host-specific. Exactly one account card may receive pool-target styling, and
-  only from a fresh, internally consistent authority observation. That card
+  only from an internally consistent authority identity. Retained stale
+  telemetry may preserve which account is the durable pool target, but it is
+  neutral identity metadata and must not turn that account's card or target
+  badge yellow. That card
   shows `Mac` and `VPS` convergence summaries such as current, pending,
   degraded, offline, or not required. A host's stale local credential or
   runtime identity is diagnostic evidence under that target; it never gives a
@@ -1395,8 +1412,9 @@ actor boundary on every supported Swift 6 toolchain.
 - Account cards, status-bar tooltips, popover labels, green rings, and current
   styling receive the single authority target explicitly. Per-host runtime
   evidence determines convergence labels, not which account is the target.
-  Quota may still drive a status ring, but without fresh authority its label is
-  never `Current`.
+  Quota may still drive a status ring. Stale authority telemetry is surfaced in
+  the shared host-convergence area and accessibility help, not as a warning
+  color or repeated suffix on the target account card.
 - On launch, a degraded Mac activation journal restores its same-target barrier
   before polling can select another account. Consistent committed files resume
   bounded convergence retries. Missing targets or inconsistent/corrupt evidence

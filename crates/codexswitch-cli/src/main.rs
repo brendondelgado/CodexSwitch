@@ -31,15 +31,14 @@ use activation::{
     activate_remote_authority_with_unlocked_reload_under_runtime_lease,
     activate_with_under_runtime_lease, activate_with_unlocked_reload_under_runtime_lease,
     commit_accounts_with_provider_io_activation_under_runtime_lease,
-    preflight_provider_io_activation, reconcile_activation_barrier_unlocked_under_runtime_lease,
+    preflight_provider_io_activation, reconcile_activation_barrier_unlocked,
+    reconcile_activation_barrier_unlocked_under_runtime_lease,
     replace_accounts_with_under_runtime_lease, resolve_manual_review_activation_unlocked,
     validate_provider_io_activation, validate_provider_io_activation_locked, ActivationContext,
     ActivationOutcome, ActivationState, RuntimeActivationLease,
 };
 #[cfg(test)]
-use activation::{
-    activate_with, activate_with_unlocked_reload, reconcile_activation_barrier_unlocked,
-};
+use activation::{activate_with, activate_with_unlocked_reload};
 use anyhow::{bail, Context, Result};
 use auth::default_auth_path;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -248,6 +247,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Reconcile a completed Mac app activation into the CLI runtime journal.
+    ReconcileActivationHandoff {
+        #[arg(long)]
+        json: bool,
+    },
     Daemon {
         #[arg(long, default_value_t = 5)]
         interval_seconds: u64,
@@ -409,6 +413,9 @@ fn main() -> Result<()> {
         } => acknowledge_remote_rotation(operation_id, receipt_nonce, json),
         Command::ResolveActivation { yes, json } => {
             resolve_activation(&store_path, &auth_path, yes, json)
+        }
+        Command::ReconcileActivationHandoff { json } => {
+            reconcile_activation_handoff(&store_path, &auth_path, json)
         }
         Command::Daemon { interval_seconds } => {
             run_daemon(&store_path, &auth_path, interval_seconds)
@@ -1459,6 +1466,50 @@ struct ResolveActivationReport {
     verified_runtime_acks: usize,
     skipped_runtime_targets: usize,
     detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileActivationHandoffReport {
+    state: ActivationState,
+    reconciled: bool,
+    verified_runtime_acks: usize,
+}
+
+fn reconcile_activation_handoff(store_path: &Path, auth_path: &Path, json: bool) -> Result<()> {
+    let outcome = reconcile_activation_barrier_unlocked(
+        store_path,
+        auth_path,
+        true,
+        &reload_codex_hot_swap_processes,
+    )?;
+    let (reconciled, verified_runtime_acks) = match outcome {
+        Some(outcome) => {
+            let summary = require_confirmed_activation(outcome)
+                .context("Mac activation handoff did not obtain fresh runtime confirmation")?;
+            (true, summary.signaled.len())
+        }
+        None => {
+            activation::require_current_activation_confirmation(store_path, auth_path)?;
+            (false, 0)
+        }
+    };
+    let report = ReconcileActivationHandoffReport {
+        state: ActivationState::Confirmed,
+        reconciled,
+        verified_runtime_acks,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.reconciled {
+        println!(
+            "Reconciled Mac activation handoff with {} verified runtime ACK(s)",
+            report.verified_runtime_acks
+        );
+    } else {
+        println!("Mac activation handoff is already current");
+    }
+    Ok(())
 }
 
 fn resolve_activation(store_path: &Path, auth_path: &Path, yes: bool, json: bool) -> Result<()> {
@@ -4604,6 +4655,17 @@ mod tests {
                 yes: false,
                 json: false
             }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn mac_activation_handoff_reconciliation_is_an_explicit_command() -> Result<()> {
+        let parsed =
+            Args::try_parse_from(["codexswitch-cli", "reconcile-activation-handoff", "--json"])?;
+        assert!(matches!(
+            parsed.command,
+            Command::ReconcileActivationHandoff { json: true }
         ));
         Ok(())
     }

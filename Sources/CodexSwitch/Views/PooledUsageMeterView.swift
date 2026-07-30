@@ -415,8 +415,7 @@ struct PooledUsageMeterView: View {
     }
 
     private var rateLimitResetStatusColor: Color {
-        if rateLimitResetSummary.refreshFailedAccountCount > 0 { return .red }
-        if rateLimitResetSummary.hasIncompleteInventory { return .orange }
+        if rateLimitResetSummary.hasIncompleteInventory { return .secondary }
         return .teal
     }
 

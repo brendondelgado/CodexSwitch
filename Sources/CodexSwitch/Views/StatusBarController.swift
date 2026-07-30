@@ -37,7 +37,7 @@ final class StatusBarController {
         case .current:
             target = "Pool Target"
         case .stale:
-            target = "Pool Target (stale)"
+            target = "Pool Target"
         case .unavailable:
             target = "Pool Target unavailable"
         }
