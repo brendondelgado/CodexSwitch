@@ -10,6 +10,7 @@ enum AccountActivationCommitFailureStage: Equatable, Sendable {
     case authPersistence
     case durableReadbackAuthorization
     case durableReadback
+    case configuredCredentialPublication
     case journalAuthorization
     case journalPersistence
     case convergenceAuthorization
@@ -386,6 +387,7 @@ struct AccountActivationCommitOperations {
     let persistAccountStore: @MainActor @Sendable (AccountActivationEffectPermit) async -> Bool
     let persistAuth: @MainActor @Sendable (AccountActivationEffectPermit) async -> Bool
     let verifyDurableFiles: @MainActor @Sendable (AccountActivationEffectPermit) async -> Bool
+    let publishConfiguredCredentials: @MainActor @Sendable (AccountActivationEffectPermit) -> Bool
     let markCommittedDegraded: @MainActor @Sendable (AccountActivationEffectPermit) async -> Bool
     let authorizeConvergence: @MainActor @Sendable () async -> AccountActivationEffectPermit?
     let convergeRuntime: @MainActor @Sendable (AccountActivationEffectPermit) async -> Bool
@@ -613,6 +615,9 @@ struct AccountActivationTransaction: Sendable {
         }
         guard await operations.verifyDurableFiles(durableReadPermit) else {
             return .failed(.durableReadback)
+        }
+        guard operations.publishConfiguredCredentials(durableReadPermit) else {
+            return .failed(.configuredCredentialPublication)
         }
         guard let journalPermit = await operations.authorizePreparingEffect() else {
             return .failed(.journalAuthorization)

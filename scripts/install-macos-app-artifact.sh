@@ -578,6 +578,10 @@ verify_bundle() {
     print -u2 "app plist has the wrong executable name"
     return 1
   }
+  [[ "$(plist_value "$bundle" LSMultipleInstancesProhibited)" == "true" ]] || {
+    print -u2 "bundle permits multiple CodexSwitch instances"
+    return 1
+  }
 
   [[ "$(/usr/bin/lipo -archs "$executable")" == "arm64" ]] || {
     print -u2 "app executable is not thin arm64"

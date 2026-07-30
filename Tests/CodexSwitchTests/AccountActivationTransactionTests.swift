@@ -7,6 +7,7 @@ private enum ActivationRevocationBoundary: CaseIterable, Sendable {
     case accountStore
     case authFile
     case durableReadback
+    case configuredCredentialPublication
     case journal
     case convergence
 
@@ -16,6 +17,7 @@ private enum ActivationRevocationBoundary: CaseIterable, Sendable {
         case .accountStore: .accountStorePersistence
         case .authFile: .authPersistence
         case .durableReadback: .durableReadback
+        case .configuredCredentialPublication: .configuredCredentialPublication
         case .journal: .journalPersistence
         case .convergence: .convergence
         }
@@ -36,6 +38,12 @@ private final class ActivationEffectRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return effects.contains(effect)
+    }
+
+    func snapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return effects
     }
 }
 
@@ -189,6 +197,14 @@ struct AccountActivationTransactionTests {
                                     atPath: authURL.path
                                 )
                         },
+                        publishConfiguredCredentials: { permit in
+                            if boundary == .configuredCredentialPublication {
+                                transaction.invalidateCurrentActivationSynchronously()
+                            }
+                            guard permit.isCurrentlyAuthorized() else { return false }
+                            effects.record("configured-publication")
+                            return true
+                        },
                         markCommittedDegraded: { permit in
                             if boundary == .journal {
                                 transaction.invalidateCurrentActivationSynchronously()
@@ -236,6 +252,18 @@ struct AccountActivationTransactionTests {
             #expect(result == .failed(boundary.expectedFailure))
             if boundary != .convergence {
                 #expect(!effects.contains("convergence"))
+            }
+            if boundary == .authFile || boundary == .durableReadback {
+                #expect(!effects.contains("configured-publication"))
+            }
+            if boundary == .convergence {
+                #expect(effects.snapshot() == [
+                    "credentials",
+                    "account-store",
+                    "auth-file",
+                    "configured-publication",
+                    "journal",
+                ])
             }
             try? FileManager.default.removeItem(at: journalURL.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: authURL.deletingLastPathComponent())

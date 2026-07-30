@@ -30,6 +30,9 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/AccountActivationRuntimeEvidence.swift
   - ../../Sources/CodexSwitch/Services/AccountActivationRecoveryCoordinator.swift
   - ../../Sources/CodexSwitch/Services/AccountActivationTransaction.swift
+  - ../../Sources/CodexSwitch/Services/RustActivationJournal.swift
+  - ../../Sources/CodexSwitch/Services/SingleInstanceLock.swift
+  - ../../Sources/CodexSwitch/Services/AppRelaunchPlanner.swift
   - ../../Sources/CodexSwitch/Services/AccountMutationLeaseCoordinator.swift
   - ../../Sources/CodexSwitch/Services/AccountPersistenceCoordinator.swift
   - ../../Sources/CodexSwitch/Services/KeychainStore.swift
@@ -317,6 +320,15 @@ account swap, active-token refresh, active-account reauthentication, first
 account activation, and promotion of a target observed in an externally changed
 `auth.json`. Persisting credentials is never itself runtime-current evidence.
 
+Exactly one CodexSwitch menu process may coordinate the Mac account store. The
+process acquires the per-user single-instance lease before service startup. A
+duplicate launch exits through a side-effect-free termination path: it does not
+load accounts, start timers, install helpers, flush telemetry, reconcile
+external auth, or release the primary process's lease. LaunchServices metadata,
+the in-process lease, the watchdog, and explicit relaunches all enforce the same
+single-instance contract; relaunch helpers never request a new parallel app
+instance.
+
 ```text
 observe authority -> lock -> revalidate epoch/target -> commit auth/store
                   -> readback -> reload verified targets -> acknowledge -> publish
@@ -338,6 +350,15 @@ during the durable write without accepting credential or selection drift.
 Account-set growth is accepted only when the committed target is the one new
 identity, including first-account activation. A local durable selection or
 external `auth.json` observation cannot replace the authority target.
+
+The account-store write is not a publication boundary. The pending target stays
+hidden from `AccountManager.configuredAccount`, the menu UI, CLI status, and
+credential-sync scheduling until the matching complete `auth.json` write and
+combined durable readback both succeed. Publication is then synchronous on the
+main actor before runtime convergence starts. Consequently, a Codex CLI process
+started after the menu first exposes the new configured account reads the same
+credential generation on its first launch; it never needs a second exit merely
+because the UI advanced before `auth.json`.
 
 Runtime convergence remains a child of the activation transaction and inherits
 its cross-process lease task-local. Detaching convergence loses that proof and
@@ -845,13 +866,28 @@ unacknowledged target may already have changed. Import rollback must perform and
 verify compensating convergence after any delivered signal; failure to prove the
 restored runtime enters `ManualReview` instead of claiming a safe rollback.
 
-A stale Rust `Confirmed` journal may be superseded during explicit Mac adoption
-only when a fresh validated remote-authority observation, the journal target,
-and one unique local provider account all name the same desired provider. The
-recovery starts a new journaled activation transaction for that same target; it
-does not delete the old journal, accept a different target, infer authority from
-credential files, or publish confirmation without complete runtime evidence.
-Any mismatch remains fail-closed.
+A stale Rust `Confirmed` journal is historical evidence, not account authority.
+During explicit Mac adoption it may be superseded when it describes a different
+target or credential generation, but it is never deleted or rewritten by the
+Swift app. A matching Rust `Prepared`, fresh `FileOnly`, `ManualReview`, or
+unreadable journal remains a hard barrier because it can represent an in-flight
+or unresolved mutation.
+
+The Swift app may recover an `externalAuthConflict` only from a fresh validated
+remote-authority observation. Under one activation lease, all of these facts
+must hold together: the authority names exactly one local provider account;
+`auth.json` contains that account's complete matching token set; the durable
+account store contains exactly one configured source account and its credentials
+match the in-memory source snapshot; the target differs from that source; and
+the authority operation witness remains current through every file effect. The
+coordinator then supersedes only the matching Swift `ManualReview` record with a
+new `Preparing` generation, persists the target account-store selection without
+rewriting the already matching auth file, reads both files back, and publishes
+the configured account only after that combined readback succeeds. This path
+does not infer authority from credential files, ask the Rust journal to resolve
+the Swift state, or publish confirmation without complete runtime evidence. Any
+ambiguity, stale observation, credential mismatch, changed generation, or lost
+operation witness remains fail-closed.
 
 The desktop reload client owns one admitted transaction: JSON-RPC submission,
 identity readback, and its strict acknowledgement all use the same discovery and

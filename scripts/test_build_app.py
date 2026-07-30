@@ -10,6 +10,13 @@ SCRIPT = (ROOT / "scripts" / "build-app.sh").read_text()
 
 
 class BuildAppInstallerTests(unittest.TestCase):
+    def test_bundle_prohibits_parallel_app_instances(self) -> None:
+        self.assertIn("<key>LSMultipleInstancesProhibited</key>", SCRIPT)
+        self.assertIn(
+            'PlistBuddy -c "Print :LSMultipleInstancesProhibited"',
+            SCRIPT,
+        )
+
     def test_stages_and_verifies_before_stopping_installed_app(self) -> None:
         stage = SCRIPT.index('ditto --noextattr --noqtn "$APP_BUNDLE" "$STAGED_PATH"')
         verify = SCRIPT.index('verify_bundle "$STAGED_PATH"')

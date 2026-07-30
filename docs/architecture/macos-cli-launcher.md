@@ -13,6 +13,10 @@ toc:
 cross_dependencies:
   - ../../Sources/CodexSwitch/Services/RuntimeHotSwapContract.swift
   - ../../Sources/CodexSwitch/Services/CodexVersionChecker.swift
+  - ../../Sources/CodexSwitch/App/AppDelegate.swift
+  - ../../Sources/CodexSwitch/Services/AccountActivationTransaction.swift
+  - ../../Sources/CodexSwitch/Services/SingleInstanceLock.swift
+  - ../../Sources/CodexSwitch/Services/AppRelaunchPlanner.swift
   - ../../Tests/CodexSwitchTests/CodexVersionCheckerTests.swift
   - ../../crates/codexswitch-cli/src/codex_update.rs
   - ../../crates/codexswitch-cli/src/reload.rs
@@ -23,7 +27,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-28
+  last_updated: 2026-07-29
 ---
 
 # macOS CLI Launcher
@@ -89,6 +93,19 @@ The generated launcher performs only bounded, constant-time routing:
 
 `CODEX_CLI_PATH` is output from repair for other clients; it is not an
 unchecked launcher fallback.
+
+Local CLI authentication has one visibility boundary. The Mac menu process
+does not publish a changed configured account until the matching account store
+and `~/.codex/auth.json` generation have both been committed, synchronized, and
+read back under the activation lease. Any CLI launched after that publication
+therefore reads the new generation immediately. A running CLI can still require
+one explicit exit when runtime reload is unavailable, but a newly launched or
+resumed CLI must never require a second exit to catch a delayed auth-file write.
+
+Only one CodexSwitch menu process may perform that commit. The app bundle
+prohibits multiple instances, startup takes a per-user advisory lease before
+services begin, duplicate termination skips persistence, and relaunch helpers
+ask LaunchServices to reopen the existing bundle without forcing `open -n`.
 
 ## Explicit Activation Flow
 

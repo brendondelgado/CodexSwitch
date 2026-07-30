@@ -198,6 +198,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <string>15.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>LSMultipleInstancesProhibited</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticTermination</key>
@@ -393,6 +395,10 @@ if [[ "${1:-}" == "--install" ]]; then
         if /usr/bin/strings "$bundle/Contents/MacOS/$APP_NAME" \
             | /usr/bin/grep -E 'LINUX_DEVBOX_ACTIVE_PUSH|pendingLinuxDevboxActive|pushLinuxDevboxActiveAccount' >/dev/null; then
             echo "Error: bundle still contains removed VPS active-push code: $bundle" >&2
+            return 1
+        fi
+        if [[ "$(/usr/libexec/PlistBuddy -c "Print :LSMultipleInstancesProhibited" "$bundle/Contents/Info.plist" 2>/dev/null)" != "true" ]]; then
+            echo "Error: bundle permits multiple CodexSwitch instances: $bundle" >&2
             return 1
         fi
         /usr/bin/codesign --verify --strict --verbose=4 "$bundle"

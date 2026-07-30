@@ -161,6 +161,11 @@ private struct PreparedAccountActivation: Sendable {
     let lease: AccountMutationLease
 }
 
+@MainActor
+private final class ConfiguredCredentialPublicationBuffer {
+    var persistedAccounts: [CodexAccount]?
+}
+
 private enum AccountActivationPreparationResult: Sendable {
     case prepared(PreparedAccountActivation)
     case retrySameTarget
@@ -273,6 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let desktopUpdateCoordinator = CodexDesktopUpdateCoordinator()
     private let desktopInstallationWatcher = DesktopInstallationWatcher()
     private let linuxDevboxCredentialSyncJournal = LinuxDevboxCredentialSyncJournal()
+    private var instanceRole: CodexSwitchInstanceRole = .unresolved
 
     private var monitorTask: Task<Void, Never>?
     private var idleAccountPrimeTask: Task<Void, Never>?
@@ -441,15 +447,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        installCrashHandlers()
-        writeCrashLog("LAUNCH: applicationDidFinishLaunching started")
-        guard singleInstanceLock.acquire() else {
-            writeCrashLog("LAUNCH: duplicate CodexSwitch instance exiting before services start")
-            SwapLog.append(.debug("APP_DUPLICATE_INSTANCE_EXIT reason=single_instance_lock"))
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        instanceRole = .resolve(lockAcquired: singleInstanceLock.acquire())
+        guard instanceRole.mayStartServices else {
             NSApp.terminate(nil)
             return
         }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard instanceRole.mayStartServices else {
+            NSApp.terminate(nil)
+            return
+        }
+        installCrashHandlers()
+        writeCrashLog("LAUNCH: applicationDidFinishLaunching started")
 
         DesktopPatchManager.registerDefaults()
         UserDefaults.standard.register(defaults: [
@@ -1451,6 +1463,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard instanceRole.requiresTerminationPersistence else {
+            return .terminateNow
+        }
         if terminationFlushCompleted { return .terminateNow }
         guard terminationFlushTask == nil else { return .terminateLater }
 
@@ -1479,6 +1494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard instanceRole == .primary else { return }
         if let codexAppTerminationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(codexAppTerminationObserver)
             self.codexAppTerminationObserver = nil
@@ -6441,6 +6457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         expectedConfiguredAccountId: UUID?,
         source: String,
         requestKind: AccountActivationRequestKind,
+        verifiedExternalAuthConflictRecovery: Bool = false,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil,
         operationAuthority: PoolAuthorityOperationAuthority? = nil,
         operation: @escaping @MainActor @Sendable (PreparedAccountActivation) async -> Bool
@@ -6472,6 +6489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 expectedConfiguredAccountId: expectedConfiguredAccountId,
                 source: source,
                 requestKind: requestKind,
+                verifiedExternalAuthConflictRecovery: verifiedExternalAuthConflictRecovery,
                 activationGeneration: activationGeneration,
                 lease: lease,
                 policyAuthority: policyAuthority,
@@ -6515,6 +6533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         expectedConfiguredAccountId: UUID?,
         source: String,
         requestKind: AccountActivationRequestKind,
+        verifiedExternalAuthConflictRecovery: Bool,
         activationGeneration: UUID,
         lease: AccountMutationLease,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil,
@@ -6532,12 +6551,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         do {
-            let decision = try await accountActivationCoordinator
-                .beginAuthorizedCredentialMutation(
-                targetAccountId: targetAccountId,
-                kind: requestKind,
-                requestedActivationGeneration: activationGeneration,
-                authorizeEffect: { [accountMutationTransaction] _ in
+            let authorizeEffect: AccountActivationCoordinator.StateEffectAuthorization = {
+                [accountMutationTransaction] _ in
                     (policyAuthority?.authorizes() ?? true)
                         && (operationAuthority?.authorizes() ?? true)
                         && accountMutationTransaction.leaseAuthorizes(
@@ -6545,8 +6560,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             targetAccountId: targetAccountId,
                             activationGeneration: activationGeneration
                         )
-                }
-            )
+            }
+            let decision: AccountActivationCredentialMutationDecision
+            if verifiedExternalAuthConflictRecovery,
+               let expectedConfiguredAccountId {
+                decision = try await accountActivationCoordinator
+                    .beginVerifiedExternalAuthConflictRecovery(
+                        targetAccountId: targetAccountId,
+                        expectedSourceAccountId: expectedConfiguredAccountId,
+                        requestedActivationGeneration: activationGeneration,
+                        authorizeEffect: authorizeEffect
+                    )
+            } else {
+                decision = try await accountActivationCoordinator
+                    .beginAuthorizedCredentialMutation(
+                        targetAccountId: targetAccountId,
+                        kind: requestKind,
+                        requestedActivationGeneration: activationGeneration,
+                        authorizeEffect: authorizeEffect
+                    )
+            }
             let preparing: AccountActivationState
             let previousActivationState: AccountActivationState?
             switch decision {
@@ -6944,11 +6977,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 )
                 return
             }
+            let recoversExternalAuthConflict: Bool
+            if self.accountManager.activationState?.phase == .manualReview,
+               self.accountManager.activationState?.detail == .externalAuthConflict {
+                let recoveryDecision = await self
+                    .poolAuthorityExternalAuthConflictRecoveryDecision(
+                        observation: observation,
+                        from: from,
+                        to: target,
+                        operationAuthority: operationAuthority
+                    )
+                guard recoveryDecision == .recover else {
+                    self.poolAuthorityClientState.finishAdoption(
+                        epoch: observation.epoch,
+                        succeeded: false,
+                        at: Date()
+                    )
+                    SwapLog.append(.debug(
+                        "POOL_AUTHORITY_EXTERNAL_AUTH_RECOVERY_BLOCKED reason=\(String(describing: recoveryDecision))"
+                    ))
+                    return
+                }
+                recoversExternalAuthConflict = true
+            } else {
+                recoversExternalAuthConflict = false
+            }
             let succeeded = await self.withPreparedActiveCredentialMutation(
                 targetAccountId: target.id,
                 expectedConfiguredAccountId: from.id,
                 source: "pool-authority",
                 requestKind: .poolAuthority,
+                verifiedExternalAuthConflictRecovery: recoversExternalAuthConflict,
                 policyAuthority: automaticPolicyLease?.authority,
                 operationAuthority: operationAuthority
             ) { [weak self] prepared in
@@ -6961,6 +7020,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     reason: .poolAuthority,
                     swapStart: Date(),
                     prepared: prepared,
+                    verifiedExternalAuthConflictRecovery: recoversExternalAuthConflict,
                     operationAuthority: operationAuthority
                 )
             }
@@ -6972,12 +7032,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    private func poolAuthorityExternalAuthConflictRecoveryDecision(
+        observation: PoolAuthorityObservation,
+        from source: CodexAccount,
+        to target: CodexAccount,
+        operationAuthority: PoolAuthorityOperationAuthority
+    ) async -> ExternalAuthConflictRecoveryDecision {
+        let matchingProviderAccountCount = accountManager.accounts.filter {
+            $0.normalizedProviderAccountId == observation.desiredProviderAccountId
+        }.count
+        let durableStoreMatchesSource = await durableAccountStoreMatches(source)
+        let authMatchesTarget = Self.authFileMatches(
+            account: target,
+            atPath: Self.codexAuthPath
+        )
+        let rustHandoffDisposition = RustActivationJournal.handoffDisposition(
+            for: target
+        )
+        return ExternalAuthConflictRecoveryPolicy.decision(
+            ExternalAuthConflictRecoveryEvidence(
+                activationState: accountManager.activationState,
+                sourceAccountId: source.id,
+                targetAccountId: target.id,
+                authorityProviderAccountId: observation.desiredProviderAccountId,
+                targetProviderAccountId: target.normalizedProviderAccountId,
+                matchingProviderAccountCount: matchingProviderAccountCount,
+                authorityIsFresh: observation.isFresh(at: Date()),
+                authorityOperationIsAuthorized: operationAuthority.authorizes()
+                    && operationAuthority.epoch == observation.epoch
+                    && operationAuthority.providerAccountId
+                        == observation.desiredProviderAccountId,
+                durableStoreMatchesSource: durableStoreMatchesSource,
+                authMatchesTarget: authMatchesTarget,
+                rustHandoffDisposition: rustHandoffDisposition
+            )
+        )
+    }
+
     private func executeSwapTransaction(
         from: CodexAccount,
         to: CodexAccount,
         reason: SwapEvent.SwapReason,
         swapStart: Date,
         prepared: PreparedAccountActivation,
+        verifiedExternalAuthConflictRecovery: Bool = false,
         operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> Bool {
         SwapLog.append(.swapTriggered(
@@ -6994,7 +7092,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         let mutationRoute: AccountCredentialMutationRoute
-        if case .higherPlanAvailable = reason {
+        if verifiedExternalAuthConflictRecovery {
+            mutationRoute = .externalAuthObservation
+        } else if case .higherPlanAvailable = reason {
             mutationRoute = .planUpgrade
         } else {
             mutationRoute = .swap
@@ -7005,11 +7105,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             to: to,
             reason: reason,
             mutationRoute: mutationRoute,
-            persistenceContext: "swap",
-            authAlreadyConfigured: false,
+            persistenceContext: verifiedExternalAuthConflictRecovery
+                ? "pool-authority-external-auth-recovery"
+                : "swap",
+            authAlreadyConfigured: verifiedExternalAuthConflictRecovery,
             swapStart: swapStart,
             prepared: prepared,
             recordsSwap: true,
+            committedDetail: verifiedExternalAuthConflictRecovery
+                ? .externalAuthObserved
+                : .runtimeConfirmationPending,
             operationAuthority: operationAuthority
         )
     }
@@ -7166,6 +7271,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         committedDetail: AccountActivationDetail = .runtimeConfirmationPending,
         operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> Bool {
+        let publicationBuffer = ConfiguredCredentialPublicationBuffer()
+        let expectedCredentialAuthority = accountManager.accounts
         let result = await accountMutationTransaction.commitConfiguredCredentials(
             AccountActivationCommitOperations(
                 authorizeMutation: { [weak self] in
@@ -7216,7 +7323,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 persistAccountStore: { [weak self] permit in
                     guard let self,
                           operationAuthority?.authorizes() ?? true else { return false }
-                    let expectedCredentialAuthority = self.accountManager.accounts
                     guard let configuredCredentialSnapshot =
                             AccountManager.configuredCredentialSnapshot(
                                 from: expectedCredentialAuthority,
@@ -7228,19 +7334,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                 context: persistenceContext,
                                 expectedCredentialAuthority: expectedCredentialAuthority,
                                 permit: permit
-                            ),
-                          self.accountManager.adoptVerifiedCommittedCredentialHandoff(
-                              persisted,
-                              expectedCredentialAuthority: expectedCredentialAuthority,
-                              targetAccountId: to.id
-                          ) else {
+                            ) else {
                         return false
                     }
-                    CLIStatusChecker.invalidateForAccountSwap()
-                    self.accountManager.clearPollingError(for: to.id)
-                    self.scheduleLinuxDevboxCredentialSyncIfNeeded(
-                        context: persistenceContext
-                    )
+                    publicationBuffer.persistedAccounts = persisted
                     return true
                 },
                 persistAuth: { [weak self] permit in
@@ -7273,6 +7370,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                           permit.isCurrentlyAuthorized() else { return false }
                     let matches = await self.durableConfiguredFilesMatch(to)
                     return matches && permit.isCurrentlyAuthorized()
+                },
+                publishConfiguredCredentials: { [weak self] permit in
+                    guard let self,
+                          operationAuthority?.authorizes() ?? true,
+                          permit.isCurrentlyAuthorized(),
+                          let persistedCredentialSnapshot = publicationBuffer.persistedAccounts,
+                          self.accountManager.adoptVerifiedCommittedCredentialHandoff(
+                              persistedCredentialSnapshot,
+                              expectedCredentialAuthority: expectedCredentialAuthority,
+                              targetAccountId: to.id
+                          ) else {
+                        return false
+                    }
+                    CLIStatusChecker.invalidateForAccountSwap()
+                    self.accountManager.clearPollingError(for: to.id)
+                    self.scheduleLinuxDevboxCredentialSyncIfNeeded(
+                        context: persistenceContext
+                    )
+                    return true
                 },
                 markCommittedDegraded: { [weak self] permit in
                     guard let self,
@@ -8832,7 +8948,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             statusItem.menu = nil
             NSStatusBar.system.removeStatusItem(statusItem)
         }
-        singleInstanceLock.release()
     }
 
     private func scheduleRelaunch() {

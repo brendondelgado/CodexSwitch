@@ -223,6 +223,10 @@ class MacOsAppArtifactContractTests(unittest.TestCase):
         self.assertGreaterEqual(installer.count("codexswitch_app_is_running"), 4)
         self.assertIn("refusing to activate a second bundle copy", installer)
 
+    def test_installer_requires_single_instance_bundle_metadata(self) -> None:
+        self.assertIn("LSMultipleInstancesProhibited", self.installer)
+        self.assertIn("bundle permits multiple CodexSwitch instances", self.installer)
+
     def test_installer_enforces_snapshot_attestation_and_no_build_or_resign(self) -> None:
         installer = self.installer
         self.assertIn(

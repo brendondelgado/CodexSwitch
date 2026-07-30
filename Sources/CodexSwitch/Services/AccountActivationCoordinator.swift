@@ -145,6 +145,49 @@ actor AccountActivationCoordinator {
         }
     }
 
+    func beginVerifiedExternalAuthConflictRecovery(
+        targetAccountId: UUID,
+        expectedSourceAccountId: UUID,
+        requestedActivationGeneration: UUID = UUID(),
+        authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
+        at date: Date = Date()
+    ) throws -> AccountActivationCredentialMutationDecision {
+        try withRuntimeLease {
+            try transaction.withExclusiveLock { lockedFile in
+                let snapshot = try lockedFile.read()
+                let current = try Self.decode(snapshot.bytes)
+                guard let current,
+                      current.phase == .manualReview,
+                      current.detail == .externalAuthConflict,
+                      current.configuredAccountId == expectedSourceAccountId,
+                      targetAccountId != expectedSourceAccountId else {
+                    return .blocked(
+                        current,
+                        "authority recovery requires the matching external-auth conflict"
+                    )
+                }
+                guard authorizeEffect(current) else {
+                    throw AccountActivationCoordinatorError.authorizationRevoked
+                }
+
+                let preparing = AccountActivationState.preparing(
+                    targetAccountId: targetAccountId,
+                    activationGeneration: requestedActivationGeneration,
+                    at: date
+                )
+                try Self.validate(preparing)
+                let readback = try lockedFile.replace(
+                    try Self.encode(preparing),
+                    expectedGeneration: snapshot.generation
+                )
+                guard try Self.decode(readback.bytes) == preparing else {
+                    throw AccountActivationCoordinatorError.readbackMismatch
+                }
+                return .prepared(preparing, previousState: current)
+            }
+        }
+    }
+
     private func beginAuthorizedCredentialMutationUnderRuntimeLease(
         targetAccountId: UUID,
         kind: AccountActivationRequestKind,

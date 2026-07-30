@@ -1,6 +1,24 @@
 import Darwin
 import Foundation
 
+enum CodexSwitchInstanceRole: Equatable, Sendable {
+    case unresolved
+    case primary
+    case duplicate
+
+    static func resolve(lockAcquired: Bool) -> Self {
+        lockAcquired ? .primary : .duplicate
+    }
+
+    var mayStartServices: Bool {
+        self == .primary
+    }
+
+    var requiresTerminationPersistence: Bool {
+        self == .primary
+    }
+}
+
 final class SingleInstanceLock {
     private let path: String
     private var fd: Int32 = -1
@@ -31,8 +49,21 @@ final class SingleInstanceLock {
             attributes: [.posixPermissions: 0o700]
         )
 
-        let opened = Darwin.open(path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        let opened = Darwin.open(
+            path,
+            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR
+        )
         guard opened >= 0 else {
+            return false
+        }
+
+        var metadata = stat()
+        guard fstat(opened, &metadata) == 0,
+              metadata.st_uid == getuid(),
+              metadata.st_mode & S_IFMT == S_IFREG,
+              fchmod(opened, S_IRUSR | S_IWUSR) == 0 else {
+            Darwin.close(opened)
             return false
         }
 
@@ -51,6 +82,7 @@ final class SingleInstanceLock {
                 }
             }
         }
+        _ = fsync(fd)
         return true
     }
 

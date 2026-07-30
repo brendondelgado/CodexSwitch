@@ -5,6 +5,8 @@ enum AppRelaunchPlanner {
         let pid = Int(currentProcessID)
         let quotedAppPath = shellQuoted(appPath)
         return """
+app_path=\(quotedAppPath)
+app_executable="$app_path/Contents/MacOS/CodexSwitch"
 log_dir="$HOME/.codexswitch/logs"
 /bin/mkdir -p "$log_dir"
 log_file="$log_dir/relaunch.log"
@@ -18,7 +20,7 @@ while kill -0 \(pid) 2>/dev/null; do
   sleep 0.1
 done
 attempts=0
-while /usr/bin/pgrep -x CodexSwitch >/dev/null 2>&1; do
+while /usr/bin/pgrep -fx "$app_executable" >/dev/null 2>&1; do
   if [ "$attempts" -ge 80 ]; then
     break
   fi
@@ -26,11 +28,11 @@ while /usr/bin/pgrep -x CodexSwitch >/dev/null 2>&1; do
   sleep 0.1
 done
 sleep 1.0
-/usr/bin/open -n \(quotedAppPath)
+/usr/bin/open \(quotedAppPath)
 sleep 3.0
-if ! /usr/bin/pgrep -x CodexSwitch >/dev/null 2>&1; then
+if ! /usr/bin/pgrep -fx "$app_executable" >/dev/null 2>&1; then
   echo "[$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)] relaunch retry app=\(appPath)" >> "$log_file"
-  /usr/bin/open -n \(quotedAppPath)
+  /usr/bin/open \(quotedAppPath)
 fi
 """
     }
