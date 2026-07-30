@@ -66,7 +66,7 @@ struct CodexDesktopNativeChildCoordinatorTests {
             arguments: ["codex", "app-server", "--listen", "stdio://"],
             parentPID: { parents[$0] },
             executablePath: { paths[$0] },
-            signatureStatus: { _ in .locallySigned }
+            signatureStatus: { _ in .nonOpenAISigned }
         ))
         #expect(!CodexDesktopNativeChildCoordinator.authorizesFirstAcknowledgementBootstrap(
             binding: binding,
