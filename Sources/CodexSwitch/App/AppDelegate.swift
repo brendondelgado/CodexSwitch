@@ -8597,7 +8597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ProcessRunner.run(
                     executableURL: URL(fileURLWithPath: cliPath),
                     arguments: ["reconcile-activation-handoff", "--json"],
-                    timeout: 20,
+                    timeout: 60,
                     maxOutputBytes: 64 * 1024
                 )
             }.value

@@ -2590,7 +2590,7 @@ struct HttpResponse {
 #[derive(Debug, Deserialize)]
 struct BackendResetBank {
     available_count: u32,
-    total_earned_count: u32,
+    total_earned_count: Option<u32>,
     credits: Vec<BackendResetCredit>,
 }
 
@@ -2691,7 +2691,7 @@ fn parse_reset_bank(data: &[u8], fetched_at: DateTime<Utc>) -> Result<RateLimitR
         serde_json::from_slice(data).context("failed to decode reset-bank response")?;
     Ok(RateLimitResetBank {
         available_count: response.available_count,
-        total_earned_count: response.total_earned_count,
+        total_earned_count: response.total_earned_count.unwrap_or_default(),
         credits: response
             .credits
             .into_iter()
@@ -3247,6 +3247,46 @@ mod tests {
         assert_eq!(parsed.available_count, 1);
         assert_eq!(parsed.total_earned_count, 0);
         assert!(parsed.has_available_reset(now));
+        Ok(())
+    }
+
+    #[test]
+    fn available_credits_tolerate_missing_or_null_earned_count_telemetry() -> Result<()> {
+        let now = DateTime::parse_from_rfc3339("2026-07-12T12:00:00Z")?.with_timezone(&Utc);
+        for response in [
+            json!({
+                "available_count": 1,
+                "credits": [{
+                    "id": "current-credit",
+                    "status": "available",
+                    "expires_at": "2026-07-31T12:00:00Z"
+                }]
+            }),
+            json!({
+                "available_count": 1,
+                "total_earned_count": null,
+                "credits": [{
+                    "id": "current-credit",
+                    "status": "available",
+                    "expires_at": "2026-07-31T12:00:00Z"
+                }]
+            }),
+        ] {
+            let parsed = fetch_rate_limit_reset_bank_with(
+                &account("a@example.com", true, 10.0, 10.0),
+                |_| {
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: serde_json::to_vec(&response)?,
+                    })
+                },
+                || now,
+            )?;
+
+            assert_eq!(parsed.available_count, 1);
+            assert_eq!(parsed.total_earned_count, 0);
+            assert!(parsed.has_available_reset(now));
+        }
         Ok(())
     }
 

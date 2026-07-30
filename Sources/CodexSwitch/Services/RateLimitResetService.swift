@@ -627,13 +627,14 @@ actor RateLimitResetService {
 
         do {
             let payload = try JSONDecoder().decode(InventoryPayload.self, from: response.data)
-            guard payload.availableCount >= 0, payload.totalEarnedCount >= 0 else {
+            let totalEarnedCount = payload.totalEarnedCount ?? 0
+            guard payload.availableCount >= 0, totalEarnedCount >= 0 else {
                 throw RateLimitResetServiceError.malformedInventory
             }
             let credits = try payload.credits.map { try $0.credit() }
             let bank = RateLimitResetBank(
                 availableCount: payload.availableCount,
-                totalEarnedCount: payload.totalEarnedCount,
+                totalEarnedCount: totalEarnedCount,
                 credits: credits,
                 fetchedAt: fetchedAt
             )
@@ -1153,7 +1154,7 @@ struct RateLimitResetAttemptJournal {
 private struct InventoryPayload: Decodable {
     let availableCount: Int
     let credits: [CreditPayload]
-    let totalEarnedCount: Int
+    let totalEarnedCount: Int?
 
     private enum CodingKeys: String, CodingKey {
         case availableCount = "available_count"

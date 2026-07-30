@@ -221,6 +221,54 @@ struct RateLimitResetServiceTests {
         #expect(bank.oldestExpiringCredit(at: now)?.id == "current-credit")
     }
 
+    @Test("Available credits tolerate absent or null earned-count telemetry")
+    func acceptsAbsentEarnedCountWithExactAvailableCredits() async throws {
+        let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))
+        let payloads = [
+            """
+            {
+              "available_count": 1,
+              "credits": [
+                {
+                  "id": "current-credit",
+                  "status": "available",
+                  "expires_at": "2026-07-31T12:00:00Z"
+                }
+              ]
+            }
+            """,
+            """
+            {
+              "available_count": 1,
+              "total_earned_count": null,
+              "credits": [
+                {
+                  "id": "current-credit",
+                  "status": "available",
+                  "expires_at": "2026-07-31T12:00:00Z"
+                }
+              ]
+            }
+            """,
+        ]
+
+        for payload in payloads {
+            let service = RateLimitResetService { _ in
+                RateLimitResetHTTPResponse(statusCode: 200, data: Data(payload.utf8))
+            }
+            let bank = try await service.fetchBank(
+                for: Self.account(),
+                force: true,
+                now: now,
+                observationCompletedAt: now
+            )
+
+            #expect(bank.availableCount == 1)
+            #expect(bank.totalEarnedCount == 0)
+            #expect(bank.oldestExpiringCredit(at: now)?.id == "current-credit")
+        }
+    }
+
     @Test("Timestamp-fresh malformed cached inventory is refreshed")
     func refreshesStructurallyInvalidCachedInventory() async throws {
         let now = try #require(Self.isoDate("2026-07-12T12:00:00Z"))

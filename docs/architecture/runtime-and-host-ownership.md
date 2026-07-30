@@ -544,10 +544,12 @@ not competing account authorities. Swift never edits or deletes the Rust
 previous Rust `Confirmed` target stale, Rust may supersede that record only
 from a secure, schema-valid `account-activation.json` witness that names the
 exact active local account, records complete runtime acknowledgements, and is
-newer than the Rust record. The durable account store and complete `auth.json`
-token set must also match that active account exactly. Rust then publishes a
-fresh same-target `CommittedDegraded` record and performs a new bound runtime
-reload; historical Swift evidence alone can never publish Rust `Confirmed`.
+newer than the Rust record and no more than one hour old. The durable account
+store and complete `auth.json` token set must also match that active account
+exactly. Rust then publishes a fresh same-target `CommittedDegraded` record and
+performs a new bound runtime reload; historical Swift evidence alone can never
+publish Rust `Confirmed`. The handoff runner allows sixty seconds for that
+fresh reload and acknowledgement before failing closed for a later retry.
 The handoff changes only the Rust journal and is idempotent. A missing,
 malformed, ambiguous, stale, symlinked, or mismatched Swift witness preserves
 the existing hard barrier without changing credentials or either journal.
