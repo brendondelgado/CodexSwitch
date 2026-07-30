@@ -1,0 +1,20 @@
+crates/codexswitch-cli/src/codex_update/source_auth_patching.rs
+  s_70c8e194852bb5::t_6222cc05337024 285,291,298,301-303,314,324-325
+  s_70c8e194852bb5::t_decc8b86e35a9b 326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "5272fa0474b1677f8d7f8962e9ff64cae5031b22",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
