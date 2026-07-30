@@ -46,13 +46,13 @@ struct CodexDesktopNativeChildCoordinatorTests {
         #expect(files.allSatisfy { !$0.contains("prepared-codex") })
     }
 
-    @Test("First native ACK requires exact stdio invocation and canonical ancestry")
+    @Test("First native ACK requires exact stdio invocation and signed app ancestry")
     func nativeBootstrapRequiresOfficialAncestry() {
         let binding = nativeBinding(pid: 42)
         let parents: [Int32: Int32] = [42: 41, 41: 40]
         let paths: [Int32: String] = [
-            41: "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
-            40: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            41: "/Applications/ChatGPT Stock.app/Contents/Resources/cua_node/bin/node_repl",
+            40: "/Applications/ChatGPT Stock.app/Contents/MacOS/ChatGPT",
         ]
         #expect(CodexDesktopNativeChildCoordinator.authorizesFirstAcknowledgementBootstrap(
             binding: binding,
@@ -60,6 +60,13 @@ struct CodexDesktopNativeChildCoordinatorTests {
             parentPID: { parents[$0] },
             executablePath: { paths[$0] },
             signatureStatus: { _ in .officialOpenAI }
+        ))
+        #expect(!CodexDesktopNativeChildCoordinator.authorizesFirstAcknowledgementBootstrap(
+            binding: binding,
+            arguments: ["codex", "app-server", "--listen", "stdio://"],
+            parentPID: { parents[$0] },
+            executablePath: { paths[$0] },
+            signatureStatus: { _ in .locallySigned }
         ))
         #expect(!CodexDesktopNativeChildCoordinator.authorizesFirstAcknowledgementBootstrap(
             binding: binding,
@@ -75,6 +82,19 @@ struct CodexDesktopNativeChildCoordinatorTests {
             executablePath: { _ in "/bin/zsh" },
             signatureStatus: { _ in .officialOpenAI }
         ))
+    }
+
+    @Test("Bundle extraction accepts only top-level Applications bundles")
+    func bundleExtractionIsFailClosed() {
+        #expect(CodexDesktopNativeChildCoordinator.topLevelChatGPTAppPath(
+            containing: "/Applications/ChatGPT Stock.app/Contents/MacOS/ChatGPT"
+        ) == "/Applications/ChatGPT Stock.app")
+        #expect(CodexDesktopNativeChildCoordinator.topLevelChatGPTAppPath(
+            containing: "/Applications/Nested/ChatGPT.app/Contents/MacOS/ChatGPT"
+        ) == nil)
+        #expect(CodexDesktopNativeChildCoordinator.topLevelChatGPTAppPath(
+            containing: "/tmp/ChatGPT.app/Contents/MacOS/ChatGPT"
+        ) == nil)
     }
 
     private func nativeBinding(pid: Int32) -> CodexReloadBinding {

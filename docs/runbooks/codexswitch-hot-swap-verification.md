@@ -1367,7 +1367,7 @@ Before claiming hot-swap is fixed or ready:
   or rotation creates a current acknowledgement; daemon polling and status
   checks send no bootstrap signal.
 - [ ] A fresh native stdio child can bootstrap its first ACK during explicit
-  activation only when canonical ChatGPT ancestry, OpenAI signing, exact argv,
+  activation only when top-level ChatGPT ancestry, OpenAI signing, exact argv,
   owner, start identity, and executable vnode all agree.
 - [ ] Desktop idle and all-zero ACKs are rejected; completed frontend delivery
   remains mandatory.
@@ -1450,7 +1450,7 @@ Every future hot-swap change must include tests for:
 - A fresh ACK from the running PID remains authoritative when the executable at that path was replaced after process start or the executable path cannot be resolved.
 - Desktop readiness rejects binaries that reload backend auth without broadcasting `account/updated` to the shell.
 - Missing or malformed auth produces no successful ACK and does not replace valid cached auth with `None`.
-- Only an exact canonical ChatGPT descendant can classify as
+- Only an exact descendant of the observed OpenAI-signed ChatGPT app can classify as
   `official-desktop-stdio-child`; any WebSocket bridge, self-claimed kind, idle
   ACK, or ancestry mismatch fails.
 - The desktop activation client invokes strict reload before releasing its

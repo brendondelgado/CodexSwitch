@@ -361,13 +361,7 @@ struct LineageProcess {
 
 #[cfg(target_os = "macos")]
 fn computer_use_lineage_readiness() -> ComputerUseLineageReadiness {
-    const CHATGPT: &str = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
     let mut issues = Vec::new();
-    let official_chatgpt = official_chatgpt_signature_is_valid();
-    if !official_chatgpt {
-        issues.push("/Applications/ChatGPT.app is not signed by OpenAI Team ID 2DC432GLL2".into());
-    }
-
     let snapshot = bounded_command::output(
         Command::new("/bin/ps").args(["-axo", "pid=,ppid=,uid=,command=", "-ww"]),
         Duration::from_secs(3),
@@ -381,11 +375,21 @@ fn computer_use_lineage_readiness() -> ComputerUseLineageReadiness {
         .iter()
         .map(|process| (process.pid, process))
         .collect::<HashMap<_, _>>();
-    let chatgpt_pids = snapshot
+    let chatgpt_roots = snapshot
         .iter()
-        .filter(|process| first_command_path(&process.command_line) == Some(CHATGPT))
-        .map(|process| process.pid)
-        .collect::<std::collections::HashSet<_>>();
+        .filter_map(|process| {
+            let path = first_command_path(&process.command_line)?;
+            let app_path = top_level_chatgpt_app_path(path)?;
+            (path == format!("{app_path}/Contents/MacOS/ChatGPT")
+                && official_chatgpt_signature_is_valid(app_path))
+            .then_some((process.pid, app_path.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let official_chatgpt = !chatgpt_roots.is_empty();
+    if !official_chatgpt {
+        issues
+            .push("no running top-level ChatGPT app is signed by OpenAI Team ID 2DC432GLL2".into());
+    }
 
     let native_child_pids = snapshot
         .iter()
@@ -393,7 +397,7 @@ fn computer_use_lineage_readiness() -> ComputerUseLineageReadiness {
             process.owner_uid == unsafe { libc::geteuid() }
                 && is_official_desktop_stdio_child_command_line(&process.command_line)
         })
-        .filter(|process| ancestry_reaches_official_chatgpt(process, &by_pid, &chatgpt_pids))
+        .filter(|process| ancestry_reaches_official_chatgpt(process, &by_pid, &chatgpt_roots))
         .map(|process| process.pid)
         .collect::<Vec<_>>();
     let observed_native_count = snapshot
@@ -401,10 +405,10 @@ fn computer_use_lineage_readiness() -> ComputerUseLineageReadiness {
         .filter(|process| is_official_desktop_stdio_child_command_line(&process.command_line))
         .count();
     if observed_native_count > native_child_pids.len() {
-        issues.push("a native stdio app-server does not descend from canonical ChatGPT".into());
+        issues.push("a native stdio app-server does not descend from signed ChatGPT".into());
     }
     if native_child_pids.is_empty() {
-        issues.push("no canonical ChatGPT-owned native stdio app-server is running".into());
+        issues.push("no signed ChatGPT-owned native stdio app-server is running".into());
     }
 
     let helper_candidates = snapshot
@@ -416,11 +420,11 @@ fn computer_use_lineage_readiness() -> ComputerUseLineageReadiness {
         .collect::<Vec<_>>();
     let helper_pids = helper_candidates
         .iter()
-        .filter(|process| ancestry_reaches_official_chatgpt(process, &by_pid, &chatgpt_pids))
+        .filter(|process| ancestry_reaches_official_chatgpt(process, &by_pid, &chatgpt_roots))
         .map(|process| process.pid)
         .collect::<Vec<_>>();
     if helper_candidates.len() > helper_pids.len() {
-        issues.push("a Computer Use helper does not descend from canonical ChatGPT".into());
+        issues.push("a Computer Use helper does not descend from signed ChatGPT".into());
     }
 
     let legacy_bridge_loaded = launchctl_job_is_loaded("com.codexswitch.desktop-app-server-9223");
@@ -466,9 +470,9 @@ fn computer_use_lineage_readiness() -> ComputerUseLineageReadiness {
 }
 
 #[cfg(target_os = "macos")]
-fn official_chatgpt_signature_is_valid() -> bool {
+fn official_chatgpt_signature_is_valid(app_path: &str) -> bool {
     bounded_command::output(
-        Command::new("/usr/bin/codesign").args(["-dvvv", "/Applications/ChatGPT.app"]),
+        Command::new("/usr/bin/codesign").args(["-dvvv", app_path]),
         Duration::from_secs(5),
         bounded_command::SMALL_OUTPUT_LIMIT,
     )
@@ -534,19 +538,46 @@ fn take_lineage_field(input: &str) -> Option<(&str, &str)> {
 }
 
 fn first_command_path(command_line: &str) -> Option<&str> {
+    if command_line.starts_with("/Applications/") {
+        for suffix in [
+            "/Contents/MacOS/ChatGPT",
+            "/Contents/Resources/cua_node/bin/node_repl",
+        ] {
+            if let Some(index) = command_line.find(suffix) {
+                let end = index + suffix.len();
+                if command_line[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+                {
+                    return Some(&command_line[..end]);
+                }
+            }
+        }
+    }
     command_line.split_whitespace().next()
+}
+
+fn top_level_chatgpt_app_path(executable_path: &str) -> Option<&str> {
+    let rest = executable_path.strip_prefix("/Applications/")?;
+    let marker = rest.find(".app/Contents/")?;
+    let app_name_end = marker + ".app".len();
+    let app_name = &rest[..app_name_end];
+    (!app_name.is_empty() && !app_name.contains('/'))
+        .then_some(&executable_path[.."/Applications/".len() + app_name_end])
 }
 
 fn ancestry_reaches_official_chatgpt(
     process: &LineageProcess,
     by_pid: &HashMap<i32, &LineageProcess>,
-    chatgpt_pids: &std::collections::HashSet<i32>,
+    chatgpt_roots: &HashMap<i32, String>,
 ) -> bool {
     let mut current = process.parent_pid;
     let mut visited = std::collections::HashSet::new();
+    let mut expected_app_path: Option<&str> = None;
     for _ in 0..12 {
-        if chatgpt_pids.contains(&current) {
-            return true;
+        if let Some(app_path) = chatgpt_roots.get(&current) {
+            return expected_app_path.is_none_or(|expected| expected == app_path);
         }
         if current <= 1 || !visited.insert(current) {
             return false;
@@ -557,9 +588,13 @@ fn ancestry_reaches_official_chatgpt(
         let Some(path) = first_command_path(&parent.command_line) else {
             return false;
         };
-        if !path.starts_with("/Applications/ChatGPT.app/Contents/") {
+        let Some(app_path) = top_level_chatgpt_app_path(path) else {
+            return false;
+        };
+        if expected_app_path.is_some_and(|expected| expected != app_path) {
             return false;
         }
+        expected_app_path = Some(app_path);
         current = parent.parent_pid;
     }
     false
@@ -886,8 +921,8 @@ mod tests {
     #[test]
     fn computer_use_lineage_parser_and_ancestry_are_fail_closed() {
         let snapshot = parse_lineage_processes(
-            "100 1 501 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n\
-             101 100 501 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl\n\
+            "100 1 501 /Applications/ChatGPT Stock.app/Contents/MacOS/ChatGPT\n\
+             101 100 501 /Applications/ChatGPT Stock.app/Contents/Resources/cua_node/bin/node_repl\n\
              102 101 501 /Users/me/.local/share/codexswitch/prepared/codex app-server --listen stdio://\n\
              200 1 501 /bin/zsh\n\
              201 200 501 /Users/me/.local/share/codexswitch/prepared/codex app-server --listen stdio://\n",
@@ -896,13 +931,25 @@ mod tests {
             .iter()
             .map(|process| (process.pid, process))
             .collect::<HashMap<_, _>>();
-        let chatgpt = [100].into_iter().collect::<std::collections::HashSet<_>>();
+        let chatgpt = [(100, "/Applications/ChatGPT Stock.app".to_string())]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         let native = snapshot.iter().find(|process| process.pid == 102).unwrap();
         let wrapper = snapshot.iter().find(|process| process.pid == 201).unwrap();
         assert!(ancestry_reaches_official_chatgpt(native, &by_pid, &chatgpt));
         assert!(!ancestry_reaches_official_chatgpt(
             wrapper, &by_pid, &chatgpt
         ));
+        assert_eq!(
+            top_level_chatgpt_app_path(
+                "/Applications/ChatGPT Stock.app/Contents/Resources/cua_node/bin/node_repl"
+            ),
+            Some("/Applications/ChatGPT Stock.app")
+        );
+        assert_eq!(
+            top_level_chatgpt_app_path("/Applications/Nested/ChatGPT.app/Contents/MacOS/ChatGPT"),
+            None
+        );
     }
 
     fn process() -> CodexProcess {

@@ -239,7 +239,8 @@ not from `pgrep` text. A signal path must:
 6. Establish capability from complete startup request and ACK evidence matching
    the current observation. First-ACK bootstrap for an
    `official-desktop-stdio-child` additionally requires a fresh ancestry walk
-   to canonical `/Applications/ChatGPT.app`, OpenAI Team ID `2DC432GLL2`, the
+   to a top-level `/Applications/*.app` ChatGPT executable with OpenAI Team ID
+   `2DC432GLL2`, the
    exact stdio invocation, and the running executable vnode. Executable markers
    or path modification time alone are never running-image proof.
 7. Persist the complete structured request binding, then sandwich two equal

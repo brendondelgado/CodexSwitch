@@ -98,7 +98,6 @@ enum CodexDesktopNativeChildCoordinator {
     ) -> Bool {
         guard binding.runtimeKind == .officialDesktopStdioChild,
               binding.processIdentity.ownerUID == UInt32(getuid()),
-              signatureStatus("/Applications/ChatGPT.app") == .officialOpenAI,
               let runtimeArguments = arguments
                 ?? SwapEngine.processArguments(pid: binding.processIdentity.pid),
               SwapEngine.hasOfficialDesktopStdioInvocation(runtimeArguments) else {
@@ -107,21 +106,37 @@ enum CodexDesktopNativeChildCoordinator {
 
         var current = binding.processIdentity.pid
         var visited: Set<Int32> = []
+        var expectedAppPath: String?
         for _ in 0..<12 {
             guard current > 1, visited.insert(current).inserted,
                   let parent = parentPID(current), parent > 0,
-                  let path = executablePath(parent) else {
+                  let path = executablePath(parent),
+                  let appPath = topLevelChatGPTAppPath(containing: path) else {
                 return false
             }
-            if path == "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT" {
-                return true
-            }
-            guard path.hasPrefix("/Applications/ChatGPT.app/Contents/") else {
+            if let expectedAppPath, expectedAppPath != appPath {
                 return false
+            }
+            expectedAppPath = appPath
+            if path == "\(appPath)/Contents/MacOS/ChatGPT" {
+                return signatureStatus(appPath) == .officialOpenAI
             }
             current = parent
         }
         return false
+    }
+
+    static func topLevelChatGPTAppPath(containing executablePath: String) -> String? {
+        let applicationsPrefix = "/Applications/"
+        let contentsMarker = ".app/Contents/"
+        guard executablePath.hasPrefix(applicationsPrefix),
+              let marker = executablePath.range(of: contentsMarker) else {
+            return nil
+        }
+        let appPath = String(executablePath[..<marker.lowerBound]) + ".app"
+        let bundleName = appPath.dropFirst(applicationsPrefix.count)
+        guard !bundleName.isEmpty, !bundleName.contains("/") else { return nil }
+        return appPath
     }
 
     private static func legacyJobIsLoaded() -> Bool {

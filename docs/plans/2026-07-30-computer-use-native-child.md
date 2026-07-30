@@ -10,12 +10,12 @@ cross_dependencies:
   - ../architecture/macos-runtime-discovery.md
   - ../architecture/runtime-and-host-ownership.md
   - ../sighup-safety.md
-  - ../../Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
+  - ../../Sources/CodexSwitch/Services/CodexDesktopNativeChildCoordinator.swift
   - ../../Sources/CodexSwitch/Services/SwapEngine.swift
   - ../../crates/codexswitch-cli/src/readiness.rs
 version_control:
-  branch: codex/computer-use-native-child
-  status: implementation
+  branch: main
+  status: active
   last_updated: 2026-07-30
 ---
 
@@ -30,7 +30,9 @@ changing the signed desktop parent.
 
 ## Invariants
 
-1. `/Applications/ChatGPT.app` has OpenAI Team ID `2DC432GLL2`.
+1. The observed top-level `/Applications/*.app` ChatGPT parent has OpenAI Team
+   ID `2DC432GLL2`; the trust decision follows the signed process ancestry and
+   does not depend on the bundle's display filename.
 2. ChatGPT starts `codex app-server --listen stdio://` through its native child
    path; CodexSwitch does not host a desktop app-server.
 3. `CODEX_APP_SERVER_WS_URL` is absent and

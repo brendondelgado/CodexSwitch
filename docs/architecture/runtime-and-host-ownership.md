@@ -834,7 +834,7 @@ processed or displayed the new account.
 Runtime kind is an authorization contract derived from verified process and
 ancestry topology, never a label trusted from the acknowledgement. On macOS,
 only an exact `codex app-server --listen stdio://` process whose kernel ancestry
-reaches the official canonical ChatGPT app may classify as
+reaches the observed top-level OpenAI-signed ChatGPT app may classify as
 `official-desktop-stdio-child`. Any WebSocket desktop bridge is unsupported.
 
 Runtime discovery lanes must not count the same PID twice. After the desktop
