@@ -1899,6 +1899,70 @@ struct CodexDesktopAppUpdaterTests {
         #expect(summary.entryCount == 1)
     }
 
+    @Test("Official signed ZIP data descriptors match the central directory")
+    func signedDataDescriptorsPassPreflight() throws {
+        var entry = ZIPTestEntry(
+            path: "ChatGPT.app/Contents/Resources/payload",
+            compressedBytes: 3,
+            expandedBytes: 7,
+            unixMode: UInt32(S_IFREG | 0o644),
+            compressionMethod: 8,
+            payload: Data([1, 2, 3]),
+            localFlags: 0x0808,
+            centralFlags: 0x0808,
+            centralCRC32: 0x1234_5678
+        )
+        entry.dataDescriptor = ZIPTestDataDescriptor(
+            signature: 0x08074b50,
+            crc32: entry.centralCRC32,
+            compressedBytes: entry.compressedBytes,
+            expandedBytes: entry.expandedBytes
+        )
+
+        let summary = try validateZIPArchive(makeZIPArchive(entries: [entry]))
+
+        #expect(summary.entryCount == 1)
+        #expect(summary.expandedBytes == 7)
+    }
+
+    @Test("Malformed or inapplicable ZIP data descriptors fail preflight")
+    func malformedDataDescriptorsFailPreflight() throws {
+        func descriptorEntry(
+            signature: UInt32 = 0x08074b50,
+            crc32: UInt32 = 0x1234_5678,
+            method: UInt16 = 8
+        ) -> ZIPTestEntry {
+            var entry = ZIPTestEntry(
+                path: "ChatGPT.app/Contents/Resources/payload",
+                compressedBytes: 3,
+                expandedBytes: 7,
+                unixMode: UInt32(S_IFREG | 0o644),
+                compressionMethod: method,
+                payload: Data([1, 2, 3]),
+                localFlags: 0x0808,
+                centralFlags: 0x0808,
+                centralCRC32: 0x1234_5678
+            )
+            entry.dataDescriptor = ZIPTestDataDescriptor(
+                signature: signature,
+                crc32: crc32,
+                compressedBytes: entry.compressedBytes,
+                expandedBytes: entry.expandedBytes
+            )
+            return entry
+        }
+
+        for entry in [
+            descriptorEntry(signature: 0),
+            descriptorEntry(crc32: 0),
+            descriptorEntry(method: 0),
+        ] {
+            #expect(throws: (any Error).self) {
+                _ = try validateZIPArchive(makeZIPArchive(entries: [entry]))
+            }
+        }
+    }
+
     @Test("Semantic and mismatched ZIP extra fields fail preflight")
     func unsupportedOrMismatchedExtraFieldsFailPreflight() throws {
         let unicodePathPayload =
@@ -5703,6 +5767,7 @@ struct CodexDesktopAppUpdaterTests {
         var centralCRC32: UInt32 = 0
         var localExtra = Data()
         var centralExtra = Data()
+        var dataDescriptor: ZIPTestDataDescriptor?
 
         static func directory(_ path: String) -> Self {
             Self(
@@ -5739,6 +5804,13 @@ struct CodexDesktopAppUpdaterTests {
         }
     }
 
+    private struct ZIPTestDataDescriptor {
+        let signature: UInt32
+        let crc32: UInt32
+        let compressedBytes: UInt32
+        let expandedBytes: UInt32
+    }
+
     private func makeZIPArchive(entries: [ZIPTestEntry]) -> Data {
         var local = Data()
         var central = Data()
@@ -5752,14 +5824,29 @@ struct CodexDesktopAppUpdaterTests {
             appendUInt16(entry.compressionMethod, to: &local)
             appendUInt16(0, to: &local)
             appendUInt16(0, to: &local)
-            appendUInt32(entry.localCRC32, to: &local)
-            appendUInt32(entry.compressedBytes, to: &local)
-            appendUInt32(entry.expandedBytes, to: &local)
+            appendUInt32(
+                entry.dataDescriptor == nil ? entry.localCRC32 : 0,
+                to: &local
+            )
+            appendUInt32(
+                entry.dataDescriptor == nil ? entry.compressedBytes : 0,
+                to: &local
+            )
+            appendUInt32(
+                entry.dataDescriptor == nil ? entry.expandedBytes : 0,
+                to: &local
+            )
             appendUInt16(UInt16(localName.count), to: &local)
             appendUInt16(UInt16(entry.localExtra.count), to: &local)
             local.append(localName)
             local.append(entry.localExtra)
             local.append(entry.payload)
+            if let descriptor = entry.dataDescriptor {
+                appendUInt32(descriptor.signature, to: &local)
+                appendUInt32(descriptor.crc32, to: &local)
+                appendUInt32(descriptor.compressedBytes, to: &local)
+                appendUInt32(descriptor.expandedBytes, to: &local)
+            }
 
             appendUInt32(0x02014b50, to: &central)
             appendUInt16(0x0314, to: &central)

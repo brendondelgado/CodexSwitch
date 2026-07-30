@@ -569,9 +569,9 @@ enum DesktopZIPArchivePreflight {
                   expanded != UInt64(UInt32.max),
                   localOffset != UInt32.max,
                   UInt64(localOffset) < UInt64(centralOffset),
-                  flags & 0x0009 == 0,
-                  flags & ~UInt16(0x0806) == 0,
-                  method != 0 || flags & 0x0006 == 0,
+                  flags & 0x0001 == 0,
+                  flags & ~UInt16(0x080e) == 0,
+                  method != 0 || flags & 0x000e == 0,
                   method == 0 || method == 8 else {
                 throw archiveError("Archive entry used unsupported or unsafe metadata")
             }
@@ -705,9 +705,6 @@ enum DesktopZIPArchivePreflight {
         guard header.uint32(at: 0) == 0x04034b50,
               header.uint16(at: 6) == expectedFlags,
               header.uint16(at: 8) == expectedMethod,
-              header.uint32(at: 14) == expectedCRC32,
-              UInt64(header.uint32(at: 18)) == expectedCompressedBytes,
-              UInt64(header.uint32(at: 22)) == expectedExpandedBytes,
               localNameLength == UInt64(expectedName.count),
               payloadOffset <= centralStart,
               expectedCompressedBytes <= centralStart - payloadOffset else {
@@ -736,8 +733,44 @@ enum DesktopZIPArchivePreflight {
             )
         }
         let payloadEnd = payloadOffset + expectedCompressedBytes
+        let usesDataDescriptor = expectedFlags & 0x0008 != 0
+        let recordEnd: UInt64
+        if usesDataDescriptor {
+            guard expectedMethod == 8,
+                  header.uint32(at: 14) == 0,
+                  header.uint32(at: 18) == 0,
+                  header.uint32(at: 22) == 0,
+                  payloadEnd <= centralStart,
+                  16 <= centralStart - payloadEnd else {
+                throw archiveError(
+                    "Archive data-descriptor header was unsupported or out of bounds"
+                )
+            }
+            let descriptor = try archive.read(
+                offset: Int64(payloadEnd),
+                count: 16
+            )
+            guard descriptor.uint32(at: 0) == 0x08074b50,
+                  descriptor.uint32(at: 4) == expectedCRC32,
+                  UInt64(descriptor.uint32(at: 8)) == expectedCompressedBytes,
+                  UInt64(descriptor.uint32(at: 12)) == expectedExpandedBytes else {
+                throw archiveError(
+                    "Archive data descriptor did not match its directory entry"
+                )
+            }
+            recordEnd = payloadEnd + 16
+        } else {
+            guard header.uint32(at: 14) == expectedCRC32,
+                  UInt64(header.uint32(at: 18)) == expectedCompressedBytes,
+                  UInt64(header.uint32(at: 22)) == expectedExpandedBytes else {
+                throw archiveError(
+                    "Archive local header did not match its directory entry"
+                )
+            }
+            recordEnd = payloadEnd
+        }
         return LocalRecord(
-            byteRange: headerOffset..<payloadEnd,
+            byteRange: headerOffset..<recordEnd,
             payloadOffset: payloadOffset
         )
     }

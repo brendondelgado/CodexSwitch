@@ -34,7 +34,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical
-  last_updated: 2026-07-24
+  last_updated: 2026-07-30
 ---
 
 # Desktop Update Storage
@@ -154,8 +154,11 @@ The complete ZIP record graph is then preflighted with limits of 200,000 entries
 8 GiB expanded bytes, 64 MiB central-directory bytes, and a 500:1 per-entry
 compression ratio. Every central record is cross-checked with its local header,
 including raw and decoded names, encoding and general-purpose flags, method,
-CRC, compressed and expanded sizes, and offset. Encryption, ZIP64, data
-descriptors, overlapping records, duplicate or case/Unicode/normalization
+CRC, compressed and expanded sizes, and offset. Signed data descriptors are
+accepted only for deflated entries with zero local CRC and size fields; their
+mandatory signature, CRC, compressed size, and expanded size must exactly match
+the authenticated central record. Encryption, ZIP64, unsigned or mismatched
+data descriptors, overlapping records, duplicate or case/Unicode/normalization
 collisions, file-directory prefix conflicts, absolute paths, traversal, special
 files, nonempty directory payloads, and expansion beyond those limits are
 rejected before extraction starts. The official old-Unix `0x5855` extra field
