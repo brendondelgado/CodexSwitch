@@ -282,21 +282,25 @@ fn patch_auth_generation_initializers(path: &Path) -> Result<()> {
     let mut updated = String::with_capacity(content.len() + 512);
     let lines = content.lines().collect::<Vec<_>>();
     let mut index = 0;
+    let mut inside_initializer = false;
     let mut initializer_has_generation = false;
     let mut initializer_has_external_auth = false;
     while index < lines.len() {
         let line = lines[index];
         if line.contains("Self {") {
+            inside_initializer = true;
             initializer_has_generation = false;
             initializer_has_external_auth = false;
         }
         if line.contains("auth_generation: AtomicU64::new(0),") {
             initializer_has_generation = true;
         }
-        if line.trim_start().starts_with("external_auth:") {
+        if inside_initializer && line.trim_start().starts_with("external_auth:") {
             initializer_has_external_auth = true;
         }
-        if line.trim_start().starts_with("auth_route_config:")
+        let finishes_initializer = inside_initializer
+            && line.trim_start().starts_with("auth_route_config:");
+        if finishes_initializer
             && initializer_has_external_auth
             && !initializer_has_generation
         {
@@ -307,7 +311,7 @@ fn patch_auth_generation_initializers(path: &Path) -> Result<()> {
         updated.push_str(line);
         updated.push('\n');
 
-        if line.contains("external_auth: RwLock::new(None),") {
+        if inside_initializer && line.contains("external_auth: RwLock::new(None),") {
             let lookahead_end = (index + 8).min(lines.len());
             let has_generation = lines[index + 1..lookahead_end]
                 .iter()
@@ -316,6 +320,9 @@ fn patch_auth_generation_initializers(path: &Path) -> Result<()> {
                 updated.push_str("            auth_generation: AtomicU64::new(0),\n");
                 initializer_has_generation = true;
             }
+        }
+        if finishes_initializer {
+            inside_initializer = false;
         }
 
         index += 1;
