@@ -803,7 +803,7 @@ struct DesktopRuntimeReloadClientTests {
         #expect(strictCalls.read() == 0)
     }
 
-    @Test("Mixed app-server topology admits only the loopback WebSocket desktop runtime")
+    @Test("Mixed app-server topology admits WebSocket diagnostics and native stdio hot-swap")
     func mixedTopologyAdmitsOnlyLoopbackWebSocketDesktopRuntime() async throws {
         let webSocketPID: Int32 = 42
         let stdioPID: Int32 = 43
@@ -889,8 +889,8 @@ struct DesktopRuntimeReloadClientTests {
 
         #expect(result == .reloaded(
             method: "account/login/start",
-            discoveredRuntimeCount: 1,
-            acknowledgedRuntimeCount: 1
+            discoveredRuntimeCount: 2,
+            acknowledgedRuntimeCount: 2
         ))
         #expect(bindingTargetPIDs.read() == [webSocketPID])
         #expect(strictTargetPIDs.read() == [webSocketPID])

@@ -131,8 +131,8 @@ struct DesktopRuntimeHotSwapStateTests {
         let idleManagedBridge = CodexLocalRuntimeEvidenceSnapshot(
             runtimes: [
                 runtimeEvidence(
-                    observationKind: .managedDesktopBridge,
-                    acknowledgementKind: .managedDesktopBridge,
+                    observationKind: .officialDesktopStdioChild,
+                    acknowledgementKind: .officialDesktopStdioChild,
                     idleListenerReady: true
                 ),
             ],

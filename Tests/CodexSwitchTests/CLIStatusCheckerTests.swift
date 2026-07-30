@@ -170,14 +170,14 @@ struct CLIStatusCheckerTests {
         #expect(readiness.detail == "pid=42 incompleteEvidence=true")
     }
 
-    @Test("CLI readiness rejects an idle managed desktop bridge")
+    @Test("CLI readiness rejects an idle official desktop child")
     func cliReadinessRejectsManagedDesktopBridge() {
         let readiness = CLIStatusChecker.codexCLIRuntimeEvidenceIsHotSwapReady(
             CodexLocalRuntimeEvidenceSnapshot(
                 runtimes: [
                     runtimeEvidence(
-                        observationRuntimeKind: .managedDesktopBridge,
-                        acknowledgementRuntimeKind: .managedDesktopBridge,
+                        observationRuntimeKind: .officialDesktopStdioChild,
+                        acknowledgementRuntimeKind: .officialDesktopStdioChild,
                         idleListenerReady: true
                     ),
                 ],

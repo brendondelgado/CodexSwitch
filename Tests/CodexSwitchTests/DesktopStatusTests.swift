@@ -201,7 +201,7 @@ struct DesktopStatusTests {
                 permissionDeniedBackoffActive: false,
                 codexAppSignatureCompatible: true,
                 markers: markers
-            ) == "Desktop app is ready."
+            ) == "Official ChatGPT native-child hot-swap is ready."
         )
     }
 
@@ -255,7 +255,7 @@ struct DesktopStatusTests {
         #expect(!markers.computerUsePreservedModeInstalled)
         #expect(!markers.desktopIntegrationInstalled)
         #expect(!status.computerUsePreservedModeInstalled)
-        #expect(!status.desktopIntegrationInstalled)
+        #expect(status.desktopIntegrationInstalled)
         #expect(
             DesktopPatchManager.statusMessage(
                 running: false,
@@ -264,7 +264,7 @@ struct DesktopStatusTests {
                 permissionDeniedBackoffActive: false,
                 codexAppSignatureCompatible: true,
                 markers: markers
-            ) == "Desktop app patch missing; will patch in background."
+            ) == "Official ChatGPT is installed; open it to verify native-child hot-swap."
         )
     }
 
@@ -287,7 +287,7 @@ struct DesktopStatusTests {
                 permissionDeniedBackoffActive: false,
                 codexAppSignatureCompatible: true,
                 markers: markers
-            ) == "Desktop app patch pending: Codex.app/app-server is still running; use ⌘Q to quit."
+            ) == "Official ChatGPT is running; native-child hot-swap acknowledgement is pending."
         )
     }
 
@@ -335,7 +335,7 @@ struct DesktopStatusTests {
                 permissionDeniedBackoffActive: false,
                 codexAppSignatureCompatible: true,
                 markers: markers
-            ) == "Desktop app hot-swap patch is off in CodexSwitch settings."
+            ) == "Official ChatGPT is installed; open it to verify native-child hot-swap."
         )
     }
 
@@ -358,7 +358,7 @@ struct DesktopStatusTests {
                 permissionDeniedBackoffActive: false,
                 codexAppSignatureCompatible: true,
                 markers: markers
-            ) == "Desktop app patch missing; will patch in background."
+            ) == "Official ChatGPT is installed; open it to verify native-child hot-swap."
         )
     }
 
@@ -382,7 +382,7 @@ struct DesktopStatusTests {
                 codexAppSignatureCompatible: true,
                 codesignIdentityAvailable: false,
                 markers: markers
-            ) == "Desktop app patch blocked: Apple signing identity/private key is missing. Open Xcode account signing or restore the cached Apple-issued iPhone Developer keypair."
+            ) == "Official ChatGPT is installed; open it to verify native-child hot-swap."
         )
     }
 
@@ -406,7 +406,7 @@ struct DesktopStatusTests {
                 codexAppSignatureCompatible: true,
                 codesignIdentityAvailable: false,
                 markers: markers
-            ) == "Desktop app patch blocked: Apple signing identity/private key is missing; quitting Codex.app alone will not patch it."
+            ) == "Official ChatGPT is running; native-child hot-swap acknowledgement is pending."
         )
     }
 

@@ -320,6 +320,7 @@ static HOT_SWAP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[serde(rename_all = "kebab-case")]
 pub enum HotSwapRuntimeKind {
     ExternalAppServer,
+    OfficialDesktopStdioChild,
     ManagedDesktopBridge,
     HeadlessRemoteControlAppServer,
     LocalInteractiveCli,
@@ -2496,7 +2497,9 @@ impl BinaryMarkerState {
 
     fn is_complete_for_runtime(&self, runtime_kind: HotSwapRuntimeKind) -> bool {
         let has_runtime_markers = match runtime_kind {
-            HotSwapRuntimeKind::ExternalAppServer | HotSwapRuntimeKind::ManagedDesktopBridge => {
+            HotSwapRuntimeKind::ExternalAppServer
+            | HotSwapRuntimeKind::OfficialDesktopStdioChild
+            | HotSwapRuntimeKind::ManagedDesktopBridge => {
                 self.external_app_server.iter().all(|found| *found)
             }
             HotSwapRuntimeKind::HeadlessRemoteControlAppServer => {
@@ -3077,6 +3080,9 @@ fn hot_swap_ack_matches_request_with_minimum_remaining(
         && ack.active_token_fingerprint == expected_fingerprint
         && match runtime_kind {
             HotSwapRuntimeKind::ExternalAppServer => {
+                external_app_server_ack_is_verified(ack, AppServerIdlePolicy::Reject)
+            }
+            HotSwapRuntimeKind::OfficialDesktopStdioChild => {
                 external_app_server_ack_is_verified(ack, AppServerIdlePolicy::Reject)
             }
             HotSwapRuntimeKind::ManagedDesktopBridge => external_app_server_ack_is_verified(
@@ -3726,6 +3732,17 @@ fn hot_swap_runtime_kind_for_platform(
         if is_headless_remote_control_app_server_command_line(&process.command_line) {
             return Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer);
         }
+        if target_is_macos && is_official_desktop_stdio_child_command_line(&process.command_line) {
+            return Some(HotSwapRuntimeKind::OfficialDesktopStdioChild);
+        }
+        if target_is_macos
+            && is_managed_desktop_bridge_app_server_command_line(
+                &process.command_line,
+                target_is_macos,
+            )
+        {
+            return None;
+        }
         if managed_runtime == Some(process.executable.as_path())
             && managed_launchd_pid == Some(process.pid)
             && is_managed_desktop_bridge_app_server_command_line(
@@ -3915,6 +3932,41 @@ fn is_managed_desktop_bridge_app_server_command_line(
         && parts[4] == "--analytics-default-enabled"
         && parts[5] == "--listen"
         && parts[6] == "ws://127.0.0.1:9223"
+}
+
+pub(crate) fn is_official_desktop_stdio_child_command_line(command_line: &str) -> bool {
+    if !is_codex_app_server_command_line(command_line) {
+        return false;
+    }
+    let parts = command_line
+        .split_whitespace()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let Some(app_server_index) = parts.iter().position(|part| part == "app-server") else {
+        return false;
+    };
+    let arguments = &parts[app_server_index + 1..];
+    if arguments
+        .iter()
+        .any(|argument| argument == "--remote-control")
+    {
+        return false;
+    }
+    let listeners = arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            argument
+                .strip_prefix("--listen=")
+                .map(str::to_string)
+                .or_else(|| {
+                    (argument == "--listen")
+                        .then(|| arguments.get(index + 1).cloned())
+                        .flatten()
+                })
+        })
+        .collect::<Vec<_>>();
+    listeners == ["stdio://"]
 }
 
 fn first_command_token_is_native_codex(command_line: &str) -> bool {
@@ -4469,7 +4521,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_desktop_bridge_runtime_kind_is_exact_and_macos_only() {
+    fn legacy_desktop_bridge_is_rejected_on_macos() {
         let managed_runtime =
             PathBuf::from("/Users/me/.local/share/codexswitch/generations/current/codex");
         let exact_command_line = format!(
@@ -4492,7 +4544,7 @@ mod tests {
                 Some(&managed_runtime),
                 Some(process.pid),
             ),
-            Some(HotSwapRuntimeKind::ManagedDesktopBridge)
+            None
         );
         assert_eq!(
             hot_swap_runtime_kind_for_platform(
@@ -4505,7 +4557,7 @@ mod tests {
         );
         assert_eq!(
             hot_swap_runtime_kind_for_platform(&process, true, None, Some(process.pid)),
-            Some(HotSwapRuntimeKind::ExternalAppServer)
+            None
         );
         assert_eq!(
             hot_swap_runtime_kind_for_platform(
@@ -4514,7 +4566,7 @@ mod tests {
                 Some(&managed_runtime),
                 Some(process.pid + 1),
             ),
-            Some(HotSwapRuntimeKind::ExternalAppServer)
+            None
         );
 
         for near_miss in [
@@ -4552,7 +4604,23 @@ mod tests {
     }
 
     #[test]
-    fn stock_binary_with_managed_desktop_argv_remains_external() {
+    fn official_desktop_stdio_child_requires_exact_private_listener() {
+        assert!(is_official_desktop_stdio_child_command_line(
+            "/prepared/codex app-server --listen stdio://"
+        ));
+        assert!(is_official_desktop_stdio_child_command_line(
+            "/prepared/codex app-server --analytics-default-enabled --listen=stdio://"
+        ));
+        assert!(!is_official_desktop_stdio_child_command_line(
+            "/prepared/codex app-server --listen ws://127.0.0.1:9223"
+        ));
+        assert!(!is_official_desktop_stdio_child_command_line(
+            "/prepared/codex app-server --remote-control --listen stdio://"
+        ));
+    }
+
+    #[test]
+    fn stock_binary_with_legacy_desktop_argv_is_rejected() {
         let managed_runtime =
             PathBuf::from("/Users/me/.local/share/codexswitch/generations/current/codex");
         let stock_runtime = PathBuf::from("/Applications/Codex.app/Contents/Resources/codex");
@@ -4575,7 +4643,7 @@ mod tests {
                 Some(managed_runtime.as_path()),
                 Some(process.pid),
             ),
-            Some(HotSwapRuntimeKind::ExternalAppServer)
+            None
         );
     }
 

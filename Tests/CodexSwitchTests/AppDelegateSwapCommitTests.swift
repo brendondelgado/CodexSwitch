@@ -254,13 +254,13 @@ struct AppDelegateSwapCommitTests {
             .allowsLaunchSameTargetRecovery)
     }
 
-    @Test("Launch waits for bridge installation before retry recovery")
-    func launchRecoveryRunsAfterBridgeInstallation() throws {
+    @Test("Launch retires the legacy bridge before retry recovery")
+    func launchRecoveryRunsAfterBridgeRetirement() throws {
         let source = try String(
             contentsOfFile: "Sources/CodexSwitch/App/AppDelegate.swift",
             encoding: .utf8
         )
-        let bridgeWait = try #require(source.range(of: "await desktopBridgeInstallation.value"))
+        let bridgeWait = try #require(source.range(of: "await desktopNativeChildMigration.value"))
         let recovery = try #require(
             source.range(of: "await recoverManualReviewActivationOnLaunch()")
         )
@@ -666,7 +666,7 @@ struct AppDelegateSwapCommitTests {
                         "ws://127.0.0.1:9223",
                     ]
                 ),
-                runtimeKind: .managedDesktopBridge
+                runtimeKind: .officialDesktopStdioChild
             ),
             port: 9223
         )

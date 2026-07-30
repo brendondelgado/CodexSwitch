@@ -13,6 +13,8 @@ enum DesktopRuntimeHotSwapState: Sendable, Equatable {
 
 enum HotSwapRuntimeKind: String, Decodable, Sendable, Equatable {
     case externalAppServer = "external-app-server"
+    case officialDesktopStdioChild = "official-desktop-stdio-child"
+    // Decode-only compatibility for historical request/ACK artifacts.
     case managedDesktopBridge = "managed-desktop-bridge"
     case headlessRemoteControlAppServer = "headless-remote-control-app-server"
     case localInteractiveCLI = "local-interactive-cli"
@@ -102,7 +104,7 @@ struct DesktopPatchStatus: Sendable, Equatable {
     }
 
     var desktopIntegrationInstalled: Bool {
-        allPatchesInstalled || computerUsePreservedModeInstalled
+        codexAppSignatureCompatible && computerUsePluginSignatureCompatible
     }
 }
 
@@ -500,119 +502,10 @@ enum DesktopPatchManager {
         ignoreCooldown: Bool = false,
         ignorePermissionDeniedBackoff: Bool = false
     ) -> DesktopPatchAttemptOutcome {
-        let status = currentStatus(maxAge: 0)
-        let bundleStrictlyValid = !status.desktopIntegrationInstalled
-            || CodexDesktopAppLocator.bundleIsValid(appPath: codexAppPath)
-        guard repairRequired(
-            desktopIntegrationInstalled: status.desktopIntegrationInstalled,
-            bundleStrictlyValid: bundleStrictlyValid
-        ) else {
-            clearPermissionDenied()
-            clearPatchAttempt()
-            return .notNeeded
-        }
-        appendPatchLog("desktop patch needed: running=\(status.isCodexAppRunning) automatic=\(automaticPatchingEnabled)")
-        SwapLog.append(.debug("DESKTOP_PATCH_NEEDED running=\(status.isCodexAppRunning) automatic=\(automaticPatchingEnabled)"))
-        guard automaticPatchingEnabled else {
-            appendPatchLog("desktop ASAR patch skipped: automatic desktop patching is disabled by user setting")
-            SwapLog.append(.debug("DESKTOP_ASAR_PATCH_DISABLED_BY_USER"))
-            return .disabled
-        }
-        guard codesignIdentityAvailable() else {
-            let suffix = status.isCodexAppRunning ? " (Codex.app also running)" : ""
-            appendPatchLog("desktop ASAR patch blocked: no usable non-ad-hoc code signing identity\(suffix)")
-            SwapLog.append(.debug("DESKTOP_PATCH_SIGNING_IDENTITY_MISSING"))
-            return .missingSigningIdentity
-        }
-        guard !status.isCodexAppRunning else {
-            appendPatchLog("desktop patch pending: Codex.app is still running")
-            SwapLog.append(.debug("DESKTOP_PATCH_WAITING_FOR_CODEX_APP_QUIT"))
-            return .waitingForCodexAppQuit
-        }
-        if permissionDeniedBackoffActive(), !ignorePermissionDeniedBackoff {
-            appendPatchLog("desktop ASAR patch blocked: permission denied backoff active")
-            SwapLog.append(.debug("DESKTOP_PATCH_PERMISSION_DENIED_BACKOFF"))
-            return .permissionDeniedBackoff
-        }
-        guard let script = patchScriptPath() else {
-            appendPatchLog("patch script not found")
-            return .scriptMissing
-        }
-
-        let outcome = withDesktopPatchMutationLease(
-            lockPath: patchLeasePath,
-            appendLog: { appendPatchLog($0) }
-        ) {
-            if !patchCooldownExpired(), !ignoreCooldown {
-                appendPatchLog("desktop ASAR patch skipped: patch attempt cooldown active")
-                SwapLog.append(.debug("DESKTOP_PATCH_COOLDOWN_ACTIVE"))
-                return .cooldownActive
-            }
-
-            markPatchAttempt()
-            appendPatchLog("starting desktop patch with \(script)")
-
-            var environment = ProcessInfo.processInfo.environment
-            environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-            environment["CODEXSWITCH_CODEX_APP_PATH"] = codexAppPath
-
-            let result = ProcessRunner.run(
-                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
-                arguments: [script],
-                timeout: 600,
-                environment: environment
-            )
-
-            let output = [result.stdoutString, result.stderrString]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n")
-            appendPatchLog(output.isEmpty ? "patch exited status=\(result.terminationStatus)" : output)
-
-            if result.timedOut {
-                desktopPatchLogger.error("Desktop patch timed out")
-                SwapLog.append(.debug("DESKTOP_PATCH_TIMEOUT"))
-                return .timedOut
-            } else if result.terminationStatus == 0 {
-                clearPermissionDenied()
-                desktopPatchLogger.info("Desktop patch completed")
-                SwapLog.append(.debug("DESKTOP_PATCH_COMPLETED"))
-                return .completed
-            } else if result.terminationStatus == 3 || isLiveAppRefusal(output) {
-                clearPatchAttempt()
-                desktopPatchLogger.warning("Desktop patch waiting for Codex.app to quit")
-                SwapLog.append(.debug("DESKTOP_PATCH_WAITING_FOR_CODEX_APP_QUIT"))
-                return .waitingForCodexAppQuit
-            } else if result.terminationStatus == 2 {
-                desktopPatchLogger.warning("Desktop patch skipped; app structure changed")
-                SwapLog.append(.debug("DESKTOP_PATCH_SKIPPED_STRUCTURE_CHANGED"))
-                return .structureChanged
-            } else if isSigningIdentityMissing(output) {
-                desktopPatchLogger.error("Desktop patch needs a non-ad-hoc code signing identity")
-                SwapLog.append(.debug("DESKTOP_PATCH_SIGNING_IDENTITY_MISSING"))
-                return .missingSigningIdentity
-            } else if isPermissionDenied(output) {
-                markPermissionDenied()
-                desktopPatchLogger.error("Desktop patch needs App Management permission")
-                SwapLog.append(.debug("DESKTOP_PATCH_PERMISSION_DENIED"))
-                return .permissionDenied
-            } else {
-                desktopPatchLogger.error("Desktop patch failed status=\(result.terminationStatus)")
-                SwapLog.append(.debug("DESKTOP_PATCH_FAILED status=\(result.terminationStatus)"))
-                return .failed(result.terminationStatus)
-            }
-        }
-
-        switch outcome {
-        case .alreadyInProgress:
-            SwapLog.append(.debug("DESKTOP_PATCH_ALREADY_IN_PROGRESS"))
-        case .leaseUnavailable:
-            SwapLog.append(.debug("DESKTOP_PATCH_LEASE_UNAVAILABLE"))
-        case .completed:
-            statusCache.set(computeCurrentStatus())
-        default:
-            break
-        }
-        return outcome
+        // Computer Use validates the complete signed ancestry. Mutating or
+        // re-signing the desktop host is never a supported automatic repair.
+        SwapLog.append(.debug("DESKTOP_ASAR_PATCH_MECHANICALLY_DISABLED_NATIVE_CHILD"))
+        return .disabled
     }
 
     nonisolated static func repairRequired(
@@ -665,7 +558,7 @@ enum DesktopPatchManager {
         return evidence.runtimes.allSatisfy { runtime in
             (
                 runtime.observation.target.runtimeKind == .externalAppServer
-                    || runtime.observation.target.runtimeKind == .managedDesktopBridge
+                    || runtime.observation.target.runtimeKind == .officialDesktopStdioChild
             )
                 && runtime.startupAcknowledgement.idleListenerReady != true
                 && SwapEngine.bindingMatchesObservation(
@@ -717,6 +610,18 @@ enum DesktopPatchManager {
         codesignIdentityAvailable: Bool = true,
         markers: InstalledMarkers
     ) -> String {
+        if codexAppSignatureCompatible && markers.computerUsePluginSignatureCompatible {
+            switch runtimeState {
+            case .ready:
+                return "Official ChatGPT native-child hot-swap is ready."
+            case .unknown where !running:
+                return "Official ChatGPT is installed; open it to verify native-child hot-swap."
+            case .restartRequired:
+                return "Official ChatGPT is using an older prepared CLI generation; new tasks will use the current route."
+            case .unknown:
+                return "Official ChatGPT is running; native-child hot-swap acknowledgement is pending."
+            }
+        }
         if !codexAppSignatureCompatible && !markers.computerUsePluginSignatureCompatible {
             return running
                 ? "Codex.app is locally signed; quit Codex.app to restore official signing for Computer Use."

@@ -832,15 +832,10 @@ compatibility contract; a control-only write cannot claim that the renderer
 processed or displayed the new account.
 
 Runtime kind is an authorization contract derived from verified process and
-listener topology, never a label trusted from the acknowledgement. On macOS,
-only the repository-managed bridge may classify as
-`managed-desktop-bridge`: it must declare the exact loopback WebSocket listener
-on port `9223` in its current arguments and own that listening TCP socket. A
-`codex app-server --listen stdio://` process belongs to its invoking host
-harness; it is not a desktop credential owner and must not enter desktop reload
-discovery. Path classification alone is insufficient because managed Codex
-binaries can serve both transports from the same executable. Any other external
-app-server remains `external-app-server` and strict.
+ancestry topology, never a label trusted from the acknowledgement. On macOS,
+only an exact `codex app-server --listen stdio://` process whose kernel ancestry
+reaches the official canonical ChatGPT app may classify as
+`official-desktop-stdio-child`. Any WebSocket desktop bridge is unsupported.
 
 Runtime discovery lanes must not count the same PID twice. After the desktop
 transaction admits and acknowledges a desktop or managed-bridge PID, the
@@ -1148,24 +1143,11 @@ not as v3 rotation evidence, and are never eligible for automatic repair.
 When a daemon tick rejects an activation barrier, the outer daemon loop remains
 side-effect free: it performs no quota network calls, reset effects, auth writes,
 or runtime reloads for that tick.
-On macOS, a newly started repository-owned `managed-desktop-bridge` may
-establish its first ACK during an explicit desktop activation only after
-CodexSwitch verifies the canonical `9223` listener, launchd PID, generated
-bridge files, exact managed-launcher route embedded in the bridge script,
-expected runtime and helper hashes, and the running executable vnode. The local
-and Homebrew CLI forwarding wrappers remain part of CLI route verification, not
-desktop bridge authorization. This narrow bootstrap is not status evidence:
-activation remains degraded until the runtime returns the normal identity-bound
-ACK. An active desktop frontend requires a completed `account/updated` write. A
-dormant bridge with exactly zero initialized frontends may instead prove only
-that its backend auth cache is current for the next frontend connection; every
-required frontend counter must be present and exactly zero. Missing counters or
-nonzero skipped, eligible, or rejected counts cannot use that idle shape.
-The normal explicit desktop activation retains its initialized verification
-connection through strict reload, so it follows the completed-write branch even
-when ChatGPT itself is closed. The dormant exact-zero branch is reserved for
-bootstrap flows that genuinely have no initialized connection; it does not
-permit the activation client to close its control connection before signalling.
+On macOS, a newly started `official-desktop-stdio-child` may establish its first
+ACK during explicit activation only after CodexSwitch revalidates canonical
+ChatGPT ancestry, OpenAI signing, exact argv, owner, start identity, and running
+executable vnode. Activation remains degraded until the normal identity-bound
+ACK proves a completed `account/updated` write. Idle desktop ACKs are rejected.
 The current managed local CLI may establish its first ACK under the same
 artifact and running-vnode proof, using the CLI-specific v3 acknowledgement
 shape. Exact-name preliminary discovery prevents unrelated command lines from
@@ -1378,20 +1360,15 @@ actor boundary on every supported Swift 6 toolchain.
   authority observation, retaining only the last committed identity when
   transport becomes stale. Mac and VPS status are per-host convergence details
   for that one target, not separate active-account selections.
-- The ChatGPT desktop and CodexSwitch share one patched local app-server on
-  `ws://127.0.0.1:9223`. CodexSwitch keeps that bridge alive and publishes
-  `CODEX_APP_SERVER_WS_URL` before ChatGPT starts. Private stdio app-server
-  children are not part of the supported steady state because they cannot
-  accept CodexSwitch's externally verified reload request. Only this
-  identity-verified repository-managed listener may classify as
-  `managed-desktop-bridge` or use its exact all-zero idle ACK. Every other Mac
-  external app-server follows the strict frontend-delivery contract.
-- Every fresh desktop bridge connection completes the app-server `initialize`
-  handshake before account mutation or verification. Current app-server
-  responses may omit the optional `jsonrpc` member; identity verification and
-  the strict SIGHUP acknowledgement remain mandatory. The account-verification
-  connection stays open through that acknowledgement so the activation proves
-  a completed frontend write before releasing its transport.
+- The official OpenAI-signed ChatGPT desktop owns the local app-server and
+  spawns CodexSwitch's prepared CLI through `CODEX_CLI_PATH` as an exact
+  `codex app-server --listen stdio://` child. CodexSwitch does not patch or
+  re-sign the desktop host and does not publish `CODEX_APP_SERVER_WS_URL`.
+- Desktop activation uses the existing identity-bound version-3 SIGHUP
+  request/ACK path. The private stdio transport remains owned by ChatGPT; the
+  acknowledgement must prove complete-token reload and strict frontend
+  delivery. The retired 9223 listener and its launch agent are unsupported and
+  make the Computer Use lineage canary fail.
 - Provider quota is shared, while runtime convergence evidence remains
   host-specific. Exactly one account card may receive pool-target styling, and
   only from an internally consistent authority identity. Retained stale

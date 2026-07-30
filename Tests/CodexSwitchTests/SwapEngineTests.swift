@@ -427,8 +427,10 @@ struct SwapEngineTests {
             defaultArguments = [
                 "codex", "-c", "features.code_mode_host=true", "app-server",
                 "--analytics-default-enabled", "--listen",
-                CodexDesktopBridgeKeepAlive.websocketURL,
+                "ws://127.0.0.1:9223",
             ]
+        case .officialDesktopStdioChild:
+            defaultArguments = ["codex", "app-server", "--listen", "stdio://"]
         case .headlessRemoteControlAppServer:
             defaultArguments = [
                 "codex", "app-server", "--remote-control", "--listen",
@@ -1146,6 +1148,7 @@ struct SwapEngineTests {
     @Test("Managed desktop bridge has an explicit stable wire kind")
     func managedDesktopBridgeHasStableWireKind() throws {
         #expect(HotSwapRuntimeKind.managedDesktopBridge.rawValue == "managed-desktop-bridge")
+        #expect(HotSwapRuntimeKind.officialDesktopStdioChild.rawValue == "official-desktop-stdio-child")
         #expect(HotSwapRuntimeKind.externalAppServer.rawValue == "external-app-server")
 
         let encoded = try JSONEncoder().encode(HotSwapRuntimeKind.managedDesktopBridge)
@@ -1184,8 +1187,8 @@ struct SwapEngineTests {
         ]))
     }
 
-    @Test("Desktop discovery classifies mixed external and managed runtimes")
-    func desktopDiscoveryClassifiesMixedExternalAndManagedRuntimes() {
+    @Test("Desktop discovery classifies external and native stdio runtimes")
+    func desktopDiscoveryClassifiesExternalAndNativeRuntimes() {
         let externalPID: Int32 = 41
         let managedPID: Int32 = 42
         let stdioPID: Int32 = 43
@@ -1224,13 +1227,13 @@ struct SwapEngineTests {
                     return [
                         "codex", "-c", "features.code_mode_host=true", "app-server",
                         "--analytics-default-enabled", "--listen",
-                        CodexDesktopBridgeKeepAlive.websocketURL,
+                        "ws://127.0.0.1:9223",
                     ]
                 case managedPID:
                     return [
                         "codex", "-c", "features.code_mode_host=true", "app-server",
                         "--analytics-default-enabled", "--listen",
-                        CodexDesktopBridgeKeepAlive.websocketURL,
+                        "ws://127.0.0.1:9223",
                     ]
                 case stdioPID:
                     return ["codex", "app-server", "--listen", "stdio://"]
@@ -1256,11 +1259,11 @@ struct SwapEngineTests {
         #expect(discovery.isComplete)
         #expect(
             discovery.targets.map { $0.process.identity.pid }
-                == [externalPID, managedPID]
+                == [externalPID, managedPID, stdioPID]
         )
         #expect(
             discovery.targets.map(\.runtimeKind)
-                == [.externalAppServer, .managedDesktopBridge]
+                == [.externalAppServer, .externalAppServer, .officialDesktopStdioChild]
         )
     }
 
@@ -1474,13 +1477,13 @@ struct SwapEngineTests {
         #expect(failed.outcome == .restartRequiredOrFailed)
     }
 
-    @Test("Desktop first ACK bootstrap authorizes only the managed bridge")
+    @Test("Desktop first ACK bootstrap authorizes only the official native child")
     func desktopFirstAcknowledgementBootstrapIsNarrow() {
         let desktopBinding = reloadBinding(
             target: runtimeTarget(pid: 41, runtimeKind: .externalAppServer)
         )
-        let managedDesktopBinding = reloadBinding(
-            target: runtimeTarget(pid: 43, runtimeKind: .managedDesktopBridge)
+        let nativeDesktopBinding = reloadBinding(
+            target: runtimeTarget(pid: 43, runtimeKind: .officialDesktopStdioChild)
         )
         let cliBinding = reloadBinding(
             target: runtimeTarget(pid: 42, runtimeKind: .localInteractiveCLI)
@@ -1497,7 +1500,7 @@ struct SwapEngineTests {
             firstAcknowledgementBootstrapAuthorized: true
         ))
         #expect(SwapEngine.desktopReloadCapabilityIsAuthorized(
-            binding: managedDesktopBinding,
+            binding: nativeDesktopBinding,
             hasStartupAcknowledgement: false,
             firstAcknowledgementBootstrapAuthorized: true
         ))

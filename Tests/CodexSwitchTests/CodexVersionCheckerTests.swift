@@ -478,8 +478,8 @@ struct CodexVersionCheckerTests {
         #expect(result.outcome.success)
     }
 
-    @Test("Explicit Update reports complete only after the desktop bridge restarts")
-    func explicitUpdateRequiresDesktopBridgeRestart() {
+    @Test("Explicit update leaves running native children undisturbed")
+    func explicitUpdateUsesFutureNativeChildren() {
         let installed = CodexVersionChecker.CodexExplicitUpdateResult(
             preparationReport: nil,
             installationReport: nil,
@@ -489,39 +489,12 @@ struct CodexVersionCheckerTests {
                 message: "Installed and verified Codex hot-swap runtime v0.145.0"
             )
         )
-        var restartCalls = 0
-        let completed = CodexVersionChecker.completeExplicitUpdate(
-            installed,
-            restartDesktopBridge: {
-                restartCalls += 1
-                return CodexDesktopBridgeKeepAlive.BridgeRestartResult(
-                    attempted: true,
-                    success: true,
-                    message: "Restarted the managed desktop bridge"
-                )
-            }
-        )
+        let completed = CodexVersionChecker.completeExplicitUpdate(installed)
 
-        #expect(restartCalls == 1)
         #expect(completed.outcome.success)
         #expect(completed.outcome.installedVersion == "0.145.0")
-        #expect(completed.outcome.message.contains("Restarted the managed desktop bridge"))
+        #expect(completed.outcome.message.contains("native children"))
 
-        let incomplete = CodexVersionChecker.completeExplicitUpdate(
-            installed,
-            restartDesktopBridge: {
-                CodexDesktopBridgeKeepAlive.BridgeRestartResult(
-                    attempted: true,
-                    success: false,
-                    message: "The managed desktop bridge did not publish a new launchd PID"
-                )
-            }
-        )
-        #expect(!incomplete.outcome.success)
-        #expect(incomplete.outcome.installedVersion == "0.145.0")
-        #expect(incomplete.outcome.message.contains("desktop activation is incomplete"))
-
-        restartCalls = 0
         let failedInstall = CodexVersionChecker.CodexExplicitUpdateResult(
             preparationReport: nil,
             installationReport: nil,
@@ -531,18 +504,7 @@ struct CodexVersionCheckerTests {
                 message: "installation failed"
             )
         )
-        let unchanged = CodexVersionChecker.completeExplicitUpdate(
-            failedInstall,
-            restartDesktopBridge: {
-                restartCalls += 1
-                return CodexDesktopBridgeKeepAlive.BridgeRestartResult(
-                    attempted: true,
-                    success: true,
-                    message: "must not run"
-                )
-            }
-        )
-        #expect(restartCalls == 0)
+        let unchanged = CodexVersionChecker.completeExplicitUpdate(failedInstall)
         #expect(unchanged.outcome == failedInstall.outcome)
     }
 

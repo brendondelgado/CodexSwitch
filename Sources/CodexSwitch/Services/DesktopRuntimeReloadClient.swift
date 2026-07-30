@@ -268,6 +268,10 @@ struct DesktopRuntimeReloadClient: Sendable {
             ).intersection(discoveredPIDs)
             : []
         var acknowledgedPIDs = reusableAcknowledgedPIDs
+        let pendingNativeTargets = context.discovery.targets.filter {
+            $0.runtimeKind == .officialDesktopStdioChild
+                && !reusableAcknowledgedPIDs.contains($0.process.identity.pid)
+        }
         let pendingSocketBindings = context.socketBindings.filter {
             !reusableAcknowledgedPIDs.contains($0.target.process.identity.pid)
         }
@@ -283,11 +287,38 @@ struct DesktopRuntimeReloadClient: Sendable {
                 acknowledgedRuntimeCount: acknowledgedPIDs.count
             )
         }
+        if !pendingNativeTargets.isEmpty {
+            let strictSummary = dependencies.strictReload(
+                CodexRuntimeDiscoverySnapshot(
+                    targets: pendingNativeTargets,
+                    isComplete: true
+                ),
+                [],
+                context.admission,
+                context.requiredOwnerUID,
+                reuseExistingAcknowledgement,
+                authorizeEffect
+            )
+            guard strictSummary.outcome == .allDiscoveredRuntimesAcknowledged else {
+                return .failed(
+                    "native desktop reload incomplete acknowledged="
+                        + "\(strictSummary.acknowledgedRuntimeCount)/"
+                        + "\(strictSummary.discoveredRuntimeCount)",
+                    discoveredRuntimeCount: context.discovery.targets.count,
+                    acknowledgedRuntimeCount: acknowledgedPIDs.count
+                )
+            }
+            acknowledgedPIDs.formUnion(
+                pendingNativeTargets.map { $0.process.identity.pid }
+            )
+        }
         if pendingSocketBindings.isEmpty {
             return .reloaded(
-                method: Self.existingAcknowledgementMethod,
+                method: pendingNativeTargets.isEmpty
+                    ? Self.existingAcknowledgementMethod
+                    : "v3-native-stdio-ack",
                 discoveredRuntimeCount: context.discovery.targets.count,
-                acknowledgedRuntimeCount: reusableAcknowledgedPIDs.count,
+                acknowledgedRuntimeCount: acknowledgedPIDs.count,
                 acknowledgedRuntimeBindings: includeAcknowledgedRuntimeBindings
                     ? context.socketBindings.filter {
                         reusableAcknowledgedPIDs.contains(
@@ -808,11 +839,6 @@ struct DesktopRuntimeReloadClient: Sendable {
                 requiredOwnerUID,
                 reuseExistingAcknowledgement,
                 authorizeEffect in
-                let portsByPID = Dictionary(
-                    uniqueKeysWithValues: socketBindings.map {
-                        ($0.target.process.identity.pid, $0.port)
-                    }
-                )
                 return SwapEngine.signalDesktopAppServerReloadSummary(
                     admittedDiscoverySnapshot: discovery,
                     admission: admission,
@@ -820,14 +846,11 @@ struct DesktopRuntimeReloadClient: Sendable {
                     reuseExistingAcknowledgement: reuseExistingAcknowledgement,
                     authorizeEffect: authorizeEffect,
                     firstAcknowledgementBootstrap: { binding in
-                        guard let port = portsByPID[binding.processIdentity.pid] else {
-                            return false
+                        if binding.runtimeKind == .officialDesktopStdioChild {
+                            return CodexDesktopNativeChildCoordinator
+                                .authorizesFirstAcknowledgementBootstrap(binding: binding)
                         }
-                        return CodexDesktopBridgeKeepAlive
-                            .authorizesFirstAcknowledgementBootstrap(
-                                binding: binding,
-                                socketPort: port
-                            )
+                        return false
                     }
                 )
             }
@@ -872,7 +895,7 @@ struct DesktopRuntimeReloadClient: Sendable {
               discovery.targets.allSatisfy({ target in
                   (
                       target.runtimeKind == .externalAppServer
-                          || target.runtimeKind == .managedDesktopBridge
+                      || target.runtimeKind == .officialDesktopStdioChild
                   )
                       && target.process.identity.ownerUID == dependencies.requiredOwnerUID
               }) else {
@@ -889,11 +912,14 @@ struct DesktopRuntimeReloadClient: Sendable {
                 )
         }
 
-        let bindings = discovery.targets.compactMap(dependencies.socketBinding)
+        let socketTargets = discovery.targets.filter {
+            $0.runtimeKind != .officialDesktopStdioChild
+        }
+        let bindings = socketTargets.compactMap(dependencies.socketBinding)
         let bindingPIDs = Set(bindings.map { $0.target.process.identity.pid })
         let bindingPorts = Set(bindings.map(\.port))
-        guard bindings.count == discovery.targets.count,
-              bindingPIDs == targetPIDs,
+        guard bindings.count == socketTargets.count,
+              bindingPIDs == Set(socketTargets.map { $0.process.identity.pid }),
               bindingPorts.count == bindings.count,
               bindings.allSatisfy({ binding in
                   binding.port > 0

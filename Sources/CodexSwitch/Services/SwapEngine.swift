@@ -1155,12 +1155,12 @@ enum SwapEngine {
         firstAcknowledgementBootstrapAuthorized: Bool
     ) -> Bool {
         guard binding.runtimeKind == .externalAppServer
-                || binding.runtimeKind == .managedDesktopBridge else {
+                || binding.runtimeKind == .officialDesktopStdioChild else {
             return false
         }
         return hasStartupAcknowledgement
             || (
-                binding.runtimeKind == .managedDesktopBridge
+                binding.runtimeKind == .officialDesktopStdioChild
                     && firstAcknowledgementBootstrapAuthorized
             )
     }
@@ -1456,12 +1456,12 @@ enum SwapEngine {
         let runtimeArguments = process.arguments.dropFirst().map { $0.lowercased() }
         let isDesktopAppServer = runtimeArguments.contains("app-server")
             && !runtimeArguments.contains("--remote-control")
-            && hasExplicitLoopbackWebSocketListener(process.arguments)
             && DesktopRuntimeDiagnostics.classifyAppServerPath(executablePath)
                 == .desktopAppServer
-        let isManagedDesktopBridge = isDesktopAppServer
-            && managedDesktopRuntimePath == executablePath
-            && hasManagedDesktopBridgeInvocation(process.arguments)
+        let isOfficialDesktopStdioChild = isDesktopAppServer
+            && hasOfficialDesktopStdioInvocation(process.arguments)
+        let isExternalAppServer = isDesktopAppServer
+            && hasExplicitLoopbackWebSocketListener(process.arguments)
 
         switch runtimeKind {
         case .localInteractiveCLI:
@@ -1474,9 +1474,11 @@ enum SwapEngine {
                     || argument.hasPrefix("--remote=")
             }) && runtimeArguments.first != "sandbox"
         case .externalAppServer:
-            return isDesktopAppServer && !isManagedDesktopBridge
+            return isExternalAppServer
+        case .officialDesktopStdioChild:
+            return isOfficialDesktopStdioChild
         case .managedDesktopBridge:
-            return isManagedDesktopBridge
+            return false
         case .headlessRemoteControlAppServer:
             return false
         }
@@ -1488,10 +1490,10 @@ enum SwapEngine {
     ) -> HotSwapRuntimeKind? {
         if processMatchesRuntime(
             process,
-            runtimeKind: .managedDesktopBridge,
+            runtimeKind: .officialDesktopStdioChild,
             managedDesktopRuntimePath: managedDesktopRuntimePath
         ) {
-            return .managedDesktopBridge
+            return .officialDesktopStdioChild
         }
         if processMatchesRuntime(
             process,
@@ -1521,18 +1523,16 @@ enum SwapEngine {
         return true
     }
 
-    nonisolated static func hasManagedDesktopBridgeInvocation(
+    nonisolated static func hasOfficialDesktopStdioInvocation(
         _ arguments: [String]
     ) -> Bool {
-        guard arguments.count == 7 else { return false }
-        return Array(arguments.dropFirst()) == [
-            "-c",
-            "features.code_mode_host=true",
-            "app-server",
-            "--analytics-default-enabled",
-            "--listen",
-            CodexDesktopBridgeKeepAlive.websocketURL,
-        ]
+        let lowered = arguments.dropFirst().map { $0.lowercased() }
+        guard let appServerIndex = lowered.firstIndex(of: "app-server") else {
+            return false
+        }
+        let appServerArguments = Array(lowered[lowered.index(after: appServerIndex)...])
+        guard !appServerArguments.contains("--remote-control") else { return false }
+        return explicitListenerValues(Array(lowered)) == ["stdio://"]
     }
 
     private nonisolated static func explicitListenerValues(
@@ -1604,9 +1604,7 @@ enum SwapEngine {
                 arguments: argumentsAfter
             ),
             runtimeKind: target.runtimeKind,
-            managedDesktopRuntimePath: target.runtimeKind == .managedDesktopBridge
-                ? expectedIdentity.executablePath
-                : installedManagedDesktopRuntimePath()
+            managedDesktopRuntimePath: nil
         )
     }
 
@@ -2427,9 +2425,7 @@ enum SwapEngine {
                 arguments: argumentsAfter
             ),
             runtimeKind: runtimeKind,
-            managedDesktopRuntimePath: runtimeKind == .managedDesktopBridge
-                ? processIdentity.executablePath
-                : installedManagedDesktopRuntimePath()
+            managedDesktopRuntimePath: nil
         )
     }
 
@@ -2888,6 +2884,11 @@ enum SwapEngine {
                 acknowledgement,
                 idlePolicy: .never
             )
+        case .officialDesktopStdioChild:
+            return externalAppServerAcknowledgementIsValid(
+                acknowledgement,
+                idlePolicy: .never
+            )
         case .managedDesktopBridge:
             return externalAppServerAcknowledgementIsValid(
                 acknowledgement,
@@ -3303,7 +3304,7 @@ enum SwapEngine {
         return overflow ? Int64.min : result
     }
 
-    private nonisolated static func processArguments(pid: Int32) -> [String]? {
+    nonisolated static func processArguments(pid: Int32) -> [String]? {
         guard pid > 0 else { return nil }
         var mib = [Int32(CTL_KERN), Int32(KERN_PROCARGS2), pid]
         var bufferSize = 0

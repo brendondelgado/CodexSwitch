@@ -509,7 +509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             RateLimitResetSettings.automaticRedemptionDefaultsKey: true,
         ])
         _ = Self.installKeepAliveOffMainActor()
-        let desktopBridgeInstallation = Self.installDesktopBridgeOffMainActor()
+        let desktopNativeChildMigration = Self.retireDesktopBridgeOffMainActor()
         scheduleConfigMaintenanceIfNeeded(removeStaleCopies: true)
         configMaintenanceTimer = Timer.scheduledTimer(
             withTimeInterval: Self.configMaintenanceInterval,
@@ -558,7 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Load accounts from Keychain (async for file I/O), then start services
         Task { @MainActor [self] in
             await loadAccounts()
-            await desktopBridgeInstallation.value
+            await desktopNativeChildMigration.value
             await recoverManualReviewActivationOnLaunch()
             await restoreExternalRateLimitResetHolds()
 
@@ -2046,9 +2046,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @discardableResult
-    nonisolated static func installDesktopBridgeOffMainActor(
+    nonisolated static func retireDesktopBridgeOffMainActor(
         operation: @escaping @Sendable () -> Void = {
-            CodexDesktopBridgeKeepAlive.installIfNeeded()
+            CodexDesktopNativeChildCoordinator.retireLegacyBridgeIfNeeded()
         }
     ) -> Task<Void, Never> {
         Task.detached(priority: .utility) {

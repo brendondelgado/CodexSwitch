@@ -22,7 +22,7 @@ cross_dependencies:
   - Sources/CodexSwitch/Services/CodexConfigRepair.swift
   - Tests/CodexSwitchTests/CodexConfigRepairTests.swift
 version_control:
-  updated_on: 2026-04-29
+  updated_on: 2026-07-30
   updated_by: Codex
   status: working-tree
 ---
@@ -41,7 +41,10 @@ Desktop logs showed the exact failure at swap time:
 
 That meant account switching was no longer isolated to terminal CLI sessions.
 
-A second drift path was found on 2026-04-28: a launchd-level `CODEX_CLI_PATH` can force `Codex.app` to spawn `/opt/homebrew/bin/codex` before it considers the bundled app binary. If that Homebrew install is updated back to stock, both desktop and CLI hot-swap can appear patched on disk while the live app-server is actually running an unpatched CLI.
+A second drift path was found on 2026-04-28: an unvalidated
+`CODEX_CLI_PATH` could select a stale binary. The supported path now publishes
+only CodexSwitch's journal-verified prepared launcher and lets the official
+ChatGPT app spawn it as a native stdio child.
 
 ## Fix
 
@@ -58,10 +61,12 @@ SIGHUP eligibility is also version-gated:
 - the candidate executable must contain the `sighup-verified` and `SIGHUP: auth reloaded` markers before app-bundled CLI sessions are eligible
 - `patch-asar.py` refuses to replace a bundled CLI with an older SIGHUP-capable binary whose model/catalog capabilities are behind the installed runtime
 - `patch-asar.py` searches the local SIGHUP fork at `~/Developer/codex/codex-rs/target/release/codex` before falling back to stock install paths
-- the desktop ASAR patch deletes inherited `CODEX_CLI_PATH` before resolving the app-server binary and from sanitized child-process env, so a launchd or shell override cannot hijack Codex.app onto a stale Homebrew wrapper
+- the stock ChatGPT app inherits only the journal-verified `CODEX_CLI_PATH`;
+  CodexSwitch never rewrites its ASAR or signature
 - CodexSwitch repairs the Homebrew vendor CLI from a verified SIGHUP-capable source while Codex.app is running, so npm/Homebrew updates do not permanently strand CLI hot-swap
 - `patch-asar.py` refuses to patch or re-sign `/Applications/Codex.app` while Codex.app is running, unless an explicit emergency override is set, because live re-signing can SIGKILL the app-server and make macOS re-prompt for permissions
-- if Codex updates and the bundled CLI is stock again, desktop patch readiness is false until `patch-asar.py` copies in a SIGHUP-capable CLI and the app bundle is re-signed
+- if ChatGPT updates, CodexSwitch republishes the verified prepared CLI route;
+  no desktop bundle mutation is required
 
 Launch-time behavior is also stricter:
 

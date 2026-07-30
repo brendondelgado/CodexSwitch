@@ -10,7 +10,8 @@ use crate::bounded_command;
 use crate::codex_update;
 use crate::reload::{
     binary_has_sighup_support_for_runtime, discover_codex_app_server_processes,
-    discover_codex_cli_processes, hot_swap_runtime_kind, process_has_current_hot_swap_ack,
+    discover_codex_cli_processes, hot_swap_runtime_kind,
+    is_official_desktop_stdio_child_command_line, process_has_current_hot_swap_ack,
     process_is_sighup_safe_target, process_matches_managed_headless_app_server, CodexProcess,
     HotSwapRuntimeKind,
 };
@@ -45,6 +46,23 @@ pub struct ReadinessReport {
     pub ready_candidate_count: usize,
     pub processes: Vec<ProcessReadiness>,
     pub app_servers: Vec<ProcessReadiness>,
+    pub computer_use_lineage: ComputerUseLineageReadiness,
+    pub issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerUseLineageReadiness {
+    pub applicable: bool,
+    pub ready: bool,
+    pub state: String,
+    pub official_chatgpt: bool,
+    pub native_child_observed: bool,
+    pub native_child_pids: Vec<i32>,
+    pub helper_observed: bool,
+    pub helper_pids: Vec<i32>,
+    pub legacy_bridge_loaded: bool,
+    pub legacy_environment_present: bool,
     pub issues: Vec<String>,
 }
 
@@ -275,6 +293,16 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
         ));
     }
 
+    let computer_use_lineage = computer_use_lineage_readiness();
+    if computer_use_lineage.applicable && !computer_use_lineage.ready {
+        issues.extend(
+            computer_use_lineage
+                .issues
+                .iter()
+                .map(|issue| format!("Computer Use lineage: {issue}")),
+        );
+    }
+
     let runtime_discovered = account_bearing_runtime_discovered(&processes, &app_servers);
     if !runtime_discovered {
         issues.push("no account-bearing Codex runtime discovered".to_string());
@@ -292,6 +320,7 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
         && runtime_discovered
         && processes.iter().all(|process| process.hot_swap_ready)
         && app_servers.iter().all(|process| process.hot_swap_ready);
+    let ready = ready && (!computer_use_lineage.applicable || computer_use_lineage.ready);
 
     let summary = if ready {
         format!(
@@ -317,8 +346,223 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
         ready_candidate_count,
         processes,
         app_servers,
+        computer_use_lineage,
         issues,
     })
+}
+
+#[derive(Debug, Clone)]
+struct LineageProcess {
+    pid: i32,
+    parent_pid: i32,
+    owner_uid: u32,
+    command_line: String,
+}
+
+#[cfg(target_os = "macos")]
+fn computer_use_lineage_readiness() -> ComputerUseLineageReadiness {
+    const CHATGPT: &str = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+    let mut issues = Vec::new();
+    let official_chatgpt = official_chatgpt_signature_is_valid();
+    if !official_chatgpt {
+        issues.push("/Applications/ChatGPT.app is not signed by OpenAI Team ID 2DC432GLL2".into());
+    }
+
+    let snapshot = bounded_command::output(
+        Command::new("/bin/ps").args(["-axo", "pid=,ppid=,uid=,command=", "-ww"]),
+        Duration::from_secs(3),
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| parse_lineage_processes(&String::from_utf8_lossy(&output.stdout)))
+    .unwrap_or_default();
+    let by_pid = snapshot
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    let chatgpt_pids = snapshot
+        .iter()
+        .filter(|process| first_command_path(&process.command_line) == Some(CHATGPT))
+        .map(|process| process.pid)
+        .collect::<std::collections::HashSet<_>>();
+
+    let native_child_pids = snapshot
+        .iter()
+        .filter(|process| {
+            process.owner_uid == unsafe { libc::geteuid() }
+                && is_official_desktop_stdio_child_command_line(&process.command_line)
+        })
+        .filter(|process| ancestry_reaches_official_chatgpt(process, &by_pid, &chatgpt_pids))
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
+    let observed_native_count = snapshot
+        .iter()
+        .filter(|process| is_official_desktop_stdio_child_command_line(&process.command_line))
+        .count();
+    if observed_native_count > native_child_pids.len() {
+        issues.push("a native stdio app-server does not descend from canonical ChatGPT".into());
+    }
+    if native_child_pids.is_empty() {
+        issues.push("no canonical ChatGPT-owned native stdio app-server is running".into());
+    }
+
+    let helper_candidates = snapshot
+        .iter()
+        .filter(|process| {
+            process.command_line.contains("/.codex/computer-use/")
+                && process.command_line.contains("SkyComputerUseService")
+        })
+        .collect::<Vec<_>>();
+    let helper_pids = helper_candidates
+        .iter()
+        .filter(|process| ancestry_reaches_official_chatgpt(process, &by_pid, &chatgpt_pids))
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
+    if helper_candidates.len() > helper_pids.len() {
+        issues.push("a Computer Use helper does not descend from canonical ChatGPT".into());
+    }
+
+    let legacy_bridge_loaded = launchctl_job_is_loaded("com.codexswitch.desktop-app-server-9223");
+    if legacy_bridge_loaded {
+        issues.push("legacy 9223 launch agent is loaded".into());
+    }
+    let legacy_environment_present = launchctl_environment_is_present("CODEX_APP_SERVER_WS_URL");
+    if legacy_environment_present {
+        issues.push("CODEX_APP_SERVER_WS_URL is still published".into());
+    }
+
+    let ready = issues.is_empty();
+    ComputerUseLineageReadiness {
+        applicable: true,
+        ready,
+        state: if ready { "ready" } else { "blocked" }.into(),
+        official_chatgpt,
+        native_child_observed: !native_child_pids.is_empty(),
+        native_child_pids,
+        helper_observed: !helper_pids.is_empty(),
+        helper_pids,
+        legacy_bridge_loaded,
+        legacy_environment_present,
+        issues,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn computer_use_lineage_readiness() -> ComputerUseLineageReadiness {
+    ComputerUseLineageReadiness {
+        applicable: false,
+        ready: true,
+        state: "not-applicable".into(),
+        official_chatgpt: false,
+        native_child_observed: false,
+        native_child_pids: Vec::new(),
+        helper_observed: false,
+        helper_pids: Vec::new(),
+        legacy_bridge_loaded: false,
+        legacy_environment_present: false,
+        issues: Vec::new(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn official_chatgpt_signature_is_valid() -> bool {
+    bounded_command::output(
+        Command::new("/usr/bin/codesign").args(["-dvvv", "/Applications/ChatGPT.app"]),
+        Duration::from_secs(5),
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .is_some_and(|output| {
+        let detail = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        detail.contains("TeamIdentifier=2DC432GLL2") && !detail.contains("Signature=adhoc")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_job_is_loaded(label: &str) -> bool {
+    let target = format!("gui/{}/{label}", unsafe { libc::geteuid() });
+    bounded_command::output(
+        Command::new("/bin/launchctl").args(["print", target.as_str()]),
+        Duration::from_secs(3),
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_environment_is_present(name: &str) -> bool {
+    bounded_command::output(
+        Command::new("/bin/launchctl").args(["getenv", name]),
+        Duration::from_secs(3),
+        bounded_command::SMALL_OUTPUT_LIMIT,
+    )
+    .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
+fn parse_lineage_processes(output: &str) -> Vec<LineageProcess> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (pid, rest) = take_lineage_field(line)?;
+            let (parent_pid, rest) = take_lineage_field(rest)?;
+            let (owner_uid, command_line) = take_lineage_field(rest)?;
+            let pid = pid.parse().ok()?;
+            let parent_pid = parent_pid.parse().ok()?;
+            let owner_uid = owner_uid.parse().ok()?;
+            let command_line = command_line.trim().to_string();
+            (!command_line.is_empty()).then_some(LineageProcess {
+                pid,
+                parent_pid,
+                owner_uid,
+                command_line,
+            })
+        })
+        .collect()
+}
+
+fn take_lineage_field(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let boundary = input.find(char::is_whitespace).unwrap_or(input.len());
+    let field = &input[..boundary];
+    (!field.is_empty()).then_some((field, &input[boundary..]))
+}
+
+fn first_command_path(command_line: &str) -> Option<&str> {
+    command_line.split_whitespace().next()
+}
+
+fn ancestry_reaches_official_chatgpt(
+    process: &LineageProcess,
+    by_pid: &HashMap<i32, &LineageProcess>,
+    chatgpt_pids: &std::collections::HashSet<i32>,
+) -> bool {
+    let mut current = process.parent_pid;
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..12 {
+        if chatgpt_pids.contains(&current) {
+            return true;
+        }
+        if current <= 1 || !visited.insert(current) {
+            return false;
+        }
+        let Some(parent) = by_pid.get(&current) else {
+            return false;
+        };
+        let Some(path) = first_command_path(&parent.command_line) else {
+            return false;
+        };
+        if !path.starts_with("/Applications/ChatGPT.app/Contents/") {
+            return false;
+        }
+        current = parent.parent_pid;
+    }
+    false
 }
 
 fn token_fingerprints_match(active: Option<&str>, auth: Option<&str>) -> bool {
@@ -639,6 +883,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn computer_use_lineage_parser_and_ancestry_are_fail_closed() {
+        let snapshot = parse_lineage_processes(
+            "100 1 501 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n\
+             101 100 501 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl\n\
+             102 101 501 /Users/me/.local/share/codexswitch/prepared/codex app-server --listen stdio://\n\
+             200 1 501 /bin/zsh\n\
+             201 200 501 /Users/me/.local/share/codexswitch/prepared/codex app-server --listen stdio://\n",
+        );
+        let by_pid = snapshot
+            .iter()
+            .map(|process| (process.pid, process))
+            .collect::<HashMap<_, _>>();
+        let chatgpt = [100].into_iter().collect::<std::collections::HashSet<_>>();
+        let native = snapshot.iter().find(|process| process.pid == 102).unwrap();
+        let wrapper = snapshot.iter().find(|process| process.pid == 201).unwrap();
+        assert!(ancestry_reaches_official_chatgpt(native, &by_pid, &chatgpt));
+        assert!(!ancestry_reaches_official_chatgpt(
+            wrapper, &by_pid, &chatgpt
+        ));
+    }
+
     fn process() -> CodexProcess {
         CodexProcess {
             pid: 42,
@@ -821,6 +1087,19 @@ mod tests {
             ready_candidate_count: 0,
             processes: Vec::new(),
             app_servers: Vec::new(),
+            computer_use_lineage: ComputerUseLineageReadiness {
+                applicable: false,
+                ready: true,
+                state: "not-applicable".to_string(),
+                official_chatgpt: false,
+                native_child_observed: false,
+                native_child_pids: Vec::new(),
+                helper_observed: false,
+                helper_pids: Vec::new(),
+                legacy_bridge_loaded: false,
+                legacy_environment_present: false,
+                issues: Vec::new(),
+            },
             issues: Vec::new(),
         };
 
