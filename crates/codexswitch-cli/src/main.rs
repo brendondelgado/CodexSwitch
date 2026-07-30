@@ -4985,7 +4985,7 @@ mod tests {
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 20.0, 100.0);
         let mut replacement = account("replacement@example.com", false, 10.0, 10.0);
-        replacement.plan_type = Some("free".to_string());
+        replacement.plan_type = Some("plus".to_string());
         save_accounts(&store_path, &[active, replacement])?;
         confirm_provider_io_activation(&store_path, &auth_path)?;
 

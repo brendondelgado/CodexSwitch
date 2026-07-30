@@ -4158,7 +4158,7 @@ mod tests {
         let auth_path = temp.path().join("auth.json");
         let active = account("active@example.com", true, 20.0, 100.0);
         let mut replacement = account("ready@example.com", false, 10.0, 10.0);
-        replacement.plan_type = Some("free".to_string());
+        replacement.plan_type = Some("plus".to_string());
         let accounts = vec![active, replacement];
         save_accounts(&store_path, &accounts)?;
         confirm_daemon_activation(&store_path, &auth_path)?;
