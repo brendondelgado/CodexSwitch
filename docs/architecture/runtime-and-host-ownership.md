@@ -880,14 +880,17 @@ must hold together: the authority names exactly one local provider account;
 account store contains exactly one configured source account and its credentials
 match the in-memory source snapshot; the target differs from that source; and
 the authority operation witness remains current through every file effect. The
-coordinator then supersedes only the matching Swift `ManualReview` record with a
-new `Preparing` generation, persists the target account-store selection without
-rewriting the already matching auth file, reads both files back, and publishes
-the configured account only after that combined readback succeeds. This path
-does not infer authority from credential files, ask the Rust journal to resolve
-the Swift state, or publish confirmation without complete runtime evidence. Any
-ambiguity, stale observation, credential mismatch, changed generation, or lost
-operation witness remains fail-closed.
+conflict journal may name the still-durable source or the authority target,
+because the conflict can be recorded on either side of the file-commit boundary;
+a third account is never recoverable. The coordinator then supersedes only that
+matching Swift `ManualReview` record with a new `Preparing` generation, persists
+the target account-store selection without rewriting the already matching auth
+file, reads both files back, and publishes the configured account only after
+that combined readback succeeds. This path does not infer authority from
+credential files, ask the Rust journal to resolve the Swift state, or publish
+confirmation without complete runtime evidence. Any ambiguity, stale
+observation, credential mismatch, changed generation, or lost operation witness
+remains fail-closed.
 
 The desktop reload client owns one admitted transaction: JSON-RPC submission,
 identity readback, and its strict acknowledgement all use the same discovery and

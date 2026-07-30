@@ -147,7 +147,7 @@ actor AccountActivationCoordinator {
 
     func beginVerifiedExternalAuthConflictRecovery(
         targetAccountId: UUID,
-        expectedSourceAccountId: UUID,
+        durableSourceAccountId: UUID,
         requestedActivationGeneration: UUID = UUID(),
         authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
         at date: Date = Date()
@@ -159,8 +159,9 @@ actor AccountActivationCoordinator {
                 guard let current,
                       current.phase == .manualReview,
                       current.detail == .externalAuthConflict,
-                      current.configuredAccountId == expectedSourceAccountId,
-                      targetAccountId != expectedSourceAccountId else {
+                      current.configuredAccountId == durableSourceAccountId
+                        || current.configuredAccountId == targetAccountId,
+                      targetAccountId != durableSourceAccountId else {
                     return .blocked(
                         current,
                         "authority recovery requires the matching external-auth conflict"

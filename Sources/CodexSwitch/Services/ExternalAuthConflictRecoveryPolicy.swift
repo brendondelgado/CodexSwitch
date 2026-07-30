@@ -34,12 +34,15 @@ enum ExternalAuthConflictRecoveryPolicy {
         _ evidence: ExternalAuthConflictRecoveryEvidence
     ) -> ExternalAuthConflictRecoveryDecision {
         guard evidence.activationState?.phase == .manualReview,
-              evidence.activationState?.detail == .externalAuthConflict,
-              evidence.activationState?.configuredAccountId == evidence.sourceAccountId else {
+              evidence.activationState?.detail == .externalAuthConflict else {
             return .blocked(.activationState)
         }
         guard evidence.sourceAccountId != evidence.targetAccountId else {
             return .blocked(.sourceAndTarget)
+        }
+        guard evidence.activationState?.configuredAccountId == evidence.sourceAccountId
+                || evidence.activationState?.configuredAccountId == evidence.targetAccountId else {
+            return .blocked(.activationState)
         }
         guard evidence.authorityIsFresh,
               evidence.authorityOperationIsAuthorized else {

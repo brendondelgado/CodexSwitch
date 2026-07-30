@@ -44,6 +44,15 @@ struct ExternalAuthConflictRecoveryTests {
         #expect(ExternalAuthConflictRecoveryPolicy.decision(
             makeEvidence(targetAccountId: sourceAccountId)
         ) == .blocked(.sourceAndTarget))
+
+        let unrelatedReview = AccountActivationState.manualReview(
+            targetAccountId: UUID(),
+            detail: .externalAuthConflict,
+            at: now
+        )
+        #expect(ExternalAuthConflictRecoveryPolicy.decision(
+            makeEvidence(state: unrelatedReview)
+        ) == .blocked(.activationState))
     }
 
     @Test("Coordinator supersedes only the verified conflict generation")
@@ -64,7 +73,7 @@ struct ExternalAuthConflictRecoveryTests {
         let decision = try await coordinator
             .beginVerifiedExternalAuthConflictRecovery(
                 targetAccountId: targetAccountId,
-                expectedSourceAccountId: sourceAccountId,
+                durableSourceAccountId: sourceAccountId,
                 requestedActivationGeneration: generation,
                 authorizeEffect: { $0 == review },
                 at: now.addingTimeInterval(1)
@@ -97,7 +106,7 @@ struct ExternalAuthConflictRecoveryTests {
 
         let decision = try await coordinator.beginVerifiedExternalAuthConflictRecovery(
             targetAccountId: targetAccountId,
-            expectedSourceAccountId: sourceAccountId,
+            durableSourceAccountId: sourceAccountId,
             at: now.addingTimeInterval(1)
         )
         guard case .blocked(let unchanged, _) = decision else {
@@ -106,6 +115,41 @@ struct ExternalAuthConflictRecoveryTests {
         }
         #expect(unchanged == review)
         #expect(try await coordinator.load() == review)
+    }
+
+    @Test("Authority target journal recovers a durable source and target auth split")
+    func targetJournalRecoversLiveConflictShape() async throws {
+        let url = makeSecureTestFileURL(
+            prefix: "codexswitch-external-auth-target-recovery",
+            fileName: "account-activation.json"
+        )
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let coordinator = AccountActivationCoordinator(url: url)
+        let review = try await coordinator.markManualReview(
+            targetAccountId: targetAccountId,
+            detail: .externalAuthConflict,
+            at: now
+        )
+        let generation = UUID()
+
+        #expect(ExternalAuthConflictRecoveryPolicy.decision(
+            makeEvidence(state: review)
+        ) == .recover)
+
+        let decision = try await coordinator.beginVerifiedExternalAuthConflictRecovery(
+            targetAccountId: targetAccountId,
+            durableSourceAccountId: sourceAccountId,
+            requestedActivationGeneration: generation,
+            authorizeEffect: { $0 == review },
+            at: now.addingTimeInterval(1)
+        )
+        guard case .prepared(let preparing, let previousState) = decision else {
+            Issue.record("Expected target-journal recovery to prepare the authority target")
+            return
+        }
+        #expect(previousState == review)
+        #expect(preparing.configuredAccountId == targetAccountId)
+        #expect(preparing.activationGeneration == generation)
     }
 
     private func makeEvidence(

@@ -6567,7 +6567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 decision = try await accountActivationCoordinator
                     .beginVerifiedExternalAuthConflictRecovery(
                         targetAccountId: targetAccountId,
-                        expectedSourceAccountId: expectedConfiguredAccountId,
+                        durableSourceAccountId: expectedConfiguredAccountId,
                         requestedActivationGeneration: activationGeneration,
                         authorizeEffect: authorizeEffect
                     )
