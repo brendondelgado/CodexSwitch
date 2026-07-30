@@ -68,7 +68,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-29
+  last_updated: 2026-07-30
 ---
 
 # Runtime And Host Ownership
@@ -448,11 +448,13 @@ handoff already committed. After a verified Rust CLI commit, the Swift
 coordinator enters a fresh activation generation and requires normal runtime
 convergence; file agreement alone never produces `Confirmed`.
 That convergence renewal must mint a new request and acknowledgement for every
-discovered runtime. The five-minute passive acknowledgement window is a
-read-only health optimization; it cannot satisfy a new activation generation
-whose runtime-evidence lease lasts at most thirty seconds. The fresh-only
-contract applies through the desktop JSON-RPC client's inner strict app-server
-SIGHUP; no nested reload helper may silently restore passive ACK reuse.
+discovered runtime whose process identity or complete auth generation changed.
+An acknowledgement remains reusable while its exact PID/start identity,
+executable vnode, runtime kind, canonical auth-file identity, provider account,
+and complete token fingerprint all remain current. Passive revalidation may
+renew the short runtime-evidence lease from that live identity proof; it must
+not send desktop JSON-RPC or SIGHUP merely because wall-clock time passed.
+Changing any bound identity invalidates reuse and requires one strict reload.
 
 An external handoff may replace an expired `Confirmed` lease or escape a
 `CommittedDegraded` record in the same narrow ways as an explicit operator
@@ -1205,7 +1207,7 @@ in a runtime that already converged.
 An automatic retry may reuse an acknowledgement only after revalidating that
 same PID, process start identity, owner, runtime kind, kernel executable
 identity, executable vnode, canonical auth-file identity, provider account,
-complete token fingerprint, request nonce, and ACK freshness. Receipt-bound
+complete token fingerprint, and request nonce. Receipt-bound
 handoffs additionally require the existing request nonce to remain bound to the
 same caller receipt. A PID-only match, a newly started replacement process, or
 an ACK for another credential generation is never reusable. Partial convergence
@@ -1220,6 +1222,12 @@ retry-exhaustion topology watcher or second recovery clock. Every attempt still
 performs full route, hash, vnode, request, signal, and ACK verification, and an
 unchanged failing topology is retried only when the journal's capped
 `nextRetryAt` is due.
+Pool-authority adoption is an automatic coordinator action, not an operator
+retry. A same-target authority observation must preserve the activation
+generation and retry counter, honor the journal's `nextRetryAt`, and may signal
+each missing runtime at most once in that due attempt. It must never call the
+manual retry reset path. Repeated observations of the same authority epoch
+therefore cannot create an unbounded desktop reload loop.
 App launch atomically migrates a valid historical
 `automatic_retry_limit_reached` review to same-generation
 `CommittedDegraded`. Relaunching CodexSwitch, reinstalling the menu app, or

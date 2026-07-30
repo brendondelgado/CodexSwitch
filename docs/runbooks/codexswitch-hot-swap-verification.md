@@ -84,7 +84,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-29
+  last_updated: 2026-07-30
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -389,13 +389,13 @@ runtime convergence attempt under the existing activation lease. Matching
 emits desktop and CLI reload evidence, retains degraded or manual-review state
 on incomplete acknowledgement, observes retry backoff on repeated status
 polls, and stops retrying once a fresh exactly bound `Confirmed` record exists.
-The confirmation attempt must disable existing-ACK reuse for both desktop and
-CLI runtimes. Reproduce an ACK older than the thirty-second evidence lease but
-younger than the five-minute passive-health window: one retry must write a new
-nonce, receive a new ACK, and confirm instead of repeatedly reusing and then
-rejecting the older ACK. Assert that the desktop JSON-RPC path forwards
-fresh-only mode into its strict app-server SIGHUP helper, not only into its
-outer existing-ACK check.
+The confirmation attempt must reuse an ACK when its exact PID/start identity,
+executable vnode, runtime kind, auth-file identity, provider account, and
+complete token fingerprint are still current. Reproduce an ACK older than the
+thirty-second evidence lease: passive revalidation must renew the evidence
+lease without writing a new nonce, sending desktop JSON-RPC, or sending SIGHUP.
+Then change one bound identity and prove that reuse fails closed and the single
+explicit convergence attempt emits one new request and ACK.
 
 The handoff may only adopt a store already switched for the same fresh
 authority epoch. It must not infer authority from credential files, rewrite a

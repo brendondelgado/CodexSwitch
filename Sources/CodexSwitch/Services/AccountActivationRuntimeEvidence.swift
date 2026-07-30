@@ -94,7 +94,9 @@ struct AccountActivationRuntimeSnapshotSet: Sendable {
 }
 
 enum AccountActivationRuntimeEvidencePreflight {
-    static let requiresFreshAcknowledgements = true
+    // Exact process and auth-generation bindings are stronger than wall-clock
+    // freshness. Reuse avoids turning read-only policy checks into UI reloads.
+    static let requiresFreshAcknowledgements = false
 
     static func performRenewal(
         desktopReload: @Sendable () async -> DesktopReloadResult,
@@ -275,8 +277,6 @@ enum AccountCredentialMutationBoundary {
 }
 
 enum AccountActivationRuntimeEvidenceEvaluator {
-    static let maximumAcknowledgementAge = SwapEngine.maximumReloadAcknowledgementAge
-
     static func evaluate(
         cli: CodexLocalRuntimeEvidenceSnapshot,
         desktop: CodexLocalRuntimeEvidenceSnapshot,
@@ -319,17 +319,15 @@ enum AccountActivationRuntimeEvidenceEvaluator {
                 acknowledgedRuntimeCount: 0
             )
         }
-        let acknowledgementDates = runtimes.map {
-            Date(
+        let maximumFutureSkew: TimeInterval = 30
+        guard runtimes.allSatisfy({ runtime in
+            let acknowledgementDate = Date(
                 timeIntervalSince1970: TimeInterval(
-                    $0.startupAcknowledgement.acknowledgedAtUnixMilliseconds
+                    runtime.startupAcknowledgement.acknowledgedAtUnixMilliseconds
                 ) / 1_000
             )
-        }
-        guard acknowledgementDates.allSatisfy({ acknowledgementDate in
-            let age = observedAt.timeIntervalSince(acknowledgementDate)
-            return age >= 0 && age <= maximumAcknowledgementAge
-        }), let evidenceObservedAt = acknowledgementDates.min() else {
+            return acknowledgementDate <= observedAt.addingTimeInterval(maximumFutureSkew)
+        }) else {
             return .denied(
                 detail: .runtimeAcknowledgementIncomplete,
                 discoveredRuntimeCount: discovered,
@@ -337,7 +335,7 @@ enum AccountActivationRuntimeEvidenceEvaluator {
             )
         }
         let boundedLifetime = max(1, min(lifetime, 30))
-        let expiresAt = evidenceObservedAt.addingTimeInterval(boundedLifetime)
+        let expiresAt = observedAt.addingTimeInterval(boundedLifetime)
         guard expiresAt > observedAt else {
             return .denied(
                 detail: .runtimeAcknowledgementIncomplete,
@@ -348,7 +346,7 @@ enum AccountActivationRuntimeEvidenceEvaluator {
         return .confirmed(AccountActivationRuntimeEvidence(
             generation: generation,
             runtimeCurrentAccountId: expectedAccountId,
-            observedAt: evidenceObservedAt,
+            observedAt: observedAt,
             expiresAt: expiresAt,
             discoveredRuntimeCount: discovered,
             acknowledgedRuntimeCount: discovered,

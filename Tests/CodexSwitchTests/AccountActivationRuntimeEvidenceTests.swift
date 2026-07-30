@@ -13,9 +13,9 @@ struct AccountActivationRuntimeEvidenceTests {
         completeTokenFingerprint: String(repeating: "a", count: 64)
     )
 
-    @Test("Activation renewal never reuses passive health acknowledgements")
-    func activationRenewalRequiresFreshAcknowledgements() {
-        #expect(AccountActivationRuntimeEvidencePreflight.requiresFreshAcknowledgements)
+    @Test("Activation renewal reuses exact identity-bound acknowledgements")
+    func activationRenewalReusesIdentityBoundAcknowledgements() {
+        #expect(!AccountActivationRuntimeEvidencePreflight.requiresFreshAcknowledgements)
     }
 
     @Test("No live runtime is configured-only evidence, never confirmation")
@@ -58,9 +58,6 @@ struct AccountActivationRuntimeEvidenceTests {
     func matchingEvidenceConfirmsWithBoundedLifetime() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let acknowledgedAtUnixMilliseconds: Int64 = 1_799_999_995_000
-        let acknowledgementDate = Date(
-            timeIntervalSince1970: TimeInterval(acknowledgedAtUnixMilliseconds) / 1_000
-        )
         let generation = UUID()
         let runtime = runtimeEvidence(
             acknowledgedAtUnixMilliseconds: acknowledgedAtUnixMilliseconds
@@ -79,16 +76,16 @@ struct AccountActivationRuntimeEvidenceTests {
         #expect(decision == .confirmed(AccountActivationRuntimeEvidence(
             generation: generation,
             runtimeCurrentAccountId: accountId,
-            observedAt: acknowledgementDate,
-            expiresAt: acknowledgementDate.addingTimeInterval(10),
+            observedAt: now,
+            expiresAt: now.addingTimeInterval(10),
             discoveredRuntimeCount: 1,
             acknowledgedRuntimeCount: 1,
             runtimeBindings: [runtime.startupAcknowledgement.binding]
         )))
     }
 
-    @Test("Evidence lifetime starts at the oldest acknowledgement")
-    func evidenceUsesOldestAcknowledgementTime() {
+    @Test("Passive revalidation renews evidence from the current observation")
+    func evidenceUsesCurrentObservationTime() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let olderMilliseconds: Int64 = 1_799_999_994_000
         let runtimes = [
@@ -110,11 +107,8 @@ struct AccountActivationRuntimeEvidenceTests {
             Issue.record("Expected confirmed runtime evidence")
             return
         }
-        let oldest = Date(
-            timeIntervalSince1970: TimeInterval(olderMilliseconds) / 1_000
-        )
-        #expect(evidence.observedAt == oldest)
-        #expect(evidence.expiresAt == oldest.addingTimeInterval(10))
+        #expect(evidence.observedAt == now)
+        #expect(evidence.expiresAt == now.addingTimeInterval(10))
     }
 
     @Test("Historical ACKs require passive current-process evidence")
@@ -142,12 +136,11 @@ struct AccountActivationRuntimeEvidenceTests {
         ))
     }
 
-    @Test("An ACK older than five minutes cannot be reminted with a current process binding")
-    func staleAcknowledgementCannotBeReminted() {
+    @Test("An old ACK can renew evidence only for the exact current process and auth binding")
+    func identityBoundAcknowledgementCanBeRevalidated() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let staleAcknowledgement = Int64(now.timeIntervalSince1970 * 1_000)
-            - Int64(AccountActivationRuntimeEvidenceEvaluator.maximumAcknowledgementAge * 1_000)
-            - 1
+            - (24 * 60 * 60 * 1_000)
         let runtime = runtimeEvidence(
             acknowledgedAtUnixMilliseconds: staleAcknowledgement
         )
@@ -166,11 +159,12 @@ struct AccountActivationRuntimeEvidenceTests {
         )
 
         #expect(passiveChecks == 1)
-        #expect(decision == .denied(
-            detail: .runtimeAcknowledgementIncomplete,
-            discoveredRuntimeCount: 1,
-            acknowledgedRuntimeCount: 0
-        ))
+        guard case .confirmed(let evidence) = decision else {
+            Issue.record("Expected identity-bound evidence to remain reusable")
+            return
+        }
+        #expect(evidence.observedAt == now)
+        #expect(evidence.runtimeBindings == [runtime.startupAcknowledgement.binding])
     }
 
     @Test("A running source renews its ACK before runtime authorization")

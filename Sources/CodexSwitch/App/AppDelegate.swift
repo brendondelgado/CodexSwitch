@@ -200,6 +200,44 @@ enum ExternalHandoffFollowUp: Equatable {
     case none
 }
 
+enum AccountActivationRetrySource: String, Equatable, Sendable {
+    case automatic
+    case manual
+    case poolAuthority = "pool-authority"
+    case launchRecovery = "launch_recovery"
+    case runtimeTopologyRecovery = "runtime_topology_recovery"
+    case externalAuthRecovered = "external_auth_recovered"
+    case externalHandoff = "external_handoff"
+    case externalHandoffDeferredRevalidation = "external_handoff_deferred_revalidation"
+
+    var resetsRetryBudget: Bool {
+        switch self {
+        case .manual, .launchRecovery, .runtimeTopologyRecovery:
+            return true
+        case .automatic, .poolAuthority, .externalAuthRecovered,
+             .externalHandoff, .externalHandoffDeferredRevalidation:
+            return false
+        }
+    }
+
+    var recoversExternalAuthBarrier: Bool {
+        self == .externalAuthRecovered
+    }
+
+    var requiresDurableRetrySchedule: Bool {
+        self == .automatic || self == .poolAuthority
+    }
+
+    func permitsRetry(
+        state: AccountActivationState?,
+        targetAccountId: UUID,
+        at date: Date
+    ) -> Bool {
+        !requiresDurableRetrySchedule
+            || state?.automaticRetryTarget(at: date) == targetAccountId
+    }
+}
+
 /// Write crash info to ~/.codexswitch/logs/crash.log for debugging
 private func writeCrashLog(_ message: String) {
     let dir = NSString("~/.codexswitch/logs").expandingTildeInPath
@@ -647,7 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 case .adopted(let adopted):
                     await startSameTargetRuntimeRetry(
                         to: adopted,
-                        source: "external_handoff"
+                        source: .externalHandoff
                     )
                     return
                 case .deferred:
@@ -702,7 +740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 case .adopted(let adopted):
                     await startSameTargetRuntimeRetry(
                         to: adopted,
-                        source: "external_handoff"
+                        source: .externalHandoff
                     )
                     return
                 case .deferred:
@@ -714,7 +752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 guard await durableAccountStoreMatches(target) else { return }
                 await startSameTargetRuntimeRetry(
                     to: target,
-                    source: "external_handoff_deferred_revalidation"
+                    source: .externalHandoffDeferredRevalidation
                 )
                 return
             case .none:
@@ -729,7 +767,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             await startSameTargetRuntimeRetry(
                 to: target,
-                source: "external_auth_recovered"
+                source: .externalAuthRecovered
             )
             return
         }
@@ -743,7 +781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .adopted(let adopted):
                 await startSameTargetRuntimeRetry(
                     to: adopted,
-                    source: "external_handoff"
+                    source: .externalHandoff
                 )
                 return
             case .deferred:
@@ -6523,7 +6561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) {
                 return await startSameTargetRuntimeRetry(
                     to: target,
-                    source: requestKind == .poolAuthority ? "pool-authority" : "manual",
+                    source: requestKind == .poolAuthority ? .poolAuthority : .manual,
                     operationAuthority: operationAuthority
                 )
             }
@@ -7818,7 +7856,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
               accountManager.configuredAccount?.id == targetAccountId else {
             return
         }
-        beginSameTargetRuntimeRetry(to: target, source: "automatic")
+        beginSameTargetRuntimeRetry(to: target, source: .automatic)
     }
 
     private func recoverManualReviewActivationOnLaunch() async {
@@ -7828,7 +7866,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ), let target = accountManager.accounts.first(where: { $0.id == targetAccountId }) else {
             return
         }
-        await startSameTargetRuntimeRetry(to: target, source: "launch_recovery")
+        await startSameTargetRuntimeRetry(to: target, source: .launchRecovery)
     }
 
     nonisolated static func manualReviewLaunchRecoveryTarget(
@@ -7926,7 +7964,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return target
     }
 
-    private func beginSameTargetRuntimeRetry(to target: CodexAccount, source: String) {
+    private func beginSameTargetRuntimeRetry(
+        to target: CodexAccount,
+        source: AccountActivationRetrySource
+    ) {
         guard !isExiting else { return }
         Task { @MainActor [weak self] in
             await self?.startSameTargetRuntimeRetry(to: target, source: source)
@@ -7936,7 +7977,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @discardableResult
     private func startSameTargetRuntimeRetry(
         to target: CodexAccount,
-        source: String,
+        source: AccountActivationRetrySource,
         operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> Bool {
         guard !isExiting,
@@ -7948,11 +7989,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return false
         }
 
-        let resetsRetryBudget = source == "manual"
-            || source == "pool-authority"
-            || source == "launch_recovery"
-            || source == "runtime_topology_recovery"
-        let recoversExternalAuthBarrier = source == "external_auth_recovered"
+        if !source.permitsRetry(
+            state: accountManager.activationState,
+            targetAccountId: target.id,
+            at: Date()
+        ) {
+            return false
+        }
+
+        let resetsRetryBudget = source.resetsRetryBudget
+        let recoversExternalAuthBarrier = source.recoversExternalAuthBarrier
         let startsFreshGeneration = resetsRetryBudget || recoversExternalAuthBarrier
         let activationGeneration = startsFreshGeneration
             ? UUID()
@@ -8079,12 +8125,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             self.accountManager.publishActivationNotice(nil)
             SwapLog.append(.debug(
-                "ACTIVATION_RETRY_STARTED target=\(target.email) source=\(source) generation=\(generation)"
+                "ACTIVATION_RETRY_STARTED target=\(target.email) source=\(source.rawValue) generation=\(generation)"
             ))
             await self.beginRuntimeConvergence(
                 from: target,
                 to: target,
-                reason: source == "pool-authority" ? .poolAuthority : .manual,
+                reason: source == .poolAuthority ? .poolAuthority : .manual,
                 swapStart: Date(),
                 prepared: prepared,
                 recordsSwap: false,

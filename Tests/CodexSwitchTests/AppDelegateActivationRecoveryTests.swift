@@ -4,6 +4,42 @@ import Testing
 
 @Suite("AppDelegate activation recovery")
 struct AppDelegateActivationRecoveryTests {
+    @Test("Pool authority cannot reset or bypass the durable retry budget")
+    func poolAuthorityUsesDurableRetryBudget() {
+        let target = UUID()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let degraded = AccountActivationState.committedDegraded(
+            targetAccountId: target,
+            detail: .runtimeAcknowledgementIncomplete,
+            activationGeneration: UUID(),
+            retryAttempt: 2,
+            nextRetryAt: now.addingTimeInterval(60),
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 0,
+            at: now
+        )
+
+        #expect(!AccountActivationRetrySource.poolAuthority.resetsRetryBudget)
+        #expect(AccountActivationRetrySource.poolAuthority.requiresDurableRetrySchedule)
+        #expect(!AccountActivationRetrySource.poolAuthority.permitsRetry(
+            state: degraded,
+            targetAccountId: target,
+            at: now.addingTimeInterval(59)
+        ))
+        #expect(AccountActivationRetrySource.poolAuthority.permitsRetry(
+            state: degraded,
+            targetAccountId: target,
+            at: now.addingTimeInterval(60)
+        ))
+        #expect(AccountActivationRetrySource.manual.resetsRetryBudget)
+        #expect(!AccountActivationRetrySource.manual.requiresDurableRetrySchedule)
+        #expect(AccountActivationRetrySource.manual.permitsRetry(
+            state: degraded,
+            targetAccountId: target,
+            at: now
+        ))
+    }
+
     @Test("Journal-free bootstrap discovers auth target without preselecting it")
     func journalFreeBootstrapDiscoveryIsReadOnly() {
         let sourceId = UUID()

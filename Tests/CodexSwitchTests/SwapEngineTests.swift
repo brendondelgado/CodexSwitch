@@ -2690,8 +2690,8 @@ struct SwapEngineTests {
         ) == nil)
     }
 
-    @Test("Startup and response ACK admission share the five-minute age limit")
-    func startupAndResponseAdmissionRejectACKsOlderThanFiveMinutes() {
+    @Test("Response ACKs expire while exact identity-bound passive ACKs remain reusable")
+    func responseAndIdentityBoundAcknowledgementAgesAreDistinct() {
         let target = runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI)
         let timestamp: Int64 = 1_500_000
         let binding = reloadBinding(
@@ -2730,6 +2730,15 @@ struct SwapEngineTests {
             expectedBinding: binding,
             nowUnixMilliseconds: boundary + 1
         ) == nil)
+        #expect(SwapEngine.validatedReloadAcknowledgement(
+            request: artifacts.0,
+            acknowledgement: artifacts.1,
+            currentBinding: binding,
+            expectedBinding: nil,
+            nowUnixMilliseconds: boundary + 1,
+            maximumArtifactAgeMilliseconds:
+                SwapEngine.maximumIdentityBoundAcknowledgementAgeMilliseconds
+        ) != nil)
     }
 
     @Test("Read-only runtime evidence fails closed on any incomplete proof")

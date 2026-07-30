@@ -454,6 +454,8 @@ enum SwapEngine {
     private static let maximumReloadArtifactBytes = 65_536
     static let maximumReloadAcknowledgementAge: TimeInterval = 5 * 60
     static let maximumReloadAcknowledgementAgeMilliseconds: Int64 = 5 * 60 * 1_000
+    // Exact live process and auth bindings invalidate replay without a time cutoff.
+    static let maximumIdentityBoundAcknowledgementAgeMilliseconds = Int64.max
     static let maximumReloadCapabilityAgeMilliseconds: Int64 = 30 * 24 * 60 * 60 * 1_000
     private static let resetTieFiveHourTolerance = 2.0
     private static let resetTieWeeklyTolerance = 5.0
@@ -2157,7 +2159,7 @@ enum SwapEngine {
         _ discoverySnapshot: CodexRuntimeDiscoverySnapshot,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         requiredOwnerUID: UInt32 = UInt32(getuid()),
-        maximumArtifactAgeMilliseconds: Int64 = maximumReloadAcknowledgementAgeMilliseconds
+        maximumArtifactAgeMilliseconds: Int64 = maximumIdentityBoundAcknowledgementAgeMilliseconds
     ) -> Bool {
         guard !discoverySnapshot.targets.isEmpty else { return false }
         let evidence = localRuntimeEvidenceSnapshot(
@@ -2211,7 +2213,7 @@ enum SwapEngine {
         expectedCompleteTokenFingerprint: String,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         requiredOwnerUID: UInt32 = UInt32(getuid()),
-        maximumArtifactAgeMilliseconds: Int64 = maximumReloadAcknowledgementAgeMilliseconds
+        maximumArtifactAgeMilliseconds: Int64 = maximumIdentityBoundAcknowledgementAgeMilliseconds
     ) -> Set<Int32> {
         alreadyAcknowledgedRuntimePIDs(
             discoverySnapshot,
@@ -2435,7 +2437,7 @@ enum SwapEngine {
         matching currentBinding: CodexReloadBinding,
         homeDirectory: URL,
         now: Date,
-        maximumArtifactAgeMilliseconds: Int64 = maximumReloadAcknowledgementAgeMilliseconds
+        maximumArtifactAgeMilliseconds: Int64 = maximumIdentityBoundAcknowledgementAgeMilliseconds
     ) -> CodexReloadAcknowledgement? {
         guard reloadBindingIsCurrent(currentBinding),
               let request = secureFileSnapshot(
