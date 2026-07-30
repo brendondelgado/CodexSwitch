@@ -3919,6 +3919,77 @@ impl AuthManager {
     }
 
     #[test]
+    fn auth_manager_patch_supports_codex_0_146_concrete_route_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = temp_dir.path().join("manager.rs");
+        fs::write(
+            &manager,
+            r#"
+use std::sync::RwLock;
+use serde::Serialize;
+
+impl CodexAuth {
+    /// Returns the precise kind of credentials backing this authentication.
+    pub fn api_auth_mode(&self) {}
+}
+
+impl AuthDotJson {
+}
+
+pub struct AuthManager {
+    external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
+    auth_route_config: AuthRouteConfig,
+}
+
+impl AuthManager {
+    pub fn external_bearer_only(config: ModelProviderAuthInfo) -> Arc<Self> {
+        Arc::new(Self {
+            external_auth: RwLock::new(Some(
+                Arc::new(BearerTokenRefresher::new(config)) as Arc<dyn ExternalAuth>
+            )),
+            // External bearer auth refreshes by running the provider's command and never makes
+            // auth-owned HTTP requests, so this route is intentionally inert.
+            auth_route_config: AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+                OutboundProxyPolicy::ReqwestDefault,
+            )),
+        })
+    }
+
+    /// Current cached auth (clone) without attempting a refresh.
+    pub fn auth_cached(&self) -> Option<CodexAuth> {
+        None
+    }
+
+    /// Reloads auth from the active source. Returns whether the auth value changed.
+    pub async fn reload(&self) {
+        tracing::info!("Reloaded auth, changed: {changed}");
+        guard.auth = new_auth;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        patch_auth_manager_source(&manager).unwrap();
+        let first = fs::read_to_string(&manager).unwrap();
+        patch_auth_manager_source(&manager).unwrap();
+        let second = fs::read_to_string(&manager).unwrap();
+
+        assert_eq!(second, first, "the 0.146 auth patch must be idempotent");
+        assert_eq!(
+            second
+                .matches("auth_generation: AtomicU64::new(0),")
+                .count(),
+            1
+        );
+        assert!(second.contains(
+            "// auth-owned HTTP requests, so this route is intentionally inert.\n            auth_generation: AtomicU64::new(0),\n            auth_route_config: AuthRouteConfig::from_http_client_factory"
+        ));
+        assert!(second.contains("            &self.auth_route_config,"));
+        assert!(!second.contains("            self.auth_route_config.as_ref(),"));
+    }
+
+    #[test]
     fn auth_manager_patch_inserts_generation_when_external_auth_initializer_shape_drifts() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manager = temp_dir.path().join("manager.rs");

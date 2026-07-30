@@ -27,7 +27,7 @@ use std::sync::atomic::Ordering;"#,
     auth_generation: AtomicU64,"#,
         "auth_generation: AtomicU64",
     )?;
-    patch_auth_generation_none_initializers(path)?;
+    patch_auth_generation_initializers(path)?;
     patch_all(
         path,
         "            external_auth: RwLock::new(Some(\n                Arc::new(BearerTokenRefresher::new(config)) as Arc<dyn ExternalAuth>\n            )),\n        })",
@@ -221,6 +221,7 @@ use std::sync::atomic::Ordering;"#,
 "#,
         "pub async fn codexswitch_reload_auth_json_verified",
     )?;
+    normalize_auth_route_config_reference(path)?;
     patch_file_after(
         path,
         "impl AuthDotJson {",
@@ -275,22 +276,30 @@ use std::sync::atomic::Ordering;"#,
     Ok(())
 }
 
-fn patch_auth_generation_none_initializers(path: &Path) -> Result<()> {
+fn patch_auth_generation_initializers(path: &Path) -> Result<()> {
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut updated = String::with_capacity(content.len() + 512);
     let lines = content.lines().collect::<Vec<_>>();
     let mut index = 0;
     let mut initializer_has_generation = false;
+    let mut initializer_has_external_auth = false;
     while index < lines.len() {
         let line = lines[index];
         if line.contains("Self {") {
             initializer_has_generation = false;
+            initializer_has_external_auth = false;
         }
         if line.contains("auth_generation: AtomicU64::new(0),") {
             initializer_has_generation = true;
         }
-        if line.contains("auth_route_config: None,") && !initializer_has_generation {
+        if line.trim_start().starts_with("external_auth:") {
+            initializer_has_external_auth = true;
+        }
+        if line.trim_start().starts_with("auth_route_config:")
+            && initializer_has_external_auth
+            && !initializer_has_generation
+        {
             updated.push_str("            auth_generation: AtomicU64::new(0),\n");
             initializer_has_generation = true;
         }
@@ -315,4 +324,25 @@ fn patch_auth_generation_none_initializers(path: &Path) -> Result<()> {
         fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(())
+}
+
+fn normalize_auth_route_config_reference(path: &Path) -> Result<()> {
+    const OPTIONAL_FIELD: &str = "    auth_route_config: Option<AuthRouteConfig>,";
+    const CONCRETE_FIELD: &str = "    auth_route_config: AuthRouteConfig,";
+    const OPTIONAL_REFERENCE: &str = "            self.auth_route_config.as_ref(),";
+    const CONCRETE_REFERENCE: &str = "            &self.auth_route_config,";
+
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if content.contains(CONCRETE_FIELD) {
+        patch_all(path, OPTIONAL_REFERENCE, CONCRETE_REFERENCE)?;
+        return Ok(());
+    }
+    if content.contains(OPTIONAL_FIELD) || !content.contains("pub struct AuthManager {") {
+        return Ok(());
+    }
+    bail!(
+        "unsupported AuthManager route configuration shape in {}",
+        path.display()
+    )
 }

@@ -1709,6 +1709,14 @@ patch transaction fails closed when none of the reviewed shapes match, and a
 generated-source contract fixture covers every supported shape before a runtime
 artifact can be published.
 
+Auth-manager patching likewise supports both the optional pre-0.146 route
+configuration and the concrete 0.146-or-later `AuthRouteConfig`. Every
+`AuthManager` initializer that carries `external_auth` must initialize the
+injected auth-generation counter, including constructors whose route field is
+separated from `external_auth` by comments. Reload construction passes the route
+configuration using the reference shape required by the reviewed upstream
+field type; an unknown field shape fails during generated-source verification.
+
 ## Storage Contract
 
 All CodexSwitch-created storage has:
