@@ -1,0 +1,26 @@
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_df002d89cf5683 3922-3991
+  s_70c8e194852bb5::t_c260c5b76737b2 3921
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_5f5fc7ab5559f2 1712-1719
+crates/codexswitch-cli/src/codex_update/source_auth_patching.rs
+  s_70c8e194852bb5::t_3838b08de4c8ce 30,279
+  s_70c8e194852bb5::t_dc73d73e9241d8 224,286,291,296-302,328-347
+  s_70c8e194852bb5::t_c82d1022bfc20a 348
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "d5c7468378bd94285f67fc9eeac11440d1a770d7",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
