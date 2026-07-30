@@ -1,0 +1,68 @@
+Sources/CodexSwitch/Models/RateLimitResetPresentation.swift
+  s_70c8e194852bb5::t_16b471d6dd2a35 445-446,475-476,478
+  s_70c8e194852bb5::t_0513aa68cf10b8 465,468-469
+Tests/CodexSwitchTests/PopoverAccountHeadingTests.swift
+  s_70c8e194852bb5::t_9047e90f5c3a91 55,57,59
+Sources/CodexSwitch/Views/AccountCardView.swift
+  s_70c8e194852bb5::t_8bfc7fed900cea 28,35,177-178,184-185,191-192,255-256,262-267
+Sources/CodexSwitch/Views/PopoverContentView.swift
+  s_70c8e194852bb5::t_8bfc7fed900cea 81,319
+  s_70c8e194852bb5::t_16b471d6dd2a35 625-628,630-634,636-637,639-650
+Tests/CodexSwitchTests/RateLimitResetServiceTests.swift
+  s_70c8e194852bb5::t_eeb7b26a4007f3 190-223
+crates/codexswitch-cli/src/rate_limit_resets.rs
+  s_70c8e194852bb5::t_eeb7b26a4007f3 3225-3252
+  s_70c8e194852bb5::t_103bd5d92c42ed 3224
+crates/codexswitch-cli/src/activation.rs
+  s_70c8e194852bb5::t_1f9ec8e5e5af95 69-72,77-95
+  s_70c8e194852bb5::t_facc29b1bafc82 73,1954
+  s_70c8e194852bb5::t_03c6b232684e8d 3130-3165
+  s_70c8e194852bb5::t_0faf5eb7b5a2a1 3689-3719,3722-3725,3728-3782,3785-3788,3791-3793,3798-3827,3831-3833,3838-3875,3880-3882
+  s_70c8e194852bb5::t_f0554dcec3dc06 1902-1909,1911-1920,1927-1929,1936-1945,1947-1953,1955-1960,1964-1971,2046-2074
+  s_70c8e194852bb5::t_32535a2292dc14 1910,1921-1926,1930-1935,1961-1963,3720-3721,3726-3727,3783-3784,3789-3790,3794-3797,3828-3830,3834-3837,3876-3879
+  s_70c8e194852bb5::t_7dd83e18a2a807 1946
+  s_70c8e194852bb5::t_379fbd6fe413c6 96,2075-2093
+Sources/CodexSwitch/Views/PooledUsageMeterView.swift
+  s_70c8e194852bb5::t_8bfc7fed900cea 418
+Sources/CodexSwitch/Models/AccountManager.swift
+  s_70c8e194852bb5::t_17dadc85f745d0 177
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_17dadc85f745d0 824-825
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_19dd028cb1be70 396-398,548,560,8565-8594,8621,8626-8627
+  s_70c8e194852bb5::t_ed713942a1ff81 8595-8620,8622-8625
+  s_70c8e194852bb5::t_17dadc85f745d0 9471,9670
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_d77558a7337685 467
+  s_70c8e194852bb5::t_9be5b659effaea 461-466,468-469,477-482
+  s_70c8e194852bb5::t_eca07bcd0d5350 483
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_9be5b659effaea 1387-1390,1415-1417
+  s_70c8e194852bb5::t_4ac4391d4a6c03 541-554
+Tests/CodexSwitchTests/RateLimitResetPresentationTests.swift
+  s_70c8e194852bb5::t_9047e90f5c3a91 280,300,312,315,318,321
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_5478ddd18fd4c4 250-254,417-418
+  s_70c8e194852bb5::t_96cfd76c8171a0 419,1471-1514
+  s_70c8e194852bb5::t_ad7d556142fc52 4663,4666-4672
+  s_70c8e194852bb5::t_32535a2292dc14 34-35,41,4664-4665
+  s_70c8e194852bb5::t_c88dd95464c3ac 4662
+Sources/CodexSwitch/Views/StatusBarController.swift
+  s_70c8e194852bb5::t_8bfc7fed900cea 40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "468a0d5812eb3ec03092ddb0d28c2b1b16f70cfe",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
