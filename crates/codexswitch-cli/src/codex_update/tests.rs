@@ -4871,6 +4871,113 @@ async fn run_turn() {
     }
 
     #[test]
+    fn core_turn_patch_supports_codex_0_146_error_details_classifier() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_dir = temp_dir.path();
+        let app_server_dir = source_dir.join("codex-rs/app-server/src");
+        let turn_dir = source_dir.join("codex-rs/core/src/session");
+        let tui_dir = source_dir.join("codex-rs/tui/src");
+        fs::create_dir_all(&app_server_dir).unwrap();
+        fs::create_dir_all(&turn_dir).unwrap();
+        fs::create_dir_all(&tui_dir).unwrap();
+        fs::write(
+            app_server_dir.join("lib.rs"),
+            r#"
+async fn run_processor() {
+    let processor_handle = tokio::spawn({
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+        let processor = MessageProcessor::new(auth_manager.clone());
+    });
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            turn_dir.join("turn.rs"),
+            r#"
+/// Takes initial turn input and runs a loop where, at each sampling request,
+async fn run_turn() {
+    let mut retries = 0;
+    let mut initial_input = Some(input);
+    let mut original_input = None;
+    loop {
+        let prompt_input = if let Some(input) = initial_input.take() {
+            input
+        } else {
+            sess.clone_history().await
+        };
+        let err = match try_run_sampling_request().await {
+            Ok(output) => return Ok(output),
+            Err(err) => match err.details() {
+                CodexErrorDetails::ContextWindowExceeded => return Err(err),
+                CodexErrorDetails::UsageLimitReached(e) => {
+                    let rate_limits = e.rate_limits.clone();
+                    if let Some(rate_limits) = rate_limits {
+                        sess.update_rate_limits(&turn_context, *rate_limits).await;
+                    }
+                    return Err(err);
+                }
+                _ => err,
+            },
+        };
+
+        if original_input.is_none() {
+            original_input = Some(prompt.input);
+        }
+        if !err.is_retryable() {
+            return Err(err);
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tui_dir.join("lib.rs"),
+            "pub async fn main() {\n    // Initialize high-fidelity session event logging if enabled.\n}\n",
+        )
+        .unwrap();
+
+        patch_codex_source(source_dir).unwrap();
+        let first = fs::read_to_string(turn_dir.join("turn.rs")).unwrap();
+        patch_codex_source(source_dir).unwrap();
+        let second = fs::read_to_string(turn_dir.join("turn.rs")).unwrap();
+
+        assert_eq!(second, first, "the 0.146 turn patch must be idempotent");
+        assert_eq!(
+            second
+                .matches("codexswitch_rotate_after_usage_limit(&sess, &turn_context).await")
+                .count(),
+            1
+        );
+        assert_eq!(
+            second
+                .matches("codexswitch_rotate_after_auth_failure(&sess, &turn_context).await")
+                .count(),
+            1
+        );
+        let usage_retry = second
+            .find("                    if !codexswitch_usage_limit_retry_attempted {")
+            .unwrap();
+        let usage_return = second[usage_retry..]
+            .find("                    return Err(err);")
+            .map(|offset| usage_retry + offset)
+            .unwrap();
+        assert!(usage_retry < usage_return);
+        let assigned_error = second.find("        let err = match").unwrap();
+        let auth_retry = second
+            .rfind("        if codexswitch_is_auth_invalidated_error(&err) {")
+            .unwrap();
+        let original_input = second[auth_retry..]
+            .find("        if original_input.is_none() {")
+            .map(|offset| auth_retry + offset)
+            .unwrap();
+        assert!(assigned_error < auth_retry);
+        assert!(auth_retry < original_input);
+    }
+
+    #[test]
     fn interrupted_turn_direct_contract_rejects_stale_ack_and_bad_counts() {
         let receipt = "37f84870-9b39-45ae-aee9-3e0a63e1f989";
         let request = format!("{receipt}:1a7c3ffb-bfd8-4719-9b45-c2e350469d9c");

@@ -1701,6 +1701,14 @@ manifest of every affected crate idempotently, including both `codex-login` and
 prepared until the current stable tag compiles both the CLI and its required
 `codex-code-mode-host` companion.
 
+Interrupted-turn patching recognizes each supported upstream sampling-loop
+shape explicitly. The pre-0.146 direct error arms and the 0.146-or-later
+`CodexErrorDetails` classifier must both preserve the one-shot usage-limit
+rotation, external-auth reload, and authentication-failure rotation paths. The
+patch transaction fails closed when none of the reviewed shapes match, and a
+generated-source contract fixture covers every supported shape before a runtime
+artifact can be published.
+
 ## Storage Contract
 
 All CodexSwitch-created storage has:

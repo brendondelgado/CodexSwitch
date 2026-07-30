@@ -117,19 +117,8 @@ fn normalize_interrupted_turn_retry_loop(path: &Path) -> Result<()> {
                     }
                 }"#,
     )?;
-    patch_file_after(
-        path,
-        "                if let Some(rate_limits) = rate_limits {\n                    sess.update_rate_limits(&turn_context, *rate_limits).await;\n                }",
-        r#"
-                if !codexswitch_usage_limit_retry_attempted {
-                    codexswitch_usage_limit_retry_attempted = true;
-                    if codexswitch_rotate_after_usage_limit(&sess, &turn_context).await {
-                        continue;
-                    }
-                }"#,
-        "if codexswitch_rotate_after_usage_limit(&sess, &turn_context).await",
-    )?;
-    let auth_retry = r#"            Err(err) => {
+    patch_turn_usage_limit_retry(path)?;
+    const AUTH_RETRY_ARM: &str = r#"            Err(err) => {
                 if codexswitch_is_auth_invalidated_error(&err) {
                     if !codexswitch_auth_reload_retry_attempted {
                         codexswitch_auth_reload_retry_attempted = true;
@@ -163,7 +152,6 @@ fn normalize_interrupted_turn_retry_loop(path: &Path) -> Result<()> {
                         .await
                         {"#,
     )?;
-    patch_all(path, "            Err(err) => err,", auth_retry)?;
     patch_all(
         path,
         r#"            Err(err) => {
@@ -176,8 +164,110 @@ fn normalize_interrupted_turn_retry_loop(path: &Path) -> Result<()> {
                 }
                 err
             },"#,
-        auth_retry,
+        AUTH_RETRY_ARM,
     )?;
+    patch_turn_auth_retry(path, AUTH_RETRY_ARM)?;
+    Ok(())
+}
+
+fn patch_turn_usage_limit_retry(path: &Path) -> Result<()> {
+    const MARKER: &str =
+        "if codexswitch_rotate_after_usage_limit(&sess, &turn_context).await {";
+    const DIRECT_ERROR_ANCHOR: &str = "                if let Some(rate_limits) = rate_limits {\n                    sess.update_rate_limits(&turn_context, *rate_limits).await;\n                }";
+    const DIRECT_ERROR_INSERTION: &str = r#"
+                if !codexswitch_usage_limit_retry_attempted {
+                    codexswitch_usage_limit_retry_attempted = true;
+                    if codexswitch_rotate_after_usage_limit(&sess, &turn_context).await {
+                        continue;
+                    }
+                }"#;
+    const ERROR_DETAILS_ANCHOR: &str = "                    if let Some(rate_limits) = rate_limits {\n                        sess.update_rate_limits(&turn_context, *rate_limits).await;\n                    }";
+    const ERROR_DETAILS_INSERTION: &str = r#"
+                    if !codexswitch_usage_limit_retry_attempted {
+                        codexswitch_usage_limit_retry_attempted = true;
+                        if codexswitch_rotate_after_usage_limit(&sess, &turn_context).await {
+                            continue;
+                        }
+                    }"#;
+
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if content.contains(MARKER) {
+        return Ok(());
+    }
+    let variants = [
+        (DIRECT_ERROR_ANCHOR, DIRECT_ERROR_INSERTION),
+        (ERROR_DETAILS_ANCHOR, ERROR_DETAILS_INSERTION),
+    ];
+    let Some((index, anchor, insertion)) = variants.iter().find_map(|(anchor, insertion)| {
+        content
+            .find(anchor)
+            .map(|index| (index, *anchor, *insertion))
+    }) else {
+        bail!("usage-limit retry patch anchor not found in {}", path.display());
+    };
+    let insert_at = index + anchor.len();
+    let updated = format!(
+        "{}{}{}",
+        &content[..insert_at],
+        insertion,
+        &content[insert_at..]
+    );
+    fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn patch_turn_auth_retry(path: &Path, direct_error_replacement: &str) -> Result<()> {
+    const MARKER: &str = "if codexswitch_is_auth_invalidated_error(&err)";
+    const DIRECT_ERROR_ANCHOR: &str = "            Err(err) => err,";
+    const ERROR_DETAILS_ANCHOR: &str = r#"                _ => err,
+            },
+        };
+
+        if original_input.is_none() {"#;
+    const ERROR_DETAILS_REPLACEMENT: &str = r#"                _ => err,
+            },
+        };
+
+        if codexswitch_is_auth_invalidated_error(&err) {
+            if !codexswitch_auth_reload_retry_attempted {
+                codexswitch_auth_reload_retry_attempted = true;
+                if codexswitch_reload_changed_external_auth(
+                    &sess,
+                    &turn_context,
+                    codexswitch_request_auth_generation,
+                )
+                .await
+                {
+                    continue;
+                }
+            }
+            if !codexswitch_auth_rotation_retry_attempted {
+                codexswitch_auth_rotation_retry_attempted = true;
+                if codexswitch_rotate_after_auth_failure(&sess, &turn_context).await {
+                    continue;
+                }
+            }
+        }
+
+        if original_input.is_none() {"#;
+
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if content.contains(MARKER) {
+        return Ok(());
+    }
+    let updated = if content.contains(DIRECT_ERROR_ANCHOR) {
+        content.replacen(DIRECT_ERROR_ANCHOR, direct_error_replacement, 1)
+    } else if content.contains(ERROR_DETAILS_ANCHOR) {
+        content.replacen(ERROR_DETAILS_ANCHOR, ERROR_DETAILS_REPLACEMENT, 1)
+    } else {
+        bail!(
+            "authentication retry patch anchor not found in {}",
+            path.display()
+        );
+    };
+    fs::write(path, updated).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
