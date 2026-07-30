@@ -1,0 +1,26 @@
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_78880f80a617fc 322-324,808-812
+  s_70c8e194852bb5::t_b643c1c8e3ffdb 813
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_78880f80a617fc 7-10,1423-1424,1440-1441,1496,1517,1520,1574-1575,1584-1596,1598-1626,1722,1739-1740,1742-1775,1780-1802,1804-1834,1836-1850,1852,3961-3962,3979-3986,3995,3998-4009,4019,4031-4042,4044-4066
+  s_70c8e194852bb5::t_a236fe54fdd982 1851
+  s_70c8e194852bb5::t_775eb960f91853 1597
+  s_70c8e194852bb5::t_08dcc3ebbe76a3 1803,1835,4043
+  s_70c8e194852bb5::t_015a077db08109 1853
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "26253f08dbe7dd58591d105668422b1f0e3bb254",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

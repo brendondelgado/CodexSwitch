@@ -1,0 +1,67 @@
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_6bf84bfb816dfa 30-32,802,826,832-833,844,851
+  s_70c8e194852bb5::t_61473354668262 838
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_dd6728ad72f012 3514-3515
+  s_70c8e194852bb5::t_4f27e2baa5e7b9 3133-3134
+  s_70c8e194852bb5::t_90dc6da2152370 3087-3089,3126-3132,3516-3519
+Tests/CodexSwitchTests/PopoverAccountHeadingTests.swift
+  s_70c8e194852bb5::t_c694e8c050a0fb 48-82,105-113,115
+  s_70c8e194852bb5::t_bdc5ed901005d4 114
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_ead810eb75ed82 362-368,589-590,1530-1531
+Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
+  s_70c8e194852bb5::t_4c0077d5f84e0c 7,135,153-158
+  s_70c8e194852bb5::t_c1491cf8a87740 8-25,88-134,136-152,159-164,168,179,195-227,231-232
+  s_70c8e194852bb5::t_f2ef9b7c79aafc 228-230
+  s_70c8e194852bb5::t_27f80eb2cceddf 233
+scripts/test_macos_runtime_artifact.py
+  s_70c8e194852bb5::t_58734a6e74000d 298
+Tests/CodexSwitchTests/AppDelegateSwapCommitTests.swift
+  s_70c8e194852bb5::t_0a75bf70ae6cfc 179-180
+  s_70c8e194852bb5::t_c694e8c050a0fb 95-98,125-178
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_29dba0fc7f511c 1033-1037,1074-1077
+  s_70c8e194852bb5::t_c694e8c050a0fb 1028-1032,1073
+Sources/CodexSwitch/Views/StatusBarController.swift
+  s_70c8e194852bb5::t_a5a176062d9764 39-59,70-96
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_9dcda107320805 904-914
+  s_70c8e194852bb5::t_90dc6da2152370 1467
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_3c955183a246c1 115
+  s_70c8e194852bb5::t_8727e2b8cbd980 73-76,108-114
+Tests/CodexSwitchTests/CodexManagedRuntimeTrustTests.swift
+  s_70c8e194852bb5::t_83355e6d059b64 80-82
+  s_70c8e194852bb5::t_65c4115b1c7718 1-79,83-126
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_6af3662c407c46 822
+  s_70c8e194852bb5::t_89ce157735ee3d 192-200,253-259,726-739,815-821
+Sources/CodexSwitch/Services/AccountActivationTransaction.swift
+  s_70c8e194852bb5::t_3e2c6df8e86967 294-296
+crates/codexswitch-cli/src/activation.rs
+  s_70c8e194852bb5::t_b73bc88d8d5726 552,858,933-947,952,967-971,976-993
+  s_70c8e194852bb5::t_c649950779b0ac 553-581,611,625,638,648,650,931
+  s_70c8e194852bb5::t_41997d016f8308 860-927,929
+  s_70c8e194852bb5::t_65576d12a8799f 3101,3103-3154,3159-3217,3222-3227
+  s_70c8e194852bb5::t_6bf84bfb816dfa 2236-2248
+  s_70c8e194852bb5::t_7c7977d78087db 122-127
+  s_70c8e194852bb5::t_61473354668262 3155-3158,3218-3221
+  s_70c8e194852bb5::t_1295e0ab346c48 859,930,932,1068,1094,1116,1141,1166,2160,2177,2234-2235,3102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "dc86ece49aef1b7c5788ae58c4c675cf710fd05d",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}

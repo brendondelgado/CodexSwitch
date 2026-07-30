@@ -1,0 +1,24 @@
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_6c3d19e1a71793 472-478
+Sources/CodexSwitch/Services/KeychainStore.swift
+  s_70c8e194852bb5::t_6c3d19e1a71793 97-104,106-110,148-151,157,164,166,169-175,180-185,187-198,205-211,213-218,223-229,237-243,245-250
+  s_70c8e194852bb5::t_98d31d189a525a 257,276
+Tests/CodexSwitchTests/KeychainStoreTests.swift
+  s_70c8e194852bb5::t_6c3d19e1a71793 1629-1636,1638,1641
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "67b1e61a0e6c1809b4de3fa5a7e19ee3c6b8549d",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

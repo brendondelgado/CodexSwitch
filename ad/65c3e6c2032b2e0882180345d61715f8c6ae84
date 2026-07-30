@@ -1,0 +1,28 @@
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_17937fcbf4a4ff 396-398
+Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
+  s_70c8e194852bb5::t_15fa9e31f1ded3 105,365,809,820
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_17937fcbf4a4ff 423-425
+Tests/CodexSwitchTests/DesktopRuntimeReloadClientTests.swift
+  s_70c8e194852bb5::t_15fa9e31f1ded3 220,229,231,251,1104,1106
+  s_70c8e194852bb5::t_22aa0b1a3a5b22 199,264,302,333,369,408,444,559,787,874,934
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_15fa9e31f1ded3 1078,1122-1127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "ad65c3e6c2032b2e0882180345d61715f8c6ae84",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
