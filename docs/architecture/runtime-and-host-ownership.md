@@ -105,6 +105,26 @@ provider identity selected by the current VPS authority epoch. Bundle metadata,
 array order, Mac `isActive`, and a stale VPS store flag cannot advance or replace
 the authority target.
 
+Credential replication is also not a rollback channel. When a provider account
+already exists on the destination host, the import merges token generations
+monotonically:
+
+- an expired or older inference-token generation cannot replace a newer
+  destination generation;
+- equal access-token generations with different refresh-token material preserve
+  the destination's complete token set;
+- incomparable, incomplete, or malformed generations fail closed before any
+  credential mutation;
+- destination quota observations, runtime blocks, reset inventory, and other
+  host-owned operational state survive credential replication.
+
+The sender must perform a stable post-import read-back of account identity,
+complete credential-set fingerprint, active provider identity, active token
+fingerprint, and store/auth convergence. A successful import process exit is not
+proof of synchronization. The sender may publish `credentials already
+converged` or a successful sync result only when that read-back matches the
+operation's intended generation exactly.
+
 ## Pool Authority Protocol
 
 The VPS persists a bounded token-free authority record under the private

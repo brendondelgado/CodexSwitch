@@ -2027,7 +2027,7 @@ enum LinuxDevboxMonitor {
         let bundleName = "codexswitch-auto-sync-\(operation.operationID).csbundle"
         let passphraseName = "codexswitch-auto-sync-\(operation.operationID).passphrase"
         let tempDirectory = URL(fileURLWithPath: operation.localDirectory, isDirectory: true)
-        let result: Result<String, LinuxDevboxMonitorFailure>
+        var result: Result<String, LinuxDevboxMonitorFailure>
 
         do {
             try createPrivateLocalCredentialStage(at: tempDirectory)
@@ -2055,6 +2055,14 @@ enum LinuxDevboxMonitor {
             ))
         }
 
+        if case .success(let output) = result {
+            result = verifiedCredentialSyncPostImportResult(
+                output: output,
+                operation: operation,
+                observed: captureCredentialStateEvidence(settings: settings)
+            )
+        }
+
         if let cleanupFailure = cleanupLocalCredentialStage(at: tempDirectory) {
             let original: String?
             if case .failure(let failure) = result {
@@ -2068,6 +2076,27 @@ enum LinuxDevboxMonitor {
             ))
         }
         return result
+    }
+
+    static func verifiedCredentialSyncPostImportResult(
+        output: String,
+        operation: LinuxDevboxCredentialSyncOperation,
+        observed: Result<LinuxDevboxCredentialStateEvidence, LinuxDevboxMonitorFailure>
+    ) -> Result<String, LinuxDevboxMonitorFailure> {
+        switch observed {
+        case .success(let evidence) where evidence == operation.expected:
+            return .success(output)
+        case .success:
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox credential import completed, but stable post-import evidence does not match the intended credential generation",
+                credentialSyncDisposition: .rejected
+            ))
+        case .failure(let failure):
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox credential import completed, but post-import convergence could not be proven: \(failure.message)",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
     }
 
     private static func transferCredentials(

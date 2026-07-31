@@ -18,8 +18,8 @@ mod secure_file;
 mod token_refresh;
 
 use account_store::{
-    active_account, default_store_path, load_account_store_snapshot, load_accounts,
-    lock_account_store, mark_runtime_unusable, quota_availability_at,
+    active_account, default_store_path, inference_token_expiration, load_account_store_snapshot,
+    load_accounts, lock_account_store, mark_runtime_unusable, quota_availability_at,
     ready_automatic_rotation_candidate_count, real_quota_snapshot, resolve_account_selector,
     select_auto_swap_candidate_from_observations, usage_limit_runtime_block_until,
     validate_accounts, CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
@@ -571,14 +571,18 @@ where
     let (account_count, prepared) = {
         let store_lock = lock_account_store(store_path)?;
         let snapshot = store_lock.load()?;
+        let mut stored_accounts = snapshot.accounts;
         let replacement_accounts = if let Some(authority_target) = authority_target.as_deref() {
-            preserve_authority_active_account(imported_accounts, authority_target)?
+            merge_authority_preserving_accounts(
+                imported_accounts,
+                &stored_accounts,
+                authority_target,
+            )?
         } else {
             imported_accounts
         };
         let account_count = replacement_accounts.len();
         let mut generation = snapshot.generation;
-        let mut stored_accounts = snapshot.accounts;
         let outcome = replace_accounts_with_under_runtime_lease(
             &runtime_lease,
             &store_lock,
@@ -606,13 +610,23 @@ where
     Ok((account_count, outcome))
 }
 
-fn preserve_authority_active_account(
+fn merge_authority_preserving_accounts(
     mut incoming: Vec<account_store::CodexAccount>,
+    current: &[account_store::CodexAccount],
     authority_target: &str,
 ) -> Result<Vec<account_store::CodexAccount>> {
     validate_accounts(&incoming).context("incoming credential bundle is invalid")?;
     for account in &mut incoming {
         account.is_active = account.account_id == authority_target;
+        let Some(existing) = current
+            .iter()
+            .find(|candidate| candidate.account_id == account.account_id)
+        else {
+            continue;
+        };
+
+        preserve_host_operational_state(account, existing);
+        merge_token_generation(account, existing)?;
     }
     if !incoming
         .iter()
@@ -625,6 +639,65 @@ fn preserve_authority_active_account(
     }
     validate_accounts(&incoming).context("authority-preserving credential merge is invalid")?;
     Ok(incoming)
+}
+
+fn preserve_host_operational_state(
+    incoming: &mut account_store::CodexAccount,
+    current: &account_store::CodexAccount,
+) {
+    incoming.quota_snapshot = current.quota_snapshot.clone();
+    incoming.five_hour_primed_at = current.five_hour_primed_at.clone();
+    incoming.runtime_unusable_until = current.runtime_unusable_until;
+    incoming.runtime_unusable_reason = current.runtime_unusable_reason.clone();
+    incoming.rate_limit_reset_bank = current.rate_limit_reset_bank.clone();
+}
+
+fn merge_token_generation(
+    incoming: &mut account_store::CodexAccount,
+    current: &account_store::CodexAccount,
+) -> Result<()> {
+    let incoming_complete = incoming.has_complete_token_material();
+    let current_complete = current.has_complete_token_material();
+    if !incoming_complete || !current_complete {
+        bail!(
+            "cannot compare incomplete credential generations for provider account {}",
+            incoming.account_id
+        );
+    }
+
+    let token_sets_match = incoming.id_token == current.id_token
+        && incoming.access_token == current.access_token
+        && incoming.refresh_token == current.refresh_token;
+    if token_sets_match {
+        return Ok(());
+    }
+
+    let preserve_current = if incoming.access_token == current.access_token {
+        true
+    } else {
+        match (
+            inference_token_expiration(&incoming.access_token),
+            inference_token_expiration(&current.access_token),
+        ) {
+            (Some(incoming_expiry), Some(current_expiry)) => current_expiry >= incoming_expiry,
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (None, None) => {
+                bail!(
+                    "cannot order malformed credential generations for provider account {}",
+                    incoming.account_id
+                )
+            }
+        }
+    };
+
+    if preserve_current {
+        incoming.id_token.clone_from(&current.id_token);
+        incoming.access_token.clone_from(&current.access_token);
+        incoming.refresh_token.clone_from(&current.refresh_token);
+        incoming.last_refreshed.clone_from(&current.last_refreshed);
+    }
+    Ok(())
 }
 
 fn pool_authority_status(store_path: &Path, json: bool) -> Result<()> {
@@ -4718,17 +4791,35 @@ mod tests {
         let mut incoming_vps = current_active.clone();
         incoming_vps.is_active = false;
         incoming_vps.refresh_token = "refreshed-on-mac".to_string();
+        incoming_vps
+            .quota_snapshot
+            .as_mut()
+            .unwrap()
+            .weekly_mut()
+            .unwrap()
+            .used_percent = 90.0;
         let mut incoming_mac = current_inactive.clone();
         incoming_mac.is_active = true;
 
-        let merged = preserve_authority_active_account(
+        let merged = merge_authority_preserving_accounts(
             vec![incoming_mac, incoming_vps],
+            &[current_active.clone(), current_inactive],
             &current_active.account_id,
         )?;
 
         let active = active_account(&merged).context("merged host lost its active account")?;
         assert_eq!(active.account_id, current_active.account_id);
-        assert_eq!(active.refresh_token, "refreshed-on-mac");
+        assert_eq!(active.refresh_token, current_active.refresh_token);
+        assert_eq!(
+            active
+                .quota_snapshot
+                .as_ref()
+                .unwrap()
+                .weekly()
+                .unwrap()
+                .used_percent,
+            10.0
+        );
         Ok(())
     }
 
@@ -4737,14 +4828,80 @@ mod tests {
         let current_active = account("vps-only@example.com", true, 10.0, 10.0);
         let incoming_active = account("mac-only@example.com", true, 10.0, 10.0);
 
-        let error =
-            preserve_authority_active_account(vec![incoming_active], &current_active.account_id)
-                .expect_err("missing authority target must fail before credential mutation");
+        let error = merge_authority_preserving_accounts(
+            vec![incoming_active],
+            std::slice::from_ref(&current_active),
+            &current_active.account_id,
+        )
+        .expect_err("missing authority target must fail before credential mutation");
 
         assert!(error
             .to_string()
             .contains("does not contain pool-authority target"));
         Ok(())
+    }
+
+    #[test]
+    fn credential_bundle_merge_rejects_active_token_generation_rollback() -> Result<()> {
+        let mut current = account("active@example.com", true, 10.0, 10.0);
+        current.access_token =
+            account_store::test_inference_token(Utc::now() + ChronoDuration::days(10));
+        current.refresh_token = "current-refresh".to_string();
+        let mut incoming = current.clone();
+        incoming.access_token =
+            account_store::test_inference_token(Utc::now() + ChronoDuration::hours(1));
+        incoming.refresh_token = "stale-refresh".to_string();
+
+        let merged = merge_authority_preserving_accounts(
+            vec![incoming],
+            std::slice::from_ref(&current),
+            &current.account_id,
+        )?;
+        let active = active_account(&merged).unwrap();
+
+        assert_eq!(active.access_token, current.access_token);
+        assert_eq!(active.refresh_token, current.refresh_token);
+        Ok(())
+    }
+
+    #[test]
+    fn credential_bundle_merge_accepts_newer_active_token_generation() -> Result<()> {
+        let mut current = account("active@example.com", true, 10.0, 10.0);
+        current.access_token =
+            account_store::test_inference_token(Utc::now() + ChronoDuration::hours(1));
+        current.refresh_token = "old-refresh".to_string();
+        let mut incoming = current.clone();
+        incoming.access_token =
+            account_store::test_inference_token(Utc::now() + ChronoDuration::days(10));
+        incoming.refresh_token = "new-refresh".to_string();
+
+        let merged = merge_authority_preserving_accounts(
+            vec![incoming.clone()],
+            std::slice::from_ref(&current),
+            &current.account_id,
+        )?;
+        let active = active_account(&merged).unwrap();
+
+        assert_eq!(active.access_token, incoming.access_token);
+        assert_eq!(active.refresh_token, incoming.refresh_token);
+        Ok(())
+    }
+
+    #[test]
+    fn credential_bundle_merge_fails_closed_for_unordered_generations() {
+        let mut current = account("active@example.com", true, 10.0, 10.0);
+        current.access_token = "not-a-jwt-current".to_string();
+        let mut incoming = current.clone();
+        incoming.access_token = "not-a-jwt-incoming".to_string();
+
+        let error = merge_authority_preserving_accounts(
+            vec![incoming],
+            std::slice::from_ref(&current),
+            &current.account_id,
+        )
+        .expect_err("malformed divergent generations must be rejected");
+
+        assert!(error.to_string().contains("cannot order malformed"));
     }
 
     #[test]

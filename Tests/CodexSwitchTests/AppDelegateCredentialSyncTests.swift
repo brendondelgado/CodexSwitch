@@ -92,6 +92,46 @@ struct AppDelegateCredentialSyncTests {
         }
     }
 
+    @Test("successful import requires exact stable post-import evidence")
+    func successfulImportRequiresPostImportProof() throws {
+        let fixture = try JournalFixture()
+        defer { fixture.cleanup() }
+        let operation = fixture.operation()
+
+        let confirmed = LinuxDevboxMonitor.verifiedCredentialSyncPostImportResult(
+            output: "updated",
+            operation: operation,
+            observed: .success(operation.expected)
+        )
+        guard case .success(let output) = confirmed else {
+            Issue.record("Exact post-import evidence was rejected")
+            return
+        }
+        #expect(output == "updated")
+
+        let stale = LinuxDevboxMonitor.verifiedCredentialSyncPostImportResult(
+            output: "updated",
+            operation: operation,
+            observed: .success(operation.baseline)
+        )
+        guard case .failure(let staleFailure) = stale else {
+            Issue.record("Stale post-import generation was reported as synchronized")
+            return
+        }
+        #expect(staleFailure.credentialSyncDisposition == .rejected)
+
+        let unavailable = LinuxDevboxMonitor.verifiedCredentialSyncPostImportResult(
+            output: "updated",
+            operation: operation,
+            observed: .failure(LinuxDevboxMonitorFailure(message: "observation unavailable"))
+        )
+        guard case .failure(let unavailableFailure) = unavailable else {
+            Issue.record("Unproven post-import outcome was reported as synchronized")
+            return
+        }
+        #expect(unavailableFailure.credentialSyncDisposition == .outcomeUnknown)
+    }
+
     @Test("unresolved reason persists and is surfaced")
     func unresolvedReasonPersistsAndIsSurfaced() throws {
         let fixture = try JournalFixture()
