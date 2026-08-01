@@ -46,7 +46,7 @@ struct CodexDesktopNativeChildCoordinatorTests {
         #expect(files.allSatisfy { !$0.contains("prepared-codex") })
     }
 
-    @Test("First native ACK requires exact stdio invocation and signed app ancestry")
+    @Test("First native ACK requires valid stdio invocation and signed app ancestry")
     func nativeBootstrapRequiresOfficialAncestry() {
         let binding = nativeBinding(pid: 42)
         let parents: [Int32: Int32] = [42: 41, 41: 40]
@@ -54,6 +54,16 @@ struct CodexDesktopNativeChildCoordinatorTests {
             41: "/Applications/ChatGPT Stock.app/Contents/Resources/cua_node/bin/node_repl",
             40: "/Applications/ChatGPT Stock.app/Contents/MacOS/ChatGPT",
         ]
+        #expect(CodexDesktopNativeChildCoordinator.authorizesFirstAcknowledgementBootstrap(
+            binding: binding,
+            arguments: [
+                "codex", "-c", "features.code_mode_host=true", "app-server",
+                "--analytics-default-enabled",
+            ],
+            parentPID: { parents[$0] },
+            executablePath: { paths[$0] },
+            signatureStatus: { _ in .officialOpenAI }
+        ))
         #expect(CodexDesktopNativeChildCoordinator.authorizesFirstAcknowledgementBootstrap(
             binding: binding,
             arguments: ["codex", "app-server", "--listen", "stdio://"],

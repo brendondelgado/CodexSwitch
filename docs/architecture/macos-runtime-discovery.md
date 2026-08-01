@@ -158,9 +158,10 @@ artifact or identity check.
 Runtime kinds are closed authorization contracts derived by the classifier, not
 labels that an ACK may select for itself:
 
-- `official-desktop-stdio-child` is reserved for an exact
-  `codex app-server --listen stdio://` runtime whose ancestry reaches the
-  official OpenAI-signed ChatGPT app. It uses the strict frontend-delivery ACK
+- `official-desktop-stdio-child` is reserved for a `codex app-server`
+  runtime using either the app-server's default stdio transport or one explicit
+  `--listen stdio://` declaration, whose ancestry reaches the official
+  OpenAI-signed ChatGPT app. It uses the strict frontend-delivery ACK
   contract; private transport is not permission to accept an idle ACK.
 - `external-app-server` covers every ordinary external app-server, including a
   VPS app-server reached through SSH or a Unix socket. It remains strict and
@@ -176,15 +177,18 @@ labels that an ACK may select for itself:
 ## Official Desktop Native Child
 
 The supported Mac desktop topology is the official OpenAI-signed ChatGPT app
-spawning CodexSwitch's prepared CLI as `codex app-server --listen stdio://`.
-CodexSwitch publishes the prepared launcher in `CODEX_CLI_PATH`; it does not
-patch, re-sign, proxy, or replace the desktop host.
+spawning CodexSwitch's prepared CLI as `codex app-server`. ChatGPT builds may
+either rely on the app-server's default stdio transport or pass
+`--listen stdio://` explicitly. CodexSwitch publishes the prepared launcher
+in `CODEX_CLI_PATH`; it does not patch, re-sign, proxy, or replace the desktop
+host.
 
 The native-child contract is:
 
 1. The ChatGPT root has Team ID `2DC432GLL2` and a valid strict signature.
-2. The app-server has one exact `stdio://` listener declaration and no
-   WebSocket listener or remote-control mode.
+2. The app-server has no listener declaration, meaning its default stdio
+   transport, or one exact `stdio://` declaration. It has no WebSocket
+   listener or remote-control mode.
 3. The kernel-observed parent chain reaches that ChatGPT root and contains no
    CodexSwitch launch agent, shell bridge, or unrelated app-server.
 4. `CODEX_APP_SERVER_WS_URL` is absent and the legacy

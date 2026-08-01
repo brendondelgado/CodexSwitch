@@ -1196,6 +1196,22 @@ struct SwapEngineTests {
             "codex", "app-server", "--listen", "ws://127.0.0.1:9223",
             "--listen", "stdio://",
         ]))
+        #expect(SwapEngine.hasOfficialDesktopStdioInvocation([
+            "codex", "-c", "features.code_mode_host=true", "app-server",
+            "--analytics-default-enabled",
+        ]))
+        #expect(SwapEngine.hasOfficialDesktopStdioInvocation([
+            "codex", "app-server", "--listen", "stdio://",
+        ]))
+        #expect(!SwapEngine.hasOfficialDesktopStdioInvocation([
+            "codex", "app-server", "--listen", "ws://127.0.0.1:9223",
+        ]))
+        #expect(!SwapEngine.hasOfficialDesktopStdioInvocation([
+            "codex", "app-server", "--remote-control",
+        ]))
+        #expect(!SwapEngine.hasOfficialDesktopStdioInvocation([
+            "codex", "app-server", "--listen",
+        ]))
     }
 
     @Test("Desktop discovery classifies external and native stdio runtimes")
@@ -1247,7 +1263,10 @@ struct SwapEngineTests {
                         "ws://127.0.0.1:9223",
                     ]
                 case stdioPID:
-                    return ["codex", "app-server", "--listen", "stdio://"]
+                    return [
+                        "codex", "-c", "features.code_mode_host=true", "app-server",
+                        "--analytics-default-enabled",
+                    ]
                 case remoteControlPID:
                     return [
                         "codex", "app-server", "--remote-control", "--listen",

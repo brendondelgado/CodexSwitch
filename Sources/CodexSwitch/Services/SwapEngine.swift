@@ -1532,7 +1532,10 @@ enum SwapEngine {
         }
         let appServerArguments = Array(lowered[lowered.index(after: appServerIndex)...])
         guard !appServerArguments.contains("--remote-control") else { return false }
-        return explicitListenerValues(Array(lowered)) == ["stdio://"]
+        guard let listeners = explicitListenerValues(Array(lowered)) else {
+            return false
+        }
+        return listeners.isEmpty || listeners == ["stdio://"]
     }
 
     private nonisolated static func explicitListenerValues(
