@@ -164,6 +164,23 @@ fn patch_app_server_reload_template(
                                     .get(index + 1)
                                     .is_some_and(|value| value.starts_with("ws://")))
                     });
+                let mut listeners = Vec::new();
+                let mut listener_index = 0;
+                while listener_index < app_server_arguments.len() {
+                    let argument = &app_server_arguments[listener_index];
+                    if argument == "--listen" {
+                        let Some(listener) = app_server_arguments.get(listener_index + 1) else {
+                            return "external-app-server";
+                        };
+                        listeners.push(listener.as_str());
+                        listener_index += 2;
+                        continue;
+                    }
+                    if let Some(listener) = argument.strip_prefix("--listen=") {
+                        listeners.push(listener);
+                    }
+                    listener_index += 1;
+                }
                 if has_remote_control && has_websocket_listener {
                     "headless-remote-control-app-server"
                 } else if cfg!(target_os = "macos")
@@ -180,6 +197,11 @@ fn patch_app_server_reload_template(
                     && arguments[6] == "ws://127.0.0.1:9223"
                 {
                     "managed-desktop-bridge"
+                } else if cfg!(target_os = "macos")
+                    && !has_remote_control
+                    && (listeners.is_empty() || listeners == ["stdio://"])
+                {
+                    "official-desktop-stdio-child"
                 } else {
                     "external-app-server"
                 }

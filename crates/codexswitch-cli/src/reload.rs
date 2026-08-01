@@ -3952,21 +3952,24 @@ pub(crate) fn is_official_desktop_stdio_child_command_line(command_line: &str) -
     {
         return false;
     }
-    let listeners = arguments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, argument)| {
-            argument
-                .strip_prefix("--listen=")
-                .map(str::to_string)
-                .or_else(|| {
-                    (argument == "--listen")
-                        .then(|| arguments.get(index + 1).cloned())
-                        .flatten()
-                })
-        })
-        .collect::<Vec<_>>();
-    listeners == ["stdio://"]
+    let mut listeners = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--listen" {
+            let Some(listener) = arguments.get(index + 1) else {
+                return false;
+            };
+            listeners.push(listener.clone());
+            index += 2;
+            continue;
+        }
+        if let Some(listener) = argument.strip_prefix("--listen=") {
+            listeners.push(listener.to_string());
+        }
+        index += 1;
+    }
+    listeners.is_empty() || listeners == ["stdio://"]
 }
 
 fn first_command_token_is_native_codex(command_line: &str) -> bool {
@@ -4604,7 +4607,10 @@ mod tests {
     }
 
     #[test]
-    fn official_desktop_stdio_child_requires_exact_private_listener() {
+    fn official_desktop_stdio_child_accepts_default_or_exact_private_listener() {
+        assert!(is_official_desktop_stdio_child_command_line(
+            "/prepared/codex -c features.code_mode_host=true app-server --analytics-default-enabled"
+        ));
         assert!(is_official_desktop_stdio_child_command_line(
             "/prepared/codex app-server --listen stdio://"
         ));
@@ -4616,6 +4622,12 @@ mod tests {
         ));
         assert!(!is_official_desktop_stdio_child_command_line(
             "/prepared/codex app-server --remote-control --listen stdio://"
+        ));
+        assert!(!is_official_desktop_stdio_child_command_line(
+            "/prepared/codex app-server --listen"
+        ));
+        assert!(!is_official_desktop_stdio_child_command_line(
+            "/prepared/codex app-server --listen stdio:// --listen stdio://"
         ));
     }
 

@@ -4448,6 +4448,8 @@ async fn run_turn() {
         assert!(patched.contains("codexswitch-hotswap-contract-v3"));
         assert!(patched.contains("codexswitch-hotswap-headless-idle-v1"));
         assert!(patched.contains("codexswitch_external_runtime_kind()"));
+        assert!(patched.contains(r#""official-desktop-stdio-child""#));
+        assert!(patched.contains(r#"listeners.is_empty() || listeners == ["stdio://"]"#));
         assert!(patched.contains("headless-remote-control-app-server"));
         assert!(
             patched.contains("codexswitch_validate_v3_binding(&request, expected_runtime_kind)")
