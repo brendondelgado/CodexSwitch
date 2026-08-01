@@ -791,13 +791,31 @@ enum SwapEngine {
         ))
     }
 
-    /// Send SIGHUP to running Codex CLI processes so they reload auth.json.
-    /// Only sends if a SIGHUP-capable binary wrote a verification marker.
-    nonisolated static let localCodexProcessDiscoveryArguments = [
+    /// Enumerate all Codex processes by exact kernel process name. Runtime
+    /// classification happens later from identity-bound argv and executable data.
+    nonisolated static let codexProcessDiscoveryArguments = [
         "-l",
         "-x",
         "codex",
     ]
+    nonisolated static let localCodexProcessDiscoveryArguments =
+        codexProcessDiscoveryArguments
+
+    nonisolated static func discoverCodexProcesses() -> CodexPGrepDiscoveryResult {
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
+            arguments: codexProcessDiscoveryArguments,
+            timeout: 3
+        )
+        return pgrepDiscoveryResult(
+            stdout: result.stdout,
+            terminationStatus: result.terminationStatus,
+            timedOut: result.timedOut
+        )
+    }
+
+    /// Send SIGHUP to running Codex CLI processes so they reload auth.json.
+    /// Only sends if a SIGHUP-capable binary wrote a verification marker.
 
     @discardableResult
     static func signalCodexReload(
@@ -821,18 +839,9 @@ enum SwapEngine {
         let now = Date()
         let minAge: TimeInterval = 10  // Process must be running at least 10s
 
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: localCodexProcessDiscoveryArguments,
-            timeout: 3
-        )
         let discoveryResult = Self.excludingRuntimePIDs(
             excludingRuntimePIDs,
-            from: pgrepDiscoveryResult(
-                stdout: result.stdout,
-                terminationStatus: result.terminationStatus,
-                timedOut: result.timedOut
-            )
+            from: discoverCodexProcesses()
         )
         if case .failed(let reason) = discoveryResult {
             logger.error("Local Codex pgrep discovery failed: \(reason)")
@@ -997,16 +1006,7 @@ enum SwapEngine {
 
     @discardableResult
     static func signalDesktopAppServerReloadSummary() -> CodexReloadSummary {
-        let result = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-fl", "codex.*app-server"],
-            timeout: 3
-        )
-        let discoveryResult = pgrepDiscoveryResult(
-            stdout: result.stdout,
-            terminationStatus: result.terminationStatus,
-            timedOut: result.timedOut
-        )
+        let discoveryResult = discoverCodexProcesses()
         if case .failed(let reason) = discoveryResult {
             SwapLog.append(.desktopExternalReloadSkipped(reason: "desktop pgrep failed: \(reason)"))
         }

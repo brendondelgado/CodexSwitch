@@ -9,13 +9,12 @@ enum DesktopAppConnector {
     /// Discover the WebSocket port of a running Codex app-server.
     /// The app-server binds to 127.0.0.1 on a dynamic port.
     nonisolated static func discoverPort() -> UInt16? {
-        let pgrepResult = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-fl", "codex.*app-server"],
-            timeout: 3
+        let discovery = SwapEngine.desktopRuntimeDiscoverySnapshot(
+            from: SwapEngine.discoverCodexProcesses(),
+            requiredOwnerUID: UInt32(getuid())
         )
-        guard !pgrepResult.timedOut, pgrepResult.terminationStatus == 0 else {
-            logger.debug("pgrep failed or timed out while discovering Codex app-server")
+        guard discovery.isComplete else {
+            logger.debug("Codex app-server identity discovery was incomplete")
             return nil
         }
 
@@ -30,7 +29,7 @@ enum DesktopAppConnector {
         }
 
         let port = discoverPort(
-            pgrepOutput: pgrepResult.stdoutString,
+            appServerPIDs: discovery.targets.map { $0.process.identity.pid },
             lsofOutput: lsofResult.stdoutString
         )
         if let port {
@@ -41,6 +40,17 @@ enum DesktopAppConnector {
         return port
     }
 
+    nonisolated static func discoverPort(
+        appServerPIDs: [Int32],
+        lsofOutput: String
+    ) -> UInt16? {
+        let listeningPorts = DesktopRuntimeDiagnostics.parseListeningPorts(
+            fromLsofOutput: lsofOutput
+        )
+        return appServerPIDs.lazy.compactMap { pid in
+            listeningPorts.first { $0.pid == pid }?.port
+        }.first
+    }
 
     nonisolated static func discoverPort(pgrepOutput: String, lsofOutput: String) -> UInt16? {
         let desktopPID = DesktopRuntimeDiagnostics

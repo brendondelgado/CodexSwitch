@@ -47,6 +47,17 @@ struct SwapEngineTests {
         let acknowledgement: CodexReloadAcknowledgement
     }
 
+    @Test("CLI and desktop discovery share exact Codex process-name matching")
+    func allLocalRuntimeDiscoveryUsesExactProcessName() {
+        #expect(SwapEngine.codexProcessDiscoveryArguments == ["-l", "-x", "codex"])
+        #expect(
+            SwapEngine.localCodexProcessDiscoveryArguments
+                == SwapEngine.codexProcessDiscoveryArguments
+        )
+        #expect(!SwapEngine.codexProcessDiscoveryArguments.contains("-f"))
+        #expect(!SwapEngine.codexProcessDiscoveryArguments.contains { $0.contains("*") })
+    }
+
     @Test("Earliest usable reset ignores healthy windows")
     func earliestUsableResetIgnoresHealthyWindows() {
         let now = Date(timeIntervalSince1970: 1_000)

@@ -794,16 +794,7 @@ struct DesktopRuntimeReloadClient: Sendable {
             requiredOwnerUID: UInt32(getuid()),
             gate: SwapEngine.reloadAttemptGate,
             preliminaryDiscovery: {
-                let result = ProcessRunner.run(
-                    executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-                    arguments: ["-fl", "codex.*app-server"],
-                    timeout: 3
-                )
-                return SwapEngine.pgrepDiscoveryResult(
-                    stdout: result.stdout,
-                    terminationStatus: result.terminationStatus,
-                    timedOut: result.timedOut
-                )
+                SwapEngine.discoverCodexProcesses()
             },
             runtimeDiscovery: { discoveryResult, requiredOwnerUID in
                 SwapEngine.desktopRuntimeDiscoverySnapshot(

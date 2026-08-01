@@ -84,7 +84,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-30
+  last_updated: 2026-08-01
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -600,6 +600,11 @@ CodexSwitch must evaluate these independently:
 - **Mac CLI subprocesses:** `codex sandbox` is a tool subprocess, not an interactive account owner. Verify it is excluded from discovery and does not increase discovered, skipped, or acknowledgement counts.
 - **Retained Mac CLI generations:** after an attested runtime update, a still-running prepared generation remains eligible only through exact adjacent-manifest, hash, owner, path-containment, vnode, capability, and request/ACK verification. Prove a retained valid generation acknowledges, while an absent or altered generation remains a typed restart blocker.
 - **Mac CLI discovery:** preliminary `pgrep` candidates use exact process-name matching for `codex`. Full-command-line matching is prohibited because unrelated CodexSwitch paths and short-lived tools can make an otherwise valid batch incomplete.
+- **Mac desktop discovery:** the official ChatGPT stdio child uses the same
+  exact-name `pgrep -l -x codex` snapshot as the CLI. CodexSwitch classifies
+  `app-server --listen stdio://` only from kernel-read argv after binding PID,
+  owner, start time, executable path, device, and inode. A full-command regex
+  must never decide whether the desktop participates in a swap.
 - **Mac CLI process identity:** after `ps` discovery, reclassify every candidate from its kernel-resolved executable path. Any executable inside a macOS `.app/Contents/` tree is an application or helper, not an interactive Codex CLI, even when an unquoted path segment such as `Codex Computer Use.app` makes the first whitespace-delimited token look like a `codex` binary.
 - **Mac coordinator readiness:** the signed `CodexSwitch.app` menu process owns
   Mac observation and host convergence; a separate `codexswitch-cli daemon`

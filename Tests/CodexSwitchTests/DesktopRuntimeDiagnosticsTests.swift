@@ -139,4 +139,20 @@ struct DesktopRuntimeDiagnosticsTests {
         #expect(port == 51234)
     }
 
+    @Test("desktop connector uses only identity-classified app-server PIDs")
+    func desktopConnectorUsesClassifiedPIDs() {
+        let lsofOutput = """
+        COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+        codex   34109 user   12u  IPv4 0x123456789abcdef0      0t0  TCP 127.0.0.1:51234 (LISTEN)
+        codex   90722 user   13u  IPv4 0x123456789abcdef1      0t0  TCP 127.0.0.1:61234 (LISTEN)
+        """
+
+        let port = DesktopAppConnector.discoverPort(
+            appServerPIDs: [34109],
+            lsofOutput: lsofOutput
+        )
+
+        #expect(port == 51234)
+    }
+
 }

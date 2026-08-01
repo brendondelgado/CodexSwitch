@@ -11,13 +11,11 @@ struct DesktopRuntimeDiagnostics: Sendable, Equatable {
 
     /// Runs bounded subprocess diagnostics synchronously; call off UI/main hot paths.
     nonisolated static func current() -> DesktopRuntimeDiagnostics {
-        let pgrepResult = ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-fl", "codex.*app-server"],
-            timeout: 3
+        let discovery = SwapEngine.desktopRuntimeDiscoverySnapshot(
+            from: SwapEngine.discoverCodexProcesses(),
+            requiredOwnerUID: UInt32(getuid())
         )
-        let processes = pgrepResult.timedOut ? [] : parseAppServerProcesses(fromPGrepOutput: pgrepResult.stdoutString)
-        let desktopProcess = processes.first { $0.classification == .desktopAppServer }
+        let desktopProcess = discovery.isComplete ? discovery.targets.first : nil
 
         let lsofResult = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/sbin/lsof"),
@@ -26,14 +24,17 @@ struct DesktopRuntimeDiagnostics: Sendable, Equatable {
         )
         let port = lsofResult.timedOut
             ? nil
-            : parseWebSocketPort(fromLsofOutput: lsofResult.stdoutString, appServerPID: desktopProcess?.pid)
+            : parseWebSocketPort(
+                fromLsofOutput: lsofResult.stdoutString,
+                appServerPID: desktopProcess?.process.identity.pid
+            )
 
         let teamIdentifier = codeSignatureTeamIdentifier(at: codexAppPath)
         let gatekeeperAccepted = spctlAccepts(path: codexAppPath)
 
         return DesktopRuntimeDiagnostics(
-            appServerPID: desktopProcess?.pid,
-            appServerPath: desktopProcess?.executablePath,
+            appServerPID: desktopProcess?.process.identity.pid,
+            appServerPath: desktopProcess?.process.kernelExecutableIdentity.canonicalPath,
             websocketPort: port,
             codexAppTeamIdentifier: teamIdentifier,
             codexAppAcceptedByGatekeeper: gatekeeperAccepted,
