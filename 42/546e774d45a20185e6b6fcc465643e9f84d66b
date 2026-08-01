@@ -1,0 +1,28 @@
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_8babf02b452471 1199-1214,1266-1269
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_8babf02b452471 1535-1538
+Tests/CodexSwitchTests/CodexDesktopNativeChildCoordinatorTests.swift
+  s_70c8e194852bb5::t_8babf02b452471 49,58-66
+  s_70c8e194852bb5::t_5935f841959a24 67
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_8babf02b452471 161-164,180-184,189-191
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_8babf02b452471 605-608
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "42546e774d45a20185e6b6fcc465643e9f84d66b",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
