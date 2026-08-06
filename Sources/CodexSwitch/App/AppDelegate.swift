@@ -3790,6 +3790,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                       activationGeneration: activationState.activationGeneration,
                       requiredPhase: .confirmed
                   ) != nil else {
+                await handleTokenRefreshFailure(
+                    account: account,
+                    error: PollerError.tokenExpired,
+                    shouldNotify: shouldNotifyRefreshFailure
+                )
                 return
             }
             let committed = await withPreparedActiveCredentialMutation(
@@ -5886,22 +5891,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             guard !self.isExiting else { return }
             guard self.automaticPolicyEvaluationIsCurrent(lease) else { return }
+            guard let activationState = await self.activationStateForRequest(
+                at: now,
+                policyAuthority: lease.authority
+            ), self.automaticPolicyEvaluationIsCurrent(lease) else {
+                return
+            }
+            guard activationState.phase == .confirmed else {
+                if AccountTerminalTokenRecoveryPolicy.allowsUnconfirmedSourceRecovery(
+                    trigger: trigger,
+                    configuredAccountId: self.accountManager.configuredAccount?.id,
+                    state: activationState
+                ), let replacement = SwapEngine.selectAutoSwapCandidate(
+                    from: self.accountManager.accounts,
+                    now: now
+                ) {
+                    let barrierDetail = activationState.detail?.rawValue ?? "none"
+                    SwapLog.append(.debug(
+                        "TERMINAL_TOKEN_RECOVERY_STARTED source=\(configured.email) target=\(replacement.email) barrier=\(activationState.phase.rawValue):\(barrierDetail)"
+                    ))
+                    self.executeSwap(
+                        from: configured,
+                        to: replacement,
+                        reason: .terminalTokenRecovery,
+                        automaticPolicyLease: lease
+                    )
+                    return
+                }
+                if self.automaticPolicyEvaluationIsCurrent(lease) {
+                    self.retryActivationConvergenceIfDue(at: now)
+                }
+                return
+            }
             let resetJournalIsReadable = await self.ensureRateLimitResetJournalStateIsReadable()
             guard self.automaticPolicyEvaluationIsCurrent(lease),
                   Self.rateLimitResetJournalAllowsAutomaticRouting(
                 isReadable: resetJournalIsReadable
             ) else {
-                return
-            }
-            guard let activationState = await self.activationStateForRequest(
-                at: now,
-                policyAuthority: lease.authority
-            ),
-                  self.automaticPolicyEvaluationIsCurrent(lease),
-                  activationState.phase == .confirmed else {
-                if self.automaticPolicyEvaluationIsCurrent(lease) {
-                    self.retryActivationConvergenceIfDue(at: now)
-                }
                 return
             }
             let activationGeneration = activationState.activationGeneration
@@ -6727,14 +6753,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         automaticPolicyLease: AccountAutomaticPolicyLease? = nil
     ) {
         guard !isExiting else { return }
-        let isManual: Bool
+        let bypassesConfirmedSourceRequirement: Bool
         switch reason {
-        case .manual:
-            isManual = true
+        case .manual, .terminalTokenRecovery:
+            bypassesConfirmedSourceRequirement = true
         default:
-            isManual = false
+            bypassesConfirmedSourceRequirement = false
         }
-        if !isManual {
+        if !bypassesConfirmedSourceRequirement {
             guard let automaticPolicyLease,
                   automaticPolicyEvaluationIsCurrent(automaticPolicyLease),
                   automaticPolicyLease.authority.authorizes() else {
@@ -6772,7 +6798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         Task { @MainActor [weak self] in
             guard let self, !self.isExiting else { return }
-            if !isManual {
+            if !bypassesConfirmedSourceRequirement {
                 guard let automaticPermit,
                       let automaticPolicyLease,
                       automaticPolicyLease.authority.authorizes(),
@@ -6789,8 +6815,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 targetAccountId: to.id,
                 expectedConfiguredAccountId: from.id,
                 source: "swap",
-                requestKind: isManual ? .manual : .automatic,
-                policyAuthority: isManual ? nil : automaticPolicyLease?.authority
+                requestKind: reason == .terminalTokenRecovery
+                    ? .terminalTokenRecovery
+                    : (reason == .manual ? .manual : .automatic),
+                policyAuthority: bypassesConfirmedSourceRequirement
+                    ? nil
+                    : automaticPolicyLease?.authority
             ) { [weak self] prepared in
                 guard let self else { return false }
                 return await self.executeSwapTransaction(
@@ -6824,7 +6854,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             return
         }
-        if reason != .manual {
+        let requiresConfirmedSource = reason != .manual
+            && reason != .terminalTokenRecovery
+        if requiresConfirmedSource {
             guard let automaticPermit,
                   let automaticPolicyLease,
                   automaticPolicyEvaluationIsCurrent(automaticPolicyLease),
@@ -6898,7 +6930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return
             }
 
-            if reason != .manual {
+            if requiresConfirmedSource {
                 guard let automaticPermit,
                       let automaticPolicyLease,
                       self.automaticPolicyEvaluationIsCurrent(automaticPolicyLease),
@@ -6915,7 +6947,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self.handlePoolAuthorityObservation(
                 acceptedObservation,
                 permitsConverging: true,
-                automaticPolicyLease: reason == .manual ? nil : automaticPolicyLease
+                automaticPolicyLease: requiresConfirmedSource
+                    ? automaticPolicyLease
+                    : nil
             )
         }
     }

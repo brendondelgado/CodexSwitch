@@ -268,6 +268,28 @@ enum AccountAutomaticPolicyGate {
     }
 }
 
+enum AccountTerminalTokenRecoveryPolicy {
+    static func allowsUnconfirmedSourceRecovery(
+        trigger: AccountAutomaticPolicyTrigger,
+        configuredAccountId: UUID?,
+        state: AccountActivationState?
+    ) -> Bool {
+        guard case .tokenInvalidated(let invalidatedAccountId) = trigger,
+              configuredAccountId == invalidatedAccountId,
+              state?.configuredAccountId == invalidatedAccountId else {
+            return false
+        }
+        switch state?.phase {
+        case .committedDegraded:
+            return true
+        case .manualReview:
+            return state?.detail == .durableConfigurationChanged
+        case .preparing, .confirmed, nil:
+            return false
+        }
+    }
+}
+
 enum AccountCredentialMutationPolicy {
     static func stillAllows(
         route: AccountCredentialMutationRoute,
@@ -308,6 +330,8 @@ enum AccountCredentialMutationPolicy {
             }
             let tokenInvalidated: Bool
             if case .tokenInvalidated = reason {
+                tokenInvalidated = true
+            } else if case .terminalTokenRecovery = reason {
                 tokenInvalidated = true
             } else {
                 tokenInvalidated = false

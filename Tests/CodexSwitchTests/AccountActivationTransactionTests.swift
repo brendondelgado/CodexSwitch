@@ -492,6 +492,60 @@ struct AccountActivationTransactionTests {
         ))
     }
 
+    @Test("Terminal token recovery bypasses only recoverable unconfirmed barriers")
+    func terminalTokenRecoveryBarrierPolicy() {
+        let accountId = UUID()
+        let other = UUID()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let degraded = AccountActivationState.committedDegraded(
+            targetAccountId: accountId,
+            detail: .runtimeAcknowledgementIncomplete,
+            activationGeneration: UUID(),
+            retryAttempt: 1,
+            nextRetryAt: now,
+            at: now
+        )
+        let recoverableReview = AccountActivationState.manualReview(
+            targetAccountId: accountId,
+            detail: .durableConfigurationChanged,
+            at: now
+        )
+        let unsafeReview = AccountActivationState.manualReview(
+            targetAccountId: accountId,
+            detail: .configuredFilesInconsistent,
+            at: now
+        )
+        let trigger = AccountAutomaticPolicyTrigger.tokenInvalidated(
+            accountId: accountId
+        )
+
+        #expect(AccountTerminalTokenRecoveryPolicy.allowsUnconfirmedSourceRecovery(
+            trigger: trigger,
+            configuredAccountId: accountId,
+            state: degraded
+        ))
+        #expect(AccountTerminalTokenRecoveryPolicy.allowsUnconfirmedSourceRecovery(
+            trigger: trigger,
+            configuredAccountId: accountId,
+            state: recoverableReview
+        ))
+        #expect(!AccountTerminalTokenRecoveryPolicy.allowsUnconfirmedSourceRecovery(
+            trigger: trigger,
+            configuredAccountId: accountId,
+            state: unsafeReview
+        ))
+        #expect(!AccountTerminalTokenRecoveryPolicy.allowsUnconfirmedSourceRecovery(
+            trigger: trigger,
+            configuredAccountId: other,
+            state: recoverableReview
+        ))
+        #expect(!AccountTerminalTokenRecoveryPolicy.allowsUnconfirmedSourceRecovery(
+            trigger: .routine,
+            configuredAccountId: accountId,
+            state: recoverableReview
+        ))
+    }
+
     @Test("Routine policy does not renew runtimes without an actionable mutation")
     @MainActor
     func automaticMutationDemandGatesRuntimeAuthorization() async {

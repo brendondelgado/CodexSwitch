@@ -55,9 +55,10 @@ enum AccountActivationRequestKind: Equatable, Sendable {
     case automatic
     case manual
     case poolAuthority
+    case terminalTokenRecovery
 
     var permitsOperatorRecovery: Bool {
-        self == .manual || self == .poolAuthority
+        self != .automatic
     }
 }
 
@@ -152,6 +153,10 @@ struct AccountActivationState: Codable, Equatable, Sendable {
                 if configuredAccountId == accountId,
                    detail.allowsManualSameTargetRetry {
                     return .retrySameTarget
+                }
+                if configuredAccountId != accountId,
+                   detail == .durableConfigurationChanged {
+                    return .beginActivation
                 }
             }
             return .blocked("Mac activation state needs manual review; account changes are paused")

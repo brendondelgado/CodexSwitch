@@ -691,8 +691,8 @@ struct AccountActivationStateTests {
         #expect(try await coordinator.load() == review)
     }
 
-    @Test("Durable readback review permits only same-target reconciliation")
-    func durableReadbackReviewPermitsOnlySameTargetRetry() async throws {
+    @Test("Durable readback review permits verified replacement recovery")
+    func durableReadbackReviewPermitsVerifiedReplacementRecovery() async throws {
         let url = temporaryJournalURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let target = UUID()
@@ -709,13 +709,18 @@ struct AccountActivationStateTests {
             forRequestedTarget: target,
             kind: .manual
         ) == .retrySameTarget)
-        guard case .blocked = review.decision(
+        #expect(review.decision(
             forRequestedTarget: replacement,
             kind: .manual
-        ) else {
-            Issue.record("Durable readback review must not authorize another account")
-            return
-        }
+        ) == .beginActivation)
+        #expect(review.decision(
+            forRequestedTarget: replacement,
+            kind: .poolAuthority
+        ) == .beginActivation)
+        #expect(review.decision(
+            forRequestedTarget: replacement,
+            kind: .terminalTokenRecovery
+        ) == .beginActivation)
         guard case .blocked = review.decision(
             forRequestedTarget: target,
             kind: .automatic

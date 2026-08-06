@@ -84,7 +84,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-08-01
+  last_updated: 2026-08-06
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -294,6 +294,16 @@ CLI swap and rotate commands must exit unsuccessfully when any discovered
 runtime is reported as skipped or unacknowledged. Writing auth state is not a
 successful hot swap, and callers must be able to distinguish configured state
 from runtime convergence using the process exit status.
+
+For the active-token-expiry adversarial case, seed a last-known healthy quota
+snapshot and then return HTTP 401 while activation is degraded. Verification
+must prove that CodexSwitch marks the expired generation unavailable, does not
+continue presenting the cached percentage as current, and selects only a
+fresh, credential-complete, quota-usable replacement. A
+`durable_configuration_changed` review may be superseded by that exact
+terminal-token recovery, an explicit account click, or a fresh pool-authority
+operation. Automatic routine policy and every other manual-review reason must
+remain blocked.
 
 If `swap` blocks while `lslocks` shows the daemon owning
 `accounts.json.lock`, inspect the daemon journal before retrying. Runtime ACK

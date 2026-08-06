@@ -68,7 +68,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-30
+  last_updated: 2026-08-06
 ---
 
 # Runtime And Host Ownership
@@ -317,6 +317,29 @@ The containing private directory is mode `0700`. Whole-file writes outside this 
 ## Activation Transaction
 
 Selection and activation are different phases. An activation succeeds only after the durable state and runtime agree.
+
+An expired active inference token is terminal evidence for that credential
+generation. If refresh cannot start because runtime confirmation is already
+degraded, the coordinator must not leave the last quota percentage displayed
+as live and silently return. It records the token generation as unusable and
+may replace it without source-runtime proof only when all of these conditions
+hold:
+
+- the invalidated account is still the uniquely configured source;
+- the activation barrier is `committed_degraded`, or is `manual_review` with
+  the recoverable `durable_configuration_changed` detail;
+- the replacement has complete, non-expiring credentials and a fresh usable
+  quota observation;
+- the normal account mutation lease, durable store/auth readback, and runtime
+  convergence transaction remain in force; and
+- when VPS authority is configured, a fresh authority operation selects the
+  replacement before the Mac changes credentials.
+
+This is a narrow terminal-token recovery path, not permission to clear an
+unknown or corrupt activation journal. Other manual-review reasons remain hard
+barriers. An explicit account click and a fresh pool-authority adoption may
+also supersede `durable_configuration_changed` through the same transaction;
+they must never require the operator to retry the dead source account first.
 
 Pool selection precedes host activation. When VPS authority is configured, a
 host activation transaction must carry the exact authority epoch and desired

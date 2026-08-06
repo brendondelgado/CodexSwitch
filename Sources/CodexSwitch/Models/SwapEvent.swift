@@ -10,6 +10,7 @@ struct SwapEvent: Codable, Sendable {
         case quotaExhausted
         case higherPlanAvailable
         case tokenInvalidated
+        case terminalTokenRecovery
         case usageUnavailable
         case manual
         case poolAuthority

@@ -96,6 +96,10 @@ struct AppDelegateSwapCommitTests {
             route: .swap,
             reason: .poolAuthority
         ))
+        #expect(!AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
+            route: .swap,
+            reason: .terminalTokenRecovery
+        ))
         #expect(AccountCredentialMutationRuntimePolicy.requiresSourceRuntimeEvidence(
             route: .swap,
             reason: .quotaExhausted
