@@ -625,8 +625,8 @@ fn merge_authority_preserving_accounts(
             continue;
         };
 
-        preserve_host_operational_state(account, existing);
-        merge_token_generation(account, existing)?;
+        let credential_generation = merge_token_generation(account, existing)?;
+        preserve_host_operational_state(account, existing, credential_generation);
     }
     if !incoming
         .iter()
@@ -644,18 +644,28 @@ fn merge_authority_preserving_accounts(
 fn preserve_host_operational_state(
     incoming: &mut account_store::CodexAccount,
     current: &account_store::CodexAccount,
+    credential_generation: CredentialGeneration,
 ) {
     incoming.quota_snapshot = current.quota_snapshot.clone();
     incoming.five_hour_primed_at = current.five_hour_primed_at.clone();
-    incoming.runtime_unusable_until = current.runtime_unusable_until;
-    incoming.runtime_unusable_reason = current.runtime_unusable_reason.clone();
+    if credential_generation != CredentialGeneration::Incoming {
+        incoming.runtime_unusable_until = current.runtime_unusable_until;
+        incoming.runtime_unusable_reason = current.runtime_unusable_reason.clone();
+    }
     incoming.rate_limit_reset_bank = current.rate_limit_reset_bank.clone();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialGeneration {
+    Matching,
+    Incoming,
+    Current,
 }
 
 fn merge_token_generation(
     incoming: &mut account_store::CodexAccount,
     current: &account_store::CodexAccount,
-) -> Result<()> {
+) -> Result<CredentialGeneration> {
     let incoming_complete = incoming.has_complete_token_material();
     let current_complete = current.has_complete_token_material();
     if !incoming_complete || !current_complete {
@@ -669,7 +679,7 @@ fn merge_token_generation(
         && incoming.access_token == current.access_token
         && incoming.refresh_token == current.refresh_token;
     if token_sets_match {
-        return Ok(());
+        return Ok(CredentialGeneration::Matching);
     }
 
     let preserve_current = if incoming.access_token == current.access_token {
@@ -696,8 +706,9 @@ fn merge_token_generation(
         incoming.access_token.clone_from(&current.access_token);
         incoming.refresh_token.clone_from(&current.refresh_token);
         incoming.last_refreshed.clone_from(&current.last_refreshed);
+        return Ok(CredentialGeneration::Current);
     }
-    Ok(())
+    Ok(CredentialGeneration::Incoming)
 }
 
 fn pool_authority_status(store_path: &Path, json: bool) -> Result<()> {
@@ -4847,10 +4858,14 @@ mod tests {
         current.access_token =
             account_store::test_inference_token(Utc::now() + ChronoDuration::days(10));
         current.refresh_token = "current-refresh".to_string();
+        current.runtime_unusable_reason = Some("token_expired".to_string());
+        current.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(30));
         let mut incoming = current.clone();
         incoming.access_token =
             account_store::test_inference_token(Utc::now() + ChronoDuration::hours(1));
         incoming.refresh_token = "stale-refresh".to_string();
+        incoming.runtime_unusable_reason = None;
+        incoming.runtime_unusable_until = None;
 
         let merged = merge_authority_preserving_accounts(
             vec![incoming],
@@ -4861,6 +4876,10 @@ mod tests {
 
         assert_eq!(active.access_token, current.access_token);
         assert_eq!(active.refresh_token, current.refresh_token);
+        assert_eq!(
+            active.runtime_unusable_reason.as_deref(),
+            Some("token_expired")
+        );
         Ok(())
     }
 
@@ -4870,10 +4889,14 @@ mod tests {
         current.access_token =
             account_store::test_inference_token(Utc::now() + ChronoDuration::hours(1));
         current.refresh_token = "old-refresh".to_string();
+        current.runtime_unusable_reason = Some("token_expired".to_string());
+        current.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(30));
         let mut incoming = current.clone();
         incoming.access_token =
             account_store::test_inference_token(Utc::now() + ChronoDuration::days(10));
         incoming.refresh_token = "new-refresh".to_string();
+        incoming.runtime_unusable_reason = None;
+        incoming.runtime_unusable_until = None;
 
         let merged = merge_authority_preserving_accounts(
             vec![incoming.clone()],
@@ -4884,6 +4907,35 @@ mod tests {
 
         assert_eq!(active.access_token, incoming.access_token);
         assert_eq!(active.refresh_token, incoming.refresh_token);
+        assert_eq!(active.runtime_unusable_reason, None);
+        assert_eq!(active.runtime_unusable_until, None);
+        Ok(())
+    }
+
+    #[test]
+    fn credential_bundle_merge_preserves_block_for_matching_generation() -> Result<()> {
+        let mut current = account("active@example.com", true, 10.0, 10.0);
+        current.runtime_unusable_reason = Some("token_expired".to_string());
+        current.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(30));
+        let mut incoming = current.clone();
+        incoming.runtime_unusable_reason = None;
+        incoming.runtime_unusable_until = None;
+
+        let merged = merge_authority_preserving_accounts(
+            vec![incoming],
+            std::slice::from_ref(&current),
+            &current.account_id,
+        )?;
+        let active = active_account(&merged).unwrap();
+
+        assert_eq!(
+            active.runtime_unusable_reason.as_deref(),
+            Some("token_expired")
+        );
+        assert_eq!(
+            active.runtime_unusable_until,
+            current.runtime_unusable_until
+        );
         Ok(())
     }
 

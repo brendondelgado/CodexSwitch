@@ -24,7 +24,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-27
+  last_updated: 2026-08-11
 ---
 
 # Credential Bundle Format
@@ -180,6 +180,16 @@ are opened as new regular files with mode `0600`; permissions are restrictive
 from creation rather than repaired after writing. Local cleanup must verify the
 path is absent. A failed removal or failed absence check is observable and keeps
 the operation held.
+
+Authority-preserving import compares complete credential generations before it
+merges host-local operational state. Quota snapshots, primer timestamps, and
+reset inventory remain owned by the receiving host. A matching or older
+incoming credential generation also preserves that host's runtime blocker. A
+strictly newer incoming generation instead carries its own runtime-blocker
+state, because a blocker observed against the replaced generation must not make
+freshly reauthenticated credentials appear to require login. Generation order
+must remain provable from inference-token expiry; malformed or unordered
+divergent generations fail closed.
 
 ## Reconciliation and Retry
 
