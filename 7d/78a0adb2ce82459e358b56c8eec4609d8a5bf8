@@ -1,0 +1,24 @@
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_7bf294e6e10f33 628-629,647,651-654,658-664,668,682,709,711
+  s_70c8e194852bb5::t_b197c7dc70e5b9 4861-4862,4867-4868,4879-4882,4892-4893,4898-4899,4910-4937
+  s_70c8e194852bb5::t_01a3f58ca2ab9a 4938
+docs/architecture/credential-bundle-format.md
+  s_70c8e194852bb5::t_7bf294e6e10f33 27,184-192
+  s_70c8e194852bb5::t_dc90a319613a77 193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "7d78a0adb2ce82459e358b56c8eec4609d8a5bf8",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
