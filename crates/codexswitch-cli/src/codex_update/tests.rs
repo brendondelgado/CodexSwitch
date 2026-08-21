@@ -2186,8 +2186,12 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
             &in_process,
             r#"async fn run(args: InProcessStartArgs) {
     let auth_manager =
-            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)
-                .await;
+        AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)
+            .await
+            .map_err(IoError::other)?;
+    let runtime_handle = tokio::spawn(async move {
+        let processor = MessageProcessor::new(auth_manager.clone());
+    });
 }
 "#,
         )?;
@@ -2204,6 +2208,17 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         let processor_index = patched_app_server.find("let processor_handle").unwrap();
         assert!(shared_auth_index < reload_index);
         assert!(reload_index < processor_index);
+
+        let patched_in_process = fs::read_to_string(&in_process)?;
+        let local_auth_index = patched_in_process
+            .find("AuthManager::shared_from_config")
+            .unwrap();
+        let local_reload_index = patched_in_process
+            .find("SIGHUP: auth reload signal received by in-process app-server")
+            .unwrap();
+        let runtime_index = patched_in_process.find("let runtime_handle").unwrap();
+        assert!(local_auth_index < local_reload_index);
+        assert!(local_reload_index < runtime_index);
 
         for path in [&app_server, &in_process] {
             let patched = fs::read_to_string(path)?;

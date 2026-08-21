@@ -524,9 +524,12 @@ fn patch_app_server_reload_template(
         uses_timestamped_server_notifications,
     )?;
     if in_process_app_server.exists() {
-        patch_file_after_notification_aware(
+        patch_file_after_any_notification_aware(
             &in_process_app_server,
-            "let auth_manager =\n            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n                .await;",
+            &[
+                "let auth_manager =\n            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n                .await;",
+                "let auth_manager =\n        AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n            .await\n            .map_err(IoError::other)?;",
+            ],
             r#"
         #[cfg(unix)]
         {
