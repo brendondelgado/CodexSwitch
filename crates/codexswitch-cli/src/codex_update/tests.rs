@@ -2190,8 +2190,7 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
             .await
             .map_err(IoError::other)?;
     let runtime_handle = tokio::spawn(async move {
-        let (outgoing_tx, outgoing_rx) =
-            mpsc::channel::<OutgoingEnvelope>(channel_capacity);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
         let processor = MessageProcessor::new(auth_manager.clone());
     });
 }
