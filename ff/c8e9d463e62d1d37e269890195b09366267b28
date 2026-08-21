@@ -1,0 +1,27 @@
+scripts/test_linux_runtime_artifact.py
+  s_70c8e194852bb5::t_bdae92e2245f4e 12,221-240
+  s_70c8e194852bb5::t_7d5b5a49addfc1 241
+.github/workflows/build-linux-runtime.yml
+  s_70c8e194852bb5::t_066b6b7f96b7a6 147,403,426,438-501,562-573
+  s_70c8e194852bb5::t_bdae92e2245f4e 845,876-878
+  s_70c8e194852bb5::t_dc1ef9fd7cbc50 879
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_bdae92e2245f4e 74,162-169
+  s_70c8e194852bb5::t_d7d67ce17cb1d8 170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "ffc8e9d463e62d1d37e269890195b09366267b28",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
