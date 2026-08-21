@@ -29,7 +29,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-25
+  last_updated: 2026-08-21
 ---
 
 # Remote macOS Runtime Build
@@ -45,7 +45,11 @@ executables described by the
 The workflow builds `codexswitch-cli` from the exact CodexSwitch commit selected
 by the dispatch event. A workflow-only patch driver then applies that commit's
 existing v3 source transformations to the exact upstream `rust-v<version>` tag
-before Cargo builds the Codex runtime pair.
+before Cargo builds the patched Codex CLI. The companion
+`codex-code-mode-host` comes from the official arm64 archive attached to that
+same exact upstream release. The workflow admits it only after checking the
+release tag, unique asset name, GitHub SHA-256 digest, byte count, canonical
+download URL, and exact one-file archive inventory.
 
 ## Safety Boundary
 
@@ -88,8 +92,12 @@ CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 CARGO_INCREMENTAL=0
 ```
 
-The Codex runtime build names both packages in one Cargo invocation:
-`codex-cli` and `codex-code-mode-host`. The ephemeral checkout and build targets
+The Codex runtime Cargo build names only `codex-cli`. Building
+`codex-code-mode-host` would also build its embedded V8 dependency, even though
+OpenAI publishes the matching release helper as a separate official asset; on
+some releases the corresponding `rusty_v8` runner archive does not exist. The
+workflow therefore downloads and digest-verifies that exact official helper
+instead of rebuilding V8. The ephemeral checkout, archive, and build targets
 are not uploaded. Two jobs keep compilation bounded while using the remote
 runner's available cores; this setting never causes a local Mac build.
 

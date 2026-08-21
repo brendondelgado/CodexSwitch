@@ -29,7 +29,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-28
+  last_updated: 2026-08-21
 ---
 
 # macOS Runtime Artifact
@@ -37,10 +37,15 @@ version_control:
 ## Purpose
 
 A complete macOS hot-swap runtime has three coupled executables: `codex`,
-`codex-code-mode-host`, and `codexswitch-cli`. They are built from one exact
-CodexSwitch commit on native Apple Silicon, transferred as one artifact, staged
-as one immutable generation, and activated by one journaled transaction. Mixing
-one new executable with an older member is prohibited.
+`codex-code-mode-host`, and `codexswitch-cli`. The patched `codex` and
+`codexswitch-cli` executables are built from one exact CodexSwitch commit on
+native Apple Silicon. The code-mode host is the official arm64 asset from the
+same exact upstream `rust-v<version>` release as `codex`; the workflow requires
+GitHub's SHA-256 asset digest, exact URL, byte count, and one-file archive
+inventory before admitting it. The three executables are transferred as one
+attested artifact, staged as one immutable generation, and activated by one
+journaled transaction. Mixing members from different upstream releases or
+unverified helper assets is prohibited.
 
 ## App Artifact Boundary
 
@@ -74,7 +79,12 @@ The native artifact workflow must compile and run the complete Swift app test
 suite before building any release executable. It also runs the Python patcher,
 bundle-builder, and artifact-installer contract suites before preparing release
 dependencies. Release compilation uses two bounded Cargo jobs on the remote
-native runner. Test execution remains explicitly non-parallel because the suite
+native runner. Cargo builds only the patched `codex-cli` upstream package. The
+official `codex-code-mode-host` release asset is used because that package's
+embedded V8 archive is independently published by upstream and may not exist
+for the runner's current Rust/V8 build tuple. This avoids an unnecessary V8
+compilation while retaining exact release and digest binding. Test execution
+remains explicitly non-parallel because the suite
 exercises shared process state, subprocess admission, signal delivery, and
 updater leases.
 Swift Testing executes tests concurrently by default; limiting SwiftPM build

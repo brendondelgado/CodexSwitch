@@ -8,6 +8,7 @@ toc:
   - Authenticated Payload Consistency
   - Key Derivation
   - Import Rules
+  - Authority-Preserving Import Receipt
   - Compatibility
   - Remote Mutation Transport
   - Durable Credential Sync Operations
@@ -24,7 +25,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-08-11
+  last_updated: 2026-08-21
 ---
 
 # Credential Bundle Format
@@ -116,6 +117,68 @@ platform API permits and never logs credentials, salts, ciphertext, or derived
 keys. Interactive passphrase entry disables terminal echo before reading and
 restores the original terminal attributes on success, error, and unwind.
 
+## Authority-Preserving Import Receipt
+
+An automatic Mac `update-bundle --preserve-active` operation must bind the
+import to the Mac journal's canonical operation identifier and request a
+versioned JSON import receipt. A successful process exit or equality with the
+incoming bundle fingerprint is not sufficient post-import evidence.
+
+The importer computes the receipt while it owns the runtime activation lease
+and account-store lock. The token-free receipt contains:
+
+- the schema version and canonical operation identifier;
+- the pre-import VPS complete credential-set fingerprint;
+- the validated incoming bundle's complete credential-set fingerprint;
+- the committed merged complete credential-set fingerprint;
+- the committed account-identity fingerprint, active provider identifier, and
+  active complete-token hash prefix;
+- one sorted merge decision for every provider account: `incoming`, `matching`,
+  or `current`.
+
+The receipt never contains raw tokens, emails, bundle bytes, passphrases, quota
+state, reset state, or private-key material. It is emitted only after the
+account-store/auth transaction and required runtime convergence complete. The
+receipt option is therefore mechanically incompatible with file-only import.
+The Mac accepts it only when the operation identifier, pre-import fingerprint,
+incoming fingerprint, expected identities, active target, decision count, and
+all field formats match its existing durable operation. The accepted receipt
+is then persisted in that operation's token-free journal record before the Mac
+performs post-import read-back.
+
+Stable post-import evidence must equal the receipt's committed fingerprint and
+committed active evidence exactly. This permits one legitimate result that the
+old two-fingerprint protocol could not represent: the incoming Mac bundle is
+merged while one or more strictly newer VPS credential generations are
+preserved. It does not permit an arbitrary changed fingerprint. A missing,
+malformed, unbound, incomplete, or internally inconsistent receipt proves
+nothing and fails closed.
+
+The receipt is evidence, not reverse credential replication. It may report that
+the VPS preserved a newer inactive generation, but it contains no token material
+and cannot repair the older Mac generation. A future VPS-to-Mac recovery design
+requires its own authenticated encrypted transport, authority rules, durable
+operation, exact-generation receipt, and runtime-convergence proof; this import
+protocol must not silently turn its token-free response into a secret export.
+
+If transport becomes outcome-unknown before the Mac durably records a valid
+receipt, reconciliation may still accept the exact precomputed incoming state:
+that state proves no destination generation was preserved. Any other changed
+state is an unproven merge and must retain the hold. Once a valid receipt has been recorded,
+process-replacement reconciliation may classify the operation as committed
+only when stable remote evidence exactly matches that receipt. The pre-import
+baseline is safe to retry only when no accepted receipt exists.
+
+After successful reconciliation, the Mac retains a bounded token-free
+convergence proof derived from the validated receipt. Periodic authority checks
+may suppress another import only while the current Mac credential fingerprint,
+incoming complete credential-set fingerprint, account identities, active
+provider, and stable VPS evidence all exactly match that proof. Any local or
+remote drift invalidates the no-op decision and returns to the normal import
+protocol. This prevents a preserved newer inactive VPS generation from causing
+a successful import every minute without treating the receipt as credential
+replication.
+
 ## Compatibility
 
 New exports are version 2 only. Legacy encrypted version 1 `.csbundle`, `.age`,
@@ -159,9 +222,9 @@ operation identifier, a target-host fingerprint, the local credential-state
 fingerprint, expected non-secret account-identity and complete credential-set
 fingerprints, the expected authority epoch and desired provider account
 identifier, the expected active token-hash prefix, the pre-mutation remote
-evidence, the derived staging paths, timestamps, phase, and a human-readable
-reason. Raw tokens, bundle bytes, passphrases, emails, and private keys are
-forbidden from the journal.
+evidence, an optional validated import receipt, the derived staging paths,
+timestamps, phase, and a human-readable reason. Raw tokens, bundle bytes,
+passphrases, emails, and private keys are forbidden from the journal.
 
 The operation identifier owns both local and remote staging paths. A crash,
 forced exit, or relaunch with a `pending` record is therefore outcome-unknown;
@@ -188,8 +251,9 @@ incoming credential generation also preserves that host's runtime blocker. A
 strictly newer incoming generation instead carries its own runtime-blocker
 state, because a blocker observed against the replaced generation must not make
 freshly reauthenticated credentials appear to require login. Generation order
-must remain provable from inference-token expiry; malformed or unordered
-divergent generations fail closed.
+must remain provable from inference-token expiry. Divergent access-token sets
+with equal expiry are not ordered; malformed, equal-expiry, or otherwise
+unordered divergent generations fail closed.
 
 ## Reconciliation and Retry
 
@@ -197,12 +261,16 @@ A held operation has one clear path: read-only reconciliation of that same
 operation. Reconciliation first proves that its remote staging path is absent,
 then reads remote auth diagnostics and token-free account evidence. The evidence
 includes a one-way fingerprint over every account's provider identifier, full
-token tuple, and active flag; raw credentials never leave the VPS. It may
-classify the operation as committed only when that complete credential-set
-fingerprint, authority epoch and desired provider identifier, active token-hash
-prefix, auth/store agreement, and account-identity fingerprint all match the
-journal. Credential-file active flags must agree with the authority-selected
-VPS identity, but they cannot establish authority by themselves.
+token tuple, and active flag; raw credentials never leave the VPS. With an
+accepted receipt, it may classify the operation as committed only when the
+receipt is still valid for the journal and the complete credential-set
+fingerprint, desired provider identifier, active token-hash prefix, auth/store
+agreement, and account-identity fingerprint exactly match the receipt's
+committed state. Without a receipt, the exact intended incoming state proves a
+non-divergent commit, while the unchanged pre-import baseline establishes that
+a retry is safe. Any other state cannot prove a merged commit. Credential-file active flags must agree with the
+authority-selected VPS identity, but they cannot establish authority by
+themselves.
 Remote account-state output reconstructs only the explicit status fields,
 recursively removes token-named members from nested status objects, and fails
 closed before writing stdout if any raw credential value would otherwise

@@ -147,7 +147,7 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         normalize = workflow.index("Normalize patched upstream source mtimes")
         abi = workflow.index("Derive exact upstream target cache ABI")
         restore = workflow.index("Restore exact upstream Cargo target cache")
-        build = workflow.index("Build the patched Codex runtime pair")
+        build = workflow.index("Build the patched Codex CLI runtime")
 
         self.assertLess(patches, normalize)
         self.assertLess(normalize, abi)
@@ -192,7 +192,7 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         control = workflow.index("Build the CodexSwitch control plane")
         patch_driver = workflow.index("Compile the exact-commit source patch driver")
         control_block = workflow[control:patch_driver]
-        upstream_build = workflow.index("Build the patched Codex runtime pair")
+        upstream_build = workflow.index("Build the patched Codex CLI runtime")
         revalidation = workflow.index("Revalidate both source trees after compilation")
         upstream_build_block = workflow[upstream_build:revalidation]
 
@@ -273,6 +273,33 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
             abi_block,
         )
         self.assertIn('shasum -a 256 "$abi_input"', abi_block)
+        self.assertIn("cargoPackages=codex-cli", abi_block)
+        self.assertNotIn("cargoPackages=codex-cli,codex-code-mode-host", abi_block)
+
+    def test_workflow_uses_digest_verified_official_code_mode_host(self) -> None:
+        workflow = WORKFLOW.read_text()
+        build = workflow.index("Build the patched Codex CLI runtime")
+        fetch = workflow.index("Fetch the exact official code-mode host")
+        revalidation = workflow.index("Revalidate both source trees after compilation")
+        build_block = workflow[build:fetch]
+        fetch_block = workflow[fetch:revalidation]
+
+        self.assertIn("-p codex-cli", build_block)
+        self.assertNotIn("-p codex-code-mode-host", build_block)
+        self.assertIn(
+            'helper_asset_name="codex-code-mode-host-${TARGET_TRIPLE}.tar.gz"',
+            fetch_block,
+        )
+        self.assertIn('release_tag="rust-v${UPSTREAM_CODEX_VERSION}"', fetch_block)
+        self.assertIn('gh api "/repos/openai/codex/releases/tags/${release_tag}"', fetch_block)
+        self.assertIn('test("^sha256:[0-9a-f]{64}$")', fetch_block)
+        self.assertIn('shasum -a 256 "$helper_archive"', fetch_block)
+        self.assertIn('tar -tzf "$helper_archive"', fetch_block)
+        self.assertIn(
+            '"codex-code-mode-host-${TARGET_TRIPLE}"',
+            fetch_block,
+        )
+        self.assertIn('curl --proto \'=https\' --tlsv1.2 --fail --location', fetch_block)
 
     def test_workflow_saves_target_only_after_all_release_evidence(self) -> None:
         workflow = WORKFLOW.read_text()
@@ -343,7 +370,7 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
 
     def test_source_patch_updates_direct_dependencies_and_lockfile_together(self) -> None:
         workflow = WORKFLOW.read_text()
-        build_step = workflow.index("Build the patched Codex runtime pair")
+        build_step = workflow.index("Build the patched Codex CLI runtime")
         revalidation_step = workflow.index("Revalidate both source trees after compilation")
         build_contract = workflow[build_step:revalidation_step]
         source_patching = SOURCE_PATCHING.read_text()

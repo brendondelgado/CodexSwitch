@@ -6,6 +6,7 @@ import Darwin
 
 private let logger = Logger(subsystem: "com.codexswitch", category: "AppDelegate")
 private let linuxDevboxLastCredentialSyncFingerprintKey = "linuxDevboxLastCredentialSyncFingerprint"
+private let linuxDevboxCredentialConvergenceProofKey = "linuxDevboxCredentialConvergenceProof"
 private let linuxDevboxCredentialSyncUnresolvedFingerprintKey = "linuxDevboxCredentialSyncUnresolvedFingerprint"
 private let linuxDevboxCredentialSyncUnresolvedReasonKey = "linuxDevboxCredentialSyncUnresolvedReason"
 
@@ -3056,6 +3057,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         pendingLinuxDevboxCredentialSyncFingerprint = nil
         let authorityObservation = accountManager.poolAuthorityObservation
         let journal = linuxDevboxCredentialSyncJournal
+        let priorConvergenceProof = LinuxDevboxMonitor.decodeCredentialConvergenceProof(
+            UserDefaults.standard.data(forKey: linuxDevboxCredentialConvergenceProofKey)
+        )
         let deferSync: @MainActor @Sendable () -> Void = { [weak self] in
             self?.deferLinuxDevboxCredentialSync(
                 fingerprint: fingerprint,
@@ -3064,11 +3068,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         let finishSync: @MainActor @Sendable (
             Result<String, LinuxDevboxMonitorFailure>,
-            String
-        ) -> Void = { [weak self] result, completedFingerprint in
+            String,
+            LinuxDevboxCredentialConvergenceProof?
+        ) -> Void = { [weak self] result, completedFingerprint, convergenceProof in
             self?.finishLinuxDevboxCredentialSync(
                 result: result,
                 fingerprint: completedFingerprint,
+                convergenceProof: convergenceProof,
                 accountsCount: accounts.count,
                 context: context
             )
@@ -3087,7 +3093,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .success(let evidence):
                 baseline = evidence
             case .failure(let failure):
-                await finishSync(.failure(failure), fingerprint)
+                await finishSync(.failure(failure), fingerprint, nil)
                 return
             }
 
@@ -3105,7 +3111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .success(let value):
                 synchronizedAccounts = value
             case .failure(let failure):
-                await finishSync(.failure(failure), fingerprint)
+                await finishSync(.failure(failure), fingerprint, nil)
                 return
             }
             let synchronizedFingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(
@@ -3117,7 +3123,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ) {
                 await finishSync(
                     .success("credentials already converged"),
-                    synchronizedFingerprint
+                    synchronizedFingerprint,
+                    nil
+                )
+                return
+            }
+            if let priorConvergenceProof,
+               LinuxDevboxMonitor.credentialConvergenceProofMatches(
+                   priorConvergenceProof,
+                   accounts: synchronizedAccounts,
+                   credentialFingerprint: synchronizedFingerprint,
+                   observed: baseline
+               ) {
+                await finishSync(
+                    .success("credentials already converged with exact import proof"),
+                    synchronizedFingerprint,
+                    priorConvergenceProof
                 )
                 return
             }
@@ -3132,7 +3153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case .success(let value):
                 operation = value
             case .failure(let failure):
-                await finishSync(.failure(failure), synchronizedFingerprint)
+                await finishSync(.failure(failure), synchronizedFingerprint, nil)
                 return
             }
 
@@ -3144,15 +3165,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         message: "Credential-sync journal could not be committed; no remote mutation was attempted: \(error.localizedDescription)",
                         credentialSyncDisposition: .rejected
                     )),
-                    synchronizedFingerprint
+                    synchronizedFingerprint,
+                    nil
                 )
                 return
             }
 
+            var acceptedReceipt: LinuxDevboxCredentialImportReceipt?
             var result = LinuxDevboxMonitor.syncCredentials(
                 settings: settings,
                 accounts: synchronizedAccounts,
-                operation: operation
+                operation: operation,
+                recordImportReceipt: { receipt in
+                    try journal.recordImportReceipt(
+                        operationID: operation.operationID,
+                        receipt: receipt
+                    )
+                    acceptedReceipt = receipt
+                }
             )
             do {
                 switch result {
@@ -3173,7 +3203,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ))
             }
 
-            await finishSync(result, synchronizedFingerprint)
+            let convergenceProof = acceptedReceipt.flatMap {
+                LinuxDevboxMonitor.credentialConvergenceProof(
+                    credentialFingerprint: synchronizedFingerprint,
+                    operation: operation,
+                    receipt: $0
+                )
+            }
+            await finishSync(result, synchronizedFingerprint, convergenceProof)
         }
     }
 
@@ -3189,6 +3226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func finishLinuxDevboxCredentialSync(
         result: Result<String, LinuxDevboxMonitorFailure>,
         fingerprint: String,
+        convergenceProof: LinuxDevboxCredentialConvergenceProof?,
         accountsCount: Int,
         context: String
     ) {
@@ -3197,6 +3235,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         switch result {
         case .success(let output):
             UserDefaults.standard.set(fingerprint, forKey: linuxDevboxLastCredentialSyncFingerprintKey)
+            if let convergenceProof,
+               let encoded = LinuxDevboxMonitor.encodeCredentialConvergenceProof(convergenceProof) {
+                UserDefaults.standard.set(
+                    encoded,
+                    forKey: linuxDevboxCredentialConvergenceProofKey
+                )
+            } else {
+                UserDefaults.standard.removeObject(
+                    forKey: linuxDevboxCredentialConvergenceProofKey
+                )
+            }
             clearLegacyLinuxDevboxCredentialSyncHold()
             pendingLinuxDevboxCredentialSyncFingerprint = nil
             Task {
@@ -3303,6 +3352,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 operation.credentialFingerprint,
                 forKey: linuxDevboxLastCredentialSyncFingerprintKey
             )
+            if let receipt = operation.importReceipt,
+               let proof = LinuxDevboxMonitor.credentialConvergenceProof(
+                   credentialFingerprint: operation.credentialFingerprint,
+                   operation: operation,
+                   receipt: receipt
+               ),
+               let encoded = LinuxDevboxMonitor.encodeCredentialConvergenceProof(proof) {
+                UserDefaults.standard.set(
+                    encoded,
+                    forKey: linuxDevboxCredentialConvergenceProofKey
+                )
+            }
             clearLegacyLinuxDevboxCredentialSyncHold()
             SwapLog.append(.debug(
                 "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=committed"

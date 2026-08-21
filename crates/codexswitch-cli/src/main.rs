@@ -113,6 +113,13 @@ enum Command {
         /// Keep this host's current active provider account authoritative.
         #[arg(long)]
         preserve_active: bool,
+        /// Bind a token-free JSON receipt to this automatic sync operation.
+        #[arg(
+            long,
+            value_parser = parse_canonical_uuid,
+            conflicts_with = "offline_file_only"
+        )]
+        receipt_operation_id: Option<Uuid>,
         /// Commit and verify store/auth while an operator-proven runtime is idle.
         #[arg(long)]
         offline_file_only: bool,
@@ -328,12 +335,14 @@ fn main() -> Result<()> {
             ignore_expiry,
             offline_file_only,
             false,
+            None,
             "Imported",
         ),
         Command::UpdateBundle {
             bundle,
             ignore_expiry,
             preserve_active,
+            receipt_operation_id,
             offline_file_only,
         } => import_accounts(
             &bundle,
@@ -342,6 +351,7 @@ fn main() -> Result<()> {
             ignore_expiry,
             offline_file_only,
             preserve_active,
+            receipt_operation_id,
             "Updated",
         ),
         Command::Status => status(&store_path),
@@ -494,19 +504,29 @@ fn import_accounts(
     ignore_expiry: bool,
     offline_file_only: bool,
     preserve_active: bool,
+    receipt_operation_id: Option<Uuid>,
     verb: &str,
 ) -> Result<()> {
+    if receipt_operation_id.is_some() && !preserve_active {
+        bail!("an import receipt requires --preserve-active");
+    }
+    if receipt_operation_id.is_some() && offline_file_only {
+        bail!("an import receipt requires runtime convergence");
+    }
     let imported_accounts = prepare_import_bundle(bundle, ignore_expiry)?;
-    let (account_count, outcome) = replace_import_accounts_with_unlocked_reload(
+    let (account_count, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
         store_path,
         auth_path,
         imported_accounts,
         preserve_active,
+        receipt_operation_id,
         !offline_file_only,
         &reload_codex_hot_swap_processes,
     )?;
     require_rotation_activation(outcome, !offline_file_only)?;
-    if offline_file_only {
+    if let Some(receipt) = receipt {
+        println!("{}", serde_json::to_string(&receipt)?);
+    } else if offline_file_only {
         println!(
             "Prepared {} account(s) in file-only mode; runtime convergence is pending for {}",
             account_count,
@@ -528,12 +548,19 @@ fn replace_import_accounts_with_unlocked_reload<R>(
     auth_path: &Path,
     imported_accounts: Vec<account_store::CodexAccount>,
     preserve_active: bool,
+    receipt_operation_id: Option<Uuid>,
     reload_enabled: bool,
     reload: &R,
-) -> Result<(usize, ActivationOutcome)>
+) -> Result<(usize, ActivationOutcome, Option<CredentialImportReceipt>)>
 where
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
+    if receipt_operation_id.is_some() && !preserve_active {
+        bail!("an import receipt requires authority-preserving merge semantics");
+    }
+    if receipt_operation_id.is_some() && !reload_enabled {
+        bail!("an import receipt requires runtime convergence");
+    }
     let runtime_lease = acquire_runtime_activation_lease(store_path)?;
     if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
@@ -568,20 +595,43 @@ where
         None
     };
 
-    let (account_count, prepared) = {
+    let incoming_credential_set_fingerprint = receipt_operation_id
+        .map(|_| complete_credential_set_fingerprint(&imported_accounts))
+        .transpose()?;
+    let (account_count, prepared, receipt) = {
         let store_lock = lock_account_store(store_path)?;
         let snapshot = store_lock.load()?;
         let mut stored_accounts = snapshot.accounts;
-        let replacement_accounts = if let Some(authority_target) = authority_target.as_deref() {
-            merge_authority_preserving_accounts(
-                imported_accounts,
-                &stored_accounts,
-                authority_target,
-            )?
-        } else {
-            imported_accounts
-        };
+        let baseline_credential_set_fingerprint = receipt_operation_id
+            .map(|_| complete_credential_set_fingerprint(&stored_accounts))
+            .transpose()?;
+        let (replacement_accounts, credential_selections) =
+            if let Some(authority_target) = authority_target.as_deref() {
+                let merged = merge_authority_preserving_accounts(
+                    imported_accounts,
+                    &stored_accounts,
+                    authority_target,
+                )?;
+                (merged.accounts, merged.selections)
+            } else {
+                (imported_accounts, Vec::new())
+            };
         let account_count = replacement_accounts.len();
+        let receipt = receipt_operation_id
+            .map(|operation_id| {
+                build_credential_import_receipt(
+                    operation_id,
+                    baseline_credential_set_fingerprint
+                        .as_deref()
+                        .context("import receipt baseline fingerprint is missing")?,
+                    incoming_credential_set_fingerprint
+                        .as_deref()
+                        .context("import receipt incoming fingerprint is missing")?,
+                    &replacement_accounts,
+                    credential_selections,
+                )
+            })
+            .transpose()?;
         let mut generation = snapshot.generation;
         let outcome = replace_accounts_with_under_runtime_lease(
             &runtime_lease,
@@ -593,11 +643,11 @@ where
             false,
             |_| bail!("runtime reload was requested during locked import preparation"),
         )?;
-        (account_count, outcome)
+        (account_count, outcome, receipt)
     };
 
     if !reload_enabled || !prepared.is_file_only() {
-        return Ok((account_count, prepared));
+        return Ok((account_count, prepared, receipt));
     }
     let outcome = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
@@ -607,26 +657,35 @@ where
         reload,
     )?
     .context("import activation disappeared before runtime convergence")?;
-    Ok((account_count, outcome))
+    Ok((account_count, outcome, receipt))
 }
 
 fn merge_authority_preserving_accounts(
     mut incoming: Vec<account_store::CodexAccount>,
     current: &[account_store::CodexAccount],
     authority_target: &str,
-) -> Result<Vec<account_store::CodexAccount>> {
+) -> Result<AuthorityPreservingMerge> {
     validate_accounts(&incoming).context("incoming credential bundle is invalid")?;
+    let mut selections = Vec::with_capacity(incoming.len());
     for account in &mut incoming {
         account.is_active = account.account_id == authority_target;
         let Some(existing) = current
             .iter()
             .find(|candidate| candidate.account_id == account.account_id)
         else {
+            selections.push(CredentialImportSelection {
+                provider_account_id: account.account_id.clone(),
+                generation: CredentialGeneration::Incoming,
+            });
             continue;
         };
 
         let credential_generation = merge_token_generation(account, existing)?;
         preserve_host_operational_state(account, existing, credential_generation);
+        selections.push(CredentialImportSelection {
+            provider_account_id: account.account_id.clone(),
+            generation: credential_generation,
+        });
     }
     if !incoming
         .iter()
@@ -638,7 +697,11 @@ fn merge_authority_preserving_accounts(
         );
     }
     validate_accounts(&incoming).context("authority-preserving credential merge is invalid")?;
-    Ok(incoming)
+    selections.sort_by(|left, right| left.provider_account_id.cmp(&right.provider_account_id));
+    Ok(AuthorityPreservingMerge {
+        accounts: incoming,
+        selections,
+    })
 }
 
 fn preserve_host_operational_state(
@@ -655,11 +718,115 @@ fn preserve_host_operational_state(
     incoming.rate_limit_reset_bank = current.rate_limit_reset_bank.clone();
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum CredentialGeneration {
     Matching,
     Incoming,
     Current,
+}
+
+#[derive(Debug, Clone)]
+struct AuthorityPreservingMerge {
+    accounts: Vec<account_store::CodexAccount>,
+    selections: Vec<CredentialImportSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialImportSelection {
+    provider_account_id: String,
+    generation: CredentialGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialImportReceipt {
+    version: u32,
+    operation_id: Uuid,
+    account_count: usize,
+    baseline_credential_set_fingerprint: String,
+    incoming_credential_set_fingerprint: String,
+    committed_credential_set_fingerprint: String,
+    committed_account_identity_fingerprint: String,
+    active_provider_account_id: String,
+    active_token_hash_prefix: String,
+    credential_selections: Vec<CredentialImportSelection>,
+}
+
+fn build_credential_import_receipt(
+    operation_id: Uuid,
+    baseline_credential_set_fingerprint: &str,
+    incoming_credential_set_fingerprint: &str,
+    committed_accounts: &[account_store::CodexAccount],
+    credential_selections: Vec<CredentialImportSelection>,
+) -> Result<CredentialImportReceipt> {
+    let active = active_account(committed_accounts)
+        .context("committed credential import has no active account")?;
+    let active_token_fingerprint = auth::account_token_fingerprint(active)
+        .context("committed active account has incomplete token material")?;
+    Ok(CredentialImportReceipt {
+        version: 1,
+        operation_id,
+        account_count: committed_accounts.len(),
+        baseline_credential_set_fingerprint: baseline_credential_set_fingerprint.to_string(),
+        incoming_credential_set_fingerprint: incoming_credential_set_fingerprint.to_string(),
+        committed_credential_set_fingerprint: complete_credential_set_fingerprint(
+            committed_accounts,
+        )?,
+        committed_account_identity_fingerprint: account_identity_fingerprint(committed_accounts),
+        active_provider_account_id: active.account_id.clone(),
+        active_token_hash_prefix: fingerprint_hash_prefix(&active_token_fingerprint),
+        credential_selections,
+    })
+}
+
+fn complete_credential_set_fingerprint(accounts: &[account_store::CodexAccount]) -> Result<String> {
+    validate_accounts(accounts).context("cannot fingerprint invalid credential accounts")?;
+    let mut ordered: Vec<_> = accounts.iter().collect();
+    ordered.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+    let mut context = DigestContext::new(&SHA256);
+    for account in ordered {
+        for part in [
+            account.account_id.as_str(),
+            account.id_token.as_str(),
+            account.access_token.as_str(),
+            account.refresh_token.as_str(),
+            if account.is_active {
+                "active"
+            } else {
+                "inactive"
+            },
+        ] {
+            context.update(&(part.len() as u64).to_be_bytes());
+            context.update(part.as_bytes());
+        }
+    }
+    Ok(hex_digest(context.finish().as_ref()))
+}
+
+fn account_identity_fingerprint(accounts: &[account_store::CodexAccount]) -> String {
+    let mut ordered: Vec<_> = accounts.iter().collect();
+    ordered.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+    let mut context = DigestContext::new(&SHA256);
+    for account in ordered {
+        for part in [
+            account.account_id.as_str(),
+            if account.is_active {
+                "active"
+            } else {
+                "inactive"
+            },
+        ] {
+            context.update(part.as_bytes());
+            context.update(&[0]);
+        }
+    }
+    hex_digest(context.finish().as_ref())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn merge_token_generation(
@@ -689,7 +856,18 @@ fn merge_token_generation(
             inference_token_expiration(&incoming.access_token),
             inference_token_expiration(&current.access_token),
         ) {
-            (Some(incoming_expiry), Some(current_expiry)) => current_expiry >= incoming_expiry,
+            (Some(incoming_expiry), Some(current_expiry)) if current_expiry > incoming_expiry => {
+                true
+            }
+            (Some(incoming_expiry), Some(current_expiry)) if current_expiry < incoming_expiry => {
+                false
+            }
+            (Some(_), Some(_)) => {
+                bail!(
+                    "cannot order divergent credential generations with equal expiry for provider account {}",
+                    incoming.account_id
+                )
+            }
             (None, Some(_)) => true,
             (Some(_), None) => false,
             (None, None) => {
@@ -4217,11 +4395,12 @@ mod tests {
         auth::write_auth_file(&auth_path, &active)?;
         let reload_store_path = store_path.clone();
 
-        let (count, outcome) = replace_import_accounts_with_unlocked_reload(
+        let (count, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
             &store_path,
             &auth_path,
             vec![replacement.clone()],
             false,
+            None,
             true,
             &move |_| {
                 assert_store_lock_available(&reload_store_path)?;
@@ -4231,6 +4410,7 @@ mod tests {
         )?;
 
         assert_eq!(count, 1);
+        assert_eq!(receipt, None);
         assert!(outcome.is_confirmed());
         assert_eq!(
             active_account(&load_accounts(&store_path)?).map(|account| account.account_id.clone()),
@@ -4783,15 +4963,29 @@ mod tests {
             "codexswitch-cli",
             "update-bundle",
             "--preserve-active",
+            "--receipt-operation-id",
+            "11111111-1111-4111-8111-111111111111",
             "bundle.json",
         ])?;
         assert!(matches!(
             host_preserving.command,
             Command::UpdateBundle {
                 preserve_active: true,
+                receipt_operation_id: Some(_),
                 ..
             }
         ));
+
+        let offline_receipt = Args::try_parse_from([
+            "codexswitch-cli",
+            "update-bundle",
+            "--preserve-active",
+            "--receipt-operation-id",
+            "11111111-1111-4111-8111-111111111111",
+            "--offline-file-only",
+            "bundle.json",
+        ]);
+        assert!(offline_receipt.is_err());
         Ok(())
     }
 
@@ -4818,7 +5012,8 @@ mod tests {
             &current_active.account_id,
         )?;
 
-        let active = active_account(&merged).context("merged host lost its active account")?;
+        let active =
+            active_account(&merged.accounts).context("merged host lost its active account")?;
         assert_eq!(active.account_id, current_active.account_id);
         assert_eq!(active.refresh_token, current_active.refresh_token);
         assert_eq!(
@@ -4872,7 +5067,7 @@ mod tests {
             std::slice::from_ref(&current),
             &current.account_id,
         )?;
-        let active = active_account(&merged).unwrap();
+        let active = active_account(&merged.accounts).unwrap();
 
         assert_eq!(active.access_token, current.access_token);
         assert_eq!(active.refresh_token, current.refresh_token);
@@ -4903,7 +5098,7 @@ mod tests {
             std::slice::from_ref(&current),
             &current.account_id,
         )?;
-        let active = active_account(&merged).unwrap();
+        let active = active_account(&merged.accounts).unwrap();
 
         assert_eq!(active.access_token, incoming.access_token);
         assert_eq!(active.refresh_token, incoming.refresh_token);
@@ -4926,7 +5121,7 @@ mod tests {
             std::slice::from_ref(&current),
             &current.account_id,
         )?;
-        let active = active_account(&merged).unwrap();
+        let active = active_account(&merged.accounts).unwrap();
 
         assert_eq!(
             active.runtime_unusable_reason.as_deref(),
@@ -4954,6 +5149,79 @@ mod tests {
         .expect_err("malformed divergent generations must be rejected");
 
         assert!(error.to_string().contains("cannot order malformed"));
+    }
+
+    #[test]
+    fn credential_bundle_merge_rejects_equal_expiry_divergent_generations() {
+        let expiry = Utc::now() + ChronoDuration::days(5);
+        let mut current = account("active@example.com", true, 10.0, 10.0);
+        current.access_token = account_store::test_inference_token(expiry);
+        current.refresh_token = "current-refresh".to_string();
+        let mut incoming = current.clone();
+        incoming.access_token.push_str("different-signature");
+        incoming.refresh_token = "incoming-refresh".to_string();
+
+        let error = merge_authority_preserving_accounts(
+            vec![incoming],
+            std::slice::from_ref(&current),
+            &current.account_id,
+        )
+        .expect_err("equal-expiry divergent generations must be incomparable");
+
+        assert!(error.to_string().contains("equal expiry"));
+    }
+
+    #[test]
+    fn import_receipt_proves_newer_inactive_destination_generation_without_secrets() -> Result<()> {
+        let mut active = account("active-secret@example.com", true, 10.0, 10.0);
+        active.account_id = "provider-active".to_string();
+        let mut current_inactive = account("inactive-secret@example.com", false, 10.0, 10.0);
+        current_inactive.account_id = "provider-inactive".to_string();
+        current_inactive.access_token =
+            account_store::test_inference_token(Utc::now() + ChronoDuration::days(10));
+        current_inactive.refresh_token = "vps-newer-refresh-secret".to_string();
+        let mut incoming_inactive = current_inactive.clone();
+        incoming_inactive.access_token =
+            account_store::test_inference_token(Utc::now() + ChronoDuration::hours(1));
+        incoming_inactive.refresh_token = "mac-older-refresh-secret".to_string();
+        let current = vec![active.clone(), current_inactive.clone()];
+        let incoming = vec![active.clone(), incoming_inactive];
+        let baseline = complete_credential_set_fingerprint(&current)?;
+        let incoming_fingerprint = complete_credential_set_fingerprint(&incoming)?;
+
+        let merged = merge_authority_preserving_accounts(incoming, &current, &active.account_id)?;
+        let receipt = build_credential_import_receipt(
+            Uuid::parse_str("11111111-1111-4111-8111-111111111111")?,
+            &baseline,
+            &incoming_fingerprint,
+            &merged.accounts,
+            merged.selections,
+        )?;
+        let serialized = serde_json::to_string(&receipt)?;
+
+        assert_eq!(receipt.baseline_credential_set_fingerprint, baseline);
+        assert_eq!(
+            receipt.incoming_credential_set_fingerprint,
+            incoming_fingerprint
+        );
+        assert_ne!(
+            receipt.committed_credential_set_fingerprint,
+            receipt.incoming_credential_set_fingerprint
+        );
+        assert_eq!(receipt.active_provider_account_id, active.account_id);
+        assert!(receipt.credential_selections.iter().any(|selection| {
+            selection.provider_account_id == current_inactive.account_id
+                && selection.generation == CredentialGeneration::Current
+        }));
+        for secret in [
+            "active-secret@example.com",
+            "inactive-secret@example.com",
+            "vps-newer-refresh-secret",
+            "mac-older-refresh-secret",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        Ok(())
     }
 
     #[test]

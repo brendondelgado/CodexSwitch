@@ -539,12 +539,59 @@ struct LinuxDevboxAutomaticResetPolicyFailure: Error, Equatable, Sendable {
     let disposition: LinuxDevboxAutomaticResetPolicyFailureDisposition
 }
 
-struct LinuxDevboxCredentialStateEvidence: Equatable, Sendable {
+struct LinuxDevboxCredentialStateEvidence: Codable, Equatable, Sendable {
     let accountIdentityFingerprint: String
     let credentialSetFingerprint: String
     let activeProviderAccountId: String
     let activeTokenHashPrefix: String
     let authMatchesActiveStoreToken: Bool
+}
+
+struct LinuxDevboxCredentialConvergenceProof: Codable, Equatable, Sendable {
+    static let schemaVersion = 1
+
+    let version: Int
+    let credentialFingerprint: String
+    let incomingCredentialSetFingerprint: String
+    let accountIdentityFingerprint: String
+    let activeProviderAccountId: String
+    let committedEvidence: LinuxDevboxCredentialStateEvidence
+}
+
+struct LinuxDevboxCredentialImportReceipt: Codable, Equatable, Sendable {
+    enum Generation: String, Codable, Equatable, Sendable {
+        case incoming
+        case matching
+        case current
+    }
+
+    struct Selection: Codable, Equatable, Sendable {
+        let providerAccountId: String
+        let generation: Generation
+    }
+
+    static let schemaVersion = 1
+
+    let version: Int
+    let operationId: UUID
+    let accountCount: Int
+    let baselineCredentialSetFingerprint: String
+    let incomingCredentialSetFingerprint: String
+    let committedCredentialSetFingerprint: String
+    let committedAccountIdentityFingerprint: String
+    let activeProviderAccountId: String
+    let activeTokenHashPrefix: String
+    let credentialSelections: [Selection]
+
+    var committedEvidence: LinuxDevboxCredentialStateEvidence {
+        LinuxDevboxCredentialStateEvidence(
+            accountIdentityFingerprint: committedAccountIdentityFingerprint,
+            credentialSetFingerprint: committedCredentialSetFingerprint,
+            activeProviderAccountId: activeProviderAccountId,
+            activeTokenHashPrefix: activeTokenHashPrefix,
+            authMatchesActiveStoreToken: true
+        )
+    }
 }
 
 struct LinuxDevboxCredentialSyncOperation: Codable, Equatable, Sendable {
@@ -573,6 +620,7 @@ struct LinuxDevboxCredentialSyncOperation: Codable, Equatable, Sendable {
     let createdAt: Date
     var phase: Phase
     var reason: String
+    var importReceipt: LinuxDevboxCredentialImportReceipt?
 
     init(
         operationID: String,
@@ -587,7 +635,8 @@ struct LinuxDevboxCredentialSyncOperation: Codable, Equatable, Sendable {
         remoteDirectory: String,
         createdAt: Date,
         phase: Phase = .pending,
-        reason: String
+        reason: String,
+        importReceipt: LinuxDevboxCredentialImportReceipt? = nil
     ) {
         self.version = Self.schemaVersion
         self.operationID = operationID
@@ -607,6 +656,7 @@ struct LinuxDevboxCredentialSyncOperation: Codable, Equatable, Sendable {
         self.createdAt = createdAt
         self.phase = phase
         self.reason = reason
+        self.importReceipt = importReceipt
     }
 
     var baseline: LinuxDevboxCredentialStateEvidence {
@@ -697,6 +747,37 @@ struct LinuxDevboxCredentialSyncJournal: Sendable {
         }
     }
 
+    func recordImportReceipt(
+        operationID: String,
+        receipt: LinuxDevboxCredentialImportReceipt
+    ) throws {
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            guard var operation = try decode(current.bytes), operation.operationID == operationID else {
+                throw LinuxDevboxCredentialSyncJournalError.operationChanged(
+                    expected: operationID,
+                    actual: try decode(current.bytes)?.operationID
+                )
+            }
+            guard LinuxDevboxMonitor.credentialImportReceiptMatchesOperation(
+                receipt,
+                operation: operation
+            ) else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                    "import receipt does not match the pending operation"
+                )
+            }
+            if let recorded = operation.importReceipt, recorded != receipt {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                    "a different import receipt is already recorded"
+                )
+            }
+            operation.importReceipt = receipt
+            try validate(operation)
+            _ = try lockedFile.replace(try encode(operation), expectedGeneration: current.generation)
+        }
+    }
+
     func clear(operationID: String) throws {
         try transaction.withExclusiveLock { lockedFile in
             let current = try lockedFile.read()
@@ -762,6 +843,15 @@ struct LinuxDevboxCredentialSyncJournal: Sendable {
               operation.reason.utf8.count <= 4 * 1024,
               !operation.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw LinuxDevboxCredentialSyncJournalError.invalidRecord("required evidence is incomplete")
+        }
+        if let receipt = operation.importReceipt,
+           !LinuxDevboxMonitor.credentialImportReceiptMatchesOperation(
+               receipt,
+               operation: operation
+           ) {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                "import receipt does not match the operation"
+            )
         }
     }
 
@@ -986,6 +1076,162 @@ enum LinuxDevboxMonitor {
             && observed.authMatchesActiveStoreToken
     }
 
+    static func credentialImportReceiptMatchesOperation(
+        _ receipt: LinuxDevboxCredentialImportReceipt,
+        operation: LinuxDevboxCredentialSyncOperation
+    ) -> Bool {
+        let selections = receipt.credentialSelections
+        let providerAccountIDs = selections.map(\.providerAccountId)
+        guard receipt.version == LinuxDevboxCredentialImportReceipt.schemaVersion,
+              receipt.operationId.uuidString.lowercased() == operation.operationID,
+              receipt.accountCount > 0,
+              receipt.accountCount == selections.count,
+              providerAccountIDs == providerAccountIDs.sorted(),
+              Set(providerAccountIDs).count == providerAccountIDs.count,
+              providerAccountIDs.allSatisfy({
+                  !$0.isEmpty && $0.utf8.count <= maximumRemoteProviderAccountIdBytes
+              }),
+              receipt.baselineCredentialSetFingerprint
+                == operation.baselineCredentialSetFingerprint,
+              receipt.incomingCredentialSetFingerprint
+                == operation.expectedCredentialSetFingerprint,
+              receipt.committedAccountIdentityFingerprint
+                == operation.expectedAccountIdentityFingerprint,
+              receipt.activeProviderAccountId == operation.expectedActiveProviderAccountId,
+              receipt.activeProviderAccountId == operation.baselineActiveProviderAccountId,
+              isLowercaseHex(receipt.committedCredentialSetFingerprint, count: 64),
+              isLowercaseHex(receipt.activeTokenHashPrefix, count: 12),
+              credentialAccountIdentityFingerprint(
+                  providerAccountIDs: providerAccountIDs,
+                  activeProviderAccountId: receipt.activeProviderAccountId
+              ) == receipt.committedAccountIdentityFingerprint,
+              let activeSelection = selections.first(where: {
+                  $0.providerAccountId == receipt.activeProviderAccountId
+              }) else {
+            return false
+        }
+
+        switch activeSelection.generation {
+        case .incoming:
+            guard receipt.activeTokenHashPrefix == operation.expectedActiveTokenHashPrefix else {
+                return false
+            }
+        case .matching:
+            guard operation.expectedActiveTokenHashPrefix
+                    == operation.baselineActiveTokenHashPrefix,
+                  receipt.activeTokenHashPrefix == operation.expectedActiveTokenHashPrefix else {
+                return false
+            }
+        case .current:
+            guard receipt.activeTokenHashPrefix == operation.baselineActiveTokenHashPrefix else {
+                return false
+            }
+        }
+
+        let preservesCurrent = selections.contains(where: { $0.generation == .current })
+        return preservesCurrent
+            ? receipt.committedCredentialSetFingerprint
+                != operation.expectedCredentialSetFingerprint
+            : receipt.committedCredentialSetFingerprint
+                == operation.expectedCredentialSetFingerprint
+    }
+
+    static func credentialConvergenceProof(
+        credentialFingerprint: String,
+        operation: LinuxDevboxCredentialSyncOperation,
+        receipt: LinuxDevboxCredentialImportReceipt
+    ) -> LinuxDevboxCredentialConvergenceProof? {
+        guard credentialImportReceiptMatchesOperation(receipt, operation: operation),
+              credentialFingerprint == operation.credentialFingerprint else {
+            return nil
+        }
+        return LinuxDevboxCredentialConvergenceProof(
+            version: LinuxDevboxCredentialConvergenceProof.schemaVersion,
+            credentialFingerprint: credentialFingerprint,
+            incomingCredentialSetFingerprint: receipt.incomingCredentialSetFingerprint,
+            accountIdentityFingerprint: receipt.committedAccountIdentityFingerprint,
+            activeProviderAccountId: receipt.activeProviderAccountId,
+            committedEvidence: receipt.committedEvidence
+        )
+    }
+
+    static func credentialConvergenceProofMatches(
+        _ proof: LinuxDevboxCredentialConvergenceProof,
+        accounts: [CodexAccount],
+        credentialFingerprint: String,
+        observed: LinuxDevboxCredentialStateEvidence
+    ) -> Bool {
+        guard proof.version == LinuxDevboxCredentialConvergenceProof.schemaVersion,
+              proof.credentialFingerprint == credentialFingerprint,
+              proof.incomingCredentialSetFingerprint
+                == credentialSetFingerprint(accounts: accounts),
+              proof.accountIdentityFingerprint
+                == credentialAccountIdentityFingerprint(accounts: accounts),
+              proof.activeProviderAccountId == accounts.first(where: \.isActive)?.accountId,
+              proof.committedEvidence == observed,
+              proof.committedEvidence.accountIdentityFingerprint
+                == proof.accountIdentityFingerprint,
+              proof.committedEvidence.activeProviderAccountId
+                == proof.activeProviderAccountId,
+              proof.committedEvidence.authMatchesActiveStoreToken,
+              isLowercaseHex(proof.credentialFingerprint, count: 64),
+              isLowercaseHex(proof.incomingCredentialSetFingerprint, count: 64),
+              isLowercaseHex(proof.accountIdentityFingerprint, count: 64),
+              isLowercaseHex(proof.committedEvidence.credentialSetFingerprint, count: 64),
+              isLowercaseHex(proof.committedEvidence.activeTokenHashPrefix, count: 12) else {
+            return false
+        }
+        return true
+    }
+
+    static func encodeCredentialConvergenceProof(
+        _ proof: LinuxDevboxCredentialConvergenceProof
+    ) -> Data? {
+        try? JSONEncoder().encode(proof)
+    }
+
+    static func decodeCredentialConvergenceProof(
+        _ data: Data?
+    ) -> LinuxDevboxCredentialConvergenceProof? {
+        guard let data, data.count <= 64 * 1_024 else { return nil }
+        guard let object = try? JSONSerialization.jsonObject(with: data),
+              let proofObject = object as? [String: Any],
+              Set(proofObject.keys) == Set([
+                  "version",
+                  "credentialFingerprint",
+                  "incomingCredentialSetFingerprint",
+                  "accountIdentityFingerprint",
+                  "activeProviderAccountId",
+                  "committedEvidence",
+              ]),
+              let evidence = proofObject["committedEvidence"] as? [String: Any],
+              Set(evidence.keys) == Set([
+                  "accountIdentityFingerprint",
+                  "credentialSetFingerprint",
+                  "activeProviderAccountId",
+                  "activeTokenHashPrefix",
+                  "authMatchesActiveStoreToken",
+              ]) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(LinuxDevboxCredentialConvergenceProof.self, from: data)
+    }
+
+    static func credentialAccountIdentityFingerprint(
+        providerAccountIDs: [String],
+        activeProviderAccountId: String
+    ) -> String {
+        var hasher = SHA256()
+        for accountID in providerAccountIDs.sorted() {
+            updateHash(&hasher, accountID)
+            updateHash(
+                &hasher,
+                accountID == activeProviderAccountId ? "active" : "inactive"
+            )
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     static func makeCredentialSyncOperation(
         settings: LinuxDevboxMonitorSettings,
         accounts: [CodexAccount],
@@ -1040,13 +1286,23 @@ enum LinuxDevboxMonitor {
         guard let observed else {
             return .unresolved("Remote credential-state evidence is unavailable")
         }
+        if let receipt = operation.importReceipt {
+            guard credentialImportReceiptMatchesOperation(receipt, operation: operation) else {
+                return .unresolved("Recorded credential import receipt is invalid")
+            }
+            return observed == receipt.committedEvidence
+                ? .committed
+                : .unresolved(
+                    "Remote credential state does not match the recorded import receipt"
+                )
+        }
         if observed == operation.expected {
             return .committed
         }
         if observed == operation.baseline {
             return .safeToRetry
         }
-        return .unresolved("Remote credential state matches neither the expected commit nor the pre-mutation baseline")
+        return .unresolved("Remote credential state does not match the pre-mutation baseline and no import receipt was recorded")
     }
 
     static func credentialSyncOwnsLocalStagePath(
@@ -1989,7 +2245,8 @@ enum LinuxDevboxMonitor {
     static func syncCredentials(
         settings: LinuxDevboxMonitorSettings,
         accounts: [CodexAccount],
-        operation: LinuxDevboxCredentialSyncOperation
+        operation: LinuxDevboxCredentialSyncOperation,
+        recordImportReceipt: (LinuxDevboxCredentialImportReceipt) throws -> Void = { _ in }
     ) -> Result<String, LinuxDevboxMonitorFailure> {
         guard settings.isConfigured else {
             return .failure(LinuxDevboxMonitorFailure(
@@ -2056,11 +2313,24 @@ enum LinuxDevboxMonitor {
         }
 
         if case .success(let output) = result {
-            result = verifiedCredentialSyncPostImportResult(
-                output: output,
-                operation: operation,
-                observed: captureCredentialStateEvidence(settings: settings)
-            )
+            switch decodeCredentialImportReceipt(output: output, operation: operation) {
+            case .success(let receipt):
+                do {
+                    try recordImportReceipt(receipt)
+                    result = verifiedCredentialSyncPostImportResult(
+                        receipt: receipt,
+                        operation: operation,
+                        observed: captureCredentialStateEvidence(settings: settings)
+                    )
+                } catch {
+                    result = .failure(LinuxDevboxMonitorFailure(
+                        message: "Linux devbox credential import completed, but its token-free receipt could not be recorded: \(error.localizedDescription)",
+                        credentialSyncDisposition: .outcomeUnknown
+                    ))
+                }
+            case .failure(let failure):
+                result = .failure(failure)
+            }
         }
 
         if let cleanupFailure = cleanupLocalCredentialStage(at: tempDirectory) {
@@ -2078,18 +2348,78 @@ enum LinuxDevboxMonitor {
         return result
     }
 
-    static func verifiedCredentialSyncPostImportResult(
+    static func decodeCredentialImportReceipt(
         output: String,
+        operation: LinuxDevboxCredentialSyncOperation
+    ) -> Result<LinuxDevboxCredentialImportReceipt, LinuxDevboxMonitorFailure> {
+        let data = Data(output.utf8)
+        guard !data.isEmpty, data.count <= 64 * 1_024 else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox credential import returned a missing or oversized receipt",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
+
+        do {
+            let object = try JSONSerialization.jsonObject(with: data)
+            guard let receiptObject = object as? [String: Any],
+                  Set(receiptObject.keys) == Set([
+                      "version",
+                      "operationId",
+                      "accountCount",
+                      "baselineCredentialSetFingerprint",
+                      "incomingCredentialSetFingerprint",
+                      "committedCredentialSetFingerprint",
+                      "committedAccountIdentityFingerprint",
+                      "activeProviderAccountId",
+                      "activeTokenHashPrefix",
+                      "credentialSelections",
+                  ]),
+                  let rawSelections = receiptObject["credentialSelections"] as? [Any],
+                  rawSelections.allSatisfy({ selection in
+                      guard let value = selection as? [String: Any] else { return false }
+                      return Set(value.keys) == Set(["providerAccountId", "generation"])
+                  }) else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                    "receipt contains missing or unknown fields"
+                )
+            }
+            let receipt = try JSONDecoder().decode(
+                LinuxDevboxCredentialImportReceipt.self,
+                from: data
+            )
+            guard credentialImportReceiptMatchesOperation(receipt, operation: operation) else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                    "receipt is not bound to the pending operation"
+                )
+            }
+            return .success(receipt)
+        } catch {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox credential import returned an invalid token-free receipt",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
+    }
+
+    static func verifiedCredentialSyncPostImportResult(
+        receipt: LinuxDevboxCredentialImportReceipt,
         operation: LinuxDevboxCredentialSyncOperation,
         observed: Result<LinuxDevboxCredentialStateEvidence, LinuxDevboxMonitorFailure>
     ) -> Result<String, LinuxDevboxMonitorFailure> {
+        guard credentialImportReceiptMatchesOperation(receipt, operation: operation) else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox credential import receipt does not match the pending operation",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
         switch observed {
-        case .success(let evidence) where evidence == operation.expected:
-            return .success(output)
+        case .success(let evidence) where evidence == receipt.committedEvidence:
+            return .success("credentials synchronized with exact import receipt")
         case .success:
             return .failure(LinuxDevboxMonitorFailure(
-                message: "Linux devbox credential import completed, but stable post-import evidence does not match the intended credential generation",
-                credentialSyncDisposition: .rejected
+                message: "Linux devbox credential import completed, but stable post-import evidence does not match its exact token-free receipt",
+                credentialSyncDisposition: .outcomeUnknown
             ))
         case .failure(let failure):
             return .failure(LinuxDevboxMonitorFailure(
@@ -2173,7 +2503,8 @@ enum LinuxDevboxMonitor {
             remoteCommand: remoteCredentialSyncCommand(
                 remoteDirectory: remoteDirectory,
                 bundleName: bundleURL.lastPathComponent,
-                passphraseName: passphraseURL.lastPathComponent
+                passphraseName: passphraseURL.lastPathComponent,
+                operationID: operation.operationID
             ),
             timeout: 45,
             retryPolicy: .preExecutionTransportOnly
@@ -2535,6 +2866,7 @@ enum LinuxDevboxMonitor {
         remoteDirectory: String,
         bundleName: String,
         passphraseName: String,
+        operationID: String,
         removeExecutable: String = "/bin/rm"
     ) -> String {
         let stage = shellQuote(remoteDirectory)
@@ -2563,7 +2895,7 @@ enum LinuxDevboxMonitor {
         umask 077
         chmod 600 \(bundle) \(passphrase)
         export PATH="$HOME/.local/bin:$PATH"
-        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) codexswitch-cli update-bundle --preserve-active \(bundle)
+        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) codexswitch-cli update-bundle --preserve-active --receipt-operation-id \(shellQuote(operationID)) \(bundle)
         """
     }
 

@@ -68,7 +68,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-08-06
+  last_updated: 2026-08-21
 ---
 
 # Runtime And Host Ownership
@@ -113,6 +113,8 @@ monotonically:
   destination generation;
 - equal access-token generations with different refresh-token material preserve
   the destination's complete token set;
+- different access-token generations with equal inference-token expiry are
+  incomparable and fail closed;
 - incomparable, incomplete, or malformed generations fail closed before any
   credential mutation;
 - destination quota observations, runtime blocks, reset inventory, and other
@@ -120,10 +122,16 @@ monotonically:
 
 The sender must perform a stable post-import read-back of account identity,
 complete credential-set fingerprint, active provider identity, active token
-fingerprint, and store/auth convergence. A successful import process exit is not
-proof of synchronization. The sender may publish `credentials already
-converged` or a successful sync result only when that read-back matches the
-operation's intended generation exactly.
+fingerprint, and store/auth convergence. A successful import process exit is
+not proof of synchronization. For authority-preserving imports, the intended
+post-state is the importer's operation-bound token-free receipt: it binds the
+pre-import VPS fingerprint, incoming Mac fingerprint, deterministic per-account
+generation choices, and committed merged fingerprint. The sender may publish
+`credentials already converged` or a successful sync result only when stable
+read-back matches that committed receipt exactly. It must not require the
+committed fingerprint to equal the incoming bundle when the monotonic merge
+legitimately preserves a strictly newer destination generation, and it must not
+accept an unbound changed fingerprint.
 
 ## Pool Authority Protocol
 

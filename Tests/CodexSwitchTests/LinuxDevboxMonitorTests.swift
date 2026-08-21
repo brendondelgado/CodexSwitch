@@ -511,6 +511,97 @@ struct LinuxDevboxMonitorTests {
         #expect(!result.stdoutString.contains("inactive-refresh-secret"))
     }
 
+    @Test("receipt convergence proof suppresses only exact unchanged divergence")
+    func receiptConvergenceProofRequiresExactLocalAndRemoteEvidence() throws {
+        let accounts = [
+            CodexAccount(
+                email: "active@example.com",
+                accessToken: "active-access-secret",
+                refreshToken: "active-refresh-secret",
+                idToken: "active-id-secret",
+                accountId: "active-account",
+                isActive: true
+            ),
+            CodexAccount(
+                email: "inactive@example.com",
+                accessToken: "inactive-old-access-secret",
+                refreshToken: "inactive-old-refresh-secret",
+                idToken: "inactive-old-id-secret",
+                accountId: "inactive-account",
+                isActive: false
+            ),
+        ]
+        let credentialFingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(
+            accounts: accounts
+        )
+        let incomingFingerprint = try #require(
+            LinuxDevboxMonitor.credentialSetFingerprint(accounts: accounts)
+        )
+        let identityFingerprint = LinuxDevboxMonitor.credentialAccountIdentityFingerprint(
+            accounts: accounts
+        )
+        let observed = LinuxDevboxCredentialStateEvidence(
+            accountIdentityFingerprint: identityFingerprint,
+            credentialSetFingerprint: String(repeating: "9", count: 64),
+            activeProviderAccountId: "active-account",
+            activeTokenHashPrefix: try #require(
+                LinuxDevboxMonitor.activeTokenHashPrefix(accounts: accounts)
+            ),
+            authMatchesActiveStoreToken: true
+        )
+        let proof = LinuxDevboxCredentialConvergenceProof(
+            version: LinuxDevboxCredentialConvergenceProof.schemaVersion,
+            credentialFingerprint: credentialFingerprint,
+            incomingCredentialSetFingerprint: incomingFingerprint,
+            accountIdentityFingerprint: identityFingerprint,
+            activeProviderAccountId: "active-account",
+            committedEvidence: observed
+        )
+
+        #expect(LinuxDevboxMonitor.credentialConvergenceProofMatches(
+            proof,
+            accounts: accounts,
+            credentialFingerprint: credentialFingerprint,
+            observed: observed
+        ))
+
+        var changedAccounts = accounts
+        changedAccounts[1].refreshToken = "inactive-new-refresh-secret"
+        #expect(!LinuxDevboxMonitor.credentialConvergenceProofMatches(
+            proof,
+            accounts: changedAccounts,
+            credentialFingerprint: LinuxDevboxMonitor.credentialSyncFingerprint(
+                accounts: changedAccounts
+            ),
+            observed: observed
+        ))
+
+        let changedRemote = LinuxDevboxCredentialStateEvidence(
+            accountIdentityFingerprint: observed.accountIdentityFingerprint,
+            credentialSetFingerprint: String(repeating: "8", count: 64),
+            activeProviderAccountId: observed.activeProviderAccountId,
+            activeTokenHashPrefix: observed.activeTokenHashPrefix,
+            authMatchesActiveStoreToken: true
+        )
+        #expect(!LinuxDevboxMonitor.credentialConvergenceProofMatches(
+            proof,
+            accounts: accounts,
+            credentialFingerprint: credentialFingerprint,
+            observed: changedRemote
+        ))
+
+        let encoded = try #require(LinuxDevboxMonitor.encodeCredentialConvergenceProof(proof))
+        #expect(LinuxDevboxMonitor.decodeCredentialConvergenceProof(encoded) == proof)
+        let serialized = String(decoding: encoded, as: UTF8.self)
+        #expect(!serialized.contains("active-access-secret"))
+        #expect(!serialized.contains("inactive-old-refresh-secret"))
+        #expect(!serialized.contains("@"))
+        let injected = Data(
+            (String(serialized.dropLast()) + ",\"accessToken\":\"secret\"}").utf8
+        )
+        #expect(LinuxDevboxMonitor.decodeCredentialConvergenceProof(injected) == nil)
+    }
+
     @Test("credential sync fingerprint includes quota v2 denial and window metadata")
     func credentialSyncFingerprintTracksQuotaV2Semantics() {
         let now = Date(timeIntervalSince1970: 2_000)
@@ -557,12 +648,13 @@ struct LinuxDevboxMonitorTests {
         let command = LinuxDevboxMonitor.remoteCredentialSyncCommand(
             remoteDirectory: "/tmp/codexswitch-auto-sync-fixture",
             bundleName: "sync.csbundle",
-            passphraseName: "sync.passphrase"
+            passphraseName: "sync.passphrase",
+            operationID: "11111111-1111-4111-8111-111111111111"
         )
 
         #expect(command.contains("stage='/tmp/codexswitch-auto-sync-fixture'"))
         #expect(command.contains("CODEXSWITCH_IMPORT_PASSPHRASE_FILE='/tmp/codexswitch-auto-sync-fixture/sync.passphrase'"))
-        #expect(command.contains("codexswitch-cli update-bundle --preserve-active '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
+        #expect(command.contains("codexswitch-cli update-bundle --preserve-active --receipt-operation-id '11111111-1111-4111-8111-111111111111' '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
         #expect(command.contains("chmod 600 '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
         #expect(!command.contains("chmod 600 --"))
         #expect(!command.contains("--ignore-expiry"))
@@ -614,7 +706,8 @@ struct LinuxDevboxMonitorTests {
         let command = LinuxDevboxMonitor.remoteCredentialSyncCommand(
             remoteDirectory: stage.path,
             bundleName: "sync.csbundle",
-            passphraseName: "sync.passphrase"
+            passphraseName: "sync.passphrase",
+            operationID: "11111111-1111-4111-8111-111111111111"
         )
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path
@@ -658,6 +751,7 @@ struct LinuxDevboxMonitorTests {
             remoteDirectory: stage.path,
             bundleName: "sync.csbundle",
             passphraseName: "sync.passphrase",
+            operationID: "11111111-1111-4111-8111-111111111111",
             removeExecutable: fakeRM.path
         )
         var environment = ProcessInfo.processInfo.environment
@@ -701,7 +795,8 @@ struct LinuxDevboxMonitorTests {
         let command = LinuxDevboxMonitor.remoteCredentialSyncCommand(
             remoteDirectory: stage.path,
             bundleName: "sync.csbundle",
-            passphraseName: "sync.passphrase"
+            passphraseName: "sync.passphrase",
+            operationID: "11111111-1111-4111-8111-111111111111"
         )
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path
@@ -789,7 +884,8 @@ struct LinuxDevboxMonitorTests {
         let command = LinuxDevboxMonitor.remoteCredentialSyncCommand(
             remoteDirectory: "/tmp/codexswitch-auto-sync-fixture",
             bundleName: "sync.csbundle",
-            passphraseName: "sync.passphrase"
+            passphraseName: "sync.passphrase",
+            operationID: "11111111-1111-4111-8111-111111111111"
         )
         #expect(!command.contains("--ignore-expiry"))
     }
