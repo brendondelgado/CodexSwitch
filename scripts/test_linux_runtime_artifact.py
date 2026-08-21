@@ -9,6 +9,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github/workflows/build-linux-runtime.yml"
 VERIFIER = ROOT / "scripts/verify_linux_runtime_artifact.py"
 STAGER = ROOT / "scripts/stage-linux-runtime-artifact.sh"
 INSTALLER = ROOT / "scripts/install-linux.sh"
@@ -216,6 +217,27 @@ class LinuxRuntimeArtifactTests(unittest.TestCase):
         self.assertIn("sourcePatchSha256", release)
         self.assertIn("artifact_manifest_sha256", release)
         self.assertIn("upstream_codex_git_sha", release)
+
+    def test_workflow_uses_digest_verified_official_code_mode_host(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        build = workflow.index("Build the patched Codex CLI runtime")
+        fetch = workflow.index("Fetch the exact official Linux code-mode host")
+        revalidation = workflow.index("Revalidate both source trees after compilation")
+        build_block = workflow[build:fetch]
+        fetch_block = workflow[fetch:revalidation]
+
+        self.assertIn("cargoPackages=codex-cli", workflow)
+        self.assertNotIn("cargoPackages=codex-cli,codex-code-mode-host", workflow)
+        self.assertIn("-p codex-cli", build_block)
+        self.assertNotIn("-p codex-code-mode-host", build_block)
+        self.assertIn('helper_triple="x86_64-unknown-linux-musl"', fetch_block)
+        self.assertIn('release_tag="rust-v${UPSTREAM_CODEX_VERSION}"', fetch_block)
+        self.assertIn('gh api "/repos/openai/codex/releases/tags/${release_tag}"', fetch_block)
+        self.assertIn('test("^sha256:[0-9a-f]{64}$")', fetch_block)
+        self.assertIn('sha256sum "$helper_archive"', fetch_block)
+        self.assertIn('tar -tzf "$helper_archive"', fetch_block)
+        self.assertIn("codex-code-mode-host-${helper_triple}", fetch_block)
+        self.assertIn("curl --proto '=https' --tlsv1.2 --fail --location", fetch_block)
 
 
 if __name__ == "__main__":

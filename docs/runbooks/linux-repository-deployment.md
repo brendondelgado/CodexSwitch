@@ -71,7 +71,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-28
+  last_updated: 2026-08-21
 ---
 
 # Linux Repository Deployment
@@ -158,6 +158,15 @@ recorded provenance. After the workflow verifies the peeled upstream tag
 commit, it derives a nonzero epoch from that exact upstream commit and uses it
 only for patched-upstream mtime normalization, the upstream target-cache ABI,
 and the patched-upstream Cargo build.
+
+The workflow compiles only the patched upstream `codex-cli` package. It obtains
+`codex-code-mode-host` from OpenAI's official
+`x86_64-unknown-linux-musl` archive attached to the same exact upstream release,
+then requires GitHub's SHA-256 asset digest, exact canonical URL, byte count,
+and one-file archive inventory before staging it. This avoids rebuilding the
+helper's embedded V8 dependency while keeping the complete artifact bound to
+one upstream release. The static musl helper is validated as x86_64 ELF before
+the artifact is attested.
 
 The repository-scoped compiled-target cache uses the exact-only v2 key. Its ABI
 binds the Linux runner and native toolchain, target triple, upstream SHA,

@@ -144,6 +144,7 @@ jobs:
             printf 'CONTROL_TARGET_DIR=%s/codexswitch-linux-target\n' "$RUNNER_TEMP"
             printf 'UPSTREAM_SOURCE_DIR=%s/codex-linux-upstream\n' "$RUNNER_TEMP"
             printf 'UPSTREAM_TARGET_DIR=%s/codex-linux-target\n' "$RUNNER_TEMP"
+            printf 'OFFICIAL_HELPER_DIR=%s/official-linux-code-mode-host\n' "$RUNNER_TEMP"
             printf 'PATCH_DRIVER=%s/patch-codex-linux-source\n' "$RUNNER_TEMP"
             printf 'ARTIFACT_DIR=%s/codexswitch-linux-runtime-artifact\n' "$RUNNER_TEMP"
           } >> "$GITHUB_ENV"
@@ -399,7 +400,7 @@ jobs:
             printf 'patchSha256=%s\n' "$PATCH_SHA256"
             printf 'upstreamSourceDateEpoch=%s\n' "$UPSTREAM_SOURCE_DATE_EPOCH"
             printf 'cargoFlags=--locked --release --target %s\n' "$TARGET_TRIPLE"
-            printf 'cargoPackages=codex-cli,codex-code-mode-host\n'
+            printf 'cargoPackages=codex-cli\n'
             printf 'CARGO_BUILD_JOBS=%s\n' "$CARGO_BUILD_JOBS"
             printf 'CARGO_PROFILE_RELEASE_LTO=%s\n' "$CARGO_PROFILE_RELEASE_LTO"
             printf 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=%s\n' "$CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
@@ -422,7 +423,7 @@ jobs:
           path: ${{ runner.temp }}/codex-linux-target/
           key: linux-runtime-target-v2-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}
 
-      - name: Build the patched Codex runtime pair
+      - name: Build the patched Codex CLI runtime
         working-directory: ${{ runner.temp }}/codex-linux-upstream/codex-rs
         env:
           SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
@@ -434,8 +435,70 @@ jobs:
             --release \
             --target "$TARGET_TRIPLE" \
             --jobs "$CARGO_BUILD_JOBS" \
-            -p codex-cli \
-            -p codex-code-mode-host
+            -p codex-cli
+
+      - name: Fetch the exact official Linux code-mode host
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          helper_triple="x86_64-unknown-linux-musl"
+          helper_asset_name="codex-code-mode-host-${helper_triple}.tar.gz"
+          release_tag="rust-v${UPSTREAM_CODEX_VERSION}"
+          expected_url="https://github.com/openai/codex/releases/download/${release_tag}/${helper_asset_name}"
+          release_json="$RUNNER_TEMP/upstream-linux-release.json"
+          helper_archive="$RUNNER_TEMP/$helper_asset_name"
+          helper_inventory="$RUNNER_TEMP/linux-code-mode-host-inventory.txt"
+
+          gh api "/repos/openai/codex/releases/tags/${release_tag}" > "$release_json"
+          if ! jq -e \
+            --arg tag "$release_tag" \
+            --arg name "$helper_asset_name" \
+            '
+              type == "object" and
+              .tag_name == $tag and
+              .draft == false and
+              .prerelease == false and
+              ([.assets[] | select(.name == $name)] | length == 1) and
+              ([.assets[] | select(.name == $name)][0] |
+                .size > 0 and .size <= 2147483648 and
+                (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                (.browser_download_url | type == "string"))
+            ' "$release_json" >/dev/null; then
+            echo "::error::official release has no unique digest-bound $helper_asset_name asset"
+            exit 1
+          fi
+
+          helper_bytes="$(jq -r --arg name "$helper_asset_name" '.assets[] | select(.name == $name) | .size' "$release_json")"
+          helper_digest="$(jq -r --arg name "$helper_asset_name" '.assets[] | select(.name == $name) | .digest | sub("^sha256:"; "")' "$release_json")"
+          helper_url="$(jq -r --arg name "$helper_asset_name" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json")"
+          if [[ "$helper_url" != "$expected_url" ]]; then
+            echo "::error::official helper download URL is outside the exact release asset"
+            exit 1
+          fi
+
+          curl --proto '=https' --tlsv1.2 --fail --location \
+            --output "$helper_archive" \
+            "$helper_url"
+          if [[ "$(stat -c '%s' "$helper_archive")" != "$helper_bytes" \
+            || "$(sha256sum "$helper_archive" | awk '{print $1}')" != "$helper_digest" ]]; then
+            echo "::error::official helper archive identity does not match GitHub's release digest"
+            exit 1
+          fi
+
+          tar -tzf "$helper_archive" > "$helper_inventory"
+          if [[ "$(wc -l < "$helper_inventory" | tr -d '[:space:]')" != "1" \
+            || "$(cat "$helper_inventory")" != "codex-code-mode-host-${helper_triple}" ]]; then
+            echo "::error::official helper archive has an unexpected inventory"
+            exit 1
+          fi
+          install -d -m 0700 "$OFFICIAL_HELPER_DIR"
+          tar -xzf "$helper_archive" -C "$OFFICIAL_HELPER_DIR"
+          helper_path="$OFFICIAL_HELPER_DIR/codex-code-mode-host-${helper_triple}"
+          if [[ ! -f "$helper_path" || -L "$helper_path" || ! -s "$helper_path" ]]; then
+            echo "::error::official helper archive did not produce one regular executable"
+            exit 1
+          fi
 
       - name: Revalidate both source trees after compilation
         env:
@@ -496,15 +559,18 @@ jobs:
       - name: Stage the exact runtime executables
         run: |
           set -euo pipefail
-          runtime_build_dir="$UPSTREAM_TARGET_DIR/$TARGET_TRIPLE/release"
-          for name in codex codex-code-mode-host; do
-            source_path="$runtime_build_dir/$name"
-            if [[ ! -f "$source_path" || -L "$source_path" || ! -x "$source_path" || ! -s "$source_path" ]]; then
-              echo "::error::Cargo did not produce a regular executable $name"
-              exit 1
-            fi
-            install -m 0755 "$source_path" "$ARTIFACT_DIR/$name"
-          done
+          codex_path="$UPSTREAM_TARGET_DIR/$TARGET_TRIPLE/release/codex"
+          helper_path="$OFFICIAL_HELPER_DIR/codex-code-mode-host-x86_64-unknown-linux-musl"
+          if [[ ! -f "$codex_path" || -L "$codex_path" || ! -x "$codex_path" || ! -s "$codex_path" ]]; then
+            echo "::error::Cargo did not produce a regular executable codex"
+            exit 1
+          fi
+          if [[ ! -f "$helper_path" || -L "$helper_path" || ! -s "$helper_path" ]]; then
+            echo "::error::verified official Linux code-mode host is unavailable"
+            exit 1
+          fi
+          install -m 0755 "$codex_path" "$ARTIFACT_DIR/codex"
+          install -m 0755 "$helper_path" "$ARTIFACT_DIR/codex-code-mode-host"
 
       - name: Validate Linux architecture and runtime contracts
         env:
@@ -776,6 +842,7 @@ jobs:
             echo "| Upstream tag object | \`$UPSTREAM_TAG_OBJECT_SHA\` |"
             echo "| Upstream peeled SHA | \`$UPSTREAM_SHA\` |"
             echo "| Patched diff SHA-256 | \`$PATCH_SHA256\` |"
+            echo "| Code-mode host | Official \`x86_64-unknown-linux-musl\` asset from \`$UPSTREAM_TAG\`, GitHub digest verified |"
             echo "| Target | \`$TARGET_TRIPLE\` |"
             echo "| Runner architecture | \`$(uname -m)\` |"
             echo "| Build epoch | \`$SOURCE_DATE_EPOCH\` |"
@@ -805,6 +872,10 @@ jobs:
       - name: Remove ephemeral upstream Cargo target
         if: ${{ always() }}
         run: rm -rf -- "$RUNNER_TEMP/codex-linux-target"
+
+      - name: Remove ephemeral official Linux helper
+        if: ${{ always() }}
+        run: rm -rf -- "$RUNNER_TEMP/official-linux-code-mode-host" "$RUNNER_TEMP"/codex-code-mode-host-*.tar.gz
 
       - name: Save remote Cargo downloads
         if: ${{ always() && steps.cargo_download_cache.outputs.cache-hit != 'true' }}
