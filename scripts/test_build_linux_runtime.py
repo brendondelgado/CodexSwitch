@@ -40,7 +40,7 @@ class LinuxRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn("ref: ${{ inputs.codexswitch_git_sha }}", checkout)
         self.assertIn("persist-credentials: false", checkout)
 
-    def test_builds_both_exact_sources_for_native_linux_x86_64_with_one_job(self) -> None:
+    def test_builds_patched_cli_and_fetches_exact_official_helper(self) -> None:
         self.assertIn("runs-on: ubuntu-24.04", self.workflow)
         self.assertIn("TARGET_TRIPLE: x86_64-unknown-linux-gnu", self.workflow)
         self.assertIn('CARGO_BUILD_JOBS: "1"', self.workflow)
@@ -50,8 +50,9 @@ class LinuxRuntimeWorkflowContractTests(unittest.TestCase):
             self.workflow.count('--jobs "$CARGO_BUILD_JOBS"'),
             2,
         )
-        for package in ("-p codexswitch-cli", "-p codex-cli", "-p codex-code-mode-host"):
+        for package in ("-p codexswitch-cli", "-p codex-cli"):
             self.assertIn(package, self.workflow)
+        self.assertNotIn("-p codex-code-mode-host", self.workflow)
         self.assertIn(
             "Tests/Fixtures/BuildFork/patch_codex_source.rs",
             self.workflow,
@@ -59,6 +60,25 @@ class LinuxRuntimeWorkflowContractTests(unittest.TestCase):
         self.assertIn('"${tag_ref}^{commit}"', self.workflow)
         self.assertIn('"$peeled_upstream_sha" != "$EXPECTED_UPSTREAM_CODEX_SHA"', self.workflow)
         self.assertIn("Revalidate both source trees after compilation", self.workflow)
+
+        helper = self.block(
+            "Fetch the exact official Linux code-mode host",
+            "Revalidate both source trees after compilation",
+        )
+        for value in (
+            'helper_triple="x86_64-unknown-linux-musl"',
+            'release_tag="rust-v${UPSTREAM_CODEX_VERSION}"',
+            "/repos/openai/codex/releases/tags/${release_tag}",
+            ".draft == false",
+            ".prerelease == false",
+            'test("^sha256:[0-9a-f]{64}$")',
+            'if [[ "$helper_url" != "$expected_url" ]]',
+            'stat -c \'%s\' "$helper_archive"',
+            'sha256sum "$helper_archive"',
+            'tar -tzf "$helper_archive"',
+            '"codex-code-mode-host-${helper_triple}"',
+        ):
+            self.assertIn(value, helper)
 
     def test_provenance_and_cache_identity_bind_all_effective_sources(self) -> None:
         self.assertIn('SOURCE_DATE_EPOCH=%s\\n', self.workflow)
@@ -125,7 +145,7 @@ class LinuxRuntimeWorkflowContractTests(unittest.TestCase):
         )
 
         upstream_build = self.block(
-            "Build the patched Codex runtime pair",
+            "Build the patched Codex CLI runtime",
             "Revalidate both source trees after compilation",
         )
         self.assertIn(
@@ -147,7 +167,7 @@ class LinuxRuntimeWorkflowContractTests(unittest.TestCase):
         )
         restore = self.block(
             "Restore exact upstream Cargo target cache",
-            "Build the patched Codex runtime pair",
+            "Build the patched Codex CLI runtime",
         )
         self.assertIn("continue-on-error: true", restore)
         self.assertIn("${{ runner.temp }}/codex-linux-target/", restore)
