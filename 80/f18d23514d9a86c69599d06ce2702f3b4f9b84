@@ -1,0 +1,36 @@
+Tests/CodexSwitchTests/ReliabilityPolicyTests.swift
+  s_70c8e194852bb5::t_03d44bc99d0680 749-750,755-760,763-781,783-784
+  s_70c8e194852bb5::t_a3d00d54ac19b7 751-754,761-762,782
+Sources/CodexSwitch/Services/KeychainStore.swift
+  s_70c8e194852bb5::t_5b4b1d364a8281 254-297,301,320,646-654
+  s_70c8e194852bb5::t_8b4daeca5e1649 655
+Sources/CodexSwitch/Services/AccountPersistenceCoordinator.swift
+  s_70c8e194852bb5::t_5b4b1d364a8281 19-21,49,73-75,91,102-105,199-210,216
+  s_70c8e194852bb5::t_224eff32ed3242 211-215
+  s_70c8e194852bb5::t_1f8782b43e6a7e 217-219
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_a25018edb875e3 414-421
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_a25018edb875e3 525,528-545
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_5b4b1d364a8281 3871-3874,8805,8808,8843,8846,8855,8863-8865,8877,8894,8900,8902,8906
+  s_70c8e194852bb5::t_03d44bc99d0680 8849,8853
+Tests/CodexSwitchTests/KeychainStoreTests.swift
+  s_70c8e194852bb5::t_03d44bc99d0680 1691-1777
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "80f18d23514d9a86c69599d06ce2702f3b4f9b84",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
