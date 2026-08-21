@@ -1543,6 +1543,9 @@ Every future hot-swap change must include tests for:
 - Runtime `UsageLimitReached` inside Codex generates a canonical receipt UUID,
   invokes only `$HOME/.local/bin/codexswitch-cli`, rotates once, reloads the
   active turn `AuthManager`, and retries before surfacing the original error.
+  Exact-source patching supports both the legacy integer retry counter and the
+  newer `ResponsesStreamRetryState` initializer immediately before that loop;
+  any other loop shape fails closed.
 - In-turn usage-limit and auth-failure rotation passes the exact verified auth
   path and receipt UUID to normal `rotate-now`, uses a bounded timeout and
   per-stream output limit, and requires a confirmed report whose request count,

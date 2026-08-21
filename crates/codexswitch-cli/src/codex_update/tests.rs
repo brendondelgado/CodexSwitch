@@ -5113,6 +5113,83 @@ async fn run_turn() {
     }
 
     #[test]
+    fn core_turn_patch_supports_codex_0_149_retry_state_initializer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let turn_dir = temp_dir.path().join("codex-rs/core/src/session");
+        fs::create_dir_all(&turn_dir).unwrap();
+        let turn = turn_dir.join("turn.rs");
+        fs::write(
+            &turn,
+            r#"
+/// Takes initial turn input and runs a loop where, at each sampling request,
+async fn run_turn() {
+    let max_retries = turn_context.provider.info().stream_max_retries();
+    let mut retry_state = ResponsesStreamRetryState::default();
+    let mut initial_input = Some(input);
+    let mut original_input = None;
+    loop {
+        let prompt_input = if let Some(input) = initial_input.take() {
+            input
+        } else {
+            sess.clone_history().await
+        };
+        let err = match try_run_sampling_request().await {
+            Ok(output) => return Ok(output),
+            Err(err) => match err.details() {
+                CodexErrorDetails::ContextWindowExceeded => return Err(err),
+                CodexErrorDetails::UsageLimitReached(e) => {
+                    let rate_limits = e.rate_limits.clone();
+                    if let Some(rate_limits) = rate_limits {
+                        sess.update_rate_limits(&turn_context, *rate_limits).await;
+                    }
+                    return Err(err);
+                }
+                _ => err,
+            },
+        };
+
+        if original_input.is_none() {
+            original_input = Some(prompt.input);
+        }
+        if !err.is_retryable() {
+            return Err(err);
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        patch_turn_rotation_templates(&turn).unwrap();
+        let first = fs::read_to_string(&turn).unwrap();
+        patch_turn_rotation_templates(&turn).unwrap();
+        let second = fs::read_to_string(&turn).unwrap();
+
+        assert_eq!(second, first, "the 0.149 turn patch must be idempotent");
+        let retry_state = second
+            .find("let mut retry_state = ResponsesStreamRetryState::default();")
+            .unwrap();
+        let usage_guard = second
+            .find("let mut codexswitch_usage_limit_retry_attempted = false;")
+            .unwrap();
+        let initial_input = second.find("let mut initial_input = Some(input);").unwrap();
+        assert!(retry_state < usage_guard);
+        assert!(usage_guard < initial_input);
+        assert_eq!(
+            second
+                .matches("codexswitch_rotate_after_usage_limit(&sess, &turn_context).await")
+                .count(),
+            1
+        );
+        assert_eq!(
+            second
+                .matches("codexswitch_rotate_after_auth_failure(&sess, &turn_context).await")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn interrupted_turn_direct_contract_rejects_stale_ack_and_bad_counts() {
         let receipt = "37f84870-9b39-45ae-aee9-3e0a63e1f989";
         let request = format!("{receipt}:1a7c3ffb-bfd8-4719-9b45-c2e350469d9c");

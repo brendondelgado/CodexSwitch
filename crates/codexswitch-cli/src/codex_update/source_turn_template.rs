@@ -81,21 +81,30 @@ fn normalize_interrupted_turn_retry_loop(path: &Path) -> Result<()> {
         "codexswitch_auth_failure_retry_attempted",
         "codexswitch_auth_rotation_retry_attempted",
     )?;
-    patch_file_after(
+    patch_file_after_any(
         path,
-        "    let mut retries = 0;",
+        &[
+            "    let mut retries = 0;",
+            "    let mut retry_state = ResponsesStreamRetryState::default();",
+        ],
         "\n    let mut codexswitch_usage_limit_retry_attempted = false;",
         "let mut codexswitch_usage_limit_retry_attempted = false;",
     )?;
-    patch_file_after(
+    patch_file_after_any(
         path,
-        "    let mut retries = 0;",
+        &[
+            "    let mut retries = 0;",
+            "    let mut retry_state = ResponsesStreamRetryState::default();",
+        ],
         "\n    let mut codexswitch_auth_reload_retry_attempted = false;",
         "let mut codexswitch_auth_reload_retry_attempted = false;",
     )?;
-    patch_file_after(
+    patch_file_after_any(
         path,
-        "    let mut retries = 0;",
+        &[
+            "    let mut retries = 0;",
+            "    let mut retry_state = ResponsesStreamRetryState::default();",
+        ],
         "\n    let mut codexswitch_auth_rotation_retry_attempted = false;",
         "let mut codexswitch_auth_rotation_retry_attempted = false;",
     )?;
