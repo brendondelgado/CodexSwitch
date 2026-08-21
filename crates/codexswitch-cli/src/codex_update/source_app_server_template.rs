@@ -60,6 +60,7 @@ fn patch_app_server_reload_template(
         path,
         &[
             "let processor_handle = tokio::spawn({\n        let auth_manager =\n            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;",
+            "let auth_manager =\n        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)\n            .await\n            .map_err(std::io::Error::other)?;",
             "let auth_manager =\n        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;",
         ],
         r#"

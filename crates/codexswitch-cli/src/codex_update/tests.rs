@@ -2172,9 +2172,12 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         fs::write(
             &app_server,
             r#"async fn run() {
+    let auth_manager =
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+            .await
+            .map_err(std::io::Error::other)?;
     let processor_handle = tokio::spawn({
-        let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+        let auth_manager = Arc::clone(&auth_manager);
     });
 }
 "#,
@@ -2190,6 +2193,17 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
         )?;
 
         patch_app_server_reload_template(&app_server, &in_process, true)?;
+
+        let patched_app_server = fs::read_to_string(&app_server)?;
+        let shared_auth_index = patched_app_server
+            .find("AuthManager::shared_from_config")
+            .unwrap();
+        let reload_index = patched_app_server
+            .find("SIGHUP: auth reload signal received")
+            .unwrap();
+        let processor_index = patched_app_server.find("let processor_handle").unwrap();
+        assert!(shared_auth_index < reload_index);
+        assert!(reload_index < processor_index);
 
         for path in [&app_server, &in_process] {
             let patched = fs::read_to_string(path)?;

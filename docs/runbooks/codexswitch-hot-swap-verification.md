@@ -84,7 +84,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-08-06
+  last_updated: 2026-08-21
 ---
 
 # CodexSwitch Hot-Swap Verification Runbook
@@ -1531,7 +1531,12 @@ Every future hot-swap change must include tests for:
 - Pre-credential authorization failures restore the operation's prior journal
   under the same lease, and launch repair of file-commit failures requires exact
   store/auth agreement before publishing configured-only recovery.
-- App-server patching targets the `AuthManager` captured by `MessageProcessor`, not an earlier preload/auth probe.
+- App-server patching targets the shared `AuthManager` captured by
+  `MessageProcessor`, not an earlier preload/auth probe. The exact-source
+  patcher supports both the manager created inside the processor task and the
+  newer upstream shape that creates the manager immediately before the task
+  and clones it into the processor. Any other or ambiguous source shape fails
+  closed before a runtime artifact is built.
 - Expired or quota-exhausted authority targets produce one idempotent remote
   rotation request, then each required host rewrites `auth.json` only for the
   committed epoch.
