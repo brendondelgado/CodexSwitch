@@ -522,15 +522,27 @@ detection. Swift account-store writes remain suppressed for the in-process
 adoption barrier; after the barrier opens, subsequent telemetry is captured
 from the adopted snapshot.
 
-Every non-telemetry Swift account-store commit is also conditional on the exact
+Every whole-store Swift credential commit is conditional on the exact
 credential authority from which the operation started: account membership,
 local and provider identities, complete token sets, and the active selection.
-The check and commit occur under the account-store lock. A token refresh,
-reauthentication, or account import that finishes after a Rust selection
-therefore discards its stale whole-store mutation instead of restoring the
-prior active account. Explicit account-store deletion follows the same rule:
-it holds the shared mutation lease and deletes only when the durable credential
-authority still matches the snapshot presented to the user.
+The check and commit occur under the account-store lock. An account import that
+finishes after a Rust selection therefore discards its stale whole-store
+mutation instead of restoring the prior active account. Explicit account-store
+deletion follows the same rule: it holds the shared mutation lease and deletes
+only when the durable credential authority still matches the snapshot
+presented to the user.
+
+Inactive token refresh and inactive reauthentication are single-account
+credential transactions, not whole-store replacements. Under the shared
+account-mutation lease and account-store lock, the commit must prove that the
+target is still present, still inactive, has the same stable provider identity,
+and still has the exact credential generation from which the request began. It
+then updates only that target's credential fields while preserving the durable
+active selection, membership, every unrelated credential generation, and
+newer durable telemetry. Two concurrent refreshes for different inactive
+accounts may both commit. A stale second refresh for the same account fails
+closed. Candidate credentials must never enter observed in-memory state before
+their durable single-account commit succeeds.
 
 Rust and Swift share the exclusive
 `~/.codexswitch/accounts.runtime-activation.lock` lease for the complete

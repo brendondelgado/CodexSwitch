@@ -16,6 +16,9 @@ actor AccountPersistenceCoordinator {
     typealias SaveConditional =
         @Sendable ([CodexAccount], [CodexAccount]) throws
             -> AccountTelemetryPersistenceOutcome
+    typealias SaveInactiveCredentialUpdate =
+        @Sendable (CodexAccount, CodexAccount) throws
+            -> AccountTelemetryPersistenceOutcome
     typealias SaveTelemetry =
         @Sendable ([CodexAccount]) throws -> AccountTelemetryPersistenceOutcome
     typealias DeleteAll = @Sendable () throws -> Void
@@ -43,6 +46,7 @@ actor AccountPersistenceCoordinator {
     private let loadOperation: Load
     private let saveOperation: Save
     private let saveConditionalOperation: SaveConditional
+    private let saveInactiveCredentialUpdateOperation: SaveInactiveCredentialUpdate
     private let saveTelemetryOperation: SaveTelemetry
     private let deleteAllOperation: DeleteAll
     private let deleteAllConditionalOperation: DeleteAllConditional
@@ -66,6 +70,9 @@ actor AccountPersistenceCoordinator {
         self.saveConditionalOperation = {
             try store.saveAll($0, ifCredentialAuthorityMatches: $1)
         }
+        self.saveInactiveCredentialUpdateOperation = {
+            try store.saveInactiveCredentialUpdate(original: $0, candidate: $1)
+        }
         self.saveTelemetryOperation = { try store.saveTelemetry($0) }
         self.deleteAllOperation = { try store.deleteAll() }
         self.deleteAllConditionalOperation = {
@@ -81,6 +88,7 @@ actor AccountPersistenceCoordinator {
         load: @escaping Load,
         save: @escaping Save,
         saveConditional: SaveConditional? = nil,
+        saveInactiveCredentialUpdate: SaveInactiveCredentialUpdate? = nil,
         saveTelemetry: SaveTelemetry? = nil,
         deleteAllConditional: DeleteAllConditional? = nil,
         deleteAll: @escaping DeleteAll
@@ -91,6 +99,10 @@ actor AccountPersistenceCoordinator {
             try save(accounts)
             return .persisted(accounts)
         }
+        self.saveInactiveCredentialUpdateOperation =
+            saveInactiveCredentialUpdate ?? { _, _ in
+                .discardedCredentialDrift(try load())
+            }
         self.saveTelemetryOperation = saveTelemetry ?? { accounts in
             try save(accounts)
             return .persisted(accounts)
@@ -175,6 +187,27 @@ actor AccountPersistenceCoordinator {
             throw AccountPersistenceCoordinatorError.authorizationLost
         }
         let outcome = try saveConditionalOperation(accounts, expectedAccounts)
+        switch outcome {
+        case .persisted(let persisted):
+            recordSuccessfulPersistence(of: persisted, at: now(), isTelemetry: false)
+        case .discardedCredentialDrift(let durable):
+            recordSuccessfulPersistence(of: durable, at: now(), isTelemetry: false)
+        }
+        return outcome
+    }
+
+    func persistInactiveCredentialUpdate(
+        original: CodexAccount,
+        candidate: CodexAccount,
+        revision: UInt64
+    ) throws -> AccountTelemetryPersistenceOutcome {
+        latestRevision = max(latestRevision, revision)
+        telemetryFlushTask?.cancel()
+        telemetryFlushTask = nil
+        if let pendingTelemetry, pendingTelemetry.revision <= revision {
+            self.pendingTelemetry = nil
+        }
+        let outcome = try saveInactiveCredentialUpdateOperation(original, candidate)
         switch outcome {
         case .persisted(let persisted):
             recordSuccessfulPersistence(of: persisted, at: now(), isTelemetry: false)

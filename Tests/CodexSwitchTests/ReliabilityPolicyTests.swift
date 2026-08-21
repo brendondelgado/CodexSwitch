@@ -746,6 +746,42 @@ struct AccountPersistenceCoordinatorTests {
         #expect(recorder.savedAccountIds().isEmpty)
     }
 
+    @Test("Single-account credential commits are not rejected by unrelated revisions")
+    func inactiveCredentialCommitUsesPerAccountAuthority() async throws {
+        var original = account(id: "original")
+        original.isActive = false
+        var candidate = original
+        candidate.accessToken = "refreshed-access"
+        let recorder = PersistenceRecorder()
+        let coordinator = AccountPersistenceCoordinator(
+            load: { [original] },
+            save: { recorder.record($0) },
+            saveInactiveCredentialUpdate: { observed, replacement in
+                #expect(observed.accountId == "original")
+                #expect(replacement.accountId == "original")
+                #expect(replacement.accessToken == "refreshed-access")
+                return .persisted([replacement])
+            },
+            deleteAll: {}
+        )
+
+        _ = try await coordinator.persistInactiveCredentialUpdate(
+            original: original,
+            candidate: candidate,
+            revision: 2
+        )
+        let outcome = try await coordinator.persistInactiveCredentialUpdate(
+            original: original,
+            candidate: candidate,
+            revision: 1
+        )
+        guard case .persisted(let persisted) = outcome else {
+            Issue.record("Per-account authority should decide an out-of-order callback")
+            return
+        }
+        #expect(persisted.map(\.accountId) == ["original"])
+    }
+
     @Test("Credential drift discards a stale whole-store deletion")
     func credentialDriftDiscardsDurableDeletion() async throws {
         let durable = [account(id: "cli-target")]

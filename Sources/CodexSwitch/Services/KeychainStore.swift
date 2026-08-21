@@ -251,10 +251,54 @@ struct KeychainStore: Sendable {
         }
     }
 
+    func saveInactiveCredentialUpdate(
+        original: CodexAccount,
+        candidate: CodexAccount
+    ) throws -> AccountTelemetryPersistenceOutcome {
+        try withAccountMutationLease {
+            try withExclusiveLock { lockedFile in
+                let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
+                guard !original.isActive,
+                      candidate.id == original.id,
+                      candidate.accountId == original.accountId,
+                      candidate.hasCompleteRuntimeCredentials,
+                      let index = snapshot.accounts.firstIndex(where: {
+                          $0.id == original.id
+                      }),
+                      !snapshot.accounts[index].isActive,
+                      Self.credentialsMatch(snapshot.accounts[index], original),
+                      !snapshot.accounts.contains(where: {
+                          $0.id != original.id && $0.accountId == candidate.accountId
+                      }) else {
+                    return .discardedCredentialDrift(snapshot.accounts)
+                }
+
+                var replacement = snapshot.accounts[index]
+                replacement.email = candidate.email
+                replacement.accessToken = candidate.accessToken
+                replacement.refreshToken = candidate.refreshToken
+                replacement.idToken = candidate.idToken
+                replacement.accountId = candidate.accountId
+                replacement.lastRefreshed = candidate.lastRefreshed
+                replacement.runtimeUnusableUntil = nil
+                replacement.runtimeUnusableReason = nil
+
+                var updated = snapshot.accounts
+                updated[index] = replacement
+                let committed = try commit(
+                    updated,
+                    expectedGeneration: snapshot.generation,
+                    lockedFile: lockedFile
+                )
+                return .persisted(committed.accounts)
+            }
+        }
+    }
+
     func saveTelemetry(
         _ observedAccounts: [CodexAccount]
     ) throws -> AccountTelemetryPersistenceOutcome {
-        try withTelemetryMutationLease {
+        try withAccountMutationLease {
             try withExclusiveLock { lockedFile in
                 let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
                 guard let merged = Self.mergingTelemetry(
@@ -273,7 +317,7 @@ struct KeychainStore: Sendable {
         }
     }
 
-    private func withTelemetryMutationLease<T>(
+    private func withAccountMutationLease<T>(
         _ operation: () throws -> T
     ) throws -> T {
         let leaseURL = URL(fileURLWithPath: storePath)
@@ -597,6 +641,16 @@ struct KeychainStore: Sendable {
                 && account.idToken == expected.idToken
                 && account.isActive == expected.isActive
         }
+    }
+
+    private static func credentialsMatch(
+        _ lhs: CodexAccount,
+        _ rhs: CodexAccount
+    ) -> Bool {
+        lhs.accountId == rhs.accountId
+            && lhs.accessToken == rhs.accessToken
+            && lhs.refreshToken == rhs.refreshToken
+            && lhs.idToken == rhs.idToken
     }
 
     private enum TelemetryMergeError: Error {

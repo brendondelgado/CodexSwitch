@@ -1688,6 +1688,93 @@ struct KeychainStoreTests {
         }
     }
 
+    @Test("Concurrent inactive refreshes preserve both credential generations")
+    func inactiveCredentialUpdatesRebaseAcrossUnrelatedAccounts() throws {
+        let store = isolatedStore()
+        let active = activeAccount(accountId: "active")
+        var first = activeAccount(accountId: "first")
+        first.isActive = false
+        var second = activeAccount(accountId: "second")
+        second.isActive = false
+        try store.saveAll([active, first, second])
+
+        var refreshedFirst = first
+        refreshedFirst.accessToken = "refreshed-access-first"
+        refreshedFirst.refreshToken = "refreshed-refresh-first"
+        refreshedFirst.idToken = "refreshed-id-first"
+        var refreshedSecond = second
+        refreshedSecond.accessToken = "refreshed-access-second"
+        refreshedSecond.refreshToken = "refreshed-refresh-second"
+        refreshedSecond.idToken = "refreshed-id-second"
+
+        guard case .persisted = try store.saveInactiveCredentialUpdate(
+            original: first,
+            candidate: refreshedFirst
+        ) else {
+            Issue.record("First inactive refresh should persist")
+            return
+        }
+        guard case .persisted = try store.saveInactiveCredentialUpdate(
+            original: second,
+            candidate: refreshedSecond
+        ) else {
+            Issue.record("Unrelated inactive refresh should rebase and persist")
+            return
+        }
+
+        var persisted = try store.loadAll()
+        #expect(persisted.filter(\.isActive).map(\.accountId) == ["active"])
+        #expect(persisted.first(where: { $0.id == first.id })?.accessToken == "refreshed-access-first")
+        #expect(persisted.first(where: { $0.id == second.id })?.accessToken == "refreshed-access-second")
+
+        let secondIndex = try #require(persisted.firstIndex(where: { $0.id == second.id }))
+        persisted[secondIndex].planType = "pro"
+        guard case .persisted(let withTelemetry) = try store.saveTelemetry(persisted) else {
+            Issue.record("Persisted refresh generations must admit later telemetry")
+            return
+        }
+        #expect(withTelemetry[secondIndex].planType == "pro")
+    }
+
+    @Test("A stale second inactive refresh fails closed")
+    func inactiveCredentialUpdateRejectsStaleSameAccountGeneration() throws {
+        let store = isolatedStore()
+        let active = activeAccount(accountId: "active")
+        var inactive = activeAccount(accountId: "inactive")
+        inactive.isActive = false
+        try store.saveAll([active, inactive])
+
+        var winner = inactive
+        winner.accessToken = "winner-access"
+        winner.refreshToken = "winner-refresh"
+        winner.idToken = "winner-id"
+        var stale = inactive
+        stale.accessToken = "stale-access"
+        stale.refreshToken = "stale-refresh"
+        stale.idToken = "stale-id"
+
+        guard case .persisted = try store.saveInactiveCredentialUpdate(
+            original: inactive,
+            candidate: winner
+        ) else {
+            Issue.record("First inactive refresh should persist")
+            return
+        }
+        switch try store.saveInactiveCredentialUpdate(
+            original: inactive,
+            candidate: stale
+        ) {
+        case .persisted:
+            Issue.record("A stale same-account generation must not overwrite the winner")
+        case .discardedCredentialDrift(let durable):
+            #expect(durable.first(where: { $0.id == inactive.id })?.accessToken == "winner-access")
+        }
+
+        let persisted = try store.loadAll()
+        #expect(persisted.filter(\.isActive).map(\.accountId) == ["active"])
+        #expect(persisted.first(where: { $0.id == inactive.id })?.accessToken == "winner-access")
+    }
+
     @Test("Conditional deletion cannot erase a newer active selection")
     func conditionalDeletionPreservesCredentialAuthority() throws {
         let path = makeStorePath()

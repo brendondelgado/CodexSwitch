@@ -3775,7 +3775,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func refreshToken(for accountId: UUID) async {
         guard !isExiting else { return }
-        let credentialAuthorityBeforeRefresh = accountManager.accounts
         guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
         guard !account.isRuntimeUnusable else {
             await quotaPoller.stopPolling(for: accountId)
@@ -3869,12 +3868,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         do {
             let updated = try await TokenRefresher.refresh(account)
-            if case .rejectedConfiguredAccount = accountManager.upsertInactiveAccount(updated) {
-                return
-            }
-            guard await persistAccountsSnapshot(
-                context: "token-refresh",
-                expectedCredentialAuthority: credentialAuthorityBeforeRefresh
+            guard await persistInactiveCredentialUpdate(
+                original: account,
+                candidate: updated,
+                context: "token-refresh"
             ) else { return }
             refreshSubscriptionInfoIfNeeded(force: true)
             SwapLog.append(.tokenRefreshed(email: account.email))
@@ -8726,8 +8723,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func reauthenticateAccount(_ accountId: UUID) {
         guard !isExiting else { return }
         guard let original = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
-        let credentialAuthorityBeforeLogin = accountManager.accounts
-
         Task { @MainActor [weak self] in
             guard let self, !self.isExiting else { return }
             do {
@@ -8807,10 +8802,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     guard committed else { return }
                 } else {
-                    guard await persistInactiveReauthentication(
+                    guard await persistInactiveCredentialUpdate(
                         original: original,
                         candidate: candidate,
-                        expectedCredentialAuthority: credentialAuthorityBeforeLogin
+                        context: "reauth-account"
                     ) else {
                         return
                     }
@@ -8845,19 +8840,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    private func persistInactiveReauthentication(
+    private func persistInactiveCredentialUpdate(
         original: CodexAccount,
         candidate: CodexAccount,
-        expectedCredentialAuthority: [CodexAccount]
+        context: String
     ) async -> Bool {
         guard !externalHandoffAdoptionInFlight,
-              let snapshot = Self.inactiveReauthenticationSnapshot(
+              Self.inactiveReauthenticationSnapshot(
                   accounts: accountManager.accounts,
                   original: original,
                   candidate: candidate
-              ) else {
+              ) != nil else {
             SwapLog.append(.debug(
-                "ACCOUNT_REAUTH_COMMIT_BLOCKED target=\(original.id.uuidString) reason=credential_authority_changed"
+                "INACTIVE_CREDENTIAL_COMMIT_BLOCKED context=\(context) target=\(original.id.uuidString) reason=credential_authority_changed"
             ))
             return false
         }
@@ -8865,9 +8860,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         accountPersistenceRevision &+= 1
         let revision = accountPersistenceRevision
         do {
-            let outcome = try await accountPersistence.persistDurably(
-                snapshot,
-                ifCredentialAuthorityMatches: expectedCredentialAuthority,
+            let outcome = try await accountPersistence.persistInactiveCredentialUpdate(
+                original: original,
+                candidate: candidate,
                 revision: revision
             )
             guard case .persisted(let persisted) = outcome,
@@ -8879,7 +8874,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                   Self.credentialsMatch(current, original) else {
                 externalAuthReconciliationPending = true
                 SwapLog.append(.debug(
-                    "ACCOUNT_REAUTH_COMMIT_BLOCKED target=\(original.id.uuidString) reason=credential_authority_drift"
+                    "INACTIVE_CREDENTIAL_COMMIT_BLOCKED context=\(context) target=\(original.id.uuidString) reason=credential_authority_drift"
                 ))
                 return false
             }
@@ -8896,19 +8891,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard case .updated = accountManager.upsertInactiveAccount(applied) else {
                 externalAuthReconciliationPending = true
                 SwapLog.append(.debug(
-                    "ACCOUNT_REAUTH_COMMIT_BLOCKED target=\(original.id.uuidString) reason=in_memory_adoption_failed"
+                    "INACTIVE_CREDENTIAL_COMMIT_BLOCKED context=\(context) target=\(original.id.uuidString) reason=in_memory_adoption_failed"
                 ))
                 return false
             }
 
             SwapLog.append(.debug(
-                "ACCOUNTS_PERSISTED context=reauth-account configured=\(accountManager.configuredAccount?.email ?? "none")"
+                "ACCOUNTS_PERSISTED context=\(context) configured=\(accountManager.configuredAccount?.email ?? "none")"
             ))
-            scheduleLinuxDevboxCredentialSyncIfNeeded(context: "reauth-account")
+            scheduleLinuxDevboxCredentialSyncIfNeeded(context: context)
             return true
         } catch {
             SwapLog.append(.debug(
-                "ACCOUNTS_PERSIST_FAILED context=reauth-account error=\(error.localizedDescription)"
+                "ACCOUNTS_PERSIST_FAILED context=\(context) error=\(error.localizedDescription)"
             ))
             return false
         }

@@ -411,9 +411,14 @@ adoption and that no Swift account-store write occurs during the adoption
 barrier. A stale periodic or termination snapshot must log
 `ACCOUNTS_TELEMETRY_DISCARDED` and leave the CLI-selected credentials and active
 flag unchanged. Repeat the check with an inactive token refresh or
-reauthentication that began before the CLI swap; its conditional whole-store
-commit must log `ACCOUNTS_PERSIST_DISCARDED` and preserve the CLI-selected
-account.
+reauthentication that began before the CLI swap. Its single-account commit may
+update only the same still-inactive credential generation and must preserve the
+CLI-selected account. Run two inactive refreshes from the same baseline for
+different accounts and verify that both generations persist without a
+discarded-write loop. Run two refreshes for the same account and verify that
+the stale second generation fails closed without entering memory. After either
+case, periodic telemetry must continue to persist instead of repeatedly
+logging `ACCOUNTS_TELEMETRY_DISCARDED`.
 
 If the matching Rust activation journal is `Prepared` or a fresh `FileOnly`,
 Swift must log `ACTIVATION_EXTERNAL_HANDOFF_DEFERRED` and send no competing
