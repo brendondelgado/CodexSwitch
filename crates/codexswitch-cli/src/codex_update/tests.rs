@@ -2190,6 +2190,8 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
             .await
             .map_err(IoError::other)?;
     let runtime_handle = tokio::spawn(async move {
+        let (outgoing_tx, outgoing_rx) =
+            mpsc::channel::<OutgoingEnvelope>(channel_capacity);
         let processor = MessageProcessor::new(auth_manager.clone());
     });
 }
@@ -2217,8 +2219,14 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
             .find("SIGHUP: auth reload signal received by in-process app-server")
             .unwrap();
         let runtime_index = patched_in_process.find("let runtime_handle").unwrap();
-        assert!(local_auth_index < local_reload_index);
-        assert!(local_reload_index < runtime_index);
+        let outgoing_index = patched_in_process
+            .find("let (outgoing_tx, outgoing_rx)")
+            .unwrap();
+        let processor_index = patched_in_process.find("MessageProcessor::new").unwrap();
+        assert!(local_auth_index < runtime_index);
+        assert!(runtime_index < outgoing_index);
+        assert!(outgoing_index < local_reload_index);
+        assert!(local_reload_index < processor_index);
 
         for path in [&app_server, &in_process] {
             let patched = fs::read_to_string(path)?;

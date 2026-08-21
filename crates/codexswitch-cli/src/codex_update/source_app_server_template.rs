@@ -524,12 +524,23 @@ fn patch_app_server_reload_template(
         uses_timestamped_server_notifications,
     )?;
     if in_process_app_server.exists() {
+        const LEGACY_IN_PROCESS_AUTH_ANCHOR: &str = "let auth_manager =\n            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n                .await;";
+        const SHARED_IN_PROCESS_AUTH_ANCHOR: &str = "let auth_manager =\n        AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n            .await\n            .map_err(IoError::other)?;";
+        const SHARED_IN_PROCESS_OUTGOING_ANCHOR: &str =
+            "        let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);";
+        let in_process_source = fs::read_to_string(in_process_app_server).with_context(|| {
+            format!("failed to read {}", in_process_app_server.display())
+        })?;
+        let in_process_anchors: &[&str] = if in_process_source
+            .contains(SHARED_IN_PROCESS_AUTH_ANCHOR)
+        {
+            &[SHARED_IN_PROCESS_OUTGOING_ANCHOR]
+        } else {
+            &[LEGACY_IN_PROCESS_AUTH_ANCHOR]
+        };
         patch_file_after_any_notification_aware(
             &in_process_app_server,
-            &[
-                "let auth_manager =\n            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n                .await;",
-                "let auth_manager =\n        AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)\n            .await\n            .map_err(IoError::other)?;",
-            ],
+            in_process_anchors,
             r#"
         #[cfg(unix)]
         {
