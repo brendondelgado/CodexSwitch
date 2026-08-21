@@ -748,8 +748,9 @@ struct AccountPersistenceCoordinatorTests {
 
     @Test("Single-account credential commits are not rejected by unrelated revisions")
     func inactiveCredentialCommitUsesPerAccountAuthority() async throws {
-        var original = account(id: "original")
-        original.isActive = false
+        var inactive = account(id: "original")
+        inactive.isActive = false
+        let original = inactive
         var candidate = original
         candidate.accessToken = "refreshed-access"
         let recorder = PersistenceRecorder()
