@@ -1,0 +1,51 @@
+scripts/lib/systemd-start-barrier.py
+  s_70c8e194852bb5::t_0cbd64c3bf2556 1-400,412-420,422-1008
+  s_70c8e194852bb5::t_82abdfe9b37020 401-411,421
+scripts/lib/install-linux-systemd-policy.sh
+  s_70c8e194852bb5::t_39f86256182249 54
+  s_70c8e194852bb5::t_80f2f7f17d6728 194,214-216
+  s_70c8e194852bb5::t_a206e3d6ea5f42 28-53,55-130,191-193,196,198-199,203-213,217-229,240-253,263-266,281,286-287,290,292-300,302,305,317-325,329
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_e33684d630d228 1284-1288
+  s_70c8e194852bb5::t_d6ea02e76d0f6f 23,1322,1324,1326,1328-1329,3209-3312,3318-3349
+  s_70c8e194852bb5::t_4c19a900a8be06 1071-1073,1319-1321,1323,1325,1327,1330-1340,1342,1344-1364
+  s_70c8e194852bb5::t_dbde3ca6694928 3313-3317
+  s_70c8e194852bb5::t_13ca8ad20315e9 3350
+scripts/lib/observe-managed-systemd.py
+  s_70c8e194852bb5::t_ee729fd0a03fc6 21-22
+  s_70c8e194852bb5::t_e33684d630d228 16-20,23-24,34-48,126-137
+scripts/lib/install-linux-activation.sh
+  s_70c8e194852bb5::t_80f2f7f17d6728 807
+scripts/lib/install-linux-release.sh
+  s_70c8e194852bb5::t_ee729fd0a03fc6 4,10,17
+  s_70c8e194852bb5::t_e33684d630d228 5-9,11
+  s_70c8e194852bb5::t_7ad0d50f6e2580 35-42
+scripts/lib/install-linux-common.sh
+  s_70c8e194852bb5::t_80f2f7f17d6728 619
+  s_70c8e194852bb5::t_e33684d630d228 371-375,377,622
+  s_70c8e194852bb5::t_ee729fd0a03fc6 370,376,383
+scripts/lib/install-linux-systemd-transaction.sh
+  s_70c8e194852bb5::t_80f2f7f17d6728 213,215
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_8a002a53d83d55 38,623-659,784-795
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_8a002a53d83d55 58,1183-1199
+scripts/install-linux.sh
+  s_70c8e194852bb5::t_a206e3d6ea5f42 6,98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "8ea60b0f6b658535e8e2398fbf2554590f71ba91",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

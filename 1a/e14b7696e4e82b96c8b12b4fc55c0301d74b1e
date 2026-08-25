@@ -1,0 +1,39 @@
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_d2a689e227bd2e 153,168,182,2530,2542,2546,2548-2557
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_1d2f11cea24670 3569
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_d2a689e227bd2e 1056
+  s_70c8e194852bb5::t_b4ced322cab4a3 1061-1062
+  s_70c8e194852bb5::t_1d2f11cea24670 1054-1055,1057-1060
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_b4ced322cab4a3 29,298-300
+  s_70c8e194852bb5::t_1d2f11cea24670 293
+  s_70c8e194852bb5::t_d2a689e227bd2e 294-297
+Tests/Fixtures/RuntimeConvergence/reload-contract-v3.json
+  s_70c8e194852bb5::t_1d2f11cea24670 60-63
+Tests/CodexSwitchTests/DesktopRuntimeHotSwapStateTests.swift
+  s_70c8e194852bb5::t_1d2f11cea24670 78-82
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_53af25f159373e 1846,1863,1883-1899
+  s_70c8e194852bb5::t_d2a689e227bd2e 472,1973
+  s_70c8e194852bb5::t_b4ced322cab4a3 45-49,1800-1836
+  s_70c8e194852bb5::t_2e85636bd2d38f 1912-1940
+  s_70c8e194852bb5::t_470a75d84faf57 1837
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "1ae14b7696e4e82b96c8b12b4fc55c0301d74b1e",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

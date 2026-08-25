@@ -1,0 +1,95 @@
+Tests/CodexSwitchTests/AppDelegateSwapCommitTests.swift
+  s_70c8e194852bb5::t_fd778bd0053391 669
+  s_70c8e194852bb5::t_78a3c206b415bc 257-258,263
+Tests/CodexSwitchTests/DesktopRuntimeHotSwapStateTests.swift
+  s_70c8e194852bb5::t_fd778bd0053391 134-135
+Sources/CodexSwitch/Services/CodexVersionChecker.swift
+  s_70c8e194852bb5::t_27b57e40e385f8 183,497,503-507
+docs/sighup-safety.md
+  s_70c8e194852bb5::t_f14b89d230a318 25,44-47,64-65,68-69
+Tests/CodexSwitchTests/CodexDesktopNativeChildCoordinatorTests.swift
+  s_70c8e194852bb5::t_fd778bd0053391 5-15,23-26,30-32,34,37-47,49-77,80-95,97,101
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_27b57e40e385f8 512,561,2049,2051
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_4188cc2ec99e43 853-856
+  s_70c8e194852bb5::t_5fcaf8fc46f3a7 168-171,586-588,594-598
+  s_70c8e194852bb5::t_3059dddd87b6dd 962-964
+  s_70c8e194852bb5::t_f14b89d230a318 807,809-810,815-818,823-829,831-834
+  s_70c8e194852bb5::t_4699a9b3801bdd 1369-1373,1453-1455
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_f14b89d230a318 10,30,156-159,171-193
+  s_70c8e194852bb5::t_b820974eb793a9 240-244,261-265
+  s_70c8e194852bb5::t_801f4b7c294601 349-351,380-383
+  s_70c8e194852bb5::t_0655a0ab5a1a91 334-335,345-346
+Sources/CodexSwitch/Services/CodexDesktopNativeChildCoordinator.swift
+  s_70c8e194852bb5::t_27b57e40e385f8 4-6,8,14-18,21-22,31-34,36,38-39,41-43,46-53,55-59,63-71,73,77-87,127,130,154-158,161
+  s_70c8e194852bb5::t_adf9075ddf3fbd 146-147,150-151
+  s_70c8e194852bb5::t_1c7011c2b35454 92-96,99,101-104,108-114,116-124,136-139,142,145,148-149
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_19d6e760a6c7be 3937
+  s_70c8e194852bb5::t_7f61f00b7115b1 4621-4622
+  s_70c8e194852bb5::t_e3cf8f65954b7e 4524,4560,4607-4619
+  s_70c8e194852bb5::t_59f79b4dcb2eaa 4569
+  s_70c8e194852bb5::t_74df3b5ba13def 3735,3949-3952,4547
+  s_70c8e194852bb5::t_30529daa55d9fc 2500-2502,3085
+  s_70c8e194852bb5::t_21d232db3d7ad8 3970-3971
+  s_70c8e194852bb5::t_e08977d21695af 3086-3087
+  s_70c8e194852bb5::t_7e82b2c0b75c2e 323,3736-3745,3938-3948,3953-3969,4620
+  s_70c8e194852bb5::t_4110588cec700e 4623,4646
+Tests/CodexSwitchTests/CLIStatusCheckerTests.swift
+  s_70c8e194852bb5::t_fd778bd0053391 179-180
+  s_70c8e194852bb5::t_dce820ee37ea95 173
+Tests/CodexSwitchTests/CodexVersionCheckerTests.swift
+  s_70c8e194852bb5::t_fd778bd0053391 481-482,492,496,507
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_560037c49a43ef 835-838,1146-1150
+  s_70c8e194852bb5::t_f14b89d230a318 1363-1371
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_1d4d21d8f6fdcf 432-433
+  s_70c8e194852bb5::t_da22b0bec89b54 1151,1190-1191,1262,1266
+  s_70c8e194852bb5::t_56558bb31ff1ac 430,1230,1236
+  s_70c8e194852bb5::t_6411579be3c369 1480,1485-1486,1503
+Sources/CodexSwitch/Services/DesktopPatchManager.swift
+  s_70c8e194852bb5::t_1c7011c2b35454 16
+  s_70c8e194852bb5::t_8d7c1a3935dab7 107,613-624
+  s_70c8e194852bb5::t_1d4d21d8f6fdcf 17,561
+  s_70c8e194852bb5::t_27b57e40e385f8 505-508
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_1c7011c2b35454 1158,1163,1461-1464,1477-1479,1493,1496,1526,1529-1535,1607,2428,2887
+  s_70c8e194852bb5::t_1d4d21d8f6fdcf 1481,2888-2891
+  s_70c8e194852bb5::t_24ca9401350124 3307
+crates/codexswitch-cli/src/readiness.rs
+  s_70c8e194852bb5::t_19d6e760a6c7be 49-65,296-305,323,349,354-425,427-429,431-470,472-511,519-528,536-566
+  s_70c8e194852bb5::t_0364bb193468cd 13-14,426,430,471,512-518,529-535,903-905
+  s_70c8e194852bb5::t_7af6c435cf4f70 1090-1102
+  s_70c8e194852bb5::t_2ed9e58776c2af 567
+  s_70c8e194852bb5::t_e3cf8f65954b7e 886-902,906-907
+Tests/CodexSwitchTests/DesktopStatusTests.swift
+  s_70c8e194852bb5::t_78a3c206b415bc 204,258,267,290,338,361,385,409
+Tests/CodexSwitchTests/DesktopRuntimeReloadClientTests.swift
+  s_70c8e194852bb5::t_78a3c206b415bc 806,892-893
+Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
+  s_70c8e194852bb5::t_1c7011c2b35454 898,915-918,921-922
+  s_70c8e194852bb5::t_e83484154d5f7f 321
+  s_70c8e194852bb5::t_88030d871f53f9 853
+  s_70c8e194852bb5::t_cbcddd350e6404 271-274,290-314,317-319,849-851
+docs/plans/2026-07-30-computer-use-native-child.md
+  s_70c8e194852bb5::t_f14b89d230a318 1-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "dc89a5772c09ca3f0e7c567878ba58302a6c6fbd",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}

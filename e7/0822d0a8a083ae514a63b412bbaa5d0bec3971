@@ -1,0 +1,28 @@
+docs/linux-cli-only.md
+  s_17b60250b4a386::t_a09bc8f18225b6 27
+  s_17b60250b4a386::t_7a77991605a79f 12,18,26,97-103
+scripts/test_signul_ssh.py
+  s_17b60250b4a386::t_a483d966c7c6b1 1-30
+scripts/signul
+  s_17b60250b4a386::t_c2bff33294a1e0 1-120
+scripts/test_claude_vps.py
+  s_17b60250b4a386::t_a483d966c7c6b1 26-29
+scripts/claude-vps
+  s_17b60250b4a386::t_c2bff33294a1e0 10-11,36-57,59-69,105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "e70822d0a8a083ae514a63b412bbaa5d0bec3971",
+  "prompts": {},
+  "sessions": {
+    "s_17b60250b4a386": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e498f-4e23-7d42-8cf6-6e470c609e67",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}

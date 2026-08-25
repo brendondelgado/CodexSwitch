@@ -1,0 +1,37 @@
+Tests/CodexSwitchTests/AppDelegateCredentialSyncTests.swift
+  s_70c8e194852bb5::t_85acc86491ac5b 95-134
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_5d034be8820459 22,574,576-580,613,615,621-629,644-702
+  s_70c8e194852bb5::t_8dff68d7ca3468 4796-4800,4804,4806,4812-4822,4831-4836,4844-4893,4895,4897
+  s_70c8e194852bb5::t_26acf292660cd0 21,4794-4795,4894,4896,4898-4906
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_36174df2b322b1 108-127
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_d2c688eb2fa4fa 2030,2058
+  s_70c8e194852bb5::t_47059048c9a319 2059-2065,2081-2099
+  s_828276550cf568::t_07afb4374b6656 2100-2101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "24919ddd1fa911500559b0e6304dd498b3f36966",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    },
+    "s_828276550cf568": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f58bc-37ff-7493-b312-f0f6ed84cf89",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,76 @@
+docs/audits/2026-07-12-codebase-audit.md
+  s_70c8e194852bb5::t_a6bb60ae5feb6c 103-104
+  s_70c8e194852bb5::t_8c4a08ee55a385 105
+crates/codexswitch-cli/src/quota.rs
+  s_70c8e194852bb5::t_418ef384cd4a6b 144-145,156-159
+  s_70c8e194852bb5::t_06e44a75aa9bed 573-616
+  s_70c8e194852bb5::t_0b5192c1bdd5b2 572
+Sources/CodexSwitch/Models/CodexAccount.swift
+  s_70c8e194852bb5::t_fe9a9a29bfb74b 5-7,57-64,66,73-79,163-185
+  s_70c8e194852bb5::t_10babf13e8a290 2
+  s_70c8e194852bb5::t_8e0d76e233f923 186
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_99cb483021106c 23,29,31
+  s_70c8e194852bb5::t_ddda717c34bc64 38
+  s_70c8e194852bb5::t_324c71cddb0cfc 129-142,170-173
+crates/codexswitch-cli/src/remote_authority.rs
+  s_70c8e194852bb5::t_2d08f5ae6cb785 1295-1319,1322-1337
+  s_70c8e194852bb5::t_5aa87061542488 1320-1321
+  s_70c8e194852bb5::t_5b0262bcc83101 1294
+crates/codexswitch-cli/src/account_store.rs
+  s_70c8e194852bb5::t_ab3b785bc7a578 2732-2752,2754-2770
+  s_70c8e194852bb5::t_1ada91a2e982ba 1970
+  s_70c8e194852bb5::t_a7242e6e16eaaf 730-735,2753
+  s_70c8e194852bb5::t_972c3a7adccc66 2-3,23-24,684-695,703-729,736-738,1685-1687,1709-1716
+  s_70c8e194852bb5::t_b00d90300941c2 1717,2730-2731
+crates/codexswitch-cli/src/daemon.rs
+  s_70c8e194852bb5::t_7f725c290bc44b 2218,3352-3376
+  s_70c8e194852bb5::t_911bfbfc94d02b 2152-2154,2173,2185,2190-2217,3351
+  s_70c8e194852bb5::t_3b83b893858561 1025-1031,1033-1037,1056-1060,1473-1475
+  s_70c8e194852bb5::t_418ef384cd4a6b 1218-1221,1223-1225,1249
+  s_70c8e194852bb5::t_654cd18e27732d 1061
+  s_70c8e194852bb5::t_3fcba211945e57 2219
+crates/codexswitch-cli/src/readiness.rs
+  s_70c8e194852bb5::t_44f09a9921ca7e 76,83-88
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_418ef384cd4a6b 2311-2315,2627-2628,2633-2635
+  s_70c8e194852bb5::t_911bfbfc94d02b 2917-2919
+  s_70c8e194852bb5::t_fb21f4aaf59872 4644-4719
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_fe9a9a29bfb74b 319,359,383-392
+  s_70c8e194852bb5::t_10babf13e8a290 239-272,393
+  s_70c8e194852bb5::t_be8d187ff8ac01 394
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_fe9a9a29bfb74b 3584,5756,5816
+crates/codexswitch-cli/src/rate_limit_resets.rs
+  s_70c8e194852bb5::t_5c4d9e3abfe5d1 2588-2590
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_8c4a08ee55a385 191
+  s_70c8e194852bb5::t_324c71cddb0cfc 916-921
+  s_70c8e194852bb5::t_a381305364829b 182-190
+crates/codexswitch-cli/src/pool_authority.rs
+  s_70c8e194852bb5::t_b702c9145b452f 866,872-883
+  s_70c8e194852bb5::t_6b32aba1ef47bf 867-871,942-970,973-974
+  s_70c8e194852bb5::t_5aa87061542488 935
+  s_70c8e194852bb5::t_a381305364829b 438-440,556
+  s_70c8e194852bb5::t_0413d70168bc62 336-344
+  s_70c8e194852bb5::t_b2f0a0bdc25ccb 542-555,557-569,841-865,884-934,936-941,971-972
+Tests/Fixtures/Policy/candidate-order.json
+  s_70c8e194852bb5::t_ab3b785bc7a578 9,39,69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "a979427972ba88bd75c5e56a004a8c842d714f2e",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,32 @@
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_2119b6c08faaa9 2904-2911,2926-2928
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_96dde0e74187b2 439-447
+  s_70c8e194852bb5::t_fcb04bc9c819bf 290-298
+crates/codexswitch-cli/src/codex_update.rs
+  s_70c8e194852bb5::t_2119b6c08faaa9 1343,1345-1358
+crates/codexswitch-cli/src/activation.rs
+  s_70c8e194852bb5::t_fcb04bc9c819bf 123-200
+  s_70c8e194852bb5::t_44c4cd4718e5d6 1563,1565-1575,2205-2343
+  s_70c8e194852bb5::t_3bd048c355673e 1562,1564
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_fcb04bc9c819bf 27-29,165-171,274-276,770-814,1935
+  s_70c8e194852bb5::t_44c4cd4718e5d6 1933,1938-1954
+  s_70c8e194852bb5::t_1228a69dbbaf8f 1932,1934,1936-1937
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "1436ad82ee3c4b4f7aa6e8622be1d72e975bffab",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

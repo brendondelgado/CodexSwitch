@@ -1,0 +1,38 @@
+Sources/CodexSwitch/Models/AccountActivationState.swift
+  s_70c8e194852bb5::t_bc3996133e6e32 48-56
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_d6db2a3df59b1c 167-178
+Sources/CodexSwitch/Services/AccountImporter.swift
+  s_70c8e194852bb5::t_04ba85805fcab9 296,306-313,331
+  s_70c8e194852bb5::t_44e0714e545013 16-24
+Tests/CodexSwitchTests/AccountImporterObservationTests.swift
+  s_70c8e194852bb5::t_b3412ab66e5c95 131-152
+Sources/CodexSwitch/Services/AccountActivationCoordinator.swift
+  s_70c8e194852bb5::t_ffefc6df036ea1 367-392
+  s_70c8e194852bb5::t_87a0c49080357c 366
+Tests/CodexSwitchTests/AccountActivationStateTests.swift
+  s_70c8e194852bb5::t_83e0051c1ab245 581-637
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_7a5b55e057b826 399-403,413-416,454-467
+  s_70c8e194852bb5::t_b9e7cbc7cc536a 4540-4554
+  s_70c8e194852bb5::t_d367c7c0e3ae3e 4438-4452
+  s_70c8e194852bb5::t_4ffb0837043962 4489-4491,4500-4508,4519-4539,4555
+Tests/CodexSwitchTests/AppDelegateActivationRecoveryTests.swift
+  s_70c8e194852bb5::t_d5d60c4879a29c 151-193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "baabf924e085f67d6ce482a134454a5665a49f52",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

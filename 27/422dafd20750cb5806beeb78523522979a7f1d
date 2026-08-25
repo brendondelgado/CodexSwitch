@@ -1,0 +1,25 @@
+.gitignore
+  10ea22953ca45d80 7-8
+scripts/extract-codex-frontend.sh
+  10ea22953ca45d80 1-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "27422dafd20750cb5806beeb78523522979a7f1d",
+  "prompts": {
+    "10ea22953ca45d80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4f378cf-8706-424b-8059-f5f34db95dd7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "brendondelgado",
+      "messages": [],
+      "total_additions": 8363,
+      "total_deletions": 0,
+      "accepted_lines": 8063,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,27 @@
+Cargo.lock
+  s_70c8e194852bb5::t_9783db1bfd8474 118-126,172-182,253,263-268,275-298,305-315,464,529-537,970,1024-1035,1045,1057-1062,1273-1283,1519-1540
+crates/codexswitch-cli/Cargo.toml
+  s_70c8e194852bb5::t_cd6894c3baa75b 20-22
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_742b7fd2acdd75 11-12,17-18,414-498,743-748,773,832-926,956,959-961,963-968,970,972-985,1417-1694,1727-1729,1752-1759,3758-3859
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_689463074d41e3 23,30,45-53,60,63-65,75-78,95-98,212-215
+docs/audits/2026-07-12-codebase-audit.md
+  s_70c8e194852bb5::t_02a0a6a2e4e80e 25,36-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "9fb205eb191eca79189ed4d74179e4c93f3fa206",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

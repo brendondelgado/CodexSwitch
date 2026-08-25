@@ -1,0 +1,20 @@
+Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
+  s_70c8e194852bb5::t_39f84b7a631a11 155-176,193-194,196,388-395
+  s_70c8e194852bb5::t_29f1594d50cb9e 396-397
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b74747f65178cf4661976a6284de360105a9983b",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

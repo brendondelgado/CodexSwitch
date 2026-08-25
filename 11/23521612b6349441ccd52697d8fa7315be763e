@@ -1,0 +1,35 @@
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_6fc4aa702f8e58 4274-4277
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_f23396da6bde8f 29,130-138,210-215,307-312
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_f23396da6bde8f 148-155,1013-1017
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_82ba858419abcd 59
+  s_70c8e194852bb5::t_f23396da6bde8f 708-712
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_f290598ff3d010 2517,2522,2537-2541,2544,2569-2575,2578
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_f290598ff3d010 1991-1993,1995,2010-2016,2033-2039,2042,3798,3804-3821
+  s_70c8e194852bb5::t_2a61713a518e07 1990,3822-3823
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_f290598ff3d010 1988-2037
+crates/codexswitch-cli/src/codex_update/source_app_server_template.rs
+  s_70c8e194852bb5::t_f290598ff3d010 412-423
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "1123521612b6349441ccd52697d8fa7315be763e",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

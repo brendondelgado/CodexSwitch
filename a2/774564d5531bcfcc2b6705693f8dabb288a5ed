@@ -1,0 +1,26 @@
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_7df7d13392d6bd 14,55-56,543-555,643-644,666-667
+Sources/CodexSwitch/Views/AccountCardView.swift
+  s_70c8e194852bb5::t_75e206394f16b8 246-258,489,504-508,510
+  s_70c8e194852bb5::t_fb4e6cd5d05d05 509
+Tests/CodexSwitchTests/AccountCardViewTests.swift
+  s_70c8e194852bb5::t_f509e9c97162dd 109-146
+Tests/CodexSwitchTests/PopoverUXTests.swift
+  s_70c8e194852bb5::t_f509e9c97162dd 56,61-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a2774564d5531bcfcc2b6705693f8dabb288a5ed",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

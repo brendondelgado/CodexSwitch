@@ -1,0 +1,20 @@
+Tests/CodexSwitchTests/CodexDesktopAppUpdaterTests.swift
+  s_70c8e194852bb5::t_bd475b94ef5097 69-71,74-83,85-98,100-107,109-113,116-128,132-140,146,148-149,153,157-165,2997
+  s_70c8e194852bb5::t_7e0d61094b600a 84,99,141-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "462eda7cb7cd1a0f3344074783db6159c75764b0",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

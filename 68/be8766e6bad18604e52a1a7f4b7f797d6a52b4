@@ -1,0 +1,23 @@
+docs/architecture/macos-runtime-artifact.md
+  s_70c8e194852bb5::t_99c5b9d13b55be 31,267-273
+crates/codexswitch-cli/src/codex_update.rs
+  s_70c8e194852bb5::t_c6d47a5d5b16b3 292,296-297,302
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_c6d47a5d5b16b3 2605-2629
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "68be8766e6bad18604e52a1a7f4b7f797d6a52b4",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

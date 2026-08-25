@@ -1,0 +1,25 @@
+docs/architecture/macos-runtime-artifact.md
+  s_70c8e194852bb5::t_5ba1cb309f87d8 9,32,112-134
+  s_70c8e194852bb5::t_3d98e3057e81b0 135
+.github/workflows/build-fork.yml
+  s_70c8e194852bb5::t_a7359f79bac470 360,412,421,436-525,576
+  s_70c8e194852bb5::t_c6dc82acb57a78 847,858-860
+  s_70c8e194852bb5::t_d164d6afd721bb 18-29,32,81-83,101-122,160
+  s_70c8e194852bb5::t_5b9814eb6a065f 861
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "8868579dbc42fcbe7689b055d42c553f96a665b7",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

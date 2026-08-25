@@ -1,0 +1,36 @@
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_287c55578da003 1370,1453
+crates/codexswitch-cli/src/readiness.rs
+  s_70c8e194852bb5::t_ab4f643421b738 408,411,427,541-556
+  s_70c8e194852bb5::t_62dd7aef5e954b 378,380-391,561-569,573,577,579-580,591-593
+  s_70c8e194852bb5::t_b21fb1fc29f4e1 924-925,934-936,943-952
+  s_70c8e194852bb5::t_51a2aa696215d7 392,400,423,473,475,557,594,597
+docs/plans/2026-07-30-computer-use-native-child.md
+  s_70c8e194852bb5::t_76d72723bf7373 13,17-18,33-35
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_287c55578da003 242-243
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_287c55578da003 837
+Sources/CodexSwitch/Services/CodexDesktopNativeChildCoordinator.swift
+  s_70c8e194852bb5::t_76d72723bf7373 109,113-114,117,120-123,129-139
+  s_70c8e194852bb5::t_4c12e91153cb1a 140-141
+Tests/CodexSwitchTests/CodexDesktopNativeChildCoordinatorTests.swift
+  s_70c8e194852bb5::t_76d72723bf7373 49,54-55,64-70,87-97
+  s_70c8e194852bb5::t_3d911a350c8200 98-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "d11af2ce684db801b18c907ab5f7b01d20578e18",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

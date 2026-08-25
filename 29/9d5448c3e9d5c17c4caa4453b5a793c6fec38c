@@ -1,0 +1,46 @@
+Sources/CodexSwitch/Models/AccountManager.swift
+  s_70c8e194852bb5::t_5718fa43f703ac 349,355,366-368,370-377,379-384
+  s_70c8e194852bb5::t_3b8e3eec7338c3 463-467,472,474-482,484-487,491-495,501-520
+  s_70c8e194852bb5::t_4f44f4a2058ae2 323-348,350-354,356-365,369,378,385-424,521-525
+  s_70c8e194852bb5::t_194cbadc896947 526
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_822f5b31473800 123-125
+  s_70c8e194852bb5::t_4f44f4a2058ae2 126-127
+  s_70c8e194852bb5::t_5718fa43f703ac 128-129
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_4f44f4a2058ae2 322-323
+  s_70c8e194852bb5::t_f95539be27ef26 318-319
+  s_70c8e194852bb5::t_822f5b31473800 320-321
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_280b3cd7683b76 2771,2775,2780,2785,2792-2793,2799,2802,2804,2812
+  s_70c8e194852bb5::t_6874652e0fa52f 6504-6508
+  s_70c8e194852bb5::t_2f47880357c3c7 6357-6363
+  s_70c8e194852bb5::t_21a52c4add36b9 6515-6521,6526
+  s_70c8e194852bb5::t_4f44f4a2058ae2 6544,6546
+  s_70c8e194852bb5::t_8f86ffa78606d0 6553-6555
+  s_70c8e194852bb5::t_13a565519a9551 1874-1893
+  s_70c8e194852bb5::t_00f67eaf944a53 6545,6547-6552,6556
+  s_70c8e194852bb5::t_4423b848b7e949 6530-6543
+Tests/CodexSwitchTests/AccountManagerSyncTests.swift
+  s_70c8e194852bb5::t_d9a9f01d70faaf 428
+  s_70c8e194852bb5::t_9e913de7c3047d 405-426,433-434,436-446,449-450
+  s_70c8e194852bb5::t_4f44f4a2058ae2 451-512,532-533
+  s_70c8e194852bb5::t_822f5b31473800 427,429-432,435,447-448
+  s_70c8e194852bb5::t_5718fa43f703ac 513-531
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "299d5448c3e9d5c17c4caa4453b5a793c6fec38c",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

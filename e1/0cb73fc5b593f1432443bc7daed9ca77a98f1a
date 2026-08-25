@@ -1,0 +1,26 @@
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_410e3f39287758 55,60,80,829
+Sources/CodexSwitch/Services/NotificationManager.swift
+  s_70c8e194852bb5::t_410e3f39287758 87-90,340,347,353-378
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_410e3f39287758 8254,8388
+Tests/CodexSwitchTests/AppDelegateNotificationTests.swift
+  s_70c8e194852bb5::t_05d8c335267b2b 527,529,533
+  s_70c8e194852bb5::t_410e3f39287758 517-526,528,530-532,534-544
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "e10cb73fc5b593f1432443bc7daed9ca77a98f1a",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

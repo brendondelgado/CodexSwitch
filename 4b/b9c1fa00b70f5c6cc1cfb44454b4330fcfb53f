@@ -1,0 +1,28 @@
+docs/linux-cli-only.md
+  s_17b60250b4a386::t_b979cb79ef07cd 27,99
+scripts/claude-vps
+  s_17b60250b4a386::t_647cef0e1afac8 64,68-72,82
+  s_17b60250b4a386::t_b92f1d9d128562 124,126
+  s_17b60250b4a386::t_808115d5ea56ff 13,80-81
+scripts/test_claude_vps.py
+  s_17b60250b4a386::t_757564fb8237cc 29,43,59
+  s_17b60250b4a386::t_c0dda61b61d74f 40
+  s_17b60250b4a386::t_6621c3153d5b6b 41,44,57-58
+  s_17b60250b4a386::t_20262c6b6ee269 56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "4bb9c1fa00b70f5c6cc1cfb44454b4330fcfb53f",
+  "prompts": {},
+  "sessions": {
+    "s_17b60250b4a386": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e498f-4e23-7d42-8cf6-6e470c609e67",
+        "model": "gpt-5.5"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

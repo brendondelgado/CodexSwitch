@@ -1,0 +1,73 @@
+scripts/test_build_app.py
+  s_70c8e194852bb5::t_51df83a0163398 44-50
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_d92a69d98ca066 792
+tools/asar-tool/package.json
+  s_70c8e194852bb5::t_c0db0b19253df9 1-8
+docs/architecture/macos-runtime-artifact.md
+  s_70c8e194852bb5::t_d92a69d98ca066 210-211
+  s_70c8e194852bb5::t_047e7cc3b4b4da 57-61,207,283
+  s_70c8e194852bb5::t_23a6ae004b8812 208-209,284-285
+  s_70c8e194852bb5::t_df96944b756cde 73-75
+.github/workflows/build-macos-app.yml
+  s_70c8e194852bb5::t_0aaf7adebd64df 119-124,143
+  s_70c8e194852bb5::t_51df83a0163398 138,322-324
+  s_70c8e194852bb5::t_df96944b756cde 111-114
+  s_70c8e194852bb5::t_2b217fb94cfe6c 116-118,125-137,139-142,144-153,178-179,203-204,206,218-221,224-225,228-229,511-513
+  s_70c8e194852bb5::t_18ecd3767fb6a8 205,222-223,230-235,321
+  s_70c8e194852bb5::t_488a99c0b8cb50 115
+scripts/test_patch_asar.py
+  s_70c8e194852bb5::t_0aaf7adebd64df 532,548-551,563,565-591,611-633,681-682
+  s_70c8e194852bb5::t_ffd1b62ffeabe6 592-610
+  s_70c8e194852bb5::t_78575287567d32 469-470,492-493,680
+  s_70c8e194852bb5::t_51df83a0163398 501-531,533-547,552-562,564
+scripts/patch-asar.py
+  s_70c8e194852bb5::t_b75bb921f4e512 757-760
+  s_70c8e194852bb5::t_0ba7b40a665ff7 92,694,707,719-721,724-756,761-771,776,778,780-787,837,852-853,855,935-950,959-961,975-981,983-984,992-994
+  s_70c8e194852bb5::t_ed4e8acb4c0645 691-693,695,722,772-773
+  s_70c8e194852bb5::t_51df83a0163398 723
+  s_70c8e194852bb5::t_c1e9f4c17245af 91
+scripts/build-app.sh
+  s_70c8e194852bb5::t_35e29b38315c03 170
+  s_70c8e194852bb5::t_18ecd3767fb6a8 150-153,155
+  s_70c8e194852bb5::t_fe759e3bf30d5d 154,156
+  s_70c8e194852bb5::t_c11a9b11b3f0fb 33,143-149,157-169,171
+  s_70c8e194852bb5::t_e0f7f7045f6d8e 172
+docs/runbooks/remote-macos-runtime-build.md
+  s_70c8e194852bb5::t_df96944b756cde 287-288
+  s_70c8e194852bb5::t_23a6ae004b8812 353-354
+  s_70c8e194852bb5::t_d92a69d98ca066 355
+  s_70c8e194852bb5::t_047e7cc3b4b4da 299,302-306,356,358,361,363,394-398
+scripts/test_macos_app_artifact.py
+  s_70c8e194852bb5::t_3274175a1cd7f2 87-88
+  s_70c8e194852bb5::t_18ecd3767fb6a8 118,256,260,262-263
+  s_70c8e194852bb5::t_2dfb7b642e873a 120-121
+  s_70c8e194852bb5::t_51df83a0163398 35,39,55-56,75-84,90-93,116-117,119,130-133,251-255,257-259,261,264-265
+  s_70c8e194852bb5::t_df96944b756cde 62-74
+  s_70c8e194852bb5::t_0aaf7adebd64df 85-86,89
+  s_70c8e194852bb5::t_97a6bf921f2650 266
+scripts/install-macos-app-artifact.sh
+  s_70c8e194852bb5::t_51df83a0163398 441-443,472-473,475,500-507,512-515,536-543
+  s_70c8e194852bb5::t_18ecd3767fb6a8 440,474,508-511,544-559
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_d92a69d98ca066 778-782
+  s_70c8e194852bb5::t_1ee91afaae87c5 773-777
+tools/asar-tool/package-lock.json
+  s_70c8e194852bb5::t_fbefbe69a89e6c 1-128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "580f775cfeee7019f0fb3856139bf3cdcdbf6bce",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

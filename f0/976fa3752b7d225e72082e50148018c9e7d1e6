@@ -1,0 +1,28 @@
+crates/codexswitch-cli/src/codex_update/source_patching.rs
+  s_70c8e194852bb5::t_77b74b0802888e 30-31,35-39
+crates/codexswitch-cli/src/codex_update/source_app_server_patching.rs
+  s_70c8e194852bb5::t_77b74b0802888e 166-202
+docs/architecture/macos-runtime-artifact.md
+  s_70c8e194852bb5::t_0a72a26caa4563 104-109
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_09c4d682f3a6cc 2034-2060,2098-2142
+  s_70c8e194852bb5::t_fe9624a50d572a 2061-2097
+crates/codexswitch-cli/src/codex_update/source_app_server_template.rs
+  s_70c8e194852bb5::t_60741fc6bc0648 1-59,477,480,813
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "f0976fa3752b7d225e72082e50148018c9e7d1e6",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_68ce4c2b828c2a 3955-3972,4610-4613,4626-4631
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_b1d2974a785867 4451-4452
+crates/codexswitch-cli/src/codex_update/source_app_server_template.rs
+  s_70c8e194852bb5::t_68ce4c2b828c2a 167-183,200-204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "2e79f5ae49b1c649b387ab46975f2c6b7abee1fe",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

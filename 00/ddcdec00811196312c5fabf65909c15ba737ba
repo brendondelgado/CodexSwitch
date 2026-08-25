@@ -1,0 +1,37 @@
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_61f5510902a35b 57,168-180
+Sources/CodexSwitch/Views/PopoverContentView.swift
+  s_70c8e194852bb5::t_89838f0b846e11 63-64,72-78,304-306
+Tests/CodexSwitchTests/PopoverUXTests.swift
+  s_70c8e194852bb5::t_f256f98e986f2c 25-40
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_73acd3f91c37d7 8
+  s_70c8e194852bb5::t_61f5510902a35b 74,230-243
+  s_70c8e194852bb5::t_de2a6695f506ba 244
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_89838f0b846e11 323,4227-4228,4286,4292,4307-4308,4311,4346-4355
+Sources/CodexSwitch/Models/AccountActivationState.swift
+  s_70c8e194852bb5::t_89838f0b846e11 34-46,136-143
+Tests/CodexSwitchTests/AccountActivationStateTests.swift
+  s_70c8e194852bb5::t_f256f98e986f2c 436-476
+Tests/CodexSwitchTests/AppDelegateSwapCommitTests.swift
+  s_70c8e194852bb5::t_f256f98e986f2c 70-71,80-84,92,96-100,104,108,152
+Sources/CodexSwitch/Services/AccountActivationCoordinator.swift
+  s_70c8e194852bb5::t_89838f0b846e11 406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "00ddcdec00811196312c5fabf65909c15ba737ba",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

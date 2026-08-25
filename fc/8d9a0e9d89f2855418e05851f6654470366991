@@ -1,0 +1,30 @@
+scripts/test_patch_asar.py
+  s_70c8e194852bb5::t_bbf76b7b043981 242-259,1063-1123,1463
+Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
+  s_70c8e194852bb5::t_e39e5a23440a13 33
+scripts/patch-asar.py
+  s_70c8e194852bb5::t_e39e5a23440a13 99,1098-1140,1224-1235,1957,1970,2498-2530,3614-3617,3638,3643,3651-3653,3674,3732-3734
+  s_70c8e194852bb5::t_bacdc8656b0afd 3735
+Tests/CodexSwitchTests/CodexPatchingTests.swift
+  s_70c8e194852bb5::t_bbf76b7b043981 218-232
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_e39e5a23440a13 575-581,760
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_e39e5a23440a13 733-739
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "fc8d9a0e9d89f2855418e05851f6654470366991",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

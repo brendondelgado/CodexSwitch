@@ -1,0 +1,35 @@
+docs/runbooks/vps-connection-resilience.md
+  s_70c8e194852bb5::t_2e1aeb7f4b5db4 129
+docs/linux-cli-only.md
+  s_70c8e194852bb5::t_0cb3162f90d65a 107
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_2e1aeb7f4b5db4 163,373
+crates/codexswitch-cli/src/patched_codex.rs
+  s_70c8e194852bb5::t_ad46688dab3355 862
+  s_70c8e194852bb5::t_2e1aeb7f4b5db4 10,861
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_0cb3162f90d65a 291-296
+  s_70c8e194852bb5::t_369808897342d7 297
+  s_70c8e194852bb5::t_e7854c798997a9 484-486
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_1766a6d6497a05 1912,1938-1939,1955-1960
+  s_70c8e194852bb5::t_d2133025273aa7 1940-1954
+  s_70c8e194852bb5::t_9dce69f83b260e 2412
+  s_70c8e194852bb5::t_f14449297fe254 1961-1962
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "bc708e8ef8258a6581f1decf13672e3327e04343",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

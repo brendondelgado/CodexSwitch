@@ -1,0 +1,23 @@
+Sources/CodexNative/Integration/CodexSwitchBridge.swift
+  10ea22953ca45d80 1-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "7654a17d41aa2b706012353cdaf21ef69ba056ab",
+  "prompts": {
+    "10ea22953ca45d80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4f378cf-8706-424b-8059-f5f34db95dd7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "brendondelgado",
+      "messages": [],
+      "total_additions": 64,
+      "total_deletions": 0,
+      "accepted_lines": 677,
+      "overriden_lines": 0
+    }
+  }
+}

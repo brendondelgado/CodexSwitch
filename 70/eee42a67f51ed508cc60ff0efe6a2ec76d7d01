@@ -1,0 +1,19 @@
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_43476d49a33ce9 3642-3645
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "70eee42a67f51ed508cc60ff0efe6a2ec76d7d01",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

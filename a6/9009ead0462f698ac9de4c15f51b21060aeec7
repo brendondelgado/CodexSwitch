@@ -1,0 +1,25 @@
+Tests/CodexSwitchTests/AccountMutationLeaseCoordinatorTests.swift
+  s_70c8e194852bb5::t_bc9beb50bb7662 45,49,105
+Tests/CodexSwitchTests/CodexSwitchKeepAliveTests.swift
+  s_70c8e194852bb5::t_bc9beb50bb7662 39
+Tests/CodexSwitchTests/AsyncStreamTestSupport.swift
+  s_70c8e194852bb5::t_bc9beb50bb7662 1-8
+Tests/CodexSwitchTests/AccountActivationTransactionTests.swift
+  s_70c8e194852bb5::t_bc9beb50bb7662 258,262,323,347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "a69009ead0462f698ac9de4c15f51b21060aeec7",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

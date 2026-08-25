@@ -1,0 +1,24 @@
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_3099d32f5297e6 87,1534-1539
+crates/codexswitch-cli/src/codex_update/source_app_server_template.rs
+  s_70c8e194852bb5::t_3099d32f5297e6 63
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_3099d32f5297e6 2175-2178,2180,2197-2206
+  s_70c8e194852bb5::t_21d498d406685c 2207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "3bcd190f968ea0f598cba7e62dfad324292e188d",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

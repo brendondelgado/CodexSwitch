@@ -1,0 +1,39 @@
+crates/codexswitch-cli/src/daemon.rs
+  s_70c8e194852bb5::t_bdd42c83d585e1 447-454,857-875,882-885,887,889,905-917,920-946,948-950
+  s_70c8e194852bb5::t_5abf575fd0f898 849-855,876-881,886,888,890-904,918-919,951-952
+  s_70c8e194852bb5::t_f47dbd43eaf240 1868-1870
+  s_70c8e194852bb5::t_eb5bda26ca99ac 1861,1935-2086
+  s_70c8e194852bb5::t_18fd7d00930d6d 44,446,455
+  s_70c8e194852bb5::t_00398d6c979c24 856,947,1873-1893,1895,2652
+  s_70c8e194852bb5::t_f2d4845038231f 1894
+  s_70c8e194852bb5::t_d51cbc8266bdf8 1862-1867,1871-1872,1896-1934,2130,2160
+crates/codexswitch-cli/src/main.rs
+  s_70c8e194852bb5::t_501afb7e049e1d 364,402,406-408,1446-1447,1451-1457,1461-1462
+  s_70c8e194852bb5::t_f47dbd43eaf240 1458-1460
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_cc0c36edc9bb87 173-174
+crates/codexswitch-cli/src/account_store.rs
+  s_70c8e194852bb5::t_f47dbd43eaf240 22,482,2639-2640
+  s_70c8e194852bb5::t_f6c85e9d7298c2 2649-2669
+  s_70c8e194852bb5::t_501afb7e049e1d 480,483-486
+  s_70c8e194852bb5::t_9bf3b8bbd73cad 2648
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_cc0c36edc9bb87 326-327,330-334
+  s_70c8e194852bb5::t_eb5bda26ca99ac 328-329
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6da9311c99d06111819da3eaa267373e94cce53c",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
