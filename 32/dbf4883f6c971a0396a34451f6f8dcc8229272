@@ -1,0 +1,23 @@
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_62090cc89f7eeb 1175-1178
+Sources/CodexSwitch/Models/AccountActivationState.swift
+  s_70c8e194852bb5::t_62090cc89f7eeb 46-47
+Tests/CodexSwitchTests/AppDelegateActivationRecoveryTests.swift
+  s_70c8e194852bb5::t_62090cc89f7eeb 380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "32dbf4883f6c971a0396a34451f6f8dcc8229272",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
