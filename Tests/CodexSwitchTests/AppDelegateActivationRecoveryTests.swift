@@ -377,7 +377,7 @@ struct AppDelegateActivationRecoveryTests {
             state: inconsistent,
             configuredAccountId: target,
             observedTargetAccountId: target
-        ) == nil)
+        ) == target)
 
         #expect(AccountAuthObservationFailure.ancestorChanged.isRetryableObservationFailure)
         #expect(AccountAuthObservationFailure.changedDuringRead.isRetryableObservationFailure)

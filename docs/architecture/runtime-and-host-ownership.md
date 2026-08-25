@@ -1172,6 +1172,10 @@ and swap, and runtime-convergence transaction; it never rewrites `auth.json`
 because that file is already the observed authority. Equal-expiry divergence,
 older or malformed tokens, partial credentials, ambiguous provider identity,
 and any local or provider account change remain hard manual-review barriers.
+If the same configured account's durable store and `auth.json` already contain
+the exact same complete generation, the review may instead resume the existing
+same-target runtime-confirmation path. It still publishes `Confirmed` only
+after a fresh generation-bound runtime acknowledgement.
 
 After an authority-approved Rust CLI activation commits both shared credential
 files, the running Swift menu app may adopt the handoff only when the fresh pool

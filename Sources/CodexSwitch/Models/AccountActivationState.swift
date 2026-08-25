@@ -43,7 +43,8 @@ enum AccountActivationDetail: String, Codable, Equatable, Sendable {
 
     var allowsVerifiedExternalAuthRecovery: Bool {
         switch self {
-        case .externalAuthAbsent, .externalAuthInvalid, .externalAuthUnreadable:
+        case .externalAuthAbsent, .externalAuthInvalid, .externalAuthUnreadable,
+             .configuredFilesInconsistent:
             return true
         default:
             return false
