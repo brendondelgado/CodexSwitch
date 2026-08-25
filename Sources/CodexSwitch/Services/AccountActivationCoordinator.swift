@@ -608,6 +608,33 @@ actor AccountActivationCoordinator {
     }
 
     @discardableResult
+    func recoverConvergedConfiguredFiles(
+        targetAccountId: UUID,
+        newActivationGeneration: UUID = UUID(),
+        authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
+        at date: Date = Date()
+    ) throws -> AccountActivationState {
+        try transition(authorizeEffect: authorizeEffect) { current in
+            guard let current,
+                  current.phase == .manualReview,
+                  current.configuredAccountId == targetAccountId,
+                  current.detail == .configuredFilesInconsistent else {
+                throw AccountActivationCoordinatorError.invalidTransition(
+                    "configured-file recovery requires the matching review"
+                )
+            }
+            return .committedDegraded(
+                targetAccountId: targetAccountId,
+                detail: .externalAuthObserved,
+                activationGeneration: newActivationGeneration,
+                retryAttempt: 0,
+                nextRetryAt: date,
+                at: date
+            )
+        }
+    }
+
+    @discardableResult
     func adoptVerifiedExternalHandoff(
         targetAccountId: UUID,
         expectedState: AccountActivationState,

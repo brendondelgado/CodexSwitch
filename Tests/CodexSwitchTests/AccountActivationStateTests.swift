@@ -899,6 +899,17 @@ struct AccountActivationStateTests {
             #expect(error is AccountActivationCoordinatorError)
         }
         #expect(try Data(contentsOf: url) == beforeRejectedRecovery)
+
+        let convergedGeneration = UUID()
+        let converged = try await coordinator.recoverConvergedConfiguredFiles(
+            targetAccountId: target,
+            newActivationGeneration: convergedGeneration,
+            at: now.addingTimeInterval(4)
+        )
+        #expect(converged.phase == .committedDegraded)
+        #expect(converged.configuredAccountId == target)
+        #expect(converged.activationGeneration == convergedGeneration)
+        #expect(converged.detail == .externalAuthObserved)
     }
 
     @Test("Verified durable handoff is state-bound and failures enter exact-target review")

@@ -377,7 +377,17 @@ struct AppDelegateActivationRecoveryTests {
             state: inconsistent,
             configuredAccountId: target,
             observedTargetAccountId: target
+        ) == nil)
+        #expect(AppDelegate.convergedConfiguredFilesRecoveryTarget(
+            state: inconsistent,
+            configuredAccountId: target,
+            observedTargetAccountId: target
         ) == target)
+        #expect(AppDelegate.convergedConfiguredFilesRecoveryTarget(
+            state: inconsistent,
+            configuredAccountId: other,
+            observedTargetAccountId: target
+        ) == nil)
 
         #expect(AccountAuthObservationFailure.ancestorChanged.isRetryableObservationFailure)
         #expect(AccountAuthObservationFailure.changedDuringRead.isRetryableObservationFailure)

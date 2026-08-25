@@ -208,6 +208,7 @@ enum AccountActivationRetrySource: String, Equatable, Sendable {
     case launchRecovery = "launch_recovery"
     case runtimeTopologyRecovery = "runtime_topology_recovery"
     case externalAuthRecovered = "external_auth_recovered"
+    case configuredFilesRecovered = "configured_files_recovered"
     case externalHandoff = "external_handoff"
     case externalHandoffDeferredRevalidation = "external_handoff_deferred_revalidation"
 
@@ -216,13 +217,18 @@ enum AccountActivationRetrySource: String, Equatable, Sendable {
         case .manual, .launchRecovery, .runtimeTopologyRecovery:
             return true
         case .automatic, .poolAuthority, .externalAuthRecovered,
-             .externalHandoff, .externalHandoffDeferredRevalidation:
+             .configuredFilesRecovered, .externalHandoff,
+             .externalHandoffDeferredRevalidation:
             return false
         }
     }
 
     var recoversExternalAuthBarrier: Bool {
         self == .externalAuthRecovered
+    }
+
+    var recoversConfiguredFilesBarrier: Bool {
+        self == .configuredFilesRecovered
     }
 
     var requiresDurableRetrySchedule: Bool {
@@ -769,6 +775,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return
             case .none:
                 break
+            }
+            if Self.convergedConfiguredFilesRecoveryTarget(
+                state: accountManager.activationState,
+                configuredAccountId: configured?.id,
+                observedTargetAccountId: target.id
+            ) != nil {
+                await startSameTargetRuntimeRetry(
+                    to: target,
+                    source: .configuredFilesRecovered
+                )
+                return
             }
             guard Self.verifiedExternalAuthRecoveryTarget(
                 state: accountManager.activationState,
@@ -8012,6 +8029,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return observedTargetAccountId
     }
 
+    nonisolated static func convergedConfiguredFilesRecoveryTarget(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        observedTargetAccountId: UUID
+    ) -> UUID? {
+        guard let state,
+              state.phase == .manualReview,
+              state.detail == .configuredFilesInconsistent,
+              state.configuredAccountId == observedTargetAccountId,
+              configuredAccountId == observedTargetAccountId else {
+            return nil
+        }
+        return observedTargetAccountId
+    }
+
     nonisolated static func externalHandoffFollowUp(
         state: AccountActivationState?,
         configuredAccountId: UUID?,
@@ -8113,7 +8145,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         let resetsRetryBudget = source.resetsRetryBudget
         let recoversExternalAuthBarrier = source.recoversExternalAuthBarrier
-        let startsFreshGeneration = resetsRetryBudget || recoversExternalAuthBarrier
+        let recoversConfiguredFilesBarrier = source.recoversConfiguredFilesBarrier
+        let startsFreshGeneration = resetsRetryBudget
+            || recoversExternalAuthBarrier
+            || recoversConfiguredFilesBarrier
         let activationGeneration = startsFreshGeneration
             ? UUID()
             : accountManager.activationState?.activationGeneration ?? UUID()
@@ -8128,7 +8163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             do {
                 if startsFreshGeneration {
-                    if recoversExternalAuthBarrier {
+                    if recoversExternalAuthBarrier || recoversConfiguredFilesBarrier {
                         guard await self.durableConfiguredFilesMatch(target) else {
                             self.accountManager.publishActivationNotice(
                                 "Stored account and auth file still disagree; activation remains paused"
@@ -8163,6 +8198,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                         && state?.phase == .manualReview
                                         && state?.detail?
                                             .allowsVerifiedExternalAuthRecovery == true
+                                }
+                            )
+                    } else if recoversConfiguredFilesBarrier {
+                        reset = try await self.accountActivationCoordinator
+                            .recoverConvergedConfiguredFiles(
+                                targetAccountId: target.id,
+                                newActivationGeneration: activationGeneration,
+                                authorizeEffect: { [accountMutationTransaction] state in
+                                    accountMutationTransaction.leaseAuthorizes(
+                                        lease,
+                                        targetAccountId: target.id,
+                                        activationGeneration: activationGeneration
+                                    )
+                                        && (operationAuthority?.authorizes() ?? true)
+                                        && state?.configuredAccountId == target.id
+                                        && state?.phase == .manualReview
+                                        && state?.detail == .configuredFilesInconsistent
                                 }
                             )
                     } else {
