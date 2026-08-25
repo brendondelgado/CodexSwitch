@@ -77,6 +77,18 @@ struct CodexAccount: Codable, Identifiable, Sendable {
         return expiresAt > now.addingTimeInterval(Self.inferenceTokenSafetyWindow)
     }
 
+    func hasStrictlyNewerInferenceToken(
+        than other: CodexAccount,
+        at now: Date
+    ) -> Bool {
+        guard hasUsableInferenceToken(at: now),
+              let observedExpiry = Self.inferenceTokenExpiration(accessToken),
+              let storedExpiry = Self.inferenceTokenExpiration(other.accessToken) else {
+            return false
+        }
+        return observedExpiry > storedExpiry
+    }
+
     var isQuotaImmediatelyUsable: Bool {
         isQuotaImmediatelyUsable(at: Date())
     }

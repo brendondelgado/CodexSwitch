@@ -30,6 +30,34 @@ struct ExternalAuthConflictRecoveryEvidence: Sendable {
 }
 
 enum ExternalAuthConflictRecoveryPolicy {
+    static func newerSameAccountGenerationTarget(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        storedTarget: CodexAccount,
+        observedTarget: CodexAccount,
+        matchingProviderAccountCount: Int,
+        now: Date
+    ) -> CodexAccount? {
+        guard state?.phase == .manualReview,
+              state?.detail == .configuredFilesInconsistent,
+              let targetAccountId = state?.configuredAccountId,
+              targetAccountId == configuredAccountId,
+              targetAccountId == storedTarget.id,
+              observedTarget.id == storedTarget.id,
+              matchingProviderAccountCount == 1,
+              let storedProviderAccountId = storedTarget.normalizedProviderAccountId,
+              observedTarget.normalizedProviderAccountId == storedProviderAccountId,
+              storedTarget.hasCompleteRuntimeCredentials,
+              observedTarget.hasCompleteRuntimeCredentials,
+              observedTarget.hasStrictlyNewerInferenceToken(
+                  than: storedTarget,
+                  at: now
+              ) else {
+            return nil
+        }
+        return observedTarget
+    }
+
     static func authorityTarget(
         storedTarget: CodexAccount,
         observedAuth: CodexAccount,

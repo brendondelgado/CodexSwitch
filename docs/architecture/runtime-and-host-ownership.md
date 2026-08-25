@@ -1160,6 +1160,19 @@ and fingerprint, then retries verified runtime convergence. The repair publishes
 active provider identity, incomplete token set, store/auth mismatch, malformed
 journal, or unknown activation kind remains a hard barrier.
 
+A legacy `configured_files_inconsistent` review may be rebased automatically
+only for a strictly newer generation of that same configured account. The
+configured local UUID and normalized provider account ID must remain identical,
+exactly one stored account may match that provider identity, both credential
+sets must be complete, and both inference JWT expirations must be parseable.
+The observed `auth.json` generation must remain usable beyond the safety window
+and expire strictly later than the stored generation. The rebase runs through
+the ordinary account-mutation lease, activation journal, account-store compare
+and swap, and runtime-convergence transaction; it never rewrites `auth.json`
+because that file is already the observed authority. Equal-expiry divergence,
+older or malformed tokens, partial credentials, ambiguous provider identity,
+and any local or provider account change remain hard manual-review barriers.
+
 After an authority-approved Rust CLI activation commits both shared credential
 files, the running Swift menu app may adopt the handoff only when the fresh pool
 authority epoch and desired provider identifier exactly match the selected

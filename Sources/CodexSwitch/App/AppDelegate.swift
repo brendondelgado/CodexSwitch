@@ -725,6 +725,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             || existing.accessToken != target.accessToken
             || existing.refreshToken != target.refreshToken
             || existing.idToken != target.idToken
+        let newerSameAccountGeneration = ExternalAuthConflictRecoveryPolicy
+            .newerSameAccountGenerationTarget(
+                state: accountManager.activationState,
+                configuredAccountId: configured?.id,
+                storedTarget: existing,
+                observedTarget: target,
+                matchingProviderAccountCount: accountManager.accounts.filter {
+                    $0.normalizedProviderAccountId == target.normalizedProviderAccountId
+                }.count,
+                now: Date()
+            )
         if !targetChanged, !credentialsChanged {
             switch Self.externalHandoffFollowUp(
                 state: accountManager.activationState,
@@ -834,7 +845,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             targetAccountId: target.id,
             expectedConfiguredAccountId: configured?.id,
             source: "external-auth",
-            requestKind: .automatic
+            requestKind: .automatic,
+            verifiedSameAccountGenerationRecovery: newerSameAccountGeneration != nil
         ) { [weak self] prepared in
             guard let self else { return false }
             return await self.commitConfiguredCredentialMutation(
@@ -6585,6 +6597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         source: String,
         requestKind: AccountActivationRequestKind,
         verifiedExternalAuthConflictRecovery: Bool = false,
+        verifiedSameAccountGenerationRecovery: Bool = false,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil,
         operationAuthority: PoolAuthorityOperationAuthority? = nil,
         operation: @escaping @MainActor @Sendable (PreparedAccountActivation) async -> Bool
@@ -6617,6 +6630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 source: source,
                 requestKind: requestKind,
                 verifiedExternalAuthConflictRecovery: verifiedExternalAuthConflictRecovery,
+                verifiedSameAccountGenerationRecovery: verifiedSameAccountGenerationRecovery,
                 activationGeneration: activationGeneration,
                 lease: lease,
                 policyAuthority: policyAuthority,
@@ -6661,6 +6675,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         source: String,
         requestKind: AccountActivationRequestKind,
         verifiedExternalAuthConflictRecovery: Bool,
+        verifiedSameAccountGenerationRecovery: Bool,
         activationGeneration: UUID,
         lease: AccountMutationLease,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil,
@@ -6695,6 +6710,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     .beginVerifiedExternalAuthConflictRecovery(
                         targetAccountId: targetAccountId,
                         durableSourceAccountId: expectedConfiguredAccountId,
+                        requestedActivationGeneration: activationGeneration,
+                        authorizeEffect: authorizeEffect
+                    )
+            } else if verifiedSameAccountGenerationRecovery {
+                decision = try await accountActivationCoordinator
+                    .beginVerifiedSameAccountGenerationRecovery(
+                        targetAccountId: targetAccountId,
                         requestedActivationGeneration: activationGeneration,
                         authorizeEffect: authorizeEffect
                     )

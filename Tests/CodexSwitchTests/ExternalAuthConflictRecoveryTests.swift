@@ -73,6 +73,114 @@ struct ExternalAuthConflictRecoveryTests {
         )?.id == nil)
     }
 
+    @Test("Same-account recovery admits only a strictly newer usable generation")
+    func sameAccountGenerationRecoveryIsStrictlyMonotonic() {
+        var stored = makeAccount(id: targetAccountId, active: true)
+        stored.accountId = providerAccountId
+        stored.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(3_600)
+        )
+        var observed = stored
+        observed.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(7_200)
+        )
+        observed.refreshToken = "new-refresh"
+        observed.idToken = "new-id"
+        let review = AccountActivationState.manualReview(
+            targetAccountId: targetAccountId,
+            detail: .configuredFilesInconsistent,
+            at: now
+        )
+
+        let accepted = ExternalAuthConflictRecoveryPolicy
+            .newerSameAccountGenerationTarget(
+                state: review,
+                configuredAccountId: targetAccountId,
+                storedTarget: stored,
+                observedTarget: observed,
+                matchingProviderAccountCount: 1,
+                now: now
+            )
+        #expect(accepted?.accessToken == observed.accessToken)
+        #expect(accepted?.refreshToken == observed.refreshToken)
+
+        observed.accessToken = stored.accessToken
+        #expect(ExternalAuthConflictRecoveryPolicy.newerSameAccountGenerationTarget(
+            state: review,
+            configuredAccountId: targetAccountId,
+            storedTarget: stored,
+            observedTarget: observed,
+            matchingProviderAccountCount: 1,
+            now: now
+        ) == nil)
+    }
+
+    @Test("Same-account recovery rejects identity, ambiguity, and credential drift")
+    func sameAccountGenerationRecoveryRejectsUnsafeEvidence() {
+        var stored = makeAccount(id: targetAccountId, active: true)
+        stored.accountId = providerAccountId
+        stored.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(3_600)
+        )
+        var observed = stored
+        observed.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(7_200)
+        )
+        observed.refreshToken = "new-refresh"
+        observed.idToken = "new-id"
+        let review = AccountActivationState.manualReview(
+            targetAccountId: targetAccountId,
+            detail: .configuredFilesInconsistent,
+            at: now
+        )
+
+        func target(
+            state: AccountActivationState? = review,
+            configuredAccountId: UUID? = targetAccountId,
+            observedTarget: CodexAccount? = nil,
+            matchingProviderAccountCount: Int = 1
+        ) -> CodexAccount? {
+            ExternalAuthConflictRecoveryPolicy.newerSameAccountGenerationTarget(
+                state: state,
+                configuredAccountId: configuredAccountId,
+                storedTarget: stored,
+                observedTarget: observedTarget ?? observed,
+                matchingProviderAccountCount: matchingProviderAccountCount,
+                now: now
+            )
+        }
+
+        #expect(target(configuredAccountId: UUID()) == nil)
+        #expect(target(matchingProviderAccountCount: 2) == nil)
+
+        var differentLocalAccount = observed
+        differentLocalAccount = CodexAccount(
+            id: UUID(),
+            email: differentLocalAccount.email,
+            accessToken: differentLocalAccount.accessToken,
+            refreshToken: differentLocalAccount.refreshToken,
+            idToken: differentLocalAccount.idToken,
+            accountId: differentLocalAccount.accountId,
+            isActive: true
+        )
+        #expect(target(observedTarget: differentLocalAccount) == nil)
+
+        var differentProvider = observed
+        differentProvider.accountId = "different-provider"
+        #expect(target(observedTarget: differentProvider) == nil)
+
+        var partial = observed
+        partial.refreshToken = ""
+        #expect(target(observedTarget: partial) == nil)
+
+        let unrelatedReview = AccountActivationState.manualReview(
+            targetAccountId: targetAccountId,
+            detail: .externalAuthInvalid,
+            at: now
+        )
+        #expect(target(state: unrelatedReview) == nil)
+    }
+
     @Test("Durable source restores an intentionally cleared in-memory selection")
     func durableSourceRestoresClearedSelection() {
         var durableSource = makeAccount(id: sourceAccountId, active: true)
@@ -224,6 +332,47 @@ struct ExternalAuthConflictRecoveryTests {
         }
         #expect(unchanged == review)
         #expect(try await coordinator.load() == review)
+    }
+
+    @Test("Coordinator prepares only the matching same-account generation review")
+    func coordinatorPreparesSameAccountGenerationRecovery() async throws {
+        let url = makeSecureTestFileURL(
+            prefix: "codexswitch-same-account-generation-recovery",
+            fileName: "account-activation.json"
+        )
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let coordinator = AccountActivationCoordinator(url: url)
+        let review = try await coordinator.markManualReview(
+            targetAccountId: targetAccountId,
+            detail: .configuredFilesInconsistent,
+            at: now
+        )
+        let generation = UUID()
+
+        let decision = try await coordinator
+            .beginVerifiedSameAccountGenerationRecovery(
+                targetAccountId: targetAccountId,
+                requestedActivationGeneration: generation,
+                authorizeEffect: { $0 == review },
+                at: now.addingTimeInterval(1)
+            )
+        guard case .prepared(let preparing, let previousState) = decision else {
+            Issue.record("Expected same-account recovery to prepare")
+            return
+        }
+        #expect(previousState == review)
+        #expect(preparing.configuredAccountId == targetAccountId)
+        #expect(preparing.activationGeneration == generation)
+
+        let blocked = try await coordinator.beginVerifiedSameAccountGenerationRecovery(
+            targetAccountId: sourceAccountId,
+            at: now.addingTimeInterval(2)
+        )
+        guard case .blocked(let unchanged, _) = blocked else {
+            Issue.record("Expected a different target to remain blocked")
+            return
+        }
+        #expect(unchanged == preparing)
     }
 
     @Test("Authority target journal recovers a durable source and target auth split")
