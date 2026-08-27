@@ -1,0 +1,19 @@
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_d360daea4a1f36 3593
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "30f5190023cbcd7c63bf21dc16a0a46dbfc1e65f",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
