@@ -13,6 +13,7 @@ CS_SEND_DIR = ROOT / "scripts" / "securedrop" / "cs-send-dir"
 CS_EXTRACT = ROOT / "scripts" / "securedrop" / "cs-extract"
 CS_AUTOPULL = ROOT / "scripts" / "securedrop" / "cs-autopull"
 CS_AUTOPUSH = ROOT / "scripts" / "securedrop" / "cs-autopush"
+CS_AUTOPUSH_LOOP = ROOT / "scripts" / "securedrop" / "cs-autopush-loop"
 INSTALL_MACOS_AUTOPUSH = ROOT / "scripts" / "securedrop" / "install-macos-autopush"
 KNOWLEDGE_SYNC = ROOT / "scripts" / "securedrop" / "knowledge-sync"
 
@@ -175,10 +176,21 @@ class SecureDropScriptTests(unittest.TestCase):
 
         self.assertIn("<key>StartInterval</key>", script)
         self.assertIn("<key>WatchPaths</key>", script)
-        self.assertIn("<key>SuccessfulExit</key>", script)
+        self.assertIn("<key>KeepAlive</key>", script)
+        self.assertNotIn("<key>SuccessfulExit</key>", script)
         self.assertIn("<key>ThrottleInterval</key>", script)
         self.assertIn('launchctl bootstrap "gui/$uid" "$plist_path"', script)
         self.assertIn("for attempt in 1 2 3", script)
+
+    def test_autopush_loop_owns_cadence_instead_of_launchd_rescheduling(self):
+        script = CS_AUTOPUSH_LOOP.read_text()
+
+        self.assertIn("while [ \"$stop\" -eq 0 ]", script)
+        self.assertIn('sleep "$INTERVAL" &', script)
+        self.assertIn("trap 'stop=1' INT TERM HUP", script)
+        self.assertNotIn("rm ", script)
+        installer = INSTALL_MACOS_AUTOPUSH.read_text()
+        self.assertIn('<string>$loop_path</string>', installer)
 
 
 if __name__ == "__main__":

@@ -79,7 +79,9 @@ failed_count=0
 while IFS= read -r -d '' file; do
   name="$(basename "$file")"
   if ! is_safe_name "$name"; then
-    log "skip-unsafe name=$name"
+    if [ "$name" != ".DS_Store" ]; then
+      log "skip-unsafe name=$name"
+    fi
     continue
   fi
 

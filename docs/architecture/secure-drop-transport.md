@@ -14,6 +14,7 @@ toc:
 cross_dependencies:
   - ../../crates/codexswitch-cli/src/secure_drop.rs
   - ../../scripts/securedrop/cs-autopush
+  - ../../scripts/securedrop/cs-autopush-loop
   - ../../scripts/securedrop/install-macos-autopush
   - ../../scripts/securedrop/cs-autopull
   - ../../scripts/securedrop/cs-send-dir
@@ -129,9 +130,12 @@ whose path, type, owner, age, and naming contract prove CodexSwitch ownership.
   is limited to transaction-owned temporary paths.
 - No transfer action restarts Codex, ChatGPT, CodexSwitch, or a VPS service.
 
-The macOS autopush agent has independent interval and outbox-change demand
-sources. An eligible file that cannot be published makes the worker exit
-nonzero; launchd retries it with a 15-second throttle until the verified
-transfer succeeds. Installing or repairing autopush atomically updates the
-worker and launch agent, validates the plist, re-bootstraps only the autopush
-label, and leaves application and VPS processes untouched.
+The macOS autopush agent launches one long-lived, low-cost loop that owns the
+15-second cadence. launchd interval, outbox-change, and persistent demand
+sources remain defense in depth, but correctness does not depend on launchd
+rescheduling a successful short-lived job. The transfer worker is quiet when
+no eligible files exist. An eligible file that cannot be published is retried
+by the next loop iteration until the verified transfer succeeds. Installing or
+repairing autopush atomically updates the loop, worker, and launch agent,
+validates the plist, re-bootstraps only the autopush label, and leaves
+application and VPS processes untouched.
