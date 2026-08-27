@@ -3590,7 +3590,7 @@ enum LinuxDevboxMonitor {
                         (cutoff,),
                     )
                     for timestamp, target, body in rows:
-                        normalized_body = (body or "").replace("\n", " ")
+                        normalized_body = (body or "").replace("\\n", " ")
                         yield f"codexswitch_ts={timestamp} codexswitch_target={target or ''} {normalized_body}"
                 finally:
                     conn.close()
