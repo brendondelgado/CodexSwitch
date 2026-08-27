@@ -913,6 +913,8 @@ enum LinuxDevboxMonitor {
     static let normalReadinessPollInterval: TimeInterval = 60
     static let readinessEvidenceFreshnessInterval: TimeInterval =
         normalReadinessPollInterval + 60
+    static let remoteUsageRefreshInterval: TimeInterval = 15 * 60
+    static let remoteUsageReportTimeout: TimeInterval = 12 * 60
     static let automaticCredentialBundleLifetime: TimeInterval = 10 * 60
     static let pollAccountRetryPolicy: SSHRetryPolicy = .preExecutionTransportOnly
     static let poolAuthorityStatusTimeout: TimeInterval = 20
@@ -2627,7 +2629,7 @@ enum LinuxDevboxMonitor {
         let result = runSSH(
             settings: settings,
             remoteCommand: remoteUsageReportCommand(days: days),
-            timeout: 90,
+            timeout: remoteUsageReportTimeout,
             retryPolicy: .readOnly
         )
 
@@ -3349,7 +3351,7 @@ enum LinuxDevboxMonitor {
         let safeDays = max(1, min(days, 365))
         return """
         python3 - <<'PY'
-        import json, sqlite3, pathlib, time, hashlib, re
+        import fcntl, hashlib, json, os, pathlib, re, sqlite3, time
 
         DAYS = \(safeDays)
         REFERENCE = 978307200
@@ -3358,6 +3360,27 @@ enum LinuxDevboxMonitor {
             (re.compile(r"^gpt-5(?:\\.\\d+)?(?:[-.].*)?$", re.I), frozenset(("long_context_pricing",))),
         )
         home = pathlib.Path.home()
+
+        def acquire_scan_lock():
+            lock_root = home / ".codexswitch"
+            lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock_path = lock_root / "token-usage-scan.lock"
+            flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(lock_path, flags, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(descriptor)
+                raise SystemExit(75)
+            except Exception:
+                os.close(descriptor)
+                raise
+            return descriptor
+
+        scan_lock = acquire_scan_lock()
 
         def load_accounts():
             path = home / ".codexswitch" / "accounts.json"
@@ -3550,22 +3573,27 @@ enum LinuxDevboxMonitor {
             }
 
         def usage_lines():
-            lines = []
             cutoff = int(time.time() - DAYS * 86400)
             sqlite_path = home / ".codex" / "logs_2.sqlite"
             if sqlite_path.exists():
-                conn = sqlite3.connect(sqlite_path)
-                rows = conn.execute(
-                    '''
-                    select 'codexswitch_ts=' || ts || ' codexswitch_target=' || target || ' ' || replace(feedback_log_body, char(10), ' ') from logs
-                    where (feedback_log_body like '%response.completed%'
-                        or feedback_log_body like '%codex.turn.token_usage.input_tokens%')
-                      and ts >= ?
-                    order by ts asc
-                    ''',
-                    (cutoff,),
-                ).fetchall()
-                lines.extend(row[0] for row in rows)
+                database_uri = sqlite_path.resolve().as_uri() + "?mode=ro"
+                conn = sqlite3.connect(database_uri, uri=True, timeout=5)
+                try:
+                    rows = conn.execute(
+                        '''
+                        select ts, target, feedback_log_body from logs
+                        where (feedback_log_body like '%response.completed%'
+                            or feedback_log_body like '%codex.turn.token_usage.input_tokens%')
+                          and ts >= ?
+                        order by ts asc
+                        ''',
+                        (cutoff,),
+                    )
+                    for timestamp, target, body in rows:
+                        normalized_body = (body or "").replace("\n", " ")
+                        yield f"codexswitch_ts={timestamp} codexswitch_target={target or ''} {normalized_body}"
+                finally:
+                    conn.close()
 
             session_root = home / ".codex" / "sessions"
             if session_root.exists():
@@ -3654,8 +3682,7 @@ enum LinuxDevboxMonitor {
                             best_score = score
                             best_line = raw_line.strip()
                     if best_line:
-                        lines.append(f"codexswitch_session={session_id} codexswitch_model={model} " + best_line)
-            return lines
+                        yield f"codexswitch_session={session_id} codexswitch_model={model} " + best_line
 
         by_model = {}
         response_seen = set()

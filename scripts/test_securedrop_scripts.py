@@ -12,6 +12,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CS_SEND_DIR = ROOT / "scripts" / "securedrop" / "cs-send-dir"
 CS_EXTRACT = ROOT / "scripts" / "securedrop" / "cs-extract"
 CS_AUTOPULL = ROOT / "scripts" / "securedrop" / "cs-autopull"
+CS_AUTOPUSH = ROOT / "scripts" / "securedrop" / "cs-autopush"
+INSTALL_MACOS_AUTOPUSH = ROOT / "scripts" / "securedrop" / "install-macos-autopush"
 KNOWLEDGE_SYNC = ROOT / "scripts" / "securedrop" / "knowledge-sync"
 
 
@@ -155,6 +157,28 @@ class SecureDropScriptTests(unittest.TestCase):
             'ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "$delete_cmd"',
             script,
         )
+
+    def test_autopush_fails_closed_on_missing_helper_arguments(self):
+        script = CS_AUTOPUSH.read_text()
+
+        self.assertIn('local remote_path="${1-}"', script)
+        self.assertIn('local file="${1-}"', script)
+        self.assertIn('local name="${1-}"', script)
+        self.assertIn('autopush-incomplete failures=', script)
+        self.assertNotIn('ssh -o BatchMode=yes', script)
+        self.assertIn('ssh -n -o BatchMode=yes', script)
+        self.assertIn('-e ssh', script)
+        self.assertIn('done 3< <(find "$SRC" -maxdepth 1 -type f -print0) <&3', script)
+
+    def test_macos_autopush_agent_has_interval_and_outbox_demand_sources(self):
+        script = INSTALL_MACOS_AUTOPUSH.read_text()
+
+        self.assertIn("<key>StartInterval</key>", script)
+        self.assertIn("<key>WatchPaths</key>", script)
+        self.assertIn("<key>SuccessfulExit</key>", script)
+        self.assertIn("<key>ThrottleInterval</key>", script)
+        self.assertIn('launchctl bootstrap "gui/$uid" "$plist_path"', script)
+        self.assertIn("for attempt in 1 2 3", script)
 
 
 if __name__ == "__main__":

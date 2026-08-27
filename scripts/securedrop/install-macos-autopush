@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  printf 'error: macOS is required\n' >&2
+  exit 2
+fi
+
+script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+source_script="$script_dir/cs-autopush"
+bin_dir="$HOME/.local/bin"
+worker_path="$bin_dir/cs-autopush"
+agent_dir="$HOME/Library/LaunchAgents"
+plist_path="$agent_dir/com.codexswitch.securedrop.autopush.plist"
+state_dir="$HOME/.codexswitch/securedrop"
+outbox="$HOME/CodexSwitch SecureDrop/outbox"
+label="com.codexswitch.securedrop.autopush"
+uid="$(id -u)"
+
+mkdir -p "$bin_dir" "$agent_dir" "$state_dir" "$outbox"
+chmod 700 "$state_dir" "$outbox" 2>/dev/null || true
+
+worker_tmp="$(mktemp "$bin_dir/.cs-autopush.XXXXXX")"
+plist_tmp="$(mktemp "$agent_dir/.securedrop-autopush.XXXXXX")"
+cleanup() {
+  rm -f -- "$worker_tmp" "$plist_tmp"
+}
+trap cleanup EXIT
+
+install -m 0755 "$source_script" "$worker_tmp"
+cat > "$plist_tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$worker_path</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>15</integer>
+  <key>WatchPaths</key>
+  <array>
+    <string>$outbox</string>
+  </array>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>StandardOutPath</key>
+  <string>$state_dir/autopush.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>$state_dir/autopush.launchd.err.log</string>
+</dict>
+</plist>
+PLIST
+
+plutil -lint "$plist_tmp" >/dev/null
+mv -f -- "$worker_tmp" "$worker_path"
+mv -f -- "$plist_tmp" "$plist_path"
+chmod 0755 "$worker_path"
+chmod 0600 "$plist_path"
+
+launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+loaded=false
+for attempt in 1 2 3; do
+  if launchctl bootstrap "gui/$uid" "$plist_path"; then
+    loaded=true
+    break
+  fi
+  sleep "$attempt"
+done
+if [ "$loaded" != true ]; then
+  printf 'error: failed to bootstrap %s after 3 attempts\n' "$label" >&2
+  exit 1
+fi
+launchctl kickstart "gui/$uid/$label"

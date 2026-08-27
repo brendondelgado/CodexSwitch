@@ -17,6 +17,7 @@ toc:
   - Remote Session Contract
   - Status And Repair
   - Update And Patch Contract
+  - Remote Usage Accounting
   - Storage Contract
   - Operational Proof
 cross_dependencies:
@@ -68,7 +69,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-08-21
+  last_updated: 2026-08-27
 ---
 
 # Runtime And Host Ownership
@@ -1783,6 +1784,24 @@ injected auth-generation counter, including constructors whose route field is
 separated from `external_auth` by comments. Reload construction passes the route
 configuration using the reference shape required by the reviewed upstream
 field type; an unknown field shape fails during generated-source verification.
+
+## Remote Usage Accounting
+
+Remote token-usage accounting is observational and noncritical. The Mac may
+request a VPS usage report no more frequently than once every fifteen minutes;
+quota polling, authority observation, credential synchronization, and runtime
+readiness retain their independent cadences and must not wait for that report.
+
+Every VPS usage report acquires one host-wide, nonblocking advisory lock before
+opening `~/.codex/logs_2.sqlite` or enumerating session transcripts. A second
+request exits before either scan while the first request, an orphaned SSH child,
+or another CodexSwitch process owns the lock. The database is opened read-only,
+matching rows are streamed rather than accumulated with `fetchall`, and session
+files are inspected with bounded tail reads. A timeout or lock conflict leaves
+the last accepted usage summary unchanged; it never starts a parallel fallback
+scan. This cross-process exclusion is required in addition to the Mac app's
+in-memory in-flight guard because terminating an SSH client does not prove that
+its already-started remote child exited.
 
 ## Storage Contract
 

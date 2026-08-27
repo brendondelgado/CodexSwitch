@@ -9533,7 +9533,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func startTokenUsageMetricsMonitor() {
         tokenUsageMetricsTimer?.invalidate()
-        tokenUsageMetricsTimer = Timer.scheduledTimer(withTimeInterval: 5 * 60, repeats: true) { [weak self] _ in
+        tokenUsageMetricsTimer = Timer.scheduledTimer(
+            withTimeInterval: LinuxDevboxMonitor.remoteUsageRefreshInterval,
+            repeats: true
+        ) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshTokenUsageMetrics()
             }

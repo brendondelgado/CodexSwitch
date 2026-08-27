@@ -14,6 +14,7 @@ toc:
 cross_dependencies:
   - ../../crates/codexswitch-cli/src/secure_drop.rs
   - ../../scripts/securedrop/cs-autopush
+  - ../../scripts/securedrop/install-macos-autopush
   - ../../scripts/securedrop/cs-autopull
   - ../../scripts/securedrop/cs-send-dir
   - ../../scripts/securedrop/cs-extract
@@ -22,7 +23,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-13
+  last_updated: 2026-08-27
 ---
 
 # SecureDrop Transport
@@ -78,6 +79,11 @@ A successful transfer has one publication order:
    fresh source check proves the local content still matches the transferred
    bytes.
 
+The null-delimited outbox walk uses a dedicated file descriptor. Direct SSH
+commands detach standard input, while rsync retains its standard-input data
+channel without gaining access to the outbox iterator. One transport operation
+therefore cannot consume and silently skip later filenames.
+
 Failure before publication leaves the existing destination untouched. A digest
 mismatch deletes only the verified staging path. It never deletes or replaces
 the source merely because a network command returned success.
@@ -122,3 +128,10 @@ whose path, type, owner, age, and naming contract prove CodexSwitch ownership.
 - Retrying is safe because publication is staged and digest-verified; cleanup
   is limited to transaction-owned temporary paths.
 - No transfer action restarts Codex, ChatGPT, CodexSwitch, or a VPS service.
+
+The macOS autopush agent has independent interval and outbox-change demand
+sources. An eligible file that cannot be published makes the worker exit
+nonzero; launchd retries it with a 15-second throttle until the verified
+transfer succeeds. Installing or repairing autopush atomically updates the
+worker and launch agent, validates the plist, re-bootstraps only the autopush
+label, and leaves application and VPS processes untouched.

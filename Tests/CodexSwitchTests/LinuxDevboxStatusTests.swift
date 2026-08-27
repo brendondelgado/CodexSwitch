@@ -290,6 +290,22 @@ struct LinuxDevboxStatusTests {
         #expect(result.terminationStatus == 0)
     }
 
+    @Test("Remote usage reports use a fifteen-minute cadence and host-wide lock")
+    func remoteUsageReportsAreRateLimitedAndSingleFlight() throws {
+        #expect(LinuxDevboxMonitor.remoteUsageRefreshInterval == 15 * 60)
+        #expect(LinuxDevboxMonitor.remoteUsageReportTimeout == 12 * 60)
+        #expect(
+            LinuxDevboxMonitor.remoteUsageReportTimeout
+                < LinuxDevboxMonitor.remoteUsageRefreshInterval
+        )
+        let script = try remoteUsageScript()
+        #expect(script.contains("token-usage-scan.lock"))
+        #expect(script.contains("fcntl.LOCK_EX | fcntl.LOCK_NB"))
+        #expect(script.contains("os.O_NOFOLLOW"))
+        #expect(script.contains("mode=ro"))
+        #expect(!script.contains(".fetchall()"))
+    }
+
     @Test("Remote usage report keeps missing model evidence unknown and emits aggregates only")
     func remoteUsageReportKeepsMissingModelEvidenceUnknown() throws {
         let home = try isolatedHome()

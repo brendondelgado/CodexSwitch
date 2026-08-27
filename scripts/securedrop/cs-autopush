@@ -32,19 +32,23 @@ shell_quote() {
 }
 
 remote_sha256() {
-  local remote_path="$1"
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" \
+  local remote_path="${1-}"
+  [ -n "$remote_path" ] || return 2
+  ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$HOST" \
     "sha256sum -- $(shell_quote "$remote_path") | awk '{print \$1}'" 2>/dev/null || true
 }
 
 local_sha256() {
-  shasum -a 256 "$1" | awk '{print $1}'
+  local file="${1-}"
+  [ -n "$file" ] || return 2
+  shasum -a 256 "$file" | awk '{print $1}'
 }
 
 remove_local_if_unchanged() {
-  local file="$1"
-  local expected_hash="$2"
-  local name="$3"
+  local file="${1-}"
+  local expected_hash="${2-}"
+  local name="${3-}"
+  [ -n "$file" ] && [ -n "$expected_hash" ] && [ -n "$name" ] || return 2
   local current_hash
   if [ ! -f "$file" ]; then
     log "local-delete-skipped name=$name reason=missing_after_transfer"
@@ -59,7 +63,7 @@ remove_local_if_unchanged() {
 }
 
 is_safe_name() {
-  local name="$1"
+  local name="${1-}"
   case "$name" in
     ""|.|..|.*|*/*|*\\*|*.tmp|*.part|*.download|*.crdownload|*.incoming)
       return 1
@@ -70,6 +74,7 @@ is_safe_name() {
 
 now="$(date +%s)"
 sent_count=0
+failed_count=0
 
 while IFS= read -r -d '' file; do
   name="$(basename "$file")"
@@ -94,26 +99,31 @@ while IFS= read -r -d '' file; do
   remote_final_hash="$(remote_sha256 "$remote_final")"
 
   if [ "$remote_final_hash" = "$local_hash" ]; then
-    remove_local_if_unchanged "$file" "$local_hash" "$name" || continue
+    if ! remove_local_if_unchanged "$file" "$local_hash" "$name"; then
+      failed_count=$((failed_count + 1))
+      continue
+    fi
     sent_count=$((sent_count + 1))
     log "already-pushed name=$name bytes=$local_bytes sha256=$local_hash dest=$HOST:$remote_final"
     continue
   fi
 
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" \
+  ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$HOST" \
     "mkdir -p $(shell_quote "$incoming_dir") $(shell_quote "$REMOTE_ROOT/inbox") && chmod 700 $(shell_quote "$REMOTE_ROOT") $(shell_quote "$REMOTE_ROOT/inbox") $(shell_quote "$REMOTE_ROOT/.incoming") 2>/dev/null || true" \
-    || { log "ssh-prepare-failed name=$name"; continue; }
+    || { failed_count=$((failed_count + 1)); log "ssh-prepare-failed name=$name"; continue; }
 
   if ! rsync -az --partial --timeout=30 -e ssh -- "$file" "$HOST:$(shell_quote "$remote_incoming")"; then
+    failed_count=$((failed_count + 1))
     log "rsync-failed name=$name"
-    ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "rm -rf -- $(shell_quote "$incoming_dir")" >/dev/null 2>&1 || true
+    ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "rm -rf -- $(shell_quote "$incoming_dir")" >/dev/null 2>&1 || true
     continue
   fi
 
   remote_hash="$(remote_sha256 "$remote_incoming")"
   if [ "$remote_hash" != "$local_hash" ]; then
+    failed_count=$((failed_count + 1))
     log "hash-mismatch name=$name local=$local_hash remote=${remote_hash:-missing}"
-    ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "rm -rf -- $(shell_quote "$incoming_dir")" >/dev/null 2>&1 || true
+    ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "rm -rf -- $(shell_quote "$incoming_dir")" >/dev/null 2>&1 || true
     continue
   fi
 
@@ -128,22 +138,32 @@ while IFS= read -r -d '' file; do
       "$(shell_quote "$remote_hash_file")" \
       "$(shell_quote "$incoming_dir")"
   )
-  if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "$publish_cmd"; then
+  if ! ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "$publish_cmd"; then
+    failed_count=$((failed_count + 1))
     log "publish-failed name=$name"
     continue
   fi
 
   remote_final_hash="$(remote_sha256 "$remote_final")"
   if [ "$remote_final_hash" != "$local_hash" ]; then
+    failed_count=$((failed_count + 1))
     log "final-hash-mismatch name=$name local=$local_hash remote=${remote_final_hash:-missing}"
     continue
   fi
 
-  remove_local_if_unchanged "$file" "$local_hash" "$name" || continue
+  if ! remove_local_if_unchanged "$file" "$local_hash" "$name"; then
+    failed_count=$((failed_count + 1))
+    continue
+  fi
   sent_count=$((sent_count + 1))
   log "pushed name=$name bytes=$local_bytes sha256=$local_hash dest=$HOST:$remote_final"
-done < <(find "$SRC" -maxdepth 1 -type f -print0)
+done 3< <(find "$SRC" -maxdepth 1 -type f -print0) <&3
 
 if [ "$sent_count" -gt 0 ]; then
   log "autopush-complete count=$sent_count"
+fi
+
+if [ "$failed_count" -gt 0 ]; then
+  log "autopush-incomplete failures=$failed_count"
+  exit 1
 fi
