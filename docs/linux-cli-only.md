@@ -105,6 +105,14 @@ The Mac-side `codex-vps` helper uses local port `18390` as an SSH-forwarded WebS
 
 ChatGPT's built-in SSH remote is a separate transport and lifecycle: it reaches the VPS through a `codex app-server proxy` connected to `~/.codex/app-server-control/app-server-control.sock`, not through the port-8390 `codex-vps` service. A successful `codex-vps` restart or `/healthz` probe therefore does not prove the built-in remote recovered, and recycling ChatGPT's local SSH bridge does not prove the port-8390 service recovered. Both the port-8390 listener and the built-in `unix://` daemon are account-bearing reload targets when running, while their `app-server proxy` transport helpers are not. A swap is converged only after every discovered listener acknowledges the same credential generation. Diagnose and verify the endpoint used by the failing client.
 
+An idle built-in `unix://` listener may acknowledge convergence without a
+frontend writer only after it reloads the exact requested account and complete
+token fingerprint, reports internally consistent frontend counts with zero
+eligible writers, and marks itself ready for a future client. This is the same
+fail-closed idle-listener proof used by the headless port-8390 endpoint; a
+missing ACK, mismatched fingerprint, rejected writer, or partial delivery still
+blocks activation.
+
 Port `18390` is ownership-protected. Before opening a tunnel, the helper must atomically acquire `~/.codexswitch/codex-vps-tunnel-18390.lock` and atomically publish owner, supervisor, and SSH-child metadata inside it. Cleanup may signal an SSH PID only when the lock token still belongs to the current helper and the PID, parent PID, SSH command, forward specification, and listening socket all match that metadata. A listener that cannot be proved to be this helper's current SSH child is unknown: refuse to attach or replace it, report its PID, and leave it running. A dead owner record may be reclaimed only when no process is listening on `18390`.
 
 The interactive supervisor owns SSH as a background child and monitors both that exact process and `/healthz` while the remote client runs. Cleanup traps must be installed before the startup readiness wait so an interrupt or failed startup cannot orphan the child or lock. Health probes use an 8-second default timeout and are debounced across four consecutive failures, configurable with `CODEX_VPS_TUNNEL_HEALTH_TIMEOUT_SECONDS`, `CODEX_VPS_TUNNEL_HEALTH_FAILURE_LIMIT`, and `CODEX_VPS_TUNNEL_HEALTH_INTERVAL_SECONDS`. Tunnel creation or health failure retries use bounded exponential backoff, starting at 2 seconds and capped at 30 seconds via `CODEX_VPS_TUNNEL_RECONNECT_DELAY` and `CODEX_VPS_TUNNEL_RECONNECT_DELAY_MAX`; startup readiness may wait up to 90 seconds via `CODEX_VPS_TUNNEL_STARTUP_TIMEOUT_SECONDS`. Reconnecting the local SSH tunnel must never start or restart the remote app-server. Remote service restart remains an explicit `codex-vps restart` operation.

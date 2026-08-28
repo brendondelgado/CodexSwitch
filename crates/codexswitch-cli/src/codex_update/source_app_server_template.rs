@@ -447,7 +447,7 @@ fn patch_app_server_reload_template(
                         continue;
                     }
                     let idle_listener_ready = match expected_runtime_kind {
-                        "headless-remote-control-app-server" => {
+                        "headless-remote-control-app-server" | "external-app-server" => {
                             eligible_frontend_count == 0
                         }
                         "managed-desktop-bridge" => {

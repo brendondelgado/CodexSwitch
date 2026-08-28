@@ -3094,7 +3094,7 @@ fn hot_swap_ack_matches_request_with_minimum_remaining(
         && ack.active_token_fingerprint == expected_fingerprint
         && match runtime_kind {
             HotSwapRuntimeKind::ExternalAppServer => {
-                external_app_server_ack_is_verified(ack, AppServerIdlePolicy::Reject)
+                external_app_server_ack_is_verified(ack, AppServerIdlePolicy::NoEligibleFrontends)
             }
             HotSwapRuntimeKind::OfficialDesktopStdioChild => {
                 external_app_server_ack_is_verified(ack, AppServerIdlePolicy::Reject)
@@ -5720,11 +5720,22 @@ mod tests {
         strict_idle.eligible_frontend_count = Some(0);
         strict_idle.rejected_frontend_count = Some(0);
         strict_idle.idle_listener_ready = true;
-        assert!(!hot_swap_ack_matches_request(
+        assert!(hot_swap_ack_matches_request(
             &strict_idle,
             &strict_request,
             HotSwapRuntimeKind::ExternalAppServer,
             strict_idle.acknowledged_at_unix_milliseconds,
+        ));
+
+        let mut desktop_request = strict_request.clone();
+        desktop_request.binding.runtime_kind = HotSwapRuntimeKind::OfficialDesktopStdioChild;
+        let mut desktop_idle = strict_idle.clone();
+        desktop_idle.binding = desktop_request.binding.clone();
+        assert!(!hot_swap_ack_matches_request(
+            &desktop_idle,
+            &desktop_request,
+            HotSwapRuntimeKind::OfficialDesktopStdioChild,
+            desktop_idle.acknowledged_at_unix_milliseconds,
         ));
 
         let mut managed_idle = strict_idle.clone();
