@@ -880,11 +880,10 @@ fn patch_app_server_reload_template(
 #[cfg(test)]
 mod managed_desktop_bridge_template_tests {
     #[test]
-    fn generated_app_server_keeps_managed_idle_policy_narrow() {
+    fn generated_app_server_keeps_idle_policies_narrow() {
         let source = include_str!("source_app_server_template.rs");
         let managed_wire_name = ["managed", "desktop", "bridge"].join("-");
         let managed_match_arm = format!("\"{managed_wire_name}\" =>");
-        let external_match_arm = ["\"", "external-app-server", "\" =>"].concat();
         let exact_listener = ["ws://127.0.0.1:", "9223"].concat();
         let exact_argument_count = ["arguments.len()", " == 7"].concat();
         let macos_gate = ["cfg!(target_os = ", "\"macos\")"].concat();
@@ -901,8 +900,8 @@ mod managed_desktop_bridge_template_tests {
             "                        }",
         ]
         .concat();
-        let headless_idle_policy = [
-            "\"headless-remote-control-app-server\" => {\n",
+        let listener_idle_policy = [
+            "\"headless-remote-control-app-server\" | \"external-app-server\" => {\n",
             "                            eligible_frontend_count == 0\n",
             "                        }",
         ]
@@ -910,13 +909,12 @@ mod managed_desktop_bridge_template_tests {
 
         assert!(source.contains(&format!("\"{managed_wire_name}\"")));
         assert!(source.contains(&managed_match_arm));
-        assert!(!source.contains(&external_match_arm));
         assert!(source.contains(&exact_listener));
         assert!(source.contains(&exact_argument_count));
         assert!(source.contains(&macos_gate));
         assert!(source.contains(&code_mode_argument));
         assert!(source.contains(&analytics_argument));
         assert!(source.contains(&managed_idle_policy));
-        assert!(source.contains(&headless_idle_policy));
+        assert!(source.contains(&listener_idle_policy));
     }
 }
