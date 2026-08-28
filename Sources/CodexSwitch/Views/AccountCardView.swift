@@ -310,6 +310,10 @@ struct AccountCardView: View {
         requiresReauthentication
     }
 
+    var manualReauthenticationAvailable: Bool {
+        onReauthenticate != nil
+    }
+
     var primaryActionAccessibilityHint: String {
         if needsReauthentication {
             return "Reauthenticate this account"
@@ -589,7 +593,7 @@ struct AccountCardView: View {
                 now: Date()
             )
 
-            if needsReauthentication {
+            if manualReauthenticationAvailable {
                 Button("Reauthenticate") {
                     onReauthenticate?()
                 }

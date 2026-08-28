@@ -1479,6 +1479,13 @@ actor boundary on every supported Swift 6 toolchain.
   degraded, offline, or not required. A host's stale local credential or
   runtime identity is diagnostic evidence under that target; it never gives a
   second account card legitimate current styling.
+- Runtime blockers remain host-owned operational state during credential
+  replication. A fresh VPS authentication blocker that matches exactly one
+  local account by stable provider identifier is nevertheless projected into
+  that account's Mac presentation as `Needs login`; this projection does not
+  mutate the Mac account's durable runtime blocker. Stale, disconnected,
+  malformed, missing-identity, or duplicate-identity VPS evidence cannot assert
+  a Mac reauthentication state.
 - Authority observations carry a bounded non-secret stable provider account
   identifier, epoch, phase, and per-host convergence summaries. The provider
   identifier must match exactly one local record and agree with any host
@@ -1510,6 +1517,11 @@ actor boundary on every supported Swift 6 toolchain.
   in a shared status area. Repeated host warnings do not appear on every account
   card. The pool target is listed first even while a host is still converging;
   list order never elevates a stale host-local `isActive` flag over authority.
+- Every account context menu exposes an explicit `Reauthenticate` recovery
+  command, even when current telemetry does not classify that account as
+  blocked. The card's primary action and visible `Needs login` treatment switch
+  to reauthentication only for a local auth blocker or fresh, uniquely
+  identity-bound VPS auth-blocker evidence.
 - Local quota exhaustion submits a remote-first authority request. If a VPS is
   configured but unavailable, the request fails closed: current sessions are
   preserved, no local target changes, and the UI shows authority unavailable.

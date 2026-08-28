@@ -217,6 +217,45 @@ final class AccountManager {
             : .notCurrent
     }
 
+    func vpsReauthenticationNotice(
+        for account: CodexAccount,
+        now: Date = Date()
+    ) -> String? {
+        guard linuxDevboxStatus.state == .ready,
+              let observedAt = linuxDevboxAccountStatesObservedAt,
+              LinuxDevboxStatus.accountMirrorIsFresh(
+                  observedAt: observedAt,
+                  now: now,
+                  maximumAge: Self.vpsRuntimeEvidenceFreshnessInterval
+              ),
+              let providerAccountId = account.normalizedProviderAccountId,
+              accounts.filter({
+                  $0.normalizedProviderAccountId == providerAccountId
+              }).count == 1 else {
+            return nil
+        }
+
+        let matchingStates = linuxDevboxAccountStates.filter {
+            Self.canonicalRemoteProviderAccountId($0.providerAccountId)
+                == providerAccountId
+        }
+        guard matchingStates.count == 1,
+              let state = matchingStates.first,
+              Self.isValidAuthoritativeTelemetry(
+                  state,
+                  observedAt: observedAt,
+                  now: now
+              ),
+              CodexAccount.requiresReauthentication(
+                  runtimeUnusableUntil: state.runtimeUnusableUntil,
+                  runtimeUnusableReason: state.runtimeUnusableReason,
+                  at: now
+              ) else {
+            return nil
+        }
+        return "VPS authentication requires reauthentication"
+    }
+
     func hostConvergencePresentation(
         forPoolTarget account: CodexAccount,
         now: Date = Date()

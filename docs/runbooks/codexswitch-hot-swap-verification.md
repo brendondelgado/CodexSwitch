@@ -1194,6 +1194,14 @@ or request another pool target. With a configured VPS, that target request goes
 to the VPS authority before any Mac credential mutation. Hover and tooltip
 helpers must be declared non-hit-testable so they cannot intercept that control.
 
+Every account's context menu also exposes `Reauthenticate` as an explicit
+operator recovery action, independent of the current telemetry classification.
+A fresh VPS authentication blocker may make the card show `Needs login` and
+make reauthentication its primary action only when the remote provider identity
+matches exactly one local account. This presentation must not copy host-local
+runtime-blocker state into the Mac credential store, and stale, disconnected,
+malformed, or ambiguous remote evidence must not assert a blocker.
+
 The control must remain available while a same-target `CommittedDegraded`
 barrier is visible. A successful press must produce activation journal evidence;
 a visual highlight change without a new activation generation is not proof that
@@ -1222,6 +1230,12 @@ This rule applies at every boundary: the Swift parser, Rust CLI parser, account-
 Quota-unavailable is not the same state as reauthentication-required. Placeholder quota windows are transient backend data failures and should be retried with backoff, especially for inactive Pro accounts that have no trusted quota snapshot yet.
 
 Authentication failures are different. A 401/token-expired/token-invalidated account must be marked runtime-unusable, excluded from swap candidates and pooled usage, persisted, mirrored between Mac and VPS, and shown as `Needs login` even if an old quota snapshot still exists. Stale exhausted reset text must never hide a known auth blocker.
+
+Verification must cover both ownership and presentation: each host preserves its
+own durable runtime blocker during credential replication, while a fresh,
+uniquely provider-identity-matched VPS auth blocker is still shown on the Mac
+account card with a working reauthentication action. A VPS quota-only blocker
+must not be mislabeled as an authentication failure.
 
 A direct runtime `usage_limit` signal from Codex is authoritative exhaustion
 evidence, not target-selection authority. The signal is submitted with one

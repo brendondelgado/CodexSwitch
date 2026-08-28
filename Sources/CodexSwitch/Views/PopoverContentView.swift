@@ -272,7 +272,10 @@ struct PopoverContentView: View {
                                         using: activeAccountReadModel
                                     ),
                                     poolTargetFreshness: activeAccountReadModel.freshness,
-                                    pollingError: manager.pollingErrors[account.id],
+                                    pollingError: manager.vpsReauthenticationNotice(
+                                        for: account,
+                                        now: now
+                                    ) ?? manager.pollingErrors[account.id],
                                     rateLimitResetPresentation: manager.rateLimitResetPresentations[account.id],
                                     rateLimitResetCoordinatorAuthorization:
                                         resetRedemptionAuthorization(account.id),

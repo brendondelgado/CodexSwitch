@@ -113,6 +113,40 @@ struct AccountCardViewTests {
         #expect(!didSwap)
     }
 
+    @Test("Manual reauthentication is available even without a detected blocker")
+    @MainActor
+    func manualReauthenticationIsAlwaysAvailableWhenConnected() throws {
+        let account = makeAccount(isActive: false)
+        let connected = AccountCardView(
+            account: account,
+            pollingError: nil,
+            onReauthenticate: {},
+            onForceSwap: nil
+        )
+        let disconnected = AccountCardView(
+            account: account,
+            pollingError: nil,
+            onReauthenticate: nil,
+            onForceSwap: nil
+        )
+
+        #expect(connected.manualReauthenticationAvailable)
+        #expect(!disconnected.manualReauthenticationAvailable)
+
+        let source = try String(
+            contentsOfFile: "Sources/CodexSwitch/Views/AccountCardView.swift",
+            encoding: .utf8
+        )
+        let menuStart = try #require(source.range(of: ".contextMenu {"))
+        let confirmationStart = try #require(source.range(
+            of: ".confirmationDialog(",
+            range: menuStart.upperBound..<source.endIndex
+        ))
+        let menuSource = source[menuStart.lowerBound..<confirmationStart.lowerBound]
+        #expect(menuSource.contains("if manualReauthenticationAvailable"))
+        #expect(menuSource.contains("Button(\"Reauthenticate\")"))
+    }
+
     @Test("A pool target never becomes a second switch action during host mismatch")
     @MainActor
     func poolTargetDoesNotBecomeAnotherSwitchActionDuringMismatch() {

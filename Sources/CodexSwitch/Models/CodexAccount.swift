@@ -160,7 +160,20 @@ struct CodexAccount: Codable, Identifiable, Sendable {
     }
 
     func requiresReauthentication(at now: Date) -> Bool {
-        guard isRuntimeUnusable(at: now),
+        Self.requiresReauthentication(
+            runtimeUnusableUntil: runtimeUnusableUntil,
+            runtimeUnusableReason: runtimeUnusableReason,
+            at: now
+        )
+    }
+
+    static func requiresReauthentication(
+        runtimeUnusableUntil: Date?,
+        runtimeUnusableReason: String?,
+        at now: Date
+    ) -> Bool {
+        guard let runtimeUnusableUntil,
+              runtimeUnusableUntil > now,
               let reason = runtimeUnusableReason?.normalizedRuntimeReason else {
             return false
         }

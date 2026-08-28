@@ -391,6 +391,93 @@ struct AccountHostOwnershipPresentationTests {
         #expect(manager.vpsRuntimePresentation(for: second, now: now) == .unknown)
     }
 
+    @Test("Fresh identity-bound VPS auth blocker requests Mac reauthentication")
+    func freshVPSAuthBlockerIsPresentedWithoutMutatingLocalState() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let account = makeAccount(email: "remote-auth@example.com")
+        manager.accounts = [account]
+        manager.linuxDevboxStatus = readyStatus(
+            activeEmail: nil,
+            providerAccountId: nil
+        )
+        manager.applyLinuxDevboxAccountStates(
+            [remoteRuntimeState(
+                for: account,
+                reason: "token_expired",
+                until: now.addingTimeInterval(3_600)
+            )],
+            observedAt: now
+        )
+
+        #expect(manager.vpsReauthenticationNotice(for: account, now: now)
+            == "VPS authentication requires reauthentication")
+        #expect(manager.accounts.first?.runtimeUnusableUntil == nil)
+        #expect(manager.accounts.first?.runtimeUnusableReason == nil)
+    }
+
+    @Test("Stale disconnected and quota-only VPS blockers do not request login")
+    func invalidVPSAuthEvidenceIsNotPresented() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let account = makeAccount(email: "remote-auth@example.com")
+        manager.accounts = [account]
+        manager.linuxDevboxStatus = readyStatus(
+            activeEmail: nil,
+            providerAccountId: nil
+        )
+        manager.applyLinuxDevboxAccountStates(
+            [remoteRuntimeState(
+                for: account,
+                reason: "usage_limit",
+                until: now.addingTimeInterval(3_600)
+            )],
+            observedAt: now
+        )
+
+        #expect(manager.vpsReauthenticationNotice(for: account, now: now) == nil)
+
+        manager.applyLinuxDevboxAccountStates(
+            [remoteRuntimeState(
+                for: account,
+                reason: "token_expired",
+                until: now.addingTimeInterval(3_600)
+            )],
+            observedAt: now
+        )
+        let staleNow = now.addingTimeInterval(
+            AccountManager.vpsRuntimeEvidenceFreshnessInterval + 1
+        )
+        #expect(manager.vpsReauthenticationNotice(for: account, now: staleNow) == nil)
+
+        manager.linuxDevboxStatus = LinuxDevboxStatus(
+            state: .failed,
+            summary: "unreachable",
+            activeEmail: nil
+        )
+        #expect(manager.vpsReauthenticationNotice(for: account, now: now) == nil)
+    }
+
+    @Test("Duplicate VPS provider identities cannot request login")
+    func ambiguousVPSAuthEvidenceIsNotPresented() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let account = makeAccount(email: "remote-auth@example.com")
+        manager.accounts = [account]
+        manager.linuxDevboxStatus = readyStatus(
+            activeEmail: nil,
+            providerAccountId: nil
+        )
+        let state = remoteRuntimeState(
+            for: account,
+            reason: "token_expired",
+            until: now.addingTimeInterval(3_600)
+        )
+        manager.applyLinuxDevboxAccountStates([state, state], observedAt: now)
+
+        #expect(manager.vpsReauthenticationNotice(for: account, now: now) == nil)
+    }
+
     private func makeAccount(email: String, active: Bool = false) -> CodexAccount {
         CodexAccount(
             email: email,
@@ -438,6 +525,27 @@ struct AccountHostOwnershipPresentationTests {
             subscriptionExpiresAt: nil,
             subscriptionWillRenew: nil,
             hasActiveSubscription: true
+        )
+    }
+
+    private func remoteRuntimeState(
+        for account: CodexAccount,
+        reason: String,
+        until: Date
+    ) -> LinuxDevboxAccountState {
+        LinuxDevboxAccountState(
+            email: account.email,
+            providerAccountId: account.accountId,
+            isActive: false,
+            quotaSnapshot: nil,
+            planType: nil,
+            lastRefreshed: nil,
+            subscriptionRenewsAt: nil,
+            subscriptionExpiresAt: nil,
+            subscriptionWillRenew: nil,
+            hasActiveSubscription: nil,
+            runtimeUnusableUntil: until,
+            runtimeUnusableReason: reason
         )
     }
 
