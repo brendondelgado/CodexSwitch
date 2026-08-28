@@ -1,0 +1,27 @@
+docs/linux-cli-only.md
+  s_70c8e194852bb5::t_3dc1f85fa70eda 108-115
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_655d9a9821b1e2 4502-4504
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_655d9a9821b1e2 5723,5730-5738
+  s_70c8e194852bb5::t_e686543782e405 3097
+  s_70c8e194852bb5::t_ca0d41e129b103 5739-5740
+crates/codexswitch-cli/src/codex_update/source_app_server_template.rs
+  s_70c8e194852bb5::t_655d9a9821b1e2 450
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f0cc71a64df74c93ddb95ca85ea34034f5035f25",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
