@@ -1485,7 +1485,9 @@ actor boundary on every supported Swift 6 toolchain.
   that account's Mac presentation as `Needs login`; this projection does not
   mutate the Mac account's durable runtime blocker. Stale, disconnected,
   malformed, missing-identity, or duplicate-identity VPS evidence cannot assert
-  a Mac reauthentication state.
+  a Mac reauthentication state. Runtime-blocker validity is evaluated
+  independently from unrelated quota, subscription, and reset telemetry so an
+  auth failure cannot be hidden by stale data in another field.
 - Authority observations carry a bounded non-secret stable provider account
   identifier, epoch, phase, and per-host convergence summaries. The provider
   identifier must match exactly one local record and agree with any host

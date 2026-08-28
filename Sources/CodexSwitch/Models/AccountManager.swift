@@ -241,11 +241,7 @@ final class AccountManager {
         }
         guard matchingStates.count == 1,
               let state = matchingStates.first,
-              Self.isValidAuthoritativeTelemetry(
-                  state,
-                  observedAt: observedAt,
-                  now: now
-              ),
+              Self.hasValidRemoteRuntimeBlockState(state, now: now),
               CodexAccount.requiresReauthentication(
                   runtimeUnusableUntil: state.runtimeUnusableUntil,
                   runtimeUnusableReason: state.runtimeUnusableReason,
@@ -693,24 +689,28 @@ final class AccountManager {
             }
         }
 
+        return hasValidRemoteRuntimeBlockState(state, now: now)
+    }
+
+    private static func hasValidRemoteRuntimeBlockState(
+        _ state: LinuxDevboxAccountState,
+        now: Date
+    ) -> Bool {
         switch (state.runtimeUnusableUntil, state.runtimeUnusableReason) {
         case (nil, nil):
-            break
+            return true
         case let (until?, reason?):
             let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard until > now,
-                  until.timeIntervalSinceReferenceDate.isFinite,
-                  !normalizedReason.isEmpty,
-                  normalizedReason.lengthOfBytes(using: .utf8) <= 256,
-                  normalizedReason.unicodeScalars.allSatisfy({
-                      $0.value >= 32 && $0.value != 127
-                  }) else {
-                return false
-            }
+            return until > now
+                && until.timeIntervalSinceReferenceDate.isFinite
+                && !normalizedReason.isEmpty
+                && normalizedReason.lengthOfBytes(using: .utf8) <= 256
+                && normalizedReason.unicodeScalars.allSatisfy({
+                    $0.value >= 32 && $0.value != 127
+                })
         default:
             return false
         }
-        return true
     }
 
     private static func hasSubscriptionTelemetry(_ state: LinuxDevboxAccountState) -> Bool {

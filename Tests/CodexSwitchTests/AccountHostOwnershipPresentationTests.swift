@@ -405,7 +405,16 @@ struct AccountHostOwnershipPresentationTests {
             [remoteRuntimeState(
                 for: account,
                 reason: "token_expired",
-                until: now.addingTimeInterval(3_600)
+                until: now.addingTimeInterval(3_600),
+                quotaSnapshot: QuotaSnapshot(
+                    fiveHour: nil,
+                    weekly: QuotaWindow(
+                        usedPercent: 50,
+                        windowDurationMins: 10_080,
+                        resetsAt: now.addingTimeInterval(86_400)
+                    ),
+                    fetchedAt: now.addingTimeInterval(-86_400)
+                )
             )],
             observedAt: now
         )
@@ -531,13 +540,14 @@ struct AccountHostOwnershipPresentationTests {
     private func remoteRuntimeState(
         for account: CodexAccount,
         reason: String,
-        until: Date
+        until: Date,
+        quotaSnapshot: QuotaSnapshot? = nil
     ) -> LinuxDevboxAccountState {
         LinuxDevboxAccountState(
             email: account.email,
             providerAccountId: account.accountId,
             isActive: false,
-            quotaSnapshot: nil,
+            quotaSnapshot: quotaSnapshot,
             planType: nil,
             lastRefreshed: nil,
             subscriptionRenewsAt: nil,

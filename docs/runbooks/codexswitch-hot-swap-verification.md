@@ -1201,6 +1201,8 @@ make reauthentication its primary action only when the remote provider identity
 matches exactly one local account. This presentation must not copy host-local
 runtime-blocker state into the Mac credential store, and stale, disconnected,
 malformed, or ambiguous remote evidence must not assert a blocker.
+Runtime-blocker validation is independent of quota, subscription, and reset
+telemetry validity; stale unrelated fields must not hide fresh auth evidence.
 
 The control must remain available while a same-target `CommittedDegraded`
 barrier is visible. A successful press must produce activation journal evidence;
