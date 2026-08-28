@@ -556,7 +556,7 @@ pub(crate) fn discover_live_prepared_runtime_executables(
         }
     };
     let output = bounded_command::output(
-        Command::new("/bin/ps").args(["-axo", "pid=,uid=,lstart=,command=", "-ww"]),
+        Command::new("/bin/ps").args(prepared_runtime_retention_ps_args()),
         PS_COMMAND_TIMEOUT,
         bounded_command::SMALL_OUTPUT_LIMIT,
     )
@@ -620,6 +620,11 @@ pub(crate) fn discover_live_prepared_runtime_executables(
         identities.push(identity);
     }
     Ok(identities)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn prepared_runtime_retention_ps_args() -> [&'static str; 3] {
+    ["-axo", "pid=,uid=,lstart=,comm=", "-ww"]
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -6086,6 +6091,14 @@ mod tests {
         assert_eq!(owned.len(), 1);
         assert!(prepared_runtime_process_candidate(&owned[0].executable));
         assert!(parse_ps_processes(ps_output, true, 501, 1).is_empty());
+    }
+
+    #[test]
+    fn prepared_runtime_retention_never_captures_full_process_arguments() {
+        assert_eq!(
+            prepared_runtime_retention_ps_args(),
+            ["-axo", "pid=,uid=,lstart=,comm=", "-ww"]
+        );
     }
 
     #[test]

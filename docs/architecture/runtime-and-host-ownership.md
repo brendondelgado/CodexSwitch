@@ -753,6 +753,11 @@ must not persist or publish `ManualReview`. Any genuine automatic preparation
 failure may enter `ManualReview` only while the same policy authority and typed
 mutation lease are still current inside the coordinator's persistence lock.
 
+Prepared-runtime retention inventories executable paths, not complete process
+command lines. The bounded process scan must therefore use the platform's
+executable-name column so unrelated long agent arguments cannot exhaust the
+capture budget and block a verified runtime activation.
+
 Proof captured before an `await` cannot authorize a later mutation. After every
 preparatory suspension point, and again immediately before the first credential
 mutation, swap, active-token refresh, active reauthentication, and plan-upgrade
