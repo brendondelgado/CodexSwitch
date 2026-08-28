@@ -38,8 +38,51 @@ enum ExternalAuthConflictRecoveryPolicy {
         matchingProviderAccountCount: Int,
         now: Date
     ) -> CodexAccount? {
+        newerGenerationTarget(
+            state: state,
+            recoverableDetails: [.configuredFilesInconsistent],
+            configuredAccountId: configuredAccountId,
+            storedTarget: storedTarget,
+            observedTarget: observedTarget,
+            matchingProviderAccountCount: matchingProviderAccountCount,
+            now: now
+        )
+    }
+
+    static func newerExplicitReauthenticationTarget(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        storedTarget: CodexAccount,
+        observedTarget: CodexAccount,
+        matchingProviderAccountCount: Int,
+        now: Date
+    ) -> CodexAccount? {
+        newerGenerationTarget(
+            state: state,
+            recoverableDetails: [
+                .configuredFilesInconsistent,
+                .externalAuthConflict,
+            ],
+            configuredAccountId: configuredAccountId,
+            storedTarget: storedTarget,
+            observedTarget: observedTarget,
+            matchingProviderAccountCount: matchingProviderAccountCount,
+            now: now
+        )
+    }
+
+    private static func newerGenerationTarget(
+        state: AccountActivationState?,
+        recoverableDetails: [AccountActivationDetail],
+        configuredAccountId: UUID?,
+        storedTarget: CodexAccount,
+        observedTarget: CodexAccount,
+        matchingProviderAccountCount: Int,
+        now: Date
+    ) -> CodexAccount? {
         guard state?.phase == .manualReview,
-              state?.detail == .configuredFilesInconsistent,
+              let detail = state?.detail,
+              recoverableDetails.contains(detail),
               let targetAccountId = state?.configuredAccountId,
               targetAccountId == configuredAccountId,
               targetAccountId == storedTarget.id,

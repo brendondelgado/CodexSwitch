@@ -69,7 +69,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-08-27
+  last_updated: 2026-08-28
 ---
 
 # Runtime And Host Ownership
@@ -767,6 +767,16 @@ Active reauthentication is identity preserving. It requires an exact match of
 the stable provider account identifier; email equality is presentation metadata
 and never permits replacement of the configured credentials by a different
 provider account.
+
+An explicit active reauthentication may supersede a same-target
+`configured_files_inconsistent` or `external_auth_conflict` review only when the
+review names the currently configured local account, exactly one stored account
+has the stable provider identity, the returned credential set is complete, and
+its usable inference-token expiration is strictly later than the stored
+generation. The coordinator enters a fresh preparing generation under the same
+mutation lease and still requires durable store/auth readback plus current
+runtime acknowledgement. A same-expiry, partial, near-expiry, ambiguous, or
+differently identified login leaves the review unchanged.
 
 Every coordinator launch invalidates in-memory runtime permits. A persisted
 `Confirmed` record remains historical durable evidence; startup performs

@@ -8915,11 +8915,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
                 let reauthenticatesActiveAccount = accountManager.configuredAccount?.id == accountId
                 if reauthenticatesActiveAccount {
+                    let verifiedSameAccountGenerationRecovery =
+                        ExternalAuthConflictRecoveryPolicy
+                            .newerExplicitReauthenticationTarget(
+                                state: accountManager.activationState,
+                                configuredAccountId: original.id,
+                                storedTarget: original,
+                                observedTarget: candidate,
+                                matchingProviderAccountCount: accountManager.accounts.filter {
+                                    $0.normalizedProviderAccountId
+                                        == candidate.normalizedProviderAccountId
+                                }.count,
+                                now: Date()
+                            ) != nil
                     let committed = await withPreparedActiveCredentialMutation(
                         targetAccountId: candidate.id,
                         expectedConfiguredAccountId: original.id,
                         source: "reauthentication",
-                        requestKind: .manual
+                        requestKind: .manual,
+                        verifiedSameAccountGenerationRecovery:
+                            verifiedSameAccountGenerationRecovery
                     ) { [weak self] prepared in
                         guard let self else { return false }
                         return await self.commitConfiguredCredentialMutation(

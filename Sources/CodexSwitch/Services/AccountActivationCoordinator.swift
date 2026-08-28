@@ -201,11 +201,12 @@ actor AccountActivationCoordinator {
                 let current = try Self.decode(snapshot.bytes)
                 guard let current,
                       current.phase == .manualReview,
-                      current.detail == .configuredFilesInconsistent,
+                      current.detail == .configuredFilesInconsistent
+                        || current.detail == .externalAuthConflict,
                       current.configuredAccountId == targetAccountId else {
                     return .blocked(
                         current,
-                        "same-account generation recovery requires the matching configured-files review"
+                        "same-account generation recovery requires a matching recoverable review"
                     )
                 }
                 guard authorizeEffect(current) else {

@@ -104,6 +104,28 @@ struct ExternalAuthConflictRecoveryTests {
         #expect(accepted?.accessToken == observed.accessToken)
         #expect(accepted?.refreshToken == observed.refreshToken)
 
+        let externalAuthConflict = AccountActivationState.manualReview(
+            targetAccountId: targetAccountId,
+            detail: .externalAuthConflict,
+            at: now
+        )
+        #expect(ExternalAuthConflictRecoveryPolicy.newerExplicitReauthenticationTarget(
+            state: externalAuthConflict,
+            configuredAccountId: targetAccountId,
+            storedTarget: stored,
+            observedTarget: observed,
+            matchingProviderAccountCount: 1,
+            now: now
+        )?.accessToken == observed.accessToken)
+        #expect(ExternalAuthConflictRecoveryPolicy.newerSameAccountGenerationTarget(
+            state: externalAuthConflict,
+            configuredAccountId: targetAccountId,
+            storedTarget: stored,
+            observedTarget: observed,
+            matchingProviderAccountCount: 1,
+            now: now
+        ) == nil)
+
         observed.accessToken = stored.accessToken
         #expect(ExternalAuthConflictRecoveryPolicy.newerSameAccountGenerationTarget(
             state: review,
@@ -373,6 +395,36 @@ struct ExternalAuthConflictRecoveryTests {
             return
         }
         #expect(unchanged == preparing)
+    }
+
+    @Test("Coordinator permits a verified reauthentication generation over the same-target conflict")
+    func coordinatorPreparesSameAccountExternalAuthConflictRecovery() async throws {
+        let url = makeSecureTestFileURL(
+            prefix: "codexswitch-same-account-reauth-recovery",
+            fileName: "account-activation.json"
+        )
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let coordinator = AccountActivationCoordinator(url: url)
+        let review = try await coordinator.markManualReview(
+            targetAccountId: targetAccountId,
+            detail: .externalAuthConflict,
+            at: now
+        )
+        let generation = UUID()
+
+        let decision = try await coordinator.beginVerifiedSameAccountGenerationRecovery(
+            targetAccountId: targetAccountId,
+            requestedActivationGeneration: generation,
+            authorizeEffect: { $0 == review },
+            at: now.addingTimeInterval(1)
+        )
+        guard case .prepared(let preparing, let previousState) = decision else {
+            Issue.record("Expected verified reauthentication recovery to prepare")
+            return
+        }
+        #expect(previousState == review)
+        #expect(preparing.configuredAccountId == targetAccountId)
+        #expect(preparing.activationGeneration == generation)
     }
 
     @Test("Authority target journal recovers a durable source and target auth split")
