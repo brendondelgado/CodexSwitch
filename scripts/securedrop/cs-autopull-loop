@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -u
+
+WORKER="${CODEXSWITCH_SECUREDROP_AUTOPULL_WORKER:-$HOME/.local/bin/cs-autopull}"
+INTERVAL="${CODEXSWITCH_SECUREDROP_AUTOPULL_INTERVAL_SECONDS:-15}"
+
+case "$INTERVAL" in
+  ""|*[!0-9]*)
+    printf 'error: autopull interval must be a positive integer\n' >&2
+    exit 2
+    ;;
+esac
+if [ "$INTERVAL" -lt 1 ]; then
+  printf 'error: autopull interval must be a positive integer\n' >&2
+  exit 2
+fi
+if [ ! -x "$WORKER" ]; then
+  printf 'error: autopull worker is unavailable\n' >&2
+  exit 2
+fi
+
+stop=0
+trap 'stop=1' INT TERM HUP
+
+while [ "$stop" -eq 0 ]; do
+  "$WORKER" || true
+  [ "$stop" -eq 0 ] || break
+  sleep "$INTERVAL" &
+  sleeper=$!
+  wait "$sleeper" 2>/dev/null || true
+done

@@ -17,6 +17,8 @@ cross_dependencies:
   - ../../scripts/securedrop/cs-autopush-loop
   - ../../scripts/securedrop/install-macos-autopush
   - ../../scripts/securedrop/cs-autopull
+  - ../../scripts/securedrop/cs-autopull-loop
+  - ../../scripts/securedrop/install-macos-autopull
   - ../../scripts/securedrop/cs-send-dir
   - ../../scripts/securedrop/cs-extract
   - ../../scripts/securedrop/knowledge-sync
@@ -130,12 +132,16 @@ whose path, type, owner, age, and naming contract prove CodexSwitch ownership.
   is limited to transaction-owned temporary paths.
 - No transfer action restarts Codex, ChatGPT, CodexSwitch, or a VPS service.
 
-The macOS autopush agent launches one long-lived, low-cost loop that owns the
-15-second cadence. launchd interval, outbox-change, and persistent demand
-sources remain defense in depth, but correctness does not depend on launchd
-rescheduling a successful short-lived job. The transfer worker is quiet when
-no eligible files exist. An eligible file that cannot be published is retried
-by the next loop iteration until the verified transfer succeeds. Installing or
-repairing autopush atomically updates the loop, worker, and launch agent,
-validates the plist, re-bootstraps only the autopush label, and leaves
-application and VPS processes untouched.
+The macOS autopush and autopull agents each launch one long-lived, low-cost loop
+that owns the 15-second cadence. launchd interval, local outbox-change, and
+persistent demand sources remain defense in depth where applicable, but
+correctness does not depend on launchd repeatedly rescheduling successful
+short-lived jobs. A transient disk-full, SSH, or transport failure returns to
+the loop and is retried on the next iteration after the underlying condition
+clears. The transfer workers are quiet when no eligible files exist.
+
+Installing or repairing either direction atomically updates its loop, worker,
+and launch agent, validates the plist, re-bootstraps only that SecureDrop label,
+and leaves application and VPS processes untouched. The autopull installer
+uses `KeepAlive` so launchd restores the loop if it exits unexpectedly; the
+worker's own lock still prevents overlapping transfer transactions.
