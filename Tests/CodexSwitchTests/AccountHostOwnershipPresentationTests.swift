@@ -407,13 +407,21 @@ struct AccountHostOwnershipPresentationTests {
                 reason: "token_expired",
                 until: now.addingTimeInterval(3_600),
                 quotaSnapshot: QuotaSnapshot(
-                    fiveHour: nil,
-                    weekly: QuotaWindow(
-                        usedPercent: 50,
-                        windowDurationMins: 10_080,
-                        resetsAt: now.addingTimeInterval(86_400)
-                    ),
-                    fetchedAt: now.addingTimeInterval(-86_400)
+                    allowed: true,
+                    limitReached: false,
+                    fetchedAt: now.addingTimeInterval(-86_400),
+                    windows: [
+                        QuotaWindow(
+                            kind: .weekly,
+                            durationSeconds: 604_800,
+                            usedPercent: 50,
+                            resetsAt: now.addingTimeInterval(86_400),
+                            source: QuotaWindowSourceMetadata(
+                                rateLimit: .main,
+                                slot: .primary
+                            )
+                        ),
+                    ]
                 )
             )],
             observedAt: now
