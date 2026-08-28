@@ -1,0 +1,35 @@
+Sources/CodexSwitch/Models/AccountManager.swift
+  s_70c8e194852bb5::t_03a1175b15245d 220-258
+Sources/CodexSwitch/Views/PopoverContentView.swift
+  s_70c8e194852bb5::t_03a1175b15245d 275-278
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_a8b920f2e53976 1482-1488,1520-1524
+Sources/CodexSwitch/Views/AccountCardView.swift
+  s_70c8e194852bb5::t_03a1175b15245d 313-316,596
+Tests/CodexSwitchTests/AccountHostOwnershipPresentationTests.swift
+  s_70c8e194852bb5::t_bea814af2d727a 394-480,531-550
+  s_70c8e194852bb5::t_e93e00b293a084 551
+Tests/CodexSwitchTests/AccountCardViewTests.swift
+  s_70c8e194852bb5::t_bea814af2d727a 116-149
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_a8b920f2e53976 1197-1204,1234-1238
+  s_70c8e194852bb5::t_8c194b387d31d0 1239
+Sources/CodexSwitch/Models/CodexAccount.swift
+  s_70c8e194852bb5::t_03a1175b15245d 163-176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fe82769dc1d224ca24de78f9600fecb38ca81ba3",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
