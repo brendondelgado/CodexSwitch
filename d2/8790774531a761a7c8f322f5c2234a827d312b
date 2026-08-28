@@ -1,0 +1,26 @@
+scripts/securedrop/install-macos-autopull
+  s_70c8e194852bb5::t_0cac662ecbfc3d 1-82
+scripts/test_securedrop_scripts.py
+  s_70c8e194852bb5::t_0cac662ecbfc3d 15,18,164-184
+  s_70c8e194852bb5::t_82509bd91b06eb 185
+scripts/securedrop/cs-autopull-loop
+  s_70c8e194852bb5::t_0cac662ecbfc3d 1-31
+docs/architecture/secure-drop-transport.md
+  s_70c8e194852bb5::t_35e5bcaa5ae0ce 20-21,135-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "d28790774531a761a7c8f322f5c2234a827d312b",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
