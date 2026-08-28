@@ -609,7 +609,7 @@ pub(crate) fn discover_live_prepared_runtime_executables(
         })?;
         match current_macos_owned_process_identity(process.pid)? {
             None => continue,
-            Some(current) if process_identity_matches(&process, &current) => {}
+            Some(current) if retention_process_identity_matches(&process, &current) => {}
             Some(_) => {
                 bail!(
                     "live prepared runtime pid {} changed identity during retention inventory",
@@ -1025,6 +1025,15 @@ fn process_identity_matches(expected: &CodexProcess, observed: &CodexProcess) ->
         && expected.started_at_unix == observed.started_at_unix
         && expected.executable == observed.executable
         && expected.command_line == observed.command_line
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn retention_process_identity_matches(expected: &CodexProcess, observed: &CodexProcess) -> bool {
+    expected.pid == observed.pid
+        && expected.owner_uid == observed.owner_uid
+        && expected.start_identity == observed.start_identity
+        && expected.started_at_unix == observed.started_at_unix
+        && expected.executable == observed.executable
 }
 
 pub(crate) fn process_identity_is_current(expected: &CodexProcess) -> bool {
@@ -6099,6 +6108,30 @@ mod tests {
             prepared_runtime_retention_ps_args(),
             ["-axo", "pid=,uid=,lstart=,comm=", "-ww"]
         );
+    }
+
+    #[test]
+    fn prepared_runtime_retention_binds_kernel_identity_without_arguments() {
+        let expected = CodexProcess {
+            pid: 42,
+            owner_uid: 501,
+            start_identity: "macos:1:000002".to_string(),
+            started_at_unix: 1,
+            command_line: "/prepared/codex".to_string(),
+            executable: PathBuf::from("/prepared/codex"),
+        };
+        let observed = CodexProcess {
+            command_line: "/prepared/codex --resume thread-id".to_string(),
+            ..expected.clone()
+        };
+        assert!(retention_process_identity_matches(&expected, &observed));
+
+        let reused = CodexProcess {
+            start_identity: "macos:3:000004".to_string(),
+            started_at_unix: 3,
+            ..observed
+        };
+        assert!(!retention_process_identity_matches(&expected, &reused));
     }
 
     #[test]

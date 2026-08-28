@@ -756,7 +756,11 @@ mutation lease are still current inside the coordinator's persistence lock.
 Prepared-runtime retention inventories executable paths, not complete process
 command lines. The bounded process scan must therefore use the platform's
 executable-name column so unrelated long agent arguments cannot exhaust the
-capture budget and block a verified runtime activation.
+capture budget and block a verified runtime activation. Its second identity
+check binds the candidate by PID, owner, kernel start identity, start time, and
+executable. It deliberately ignores argument text because the first bounded
+inventory never captures it; a command-line mismatch alone is not process
+replacement evidence.
 
 Proof captured before an `await` cannot authorize a later mutation. After every
 preparatory suspension point, and again immediately before the first credential
