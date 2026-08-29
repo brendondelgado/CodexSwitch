@@ -1816,24 +1816,11 @@ where
     with_account_store_unlocked(store_lock, expected_store_generation, || {
         revalidate_exact_reset_attempt(journal_path, &expected_attempt, now)
     })??;
-    let next_failure_count = expected_attempt
-        .reconciliation_failure_count
-        .saturating_add(1);
-    let expected_attempt =
-        with_account_store_unlocked(store_lock, expected_store_generation, || {
-            update_exact_reset_attempt(
-                journal_path,
-                &expected_attempt,
-                now,
-                |journal, attempt_index| {
-                    let attempt = &mut journal.attempts[attempt_index];
-                    attempt.reconciliation_failure_count = next_failure_count;
-                    attempt.last_reconciliation_attempt_at = Some(now);
-                    attempt.reconciliation_retry_not_before =
-                        Some(now + reset_reconciliation_backoff(next_failure_count));
-                },
-            )
-        })??;
+    let prior_detail = expected_attempt
+        .last_reconciliation_attempt_at
+        .is_none()
+        .then(|| expected_attempt.last_error.clone())
+        .flatten();
     validate_reset_provider_io(store_lock, expected_store_generation, validate_provider_io)
         .context("reset activation guard changed before quota reconciliation")?;
     let mut refreshed_account = account.clone();
@@ -1860,6 +1847,7 @@ where
         && owner_still_matches;
     let quota_usable = quota_reconciled
         && quota_availability_at(account, quota_checked_at) == QuotaAvailability::Usable;
+    let quota_provider_failed = quota_result.is_err();
     let quota_error = match quota_result {
         Err(error) => Some(format!("quota reconciliation failed: {error:#}")),
         Ok(()) if !owner_still_matches => Some(
@@ -1878,6 +1866,7 @@ where
     };
 
     let mut updated_attempt = expected_attempt.clone();
+    updated_attempt.last_reconciliation_attempt_at = Some(now);
     if inventory_fresh {
         updated_attempt.last_inventory_generation = Some(inventory_generation(&bank));
         updated_attempt.last_inventory_count = Some(bank.available_count);
@@ -1905,11 +1894,19 @@ where
     } else {
         ResetAttemptState::Uncertain
     };
-    updated_attempt.last_error = join_details([inventory_error.clone(), quota_error.clone()]);
-    if updated_attempt.state == ResetAttemptState::ReconciledUsable {
+    let provider_failed = inventory_error.is_some() || quota_provider_failed;
+    if provider_failed {
+        updated_attempt.reconciliation_failure_count = updated_attempt
+            .reconciliation_failure_count
+            .saturating_add(1);
+        updated_attempt.reconciliation_retry_not_before =
+            Some(now + reset_reconciliation_backoff(updated_attempt.reconciliation_failure_count));
+    } else {
         updated_attempt.reconciliation_failure_count = 0;
         updated_attempt.reconciliation_retry_not_before = None;
     }
+    updated_attempt.last_error =
+        join_details([prior_detail, inventory_error.clone(), quota_error.clone()]);
     let state = if updated_attempt.state == ResetAttemptState::ReconciledUsable {
         ResetFlowState::ReconciledUsable
     } else {
@@ -6262,6 +6259,94 @@ mod tests {
             reset_reconciliation_backoff(u32::MAX),
             ChronoDuration::minutes(60)
         );
+    }
+
+    #[test]
+    fn provider_failure_backoff_defers_only_provider_io() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store_path = temp.path().join("accounts.json");
+        let store_lock = lock_account_store(&store_path)?;
+        let now = fixed_policy_now();
+        let initial_bank = bank(now, &[ChronoDuration::days(10)]);
+        let mut account = account("active@example.com", true, 100.0, 100.0);
+        make_quota_precede_attempt(&mut account, now);
+        let provider_calls = Arc::new(Mutex::new(0usize));
+
+        let fetch_calls = Arc::clone(&provider_calls);
+        let quota_calls = Arc::clone(&provider_calls);
+        let first = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: None,
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now,
+            },
+            ResetReconciliationDependencies::new(
+                move |_account| {
+                    *fetch_calls.lock().unwrap() += 1;
+                    bail!("inventory unavailable")
+                },
+                move |_account| {
+                    *quota_calls.lock().unwrap() += 1;
+                    bail!("quota unavailable")
+                },
+                |_account, _bank, _request_id| bail!("submission outcome unknown"),
+            ),
+        )?;
+        assert_eq!(first.state, ResetFlowState::Suppressed);
+        assert_eq!(*provider_calls.lock().unwrap(), 2);
+
+        let deferred = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: Some(&initial_bank),
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now: now + ChronoDuration::minutes(1),
+            },
+            ResetReconciliationDependencies::new(
+                |_account| bail!("deferred retry must not fetch inventory"),
+                |_account| bail!("deferred retry must not refresh quota"),
+                |_account, _bank, _request_id| bail!("deferred retry must not submit"),
+            ),
+        )?;
+        assert_eq!(deferred.state, ResetFlowState::Suppressed);
+        assert_eq!(*provider_calls.lock().unwrap(), 2);
+
+        let retry_fetch_calls = Arc::clone(&provider_calls);
+        let retry_quota_calls = Arc::clone(&provider_calls);
+        let retry_bank = initial_bank.clone();
+        let retried = reconcile_or_attempt_reset(
+            ResetReconciliationContext {
+                store_lock: &store_lock,
+                account: &mut account,
+                previous_bank: Some(&initial_bank),
+                observed_bank: initial_bank.clone(),
+                attempt_reset: true,
+                now: now + ChronoDuration::minutes(5),
+            },
+            ResetReconciliationDependencies::new(
+                move |_account| {
+                    *retry_fetch_calls.lock().unwrap() += 1;
+                    Ok(retry_bank.clone())
+                },
+                move |_account| {
+                    *retry_quota_calls.lock().unwrap() += 1;
+                    Ok(())
+                },
+                |_account, _bank, _request_id| bail!("retry must not submit again"),
+            ),
+        )?;
+        assert_eq!(retried.state, ResetFlowState::Suppressed);
+        assert_eq!(*provider_calls.lock().unwrap(), 3);
+        let journal = load_reset_attempt_journal(&reset_attempt_journal_path(&store_path))?;
+        let attempt = journal.attempts.last().unwrap();
+        assert_eq!(attempt.reconciliation_failure_count, 0);
+        assert!(attempt.reconciliation_retry_not_before.is_none());
+        Ok(())
     }
 
     #[test]
