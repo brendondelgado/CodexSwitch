@@ -58,7 +58,7 @@ const INACTIVE_MISSING_QUOTA_POLL_SECONDS: u64 = 30;
 const DEGRADED_ACTIVATION_RETRY_SECONDS: u64 = 60;
 const DEGRADED_ACTIVATION_INACTIVE_QUOTA_POLL_LIMIT: usize = 4;
 const UNIX_TO_SWIFT_REFERENCE_SECONDS: f64 = 978_307_200.0;
-const MANAGED_READINESS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const MANAGED_READINESS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(4 * 60);
 const MANAGED_READINESS_MINIMUM_ACK_REMAINING: Duration = Duration::from_secs(60);
 const RESET_BANK_RATE_LIMIT_BACKOFF: ChronoDuration = ChronoDuration::minutes(15);
 const RESET_BANK_UNSUPPORTED_BACKOFF: ChronoDuration = ChronoDuration::hours(1);
@@ -1847,7 +1847,7 @@ mod tests {
         CodexAccount, QuotaSnapshot, QuotaWindow, QuotaWindowKind, QuotaWindowRateLimitSource,
         QuotaWindowSlot, QuotaWindowSourceMetadata,
     };
-    use crate::reload::HotSwapKernelExecutableIdentity;
+    use crate::reload::{HotSwapKernelExecutableIdentity, HOT_SWAP_ACK_FRESHNESS};
     use anyhow::bail;
     use serde_json::json;
     use std::fs::OpenOptions;
@@ -1984,11 +1984,11 @@ mod tests {
 
         assert_eq!(tick(start)?, ManagedReadinessTick::NoManagedRuntime);
         assert_eq!(
-            tick(start + Duration::from_secs(59))?,
+            tick(start + Duration::from_secs(239))?,
             ManagedReadinessTick::NotDue
         );
         assert_eq!(
-            tick(start + Duration::from_secs(60))?,
+            tick(start + Duration::from_secs(240))?,
             ManagedReadinessTick::NoManagedRuntime
         );
         assert_eq!(observations.get(), 2);
@@ -2003,7 +2003,7 @@ mod tests {
         let mut cadence = ManagedReadinessCadence::default();
         let maintenance_calls = std::cell::Cell::new(0);
 
-        for offset in [0, 5, 10, 59] {
+        for offset in [0, 5, 60, 239] {
             let result = maintain_managed_readiness_with(
                 &mut cadence,
                 start + Duration::from_secs(offset),
@@ -2027,6 +2027,14 @@ mod tests {
 
         assert_eq!(maintenance_calls.get(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn managed_readiness_cadence_preserves_ack_safety_margin() {
+        assert!(
+            MANAGED_READINESS_MAINTENANCE_INTERVAL + MANAGED_READINESS_MINIMUM_ACK_REMAINING
+                <= HOT_SWAP_ACK_FRESHNESS
+        );
     }
 
     #[test]
@@ -2066,6 +2074,7 @@ mod tests {
     #[test]
     fn managed_readiness_lease_contention_defers_without_reload_and_recovers() -> Result<()> {
         let temp = TempDir::new()?;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))?;
         let store_path = temp.path().join("accounts.json");
         let start = Instant::now();
         let identity = managed_readiness_identity(42, "linux:lease-recovery");

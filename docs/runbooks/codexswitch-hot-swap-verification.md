@@ -710,7 +710,9 @@ owned by `signul-codex-app-server.service`. This maintenance is not generic
 process repair and never targets an external app-server or an interactive CLI.
 
 After every primary daemon attempt, readiness maintenance runs independently of
-quota/API/network success and at most once per 60 seconds. The cadence advances
+quota/API/network success and at most once per four minutes. The four-minute
+cadence leaves a one-minute safety margin inside the five-minute ACK freshness
+window. The cadence advances
 when the check finds no work, rejects an ineligible runtime, or completes a
 renewal attempt. A fast or failing quota-poll loop therefore cannot become a
 signal loop or allow a healthy local ACK to expire.
@@ -721,7 +723,7 @@ Before observing the managed runtime, maintenance must acquire the same
 nonblocking `accounts.runtime-activation.lock` lease used by rotations and hold
 it through reload and ACK verification. Contention defers that maintenance
 attempt without observing the process, touching request/ACK files, or sending
-`SIGHUP`; the 60-second cadence still advances so contention cannot create a
+`SIGHUP`; the four-minute cadence still advances so contention cannot create a
 busy loop or suppress a later retry.
 
 Before writing a request or sending `SIGHUP`, it must prove all of the following
