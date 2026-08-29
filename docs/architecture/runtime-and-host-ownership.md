@@ -1298,6 +1298,19 @@ still-valid acknowledgement and writes a new request or sends SIGHUP only to
 the exact verified runtimes still missing evidence. The retry never kills,
 restarts, or broadly signals a session, and an identity change remains degraded
 until fresh discovery can converge that new exact runtime.
+
+Managed readiness maintenance uses one acknowledgement-lifetime threshold from
+its due decision through reload planning. When an acknowledgement has less than
+the configured safety window remaining, the reload path must not reuse it under
+a weaker general-purpose threshold and report a renewal without advancing the
+persisted request/ACK generation. A successful managed renewal means that the
+same process, auth binding, and newly current on-disk acknowledgement all pass
+the maintenance safety window after the reload completes.
+
+An authority reconciliation that proves credentials are already converged is a
+read-only result. It must not bypass the normal readiness cadence or launch an
+extra full `doctor` probe. A committed credential mutation may request one
+immediate readiness check so the new generation is verified promptly.
 After that process exits, the next due convergence attempt observes the changed
 topology and may converge without relaunching CodexSwitch. There is no separate
 retry-exhaustion topology watcher or second recovery clock. Every attempt still

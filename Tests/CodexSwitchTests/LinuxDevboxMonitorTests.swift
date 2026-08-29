@@ -134,6 +134,16 @@ struct LinuxDevboxMonitorTests {
         #expect(!command.contains("auth-diagnostics"))
     }
 
+    @Test("no-op credential convergence preserves the normal readiness cadence")
+    func noOpCredentialConvergencePreservesReadinessCadence() {
+        #expect(!AppDelegate.shouldForceLinuxDevboxReadinessAfterCredentialSync(
+            remoteMutationCommitted: false
+        ))
+        #expect(AppDelegate.shouldForceLinuxDevboxReadinessAfterCredentialSync(
+            remoteMutationCommitted: true
+        ))
+    }
+
     @Test("background readiness does not own the Mac active account")
     func backgroundReadinessKeepsMacAccountAuthority() {
         #expect(LinuxDevboxMonitor.remotePollingMode(hasActiveRemoteSession: false) == .statusOnly)

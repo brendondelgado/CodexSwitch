@@ -1384,7 +1384,7 @@ pub(crate) fn maintain_managed_headless_app_server_ack(
                 minimum_remaining,
             )
         },
-        |process| {
+        |process, reuse_minimum_remaining| {
             let guard_identity = expected.clone();
             let final_identity = expected.clone();
             reload_discovered_codex_processes(
@@ -1392,6 +1392,7 @@ pub(crate) fn maintain_managed_headless_app_server_ack(
                 auth_path,
                 None,
                 true,
+                reuse_minimum_remaining,
                 || {
                     let (observed, _) = observe_managed_headless_app_server(&guard_identity)?;
                     if observed != guard_identity {
@@ -1408,6 +1409,7 @@ pub(crate) fn maintain_managed_headless_app_server_ack(
                 },
             )
         },
+        minimum_remaining,
     )
 }
 
@@ -1416,11 +1418,12 @@ fn maintain_managed_headless_app_server_ack_with<Observe, Ack, Reload>(
     observe: Observe,
     has_current_ack: Ack,
     reload: Reload,
+    minimum_remaining: Duration,
 ) -> Result<ManagedHeadlessAckMaintenance>
 where
     Observe: FnOnce() -> Result<(ManagedHeadlessAppServerIdentity, CodexProcess)>,
     Ack: FnOnce(&CodexProcess) -> bool,
-    Reload: FnOnce(&CodexProcess) -> Result<ReloadSummary>,
+    Reload: FnOnce(&CodexProcess, Duration) -> Result<ReloadSummary>,
 {
     let (observed, process) = observe()?;
     if observed != *expected {
@@ -1429,7 +1432,7 @@ where
     if has_current_ack(&process) {
         return Ok(ManagedHeadlessAckMaintenance::Current);
     }
-    let summary = reload(&process)?;
+    let summary = reload(&process, minimum_remaining)?;
     if !summary.verified_hot_swap() {
         bail!(
             "managed systemd app-server readiness renewal was not acknowledged: {:?}",
@@ -1887,6 +1890,7 @@ fn reload_codex_processes_with_receipt(
         auth_path,
         receipt_nonce,
         include_app_server,
+        HOT_SWAP_ACK_REUSE_MINIMUM_REMAINING,
         || Ok(()),
         || discover_codex_restart_targets(include_app_server),
     )
@@ -1897,6 +1901,7 @@ fn reload_discovered_codex_processes<Guard, Discover>(
     auth_path: &Path,
     receipt_nonce: Option<Uuid>,
     include_app_server: bool,
+    reuse_minimum_remaining: Duration,
     before_signal: Guard,
     final_discover: Discover,
 ) -> Result<ReloadSummary>
@@ -1940,7 +1945,13 @@ where
             Ok(())
         },
         |process, auth_path, runtime_kind, receipt_nonce| {
-            reusable_hot_swap_request(process, auth_path, runtime_kind, receipt_nonce)
+            reusable_hot_swap_request_with_minimum_remaining(
+                process,
+                auth_path,
+                runtime_kind,
+                receipt_nonce,
+                reuse_minimum_remaining,
+            )
         },
         write_hot_swap_request_for_receipt,
         process_identity_is_current,
@@ -2964,6 +2975,22 @@ fn reusable_hot_swap_request(
     runtime_kind: HotSwapRuntimeKind,
     receipt_nonce: Option<Uuid>,
 ) -> Option<HotSwapRequest> {
+    reusable_hot_swap_request_with_minimum_remaining(
+        process,
+        auth_path,
+        runtime_kind,
+        receipt_nonce,
+        HOT_SWAP_ACK_REUSE_MINIMUM_REMAINING,
+    )
+}
+
+fn reusable_hot_swap_request_with_minimum_remaining(
+    process: &CodexProcess,
+    auth_path: &Path,
+    runtime_kind: HotSwapRuntimeKind,
+    receipt_nonce: Option<Uuid>,
+    minimum_remaining: Duration,
+) -> Option<HotSwapRequest> {
     if !process_identity_is_current(process) {
         return None;
     }
@@ -2986,7 +3013,7 @@ fn reusable_hot_swap_request(
         &request,
         runtime_kind,
         current_unix_timestamp_milliseconds(),
-        HOT_SWAP_ACK_REUSE_MINIMUM_REMAINING,
+        minimum_remaining,
     ) || !process_identity_is_current(process)
     {
         return None;
@@ -4799,7 +4826,8 @@ mod tests {
             &expected,
             || Ok((expected.clone(), restarted.clone())),
             |_| false,
-            |process| {
+            |process, minimum_remaining| {
+                assert_eq!(minimum_remaining, Duration::from_secs(60));
                 reload_calls.set(reload_calls.get() + 1);
                 Ok(ReloadSummary {
                     signaled: vec![process.pid],
@@ -4807,6 +4835,7 @@ mod tests {
                     ..ReloadSummary::default()
                 })
             },
+            Duration::from_secs(60),
         )?;
 
         assert_eq!(
@@ -4829,10 +4858,11 @@ mod tests {
             &expected,
             || Ok((observed, replacement)),
             |_| false,
-            |_| {
+            |_, _| {
                 reload_calls.set(reload_calls.get() + 1);
                 Ok(ReloadSummary::default())
             },
+            Duration::from_secs(60),
         )
         .unwrap_err();
 
@@ -4851,10 +4881,11 @@ mod tests {
                 &expected,
                 || Ok((expected.clone(), process.clone())),
                 |_| true,
-                |_| {
+                |_, _| {
                     reload_calls.set(reload_calls.get() + 1);
                     Ok(ReloadSummary::default())
                 },
+                Duration::from_secs(60),
             )?;
             assert_eq!(result, ManagedHeadlessAckMaintenance::Current);
         }

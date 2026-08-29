@@ -1336,6 +1336,20 @@ not ready until an explicit activation or rotation proves convergence. Do not
 signal it from a status probe or suppress that missing proof as a transient
 green state.
 
+The managed VPS daemon checks acknowledgement lifetime on a four-minute cadence
+with a one-minute safety window. The same one-minute window must govern reuse in
+the renewal path. If the due check rejects an ageing acknowledgement, the reload
+path must write and verify a newer request/ACK generation; reusing that same ACK
+under the ordinary shorter reuse threshold is a false renewal. Verify both the
+daemon journal and advancing `hotswap-request/<pid>.json` /
+`hotswap-ack/<pid>.json` modification times across consecutive maintenance
+cycles.
+
+The Mac may force a readiness check after a committed credential change. A
+token-free `credentials already converged` reconciliation is read-only and must
+leave the normal readiness interval intact; it must not turn the authority poll
+into an expensive full `doctor` poll.
+
 ## Verification Checklist
 
 Before claiming hot-swap is fixed or ready:
@@ -1345,6 +1359,11 @@ Before claiming hot-swap is fixed or ready:
   `stable`/`converging`/`degraded` phase.
 - [ ] Replaying the same target request ID returns the same epoch and target
   without a second account-store write, runtime reload, or notification.
+- [ ] Two consecutive managed-readiness renewals advance the persisted
+  request/ACK generation and remain ready between cycles; no renewal log is
+  emitted for a reused ageing acknowledgement.
+- [ ] A no-op credential reconciliation does not force an additional full
+  readiness probe.
 - [ ] Replaying a timed-out rotation operation ID returns the recorded target
   and banked-reset result without consuming another reset.
 - [ ] `~/.codexswitch/remote-authority.json` is owner-only, token-free, enabled
