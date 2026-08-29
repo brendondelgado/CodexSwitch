@@ -1,0 +1,32 @@
+crates/codexswitch-cli/src/rate_limit_resets.rs
+  s_70c8e194852bb5::t_f13677218c8f3a 30-31,516,527-530,573-578,1702-1704,1708-1728
+  s_70c8e194852bb5::t_e049d2fc4eb036 1785-1815,1819-1836,1908-1911
+  s_70c8e194852bb5::t_8b77c4a29e4aa3 6255-6267,6270-6271
+  s_70c8e194852bb5::t_a95553932e27a0 1729,1912,6268-6269
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_63d0c192e2f2c3 912-913,915,1378,1381,3318
+Tests/CodexSwitchTests/LinuxDevboxMonitorTests.swift
+  s_70c8e194852bb5::t_63d0c192e2f2c3 103-104,114,120-134
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_d7ee5c2bdc73f8 387-396
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_d7ee5c2bdc73f8 1289-1291,1294-1299
+crates/codexswitch-cli/src/readiness.rs
+  s_70c8e194852bb5::t_63d0c192e2f2c3 46,83,98,349,1138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "50e8fd1953d5cec3144064e66a44e5a8bef3b655",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
