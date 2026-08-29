@@ -1,0 +1,47 @@
+scripts/securedrop/cs-autopush
+  s_70c8e194852bb5::t_b14576425ab5e0 35-36,42-44,48-51,66,77,113,116,124,142,149,154-157,165-168
+  s_70c8e194852bb5::t_9ff39cc822f6ef 37,111,118,126,141
+  s_70c8e194852bb5::t_f29715c31f5b7f 102-105
+  s_70c8e194852bb5::t_1e1cfd2e6d56a6 160
+  s_70c8e194852bb5::t_488a665e37d68c 169
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_5f7db3768d15d9 9536-9539
+scripts/test_securedrop_scripts.py
+  s_70c8e194852bb5::t_9ff39cc822f6ef 168-169
+  s_70c8e194852bb5::t_b14576425ab5e0 15-16,161-167,172-180
+  s_70c8e194852bb5::t_e26dfaa873e84a 181
+  s_70c8e194852bb5::t_1e1cfd2e6d56a6 170-171
+  s_70c8e194852bb5::t_d86b20cbd9a7f6 182
+docs/architecture/secure-drop-transport.md
+  s_70c8e194852bb5::t_b14576425ab5e0 17,26,131-137
+  s_70c8e194852bb5::t_1e1cfd2e6d56a6 82-85
+  s_70c8e194852bb5::t_9ff39cc822f6ef 86
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_5f7db3768d15d9 1788-1805
+  s_70c8e194852bb5::t_67898d4924635d 20,72
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_b14576425ab5e0 917,2632
+  s_70c8e194852bb5::t_5f7db3768d15d9 916,3354,3364-3384,3579-3596,3685
+Tests/CodexSwitchTests/LinuxDevboxStatusTests.swift
+  s_70c8e194852bb5::t_5f7db3768d15d9 293-295,301-308
+  s_70c8e194852bb5::t_b14576425ab5e0 296-300
+scripts/securedrop/install-macos-autopush
+  s_70c8e194852bb5::t_e26dfaa873e84a 72-83
+  s_70c8e194852bb5::t_b14576425ab5e0 1-71,84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "3610cf696ca97dfbbf45c3ee98e8a4fb9ff9afe0",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

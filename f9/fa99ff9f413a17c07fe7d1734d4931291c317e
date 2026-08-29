@@ -1,0 +1,19 @@
+Tests/CodexSwitchTests/AccountHostOwnershipPresentationTests.swift
+  s_70c8e194852bb5::t_4f87a06aebe524 410-424
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f9fa99ff9f413a17c07fe7d1734d4931291c317e",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

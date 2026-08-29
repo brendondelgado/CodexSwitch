@@ -1,0 +1,30 @@
+scripts/securedrop/cs-autopush-loop
+  s_70c8e194852bb5::t_71ecfbba3ec2fb 1-31
+scripts/securedrop/cs-autopush
+  s_70c8e194852bb5::t_921ffa0d55eec2 82-84
+scripts/securedrop/install-macos-autopush
+  s_70c8e194852bb5::t_921ffa0d55eec2 55
+  s_70c8e194852bb5::t_71ecfbba3ec2fb 11,14,26,29,34,44,68,71
+docs/architecture/secure-drop-transport.md
+  s_70c8e194852bb5::t_71ecfbba3ec2fb 17,133-141
+scripts/test_securedrop_scripts.py
+  s_70c8e194852bb5::t_71ecfbba3ec2fb 16,185-193
+  s_70c8e194852bb5::t_921ffa0d55eec2 179-180
+  s_70c8e194852bb5::t_44e14e1a527b32 194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7805f32f16d76a5203c372b56b5024fdcf0c8f15",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

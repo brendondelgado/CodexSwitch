@@ -1,0 +1,29 @@
+Tests/CodexSwitchTests/AppDelegateActivationRecoveryTests.swift
+  s_70c8e194852bb5::t_7bf8697bb8dbe3 380-384,386-390
+Tests/CodexSwitchTests/AccountActivationStateTests.swift
+  s_70c8e194852bb5::t_4effde667a6679 902-912
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_7bf8697bb8dbe3 211,220-221,230-233,779-789,8032-8046,8148-8151,8166,8202-8217
+  s_70c8e194852bb5::t_e2d2cd8eb116a0 8218
+Sources/CodexSwitch/Models/AccountActivationState.swift
+  s_70c8e194852bb5::t_7bf8697bb8dbe3 46
+Sources/CodexSwitch/Services/AccountActivationCoordinator.swift
+  s_70c8e194852bb5::t_7bf8697bb8dbe3 611-632
+  s_70c8e194852bb5::t_4425dd105502eb 608-610
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "dc298d2ca4ac5c1ebe5d06f34353126aa71f01ab",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
