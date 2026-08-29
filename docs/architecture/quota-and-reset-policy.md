@@ -384,6 +384,16 @@ journal read, comparison, and write boundary, including legacy records, so a
 changed local UUID, case, or surrounding whitespace cannot bypass
 duplicate-spend protection.
 
+Provider reconciliation is independently backoff-driven. An unresolved attempt
+persists its consecutive failure count, last reconciliation time, and next
+eligible retry time. Ordinary daemon quota polling and account rotation continue
+while that deadline is active; they must not re-enter reset inventory or quota
+reconciliation on every daemon tick. Transient failures back off exponentially
+from five minutes to a one-hour ceiling. A credit-specific external-inventory
+observation becomes terminal audit history after that credit's recorded
+expiration, because it can no longer authorize or conflict with a future
+redemption. The terminal transition performs no provider request.
+
 ## Manual Redemption
 
 The menu app exposes the same one-account manual operation on each eligible

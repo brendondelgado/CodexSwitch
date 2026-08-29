@@ -27,6 +27,8 @@ const RESET_CONSUME_URL: &str =
 const UNIX_TO_SWIFT_REFERENCE_SECONDS: f64 = 978_307_200.0;
 pub const RESET_BANK_REFRESH_INTERVAL: ChronoDuration = ChronoDuration::minutes(1);
 pub const RESET_RECONCILIATION_INTERVAL: ChronoDuration = ChronoDuration::minutes(2);
+const RESET_RECONCILIATION_RETRY_BASE: ChronoDuration = ChronoDuration::minutes(5);
+const RESET_RECONCILIATION_RETRY_MAX: ChronoDuration = ChronoDuration::hours(1);
 const EXPIRING_SOON_INTERVAL: ChronoDuration = ChronoDuration::hours(24);
 const NATURAL_RESET_PROTECTION_INTERVAL: ChronoDuration = ChronoDuration::hours(24);
 const FINAL_SUBMISSION_EVIDENCE_MAX_AGE: ChronoDuration = ChronoDuration::seconds(10);
@@ -511,6 +513,7 @@ enum ResetAttemptState {
     Uncertain,
     ConsumptionObserved,
     ReconciliationOverdue,
+    ExpiredUnresolved,
     TerminalNotApplied,
     ReconciledUsable,
 }
@@ -521,7 +524,10 @@ impl ResetAttemptState {
     }
 
     fn is_terminal(self) -> bool {
-        matches!(self, Self::TerminalNotApplied | Self::ReconciledUsable)
+        matches!(
+            self,
+            Self::ExpiredUnresolved | Self::TerminalNotApplied | Self::ReconciledUsable
+        )
     }
 }
 
@@ -564,6 +570,12 @@ struct ResetAttempt {
     quota_usable: Option<bool>,
     #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    reconciliation_failure_count: u32,
+    #[serde(default)]
+    last_reconciliation_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    reconciliation_retry_not_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1687,7 +1699,32 @@ fn new_reset_attempt(
         quota_reconciled_at: None,
         quota_usable: None,
         last_error: None,
+        reconciliation_failure_count: 0,
+        last_reconciliation_attempt_at: None,
+        reconciliation_retry_not_before: None,
     }
+}
+
+fn reset_reconciliation_backoff(consecutive_failures: u32) -> ChronoDuration {
+    let exponent = consecutive_failures.saturating_sub(1).min(4);
+    let multiplier = 1_i32 << exponent;
+    std::cmp::min(
+        RESET_RECONCILIATION_RETRY_BASE * multiplier,
+        RESET_RECONCILIATION_RETRY_MAX,
+    )
+}
+
+fn reset_reconciliation_is_deferred(attempt: &ResetAttempt, now: DateTime<Utc>) -> bool {
+    attempt
+        .reconciliation_retry_not_before
+        .is_some_and(|retry_at| retry_at > now)
+}
+
+fn external_reset_credit_has_expired(attempt: &ResetAttempt, now: DateTime<Utc>) -> bool {
+    attempt.origin == ResetAttemptOrigin::ExternalInventoryDecrease
+        && attempt
+            .selected_credit_expires_at
+            .is_some_and(|expires_at| expires_at <= now)
 }
 
 struct ResetReconciliationObservation {
@@ -1745,9 +1782,58 @@ where
             detail: Some(detail),
         });
     };
+    if external_reset_credit_has_expired(&expected_attempt, now) {
+        let detail = "external reset observation expired without complete provider evidence; retained as terminal audit history"
+            .to_string();
+        with_account_store_unlocked(store_lock, expected_store_generation, || {
+            update_exact_reset_attempt(
+                journal_path,
+                &expected_attempt,
+                now,
+                |journal, attempt_index| {
+                    let attempt = &mut journal.attempts[attempt_index];
+                    attempt.state = ResetAttemptState::ExpiredUnresolved;
+                    attempt.last_error = Some(detail.clone());
+                    attempt.reconciliation_retry_not_before = None;
+                },
+            )
+        })??;
+        return Ok(ResetFlowResult {
+            state: ResetFlowState::TerminalNotApplied,
+            consumption_observed: false,
+            quota_reconciled: false,
+            detail: Some(detail),
+        });
+    }
+    if reset_reconciliation_is_deferred(&expected_attempt, now) {
+        return Ok(ResetFlowResult {
+            state: ResetFlowState::Suppressed,
+            consumption_observed: false,
+            quota_reconciled: false,
+            detail: expected_attempt.last_error.clone(),
+        });
+    }
     with_account_store_unlocked(store_lock, expected_store_generation, || {
         revalidate_exact_reset_attempt(journal_path, &expected_attempt, now)
     })??;
+    let next_failure_count = expected_attempt
+        .reconciliation_failure_count
+        .saturating_add(1);
+    let expected_attempt =
+        with_account_store_unlocked(store_lock, expected_store_generation, || {
+            update_exact_reset_attempt(
+                journal_path,
+                &expected_attempt,
+                now,
+                |journal, attempt_index| {
+                    let attempt = &mut journal.attempts[attempt_index];
+                    attempt.reconciliation_failure_count = next_failure_count;
+                    attempt.last_reconciliation_attempt_at = Some(now);
+                    attempt.reconciliation_retry_not_before =
+                        Some(now + reset_reconciliation_backoff(next_failure_count));
+                },
+            )
+        })??;
     validate_reset_provider_io(store_lock, expected_store_generation, validate_provider_io)
         .context("reset activation guard changed before quota reconciliation")?;
     let mut refreshed_account = account.clone();
@@ -1819,11 +1905,11 @@ where
     } else {
         ResetAttemptState::Uncertain
     };
-    updated_attempt.last_error = join_details([
-        updated_attempt.last_error.take(),
-        inventory_error.clone(),
-        quota_error.clone(),
-    ]);
+    updated_attempt.last_error = join_details([inventory_error.clone(), quota_error.clone()]);
+    if updated_attempt.state == ResetAttemptState::ReconciledUsable {
+        updated_attempt.reconciliation_failure_count = 0;
+        updated_attempt.reconciliation_retry_not_before = None;
+    }
     let state = if updated_attempt.state == ResetAttemptState::ReconciledUsable {
         ResetFlowState::ReconciledUsable
     } else {
@@ -6165,5 +6251,22 @@ mod tests {
         assert_eq!(decoded.available_count, 1);
         assert_eq!(decoded.credits[0].id, "credit-0");
         Ok(())
+    }
+
+    #[test]
+    fn reset_reconciliation_backoff_is_bounded() {
+        assert_eq!(reset_reconciliation_backoff(1), ChronoDuration::minutes(5));
+        assert_eq!(reset_reconciliation_backoff(2), ChronoDuration::minutes(10));
+        assert_eq!(reset_reconciliation_backoff(5), ChronoDuration::minutes(60));
+        assert_eq!(
+            reset_reconciliation_backoff(u32::MAX),
+            ChronoDuration::minutes(60)
+        );
+    }
+
+    #[test]
+    fn expired_external_observation_is_terminal() {
+        assert!(ResetAttemptState::ExpiredUnresolved.is_terminal());
+        assert!(!ResetAttemptState::ExpiredUnresolved.suppresses_redemption());
     }
 }

@@ -43,6 +43,7 @@ pub struct ReadinessReport {
     pub activation_state: Option<ActivationState>,
     pub account_count: usize,
     pub active_email: Option<String>,
+    pub active_provider_account_id: Option<String>,
     pub ready_candidate_count: usize,
     pub processes: Vec<ProcessReadiness>,
     pub app_servers: Vec<ProcessReadiness>,
@@ -79,6 +80,7 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
     let mut issues = Vec::new();
     let mut account_count = 0;
     let mut active_email = None;
+    let mut active_provider_account_id = None;
     let mut active_token_fingerprint = None;
     let mut active_confirmation_account = None;
     let mut store_generation = None;
@@ -93,6 +95,7 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
             if let Some(active) = active_account(&accounts) {
                 let now = Utc::now();
                 active_email = Some(active.email.clone());
+                active_provider_account_id = Some(active.account_id.clone());
                 active_token_fingerprint = account_token_fingerprint(active);
                 active_confirmation_account = Some(active.clone());
                 if active_token_fingerprint.is_none() {
@@ -343,6 +346,7 @@ pub fn check(store_path: &Path, auth_path: &Path) -> Result<ReadinessReport> {
         activation_state,
         account_count,
         active_email,
+        active_provider_account_id,
         ready_candidate_count,
         processes,
         app_servers,
@@ -1131,6 +1135,7 @@ mod tests {
             activation_state: None,
             account_count: 1,
             active_email: Some("active@example.com".to_string()),
+            active_provider_account_id: Some("provider-account".to_string()),
             ready_candidate_count: 0,
             processes: Vec::new(),
             app_servers: Vec::new(),

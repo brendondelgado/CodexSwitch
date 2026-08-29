@@ -100,8 +100,8 @@ struct LinuxDevboxMonitorTests {
         #expect(!LinuxDevboxMonitor.isCodexVPSRemoteSessionRunning(psOutput: output))
     }
 
-    @Test("remote sessions bypass normal sixty second readiness cadence")
-    func remoteSessionsBypassNormalSixtySecondReadinessCadence() {
+    @Test("remote sessions do not accelerate full readiness checks")
+    func remoteSessionsDoNotAccelerateFullReadinessChecks() {
         let now = Date(timeIntervalSince1970: 2_000)
         let recentFullCheck = now.addingTimeInterval(-5)
 
@@ -111,12 +111,27 @@ struct LinuxDevboxMonitorTests {
             hasActiveRemoteSession: false,
             force: false
         ))
-        #expect(LinuxDevboxMonitor.shouldRunReadinessCheck(
+        #expect(!LinuxDevboxMonitor.shouldRunReadinessCheck(
             now: now,
             lastFullCheckAt: recentFullCheck,
             hasActiveRemoteSession: true,
             force: false
         ))
+        #expect(LinuxDevboxMonitor.shouldRunReadinessCheck(
+            now: now,
+            lastFullCheckAt: recentFullCheck,
+            hasActiveRemoteSession: true,
+            force: true
+        ))
+    }
+
+    @Test("readiness probe uses one CLI process")
+    func readinessProbeUsesOneCLIProcess() {
+        let command = LinuxDevboxMonitor.remoteReadinessCommand()
+
+        #expect(command.components(separatedBy: "codexswitch-cli").count - 1 == 1)
+        #expect(command.contains("doctor --json"))
+        #expect(!command.contains("auth-diagnostics"))
     }
 
     @Test("background readiness does not own the Mac active account")

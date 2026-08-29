@@ -909,10 +909,10 @@ enum LinuxDevboxMonitor {
     static let remoteExecutionMarkerPrefix = "__CODEXSWITCH_REMOTE_COMMAND_STARTED_"
     static let remoteCompletionMarkerPrefix = "__CODEXSWITCH_REMOTE_COMMAND_COMPLETED_"
     static let remoteCleanupFailureMarker = "__CODEXSWITCH_REMOTE_CLEANUP_FAILED__"
-    static let activeRemoteAccountStatePollInterval: TimeInterval = 5
-    static let normalReadinessPollInterval: TimeInterval = 60
+    static let activeRemoteAccountStatePollInterval: TimeInterval = 60
+    static let normalReadinessPollInterval: TimeInterval = 10 * 60
     static let readinessEvidenceFreshnessInterval: TimeInterval =
-        normalReadinessPollInterval + 60
+        normalReadinessPollInterval + 2 * 60
     static let remoteUsageRefreshInterval: TimeInterval = 15 * 60
     static let remoteUsageReportTimeout: TimeInterval = 12 * 60
     static let automaticCredentialBundleLifetime: TimeInterval = 10 * 60
@@ -1375,9 +1375,10 @@ enum LinuxDevboxMonitor {
         hasActiveRemoteSession: Bool,
         force: Bool
     ) -> Bool {
-        if force || hasActiveRemoteSession {
+        if force {
             return true
         }
+        _ = hasActiveRemoteSession
         guard let lastFullCheckAt else {
             return true
         }
@@ -3314,36 +3315,7 @@ enum LinuxDevboxMonitor {
     static func remoteReadinessCommand() -> String {
         """
         export PATH="$HOME/.local/bin:$PATH"
-        python3 - <<'PY'
-        import json, subprocess
-
-        def run_json(arguments):
-            completed = subprocess.run(
-                arguments,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            return json.loads(completed.stdout)
-
-        def stable_id(value):
-            if not isinstance(value, str):
-                return None
-            value = value.strip()
-            if not value or len(value.encode("utf-8")) > 256:
-                return None
-            if any(ord(character) < 32 or ord(character) == 127 for character in value):
-                return None
-            return value
-
-        readiness = run_json(["codexswitch-cli", "doctor", "--json"])
-        diagnostics = run_json(["codexswitch-cli", "auth-diagnostics", "--json"])
-        readiness["activeProviderAccountId"] = stable_id(
-            diagnostics.get("activeAccountId")
-        )
-        print(json.dumps(readiness, separators=(",", ":")))
-        PY
+        codexswitch-cli doctor --json
         """
     }
 

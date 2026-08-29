@@ -1286,10 +1286,17 @@ reads the sanitized authority observation at `codexswitch-cli account-state`
 cadence, not the slower readiness cadence. That observation is the one pool
 target; Mac and VPS runtime identities are convergence details beneath it.
 
-- Active VPS remote client detected: fetch sanitized VPS account state every `5s`, with overlapping checks suppressed.
+- Active VPS remote client detected: fetch sanitized VPS account state every
+  `60s`, with overlapping checks suppressed. Account state is a bounded file
+  observation and does not run `doctor`.
 - VPS autonomous selection stays on the VPS. Mac limit handling sends one
   remote-first request and converges the returned target locally.
-- No active VPS remote client detected: keep the normal `60s` readiness cadence.
+- Run the full read-only VPS readiness check at most once every `600s`, whether
+  or not a remote client is active. A forced operator or post-credential-sync
+  check may bypass that cadence once. The remote command invokes
+  `codexswitch-cli doctor --json` exactly once; `doctor` includes the stable
+  provider account identifier needed by the Mac and no second
+  `auth-diagnostics` process is launched.
 - The detector must include both `codex-vps` terminal clients and Codex.app-launched `codex --remote ws://100.95.84.123:8390 ...` clients.
 - SSH/Tailscale tunnel helper processes are transport plumbing and must not be mistaken for an active Codex remote client.
 - Every Mac manual or automatic target change is an idempotent request to the
