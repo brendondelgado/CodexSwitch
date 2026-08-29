@@ -1,0 +1,25 @@
+crates/codexswitch-cli/src/rate_limit_resets.rs
+  s_70c8e194852bb5::t_eb3394d2abd95e 6344
+  s_70c8e194852bb5::t_bb171b7a69598d 6350-6351
+  s_70c8e194852bb5::t_f4954eab9546a2 1902-1903,1908-1909,6264-6320,6322-6333,6335-6343,6345-6349
+  s_70c8e194852bb5::t_5ff86111351bd3 6321,6334
+  s_70c8e194852bb5::t_0cbd11187f7cd8 1819-1823,1850,1869,1897-1901,1904
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_0a11998ca0bf7c 387-396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "4d1e3f9855eb20091d35fb01ebb6a0fc306eab88",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
