@@ -1,0 +1,37 @@
+Sources/CodexSwitch/Views/PopoverContentView.swift
+  s_70c8e194852bb5::t_1e05ec9c28e1ea 9,286-287
+  s_70c8e194852bb5::t_10133e339567f6 288
+Tests/CodexSwitchTests/RateLimitResetPresentationTests.swift
+  s_70c8e194852bb5::t_48ae937b59ec1c 72-82,114-143,352-354,363,366-369,443,787
+Sources/CodexSwitch/Views/AccountCardView.swift
+  s_70c8e194852bb5::t_59b847f8395ab7 12,148,152-158,244-246,258-260,267-271,276-285,288-295,305-320,338-343,352-361,496,511-521,523-539,686-691
+  s_70c8e194852bb5::t_bd3000b7bce545 344-351,522
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_1e05ec9c28e1ea 4154-4155,4705,4871-4882,9135-9136
+  s_70c8e194852bb5::t_ffda3a0c156034 9137
+Sources/CodexSwitch/Models/RateLimitResetPresentation.swift
+  s_70c8e194852bb5::t_1e05ec9c28e1ea 14-22,463,536
+docs/codexswitch-banked-resets.md
+  s_70c8e194852bb5::t_fbd60b9ee60f62 30,195,207-214,282-287
+  s_70c8e194852bb5::t_8f27b0dc8b7a42 288
+Tests/CodexSwitchTests/AccountCardViewTests.swift
+  s_70c8e194852bb5::t_48ae937b59ec1c 289-324,339-340
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_fbd60b9ee60f62 41,511-520,529-533
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9a955853be089c038dfc009a1c2f0c25644f64f5",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
