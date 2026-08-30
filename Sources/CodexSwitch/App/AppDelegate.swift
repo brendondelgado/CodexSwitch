@@ -4151,7 +4151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - Banked Rate-Limit Resets
 
     private func publishRateLimitResetPresentations(at now: Date = Date()) {
-        let presentations = Dictionary(uniqueKeysWithValues: accountManager.accounts.map { account in
+        let paidAccounts = accountManager.accounts.filter { $0.planPriority > 1 }
+        let presentations = Dictionary(uniqueKeysWithValues: paidAccounts.map { account in
             let bank = account.rateLimitResetBank
             let providerAccountId = account.normalizedProviderAccountId
             let hasExpiredAvailableCredit = bank?.credits.contains { credit in
@@ -4701,13 +4702,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             refreshed: refreshedBank
         )
         accountManager.updateRateLimitResetBank(for: account.id, bank: refreshedBank)
+        queueTelemetryPersistence(context: "reset-bank-\(source)")
         notifyRateLimitResetExpirationIfNeeded(
             for: account.id,
             bank: refreshedBank,
             now: now
         )
         if inventoryChanged {
-            queueTelemetryPersistence(context: "reset-bank-\(source)")
             statusBarController.updateIcon()
             updatePopoverContent()
         }
@@ -4865,6 +4866,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.checkAndSwapIfNeeded()
             }
         }
+    }
+
+    private func refreshRateLimitResetInventoryManually(for accountId: UUID) {
+        guard let account = accountManager.accounts.first(where: { $0.id == accountId }),
+              account.planPriority > 1 else {
+            return
+        }
+        recordManualRateLimitResetError(nil, for: accountId, reason: .manual)
+        scheduleRateLimitResetRefresh(for: accountId, force: true)
+        SwapLog.append(.debug(
+            "RESET_MANUAL_REFRESH_REQUESTED account=\(account.email)"
+        ))
     }
 
     private func rateLimitResetInventoryRefreshIsBlocked(
@@ -9118,6 +9131,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     onReauthenticate: { [weak self] id in self?.reauthenticateAccount(id) },
                     onRedeemReset: { [weak self] id in
                         self?.redeemRateLimitResetManually(for: id)
+                    },
+                    onRefreshResetInventory: { [weak self] id in
+                        self?.refreshRateLimitResetInventoryManually(for: id)
                     },
                     resetRedemptionAuthorization: { [weak self] id in
                         self?.rateLimitResetCoordinatorAuthorization(for: id)

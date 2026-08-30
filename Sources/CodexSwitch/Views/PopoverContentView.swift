@@ -6,6 +6,7 @@ struct PopoverContentView: View {
     var onForceSwap: (UUID) -> Void
     var onReauthenticate: (UUID) -> Void
     var onRedeemReset: (UUID) -> Void
+    var onRefreshResetInventory: (UUID) -> Void
     var resetRedemptionAuthorization: (UUID) -> RateLimitResetCoordinatorAuthorization
     var onOpenSettings: () -> Void
 
@@ -281,6 +282,9 @@ struct PopoverContentView: View {
                                         resetRedemptionAuthorization(account.id),
                                     onRedeemReset: {
                                         onRedeemReset(account.id)
+                                    },
+                                    onRefreshResetInventory: {
+                                        onRefreshResetInventory(account.id)
                                     },
                                     onReauthenticate: {
                                         onReauthenticate(account.id)

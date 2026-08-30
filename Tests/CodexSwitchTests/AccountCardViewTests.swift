@@ -286,6 +286,42 @@ struct AccountCardViewTests {
         #expect(!didRedeem)
     }
 
+    @Test("Stale inventory offers an explicit account refresh")
+    @MainActor
+    func staleInventoryOffersRefresh() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let account = makeRedeemableAccount(now: now)
+        var didRefresh = false
+        let view = AccountCardView(
+            account: account,
+            rateLimitResetPresentation: .stale(lastKnownCount: 1),
+            onRefreshResetInventory: {
+                didRefresh = true
+            },
+            onReauthenticate: nil,
+            onForceSwap: nil
+        )
+
+        #expect(view.resetInventoryRefreshIsAvailable)
+        #expect(view.handleResetInventoryRefresh())
+        #expect(didRefresh)
+
+        let current = AccountCardView(
+            account: account,
+            rateLimitResetPresentation: .current(
+                availableCount: 1,
+                nextExpiration: now.addingTimeInterval(86_400)
+            ),
+            onRefreshResetInventory: {
+                didRefresh = true
+            },
+            onReauthenticate: nil,
+            onForceSwap: nil
+        )
+        #expect(!current.resetInventoryRefreshIsAvailable)
+        #expect(!current.handleResetInventoryRefresh())
+    }
+
     @Test("Context-menu redemption opens confirmation and never redeems directly")
     func contextMenuRedemptionUsesConfirmationFlow() throws {
         let source = try String(
@@ -300,6 +336,8 @@ struct AccountCardViewTests {
         let menuSource = source[menuStart.lowerBound..<confirmationStart.lowerBound]
 
         #expect(menuSource.contains("RateLimitResetContextMenuPresentation.resolve("))
+        #expect(menuSource.contains("Button(\"Refresh reset inventory\")"))
+        #expect(menuSource.contains("handleResetInventoryRefresh()"))
         #expect(menuSource.contains("Button(resetPresentation.menuItemTitle)"))
         #expect(menuSource.contains("isConfirmingResetRedemption = true"))
         #expect(menuSource.contains("resetPresentation.unavailableReason"))

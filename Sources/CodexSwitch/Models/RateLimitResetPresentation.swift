@@ -11,6 +11,15 @@ enum RateLimitResetInventoryPresentation: Equatable, Sendable {
     case unknown(lastKnownCount: Int)
     case current(availableCount: Int, nextExpiration: Date?)
 
+    var offersObservationRefresh: Bool {
+        switch self {
+        case .error, .stale, .expired, .unknown:
+            return true
+        case .redeeming, .reconciling, .externalHold, .refreshing, .current:
+            return false
+        }
+    }
+
     static func resolve(
         availableCount: Int,
         nextExpiration: Date?,
@@ -451,6 +460,7 @@ struct RateLimitResetOverviewItem: Identifiable, Equatable, Sendable {
         now: Date
     ) -> [Self] {
         let candidates = accounts.compactMap { account -> (CodexAccount, Self)? in
+            guard account.planPriority > 1 else { return nil }
             guard let presentation = presentations[account.id] else { return nil }
             switch presentation {
             case .current(let availableCount, let expiration):
@@ -523,7 +533,7 @@ struct PooledRateLimitResetPresentation: Equatable, Sendable {
         presentations: [UUID: RateLimitResetInventoryPresentation],
         now: Date
     ) -> Self {
-        summarize(accounts.map { account in
+        summarize(accounts.filter { $0.planPriority > 1 }.map { account in
             RateLimitResetInventoryObservation.resolve(
                 presentation: presentations[account.id],
                 bank: account.rateLimitResetBank,

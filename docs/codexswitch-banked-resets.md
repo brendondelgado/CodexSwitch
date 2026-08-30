@@ -27,7 +27,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-29
+  last_updated: 2026-08-30
 ---
 
 # CodexSwitch Banked Resets
@@ -192,7 +192,7 @@ consume another credit using the quota snapshot that preceded the change.
 
 ## Manual Redemption And Expiration Alerts
 
-Each eligible account card exposes one reset icon button. It is enabled only
+Each paid account card exposes a labeled reset command. It is enabled only
 for a fresh blocked paid account with complete runtime credentials, an
 inference JWT valid beyond the safety window, and a fresh available reset. An
 available credit must have a normalized identifier and an
@@ -203,6 +203,14 @@ the configured account will not change. Redeeming, reconciling, refresh-failed,
 last-known/unverified, expired/unavailable, not-verified, and external-hold
 states replace the action until the durable journal proves another submission
 is safe. No non-current count is presented as spendable inventory.
+
+Stored inventory remains readable when it is no longer spendable: the card
+shows the account's last-known count and observation age with an explicit
+last-known or unverified label. Stale, unknown, expired, and refresh-failed
+states expose an observation-only `Refresh` command on both the card and its
+context menu. Refresh never consumes a credit. After current evidence arrives,
+the command becomes `Redeem` only when the complete redemption contract is
+satisfied, and redemption still requires the named confirmation dialog.
 
 The account-card context menu resolves the same guarded manual-redemption
 presentation. An enabled item opens that existing confirmation dialog; it never
@@ -270,6 +278,13 @@ at-most-sixty-second evidence. Older cached counts are
 last-known/unverified and cannot authorize redemption. Ranking observations
 must never overwrite the durable "before" bank used to detect an external
 redemption.
+
+Every successful provider observation queues its response-completion timestamp
+for the bounded coalesced telemetry writer, including observations whose count
+and credit list are unchanged. This keeps restart-time last-known metadata
+close to the live generation without turning each account poll into an
+immediate file write. Count or credit changes remain semantic changes and are
+persisted through the same locked atomic account-store path.
 
 Timestamp freshness alone is insufficient. Cached inventory is current only
 when its complete available-credit list still matches the count at the current

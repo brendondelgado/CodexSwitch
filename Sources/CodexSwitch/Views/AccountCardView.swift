@@ -9,6 +9,7 @@ struct AccountCardView: View {
     var rateLimitResetPresentation: RateLimitResetInventoryPresentation? = nil
     var rateLimitResetCoordinatorAuthorization: RateLimitResetCoordinatorAuthorization = .authorized
     var onRedeemReset: (() -> Void)? = nil
+    var onRefreshResetInventory: (() -> Void)? = nil
     let onReauthenticate: (() -> Void)?
     let onForceSwap: (() -> Void)?
     @State private var isHovering = false
@@ -144,8 +145,15 @@ struct AccountCardView: View {
         systemImage: String,
         urgency: RateLimitResetExpirationUrgency?
     )? {
-        guard let rateLimitResetPresentation else {
+        guard account.planPriority > 1, let rateLimitResetPresentation else {
             return nil
+        }
+
+        let storedLastKnownCount = account.rateLimitResetBank.map {
+            max(0, $0.availableCount)
+        }
+        let lastCheckedText = account.rateLimitResetBank.map {
+            Self.resetInventoryAgeText(fetchedAt: $0.fetchedAt, now: Date())
         }
 
         let nextExpirationText: String?
@@ -233,7 +241,9 @@ struct AccountCardView: View {
             Self.rateLimitResetText(
                 for: rateLimitResetPresentation,
                 nextExpirationText: nextExpirationText,
-                holdUntilText: holdUntilText
+                holdUntilText: holdUntilText,
+                storedLastKnownCount: storedLastKnownCount,
+                lastCheckedText: lastCheckedText
             ),
             color,
             help,
@@ -245,26 +255,44 @@ struct AccountCardView: View {
     static func rateLimitResetText(
         for presentation: RateLimitResetInventoryPresentation,
         nextExpirationText: String? = nil,
-        holdUntilText: String? = nil
+        holdUntilText: String? = nil,
+        storedLastKnownCount: Int? = nil,
+        lastCheckedText: String? = nil
     ) -> String {
         switch presentation {
         case .redeeming:
             return "Redeeming banked reset"
         case .reconciling:
             return "Reconciling reset inventory"
-        case .error:
-            return "Reset inventory unavailable"
+        case .error(_, let lastKnownCount):
+            return lastKnownResetText(
+                count: lastKnownCount,
+                suffix: "refresh failed"
+            )
         case .externalHold:
             return holdUntilText.map { "Reset hold until \($0)" }
                 ?? "Reset redemption on hold"
         case .refreshing:
-            return "Refreshing reset inventory"
-        case .stale:
-            return "Reset inventory updating"
+            guard let storedLastKnownCount else { return "Refreshing reset inventory" }
+            return lastKnownResetText(
+                count: storedLastKnownCount,
+                suffix: "refreshing"
+            )
+        case .stale(let lastKnownCount):
+            return lastKnownResetText(
+                count: lastKnownCount,
+                suffix: lastCheckedText
+            )
         case .expired:
             return "No current banked resets"
-        case .unknown:
-            return "Reset inventory unavailable"
+        case .unknown(let lastKnownCount):
+            guard storedLastKnownCount != nil || lastKnownCount > 0 else {
+                return "Reset inventory unavailable"
+            }
+            return lastKnownResetText(
+                count: lastKnownCount,
+                suffix: "unverified"
+            )
         case .current(let availableCount, _):
             var text = resetCountText(availableCount)
             if let nextExpirationText {
@@ -272,6 +300,22 @@ struct AccountCardView: View {
             }
             return text
         }
+    }
+
+    private static func lastKnownResetText(count: Int, suffix: String?) -> String {
+        var text = "Last known: \(resetCountText(count))"
+        if let suffix, !suffix.isEmpty {
+            text += " • \(suffix)"
+        }
+        return text
+    }
+
+    static func resetInventoryAgeText(fetchedAt: Date, now: Date) -> String {
+        let age = max(0, now.timeIntervalSince(fetchedAt))
+        if age < 60 { return "just now" }
+        if age < 3_600 { return "\(Int(age / 60))m ago" }
+        if age < 86_400 { return "\(Int(age / 3_600))h ago" }
+        return "\(Int(age / 86_400))d ago"
     }
 
     private static func resetCountText(_ count: Int) -> String {
@@ -289,6 +333,30 @@ struct AccountCardView: View {
             coordinatorAuthorization: rateLimitResetCoordinatorAuthorization,
             now: now
         )
+    }
+
+    var resetInventoryRefreshIsAvailable: Bool {
+        account.planPriority > 1
+            && rateLimitResetPresentation?.offersObservationRefresh == true
+            && onRefreshResetInventory != nil
+    }
+
+    private var currentRateLimitResetCount: Int? {
+        guard let rateLimitResetPresentation,
+              case .current(let availableCount, _) = rateLimitResetPresentation else {
+            return nil
+        }
+        return max(0, availableCount)
+    }
+
+    @discardableResult
+    @MainActor
+    func handleResetInventoryRefresh() -> Bool {
+        guard resetInventoryRefreshIsAvailable, let onRefreshResetInventory else {
+            return false
+        }
+        onRefreshResetInventory()
+        return true
     }
 
     @discardableResult
@@ -425,6 +493,7 @@ struct AccountCardView: View {
             if let rateLimitResetLine {
                 let redemptionAction = resetRedemptionActionPresentation()
                 let redemptionIsConnected = onRedeemReset != nil
+                let offersRefresh = rateLimitResetPresentation?.offersObservationRefresh == true
                 HStack(spacing: 4) {
                     HStack(spacing: 4) {
                         Image(systemName: rateLimitResetLine.systemImage)
@@ -439,25 +508,36 @@ struct AccountCardView: View {
 
                     Spacer(minLength: 2)
 
-                    Button {
-                        isConfirmingResetRedemption = true
-                    } label: {
-                        Label(
-                            "Redeem one banked reset for \(account.email)",
-                            systemImage: "arrow.counterclockwise"
-                        )
-                        .labelStyle(.iconOnly)
+                    if offersRefresh {
+                        Button {
+                            _ = handleResetInventoryRefresh()
+                        } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                        }
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .buttonStyle(.borderless)
+                        .controlSize(.mini)
+                        .disabled(!resetInventoryRefreshIsAvailable)
+                        .help("Refresh reset inventory for \(account.email)")
+                    } else if let availableCount = currentRateLimitResetCount,
+                              availableCount > 0 {
+                        Button {
+                            isConfirmingResetRedemption = true
+                        } label: {
+                            Label("Redeem", systemImage: "arrow.counterclockwise")
+                        }
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .buttonStyle(.borderless)
+                        .controlSize(.mini)
+                        .disabled(!redemptionAction.isEnabled || !redemptionIsConnected)
+                        .help(redemptionIsConnected
+                            ? redemptionAction.helpText
+                            : "Manual reset redemption is not connected")
+                        .accessibilityLabel("Redeem one banked reset for \(account.email)")
+                        .accessibilityHint(redemptionIsConnected
+                            ? redemptionAction.helpText
+                            : "Manual reset redemption is not connected")
                     }
-                    .font(.system(size: 9, weight: .semibold))
-                    .buttonStyle(.plain)
-                    .disabled(!redemptionAction.isEnabled || !redemptionIsConnected)
-                    .help(redemptionIsConnected
-                        ? redemptionAction.helpText
-                        : "Manual reset redemption is not connected")
-                    .accessibilityLabel("Redeem one banked reset for \(account.email)")
-                    .accessibilityHint(redemptionIsConnected
-                        ? redemptionAction.helpText
-                        : "Manual reset redemption is not connected")
                 }
                 .foregroundStyle(rateLimitResetLine.color)
                 .help(rateLimitResetLine.help)
@@ -602,6 +682,12 @@ struct AccountCardView: View {
                 Button(Self.switchPoolTargetLabel) {
                     onForceSwap?()
                 }
+            }
+            if rateLimitResetPresentation?.offersObservationRefresh == true {
+                Button("Refresh reset inventory") {
+                    _ = handleResetInventoryRefresh()
+                }
+                .disabled(!resetInventoryRefreshIsAvailable)
             }
             if resetPresentation.isEnabled {
                 Button(resetPresentation.menuItemTitle) {

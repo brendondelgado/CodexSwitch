@@ -69,6 +69,17 @@ struct RateLimitResetPresentationTests {
             expiration: expiration,
             fresh: true
         ) == .current(availableCount: 4, nextExpiration: expiration))
+
+        #expect(RateLimitResetInventoryPresentation.stale(lastKnownCount: 4)
+            .offersObservationRefresh)
+        #expect(RateLimitResetInventoryPresentation.error(
+            message: "offline",
+            lastKnownCount: 4
+        ).offersObservationRefresh)
+        #expect(!RateLimitResetInventoryPresentation.current(
+            availableCount: 4,
+            nextExpiration: expiration
+        ).offersObservationRefresh)
     }
 
     @Test("Expired holds yield to the next applicable state")
@@ -98,6 +109,36 @@ struct RateLimitResetPresentationTests {
         #expect(summary.pendingAccountCount == 2)
         #expect(summary.staleAccountCount == 2)
         #expect(summary.hasIncompleteInventory)
+    }
+
+    @Test("Pooled reset inventory ignores free accounts")
+    func pooledInventoryIgnoresFreeAccounts() {
+        let expiration = now.addingTimeInterval(86_400)
+        var pro = makeAccount(
+            email: "pro@example.com",
+            providerAccountId: "pro",
+            planType: "pro"
+        )
+        pro.rateLimitResetBank = makeBank(fetchedAt: now, expirations: [expiration])
+        let free = makeAccount(
+            email: "free@example.com",
+            providerAccountId: "free",
+            planType: "free"
+        )
+
+        let summary = PooledRateLimitResetPresentation.summarize(
+            accounts: [pro, free],
+            presentations: [
+                pro.id: .current(availableCount: 1, nextExpiration: expiration),
+                free.id: .stale(lastKnownCount: 0),
+            ],
+            now: now
+        )
+
+        #expect(summary.currentAvailableCount == 1)
+        #expect(summary.staleAccountCount == 0)
+        #expect(summary.unknownAccountCount == 0)
+        #expect(!summary.hasIncompleteInventory)
     }
 
     @Test("Verified counts carry fetched-at freshness and stale data fails closed")
@@ -308,8 +349,9 @@ struct RateLimitResetPresentationTests {
             nextExpirationText: "Jul 14"
         ) == "2 banked resets • next expires Jul 14")
         #expect(AccountCardView.rateLimitResetText(
-            for: .stale(lastKnownCount: 2)
-        ) == "Reset inventory updating")
+            for: .stale(lastKnownCount: 2),
+            lastCheckedText: "3m ago"
+        ) == "Last known: 2 banked resets • 3m ago")
         #expect(AccountCardView.rateLimitResetText(
             for: .expired(lastKnownCount: 2)
         ) == "No current banked resets")
@@ -318,10 +360,13 @@ struct RateLimitResetPresentationTests {
         ) == "Reset inventory unavailable")
         #expect(AccountCardView.rateLimitResetText(
             for: .error(message: "Inventory unavailable", lastKnownCount: 2)
-        ) == "Reset inventory unavailable")
+        ) == "Last known: 2 banked resets • refresh failed")
         #expect(AccountCardView.rateLimitResetText(for: .redeeming) == "Redeeming banked reset")
         #expect(AccountCardView.rateLimitResetText(for: .reconciling) == "Reconciling reset inventory")
-        #expect(AccountCardView.rateLimitResetText(for: .refreshing) == "Refreshing reset inventory")
+        #expect(AccountCardView.rateLimitResetText(
+            for: .refreshing,
+            storedLastKnownCount: 2
+        ) == "Last known: 2 banked resets • refreshing")
         #expect(AccountCardView.rateLimitResetText(
             for: .externalHold(until: now),
             holdUntilText: "4:30 PM"
@@ -395,7 +440,7 @@ struct RateLimitResetPresentationTests {
                 pro.id: .current(availableCount: 1, nextExpiration: expiration),
             ],
             now: now
-        ) == "1 verified reset • checked just now • 2 not checked")
+        ) == "1 verified reset • checked just now • 1 not checked")
     }
 
     @Test("Automatic redemption defaults on while preserving explicit false")
@@ -739,7 +784,7 @@ struct RateLimitResetPresentationTests {
     private func makeAccount(
         email: String,
         providerAccountId: String,
-        planType: String? = nil
+        planType: String? = "pro"
     ) -> CodexAccount {
         CodexAccount(
             email: email,

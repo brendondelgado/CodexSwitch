@@ -38,7 +38,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-07-29
+  last_updated: 2026-08-30
 ---
 
 # Quota And Reset Policy
@@ -508,6 +508,16 @@ reconciliation in progress may use their distinct operational colors.
 - Present exactly one authority-selected pool target, plus separate Mac and VPS
   convergence details for that target. Never style two accounts as current.
 - Separate remaining quota from reset inventory.
+- Keep durable reset readability separate from redemption authorization. Every
+  paid account with a stored bank shows its last-known count and observation
+  age even after the sixty-second authorization window closes. It must be
+  labeled `last known` or `unverified`, excluded from verified pooled capacity,
+  and rendered without actionable expiration urgency.
+- A successful inventory observation queues the complete bank, including its
+  response-completion timestamp, for bounded coalesced persistence even when
+  count and credit membership are unchanged. Semantic equality may suppress
+  expensive UI work and notifications, but it must not make the durable
+  observation generation lag indefinitely.
 - Attribute the next reset expiration to its account and sort expiration
   notices by urgency, then exact expiration.
 - Provide an account-specific redemption control only when current evidence
@@ -516,6 +526,11 @@ reconciliation in progress may use their distinct operational colors.
   attempts, and active local or external holds keep unavailable actions disabled
   with an explicit
   reason.
+- Each paid account card exposes a labeled `Redeem` command and the same command
+  in its context menu. When inventory is stale, unknown, expired, or failed, a
+  labeled `Refresh` command replaces the unavailable one; refresh is
+  observation-only and never implies redemption. A refreshed eligible account
+  still requires explicit confirmation before one credit is submitted.
 - A missing redemption handler is an unavailable action, not an enabled menu
   item that silently does nothing.
 - Show reset attempt states such as pending reconciliation rather than guessing success.
