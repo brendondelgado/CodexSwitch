@@ -2166,7 +2166,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         var candidate = original
-        candidate.email = observed.email
         candidate.accessToken = observed.accessToken
         candidate.refreshToken = observed.refreshToken
         candidate.idToken = observed.idToken

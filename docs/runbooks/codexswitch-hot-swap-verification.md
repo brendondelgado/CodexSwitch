@@ -1198,6 +1198,11 @@ helpers must be declared non-hit-testable so they cannot intercept that control.
 
 Every account's context menu also exposes `Reauthenticate` as an explicit
 operator recovery action, independent of the current telemetry classification.
+A successful reauthentication must preserve the selected card's local UUID and
+display email while replacing its complete credential generation. Exercise the
+flow with a matching stable provider account ID and a different token-observed
+email; the selected card must remain visible under its original label, clear its
+authentication blocker, and replicate the fresh generation normally.
 A fresh VPS authentication blocker may make the card show `Needs login` and
 make reauthentication its primary action only when the remote provider identity
 matches exactly one local account. This presentation must not copy host-local

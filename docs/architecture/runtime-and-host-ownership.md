@@ -775,7 +775,10 @@ or loses the lease must leave credentials and reset inventory untouched.
 Active reauthentication is identity preserving. It requires an exact match of
 the stable provider account identifier; email equality is presentation metadata
 and never permits replacement of the configured credentials by a different
-provider account.
+provider account. Reauthentication also preserves the selected local record's
+display email. An email claim returned with a newer credential generation may
+describe the same provider identity, but it must not silently rename or make the
+operator-selected account card appear to disappear.
 
 An explicit active reauthentication may supersede a same-target
 `configured_files_inconsistent` or `external_auth_conflict` review only when the

@@ -205,7 +205,7 @@ struct AppDelegateNotificationTests {
         #expect(original.runtimeUnusableReason == before.runtimeUnusableReason)
     }
 
-    @Test("Reauthentication for the same provider replaces credentials on the original record")
+    @Test("Reauthentication replaces credentials without renaming the selected record")
     func sameAccountReauthenticationProducesCredentialReplacement() throws {
         var original = CodexAccount(
             email: "old@example.com",
@@ -235,7 +235,8 @@ struct AppDelegateNotificationTests {
         #expect(candidate.id == original.id)
         #expect(candidate.isActive)
         #expect(candidate.accountId == original.accountId)
-        #expect(candidate.email == observed.email)
+        #expect(observed.email != original.email)
+        #expect(candidate.email == original.email)
         #expect(candidate.accessToken == observed.accessToken)
         #expect(candidate.refreshToken == observed.refreshToken)
         #expect(candidate.idToken == observed.idToken)
@@ -310,6 +311,8 @@ struct AppDelegateNotificationTests {
         #expect(unchangedActive.accessToken == active.accessToken)
         #expect(unchangedActive.refreshToken == active.refreshToken)
         #expect(unchangedActive.idToken == active.idToken)
+        #expect(observed.email != original.email)
+        #expect(replacement.email == original.email)
         #expect(replacement.accessToken == observed.accessToken)
         #expect(replacement.refreshToken == observed.refreshToken)
         #expect(replacement.idToken == observed.idToken)
