@@ -40,7 +40,9 @@ enum ExternalAuthConflictRecoveryPolicy {
     ) -> CodexAccount? {
         newerGenerationTarget(
             state: state,
-            recoverableDetails: [.configuredFilesInconsistent],
+            detailIsRecoverable: {
+                $0.allowsObservedSameAccountGenerationRecovery
+            },
             configuredAccountId: configuredAccountId,
             storedTarget: storedTarget,
             observedTarget: observedTarget,
@@ -59,10 +61,9 @@ enum ExternalAuthConflictRecoveryPolicy {
     ) -> CodexAccount? {
         newerGenerationTarget(
             state: state,
-            recoverableDetails: [
-                .configuredFilesInconsistent,
-                .externalAuthConflict,
-            ],
+            detailIsRecoverable: {
+                $0.allowsExplicitSameAccountReauthenticationRecovery
+            },
             configuredAccountId: configuredAccountId,
             storedTarget: storedTarget,
             observedTarget: observedTarget,
@@ -73,7 +74,7 @@ enum ExternalAuthConflictRecoveryPolicy {
 
     private static func newerGenerationTarget(
         state: AccountActivationState?,
-        recoverableDetails: [AccountActivationDetail],
+        detailIsRecoverable: (AccountActivationDetail) -> Bool,
         configuredAccountId: UUID?,
         storedTarget: CodexAccount,
         observedTarget: CodexAccount,
@@ -82,7 +83,7 @@ enum ExternalAuthConflictRecoveryPolicy {
     ) -> CodexAccount? {
         guard state?.phase == .manualReview,
               let detail = state?.detail,
-              recoverableDetails.contains(detail),
+              detailIsRecoverable(detail),
               let targetAccountId = state?.configuredAccountId,
               targetAccountId == configuredAccountId,
               targetAccountId == storedTarget.id,

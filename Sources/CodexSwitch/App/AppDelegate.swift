@@ -8983,7 +8983,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             committedDetail: .activeCredentialMutation
                         )
                     }
-                    guard committed else { return }
+                    guard committed else {
+                        updatePopoverContent()
+                        SwapLog.append(.debug(
+                            "ACCOUNT_REAUTH_COMMIT_BLOCKED target=\(original.id.uuidString)"
+                        ))
+                        return
+                    }
                 } else {
                     guard await persistInactiveCredentialUpdate(
                         original: original,

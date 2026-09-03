@@ -137,6 +137,49 @@ struct ExternalAuthConflictRecoveryTests {
         ) == nil)
     }
 
+    @Test("Fresh same-account auth heals observation barriers")
+    func sameAccountGenerationRecoveryHealsObservationBarriers() {
+        var stored = makeAccount(id: targetAccountId, active: true)
+        stored.accountId = providerAccountId
+        stored.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(3_600)
+        )
+        var observed = stored
+        observed.accessToken = testInferenceToken(
+            expiresAt: now.addingTimeInterval(7_200)
+        )
+        observed.refreshToken = "new-refresh"
+        observed.idToken = "new-id"
+
+        for detail in [
+            AccountActivationDetail.externalAuthAbsent,
+            .externalAuthInvalid,
+            .externalAuthUnreadable,
+        ] {
+            let review = AccountActivationState.manualReview(
+                targetAccountId: targetAccountId,
+                detail: detail,
+                at: now
+            )
+            #expect(ExternalAuthConflictRecoveryPolicy.newerSameAccountGenerationTarget(
+                state: review,
+                configuredAccountId: targetAccountId,
+                storedTarget: stored,
+                observedTarget: observed,
+                matchingProviderAccountCount: 1,
+                now: now
+            )?.accessToken == observed.accessToken)
+            #expect(ExternalAuthConflictRecoveryPolicy.newerExplicitReauthenticationTarget(
+                state: review,
+                configuredAccountId: targetAccountId,
+                storedTarget: stored,
+                observedTarget: observed,
+                matchingProviderAccountCount: 1,
+                now: now
+            )?.refreshToken == observed.refreshToken)
+        }
+    }
+
     @Test("Same-account recovery rejects identity, ambiguity, and credential drift")
     func sameAccountGenerationRecoveryRejectsUnsafeEvidence() {
         var stored = makeAccount(id: targetAccountId, active: true)
@@ -420,6 +463,45 @@ struct ExternalAuthConflictRecoveryTests {
         )
         guard case .prepared(let preparing, let previousState) = decision else {
             Issue.record("Expected verified reauthentication recovery to prepare")
+            return
+        }
+        #expect(previousState == review)
+        #expect(preparing.configuredAccountId == targetAccountId)
+        #expect(preparing.activationGeneration == generation)
+    }
+
+    @Test(
+        "Coordinator prepares verified same-account recovery after auth observation failure",
+        arguments: [
+            AccountActivationDetail.externalAuthAbsent,
+            .externalAuthInvalid,
+            .externalAuthUnreadable,
+        ]
+    )
+    func coordinatorPreparesSameAccountObservationRecovery(
+        detail: AccountActivationDetail
+    ) async throws {
+        let url = makeSecureTestFileURL(
+            prefix: "codexswitch-same-account-observation-recovery",
+            fileName: "account-activation.json"
+        )
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let coordinator = AccountActivationCoordinator(url: url)
+        let review = try await coordinator.markManualReview(
+            targetAccountId: targetAccountId,
+            detail: detail,
+            at: now
+        )
+        let generation = UUID()
+
+        let decision = try await coordinator.beginVerifiedSameAccountGenerationRecovery(
+            targetAccountId: targetAccountId,
+            requestedActivationGeneration: generation,
+            authorizeEffect: { $0 == review },
+            at: now.addingTimeInterval(1)
+        )
+        guard case .prepared(let preparing, let previousState) = decision else {
+            Issue.record("Expected verified same-account observation recovery to prepare")
             return
         }
         #expect(previousState == review)

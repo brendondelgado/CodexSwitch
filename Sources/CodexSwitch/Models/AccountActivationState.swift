@@ -49,6 +49,14 @@ enum AccountActivationDetail: String, Codable, Equatable, Sendable {
             return false
         }
     }
+
+    var allowsObservedSameAccountGenerationRecovery: Bool {
+        self == .configuredFilesInconsistent || allowsVerifiedExternalAuthRecovery
+    }
+
+    var allowsExplicitSameAccountReauthenticationRecovery: Bool {
+        allowsObservedSameAccountGenerationRecovery || self == .externalAuthConflict
+    }
 }
 
 enum AccountActivationRequestKind: Equatable, Sendable {

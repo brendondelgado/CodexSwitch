@@ -201,8 +201,8 @@ actor AccountActivationCoordinator {
                 let current = try Self.decode(snapshot.bytes)
                 guard let current,
                       current.phase == .manualReview,
-                      current.detail == .configuredFilesInconsistent
-                        || current.detail == .externalAuthConflict,
+                      current.detail?
+                        .allowsExplicitSameAccountReauthenticationRecovery == true,
                       current.configuredAccountId == targetAccountId else {
                     return .blocked(
                         current,
