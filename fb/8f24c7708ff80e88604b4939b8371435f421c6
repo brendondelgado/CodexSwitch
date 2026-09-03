@@ -1,0 +1,32 @@
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_193d6d5e2cced0 8986-8992
+Sources/CodexSwitch/Models/AccountActivationState.swift
+  s_70c8e194852bb5::t_ab821b4ee46318 52-59
+Sources/CodexSwitch/Services/ExternalAuthConflictRecoveryPolicy.swift
+  s_70c8e194852bb5::t_ab821b4ee46318 43-45,64-66,77,86
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_ab821b4ee46318 783-794
+Sources/CodexSwitch/Services/AccountActivationCoordinator.swift
+  s_70c8e194852bb5::t_ab821b4ee46318 204-205
+Tests/CodexSwitchTests/ExternalAuthConflictRecoveryTests.swift
+  s_70c8e194852bb5::t_2bedbb2d5de003 140-182,473-504,506,510
+  s_70c8e194852bb5::t_f74d6545116570 505
+  s_70c8e194852bb5::t_68419806ce50d4 507-509
+  s_70c8e194852bb5::t_6d0562a509ea1b 511
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "fb8f24c7708ff80e88604b4939b8371435f421c6",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
