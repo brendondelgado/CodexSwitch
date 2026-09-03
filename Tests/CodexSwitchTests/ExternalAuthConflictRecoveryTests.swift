@@ -240,7 +240,7 @@ struct ExternalAuthConflictRecoveryTests {
 
         let unrelatedReview = AccountActivationState.manualReview(
             targetAccountId: targetAccountId,
-            detail: .externalAuthInvalid,
+            detail: .configuredTargetMissing,
             at: now
         )
         #expect(target(state: unrelatedReview) == nil)
