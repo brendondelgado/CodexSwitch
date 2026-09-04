@@ -43,6 +43,9 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/CodexVersionChecker.swift
   - ../../Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
   - ../../Sources/CodexSwitch/Services/CodexDesktopBridgeKeepAlive.swift
+  - ../../Sources/CodexSwitch/Services/CLIStatusChecker.swift
+  - ../../Sources/CodexSwitch/Services/LocalCLIReadinessMaintainer.swift
+  - ../../Sources/CodexSwitch/Services/SwapEngine.swift
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
   - ../../Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
@@ -55,7 +58,9 @@ cross_dependencies:
   - ../../crates/codexswitch-cli/src/remote_authority.rs
   - ../../crates/codexswitch-cli/src/import.rs
   - ../../crates/codexswitch-cli/src/reload.rs
+  - ../../crates/codexswitch-cli/src/daemon.rs
   - ../../crates/codexswitch-cli/src/codex_update.rs
+  - ../../crates/codexswitch-cli/src/codex_update/runtime_discovery.rs
   - ../../crates/codexswitch-cli/src/codex_update/source_daemon_patching.rs
   - ../../scripts/codex-vps
   - ../../scripts/patch-asar.py
@@ -591,6 +596,15 @@ normal deferred maintenance result: it performs no runtime observation, file
 mutation, or signal, advances the ordinary maintenance cadence, and retries on
 a later due tick.
 
+Each due maintenance tick must enumerate every exact CodexSwitch-owned
+app-server in the current immutable release, including both the systemd-managed
+remote-control listener and the built-in Unix-daemon app-server. It renews each
+identity-bound ACK while retaining the one lease, and it must not report the
+tick current while any discovered owner is stale. Duplicate PIDs, replaced
+runtime inodes, mismatched owner UIDs, stale daemon PID records, or unexpected
+argv are ambiguous ownership and fail closed without signaling. One owner may
+not silently age out while another owner remains healthy.
+
 The Swift activation journal enforces this lease centrally. Every durable
 journal transition either inherits task-local proof from an enclosing Swift
 credential transaction or acquires the same nonblocking cross-process lease
@@ -675,6 +689,20 @@ read-only runtime-evidence refresh. Successful proof renews `Confirmed` under
 the same activation generation. Missing, incomplete, or transiently unavailable
 proof leaves the expired `Confirmed` record fail closed and retries only the
 read-only observation. It does not create an automatic reload loop.
+
+The Mac menu coordinator separately maintains capability proof for verified
+local interactive CLI runtimes. That maintenance never targets ChatGPT or a
+desktop app-server. It uses the same five-minute ACK lifetime as Rust, schedules
+one renewal from each exact ACK or newly discovered PID before one minute of
+validity remains, and holds both the in-process mutation lease and the
+cross-process runtime-activation lease through its final account, auth,
+activation-generation, PID, UID, start-identity, executable-vnode, runtime-kind,
+request-nonce, and ACK checks. The periodic status discovery is read-only;
+lease contention performs no reload or signal.
+Failure backs off per exact runtime topology, and one in-flight gate prevents a
+timer from creating a signal loop. Status inspection remains read-only and uses
+the same finite lifetime, so the menu, `doctor`, and the patched CLI cannot
+disagree about readiness.
 
 An explicit operator request may convert an expired confirmation into the
 existing same-target reconciliation or narrowly authorized cross-target escape.
