@@ -1,5 +1,136 @@
 import SwiftUI
 
+struct RateLimitResetConfirmationSession: Identifiable, Equatable {
+    let presentationId: UUID
+    let providerAccountId: String
+    let accountEmail: String
+
+    var id: UUID { presentationId }
+
+    static func begin(
+        requestedAccount: CodexAccount,
+        accounts: [CodexAccount],
+        presentations: [UUID: RateLimitResetInventoryPresentation],
+        authorization: (UUID) -> RateLimitResetCoordinatorAuthorization,
+        now: Date = Date()
+    ) -> Self? {
+        guard let providerAccountId = requestedAccount.normalizedProviderAccountId,
+              let currentAccount = accounts.first(where: {
+                  $0.normalizedProviderAccountId == providerAccountId
+              }),
+              RateLimitResetRedemptionActionPresentation.resolve(
+                  account: currentAccount,
+                  inventory: presentations[currentAccount.id],
+                  coordinatorAuthorization: authorization(currentAccount.id),
+                  now: now
+              ).isEnabled else {
+            return nil
+        }
+
+        return Self(
+            presentationId: UUID(),
+            providerAccountId: providerAccountId,
+            accountEmail: currentAccount.email
+        )
+    }
+
+    func authorizedAccountForSubmission(
+        accounts: [CodexAccount],
+        presentations: [UUID: RateLimitResetInventoryPresentation],
+        authorization: (UUID) -> RateLimitResetCoordinatorAuthorization,
+        now: Date = Date()
+    ) -> CodexAccount? {
+        guard let currentAccount = accounts.first(where: {
+            $0.normalizedProviderAccountId == providerAccountId
+        }),
+              RateLimitResetRedemptionActionPresentation.resolve(
+                  account: currentAccount,
+                  inventory: presentations[currentAccount.id],
+                  coordinatorAuthorization: authorization(currentAccount.id),
+                  now: now
+              ).isEnabled else {
+            return nil
+        }
+        return currentAccount
+    }
+}
+
+struct RateLimitResetConfirmationCoordinator {
+    private(set) var session: RateLimitResetConfirmationSession?
+
+    var isPresented: Bool { session != nil }
+
+    @discardableResult
+    mutating func open(
+        requestedAccount: CodexAccount,
+        accounts: [CodexAccount],
+        presentations: [UUID: RateLimitResetInventoryPresentation],
+        authorization: (UUID) -> RateLimitResetCoordinatorAuthorization,
+        now: Date = Date()
+    ) -> Bool {
+        session = RateLimitResetConfirmationSession.begin(
+            requestedAccount: requestedAccount,
+            accounts: accounts,
+            presentations: presentations,
+            authorization: authorization,
+            now: now
+        )
+        return isPresented
+    }
+
+    mutating func setPresented(
+        _ isPresented: Bool,
+        presenting presentedSession: RateLimitResetConfirmationSession
+    ) {
+        if !isPresented {
+            dismiss(presenting: presentedSession)
+        }
+    }
+
+    @discardableResult
+    mutating func cancel(
+        presenting presentedSession: RateLimitResetConfirmationSession
+    ) -> Bool {
+        dismiss(presenting: presentedSession)
+    }
+
+    @discardableResult
+    mutating func dismiss(
+        presenting presentedSession: RateLimitResetConfirmationSession
+    ) -> Bool {
+        guard session == presentedSession else { return false }
+        session = nil
+        return true
+    }
+
+    mutating func dismiss() {
+        session = nil
+    }
+
+    @discardableResult
+    mutating func submit(
+        presenting presentedSession: RateLimitResetConfirmationSession,
+        accounts: [CodexAccount],
+        presentations: [UUID: RateLimitResetInventoryPresentation],
+        authorization: (UUID) -> RateLimitResetCoordinatorAuthorization,
+        onSubmit: (UUID) -> Void,
+        now: Date = Date()
+    ) -> Bool {
+        guard self.session == presentedSession else { return false }
+        session = nil
+        guard let account = presentedSession.authorizedAccountForSubmission(
+            accounts: accounts,
+            presentations: presentations,
+            authorization: authorization,
+            now: now
+        ) else {
+            return false
+        }
+        onSubmit(account.id)
+        return true
+    }
+}
+
 struct PopoverContentView: View {
     @Bindable var manager: AccountManager
     var onAddAccount: () -> Void
@@ -9,6 +140,7 @@ struct PopoverContentView: View {
     var onRefreshResetInventory: (UUID) -> Void
     var resetRedemptionAuthorization: (UUID) -> RateLimitResetCoordinatorAuthorization
     var onOpenSettings: () -> Void
+    @State private var resetRedemptionConfirmation = RateLimitResetConfirmationCoordinator()
 
     private static let relativeFormatter = RelativeDateTimeFormatter()
     private static let popoverWidth: CGFloat = 620
@@ -17,6 +149,63 @@ struct PopoverContentView: View {
     private let columns = [
         GridItem(.adaptive(minimum: 136, maximum: 210), spacing: 8),
     ]
+
+    private var resetRedemptionConfirmationIsPresented: Binding<Bool> {
+        let presentedSession = resetRedemptionConfirmation.session
+        return Binding(
+            get: {
+                resetRedemptionConfirmation.session == presentedSession
+                    && presentedSession != nil
+            },
+            set: { isPresented in
+                guard let presentedSession else { return }
+                resetRedemptionConfirmation.setPresented(
+                    isPresented,
+                    presenting: presentedSession
+                )
+            }
+        )
+    }
+
+    private var resetRedemptionConfirmationTitle: String {
+        guard let session = resetRedemptionConfirmation.session else {
+            return "Redeem one banked reset?"
+        }
+        return "Redeem one banked reset for \(session.accountEmail)?"
+    }
+
+    private func requestResetRedemptionConfirmation(
+        for account: CodexAccount,
+        now: Date = Date()
+    ) {
+        resetRedemptionConfirmation.open(
+            requestedAccount: account,
+            accounts: manager.accounts,
+            presentations: manager.rateLimitResetPresentations,
+            authorization: resetRedemptionAuthorization,
+            now: now
+        )
+    }
+
+    private func confirmResetRedemption(
+        _ session: RateLimitResetConfirmationSession,
+        now: Date = Date()
+    ) {
+        guard resetRedemptionConfirmation.session == session else { return }
+        let submitted = resetRedemptionConfirmation.submit(
+            presenting: session,
+            accounts: manager.accounts,
+            presentations: manager.rateLimitResetPresentations,
+            authorization: resetRedemptionAuthorization,
+            onSubmit: onRedeemReset,
+            now: now
+        )
+        if !submitted {
+            manager.publishActivationNotice(
+                "Reset redemption was not submitted because eligibility changed; refresh this account and try again"
+            )
+        }
+    }
 
     private static func quotaColor(for percent: Double) -> Color {
         switch percent {
@@ -280,8 +469,8 @@ struct PopoverContentView: View {
                                     rateLimitResetPresentation: manager.rateLimitResetPresentations[account.id],
                                     rateLimitResetCoordinatorAuthorization:
                                         resetRedemptionAuthorization(account.id),
-                                    onRedeemReset: {
-                                        onRedeemReset(account.id)
+                                    onRequestResetRedemption: {
+                                        requestResetRedemptionConfirmation(for: account)
                                     },
                                     onRefreshResetInventory: {
                                         onRefreshResetInventory(account.id)
@@ -599,6 +788,24 @@ struct PopoverContentView: View {
             .padding(.vertical, 8)
         }
         .frame(width: Self.popoverWidth, height: Self.popoverHeight)
+        .confirmationDialog(
+            resetRedemptionConfirmationTitle,
+            isPresented: resetRedemptionConfirmationIsPresented,
+            titleVisibility: .visible,
+            presenting: resetRedemptionConfirmation.session
+        ) { session in
+            Button("Redeem Oldest Reset", role: .destructive) {
+                confirmResetRedemption(session)
+            }
+            Button("Cancel", role: .cancel) {
+                resetRedemptionConfirmation.cancel(presenting: session)
+            }
+        } message: { _ in
+            Text("This spends the oldest-expiring available reset for this account. It does not switch accounts.")
+        }
+        .onDisappear {
+            resetRedemptionConfirmation.dismiss()
+        }
     }
 }
 

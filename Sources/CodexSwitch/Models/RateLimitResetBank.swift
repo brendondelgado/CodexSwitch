@@ -95,6 +95,72 @@ struct RateLimitResetBank: Codable, Sendable, Equatable {
     func isFresh(at date: Date = Date(), maxAge: TimeInterval = 60) -> Bool {
         date.timeIntervalSince(fetchedAt) >= 0 && date.timeIntervalSince(fetchedAt) < maxAge
     }
+
+    var isStructurallyValidPersistenceObservation: Bool {
+        fetchedAt.timeIntervalSinceReferenceDate.isFinite
+            && structurallyValidAvailableCredits(at: fetchedAt) != nil
+    }
+}
+
+enum RateLimitResetInventoryPersistencePolicy {
+    static func newestValidBank(
+        observed: RateLimitResetBank?,
+        retained: RateLimitResetBank?
+    ) -> RateLimitResetBank? {
+        let validObserved = observed.flatMap {
+            $0.isStructurallyValidPersistenceObservation ? $0 : nil
+        }
+        let validRetained = retained.flatMap {
+            $0.isStructurallyValidPersistenceObservation ? $0 : nil
+        }
+
+        switch (validObserved, validRetained) {
+        case let (observed?, retained?) where observed.fetchedAt > retained.fetchedAt:
+            return observed
+        case let (observed?, retained?) where observed.fetchedAt == retained.fetchedAt:
+            return observed == retained ? observed : retained
+        case (_, let retained?):
+            return retained
+        case (let observed?, nil):
+            return observed
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    static func reconciling(
+        _ observedAccounts: [CodexAccount],
+        preservingFrom retainedAccounts: [CodexAccount]
+    ) -> [CodexAccount]? {
+        var retainedBanks: [String: RateLimitResetBank] = [:]
+        var retainedIdentities = Set<String>()
+        for account in retainedAccounts {
+            guard let providerAccountId = account.normalizedProviderAccountId,
+                  retainedIdentities.insert(providerAccountId).inserted else {
+                return nil
+            }
+            if let bank = account.rateLimitResetBank,
+               bank.isStructurallyValidPersistenceObservation {
+                retainedBanks[providerAccountId] = bank
+            }
+        }
+
+        var observedIdentities = Set<String>()
+        var reconciled: [CodexAccount] = []
+        reconciled.reserveCapacity(observedAccounts.count)
+        for var account in observedAccounts {
+            guard let providerAccountId = account.normalizedProviderAccountId,
+                  observedIdentities.insert(providerAccountId).inserted else {
+                return nil
+            }
+            account.rateLimitResetBank = newestValidBank(
+                observed: account.rateLimitResetBank,
+                retained: retainedBanks[providerAccountId]
+            )
+            reconciled.append(account)
+        }
+        return reconciled
+    }
 }
 
 enum RateLimitResetRedemptionReason: String, Codable, Sendable, Equatable {

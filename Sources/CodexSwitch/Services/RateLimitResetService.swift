@@ -87,6 +87,8 @@ struct RateLimitResetFailureState: Equatable, Sendable {
     let credentialFingerprint: String?
     let consecutiveFailureCount: Int
     let decision: RateLimitResetRetryDecision
+    let error: String
+    let observedAt: Date
 
     func blocksRetry(
         currentCredentialFingerprint: String?,
@@ -110,7 +112,7 @@ enum RateLimitResetFailurePolicy {
         _ error: RateLimitResetServiceError
     ) -> RateLimitResetFailureClassification {
         switch error {
-        case .httpError(401), .httpError(403), .submissionUnauthorized:
+        case .httpError(401), .httpError(403):
             return .authentication
         case .httpError(429):
             return .rateLimited
@@ -122,8 +124,33 @@ enum RateLimitResetFailurePolicy {
              .missingCreditIdentifier:
             return .malformed
         case .httpError, .transport, .journalUnavailable, .unresolvedAttempt,
-             .creditAlreadySucceeded:
+             .creditAlreadySucceeded, .submissionUnauthorized:
             return .transient
+        }
+    }
+
+    static func displayMessage(for error: RateLimitResetServiceError) -> String {
+        switch error {
+        case .invalidResponse:
+            return "Reset inventory returned an invalid response"
+        case .httpError(let statusCode):
+            return "Reset inventory request failed (HTTP \(statusCode))"
+        case .malformedInventory:
+            return "Reset inventory response was malformed"
+        case .malformedConsumeResponse:
+            return "Reset redemption response was malformed"
+        case .missingCreditIdentifier:
+            return "Reset inventory credit identifier is missing"
+        case .creditAlreadySucceeded:
+            return "This banked reset was already redeemed"
+        case .unresolvedAttempt:
+            return "A banked reset is awaiting reconciliation"
+        case .submissionUnauthorized:
+            return "Reset redemption is not authorized"
+        case .journalUnavailable:
+            return "Reset journal is unavailable"
+        case .transport:
+            return "Reset inventory transport failed"
         }
     }
 
@@ -191,7 +218,9 @@ enum RateLimitResetFailurePolicy {
                 for: error,
                 consecutiveFailureCount: failureCount,
                 now: now
-            )
+            ),
+            error: displayMessage(for: error),
+            observedAt: now
         )
     }
 

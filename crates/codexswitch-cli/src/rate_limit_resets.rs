@@ -508,7 +508,7 @@ enum ResetAttemptOrigin {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ResetAttemptState {
+pub(crate) enum ResetAttemptState {
     Prepared,
     Uncertain,
     ConsumptionObserved,
@@ -608,6 +608,156 @@ impl Default for ResetAttemptJournal {
 
 pub fn reset_attempt_journal_path(store_path: &Path) -> PathBuf {
     store_path.with_extension("reset-attempts.json")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ResetJournalState {
+    Observed,
+    Unavailable,
+    ManualReview,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResetAttemptObservation {
+    pub request_id: Uuid,
+    pub state: ResetAttemptState,
+}
+
+/// Public mirror contract: only an exact request ID in a readable, unblocked
+/// journal can resolve a pending operation. Inventory timestamps are not proof.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountResetAttemptStatus {
+    pub schema_version: u8,
+    pub account_id: String,
+    pub journal_state: ResetJournalState,
+    pub redemption_blocked: bool,
+    pub attempts: Vec<ResetAttemptObservation>,
+}
+
+impl AccountResetAttemptStatus {
+    pub fn single_blocking_request_id(&self) -> Option<Uuid> {
+        if self.journal_state != ResetJournalState::Observed || !self.redemption_blocked {
+            return None;
+        }
+        let mut pending = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.state.suppresses_redemption());
+        let request_id = pending.next()?.request_id;
+        pending.next().is_none().then_some(request_id)
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResetJournalObservation {
+    pub schema_version: u8,
+    pub journal_state: ResetJournalState,
+    pub accounts: Vec<AccountResetAttemptStatus>,
+    #[serde(skip)]
+    pub missing: bool,
+}
+
+impl ResetJournalObservation {
+    pub fn account(&self, account_id: &str) -> Option<&AccountResetAttemptStatus> {
+        let account_id = normalize_provider_account_id(account_id)?;
+        self.accounts
+            .iter()
+            .find(|status| status.account_id == account_id)
+    }
+}
+
+/// One bounded, no-follow read. Never locks, migrates, repairs, prunes, or
+/// exposes credit IDs, credentials, owner hashes, or provider error details.
+pub(crate) fn observe_reset_attempts(store_path: &Path) -> ResetJournalObservation {
+    let unavailable = || ResetJournalObservation {
+        schema_version: 1,
+        journal_state: ResetJournalState::Unavailable,
+        accounts: Vec::new(),
+        missing: false,
+    };
+    let Ok(snapshot) = secure_file::observe(
+        &reset_attempt_journal_path(store_path),
+        RESET_ATTEMPT_JOURNAL_MAX_BYTES,
+        true,
+    ) else {
+        return unavailable();
+    };
+    let Some(bytes) = snapshot.bytes() else {
+        return ResetJournalObservation {
+            missing: true,
+            ..unavailable()
+        };
+    };
+    let Ok(journal) = serde_json::from_slice::<ResetAttemptJournal>(bytes) else {
+        return unavailable();
+    };
+    // Older journals require mutation/migration and cannot authorize UI release.
+    if journal.version != RESET_ATTEMPT_JOURNAL_VERSION
+        || journal.attempts.len() > RESET_TERMINAL_ENTRY_CAP + RESET_UNRESOLVED_ENTRY_CAP
+    {
+        return unavailable();
+    }
+    let mut request_ids = std::collections::HashSet::new();
+    let mut accounts = std::collections::BTreeMap::<String, AccountResetAttemptStatus>::new();
+    let journal_state = if journal.manual_review.is_some() {
+        ResetJournalState::ManualReview
+    } else {
+        ResetJournalState::Observed
+    };
+    for attempt in journal.attempts {
+        let Some(account_id) = normalized_reset_account_id(&attempt.account_id) else {
+            return unavailable();
+        };
+        if !request_ids.insert(attempt.request_id) {
+            return unavailable();
+        }
+        let status =
+            accounts
+                .entry(account_id.clone())
+                .or_insert_with(|| AccountResetAttemptStatus {
+                    schema_version: 1,
+                    account_id,
+                    journal_state,
+                    redemption_blocked: journal_state != ResetJournalState::Observed,
+                    attempts: Vec::new(),
+                });
+        status.redemption_blocked |= attempt.state.suppresses_redemption();
+        status.attempts.push(ResetAttemptObservation {
+            request_id: attempt.request_id,
+            state: attempt.state,
+        });
+    }
+    ResetJournalObservation {
+        schema_version: 1,
+        journal_state,
+        accounts: accounts.into_values().collect(),
+        missing: false,
+    }
+}
+
+pub(crate) fn normalized_reset_account_id(value: &str) -> Option<String> {
+    normalize_provider_account_id(value)
+        .filter(|value| value.len() <= 256 && !value.chars().any(char::is_control))
+}
+
+/// Typed proof that the consume transport never invoked send/execute.
+#[derive(Debug)]
+struct ResetNotSubmitted;
+
+impl fmt::Display for ResetNotSubmitted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("reset request rejected before submission")
+    }
+}
+
+impl std::error::Error for ResetNotSubmitted {}
+
+fn not_submitted(error: anyhow::Error) -> anyhow::Error {
+    error.context(ResetNotSubmitted)
 }
 
 struct ResetJournalTransaction {
@@ -1148,7 +1298,7 @@ where
     )
 }
 
-fn reconcile_or_attempt_reset_with_provider_guard_and_request_id<B, Q, C, V>(
+pub(crate) fn reconcile_or_attempt_reset_with_provider_guard_and_request_id<B, Q, C, V>(
     context: ResetReconciliationContext<'_>,
     dependencies: ResetReconciliationDependencies<B, Q, C>,
     mut validate_provider_io: V,
@@ -1579,6 +1729,11 @@ where
                 });
             (Some(result.code), state, last_error)
         }
+        Err(error) if error.is::<ResetNotSubmitted>() => (
+            None,
+            ResetAttemptState::TerminalNotApplied,
+            Some("reset request rejected before submission".to_string()),
+        ),
         Err(error) => (
             None,
             ResetAttemptState::Uncertain,
@@ -1606,10 +1761,9 @@ where
             quota_reconciled: false,
             detail: Some(format!(
                 "reset was definitively not applied ({})",
-                consume_code_name(
-                    response_code
-                        .context("terminal reset response lost its durable response code")?
-                )
+                response_code
+                    .map(consume_code_name)
+                    .unwrap_or("not_submitted")
             )),
         });
     }
@@ -1748,6 +1902,14 @@ where
     Q: FnMut(&mut CodexAccount) -> Result<()>,
     V: FnMut(&AccountStoreLock) -> Result<()>,
 {
+    if expected_attempt.state == ResetAttemptState::TerminalNotApplied {
+        return Ok(ResetFlowResult {
+            state: ResetFlowState::TerminalNotApplied,
+            consumption_observed: false,
+            quota_reconciled: false,
+            detail: Some("reset was definitively not applied".to_string()),
+        });
+    }
     let ResetReconciliationObservation {
         bank,
         inventory_fresh,
@@ -2799,20 +2961,23 @@ pub fn consume_rate_limit_reset(
     bank: &RateLimitResetBank,
     redeem_request_id: Uuid,
 ) -> Result<ConsumeResult> {
-    let client = reset_http_client()?;
+    let client = reset_http_client().map_err(not_submitted)?;
     consume_rate_limit_reset_with(
         account,
         bank,
         Utc::now(),
         redeem_request_id,
         |account, body| {
-            let response = client
+            let request = client
                 .post(RESET_CONSUME_URL)
                 .bearer_auth(&account.access_token)
                 .header("ChatGPT-Account-Id", &account.account_id)
                 .header("Accept", "application/json")
                 .json(body)
-                .send()
+                .build()
+                .map_err(|error| not_submitted(error.into()))?;
+            let response = client
+                .execute(request)
                 .with_context(|| format!("failed to consume reset for {}", account.email))?;
             let status = response.status().as_u16();
             let body = response
@@ -2834,34 +2999,36 @@ fn consume_rate_limit_reset_with<F>(
 where
     F: FnOnce(&CodexAccount, &ConsumeRequest<'_>) -> Result<HttpResponse>,
 {
-    if !account.has_complete_token_material() {
-        bail!(
-            "reset consume transport requires complete runtime credentials for {}",
-            account.email
-        );
-    }
-    if !account.has_usable_inference_token_at(now) {
-        bail!(
-            "reset consume transport requires a usable inference token for {}",
-            account.email
-        );
-    }
-    if quota_availability_at(account, now) != QuotaAvailability::Blocked {
-        bail!(
-            "reset consume transport requires fresh independently blocked quota for {}",
-            account.email
-        );
-    }
-    if !bank.has_available_reset(now) {
-        bail!(
-            "reset bank has no concrete unexpired available credit for {}",
-            account.email
-        );
-    }
-    let selected_credit_id = bank
-        .oldest_expiring_available_credit(now)
-        .and_then(RateLimitResetCredit::normalized_id)
-        .context("reset bank has no concrete available credit identifier")?;
+    let selected_credit_id = (|| -> Result<&str> {
+        if !account.has_complete_token_material() {
+            bail!(
+                "reset consume transport requires complete runtime credentials for {}",
+                account.email
+            );
+        }
+        if !account.has_usable_inference_token_at(now) {
+            bail!(
+                "reset consume transport requires a usable inference token for {}",
+                account.email
+            );
+        }
+        if quota_availability_at(account, now) != QuotaAvailability::Blocked {
+            bail!(
+                "reset consume transport requires fresh independently blocked quota for {}",
+                account.email
+            );
+        }
+        if !bank.has_available_reset(now) {
+            bail!(
+                "reset bank has no concrete unexpired available credit for {}",
+                account.email
+            );
+        }
+        bank.oldest_expiring_available_credit(now)
+            .and_then(RateLimitResetCredit::normalized_id)
+            .context("reset bank has no concrete available credit identifier")
+    })()
+    .map_err(not_submitted)?;
     let request = ConsumeRequest {
         credit_id: selected_credit_id,
         redeem_request_id,
@@ -6001,6 +6168,234 @@ mod tests {
         )?;
         assert_eq!(flow.state, ResetFlowState::Suppressed);
         assert!(flow.detail.unwrap().contains("manual review"));
+        Ok(())
+    }
+
+    fn observation_fixture(now: DateTime<Utc>) -> ResetAttemptJournal {
+        let mut account = account("private@example.com", true, 100.0, 100.0);
+        account.account_id = " PROVIDER-ID ".to_string();
+        let mut attempt = new_reset_attempt(
+            &account,
+            &bank(now, &[ChronoDuration::days(10)]),
+            Some("private-credit".to_string()),
+            Uuid::new_v4(),
+            now,
+            ResetAttemptOrigin::LocalRequest,
+            ResetAttemptState::TerminalNotApplied,
+        );
+        attempt.last_error = Some("private-provider-error".to_string());
+        ResetAttemptJournal {
+            attempts: vec![attempt],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reset_observation_is_read_only_bounded_and_secret_free() -> Result<()> {
+        let temp = TempDir::new()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+        let store_path = temp.path().join("accounts.json");
+        let path = reset_attempt_journal_path(&store_path);
+        let journal = observation_fixture(Utc::now());
+        let bytes = serde_json::to_vec(&journal)?;
+        fs::write(&path, &bytes)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let before = fs::metadata(&path)?;
+        let entries = fs::read_dir(temp.path())?.count();
+        let observation = observe_reset_attempts(&store_path);
+        assert_eq!(observation.journal_state, ResetJournalState::Observed);
+        let status = observation.account(" provider-ID ").unwrap();
+        assert_eq!(status.account_id, "provider-id");
+        assert!(!status.redemption_blocked);
+        assert_eq!(
+            status.attempts[0].request_id,
+            journal.attempts[0].request_id
+        );
+        let value = serde_json::to_value(&observation)?;
+        assert_eq!(
+            value["accounts"][0]["attempts"][0]["state"],
+            "terminal_not_applied"
+        );
+        let rendered = value.to_string();
+        for secret in [
+            "private@example.com",
+            "private-credit",
+            "private-provider-error",
+            "stableOwner",
+            "lastError",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+        assert_eq!(fs::read(&path)?, bytes);
+        assert_eq!(fs::metadata(&path)?.modified()?, before.modified()?);
+        assert_eq!(
+            fs::metadata(&path)?.permissions().mode(),
+            before.permissions().mode()
+        );
+        assert_eq!(fs::read_dir(temp.path())?.count(), entries);
+        assert!(!store_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reset_observation_absent_invalid_legacy_oversized_and_duplicates_fail_closed() -> Result<()>
+    {
+        let temp = TempDir::new()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+        let store_path = temp.path().join("accounts.json");
+        let path = reset_attempt_journal_path(&store_path);
+        assert_eq!(
+            observe_reset_attempts(&store_path).journal_state,
+            ResetJournalState::Unavailable
+        );
+        assert_eq!(fs::read_dir(temp.path())?.count(), 0);
+        let valid = serde_json::to_value(observation_fixture(Utc::now()))?;
+        let mut legacy = valid.clone();
+        legacy["version"] = json!(2);
+        let mut duplicate = valid.clone();
+        duplicate["attempts"]
+            .as_array_mut()
+            .unwrap()
+            .push(valid["attempts"][0].clone());
+        let mut unknown_state = valid.clone();
+        unknown_state["attempts"][0]["state"] = json!("future_state");
+        let mut invalid_id = valid.clone();
+        invalid_id["attempts"][0]["accountId"] = json!("provider\nsecret");
+        let mut excessive = valid.clone();
+        excessive["attempts"] = json!(vec![valid["attempts"][0].clone(); 193]);
+        for bytes in [
+            b"invalid-json".to_vec(),
+            vec![b' '; RESET_ATTEMPT_JOURNAL_MAX_BYTES + 1],
+            serde_json::to_vec(&legacy)?,
+            serde_json::to_vec(&duplicate)?,
+            serde_json::to_vec(&unknown_state)?,
+            serde_json::to_vec(&invalid_id)?,
+            serde_json::to_vec(&excessive)?,
+        ] {
+            fs::write(&path, &bytes)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            let observation = observe_reset_attempts(&store_path);
+            assert_eq!(observation.journal_state, ResetJournalState::Unavailable);
+            assert!(observation.accounts.is_empty());
+            assert_eq!(fs::read(&path)?, bytes);
+            assert_eq!(fs::read_dir(temp.path())?.count(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reset_observation_manual_review_and_unresolved_override_terminal_history() -> Result<()> {
+        let temp = TempDir::new()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+        let store_path = temp.path().join("accounts.json");
+        let path = reset_attempt_journal_path(&store_path);
+        for state in [
+            ResetAttemptState::Prepared,
+            ResetAttemptState::Uncertain,
+            ResetAttemptState::ConsumptionObserved,
+            ResetAttemptState::ReconciliationOverdue,
+        ] {
+            let mut journal = observation_fixture(Utc::now());
+            let mut pending = journal.attempts[0].clone();
+            pending.request_id = Uuid::new_v4();
+            pending.state = state;
+            let pending_id = pending.request_id;
+            journal.attempts.push(pending);
+            fs::write(&path, serde_json::to_vec(&journal)?)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            let observation = observe_reset_attempts(&store_path);
+            let status = observation.account("provider-id").unwrap();
+            assert!(status.redemption_blocked);
+            assert_eq!(status.single_blocking_request_id(), Some(pending_id));
+            let mut second = journal.attempts[1].clone();
+            second.request_id = Uuid::new_v4();
+            journal.attempts.push(second);
+            fs::write(&path, serde_json::to_vec(&journal)?)?;
+            assert_eq!(
+                observe_reset_attempts(&store_path)
+                    .account("provider-id")
+                    .unwrap()
+                    .single_blocking_request_id(),
+                None
+            );
+        }
+        let mut journal = observation_fixture(Utc::now());
+        mark_reset_journal_manual_review(&mut journal, Utc::now(), 1, "private-error");
+        let bytes = serde_json::to_vec(&journal)?;
+        fs::write(&path, &bytes)?;
+        let observation = observe_reset_attempts(&store_path);
+        assert_eq!(observation.journal_state, ResetJournalState::ManualReview);
+        assert!(
+            observation
+                .account("provider-id")
+                .unwrap()
+                .redemption_blocked
+        );
+        assert_eq!(
+            observation
+                .account("provider-id")
+                .unwrap()
+                .single_blocking_request_id(),
+            None
+        );
+        assert!(!serde_json::to_string(&observation)?.contains("private-error"));
+        assert_eq!(fs::read(&path)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn reset_observation_rejects_symlinks_directories_and_fifo_without_mutation() -> Result<()> {
+        let temp = TempDir::new()?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+        let store_path = temp.path().join("accounts.json");
+        let path = reset_attempt_journal_path(&store_path);
+        let outside = temp.path().join("outside.json");
+        let bytes = serde_json::to_vec(&observation_fixture(Utc::now()))?;
+        fs::write(&outside, &bytes)?;
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600))?;
+        symlink(&outside, &path)?;
+        assert_eq!(
+            observe_reset_attempts(&store_path).journal_state,
+            ResetJournalState::Unavailable
+        );
+        assert!(path.is_symlink());
+        assert_eq!(fs::read(&outside)?, bytes);
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        assert_eq!(
+            observe_reset_attempts(&store_path).journal_state,
+            ResetJournalState::Unavailable
+        );
+        fs::remove_dir(&path)?;
+        let name = std::ffi::CString::new(path.to_str().unwrap())?;
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            observe_reset_attempts(&store_path).journal_state,
+            ResetJournalState::Unavailable
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_transport_pre_send_errors_are_typed_but_send_failures_are_unknown() -> Result<()> {
+        let now = Utc::now();
+        let mut account = account("private@example.com", true, 100.0, 100.0);
+        let bank = bank(now, &[ChronoDuration::days(10)]);
+        account.account_id = "invalid\nheader".to_string();
+        let error = consume_rate_limit_reset(&account, &bank, Uuid::new_v4()).unwrap_err();
+        assert!(error.is::<ResetNotSubmitted>());
+        account.account_id = "provider-id".to_string();
+        let error = consume_rate_limit_reset_with(&account, &bank, now, Uuid::new_v4(), |_, _| {
+            bail!("transport timed out after send")
+        })
+        .unwrap_err();
+        assert!(!error.is::<ResetNotSubmitted>());
+        account.access_token.clear();
+        let error = consume_rate_limit_reset_with(&account, &bank, now, Uuid::new_v4(), |_, _| {
+            panic!("validation must prevent send")
+        })
+        .unwrap_err();
+        assert!(error.is::<ResetNotSubmitted>());
         Ok(())
     }
 

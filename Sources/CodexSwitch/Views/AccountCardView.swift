@@ -8,12 +8,11 @@ struct AccountCardView: View {
     var pollingError: String? = nil
     var rateLimitResetPresentation: RateLimitResetInventoryPresentation? = nil
     var rateLimitResetCoordinatorAuthorization: RateLimitResetCoordinatorAuthorization = .authorized
-    var onRedeemReset: (() -> Void)? = nil
+    var onRequestResetRedemption: (() -> Void)? = nil
     var onRefreshResetInventory: (() -> Void)? = nil
     let onReauthenticate: (() -> Void)?
     let onForceSwap: (() -> Void)?
     @State private var isHovering = false
-    @State private var isConfirmingResetRedemption = false
 
     private static let activeGreen = Color(red: 0.15, green: 0.68, blue: 0.25)
     static let poolTargetLabel = "Pool Target"
@@ -361,12 +360,12 @@ struct AccountCardView: View {
 
     @discardableResult
     @MainActor
-    func handleConfirmedResetRedemption(at now: Date = Date()) -> Bool {
+    func handleResetRedemptionRequest(at now: Date = Date()) -> Bool {
         guard resetRedemptionActionPresentation(at: now).isEnabled,
-              let onRedeemReset else {
+              let onRequestResetRedemption else {
             return false
         }
-        onRedeemReset()
+        onRequestResetRedemption()
         return true
     }
 
@@ -492,7 +491,7 @@ struct AccountCardView: View {
 
             if let rateLimitResetLine {
                 let redemptionAction = resetRedemptionActionPresentation()
-                let redemptionIsConnected = onRedeemReset != nil
+                let redemptionIsConnected = onRequestResetRedemption != nil
                 let offersRefresh = rateLimitResetPresentation?.offersObservationRefresh == true
                 HStack(spacing: 4) {
                     HStack(spacing: 4) {
@@ -522,7 +521,7 @@ struct AccountCardView: View {
                     } else if let availableCount = currentRateLimitResetCount,
                               availableCount > 0 {
                         Button {
-                            isConfirmingResetRedemption = true
+                            _ = handleResetRedemptionRequest()
                         } label: {
                             Label("Redeem", systemImage: "arrow.counterclockwise")
                         }
@@ -669,7 +668,7 @@ struct AccountCardView: View {
                 account: account,
                 inventory: rateLimitResetPresentation,
                 coordinatorAuthorization: rateLimitResetCoordinatorAuthorization,
-                redemptionHandlerAvailable: onRedeemReset != nil,
+                redemptionHandlerAvailable: onRequestResetRedemption != nil,
                 now: Date()
             )
 
@@ -691,7 +690,7 @@ struct AccountCardView: View {
             }
             if resetPresentation.isEnabled {
                 Button(resetPresentation.menuItemTitle) {
-                    isConfirmingResetRedemption = true
+                    _ = handleResetRedemptionRequest()
                 }
             } else {
                 Button(resetPresentation.menuItemTitle) {}
@@ -705,18 +704,6 @@ struct AccountCardView: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(account.email, forType: .string)
             }
-        }
-        .confirmationDialog(
-            "Redeem one banked reset for \(account.email)?",
-            isPresented: $isConfirmingResetRedemption,
-            titleVisibility: .visible
-        ) {
-            Button("Redeem Oldest Reset", role: .destructive) {
-                _ = handleConfirmedResetRedemption()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This spends the oldest-expiring available reset for this account. It does not switch accounts.")
         }
     }
 }

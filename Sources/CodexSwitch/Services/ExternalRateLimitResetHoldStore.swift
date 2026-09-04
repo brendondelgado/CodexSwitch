@@ -62,7 +62,11 @@ struct ExternalRateLimitResetHoldStore {
         observedAt: Date,
         blockedUntil: Date
     ) throws -> Hold? {
-        guard !providerAccountId.isEmpty, blockedUntil > observedAt else { return nil }
+        guard let providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+            providerAccountId
+        ), blockedUntil > observedAt else {
+            return nil
+        }
 
         return try withHolds { holds in
             _ = Self.pruneExpired(&holds, at: observedAt)
@@ -79,7 +83,7 @@ struct ExternalRateLimitResetHoldStore {
     }
 
     func activeHolds(at now: Date) throws -> [String: Hold] {
-        try withHolds { holds in
+        return try withHolds { holds in
             _ = Self.pruneExpired(&holds, at: now)
             return holds
         }
@@ -91,7 +95,12 @@ struct ExternalRateLimitResetHoldStore {
         snapshot: QuotaSnapshot,
         at now: Date
     ) throws -> Hold? {
-        try withHolds { holds in
+        guard let providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+            providerAccountId
+        ) else {
+            return nil
+        }
+        return try withHolds { holds in
             _ = Self.pruneExpired(&holds, at: now)
             guard let hold = holds[providerAccountId],
                   snapshot.fetchedAt > hold.observedAt,
@@ -112,8 +121,8 @@ struct ExternalRateLimitResetHoldStore {
         let committed = try transaction.withExclusiveLock { lockedFile in
             let current = try lockedFile.read()
             let loaded = try loadHolds(secureData: current.bytes)
-            var proposed = loaded.values
-            let original = proposed
+            let original = loaded.values
+            var proposed = try Self.normalizedHolds(original)
             let result = try operation(&proposed)
 
             if proposed != original || loaded.migratedFromUserDefaults {
@@ -206,6 +215,25 @@ struct ExternalRateLimitResetHoldStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return try encoder.encode(Snapshot(version: 1, holdsByProviderAccountId: holds))
+    }
+
+    private static func normalizedHolds(_ holds: [String: Hold]) throws -> [String: Hold] {
+        var normalized: [String: Hold] = [:]
+        for (providerAccountId, hold) in holds {
+            guard let providerAccountId = RateLimitResetProviderAccountIdentity.normalize(
+                providerAccountId
+            ) else {
+                throw ExternalRateLimitResetHoldStoreError.corruptState(
+                    "invalid provider account key"
+                )
+            }
+            if let retained = normalized[providerAccountId],
+               retained.blockedUntil >= hold.blockedUntil {
+                continue
+            }
+            normalized[providerAccountId] = hold
+        }
+        return normalized
     }
 
     private static func pruneExpired(

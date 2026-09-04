@@ -51,9 +51,13 @@ use pool_authority::{
     TargetRequestDisposition,
 };
 use quota::{apply_fetch_result, fetch_quota, FetchResult};
+#[cfg(test)]
+use rate_limit_resets::reconcile_or_attempt_reset_with_provider_guard;
 use rate_limit_resets::{
-    consume_rate_limit_reset, fetch_rate_limit_reset_bank, orchestrate_reset_with_provider_guard,
-    reconcile_or_attempt_reset_with_provider_guard, ConsumeResult, RateLimitResetBank,
+    consume_rate_limit_reset, fetch_rate_limit_reset_bank, normalized_reset_account_id,
+    observe_reset_attempts, orchestrate_reset_with_provider_guard,
+    reconcile_or_attempt_reset_with_provider_guard_and_request_id, ConsumeResult,
+    RateLimitResetBank, ResetAttemptState, ResetFlowState, ResetJournalState,
     ResetOrchestrationContext, ResetOrchestrationDependencies, ResetQuotaRefreshStrategy,
     ResetReconciliationContext, ResetReconciliationDependencies, SmartResetReason,
 };
@@ -64,9 +68,11 @@ use reload::{
 use ring::digest::{digest, Context as DigestContext, SHA256};
 use serde::Serialize;
 use serde_json::Value;
+use std::cell::Cell;
 use std::ffi::OsString;
 #[cfg(test)]
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -205,6 +211,13 @@ enum Command {
     /// Redeem one banked reset for one blocked paid account without activating it.
     RedeemReset {
         account: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Read only the bounded durable reset journal; never performs provider I/O.
+    ResetAttemptStatus {
         #[arg(long)]
         json: bool,
     },
@@ -393,8 +406,26 @@ fn main() -> Result<()> {
         Command::InstallPreparedCodex { json } => install_prepared_codex(json),
         Command::AutoInstallCodexUpdate { json } => auto_install_codex_update(json),
         Command::Swap { account } => swap(&store_path, &auth_path, &account),
-        Command::RedeemReset { account, json } => {
-            redeem_reset(&store_path, &auth_path, &account, json)
+        Command::RedeemReset {
+            account,
+            json,
+            request_id,
+        } => match request_id {
+            Some(request_id) => redeem_reset_with_request_id(
+                &store_path,
+                &auth_path,
+                &account,
+                json,
+                Some(request_id),
+            ),
+            None => redeem_reset(&store_path, &auth_path, &account, json),
+        },
+        Command::ResetAttemptStatus { json: _ } => {
+            println!(
+                "{}",
+                serde_json::to_string(&observe_reset_attempts(&store_path))?
+            );
+            Ok(())
         }
         Command::AutomaticResetPolicy { command } => automatic_reset_policy(&store_path, command),
         Command::RotateNow {
@@ -1873,33 +1904,221 @@ struct RedeemResetReport {
     remaining_percent: Option<f64>,
 }
 
+const REDEEM_RESET_FAILURE_SCHEMA_VERSION: u8 = 1;
+const REDEEM_RESET_FAILURE_MAX_BYTES: usize = 2_048;
+const REDEEM_RESET_REJECTED_MESSAGE: &str =
+    "No banked reset was applied; refresh this account and try again";
+const REDEEM_RESET_OUTCOME_UNKNOWN_MESSAGE: &str =
+    "Reset submission outcome is unknown; reconcile before retrying";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum RedeemResetFailureDisposition {
+    Rejected,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RedeemResetFailureEnvelope {
+    schema_version: u8,
+    status: &'static str,
+    disposition: RedeemResetFailureDisposition,
+    message: &'static str,
+    account_id: Option<String>,
+    request_id: Uuid,
+    blocking_request_id: Option<Uuid>,
+}
+
+impl RedeemResetFailureEnvelope {
+    fn for_operation(store_path: &Path, operation: &ResetOperation) -> Self {
+        let observation = observe_reset_attempts(store_path);
+        let status = operation
+            .account_id
+            .as_deref()
+            .and_then(|id| observation.account(id));
+        let disposition = if status.is_some_and(|status| status.redemption_blocked)
+            || matches!(
+                operation.flow_state.get(),
+                Some(ResetFlowState::Suppressed | ResetFlowState::ReconciledUsable)
+            ) {
+            RedeemResetFailureDisposition::OutcomeUnknown
+        } else if observation.journal_state == ResetJournalState::Observed
+            && status.is_some_and(|status| {
+                status.attempts.iter().any(|attempt| {
+                    attempt.request_id == operation.request_id
+                        && attempt.state == ResetAttemptState::TerminalNotApplied
+                })
+            })
+        {
+            RedeemResetFailureDisposition::Rejected
+        } else if !operation.submission_started.get()
+            && (observation.journal_state == ResetJournalState::Observed || observation.missing)
+            && !status.is_some_and(|status| {
+                status
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.request_id == operation.request_id)
+            })
+        {
+            RedeemResetFailureDisposition::Rejected
+        } else {
+            RedeemResetFailureDisposition::OutcomeUnknown
+        };
+        let message = match disposition {
+            RedeemResetFailureDisposition::Rejected => REDEEM_RESET_REJECTED_MESSAGE,
+            RedeemResetFailureDisposition::OutcomeUnknown => REDEEM_RESET_OUTCOME_UNKNOWN_MESSAGE,
+        };
+        Self {
+            schema_version: REDEEM_RESET_FAILURE_SCHEMA_VERSION,
+            status: "error",
+            disposition,
+            message,
+            account_id: operation.account_id.clone(),
+            request_id: operation.request_id,
+            blocking_request_id: (disposition == RedeemResetFailureDisposition::OutcomeUnknown)
+                .then(|| status.and_then(|status| status.single_blocking_request_id()))
+                .flatten(),
+        }
+    }
+}
+
+struct ResetOperation {
+    account_id: Option<String>,
+    request_id: Uuid,
+    submission_started: Cell<bool>,
+    flow_state: Cell<Option<ResetFlowState>>,
+}
+
+impl ResetOperation {
+    fn new(request_id: Option<Uuid>) -> Self {
+        Self {
+            account_id: None,
+            request_id: request_id.unwrap_or_else(Uuid::new_v4),
+            submission_started: Cell::new(false),
+            flow_state: Cell::new(None),
+        }
+    }
+}
+
 pub(crate) fn redeem_reset(
     store_path: &Path,
     auth_path: &Path,
     selector: &str,
     json_output: bool,
 ) -> Result<()> {
-    let report = redeem_reset_with(
+    redeem_reset_with_request_id(store_path, auth_path, selector, json_output, None)
+}
+
+fn redeem_reset_with_request_id(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    json_output: bool,
+    request_id: Option<Uuid>,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    redeem_reset_with_output_and_request_id(
         store_path,
         auth_path,
         selector,
+        json_output,
+        &mut output,
         fetch_quota,
         fetch_rate_limit_reset_bank,
         consume_rate_limit_reset,
-    )?;
+        request_id,
+    )
+}
+
+#[cfg(test)]
+fn redeem_reset_with_output<F, B, C, W>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    json_output: bool,
+    output: &mut W,
+    fetch_quota_fn: F,
+    fetch_reset_bank_fn: B,
+    consume_reset_fn: C,
+) -> Result<()>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    W: Write,
+{
+    redeem_reset_with_output_and_request_id(
+        store_path,
+        auth_path,
+        selector,
+        json_output,
+        output,
+        fetch_quota_fn,
+        fetch_reset_bank_fn,
+        consume_reset_fn,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn redeem_reset_with_output_and_request_id<F, B, C, W>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    json_output: bool,
+    output: &mut W,
+    fetch_quota_fn: F,
+    fetch_reset_bank_fn: B,
+    consume_reset_fn: C,
+    request_id: Option<Uuid>,
+) -> Result<()>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    W: Write,
+{
+    let mut operation = ResetOperation::new(request_id);
+    let report = match redeem_reset_with_submission_state(
+        store_path,
+        auth_path,
+        selector,
+        &mut operation,
+        fetch_quota_fn,
+        fetch_reset_bank_fn,
+        consume_reset_fn,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            if json_output {
+                let envelope = RedeemResetFailureEnvelope::for_operation(store_path, &operation);
+                let encoded = serde_json::to_vec(&envelope)?;
+                if encoded.len() > REDEEM_RESET_FAILURE_MAX_BYTES {
+                    bail!("structured reset failure exceeded its fixed output bound");
+                }
+                output.write_all(&encoded)?;
+                output.write_all(b"\n")?;
+            }
+            return Err(error);
+        }
+    };
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        serde_json::to_writer_pretty(&mut *output, &report)?;
+        output.write_all(b"\n")?;
     } else {
         let action = if report.submitted_reset {
             "Redeemed"
         } else {
             "Reconciled"
         };
-        println!(
+        writeln!(
+            output,
             "{action} one banked reset for {}; {} reset(s) remain and the active account was unchanged",
-            report.account, report.banked_resets_remaining
-        );
+            report.account, report.banked_resets_remaining,
+        )?;
     }
     Ok(())
 }
@@ -1908,6 +2127,32 @@ fn redeem_reset_with<F, B, C>(
     store_path: &Path,
     auth_path: &Path,
     selector: &str,
+    fetch_quota_fn: F,
+    fetch_reset_bank_fn: B,
+    consume_reset_fn: C,
+) -> Result<RedeemResetReport>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+{
+    let mut operation = ResetOperation::new(None);
+    redeem_reset_with_submission_state(
+        store_path,
+        auth_path,
+        selector,
+        &mut operation,
+        fetch_quota_fn,
+        fetch_reset_bank_fn,
+        consume_reset_fn,
+    )
+}
+
+fn redeem_reset_with_submission_state<F, B, C>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    operation: &mut ResetOperation,
     fetch_quota_fn: F,
     fetch_reset_bank_fn: B,
     consume_reset_fn: C,
@@ -1928,6 +2173,10 @@ where
         .iter()
         .position(|account| account.id == target_id)
         .context("resolved reset target disappeared from the account store")?;
+    operation.account_id = normalized_reset_account_id(&accounts[target_index].account_id);
+    if operation.account_id.is_none() {
+        bail!("targeted reset requires a bounded printable provider account ID");
+    }
     if !accounts[target_index].has_complete_token_material() {
         bail!(
             "banked reset redemption requires complete runtime credentials for {}",
@@ -1993,7 +2242,10 @@ where
     let attempt_reset = quota_availability == QuotaAvailability::Blocked;
 
     let email = accounts[target_index].email.clone();
-    let account_id = accounts[target_index].account_id.clone();
+    let account_id = operation
+        .account_id
+        .clone()
+        .context("reset account ID was not resolved")?;
     let was_active = accounts[target_index].is_active;
     let previous_banked_resets = observed_bank.available_count;
     let previous_runtime_unusable_until = accounts[target_index].runtime_unusable_until;
@@ -2002,7 +2254,7 @@ where
     accounts[target_index].runtime_unusable_reason = None;
 
     let mut submitted_reset = false;
-    let flow_result = reconcile_or_attempt_reset_with_provider_guard(
+    let flow_result = reconcile_or_attempt_reset_with_provider_guard_and_request_id(
         ResetReconciliationContext {
             store_lock: &store_lock,
             account: &mut accounts[target_index],
@@ -2020,13 +2272,19 @@ where
             },
             |account, bank, request_id| {
                 submitted_reset = true;
+                operation.submission_started.set(true);
                 consume_reset_fn(account, bank, request_id)
             },
         ),
         |store_lock| {
             validate_provider_io_activation_locked(store_lock, auth_path, &activation_guard)
         },
+        Some(operation.request_id),
+        true,
     );
+    operation
+        .flow_state
+        .set(flow_result.as_ref().ok().map(|flow| flow.state));
 
     let usable_success = flow_result
         .as_ref()
@@ -2065,6 +2323,19 @@ where
                 .as_deref()
                 .unwrap_or("no available reset or no confirmed inventory decrease")
         );
+    }
+
+    let observation = observe_reset_attempts(store_path);
+    if observation.journal_state != ResetJournalState::Observed
+        || !observation.account(&account_id).is_some_and(|status| {
+            !status.redemption_blocked
+                && status
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.state == ResetAttemptState::ReconciledUsable)
+        })
+    {
+        bail!("reset success requires a readable journal with no unresolved account attempts");
     }
 
     Ok(RedeemResetReport {
@@ -4677,6 +4948,7 @@ mod tests {
             Command::RedeemReset {
                 account,
                 json: true,
+                request_id: None,
             } if account == "pro@example.com"
         ));
         Ok(())
@@ -6802,6 +7074,214 @@ mod tests {
         assert!(format!("{error:#}").contains("requires a paid account"));
         assert_eq!(*bank_calls.lock().unwrap(), 0);
         assert_eq!(*consume_calls.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn redeem_reset_json_emits_bounded_rejected_envelope_before_submission() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let root = temp.path().canonicalize()?;
+        let store_path = root.join("accounts.json");
+        let auth_path = root.join("auth.json");
+        let mut free = account("private-free-account@example.com", true, 0.0, 100.0);
+        free.account_id = "free-provider-id".to_string();
+        free.plan_type = Some("free".to_string());
+        save_accounts(&store_path, std::slice::from_ref(&free))?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let mut output = Vec::new();
+
+        let error = redeem_reset_with_output(
+            &store_path,
+            &auth_path,
+            &free.email,
+            true,
+            &mut output,
+            fetch_from_account,
+            |_account| bail!("reset inventory must not be fetched for a free account"),
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    bail!("reset must not be submitted for a free account")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("requires a paid account"));
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        assert!(output.len() <= REDEEM_RESET_FAILURE_MAX_BYTES);
+        let payload: Value = serde_json::from_slice(&output)?;
+        assert_eq!(
+            payload["schemaVersion"],
+            REDEEM_RESET_FAILURE_SCHEMA_VERSION
+        );
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["disposition"], "rejected");
+        assert_eq!(payload["message"], REDEEM_RESET_REJECTED_MESSAGE);
+        let rendered = String::from_utf8(output)?;
+        assert!(!rendered.contains(&free.email));
+        assert!(!rendered.contains("requires a paid account"));
+        Ok(())
+    }
+
+    #[test]
+    fn redeem_reset_json_emits_bounded_unknown_envelope_after_submission_starts() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let root = temp.path().canonicalize()?;
+        let store_path = root.join("accounts.json");
+        let auth_path = root.join("auth.json");
+        let active = account("active@example.com", true, 0.0, 10.0);
+        let mut exhausted = account("private-exhausted-account@example.com", false, 0.0, 100.0);
+        exhausted.account_id = "exhausted-provider-id".to_string();
+        exhausted.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(7));
+        exhausted.runtime_unusable_reason = Some("usage_limit".to_string());
+        save_accounts(&store_path, &[active, exhausted.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let bank_snapshot = reset_bank(&["private-credit-id"]);
+        let mut output = Vec::new();
+
+        let error = redeem_reset_with_output(
+            &store_path,
+            &auth_path,
+            &exhausted.email,
+            true,
+            &mut output,
+            fetch_from_account,
+            move |_account| {
+                let mut observed = bank_snapshot.clone();
+                observed.fetched_at = Utc::now();
+                Ok(observed)
+            },
+            {
+                let consume_calls = Arc::clone(&consume_calls);
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    bail!("private provider failure detail")
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(*consume_calls.lock().unwrap(), 1, "{error:#}");
+        assert!(output.len() <= REDEEM_RESET_FAILURE_MAX_BYTES);
+        let payload: Value = serde_json::from_slice(&output)?;
+        assert_eq!(
+            payload["schemaVersion"],
+            REDEEM_RESET_FAILURE_SCHEMA_VERSION
+        );
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["disposition"], "outcomeUnknown");
+        assert_eq!(payload["message"], REDEEM_RESET_OUTCOME_UNKNOWN_MESSAGE);
+        assert_eq!(payload["accountId"], exhausted.account_id);
+        let request_id = Uuid::parse_str(payload["requestId"].as_str().unwrap())?;
+        let mut replay_output = Vec::new();
+        redeem_reset_with_output_and_request_id(
+            &store_path,
+            &auth_path,
+            &exhausted.email,
+            true,
+            &mut replay_output,
+            fetch_from_account,
+            |_account| Ok(reset_bank(&["private-credit-id"])),
+            |_account, _bank, _request_id| bail!("replay must not submit"),
+            Some(request_id),
+        )
+        .unwrap_err();
+        let replay: Value = serde_json::from_slice(&replay_output)?;
+        assert_eq!(replay["disposition"], "outcomeUnknown");
+        assert_eq!(replay["requestId"], request_id.to_string());
+        let new_request_id = Uuid::new_v4();
+        let mut blocked_output = Vec::new();
+        redeem_reset_with_output_and_request_id(
+            &store_path,
+            &auth_path,
+            &exhausted.email,
+            true,
+            &mut blocked_output,
+            fetch_from_account,
+            |_account| Ok(reset_bank(&["private-credit-id"])),
+            |_account, _bank, _request_id| bail!("existing request must suppress a new POST"),
+            Some(new_request_id),
+        )
+        .unwrap_err();
+        let blocked: Value = serde_json::from_slice(&blocked_output)?;
+        assert_eq!(blocked["disposition"], "outcomeUnknown");
+        assert_eq!(blocked["requestId"], new_request_id.to_string());
+        assert_eq!(blocked["blockingRequestId"], request_id.to_string());
+        let rendered = String::from_utf8(output)?;
+        assert!(!rendered.contains(&exhausted.email));
+        assert!(!rendered.contains("private-credit-id"));
+        assert!(!rendered.contains("private provider failure detail"));
+        Ok(())
+    }
+
+    #[test]
+    fn redeem_reset_json_terminal_failures_and_replay_use_durable_request_id() -> Result<()> {
+        for code in [
+            Some(rate_limit_resets::ConsumeCode::NoCredit),
+            Some(rate_limit_resets::ConsumeCode::NothingToReset),
+            None,
+        ] {
+            let temp = secure_temp_dir()?;
+            let root = temp.path().canonicalize()?;
+            let store_path = root.join("accounts.json");
+            let auth_path = root.join("auth.json");
+            let exhausted = account("exhausted@example.com", true, 100.0, 100.0);
+            save_accounts(&store_path, std::slice::from_ref(&exhausted))?;
+            confirm_provider_io_activation(&store_path, &auth_path)?;
+            let request_id = Uuid::new_v4();
+            let calls = Cell::new(0);
+            let bank_snapshot = reset_bank(&["private-credit-id"]);
+            for _ in 0..2 {
+                let mut output = Vec::new();
+                redeem_reset_with_output_and_request_id(
+                    &store_path,
+                    &auth_path,
+                    &exhausted.account_id,
+                    true,
+                    &mut output,
+                    fetch_from_account,
+                    |_account| {
+                        let mut observed = bank_snapshot.clone();
+                        observed.fetched_at = Utc::now();
+                        Ok(observed)
+                    },
+                    |account, bank, actual_id| {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(actual_id, request_id);
+                        if let Some(code) = code {
+                            Ok(ConsumeResult {
+                                code,
+                                credit_id: None,
+                            })
+                        } else {
+                            let mut invalid = account.clone();
+                            invalid.access_token.clear();
+                            consume_rate_limit_reset(&invalid, bank, actual_id)
+                        }
+                    },
+                    Some(request_id),
+                )
+                .unwrap_err();
+                let payload: Value = serde_json::from_slice(&output)?;
+                assert_eq!(payload["disposition"], "rejected", "{payload}");
+                assert_eq!(payload["accountId"], exhausted.account_id);
+                assert_eq!(payload["requestId"], request_id.to_string());
+                let observation = observe_reset_attempts(&store_path);
+                let status = observation.account(&exhausted.account_id).unwrap();
+                assert!(!status.redemption_blocked);
+                assert_eq!(status.attempts.len(), 1);
+                assert_eq!(status.attempts[0].request_id, request_id);
+                assert_eq!(
+                    status.attempts[0].state,
+                    ResetAttemptState::TerminalNotApplied
+                );
+            }
+            assert_eq!(calls.get(), 1);
+        }
         Ok(())
     }
 

@@ -97,14 +97,17 @@ struct KeychainStore: Sendable {
         try withExclusiveLock { lockedFile in
             let snapshot = try loadSnapshotOrMigrate(lockedFile: lockedFile)
             var accounts = snapshot.accounts
-            // Deduplicate by accountId (OpenAI account UUID), not local id.
-            if let index = accounts.firstIndex(where: { $0.accountId == account.accountId }) {
+            let providerAccountId = account.normalizedProviderAccountId
+            if let index = accounts.firstIndex(where: {
+                $0.normalizedProviderAccountId == providerAccountId
+            }) {
                 accounts[index] = account
             } else {
                 accounts.append(account)
             }
             _ = try commit(
                 accounts,
+                preservingResetInventoriesFrom: snapshot.accounts,
                 expectedGeneration: snapshot.generation,
                 lockedFile: lockedFile
             )
@@ -158,6 +161,7 @@ struct KeychainStore: Sendable {
                 } else {
                     _ = try commit(
                         remaining,
+                        preservingResetInventoriesFrom: snapshot.accounts,
                         expectedGeneration: snapshot.generation,
                         lockedFile: lockedFile
                     )
@@ -180,6 +184,7 @@ struct KeychainStore: Sendable {
             } else {
                 _ = try commit(
                     remaining,
+                    preservingResetInventoriesFrom: snapshot.accounts,
                     expectedGeneration: snapshot.generation,
                     lockedFile: lockedFile
                 )
@@ -224,6 +229,7 @@ struct KeychainStore: Sendable {
             let snapshot = try readSnapshot(lockedFile: lockedFile, allowMissing: true)
             _ = try commit(
                 accounts,
+                preservingResetInventoriesFrom: snapshot.accounts,
                 expectedGeneration: snapshot.generation,
                 lockedFile: lockedFile
             )
@@ -244,6 +250,7 @@ struct KeychainStore: Sendable {
             }
             let committed = try commit(
                 accounts,
+                preservingResetInventoriesFrom: snapshot.accounts,
                 expectedGeneration: snapshot.generation,
                 lockedFile: lockedFile
             )
@@ -287,6 +294,7 @@ struct KeychainStore: Sendable {
                 updated[index] = replacement
                 let committed = try commit(
                     updated,
+                    preservingResetInventoriesFrom: snapshot.accounts,
                     expectedGeneration: snapshot.generation,
                     lockedFile: lockedFile
                 )
@@ -309,6 +317,7 @@ struct KeychainStore: Sendable {
                 }
                 let committed = try commit(
                     merged,
+                    preservingResetInventoriesFrom: snapshot.accounts,
                     expectedGeneration: snapshot.generation,
                     lockedFile: lockedFile
                 )
@@ -366,6 +375,7 @@ struct KeychainStore: Sendable {
 
         let committed = try commit(
             accounts,
+            preservingResetInventoriesFrom: snapshot.accounts,
             expectedGeneration: snapshot.generation,
             lockedFile: lockedFile
         )
@@ -406,11 +416,19 @@ struct KeychainStore: Sendable {
 
     private func commit(
         _ proposedAccounts: [CodexAccount],
+        preservingResetInventoriesFrom retainedAccounts: [CodexAccount],
         expectedGeneration: StoreGeneration,
         lockedFile: SecureAtomicFileTransaction.LockedFile
     ) throws -> StoreSnapshot {
-        let accounts = Self.removingPlaceholderQuotaSnapshots(proposedAccounts)
-        try Self.validate(accounts)
+        let proposed = Self.removingPlaceholderQuotaSnapshots(proposedAccounts)
+        try Self.validate(proposed)
+        try Self.validate(retainedAccounts)
+        guard let accounts = RateLimitResetInventoryPersistencePolicy.reconciling(
+            proposed,
+            preservingFrom: retainedAccounts
+        ) else {
+            throw KeychainError.missingAccountId
+        }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -518,8 +536,7 @@ struct KeychainStore: Sendable {
         var localIds = Set<UUID>()
 
         for account in accounts {
-            let accountId = account.accountId.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !accountId.isEmpty else {
+            guard let accountId = account.normalizedProviderAccountId else {
                 throw KeychainError.missingAccountId
             }
             guard account.id != Self.nilUUID, localIds.insert(account.id).inserted else {
@@ -590,16 +607,20 @@ struct KeychainStore: Sendable {
         into durableAccounts: [CodexAccount]
     ) -> [CodexAccount]? {
         guard observedAccounts.count == durableAccounts.count else { return nil }
-        var observedById: [UUID: CodexAccount] = [:]
+        var observedByProviderAccountId: [String: CodexAccount] = [:]
         for account in observedAccounts {
-            guard observedById.updateValue(account, forKey: account.id) == nil else {
+            guard let providerAccountId = account.normalizedProviderAccountId,
+                  observedByProviderAccountId.updateValue(
+                      account,
+                      forKey: providerAccountId
+                  ) == nil else {
                 return nil
             }
         }
 
         return try? durableAccounts.map { durable in
-            guard let observed = observedById[durable.id],
-                  observed.accountId == durable.accountId,
+            guard let providerAccountId = durable.normalizedProviderAccountId,
+                  let observed = observedByProviderAccountId[providerAccountId],
                   observed.accessToken == durable.accessToken,
                   observed.refreshToken == durable.refreshToken,
                   observed.idToken == durable.idToken,

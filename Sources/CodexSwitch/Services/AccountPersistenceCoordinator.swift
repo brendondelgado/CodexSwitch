@@ -8,6 +8,7 @@ private let accountPersistenceLogger = Logger(
 
 enum AccountPersistenceCoordinatorError: Error, Equatable {
     case authorizationLost
+    case ambiguousProviderIdentity
 }
 
 actor AccountPersistenceCoordinator {
@@ -153,16 +154,13 @@ actor AccountPersistenceCoordinator {
         }
         guard revision >= latestRevision else { return }
         latestRevision = revision
-        telemetryFlushTask?.cancel()
-        telemetryFlushTask = nil
-        if let pendingTelemetry, pendingTelemetry.revision <= revision {
-            self.pendingTelemetry = nil
-        }
+        let accountsToPersist = try preservingPendingResetInventories(in: accounts)
         guard authorizeEffect() else {
             throw AccountPersistenceCoordinatorError.authorizationLost
         }
-        try saveOperation(accounts)
-        recordSuccessfulPersistence(of: accounts, at: now(), isTelemetry: false)
+        try saveOperation(accountsToPersist)
+        clearPendingTelemetry(upTo: revision)
+        recordSuccessfulPersistence(of: accountsToPersist, at: now(), isTelemetry: false)
     }
 
     func persistDurably(
@@ -178,15 +176,12 @@ actor AccountPersistenceCoordinator {
             return .discardedCredentialDrift(try loadOperation())
         }
         latestRevision = revision
-        telemetryFlushTask?.cancel()
-        telemetryFlushTask = nil
-        if let pendingTelemetry, pendingTelemetry.revision <= revision {
-            self.pendingTelemetry = nil
-        }
+        let accountsToPersist = try preservingPendingResetInventories(in: accounts)
         guard authorizeEffect() else {
             throw AccountPersistenceCoordinatorError.authorizationLost
         }
-        let outcome = try saveConditionalOperation(accounts, expectedAccounts)
+        let outcome = try saveConditionalOperation(accountsToPersist, expectedAccounts)
+        clearPendingTelemetry(upTo: revision)
         switch outcome {
         case .persisted(let persisted):
             recordSuccessfulPersistence(of: persisted, at: now(), isTelemetry: false)
@@ -202,12 +197,15 @@ actor AccountPersistenceCoordinator {
         revision: UInt64
     ) throws -> AccountTelemetryPersistenceOutcome {
         latestRevision = max(latestRevision, revision)
-        telemetryFlushTask?.cancel()
-        telemetryFlushTask = nil
-        if let pendingTelemetry, pendingTelemetry.revision <= revision {
-            self.pendingTelemetry = nil
+        guard let candidateToPersist = try preservingPendingResetInventories(
+            in: [candidate]
+        ).first else {
+            throw AccountPersistenceCoordinatorError.ambiguousProviderIdentity
         }
-        let outcome = try saveInactiveCredentialUpdateOperation(original, candidate)
+        // A one-account credential write must not discard other accounts' banks.
+        try flushTelemetry()
+        let outcome = try saveInactiveCredentialUpdateOperation(original, candidateToPersist)
+        clearPendingTelemetry(upTo: revision)
         switch outcome {
         case .persisted(let persisted):
             recordSuccessfulPersistence(of: persisted, at: now(), isTelemetry: false)
@@ -252,9 +250,24 @@ actor AccountPersistenceCoordinator {
         guard revision >= latestRevision else { return }
         latestRevision = revision
         let queuedAt = now()
+        let accountsToQueue: [CodexAccount]
+        if let pendingTelemetry {
+            guard let reconciled = RateLimitResetInventoryPersistencePolicy.reconciling(
+                accounts,
+                preservingFrom: pendingTelemetry.accounts
+            ) else {
+                accountPersistenceLogger.error(
+                    "Account telemetry queue rejected ambiguous provider identities"
+                )
+                return
+            }
+            accountsToQueue = reconciled
+        } else {
+            accountsToQueue = accounts
+        }
         pendingTelemetry = PendingTelemetry(
             revision: revision,
-            accounts: accounts,
+            accounts: accountsToQueue,
             firstQueuedAt: pendingTelemetry?.firstQueuedAt ?? queuedAt,
             updateCount: (pendingTelemetry?.updateCount ?? 0) + 1
         )
@@ -291,14 +304,34 @@ actor AccountPersistenceCoordinator {
     ) throws -> Bool {
         guard revision >= latestRevision else { return false }
         latestRevision = revision
-        telemetryFlushTask?.cancel()
-        telemetryFlushTask = nil
-        pendingTelemetry = nil
-        return try persistTelemetryAccounts(
-            accounts,
+        let accountsToPersist = try preservingPendingResetInventories(in: accounts)
+        let persisted = try persistTelemetryAccounts(
+            accountsToPersist,
             at: now(),
             context: "termination-flush"
         )
+        clearPendingTelemetry(upTo: revision)
+        return persisted
+    }
+
+    private func preservingPendingResetInventories(
+        in accounts: [CodexAccount]
+    ) throws -> [CodexAccount] {
+        guard let pendingTelemetry else { return accounts }
+        guard let reconciled = RateLimitResetInventoryPersistencePolicy.reconciling(
+            accounts,
+            preservingFrom: pendingTelemetry.accounts
+        ) else {
+            throw AccountPersistenceCoordinatorError.ambiguousProviderIdentity
+        }
+        return reconciled
+    }
+
+    private func clearPendingTelemetry(upTo revision: UInt64) {
+        guard let pendingTelemetry, pendingTelemetry.revision <= revision else { return }
+        telemetryFlushTask?.cancel()
+        telemetryFlushTask = nil
+        self.pendingTelemetry = nil
     }
 
     private func scheduleTelemetryFlushIfNeeded() {

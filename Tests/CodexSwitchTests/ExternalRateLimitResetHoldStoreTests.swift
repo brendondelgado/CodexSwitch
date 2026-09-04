@@ -110,6 +110,40 @@ struct ExternalRateLimitResetHoldStoreTests {
         #expect(try store.activeHolds(at: observedAt.addingTimeInterval(31)).isEmpty)
     }
 
+    @Test("Hold identity is canonical across record restart and clear")
+    func holdIdentityIsCanonical() throws {
+        let storeURL = temporaryStoreURL()
+        defer { try? FileManager.default.removeItem(at: storeURL.deletingLastPathComponent()) }
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = ExternalRateLimitResetHoldStore(
+            url: storeURL,
+            legacyUserDefaults: nil
+        )
+        let recorded = try #require(try store.record(
+            providerAccountId: "  Provider-Account-1  ",
+            observedAt: observedAt,
+            blockedUntil: observedAt.addingTimeInterval(120)
+        ))
+
+        let restartedStore = ExternalRateLimitResetHoldStore(
+            url: storeURL,
+            legacyUserDefaults: nil
+        )
+        let active = try restartedStore.activeHolds(at: observedAt.addingTimeInterval(30))
+        #expect(active == ["provider-account-1": recorded])
+
+        let recovered = quotaSnapshot(
+            fetchedAt: observedAt.addingTimeInterval(40),
+            usedPercent: 20
+        )
+        #expect(try restartedStore.clearIfQuotaRecovered(
+            providerAccountId: "PROVIDER-ACCOUNT-1",
+            snapshot: recovered,
+            at: observedAt.addingTimeInterval(41)
+        ) == recorded)
+        #expect(try restartedStore.activeHolds(at: observedAt.addingTimeInterval(41)).isEmpty)
+    }
+
     @Test("Corrupt secure hold state fails closed")
     func corruptStateIsRejected() throws {
         let storeURL = temporaryStoreURL()

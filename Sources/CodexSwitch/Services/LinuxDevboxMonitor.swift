@@ -244,6 +244,45 @@ struct LinuxDevboxReadiness: Codable, Equatable, Sendable {
     }
 }
 
+/// Durable request-ID evidence, independent of bank freshness and host clocks.
+/// Missing, unsupported, blocked, or uncorrelated observations never release a hold.
+struct LinuxDevboxResetAttemptStatus: Codable, Equatable, Sendable {
+    struct Attempt: Codable, Equatable, Sendable {
+        let requestId: UUID
+        let state: String
+    }
+
+    let schemaVersion: Int
+    let accountId: String
+    let journalState: String
+    let redemptionBlocked: Bool
+    let attempts: [Attempt]
+
+    func provesTerminalAttempt(requestID: UUID, providerAccountId: String) -> Bool {
+        guard provesNoUnresolvedAttempts(providerAccountId: providerAccountId),
+              let attempt = attempts.first(where: { $0.requestId == requestID }) else {
+            return false
+        }
+        return attempt.state == "terminal_not_applied" || attempt.state == "reconciled_usable"
+    }
+
+    func provesNoUnresolvedAttempts(providerAccountId: String) -> Bool {
+        guard schemaVersion == 1,
+              journalState == "observed",
+              !redemptionBlocked,
+              let expected = LinuxDevboxMonitor.normalizedRemoteProviderAccountId(providerAccountId),
+              LinuxDevboxMonitor.normalizedRemoteProviderAccountId(accountId) == expected,
+              attempts.count <= 192,
+              Set(attempts.map(\.requestId)).count == attempts.count,
+              attempts.allSatisfy({
+                  ["terminal_not_applied", "reconciled_usable", "expired_unresolved"].contains($0.state)
+              }) else {
+            return false
+        }
+        return true
+    }
+}
+
 struct LinuxDevboxAccountState: Codable, Equatable, Sendable {
     let email: String
     let providerAccountId: String?
@@ -256,6 +295,7 @@ struct LinuxDevboxAccountState: Codable, Equatable, Sendable {
     let subscriptionWillRenew: Bool?
     let hasActiveSubscription: Bool?
     var rateLimitResetBank: RateLimitResetBank? = nil
+    var resetAttemptStatus: LinuxDevboxResetAttemptStatus? = nil
     var runtimeUnusableUntil: Date? = nil
     var runtimeUnusableReason: String? = nil
 
@@ -271,6 +311,7 @@ struct LinuxDevboxAccountState: Codable, Equatable, Sendable {
         subscriptionWillRenew: Bool?,
         hasActiveSubscription: Bool?,
         rateLimitResetBank: RateLimitResetBank? = nil,
+        resetAttemptStatus: LinuxDevboxResetAttemptStatus? = nil,
         runtimeUnusableUntil: Date? = nil,
         runtimeUnusableReason: String? = nil
     ) {
@@ -285,6 +326,7 @@ struct LinuxDevboxAccountState: Codable, Equatable, Sendable {
         self.subscriptionWillRenew = subscriptionWillRenew
         self.hasActiveSubscription = hasActiveSubscription
         self.rateLimitResetBank = rateLimitResetBank
+        self.resetAttemptStatus = resetAttemptStatus
         self.runtimeUnusableUntil = runtimeUnusableUntil
         self.runtimeUnusableReason = runtimeUnusableReason
     }
@@ -500,6 +542,17 @@ enum LinuxDevboxManualResetFailureDisposition: Equatable, Sendable {
 struct LinuxDevboxManualResetFailure: Error, Equatable, Sendable {
     let message: String
     let disposition: LinuxDevboxManualResetFailureDisposition
+    let reconciliationRequestID: UUID?
+
+    init(
+        message: String,
+        disposition: LinuxDevboxManualResetFailureDisposition,
+        reconciliationRequestID: UUID? = nil
+    ) {
+        self.message = message
+        self.disposition = disposition
+        self.reconciliationRequestID = reconciliationRequestID
+    }
 }
 
 struct LinuxDevboxManualResetResult: Equatable, Sendable {
@@ -876,6 +929,11 @@ enum LinuxDevboxMonitor {
     static let maximumAutomaticResetPolicyResultBytes = 16 * 1_024
     static let manualResetTimeout: TimeInterval = 3 * 60
     static let automaticResetPolicyTimeout: TimeInterval = 30
+    static let remoteManualResetFailureSchemaVersion = 1
+    static let remoteManualResetRejectedMessage =
+        "No banked reset was applied; refresh this account and try again"
+    static let remoteManualResetOutcomeUnknownMessage =
+        "Reset submission outcome is unknown; reconcile before retrying"
 
     enum SSHRetryPolicy: Equatable, Sendable {
         case readOnly
@@ -900,6 +958,21 @@ enum LinuxDevboxMonitor {
         let previousBankedResets: Int
         let bankedResetsRemaining: Int
         let remainingPercent: Double?
+    }
+
+    private enum RemoteManualResetFailureDisposition: String, Decodable, Sendable {
+        case rejected
+        case outcomeUnknown
+    }
+
+    private struct RemoteManualResetFailureResponse: Decodable, Sendable {
+        let schemaVersion: Int
+        let status: String
+        let disposition: RemoteManualResetFailureDisposition
+        let message: String
+        let accountId: String
+        let requestId: UUID?
+        let blockingRequestId: UUID?
     }
 
     enum RemotePollingMode: Equatable, Sendable {
@@ -1940,7 +2013,8 @@ enum LinuxDevboxMonitor {
 
     static func redeemReset(
         settings: LinuxDevboxMonitorSettings,
-        providerAccountId: String
+        providerAccountId: String,
+        requestID: UUID = UUID()
     ) -> Result<LinuxDevboxManualResetResult, LinuxDevboxManualResetFailure> {
         guard settings.hasUsableVPSResetAuthorityTransport else {
             return .failure(LinuxDevboxManualResetFailure(
@@ -1950,7 +2024,8 @@ enum LinuxDevboxMonitor {
         }
         return redeemResetWithCandidates(
             sshArgumentCandidates(settings: settings),
-            providerAccountId: providerAccountId
+            providerAccountId: providerAccountId,
+            requestID: requestID
         ) { executableURL, arguments, timeout in
             ProcessRunner.run(
                 executableURL: executableURL,
@@ -2115,13 +2190,15 @@ enum LinuxDevboxMonitor {
     static func redeemResetWithCandidates(
         _ candidates: [[String]],
         providerAccountId: String,
+        requestID: UUID = UUID(),
         executionToken: String = UUID().uuidString.lowercased(),
         runner: (URL, [String], TimeInterval) -> ProcessRunResult
     ) -> Result<LinuxDevboxManualResetResult, LinuxDevboxManualResetFailure> {
         guard let normalizedProviderAccountId = normalizedRemoteProviderAccountId(
             providerAccountId
         ), let command = remoteManualResetCommand(
-            providerAccountId: normalizedProviderAccountId
+            providerAccountId: normalizedProviderAccountId,
+            requestID: requestID
         ) else {
             return .failure(LinuxDevboxManualResetFailure(
                 message: "Manual reset requires one stable provider account ID",
@@ -2147,7 +2224,6 @@ enum LinuxDevboxMonitor {
         }
         guard outcome.executionState == .completed,
               !result.timedOut,
-              result.terminationStatus == 0,
               !result.stdoutTruncated,
               !result.stderrTruncated,
               result.stdout.count <= maximumManualResetResultBytes else {
@@ -2157,10 +2233,64 @@ enum LinuxDevboxMonitor {
             ))
         }
 
+        guard result.terminationStatus == 0 else {
+            return .failure(decodeManualResetFailure(
+                result.stdout,
+                expectedProviderAccountId: normalizedProviderAccountId,
+                expectedRequestID: requestID
+            ))
+        }
+
         return decodeManualResetResult(
             result.stdout,
             expectedProviderAccountId: normalizedProviderAccountId
         )
+    }
+
+    static func decodeManualResetFailure(
+        _ data: Data,
+        expectedProviderAccountId: String,
+        expectedRequestID: UUID? = nil
+    ) -> LinuxDevboxManualResetFailure {
+        let fallback = LinuxDevboxManualResetFailure(
+            message: "Manual reset outcome is unknown; reconcile VPS reset state before retrying",
+            disposition: .outcomeUnknown
+        )
+        guard data.count <= maximumManualResetResultBytes else { return fallback }
+
+        do {
+            let response = try JSONDecoder().decode(
+                RemoteManualResetFailureResponse.self,
+                from: data
+            )
+            guard response.schemaVersion == remoteManualResetFailureSchemaVersion,
+                  response.status == "error",
+                  let expected = normalizedRemoteProviderAccountId(expectedProviderAccountId),
+                  normalizedRemoteProviderAccountId(response.accountId) == expected,
+                  expectedRequestID == nil || response.requestId == expectedRequestID else {
+                return fallback
+            }
+            switch response.disposition {
+            case .rejected:
+                guard response.message == remoteManualResetRejectedMessage,
+                      response.blockingRequestId == nil else { return fallback }
+                return LinuxDevboxManualResetFailure(
+                    message: remoteManualResetRejectedMessage,
+                    disposition: .rejected
+                )
+            case .outcomeUnknown:
+                guard response.message == remoteManualResetOutcomeUnknownMessage else {
+                    return fallback
+                }
+                return LinuxDevboxManualResetFailure(
+                    message: remoteManualResetOutcomeUnknownMessage,
+                    disposition: .outcomeUnknown,
+                    reconciliationRequestID: expectedRequestID == nil ? nil : response.blockingRequestId
+                )
+            }
+        } catch {
+            return fallback
+        }
     }
 
     static func decodeManualResetResult(
@@ -3066,13 +3196,17 @@ enum LinuxDevboxMonitor {
         return normalized
     }
 
-    static func remoteManualResetCommand(providerAccountId: String) -> String? {
+    static func remoteManualResetCommand(
+        providerAccountId: String,
+        requestID: UUID? = nil
+    ) -> String? {
         guard let providerAccountId = normalizedRemoteProviderAccountId(
             providerAccountId
         ) else {
             return nil
         }
-        return "\(remoteCodexSwitchCLI) redeem-reset \(shellQuote(providerAccountId)) --json"
+        let correlation = requestID.map { " --request-id \(shellQuote($0.uuidString.lowercased()))" } ?? ""
+        return "\(remoteCodexSwitchCLI) redeem-reset \(shellQuote(providerAccountId))\(correlation) --json"
     }
 
     static func remoteAutomaticResetPolicyGetCommand() -> String {
@@ -3179,10 +3313,37 @@ enum LinuxDevboxMonitor {
     static func remoteAccountStateCommand() -> String {
         """
         python3 - <<'PY'
-        import hashlib, json, pathlib
+        import hashlib, json, pathlib, subprocess
 
         home = pathlib.Path.home()
         path = home / ".codexswitch" / "accounts.json"
+
+        def reset_attempt_statuses():
+            # This command observes only the journal, with no doctor/provider work.
+            try:
+                result = subprocess.run(
+                    [str(home / ".local/share/codexswitch/current/codexswitch-cli"),
+                     "--store", str(path), "reset-attempt-status", "--json"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=2, check=True,
+                )
+                if len(result.stdout) > 128 * 1024:
+                    return {}
+                report = json.loads(result.stdout)
+                if report.get("schemaVersion") != 1 or report.get("journalState") not in ("observed", "manualReview"):
+                    return {}
+                statuses = report.get("accounts", [])
+                if not isinstance(statuses, list) or len(statuses) > 192:
+                    return {}
+                mapped = {}
+                for status in statuses:
+                    account_id = stable_id(status.get("accountId"))
+                    if account_id is None or account_id.lower() in mapped:
+                        return {}
+                    mapped[account_id.lower()] = status
+                return mapped
+            except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+                return {}
 
         def account_value(account, *names):
             for name in names:
@@ -3263,6 +3424,7 @@ enum LinuxDevboxMonitor {
             return digest.hexdigest()
 
         def sanitized(account):
+            provider_id = stable_id(account_value(account, "accountId", "account_id"))
             return {
                 "email": account_value(account, "email") or "",
                 "providerAccountId": stable_id(account_value(account, "accountId", "account_id")),
@@ -3275,6 +3437,7 @@ enum LinuxDevboxMonitor {
                 "subscriptionWillRenew": account_value(account, "subscriptionWillRenew", "subscription_will_renew"),
                 "hasActiveSubscription": account_value(account, "hasActiveSubscription", "has_active_subscription"),
                 "rateLimitResetBank": account_value(account, "rateLimitResetBank", "rate_limit_reset_bank"),
+                "resetAttemptStatus": reset_statuses.get(provider_id.lower()) if provider_id else None,
                 "runtimeUnusableUntil": account_value(account, "runtimeUnusableUntil", "runtime_unusable_until"),
                 "runtimeUnusableReason": account_value(account, "runtimeUnusableReason", "runtime_unusable_reason"),
             }
@@ -3287,6 +3450,7 @@ enum LinuxDevboxMonitor {
         accounts = raw.get("accounts", []) if isinstance(raw, dict) else raw
         accounts = [account for account in accounts if isinstance(account, dict)]
         fingerprint = credential_set_fingerprint(accounts)
+        reset_statuses = reset_attempt_statuses()
         visible_accounts = [
             public_value(sanitized(account))
             for account in accounts

@@ -9,6 +9,7 @@ enum AccountCredentialUpsertResult: Equatable, Sendable {
     case inserted(UUID)
     case updated(UUID)
     case rejectedConfiguredAccount(UUID)
+    case rejectedInvalidProviderIdentity(UUID)
 }
 
 enum ConfiguredAccountRecovery: Equatable, Sendable {
@@ -439,6 +440,20 @@ final class AccountManager {
         }
     }
 
+    @discardableResult
+    func updateQuota(
+        forProviderAccountId providerAccountId: String,
+        snapshot: QuotaSnapshot,
+        planType: String
+    ) -> UUID? {
+        guard let idx = uniqueAccountIndex(forProviderAccountId: providerAccountId) else {
+            return nil
+        }
+        let accountId = accounts[idx].id
+        updateQuota(for: accountId, snapshot: snapshot, planType: planType)
+        return accountId
+    }
+
     private static func shouldClearStaleFiveHourPrimedMarker(
         primedAt: Date?,
         snapshot: QuotaSnapshot
@@ -472,10 +487,41 @@ final class AccountManager {
         accounts[idx].hasActiveSubscription = info.hasActiveSubscription
     }
 
-    func updateRateLimitResetBank(for accountId: UUID, bank: RateLimitResetBank) {
-        guard let idx = accounts.firstIndex(where: { $0.id == accountId }) else { return }
-        guard (accounts[idx].rateLimitResetBank?.fetchedAt ?? .distantPast) <= bank.fetchedAt else { return }
-        accounts[idx].rateLimitResetBank = bank
+    @discardableResult
+    func updateRateLimitResetBank(
+        forProviderAccountId providerAccountId: String,
+        bank: RateLimitResetBank
+    ) -> UUID? {
+        guard bank.isStructurallyValidPersistenceObservation,
+              let idx = uniqueAccountIndex(forProviderAccountId: providerAccountId) else {
+            return nil
+        }
+        let retained = accounts[idx].rateLimitResetBank
+        let preferred = RateLimitResetInventoryPersistencePolicy.newestValidBank(
+            observed: bank,
+            retained: retained
+        )
+        if preferred != retained {
+            accounts[idx].rateLimitResetBank = preferred
+        }
+        return accounts[idx].id
+    }
+
+    func account(matchingProviderAccountId providerAccountId: String) -> CodexAccount? {
+        guard let idx = uniqueAccountIndex(forProviderAccountId: providerAccountId) else {
+            return nil
+        }
+        return accounts[idx]
+    }
+
+    private func uniqueAccountIndex(forProviderAccountId providerAccountId: String) -> Int? {
+        guard let normalized = CodexAccount.normalizedProviderAccountId(providerAccountId) else {
+            return nil
+        }
+        let matches = accounts.indices.filter {
+            accounts[$0].normalizedProviderAccountId == normalized
+        }
+        return matches.count == 1 ? matches[0] : nil
     }
 
     func markFiveHourPrimed(for accountId: UUID, at date: Date = Date()) {
@@ -589,15 +635,20 @@ final class AccountManager {
             guard let index = localIndexByProviderAccountId[providerAccountId] else {
                 continue
             }
-            guard observedAt > (projectedObservationDates[providerAccountId] ?? .distantPast),
-                  Self.isValidAuthoritativeTelemetry(state, observedAt: observedAt, now: now) else {
-                continue
-            }
 
             let current = projectedAccounts[index]
             var projected = current
+            let advancesAccountObservation = observedAt
+                > (projectedObservationDates[providerAccountId] ?? .distantPast)
+            let acceptsNonResetTelemetry = advancesAccountObservation
+                && Self.isValidAuthoritativeNonResetTelemetry(
+                    state,
+                    observedAt: observedAt,
+                    now: now
+                )
 
             if let quota = state.quotaSnapshot,
+               acceptsNonResetTelemetry,
                quota.fetchedAt > (current.quotaSnapshot?.fetchedAt ?? .distantPast) {
                 projected.quotaSnapshot = quota
                 projected.lastRefreshed = max(
@@ -607,6 +658,7 @@ final class AccountManager {
             }
 
             if Self.hasSubscriptionTelemetry(state),
+               acceptsNonResetTelemetry,
                let telemetryRefreshedAt = state.lastRefreshed,
                telemetryRefreshedAt > (current.lastRefreshed ?? .distantPast) {
                 projected.planType = state.planType
@@ -621,18 +673,27 @@ final class AccountManager {
             }
 
             if let bank = state.rateLimitResetBank,
-               bank.fetchedAt > (current.rateLimitResetBank?.fetchedAt ?? .distantPast) {
-                projected.rateLimitResetBank = bank
+               bank.fetchedAt <= observedAt,
+               let preferredBank = RateLimitResetInventoryPersistencePolicy.newestValidBank(
+                   observed: bank,
+                   retained: current.rateLimitResetBank
+               ),
+               preferredBank != current.rateLimitResetBank {
+                projected.rateLimitResetBank = preferredBank
             }
 
-            projected.runtimeUnusableUntil = state.runtimeUnusableUntil
-            projected.runtimeUnusableReason = state.runtimeUnusableReason
+            if acceptsNonResetTelemetry {
+                projected.runtimeUnusableUntil = state.runtimeUnusableUntil
+                projected.runtimeUnusableReason = state.runtimeUnusableReason
+            }
 
             if Self.telemetryDiffers(projected, from: current) {
                 projectedAccounts[index] = projected
                 changed = true
             }
-            projectedObservationDates[providerAccountId] = observedAt
+            if advancesAccountObservation {
+                projectedObservationDates[providerAccountId] = observedAt
+            }
         }
 
         if changed {
@@ -651,45 +712,53 @@ final class AccountManager {
         return normalized.isEmpty ? nil : normalized
     }
 
-    private static func isValidAuthoritativeTelemetry(
+    private static func isValidAuthoritativeQuota(
+        _ quota: QuotaSnapshot,
+        observedAt: Date,
+        now: Date
+    ) -> Bool {
+        quota.fetchedAt <= observedAt
+            && quota.isFresh(at: now)
+            && !quota.hasExpiredPolicyWindow(at: now)
+            && !quota.hasBackendUsagePlaceholder
+            && !quota.hasInvalidPolicyEvidence
+            && (quota.isDenied || !quota.policyWindows.isEmpty)
+    }
+
+    private static func isValidAuthoritativeNonResetTelemetry(
         _ state: LinuxDevboxAccountState,
         observedAt: Date,
         now: Date
     ) -> Bool {
-        if let quota = state.quotaSnapshot {
-            guard quota.fetchedAt <= observedAt,
-                  quota.isFresh(at: now),
-                  !quota.hasExpiredPolicyWindow(at: now),
-                  !quota.hasBackendUsagePlaceholder,
-                  !quota.hasInvalidPolicyEvidence,
-                  quota.isDenied || !quota.policyWindows.isEmpty else {
-                return false
-            }
+        if let quota = state.quotaSnapshot,
+           !isValidAuthoritativeQuota(quota, observedAt: observedAt, now: now) {
+            return false
         }
-
-        if hasSubscriptionTelemetry(state) {
-            guard let refreshedAt = state.lastRefreshed,
-                  refreshedAt <= observedAt,
-                  QuotaFreshnessPolicy.isFresh(fetchedAt: refreshedAt, now: now),
-                  state.planType.map({
-                      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                  }) ?? true,
-                  [state.subscriptionRenewsAt, state.subscriptionExpiresAt]
-                    .compactMap({ $0 })
-                    .allSatisfy({ $0.timeIntervalSinceReferenceDate.isFinite }) else {
-                return false
-            }
+        if hasSubscriptionTelemetry(state),
+           !hasValidAuthoritativeSubscriptionTelemetry(
+               state,
+               observedAt: observedAt,
+               now: now
+           ) {
+            return false
         }
-
-        if let bank = state.rateLimitResetBank {
-            guard bank.fetchedAt <= observedAt,
-                  bank.isFresh(at: now),
-                  bank.structurallyValidAvailableCredits(at: now) != nil else {
-                return false
-            }
-        }
-
         return hasValidRemoteRuntimeBlockState(state, now: now)
+    }
+
+    private static func hasValidAuthoritativeSubscriptionTelemetry(
+        _ state: LinuxDevboxAccountState,
+        observedAt: Date,
+        now: Date
+    ) -> Bool {
+        guard let refreshedAt = state.lastRefreshed else { return false }
+        return refreshedAt <= observedAt
+            && QuotaFreshnessPolicy.isFresh(fetchedAt: refreshedAt, now: now)
+            && (state.planType.map {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            } ?? true)
+            && [state.subscriptionRenewsAt, state.subscriptionExpiresAt]
+                .compactMap { $0 }
+                .allSatisfy { $0.timeIntervalSinceReferenceDate.isFinite }
     }
 
     private static func hasValidRemoteRuntimeBlockState(
@@ -751,10 +820,14 @@ final class AccountManager {
         targetAccountId: UUID
     ) -> Bool {
         guard persistedAccounts.filter(\.isActive).map(\.id) == [targetAccountId],
-              persistedAccounts.contains(where: { $0.id == targetAccountId }) else {
+              persistedAccounts.contains(where: { $0.id == targetAccountId }),
+              let reconciled = RateLimitResetInventoryPersistencePolicy.reconciling(
+                  persistedAccounts,
+                  preservingFrom: accounts
+              ) else {
             return false
         }
-        accounts = persistedAccounts
+        accounts = reconciled
         userDefaults.set(targetAccountId.uuidString, forKey: "activeAccountId")
         return true
     }
@@ -814,7 +887,7 @@ final class AccountManager {
             : expectedIds
         guard persistedIds == committedIds else { return nil }
 
-        return try? persistedAccounts.map { persisted in
+        guard let merged = try? persistedAccounts.map({ persisted in
             guard let expected = expectedById[persisted.id] else {
                 guard insertsTarget, persisted.id == targetAccountId else {
                     throw CommittedCredentialHandoffError.credentialDrift
@@ -849,23 +922,32 @@ final class AccountManager {
             if current.fiveHourPrimedAt != expected.fiveHourPrimedAt {
                 merged.fiveHourPrimedAt = current.fiveHourPrimedAt
             }
-            if current.rateLimitResetBank != expected.rateLimitResetBank {
-                merged.rateLimitResetBank = current.rateLimitResetBank
-            }
+            let inMemoryBank = RateLimitResetInventoryPersistencePolicy.newestValidBank(
+                observed: current.rateLimitResetBank,
+                retained: expected.rateLimitResetBank
+            )
+            merged.rateLimitResetBank = RateLimitResetInventoryPersistencePolicy.newestValidBank(
+                observed: inMemoryBank,
+                retained: persisted.rateLimitResetBank
+            )
             if current.runtimeUnusableUntil != expected.runtimeUnusableUntil
                 || current.runtimeUnusableReason != expected.runtimeUnusableReason {
                 merged.runtimeUnusableUntil = current.runtimeUnusableUntil
                 merged.runtimeUnusableReason = current.runtimeUnusableReason
             }
             return merged
+        }) else {
+            return nil
         }
+        return merged
     }
 
     /// Inserts a new identity only. Existing identities, including the configured one, are immutable here.
     @discardableResult
     func addAccount(_ account: CodexAccount) -> Bool {
-        guard !accounts.contains(where: {
-            $0.id == account.id || $0.accountId == account.accountId
+        guard let providerAccountId = account.normalizedProviderAccountId,
+              !accounts.contains(where: {
+            $0.id == account.id || $0.normalizedProviderAccountId == providerAccountId
         }) else {
             return false
         }
@@ -881,9 +963,12 @@ final class AccountManager {
         if imported.id == protectedAccountId {
             return .rejectedConfiguredAccount(imported.id)
         }
+        guard let importedProviderAccountId = imported.normalizedProviderAccountId else {
+            return .rejectedInvalidProviderIdentity(imported.id)
+        }
         guard let idx = accounts.firstIndex(where: {
             $0.id == imported.id
-                || $0.accountId == imported.accountId
+                || $0.normalizedProviderAccountId == importedProviderAccountId
         }) else {
             var inactive = imported
             inactive.isActive = false
@@ -905,8 +990,10 @@ final class AccountManager {
         at date: Date = Date()
     ) -> [CodexAccount]? {
         let targetAccountId = account.id
-        guard !accounts.contains(where: {
-            $0.id != targetAccountId && $0.accountId == account.accountId
+        guard let providerAccountId = account.normalizedProviderAccountId,
+              !accounts.contains(where: {
+            $0.id != targetAccountId
+                && $0.normalizedProviderAccountId == providerAccountId
         }) else {
             return nil
         }
@@ -949,8 +1036,10 @@ final class AccountManager {
         updated.refreshToken = account.refreshToken
         updated.idToken = account.idToken
         updated.lastRefreshed = account.lastRefreshed ?? date
-        updated.rateLimitResetBank = account.rateLimitResetBank
-            ?? existing.rateLimitResetBank
+        updated.rateLimitResetBank = RateLimitResetInventoryPersistencePolicy.newestValidBank(
+            observed: account.rateLimitResetBank,
+            retained: existing.rateLimitResetBank
+        )
         updated.runtimeUnusableUntil = account.runtimeUnusableUntil
         updated.runtimeUnusableReason = account.runtimeUnusableReason
         if updated.quotaSnapshot?.hasExpiredExhaustedWindow(now: date) == true {

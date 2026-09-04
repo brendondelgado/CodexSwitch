@@ -25,6 +25,8 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/UsageResponseParser.swift
   - ../../Sources/CodexSwitch/Services/SwapEngine.swift
   - ../../Sources/CodexSwitch/Services/RateLimitResetService.swift
+  - ../../Sources/CodexSwitch/Services/AccountPersistenceCoordinator.swift
+  - ../../Sources/CodexSwitch/Services/AccountPersistenceSubmissionQueue.swift
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../crates/codexswitch-cli/src/quota.rs
@@ -38,7 +40,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-08-30
+  last_updated: 2026-09-04
 ---
 
 # Quota And Reset Policy
@@ -448,6 +450,25 @@ redeeming or reconciling state until a
 newer inventory and quota observation prove the result. An uncertain result is
 shown as unresolved and cannot enable a second submission.
 
+The menu owns one account-identified confirmation session above the reusable
+account-card views. Opening the inline command or context-menu command replaces
+that session with the selected stable provider account and presents the same
+confirmation action. Cancel, dismissal, a local authorization rejection, a
+transport failure proven not to have started, and a terminal authority response
+all clear the local session so the command can be opened again immediately.
+Only an authority response that is genuinely outcome-unknown or reconciling may
+keep a second submission disabled. Rebuilding, reordering, or dismissing the
+menu popover must never leave a hidden card-local presentation flag latched.
+The VPS command reports terminal rejection and outcome-unknown as distinct,
+bounded, non-secret machine-readable results bound to the account and request
+UUID. A confirmed response releases the local operation. An unknown outcome
+requires the matching request's terminal journal state from the VPS authority;
+bank timestamps alone never release it. The normal bounded account mirror
+includes read-only journal metadata, without provider requests or a full health
+scan. Missing, unreadable, mismatched, or unresolved journal evidence stays
+blocked. Reopening the Mac app also restores unresolved remote-account holds
+from that journal observation.
+
 ## Reset Expiration Urgency
 
 Available credits are ordered by expiration and attributed to their account in
@@ -518,6 +539,34 @@ reconciliation in progress may use their distinct operational colors.
   count and credit membership are unchanged. Semantic equality may suppress
   expensive UI work and notifications, but it must not make the durable
   observation generation lag indefinitely.
+- Persist each paid account's newest structurally valid inventory under its
+  normalized stable provider identity. Account object replacement, list
+  reordering, authentication refresh, or a transient provider/transport failure
+  must not erase that last-known bank. A failed refresh records its error and
+  observation time separately; it never rewrites the saved count to zero.
+  Display zero only after a newer structurally valid provider observation
+  explicitly reports zero available credits. The failure message and observation
+  time live in provider-keyed local diagnostic state; they are not shared
+  capacity and may be cleared on process restart. Startup and cross-host merges
+  retain the newest valid bank by provider identity while normal freshness rules
+  keep stale data non-actionable.
+- Coalesced telemetry and durable credential writes use the same merge rule. A
+  durable save must absorb a newer valid bank already queued in memory before it
+  supersedes that queue. Main-actor submissions are ordered before allocating
+  revisions for durable writes, adoption, deletion, and shutdown. An inactive
+  account's credential write flushes queued inventories for the other accounts
+  before committing. Accepted remote inventories enter the same persistence
+  queue. Reset holds use only normalized provider identities on
+  disk and in memory, including migration of previously noncanonical keys.
+- Associate a refresh failure with the credential generation that made the
+  request. If reauthentication changes that generation while the request is in
+  flight, discard the old failure and immediately refresh with the new
+  credentials. A later valid bank observation supersedes an older failure
+  diagnostic instead of leaving the account red or stale indefinitely.
+  A missing current fingerprint is not proof of a new credential generation and
+  never authorizes an immediate retry loop. A local authorization rejection with
+  a readable, resolved journal clears the operation without an authentication
+  failure or redemption cooldown; uncertain or unreadable journals stay blocked.
 - Attribute the next reset expiration to its account and sort expiration
   notices by urgency, then exact expiration.
 - Provide an account-specific redemption control only when current evidence

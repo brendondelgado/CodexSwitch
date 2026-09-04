@@ -1094,6 +1094,241 @@ struct LinuxDevboxMonitorTests {
         #expect(!failure.disposition.allowsAutomaticRetry)
     }
 
+    @Test("manual reset accepts a completed structured rejection without replay")
+    func manualResetStructuredRejectionIsTerminal() {
+        let requestID = UUID()
+        let executionToken = "reset-rejected"
+        let executionMarker = LinuxDevboxMonitor.remoteExecutionMarker(
+            executionToken: executionToken
+        )
+        let completionMarker = LinuxDevboxMonitor.remoteCompletionMarker(
+            executionToken: executionToken
+        )
+        let json = """
+        {"schemaVersion":1,"status":"error","accountId":"provider-account-id","requestId":"\(requestID.uuidString)","disposition":"rejected","message":"No banked reset was applied; refresh this account and try again"}
+        """
+        var calls = 0
+
+        let result = LinuxDevboxMonitor.redeemResetWithCandidates(
+            [["first"], ["second"]],
+            providerAccountId: "provider-account-id",
+            requestID: requestID,
+            executionToken: executionToken
+        ) { _, _, _ in
+            calls += 1
+            return ProcessRunResult(
+                terminationStatus: 1,
+                stdout: Data(json.utf8),
+                stderr: Data("\(executionMarker)\n\(completionMarker) 1\n".utf8),
+                timedOut: false
+            )
+        }
+
+        #expect(calls == 1)
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected a structured rejection")
+            return
+        }
+        #expect(failure.disposition == .rejected)
+        #expect(!failure.disposition.allowsAutomaticRetry)
+        #expect(failure.message == LinuxDevboxMonitor.remoteManualResetRejectedMessage)
+    }
+
+    @Test("manual reset accepts a completed structured unknown result without replay")
+    func manualResetStructuredUnknownRemainsUnknown() {
+        let requestID = UUID()
+        let executionToken = "reset-unknown"
+        let executionMarker = LinuxDevboxMonitor.remoteExecutionMarker(
+            executionToken: executionToken
+        )
+        let completionMarker = LinuxDevboxMonitor.remoteCompletionMarker(
+            executionToken: executionToken
+        )
+        let json = """
+        {"schemaVersion":1,"status":"error","accountId":"provider-account-id","requestId":"\(requestID.uuidString)","disposition":"outcomeUnknown","message":"Reset submission outcome is unknown; reconcile before retrying"}
+        """
+        var calls = 0
+
+        let result = LinuxDevboxMonitor.redeemResetWithCandidates(
+            [["first"], ["second"]],
+            providerAccountId: "provider-account-id",
+            requestID: requestID,
+            executionToken: executionToken
+        ) { _, _, _ in
+            calls += 1
+            return ProcessRunResult(
+                terminationStatus: 70,
+                stdout: Data(json.utf8),
+                stderr: Data("\(executionMarker)\n\(completionMarker) 70\n".utf8),
+                timedOut: false
+            )
+        }
+
+        #expect(calls == 1)
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected an outcome-unknown failure")
+            return
+        }
+        #expect(failure.disposition == .outcomeUnknown)
+        #expect(!failure.disposition.allowsAutomaticRetry)
+        #expect(failure.message == LinuxDevboxMonitor.remoteManualResetOutcomeUnknownMessage)
+    }
+
+    @Test("manual reset treats invalid or truncated output after start as outcome unknown")
+    func manualResetInvalidCompletedOutputRemainsUnknown() {
+        let executionToken = "reset-invalid"
+        let executionMarker = LinuxDevboxMonitor.remoteExecutionMarker(
+            executionToken: executionToken
+        )
+        let completionMarker = LinuxDevboxMonitor.remoteCompletionMarker(
+            executionToken: executionToken
+        )
+        var calls = 0
+
+        let result = LinuxDevboxMonitor.redeemResetWithCandidates(
+            [["first"], ["second"]],
+            providerAccountId: "provider-account-id",
+            executionToken: executionToken
+        ) { _, _, _ in
+            calls += 1
+            return ProcessRunResult(
+                terminationStatus: 1,
+                stdout: Data("not-json".utf8),
+                stderr: Data("\(executionMarker)\n\(completionMarker) 1\n".utf8),
+                timedOut: false,
+                stdoutTruncated: true
+            )
+        }
+
+        #expect(calls == 1)
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected an outcome-unknown failure")
+            return
+        }
+        #expect(failure.disposition == .outcomeUnknown)
+        #expect(!failure.disposition.allowsAutomaticRetry)
+    }
+
+    @Test("reset attempt proof requires an exact durable identity and unblocked journal")
+    func resetAttemptProofRequiresExactDurableIdentity() throws {
+        let requestID = UUID()
+        let otherID = UUID()
+        func status(
+            version: Int = 1,
+            accountId: String = "provider-account-id",
+            journalState: String = "observed",
+            blocked: Bool = false,
+            state: String = "terminal_not_applied",
+            id: UUID? = nil,
+            extra: [LinuxDevboxResetAttemptStatus.Attempt] = []
+        ) -> LinuxDevboxResetAttemptStatus {
+            LinuxDevboxResetAttemptStatus(
+                schemaVersion: version,
+                accountId: accountId,
+                journalState: journalState,
+                redemptionBlocked: blocked,
+                attempts: [.init(requestId: id ?? requestID, state: state)] + extra
+            )
+        }
+        func proves(_ value: LinuxDevboxResetAttemptStatus) -> Bool {
+            value.provesTerminalAttempt(requestID: requestID, providerAccountId: " PROVIDER-ACCOUNT-ID ")
+        }
+        #expect(proves(status()))
+        #expect(proves(status(state: "reconciled_usable")))
+        #expect(status().provesNoUnresolvedAttempts(providerAccountId: "provider-account-id"))
+        #expect(!proves(status(version: 2)))
+        #expect(!proves(status(accountId: "different-account")))
+        #expect(!proves(status(journalState: "unavailable")))
+        #expect(!proves(status(journalState: "manualReview")))
+        #expect(!proves(status(blocked: true)))
+        #expect(!proves(status(id: otherID)))
+        for state in ["prepared", "uncertain", "consumption_observed", "reconciliation_overdue", "expired_unresolved", "future_state"] {
+            #expect(!proves(status(state: state)))
+        }
+        #expect(!proves(status(extra: [.init(requestId: requestID, state: "reconciled_usable")])))
+        #expect(!proves(status(extra: [.init(requestId: otherID, state: "uncertain")])))
+        #expect(!proves(status(extra: [.init(requestId: otherID, state: "future_state")])))
+        for invalid in [status(version: 2), status(accountId: "wrong-id"),
+                        status(journalState: "unavailable"), status(journalState: "manualReview"),
+                        status(blocked: true), status(state: "uncertain"),
+                        status(extra: [.init(requestId: otherID, state: "future_state")]),
+                        status(extra: [.init(requestId: requestID, state: "reconciled_usable")])] {
+            #expect(!invalid.provesNoUnresolvedAttempts(providerAccountId: "provider-account-id"))
+        }
+        let decoded = try JSONDecoder().decode(
+            LinuxDevboxResetAttemptStatus.self,
+            from: JSONEncoder().encode(status())
+        )
+        #expect(proves(decoded))
+    }
+
+    @Test("reset failure rejection is bound to the requested provider account")
+    func resetFailureRejectsMissingMismatchedOrInvalidAccount() throws {
+        let base: [String: Any] = [
+            "schemaVersion": 1, "status": "error", "disposition": "rejected",
+            "message": LinuxDevboxMonitor.remoteManualResetRejectedMessage,
+        ]
+        for accountID in [nil, "other-account", "", "provider-account-id\ninvalid", String(repeating: "x", count: 257)] as [String?] {
+            var payload = base
+            payload["accountId"] = accountID
+            let failure = LinuxDevboxMonitor.decodeManualResetFailure(
+                try JSONSerialization.data(withJSONObject: payload),
+                expectedProviderAccountId: "provider-account-id"
+            )
+            #expect(failure.disposition == .outcomeUnknown)
+        }
+        var valid = base
+        valid["accountId"] = " PROVIDER-ACCOUNT-ID "
+        #expect(LinuxDevboxMonitor.decodeManualResetFailure(
+            try JSONSerialization.data(withJSONObject: valid),
+            expectedProviderAccountId: "provider-account-id"
+        ).disposition == .rejected)
+    }
+
+    @Test("reset failure blocker correlation requires the requested ID and account")
+    func resetFailureEffectiveCorrelationRequiresBoundRequestAndAccount() throws {
+        let requestID = UUID()
+        let blockingID = UUID()
+        let base: [String: Any] = [
+            "schemaVersion": 1, "status": "error", "disposition": "outcomeUnknown",
+            "message": LinuxDevboxMonitor.remoteManualResetOutcomeUnknownMessage,
+            "accountId": "provider-id", "requestId": requestID.uuidString,
+            "blockingRequestId": blockingID.uuidString,
+        ]
+        func decode(_ payload: [String: Any]) throws -> LinuxDevboxManualResetFailure {
+            LinuxDevboxMonitor.decodeManualResetFailure(
+                try JSONSerialization.data(withJSONObject: payload),
+                expectedProviderAccountId: "provider-id", expectedRequestID: requestID
+            )
+        }
+        #expect(try decode(base).reconciliationRequestID == blockingID)
+        for (field, value) in [("requestId", UUID().uuidString), ("accountId", "other-provider"),
+                               ("blockingRequestId", "not-a-uuid")] {
+            var invalid = base
+            invalid[field] = value
+            let failure = try decode(invalid)
+            #expect(failure.disposition == .outcomeUnknown)
+            #expect(failure.reconciliationRequestID == nil)
+        }
+        var missingRequest = base
+        missingRequest.removeValue(forKey: "requestId")
+        #expect(try decode(missingRequest).reconciliationRequestID == nil)
+        var contradictory = base
+        contradictory["disposition"] = "rejected"
+        contradictory["message"] = LinuxDevboxMonitor.remoteManualResetRejectedMessage
+        #expect(try decode(contradictory).disposition == .outcomeUnknown)
+    }
+
+    @Test("targeted reset preserves a caller-owned durable request ID")
+    func remoteResetCommandCarriesRequestID() throws {
+        let requestID = UUID()
+        let command = try #require(LinuxDevboxMonitor.remoteManualResetCommand(
+            providerAccountId: " PROVIDER-ID ", requestID: requestID
+        ))
+        #expect(command.contains("redeem-reset 'provider-id'"))
+        #expect(command.contains("--request-id '\(requestID.uuidString.lowercased())'"))
+    }
+
     @Test("automatic-reset policy commands match the VPS CLI contract")
     func automaticResetPolicyCommandsMatchContract() {
         #expect(LinuxDevboxMonitor.remoteAutomaticResetPolicyGetCommand()

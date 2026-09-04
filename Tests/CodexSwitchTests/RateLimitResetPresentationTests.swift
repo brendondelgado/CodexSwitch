@@ -733,6 +733,392 @@ struct RateLimitResetPresentationTests {
         #expect(freePlan.unavailableReason == "Manual redemption is available only for paid accounts")
     }
 
+    @Test("Confirmation coordinator reopens after dismissal and cancellation")
+    func confirmationCoordinatorReopensAfterDismissalAndCancellation() throws {
+        let expiration = now.addingTimeInterval(86_400)
+        var account = makeAccount(
+            email: "pro@example.com",
+            providerAccountId: "provider-account"
+        )
+        account.rateLimitResetBank = makeBank(
+            fetchedAt: now,
+            expirations: [expiration]
+        )
+        account.quotaSnapshot = exhaustedSnapshot(fetchedAt: now)
+        let presentations: [UUID: RateLimitResetInventoryPresentation] = [
+            account.id: .current(
+                availableCount: 1,
+                nextExpiration: expiration
+            ),
+        ]
+        var coordinator = RateLimitResetConfirmationCoordinator()
+
+        let initiallyOpened = coordinator.open(
+            requestedAccount: account,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(initiallyOpened)
+        #expect(coordinator.isPresented)
+        let dismissedSession = try #require(coordinator.session)
+        coordinator.setPresented(false, presenting: dismissedSession)
+        #expect(!coordinator.isPresented)
+        var submittedAccountId: UUID?
+        let submittedAfterDismissal = coordinator.submit(
+            presenting: dismissedSession,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            onSubmit: { submittedAccountId = $0 },
+            now: now
+        )
+        #expect(!submittedAfterDismissal)
+        #expect(submittedAccountId == nil)
+
+        let reopenedAfterDismissal = coordinator.open(
+            requestedAccount: account,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(reopenedAfterDismissal)
+        let cancelledSession = try #require(coordinator.session)
+        coordinator.cancel(presenting: cancelledSession)
+        #expect(!coordinator.isPresented)
+        let submittedAfterCancellation = coordinator.submit(
+            presenting: cancelledSession,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            onSubmit: { submittedAccountId = $0 },
+            now: now
+        )
+        #expect(!submittedAfterCancellation)
+        #expect(submittedAccountId == nil)
+
+        let reopenedAfterCancellation = coordinator.open(
+            requestedAccount: account,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(reopenedAfterCancellation)
+        #expect(coordinator.isPresented)
+    }
+
+    @Test("Stale same-account callbacks cannot dismiss or submit a reopened confirmation")
+    func staleSameAccountCallbacksCannotMutateReopenedConfirmation() throws {
+        let expiration = now.addingTimeInterval(86_400)
+        var account = makeAccount(
+            email: "pro@example.com",
+            providerAccountId: "provider-account"
+        )
+        account.rateLimitResetBank = makeBank(
+            fetchedAt: now,
+            expirations: [expiration]
+        )
+        account.quotaSnapshot = exhaustedSnapshot(fetchedAt: now)
+        let presentations: [UUID: RateLimitResetInventoryPresentation] = [
+            account.id: .current(
+                availableCount: 1,
+                nextExpiration: expiration
+            ),
+        ]
+        var coordinator = RateLimitResetConfirmationCoordinator()
+
+        let openedInitialSession = coordinator.open(
+            requestedAccount: account,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(openedInitialSession)
+        let staleSession = try #require(coordinator.session)
+        let dismissedInitialSession = coordinator.dismiss(presenting: staleSession)
+        #expect(dismissedInitialSession)
+
+        let openedCurrentSession = coordinator.open(
+            requestedAccount: account,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(openedCurrentSession)
+        let currentSession = try #require(coordinator.session)
+        #expect(currentSession.providerAccountId == staleSession.providerAccountId)
+        #expect(currentSession.accountEmail == staleSession.accountEmail)
+        #expect(currentSession.id != staleSession.id)
+
+        coordinator.setPresented(false, presenting: staleSession)
+        #expect(coordinator.session == currentSession)
+        let staleCancellation = coordinator.cancel(presenting: staleSession)
+        #expect(!staleCancellation)
+        #expect(coordinator.session == currentSession)
+
+        var submittedAccountId: UUID?
+        let staleSubmission = coordinator.submit(
+            presenting: staleSession,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            onSubmit: { submittedAccountId = $0 },
+            now: now
+        )
+        #expect(!staleSubmission)
+        #expect(submittedAccountId == nil)
+        #expect(coordinator.session == currentSession)
+
+        let currentSubmission = coordinator.submit(
+            presenting: currentSession,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            onSubmit: { submittedAccountId = $0 },
+            now: now
+        )
+        #expect(currentSubmission)
+        #expect(submittedAccountId == account.id)
+        #expect(!coordinator.isPresented)
+    }
+
+    @Test("Old confirmation callback cannot submit or clear a replacement session")
+    func oldConfirmationCallbackCannotSubmitReplacementSession() throws {
+        let expiration = now.addingTimeInterval(86_400)
+        var firstAccount = makeAccount(
+            email: "first@example.com",
+            providerAccountId: "provider-first"
+        )
+        firstAccount.rateLimitResetBank = makeBank(
+            fetchedAt: now,
+            expirations: [expiration]
+        )
+        firstAccount.quotaSnapshot = exhaustedSnapshot(fetchedAt: now)
+
+        var replacementAccount = makeAccount(
+            email: "replacement@example.com",
+            providerAccountId: "provider-replacement"
+        )
+        replacementAccount.rateLimitResetBank = makeBank(
+            fetchedAt: now,
+            expirations: [expiration]
+        )
+        replacementAccount.quotaSnapshot = exhaustedSnapshot(fetchedAt: now)
+        let accounts = [firstAccount, replacementAccount]
+        let presentations: [UUID: RateLimitResetInventoryPresentation] = [
+            firstAccount.id: .current(
+                availableCount: 1,
+                nextExpiration: expiration
+            ),
+            replacementAccount.id: .current(
+                availableCount: 1,
+                nextExpiration: expiration
+            ),
+        ]
+        var coordinator = RateLimitResetConfirmationCoordinator()
+
+        let openedFirst = coordinator.open(
+            requestedAccount: firstAccount,
+            accounts: accounts,
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(openedFirst)
+        let oldSession = try #require(coordinator.session)
+
+        let openedReplacement = coordinator.open(
+            requestedAccount: replacementAccount,
+            accounts: accounts,
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(openedReplacement)
+        let replacementSession = try #require(coordinator.session)
+        #expect(replacementSession != oldSession)
+
+        var submittedAccountId: UUID?
+        let oldCallbackSubmitted = coordinator.submit(
+            presenting: oldSession,
+            accounts: accounts,
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            onSubmit: { submittedAccountId = $0 },
+            now: now
+        )
+        #expect(!oldCallbackSubmitted)
+        #expect(submittedAccountId == nil)
+        #expect(coordinator.session == replacementSession)
+
+        let replacementSubmitted = coordinator.submit(
+            presenting: replacementSession,
+            accounts: accounts,
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            onSubmit: { submittedAccountId = $0 },
+            now: now
+        )
+        #expect(replacementSubmitted)
+        #expect(submittedAccountId == replacementAccount.id)
+        #expect(!coordinator.isPresented)
+    }
+
+    @Test("Confirmation coordinator reopens after local rejection and terminal submission")
+    func confirmationCoordinatorReopensAfterRejectionAndSubmission() throws {
+        let expiration = now.addingTimeInterval(86_400)
+        var account = makeAccount(
+            email: "pro@example.com",
+            providerAccountId: "provider-account"
+        )
+        account.rateLimitResetBank = makeBank(
+            fetchedAt: now,
+            expirations: [expiration]
+        )
+        account.quotaSnapshot = exhaustedSnapshot(fetchedAt: now)
+        let presentations: [UUID: RateLimitResetInventoryPresentation] = [
+            account.id: .current(
+                availableCount: 1,
+                nextExpiration: expiration
+            ),
+        ]
+        var coordinator = RateLimitResetConfirmationCoordinator()
+
+        let openedForRejection = coordinator.open(
+            requestedAccount: account,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(openedForRejection)
+        let rejectedSession = try #require(coordinator.session)
+        var submittedAccountId: UUID?
+
+        let rejectedSubmission = coordinator.submit(
+            presenting: rejectedSession,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .blocked("Coordinator is reconciling") },
+            onSubmit: { submittedAccountId = $0 },
+            now: now
+        )
+        #expect(!rejectedSubmission)
+        #expect(submittedAccountId == nil)
+        #expect(!coordinator.isPresented)
+
+        let reopenedAfterRejection = coordinator.open(
+            requestedAccount: account,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(reopenedAfterRejection)
+        let submittedSession = try #require(coordinator.session)
+        let submitted = coordinator.submit(
+            presenting: submittedSession,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            onSubmit: { submittedAccountId = $0 },
+            now: now
+        )
+        #expect(submitted)
+        #expect(submittedAccountId == account.id)
+        #expect(!coordinator.isPresented)
+
+        let reopenedAfterSubmission = coordinator.open(
+            requestedAccount: account,
+            accounts: [account],
+            presentations: presentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(reopenedAfterSubmission)
+        #expect(coordinator.isPresented)
+    }
+
+    @Test("Confirmation coordinator follows provider identity across account replacement")
+    func confirmationCoordinatorFollowsProviderIdentityReplacement() throws {
+        let expiration = now.addingTimeInterval(86_400)
+        var requested = makeAccount(
+            email: "old@example.com",
+            providerAccountId: " provider-account "
+        )
+        requested.rateLimitResetBank = makeBank(
+            fetchedAt: now,
+            expirations: [expiration]
+        )
+        requested.quotaSnapshot = exhaustedSnapshot(fetchedAt: now)
+
+        var replacement = makeAccount(
+            email: "current@example.com",
+            providerAccountId: "provider-account"
+        )
+        replacement.rateLimitResetBank = requested.rateLimitResetBank
+        replacement.quotaSnapshot = requested.quotaSnapshot
+        let replacementPresentations: [UUID: RateLimitResetInventoryPresentation] = [
+            replacement.id: .current(
+                availableCount: 1,
+                nextExpiration: expiration
+            ),
+        ]
+        var coordinator = RateLimitResetConfirmationCoordinator()
+
+        let openedForReplacement = coordinator.open(
+            requestedAccount: requested,
+            accounts: [replacement],
+            presentations: replacementPresentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(openedForReplacement)
+        let session = try #require(coordinator.session)
+        #expect(session.providerAccountId == "provider-account")
+        #expect(session.accountEmail == replacement.email)
+
+        var secondReplacement = makeAccount(
+            email: "newest@example.com",
+            providerAccountId: "provider-account"
+        )
+        secondReplacement.rateLimitResetBank = requested.rateLimitResetBank
+        secondReplacement.quotaSnapshot = requested.quotaSnapshot
+        let secondPresentations: [UUID: RateLimitResetInventoryPresentation] = [
+            secondReplacement.id: .current(
+                availableCount: 1,
+                nextExpiration: expiration
+            ),
+        ]
+        var replacementAccountId: UUID?
+        let submittedReplacement = coordinator.submit(
+            presenting: session,
+            accounts: [secondReplacement],
+            presentations: secondPresentations,
+            authorization: { _ in .authorized },
+            onSubmit: { replacementAccountId = $0 },
+            now: now
+        )
+        #expect(submittedReplacement)
+        #expect(replacementAccountId == secondReplacement.id)
+        #expect(!coordinator.isPresented)
+
+        let reopenedAfterReplacement = coordinator.open(
+            requestedAccount: requested,
+            accounts: [secondReplacement],
+            presentations: secondPresentations,
+            authorization: { _ in .authorized },
+            now: now
+        )
+        #expect(reopenedAfterReplacement)
+        #expect(coordinator.isPresented)
+    }
+
     private func resolve(
         expiration: Date? = nil,
         redeeming: Bool = false,

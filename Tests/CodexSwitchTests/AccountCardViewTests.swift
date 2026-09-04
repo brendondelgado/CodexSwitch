@@ -138,11 +138,11 @@ struct AccountCardViewTests {
             encoding: .utf8
         )
         let menuStart = try #require(source.range(of: ".contextMenu {"))
-        let confirmationStart = try #require(source.range(
-            of: ".confirmationDialog(",
+        let copyEmailStart = try #require(source.range(
+            of: "Button(\"Copy email\")",
             range: menuStart.upperBound..<source.endIndex
         ))
-        let menuSource = source[menuStart.lowerBound..<confirmationStart.lowerBound]
+        let menuSource = source[menuStart.lowerBound..<copyEmailStart.lowerBound]
         #expect(menuSource.contains("if manualReauthenticationAvailable"))
         #expect(menuSource.contains("Button(\"Reauthenticate\")"))
     }
@@ -218,9 +218,9 @@ struct AccountCardViewTests {
         ).primaryActionAccessibilityHint == "Reauthenticate this account")
     }
 
-    @Test("Confirmed redemption invokes the account callback only for current eligible inventory")
+    @Test("Reset request invokes confirmation callback only for current eligible inventory")
     @MainActor
-    func confirmedRedemptionRequiresVisibleEligibility() {
+    func resetRequestRequiresVisibleEligibility() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let account = makeRedeemableAccount(now: now)
         var didRedeem = false
@@ -230,7 +230,7 @@ struct AccountCardViewTests {
                 availableCount: 1,
                 nextExpiration: now.addingTimeInterval(2 * 86_400)
             ),
-            onRedeemReset: {
+            onRequestResetRedemption: {
                 didRedeem = true
             },
             onReauthenticate: nil,
@@ -238,7 +238,7 @@ struct AccountCardViewTests {
         )
 
         #expect(eligibleView.resetRedemptionActionPresentation(at: now).isEnabled)
-        #expect(eligibleView.handleConfirmedResetRedemption(at: now))
+        #expect(eligibleView.handleResetRedemptionRequest(at: now))
         #expect(didRedeem)
 
         didRedeem = false
@@ -248,7 +248,7 @@ struct AccountCardViewTests {
                 message: "Inventory request failed",
                 lastKnownCount: 1
             ),
-            onRedeemReset: {
+            onRequestResetRedemption: {
                 didRedeem = true
             },
             onReauthenticate: nil,
@@ -261,7 +261,7 @@ struct AccountCardViewTests {
             errorAction.helpText
                 == "Reset inventory is unverified because refresh failed; refresh it before redeeming: Inventory request failed"
         )
-        #expect(!errorView.handleConfirmedResetRedemption(at: now))
+        #expect(!errorView.handleResetRedemptionRequest(at: now))
         #expect(!didRedeem)
 
         let coordinatorBlockedView = AccountCardView(
@@ -273,7 +273,7 @@ struct AccountCardViewTests {
             rateLimitResetCoordinatorAuthorization: .blocked(
                 "Another reset redemption is already in progress"
             ),
-            onRedeemReset: {
+            onRequestResetRedemption: {
                 didRedeem = true
             },
             onReauthenticate: nil,
@@ -282,7 +282,7 @@ struct AccountCardViewTests {
         let blockedAction = coordinatorBlockedView.resetRedemptionActionPresentation(at: now)
         #expect(!blockedAction.isEnabled)
         #expect(blockedAction.helpText == "Another reset redemption is already in progress")
-        #expect(!coordinatorBlockedView.handleConfirmedResetRedemption(at: now))
+        #expect(!coordinatorBlockedView.handleResetRedemptionRequest(at: now))
         #expect(!didRedeem)
     }
 
@@ -322,29 +322,47 @@ struct AccountCardViewTests {
         #expect(!current.handleResetInventoryRefresh())
     }
 
-    @Test("Context-menu redemption opens confirmation and never redeems directly")
-    func contextMenuRedemptionUsesConfirmationFlow() throws {
-        let source = try String(
+    @Test("Inline and context-menu redemption share the parent confirmation session")
+    func redemptionUsesParentConfirmationSession() throws {
+        let cardSource = try String(
             contentsOfFile: "Sources/CodexSwitch/Views/AccountCardView.swift",
             encoding: .utf8
         )
-        let menuStart = try #require(source.range(of: ".contextMenu {"))
-        let confirmationStart = try #require(source.range(
-            of: ".confirmationDialog(",
-            range: menuStart.upperBound..<source.endIndex
+        let menuStart = try #require(cardSource.range(of: ".contextMenu {"))
+        let copyEmailStart = try #require(cardSource.range(
+            of: "Button(\"Copy email\")",
+            range: menuStart.upperBound..<cardSource.endIndex
         ))
-        let menuSource = source[menuStart.lowerBound..<confirmationStart.lowerBound]
+        let menuSource = cardSource[menuStart.lowerBound..<copyEmailStart.lowerBound]
+        let popoverSource = try String(
+            contentsOfFile: "Sources/CodexSwitch/Views/PopoverContentView.swift",
+            encoding: .utf8
+        )
 
         #expect(menuSource.contains("RateLimitResetContextMenuPresentation.resolve("))
         #expect(menuSource.contains("Button(\"Refresh reset inventory\")"))
         #expect(menuSource.contains("handleResetInventoryRefresh()"))
         #expect(menuSource.contains("Button(resetPresentation.menuItemTitle)"))
-        #expect(menuSource.contains("isConfirmingResetRedemption = true"))
+        #expect(menuSource.contains("handleResetRedemptionRequest()"))
         #expect(menuSource.contains("resetPresentation.unavailableReason"))
-        #expect(menuSource.contains("redemptionHandlerAvailable: onRedeemReset != nil"))
+        #expect(menuSource.contains("redemptionHandlerAvailable: onRequestResetRedemption != nil"))
         #expect(menuSource.contains(".disabled(true)"))
-        #expect(!menuSource.contains("handleConfirmedResetRedemption"))
-        #expect(!menuSource.contains("onRedeemReset()"))
+        #expect(!cardSource.contains("isConfirmingResetRedemption"))
+        #expect(!cardSource.contains(".confirmationDialog("))
+        #expect(
+            cardSource.components(separatedBy: "handleResetRedemptionRequest()").count - 1 == 2
+        )
+        #expect(popoverSource.contains(
+            "@State private var resetRedemptionConfirmation = RateLimitResetConfirmationCoordinator()"
+        ))
+        #expect(popoverSource.contains(".confirmationDialog("))
+        #expect(popoverSource.contains("requestResetRedemptionConfirmation(for: account)"))
+        #expect(popoverSource.contains("resetRedemptionConfirmation.setPresented("))
+        #expect(popoverSource.contains("presenting: presentedSession"))
+        #expect(popoverSource.contains("resetRedemptionConfirmation.cancel(presenting: session)"))
+        #expect(popoverSource.contains("resetRedemptionConfirmation.dismiss()"))
+        #expect(popoverSource.contains("onSubmit: onRedeemReset"))
+        #expect(popoverSource.contains(".onDisappear"))
     }
 
     @Test("Redemption tooltip uses the policy's unavailable reason")
@@ -360,7 +378,7 @@ struct AccountCardViewTests {
                 availableCount: 1,
                 nextExpiration: now.addingTimeInterval(2 * 86_400)
             ),
-            onRedeemReset: {},
+            onRequestResetRedemption: {},
             onReauthenticate: nil,
             onForceSwap: nil
         )

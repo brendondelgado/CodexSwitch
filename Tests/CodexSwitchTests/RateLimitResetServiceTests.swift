@@ -8,7 +8,7 @@ struct RateLimitResetServiceTests {
     func classifiesResetFailures() {
         #expect(RateLimitResetFailurePolicy.classify(.httpError(401)) == .authentication)
         #expect(RateLimitResetFailurePolicy.classify(.httpError(403)) == .authentication)
-        #expect(RateLimitResetFailurePolicy.classify(.submissionUnauthorized) == .authentication)
+        #expect(RateLimitResetFailurePolicy.classify(.submissionUnauthorized) == .transient)
         #expect(RateLimitResetFailurePolicy.classify(.httpError(429)) == .rateLimited)
         #expect(RateLimitResetFailurePolicy.classify(.httpError(404)) == .unsupported)
         #expect(RateLimitResetFailurePolicy.classify(.httpError(405)) == .unsupported)
