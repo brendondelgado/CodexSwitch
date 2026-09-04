@@ -8,10 +8,11 @@ use crate::activation::{
 use crate::auth::{account_token_fingerprint, auth_file_fingerprint};
 use crate::bounded_command;
 use crate::codex_update;
+#[cfg(target_os = "macos")]
+use crate::reload::is_official_desktop_stdio_child_command_line;
 use crate::reload::{
     binary_has_sighup_support_for_runtime, discover_codex_app_server_processes,
-    discover_codex_cli_processes, hot_swap_runtime_kind,
-    is_official_desktop_stdio_child_command_line, process_has_current_hot_swap_ack,
+    discover_codex_cli_processes, hot_swap_runtime_kind, process_has_current_hot_swap_ack,
     process_is_sighup_safe_target, process_matches_managed_headless_app_server, CodexProcess,
     HotSwapRuntimeKind,
 };

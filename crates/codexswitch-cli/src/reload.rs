@@ -3756,7 +3756,7 @@ pub fn hot_swap_runtime_kind(process: &CodexProcess) -> Option<HotSwapRuntimeKin
     .then(current_managed_desktop_runtime_route)
     .flatten();
     #[cfg(not(target_os = "macos"))]
-    let managed_runtime = None;
+    let managed_runtime: Option<PathBuf> = None;
     #[cfg(target_os = "macos")]
     let managed_launchd_pid = (managed_runtime.as_deref() == Some(process.executable.as_path()))
         .then(|| current_managed_desktop_bridge_launchd_pid(process.owner_uid))
