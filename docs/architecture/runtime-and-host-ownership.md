@@ -367,6 +367,15 @@ that exact witness is not proof that the current pool-authority epoch has
 converged. The Mac therefore performs a same-target desktop and CLI reload
 instead of accepting file equality.
 
+A telemetry-only account-store generation change must not strand a later
+authority adoption behind otherwise valid `Confirmed` evidence. While holding
+the runtime-activation lease, Rust may rebase that record to the current store
+generation only when its target and complete token fingerprint exactly match
+the uniquely active account and `auth.json` matches that same account. The
+rebased record becomes the rollback anchor for an authority-selected move to a
+different account. A record naming any inactive third account, or carrying a
+different fingerprint, remains a hard barrier.
+
 The Mac invariant is simple: every active credential mutation is
 configured-only until fresh runtime convergence is journaled. This includes an
 account swap, active-token refresh, active-account reauthentication, first

@@ -1009,10 +1009,8 @@ fn prepare_validated_remote_authority_adoption(
     {
         bail!("stale Confirmed activation is not structurally safe for authority recovery");
     }
-    if desired_provider_account_id.is_empty()
-        || record.target_account_id != desired_provider_account_id
-    {
-        bail!("stale Confirmed activation target does not match the validated remote authority");
+    if desired_provider_account_id.is_empty() {
+        bail!("validated remote authority omitted its target account");
     }
     if !auth_file_matches_account(auth_path, active) {
         bail!("remote-authority recovery refused divergent source store/auth state");
@@ -1029,11 +1027,32 @@ fn prepare_validated_remote_authority_adoption(
     if matching_targets.len() != 1 || target.id != target_id {
         bail!("remote-authority target is not unique in the local account store");
     }
+
+    if record.target_account_id == active.account_id
+        && record.auth_fingerprint.as_deref() == Some(active_fingerprint.as_str())
+    {
+        let mut rebased = record;
+        rebased.store_generation = generation.as_str().to_string();
+        rebased.updated_at = Utc::now();
+        write_activation_record(store_lock, &rebased)?;
+        return if target.is_active || target.id == active.id {
+            Ok(None)
+        } else {
+            Ok(Some(rebased))
+        };
+    }
+
+    if record.target_account_id != desired_provider_account_id {
+        bail!("stale Confirmed activation target does not match the validated remote authority");
+    }
     if target.is_active || target.id == active.id {
         return Ok(None);
     }
-    complete_account_token_fingerprint(target)
+    let target_fingerprint = complete_account_token_fingerprint(target)
         .context("remote-authority recovery target has incomplete token material")?;
+    if record.auth_fingerprint.as_deref() != Some(target_fingerprint.as_str()) {
+        bail!("stale Confirmed authority target is not bound to its current token generation");
+    }
     Ok(Some(record))
 }
 
@@ -3428,6 +3447,83 @@ mod tests {
             .context("activation record disappeared")?;
         assert_eq!(record.state, ActivationState::Confirmed);
         assert_eq!(record.target_account_id, target.account_id);
+        Ok(())
+    }
+
+    #[test]
+    fn validated_remote_authority_rebases_confirmed_source_after_telemetry_commit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let active = account("active@example.com", true);
+        let desired = account("desired@example.com", false);
+        save_accounts(&store_path, &[active.clone(), desired.clone()])?;
+        commit_auth_file(&auth_path, &active)?;
+
+        let initial = crate::account_store::load_account_store_snapshot(&store_path)?;
+        let store_lock = lock_account_store(&store_path)?;
+        write_activation_record(
+            &store_lock,
+            &activation_record_ids(
+                ActivationState::Confirmed,
+                "previous@example.com",
+                &active.account_id,
+                &initial.generation,
+                account_token_fingerprint(&active),
+                None,
+            ),
+        )?;
+        drop(store_lock);
+
+        let mut telemetry_commit = fs::read(&store_path)?;
+        telemetry_commit.push(b'\n');
+        fs::write(&store_path, telemetry_commit)?;
+        let snapshot = crate::account_store::load_account_store_snapshot(&store_path)?;
+        assert_ne!(snapshot.generation, initial.generation);
+        let mut generation = snapshot.generation;
+        let mut accounts = snapshot.accounts;
+
+        let runtime_lease = acquire_runtime_activation_lease(&store_path)?;
+        let outcome = activate_with_unlocked_reload_with_topology_under_runtime_lease(
+            &runtime_lease,
+            &store_path,
+            &auth_path,
+            &mut generation,
+            &mut accounts,
+            desired.id,
+            true,
+            &|_| {
+                Ok(ReloadSummary::default()
+                    .with_sighup_sent(vec![42])
+                    .with_signaled(vec![42])
+                    .with_topology_verified(true))
+            },
+            |summary, _| {
+                if !summary.has_bound_activation_proof() {
+                    bail!("topology proof received unbound runtime evidence");
+                }
+                Ok(())
+            },
+            ActivationBarrierMode::ValidatedRemoteAuthorityAdoption {
+                desired_provider_account_id: desired.account_id.clone(),
+            },
+        )?;
+
+        assert!(outcome.is_confirmed());
+        assert_eq!(
+            active_account(
+                &crate::account_store::load_account_store_snapshot(&store_path)?.accounts
+            )
+            .map(|account| account.id),
+            Some(desired.id)
+        );
+        assert!(auth_file_matches_account(&auth_path, &desired));
+        let record = read_activation_record_for_store(&store_path)?
+            .context("activation record disappeared")?;
+        assert_eq!(record.state, ActivationState::Confirmed);
+        assert_eq!(record.previous_account_id, active.account_id);
+        assert_eq!(record.target_account_id, desired.account_id);
+        assert_eq!(record.store_generation, generation.as_str());
         Ok(())
     }
 
