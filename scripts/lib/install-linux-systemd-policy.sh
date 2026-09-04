@@ -594,7 +594,7 @@ validate_merged_systemd_unit() {
   if [[ "$unit" == "signul-codex-app-server.service" ]]; then
     expected_keys=(Description Wants After StartLimitIntervalSec Type WorkingDirectory Environment EnvironmentFile UMask ExecStart KillSignal KillMode TimeoutStopSec SendSIGKILL Nice CPUWeight IOWeight IOSchedulingClass IOSchedulingPriority MemoryLow MemoryHigh MemoryMax MemorySwapMax TasksMax LimitNOFILE WantedBy)
   else
-    expected_keys=(Description ExecStart Restart RestartSec Nice CPUWeight IOWeight IOSchedulingClass MemoryHigh MemoryMax MemorySwapMax TasksMax LimitNOFILE WantedBy)
+    expected_keys=(Description StartLimitIntervalSec StartLimitBurst ExecStart Restart RestartSec Nice CPUQuota CPUWeight IOWeight IOSchedulingClass MemoryHigh MemoryMax MemorySwapMax TasksMax LimitNOFILE WantedBy)
   fi
   if [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "1" ]]; then
     expected_keys+=(ConditionPathExists)
@@ -712,7 +712,7 @@ validate_systemd_preconditions() {
       [[ "$dropin_count" -le "$SCAN_MAX_ENTRIES" ]] || fail "managed systemd drop-in scan entry bound exceeded"
       [[ "$(basename "$entry")" == "$expected" && -f "$entry" && ! -L "$entry" ]] && continue
       case "$unit:$(basename "$entry")" in
-        signul-codex-app-server.service:env.conf|signul-codex-app-server.service:limits.conf|signul-codex-app-server.service:oom.conf|signul-codex-app-server.service:remote-control.conf)
+        codexswitch.service:zz-restart-bound.conf|signul-codex-app-server.service:env.conf|signul-codex-app-server.service:limits.conf|signul-codex-app-server.service:oom.conf|signul-codex-app-server.service:remote-control.conf|signul-codex-app-server.service:90-runtime-tree.conf)
           [[ -f "$entry" && ! -L "$entry" ]] || fail "known removable systemd artifact is not a regular file: $entry"
           echo "SYSTEMD_CONFLICT unit=$unit removable_dropin=$(basename "$entry")" >&2
           conflict_count=$((conflict_count + 1))

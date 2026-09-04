@@ -1,10 +1,12 @@
 [Unit]
 Description=CodexSwitch CLI daemon
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 ExecStart=/usr/bin/flock --shared --no-fork %h/.local/share/codexswitch/runtime-start-install.lock %h/.local/share/codexswitch/current/codexswitch-cli daemon
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 
 [Install]
 WantedBy=default.target

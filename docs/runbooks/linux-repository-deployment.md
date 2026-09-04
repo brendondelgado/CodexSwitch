@@ -71,7 +71,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-08-21
+  last_updated: 2026-09-04
 ---
 
 # Linux Repository Deployment
@@ -515,9 +515,13 @@ The release owns these complete definitions:
 The managed namespace converges to this exact four-file state. Unknown
 drop-ins always block. Explicit conflict approval can authorize removal only of
 the named legacy `env.conf`, `limits.conf`, `oom.conf`, and
-`remote-control.conf` artifacts inside the activation transaction. Known obsolete
-CodexSwitch daemon, app-server, and knowledge-sync units must be inactive and
-are removed transactionally. Unrelated user units remain untouched.
+`remote-control.conf` app-server artifacts, the redundant app-server
+`90-runtime-tree.conf`, and the daemon's superseded `zz-restart-bound.conf`
+inside the activation transaction. The daemon's start-rate limit, restart
+delay, and CPU cap are part of the canonical payload before that hardening
+drop-in is eligible for removal. Known obsolete CodexSwitch daemon, app-server,
+and knowledge-sync units must be inactive and are removed transactionally.
+Unrelated user units remain untouched.
 Obsolete enablement links are part of that namespace, including knowledge-sync
 links beneath `default.target.wants/` and `timers.target.wants/`. Their exact
 prior symlink targets or absence are journaled and restored on rollback.
@@ -551,7 +555,8 @@ and global generator/vendor drop-ins are blockers too; absence of directives
 does not make an external source acceptable.
 
 Both persistent services have enforceable cgroup ceilings. The maintenance
-daemon uses `MemoryHigh=4G`, `MemoryMax=6G`, and `MemorySwapMax=2G`. The
+daemon uses a five-starts-per-five-minutes rate limit, `RestartSec=10`,
+`CPUQuota=200%`, `MemoryHigh=4G`, `MemoryMax=6G`, and `MemorySwapMax=2G`. The
 session-bearing app-server keeps `MemoryLow=512M` protection while applying
 `MemoryHigh=12G`, `MemoryMax=14G`, and `MemorySwapMax=2G`. Activation verifies
 the merged values rather than trusting only the checked-in drop-ins. After

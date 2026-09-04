@@ -140,6 +140,7 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             self.assertIn(directive, runtime)
         for directive in (
             "Nice=10",
+            "CPUQuota=200%",
             "CPUWeight=25",
             "IOWeight=25",
             "IOSchedulingClass=idle",
@@ -148,6 +149,13 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             "MemorySwapMax=2G",
         ):
             self.assertIn(directive, maintenance)
+        daemon = (SYSTEMD / "codexswitch.service").read_text()
+        for directive in (
+            "StartLimitIntervalSec=300",
+            "StartLimitBurst=5",
+            "RestartSec=10",
+        ):
+            self.assertIn(directive, daemon)
 
     def test_installer_encodes_stage_activation_and_provenance_contracts(self):
         text = installer_source()
@@ -1820,6 +1828,15 @@ PY
         dropin.mkdir(parents=True, exist_ok=True)
         for name in ("env.conf", "limits.conf", "oom.conf", "remote-control.conf"):
             (dropin / name).write_text("[Service]\nEnvironment=STALE=1\n")
+        (dropin / "90-runtime-tree.conf").write_text(
+            "[Service]\nWorkingDirectory=/home/signul/runtime/SIGNUL\n"
+        )
+        daemon_dropin = self.service_dir / "codexswitch.service.d"
+        daemon_dropin.mkdir(parents=True, exist_ok=True)
+        (daemon_dropin / "zz-restart-bound.conf").write_text(
+            "[Unit]\nStartLimitIntervalSec=300\nStartLimitBurst=5\n"
+            "[Service]\nRestartSec=10\nCPUQuota=200%\n"
+        )
         (self.service_dir / "codexswitch-knowledge-sync.service").write_text(
             "[Service]\nExecStart=/bin/false\n"
         )
@@ -2878,11 +2895,23 @@ PY
         app_unit = self.service_dir / "signul-codex-app-server.service"
         self.assertIn("current/patched-codex/codex", app_unit.read_text())
         dropin = self.service_dir / "signul-codex-app-server.service.d"
-        for stale in ("env.conf", "limits.conf", "oom.conf", "remote-control.conf"):
+        for stale in (
+            "env.conf",
+            "limits.conf",
+            "oom.conf",
+            "remote-control.conf",
+            "90-runtime-tree.conf",
+        ):
             self.assertFalse((dropin / stale).exists())
         self.assertEqual(
             {path.name for path in dropin.iterdir()},
             {"10-runtime-resources.conf"},
+        )
+        daemon_dropin = self.service_dir / "codexswitch.service.d"
+        self.assertFalse((daemon_dropin / "zz-restart-bound.conf").exists())
+        self.assertEqual(
+            {path.name for path in daemon_dropin.iterdir()},
+            {"10-maintenance-resources.conf"},
         )
         self.assertFalse((self.service_dir / "codexswitch-knowledge-sync.service").exists())
         self.assertFalse((self.service_dir / "codexswitch-knowledge-sync.timer").exists())
