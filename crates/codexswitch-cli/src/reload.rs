@@ -41,19 +41,40 @@ pub struct CodexProcess {
     pub executable: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ManagedAppServerOwnerKind {
+    SystemdPort8390,
+    BuiltinUnixDaemon,
+}
+
+impl ManagedAppServerOwnerKind {
+    fn runtime_kind(self) -> HotSwapRuntimeKind {
+        match self {
+            Self::SystemdPort8390 => HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
+            Self::BuiltinUnixDaemon => HotSwapRuntimeKind::ExternalAppServer,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ManagedHeadlessAppServerIdentity {
-    pub(crate) pid: i32,
-    pub(crate) owner_uid: u32,
-    pub(crate) executable: PathBuf,
-    pub(crate) start_identity: String,
+pub(crate) struct ManagedAppServerIdentity {
+    pub(crate) owner_kind: ManagedAppServerOwnerKind,
+    pub(crate) process: CodexProcess,
     pub(crate) kernel_executable_identity: HotSwapKernelExecutableIdentity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ManagedHeadlessAckMaintenance {
+pub(crate) type ManagedHeadlessAppServerIdentity = ManagedAppServerIdentity;
+
+impl ManagedAppServerIdentity {
+    pub(crate) fn pid(&self) -> i32 {
+        self.process.pid
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManagedAppServerAckMaintenance {
     Current,
-    Renewed { pid: i32 },
+    Renewed { pids: Vec<i32> },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1321,125 +1342,211 @@ pub(crate) fn bind_managed_headless_app_server_identity(
     owner_uid: u32,
     executable: PathBuf,
 ) -> Result<ManagedHeadlessAppServerIdentity> {
-    let process = current_process_identity(pid)
-        .context("managed systemd app-server PID was not discovered")?;
+    bind_managed_app_server_identity(
+        pid,
+        owner_uid,
+        executable,
+        ManagedAppServerOwnerKind::SystemdPort8390,
+    )
+}
+
+pub(crate) fn bind_managed_unix_app_server_identity(
+    pid: i32,
+    owner_uid: u32,
+    executable: PathBuf,
+) -> Result<ManagedAppServerIdentity> {
+    bind_managed_app_server_identity(
+        pid,
+        owner_uid,
+        executable,
+        ManagedAppServerOwnerKind::BuiltinUnixDaemon,
+    )
+}
+
+fn bind_managed_app_server_identity(
+    pid: i32,
+    owner_uid: u32,
+    executable: PathBuf,
+    owner_kind: ManagedAppServerOwnerKind,
+) -> Result<ManagedAppServerIdentity> {
+    let process =
+        current_process_identity(pid).context("managed app-server PID was not discovered")?;
     if process.owner_uid != owner_uid || process.executable != executable {
-        bail!("managed systemd app-server process does not match unit ownership");
+        bail!("managed app-server process does not match owner identity");
     }
-    managed_headless_identity_for_process(&process)
+    managed_app_server_identity_for_process(&process, owner_kind)
 }
 
-fn managed_headless_identity_for_process(
+fn managed_app_server_identity_for_process(
     process: &CodexProcess,
-) -> Result<ManagedHeadlessAppServerIdentity> {
+    owner_kind: ManagedAppServerOwnerKind,
+) -> Result<ManagedAppServerIdentity> {
     let (_, kernel_executable_identity) = hot_swap_process_binding(process)?;
-    managed_headless_identity_from_kernel(process, kernel_executable_identity)
+    managed_app_server_identity_from_kernel(process, owner_kind, kernel_executable_identity)
 }
 
-fn managed_headless_identity_from_kernel(
+fn managed_app_server_identity_from_kernel(
     process: &CodexProcess,
+    owner_kind: ManagedAppServerOwnerKind,
     kernel_executable_identity: HotSwapKernelExecutableIdentity,
-) -> Result<ManagedHeadlessAppServerIdentity> {
-    if hot_swap_runtime_kind(process) != Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer) {
-        bail!("managed systemd app-server is not the expected headless remote-control runtime");
+) -> Result<ManagedAppServerIdentity> {
+    let expected_runtime_kind = owner_kind.runtime_kind();
+    if hot_swap_runtime_kind(process) != Some(expected_runtime_kind) {
+        bail!(
+            "managed app-server owner {owner_kind:?} is not the expected {expected_runtime_kind:?} runtime"
+        );
     }
-    Ok(ManagedHeadlessAppServerIdentity {
-        pid: process.pid,
-        owner_uid: process.owner_uid,
-        executable: process.executable.clone(),
-        start_identity: process.start_identity.clone(),
+    Ok(ManagedAppServerIdentity {
+        owner_kind,
+        process: process.clone(),
         kernel_executable_identity,
     })
-}
-
-fn observe_managed_headless_app_server(
-    expected: &ManagedHeadlessAppServerIdentity,
-) -> Result<(ManagedHeadlessAppServerIdentity, CodexProcess)> {
-    let process = current_process_identity(expected.pid)
-        .context("managed systemd app-server process is no longer running")?;
-    let observed = managed_headless_identity_for_process(&process)?;
-    Ok((observed, process))
 }
 
 pub(crate) fn process_matches_managed_headless_app_server(
     expected: &ManagedHeadlessAppServerIdentity,
     process: &CodexProcess,
 ) -> bool {
-    managed_headless_identity_for_process(process).is_ok_and(|observed| observed == *expected)
+    expected.owner_kind == ManagedAppServerOwnerKind::SystemdPort8390
+        && managed_app_server_identity_for_process(
+            process,
+            ManagedAppServerOwnerKind::SystemdPort8390,
+        )
+        .is_ok_and(|observed| observed == *expected)
 }
 
-pub(crate) fn maintain_managed_headless_app_server_ack(
-    expected: &ManagedHeadlessAppServerIdentity,
+pub(crate) fn maintain_managed_app_server_acks<Observe>(
+    expected: &[ManagedAppServerIdentity],
     auth_path: &Path,
     minimum_remaining: Duration,
-) -> Result<ManagedHeadlessAckMaintenance> {
-    maintain_managed_headless_app_server_ack_with(
+    observe: Observe,
+) -> Result<ManagedAppServerAckMaintenance>
+where
+    Observe: Fn() -> Result<Vec<ManagedAppServerIdentity>>,
+{
+    maintain_managed_app_server_acks_with(
         expected,
-        || observe_managed_headless_app_server(expected),
-        |process| {
+        minimum_remaining,
+        observe,
+        |identity, remaining| {
             process_has_current_hot_swap_ack_for_runtime_with_minimum_remaining(
-                process,
+                &identity.process,
                 auth_path,
-                HotSwapRuntimeKind::HeadlessRemoteControlAppServer,
-                minimum_remaining,
+                identity.owner_kind.runtime_kind(),
+                remaining,
             )
         },
-        |process, reuse_minimum_remaining| {
-            let guard_identity = expected.clone();
-            let final_identity = expected.clone();
+        |observed, reuse_minimum_remaining, observe| {
+            let expected = expected.to_vec();
+            let processes = observed
+                .iter()
+                .map(|identity| identity.process.clone())
+                .collect::<Vec<_>>();
             reload_discovered_codex_processes(
-                vec![process.clone()],
+                processes,
                 auth_path,
                 None,
                 true,
                 reuse_minimum_remaining,
                 || {
-                    let (observed, _) = observe_managed_headless_app_server(&guard_identity)?;
-                    if observed != guard_identity {
-                        bail!("managed systemd app-server identity changed before SIGHUP");
-                    }
-                    Ok(())
+                    require_same_managed_app_server_identities(&expected, &observe()?)
+                        .context("managed app-server ownership changed before SIGHUP")
                 },
                 || {
-                    let (observed, process) = observe_managed_headless_app_server(&final_identity)?;
-                    if observed != final_identity {
-                        bail!("managed systemd app-server identity changed after SIGHUP");
-                    }
-                    Ok(vec![process])
+                    let final_identities = observe()?;
+                    require_same_managed_app_server_identities(&expected, &final_identities)
+                        .context("managed app-server ownership changed after SIGHUP")?;
+                    Ok(final_identities
+                        .into_iter()
+                        .map(|identity| identity.process)
+                        .collect())
                 },
             )
         },
-        minimum_remaining,
     )
 }
 
-fn maintain_managed_headless_app_server_ack_with<Observe, Ack, Reload>(
-    expected: &ManagedHeadlessAppServerIdentity,
+fn maintain_managed_app_server_acks_with<Observe, Ack, Reload>(
+    expected: &[ManagedAppServerIdentity],
+    minimum_remaining: Duration,
     observe: Observe,
     has_current_ack: Ack,
     reload: Reload,
-    minimum_remaining: Duration,
-) -> Result<ManagedHeadlessAckMaintenance>
+) -> Result<ManagedAppServerAckMaintenance>
 where
-    Observe: FnOnce() -> Result<(ManagedHeadlessAppServerIdentity, CodexProcess)>,
-    Ack: FnOnce(&CodexProcess) -> bool,
-    Reload: FnOnce(&CodexProcess, Duration) -> Result<ReloadSummary>,
+    Observe: Fn() -> Result<Vec<ManagedAppServerIdentity>>,
+    Ack: Fn(&ManagedAppServerIdentity, Duration) -> bool,
+    Reload: FnOnce(&[ManagedAppServerIdentity], Duration, &Observe) -> Result<ReloadSummary>,
 {
-    let (observed, process) = observe()?;
-    if observed != *expected {
-        bail!("managed systemd app-server identity changed; refusing readiness renewal");
+    validate_managed_app_server_identities(expected)?;
+    if expected.is_empty() {
+        bail!("managed app-server readiness maintenance requires at least one exact owner");
     }
-    if has_current_ack(&process) {
-        return Ok(ManagedHeadlessAckMaintenance::Current);
+    let observed = observe()?;
+    require_same_managed_app_server_identities(expected, &observed)
+        .context("managed app-server ownership changed before readiness maintenance")?;
+    let mut renewed_pids = observed
+        .iter()
+        .filter(|identity| !has_current_ack(identity, minimum_remaining))
+        .map(ManagedAppServerIdentity::pid)
+        .collect::<Vec<_>>();
+    if renewed_pids.is_empty() {
+        return Ok(ManagedAppServerAckMaintenance::Current);
     }
-    let summary = reload(&process, minimum_remaining)?;
+    renewed_pids.sort_unstable();
+    let summary = reload(&observed, minimum_remaining, &observe)?;
     if !summary.verified_hot_swap() {
         bail!(
-            "managed systemd app-server readiness renewal was not acknowledged: {:?}",
+            "managed app-server readiness renewal was not acknowledged: {:?}",
             summary.skipped
         );
     }
-    Ok(ManagedHeadlessAckMaintenance::Renewed { pid: process.pid })
+    let final_identities = observe()?;
+    require_same_managed_app_server_identities(expected, &final_identities)
+        .context("managed app-server ownership changed after readiness renewal")?;
+    if final_identities
+        .iter()
+        .any(|identity| !has_current_ack(identity, minimum_remaining))
+    {
+        bail!("managed app-server readiness renewal did not preserve the ACK safety window");
+    }
+    Ok(ManagedAppServerAckMaintenance::Renewed { pids: renewed_pids })
+}
+
+pub(crate) fn validate_managed_app_server_identities(
+    identities: &[ManagedAppServerIdentity],
+) -> Result<()> {
+    let mut pids = HashSet::new();
+    let mut owners = HashSet::new();
+    for identity in identities {
+        if !pids.insert(identity.process.pid) {
+            bail!(
+                "managed app-server ownership is ambiguous: duplicate pid {}",
+                identity.process.pid
+            );
+        }
+        if !owners.insert(identity.owner_kind) {
+            bail!(
+                "managed app-server ownership is ambiguous: duplicate {:?} owner",
+                identity.owner_kind
+            );
+        }
+    }
+    Ok(())
+}
+
+fn require_same_managed_app_server_identities(
+    expected: &[ManagedAppServerIdentity],
+    observed: &[ManagedAppServerIdentity],
+) -> Result<()> {
+    validate_managed_app_server_identities(expected)?;
+    validate_managed_app_server_identities(observed)?;
+    if expected.len() != observed.len()
+        || expected.iter().any(|identity| !observed.contains(identity))
+    {
+        bail!("managed app-server identity set changed");
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -4840,16 +4947,54 @@ mod tests {
             device: executable_metadata.dev(),
             inode: executable_metadata.ino(),
         };
-        let expected =
-            managed_headless_identity_from_kernel(&process, expected_kernel_identity.clone())?;
-        assert_eq!(expected.pid, process.pid);
-        assert_eq!(expected.owner_uid, process.owner_uid);
-        assert_eq!(expected.executable, process.executable);
-        assert_eq!(expected.start_identity, process.start_identity);
+        let expected = managed_app_server_identity_from_kernel(
+            &process,
+            ManagedAppServerOwnerKind::SystemdPort8390,
+            expected_kernel_identity.clone(),
+        )?;
+        assert_eq!(
+            expected.owner_kind,
+            ManagedAppServerOwnerKind::SystemdPort8390
+        );
+        assert_eq!(expected.process, process);
         assert_eq!(
             expected.kernel_executable_identity,
             expected_kernel_identity
         );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_unix_identity_binds_external_app_server_runtime_kind() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let executable = temp.path().join("codex");
+        fs::write(&executable, b"runtime")?;
+        let process = CodexProcess {
+            pid: 84,
+            owner_uid: 1001,
+            start_identity: "linux:456".to_string(),
+            started_at_unix: 2,
+            command_line: format!("{} app-server --listen unix://", executable.display()),
+            executable,
+        };
+        let executable_metadata = fs::metadata(&process.executable)?;
+        let kernel_identity = HotSwapKernelExecutableIdentity {
+            canonical_path: fs::canonicalize(&process.executable)?.display().to_string(),
+            device: executable_metadata.dev(),
+            inode: executable_metadata.ino(),
+        };
+
+        let identity = managed_app_server_identity_from_kernel(
+            &process,
+            ManagedAppServerOwnerKind::BuiltinUnixDaemon,
+            kernel_identity,
+        )?;
+
+        assert_eq!(
+            identity.owner_kind,
+            ManagedAppServerOwnerKind::BuiltinUnixDaemon
+        );
+        assert_eq!(identity.process, process);
         Ok(())
     }
 
@@ -4866,11 +5011,27 @@ mod tests {
     }
 
     fn managed_headless_test_identity(process: &CodexProcess) -> ManagedHeadlessAppServerIdentity {
-        ManagedHeadlessAppServerIdentity {
-            pid: process.pid,
-            owner_uid: process.owner_uid,
-            executable: process.executable.clone(),
-            start_identity: process.start_identity.clone(),
+        managed_app_server_test_identity(process, ManagedAppServerOwnerKind::SystemdPort8390)
+    }
+
+    fn managed_unix_test_process(pid: i32, start_identity: &str) -> CodexProcess {
+        CodexProcess {
+            pid,
+            owner_uid: 1001,
+            start_identity: start_identity.to_string(),
+            started_at_unix: 1_000,
+            command_line: "/opt/codex app-server --listen unix://".to_string(),
+            executable: PathBuf::from("/opt/codex"),
+        }
+    }
+
+    fn managed_app_server_test_identity(
+        process: &CodexProcess,
+        owner_kind: ManagedAppServerOwnerKind,
+    ) -> ManagedAppServerIdentity {
+        ManagedAppServerIdentity {
+            owner_kind,
+            process: process.clone(),
             kernel_executable_identity: HotSwapKernelExecutableIdentity {
                 canonical_path: process.executable.display().to_string(),
                 device: 7,
@@ -4880,30 +5041,44 @@ mod tests {
     }
 
     #[test]
-    fn managed_headless_pid_restart_renews_the_new_exact_identity() -> Result<()> {
-        let restarted = managed_headless_test_process(84, "linux:restarted");
-        let expected = managed_headless_test_identity(&restarted);
+    fn managed_readiness_renews_systemd_and_unix_owners_together() -> Result<()> {
+        let headless =
+            managed_headless_test_identity(&managed_headless_test_process(42, "linux:headless"));
+        let unix_process = managed_unix_test_process(84, "linux:unix");
+        let unix = managed_app_server_test_identity(
+            &unix_process,
+            ManagedAppServerOwnerKind::BuiltinUnixDaemon,
+        );
+        let expected = vec![headless, unix];
         let reload_calls = std::cell::Cell::new(0);
+        let acknowledged = std::cell::RefCell::new(HashSet::<i32>::new());
 
-        let result = maintain_managed_headless_app_server_ack_with(
+        let result = maintain_managed_app_server_acks_with(
             &expected,
-            || Ok((expected.clone(), restarted.clone())),
-            |_| false,
-            |process, minimum_remaining| {
+            Duration::from_secs(60),
+            || Ok(expected.clone()),
+            |identity, minimum_remaining| {
+                assert_eq!(minimum_remaining, Duration::from_secs(60));
+                acknowledged.borrow().contains(&identity.pid())
+            },
+            |observed, minimum_remaining, _| {
+                assert_eq!(observed, expected);
                 assert_eq!(minimum_remaining, Duration::from_secs(60));
                 reload_calls.set(reload_calls.get() + 1);
+                acknowledged
+                    .borrow_mut()
+                    .extend(observed.iter().map(ManagedAppServerIdentity::pid));
                 Ok(ReloadSummary {
-                    signaled: vec![process.pid],
+                    signaled: observed.iter().map(ManagedAppServerIdentity::pid).collect(),
                     topology_verified: true,
                     ..ReloadSummary::default()
                 })
             },
-            Duration::from_secs(60),
         )?;
 
         assert_eq!(
             result,
-            ManagedHeadlessAckMaintenance::Renewed { pid: restarted.pid }
+            ManagedAppServerAckMaintenance::Renewed { pids: vec![42, 84] }
         );
         assert_eq!(reload_calls.get(), 1);
         Ok(())
@@ -4917,15 +5092,15 @@ mod tests {
         let observed = managed_headless_test_identity(&replacement);
         let reload_calls = std::cell::Cell::new(0);
 
-        let error = maintain_managed_headless_app_server_ack_with(
-            &expected,
-            || Ok((observed, replacement)),
-            |_| false,
-            |_, _| {
+        let error = maintain_managed_app_server_acks_with(
+            std::slice::from_ref(&expected),
+            Duration::from_secs(60),
+            || Ok(vec![observed.clone()]),
+            |_, _| false,
+            |_, _, _| {
                 reload_calls.set(reload_calls.get() + 1);
                 Ok(ReloadSummary::default())
             },
-            Duration::from_secs(60),
         )
         .unwrap_err();
 
@@ -4940,21 +5115,52 @@ mod tests {
         let reload_calls = std::cell::Cell::new(0);
 
         for _ in 0..3 {
-            let result = maintain_managed_headless_app_server_ack_with(
-                &expected,
-                || Ok((expected.clone(), process.clone())),
-                |_| true,
-                |_, _| {
+            let result = maintain_managed_app_server_acks_with(
+                std::slice::from_ref(&expected),
+                Duration::from_secs(60),
+                || Ok(vec![expected.clone()]),
+                |_, _| true,
+                |_, _, _| {
                     reload_calls.set(reload_calls.get() + 1);
                     Ok(ReloadSummary::default())
                 },
-                Duration::from_secs(60),
             )?;
-            assert_eq!(result, ManagedHeadlessAckMaintenance::Current);
+            assert_eq!(result, ManagedAppServerAckMaintenance::Current);
         }
 
         assert_eq!(reload_calls.get(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn duplicate_managed_owner_pid_is_rejected_before_observation_or_reload() {
+        let headless =
+            managed_headless_test_identity(&managed_headless_test_process(42, "linux:headless"));
+        let unix = managed_app_server_test_identity(
+            &managed_unix_test_process(42, "linux:unix"),
+            ManagedAppServerOwnerKind::BuiltinUnixDaemon,
+        );
+        let observations = std::cell::Cell::new(0);
+        let reloads = std::cell::Cell::new(0);
+
+        let error = maintain_managed_app_server_acks_with(
+            &[headless, unix],
+            Duration::from_secs(60),
+            || {
+                observations.set(observations.get() + 1);
+                Ok(Vec::new())
+            },
+            |_, _| false,
+            |_, _, _| {
+                reloads.set(reloads.get() + 1);
+                Ok(ReloadSummary::default())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate pid 42"));
+        assert_eq!(observations.get(), 0);
+        assert_eq!(reloads.get(), 0);
     }
 
     #[test]

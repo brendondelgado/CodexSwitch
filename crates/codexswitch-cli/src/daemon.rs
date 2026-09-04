@@ -32,8 +32,8 @@ use crate::rate_limit_resets::{
     ResetOrchestrationContext, ResetOrchestrationDependencies, ResetQuotaRefreshStrategy,
 };
 use crate::reload::{
-    maintain_managed_headless_app_server_ack, reload_codex_hot_swap_processes,
-    ManagedHeadlessAckMaintenance, ManagedHeadlessAppServerIdentity, ReloadSummary,
+    maintain_managed_app_server_acks, reload_codex_hot_swap_processes,
+    ManagedAppServerAckMaintenance, ManagedAppServerIdentity, ReloadSummary,
 };
 use crate::token_refresh::refresh_account_tokens;
 use anyhow::{bail, Context, Result};
@@ -162,13 +162,13 @@ impl ManagedReadinessCadence {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ManagedReadinessTick {
     NotDue,
     DeferredForActivation,
     NoManagedRuntime,
     Current,
-    Renewed { pid: i32 },
+    Renewed { pids: Vec<i32> },
 }
 
 fn maintain_managed_readiness_with<Lease, CompletedAt, AcquireLease, Observe, Maintain>(
@@ -182,8 +182,8 @@ fn maintain_managed_readiness_with<Lease, CompletedAt, AcquireLease, Observe, Ma
 where
     CompletedAt: FnOnce() -> Instant,
     AcquireLease: FnOnce() -> Result<Option<Lease>>,
-    Observe: FnOnce() -> Result<Option<ManagedHeadlessAppServerIdentity>>,
-    Maintain: FnOnce(&ManagedHeadlessAppServerIdentity) -> Result<ManagedHeadlessAckMaintenance>,
+    Observe: FnOnce() -> Result<Vec<ManagedAppServerIdentity>>,
+    Maintain: FnOnce(&[ManagedAppServerIdentity]) -> Result<ManagedAppServerAckMaintenance>,
 {
     if !cadence.claim_if_due(now) {
         return Ok(ManagedReadinessTick::NotDue);
@@ -191,11 +191,11 @@ where
     let result = match acquire_runtime_lease() {
         Ok(None) => Ok(ManagedReadinessTick::DeferredForActivation),
         Ok(Some(_runtime_lease)) => match observe_managed_runtime() {
-            Ok(None) => Ok(ManagedReadinessTick::NoManagedRuntime),
-            Ok(Some(identity)) => match maintain_ack(&identity) {
-                Ok(ManagedHeadlessAckMaintenance::Current) => Ok(ManagedReadinessTick::Current),
-                Ok(ManagedHeadlessAckMaintenance::Renewed { pid }) => {
-                    Ok(ManagedReadinessTick::Renewed { pid })
+            Ok(identities) if identities.is_empty() => Ok(ManagedReadinessTick::NoManagedRuntime),
+            Ok(identities) => match maintain_ack(&identities) {
+                Ok(ManagedAppServerAckMaintenance::Current) => Ok(ManagedReadinessTick::Current),
+                Ok(ManagedAppServerAckMaintenance::Renewed { pids }) => {
+                    Ok(ManagedReadinessTick::Renewed { pids })
                 }
                 Err(error) => Err(error),
             },
@@ -219,8 +219,8 @@ fn maintain_managed_readiness_after_tick_with<Lease, CompletedAt, AcquireLease, 
 where
     CompletedAt: FnOnce() -> Instant,
     AcquireLease: FnOnce() -> Result<Option<Lease>>,
-    Observe: FnOnce() -> Result<Option<ManagedHeadlessAppServerIdentity>>,
-    Maintain: FnOnce(&ManagedHeadlessAppServerIdentity) -> Result<ManagedHeadlessAckMaintenance>,
+    Observe: FnOnce() -> Result<Vec<ManagedAppServerIdentity>>,
+    Maintain: FnOnce(&[ManagedAppServerIdentity]) -> Result<ManagedAppServerAckMaintenance>,
 {
     let readiness_result = maintain_managed_readiness_with(
         cadence,
@@ -1773,18 +1773,22 @@ pub fn run_loop(store_path: &Path, auth_path: &Path, interval: Duration) -> Resu
             Instant::now(),
             Instant::now,
             || try_acquire_runtime_activation_lease(store_path),
-            codex_update::managed_headless_app_server_identity,
-            |identity| {
-                maintain_managed_headless_app_server_ack(
-                    identity,
+            codex_update::managed_app_server_identities,
+            |identities| {
+                maintain_managed_app_server_acks(
+                    identities,
                     auth_path,
                     MANAGED_READINESS_MINIMUM_ACK_REMAINING,
+                    codex_update::managed_app_server_identities,
                 )
             },
         );
         match readiness_result {
-            Ok(ManagedReadinessTick::Renewed { pid }) => {
-                eprintln!("renewed managed app-server hot-swap readiness for pid {pid}");
+            Ok(ManagedReadinessTick::Renewed { pids }) => {
+                eprintln!(
+                    "renewed managed app-server hot-swap readiness for pids {:?}",
+                    pids
+                );
             }
             Ok(_) => {}
             Err(error) => {
@@ -1847,7 +1851,10 @@ mod tests {
         CodexAccount, QuotaSnapshot, QuotaWindow, QuotaWindowKind, QuotaWindowRateLimitSource,
         QuotaWindowSlot, QuotaWindowSourceMetadata,
     };
-    use crate::reload::{HotSwapKernelExecutableIdentity, HOT_SWAP_ACK_FRESHNESS};
+    use crate::reload::{
+        CodexProcess, HotSwapKernelExecutableIdentity, ManagedAppServerOwnerKind,
+        HOT_SWAP_ACK_FRESHNESS,
+    };
     use anyhow::bail;
     use serde_json::json;
     use std::fs::OpenOptions;
@@ -1941,15 +1948,37 @@ mod tests {
             .with_topology_verified(true)
     }
 
-    fn managed_readiness_identity(
+    fn managed_readiness_identity(pid: i32, start_identity: &str) -> ManagedAppServerIdentity {
+        managed_readiness_identity_for_owner(
+            pid,
+            start_identity,
+            ManagedAppServerOwnerKind::SystemdPort8390,
+        )
+    }
+
+    fn managed_readiness_identity_for_owner(
         pid: i32,
         start_identity: &str,
-    ) -> ManagedHeadlessAppServerIdentity {
-        ManagedHeadlessAppServerIdentity {
-            pid,
-            owner_uid: 1001,
-            executable: PathBuf::from("/opt/codex"),
-            start_identity: start_identity.to_string(),
+        owner_kind: ManagedAppServerOwnerKind,
+    ) -> ManagedAppServerIdentity {
+        let command_line = match owner_kind {
+            ManagedAppServerOwnerKind::SystemdPort8390 => {
+                "/opt/codex app-server --remote-control --listen ws://127.0.0.1:8390"
+            }
+            ManagedAppServerOwnerKind::BuiltinUnixDaemon => {
+                "/opt/codex app-server --listen unix://"
+            }
+        };
+        ManagedAppServerIdentity {
+            owner_kind,
+            process: CodexProcess {
+                pid,
+                owner_uid: 1001,
+                executable: PathBuf::from("/opt/codex"),
+                start_identity: start_identity.to_string(),
+                started_at_unix: 1_000,
+                command_line: command_line.to_string(),
+            },
             kernel_executable_identity: HotSwapKernelExecutableIdentity {
                 canonical_path: "/opt/codex".to_string(),
                 device: 7,
@@ -1973,11 +2002,11 @@ mod tests {
                 || Ok(Some(())),
                 || {
                     observations.set(observations.get() + 1);
-                    Ok(None)
+                    Ok(Vec::new())
                 },
                 |_| {
                     maintenance_calls.set(maintenance_calls.get() + 1);
-                    Ok(ManagedHeadlessAckMaintenance::Current)
+                    Ok(ManagedAppServerAckMaintenance::Current)
                 },
             )
         };
@@ -2009,10 +2038,10 @@ mod tests {
                 start + Duration::from_secs(offset),
                 || start + Duration::from_secs(offset),
                 || Ok(Some(())),
-                || Ok(Some(identity.clone())),
+                || Ok(vec![identity.clone()]),
                 |_| {
                     maintenance_calls.set(maintenance_calls.get() + 1);
-                    Ok(ManagedHeadlessAckMaintenance::Current)
+                    Ok(ManagedAppServerAckMaintenance::Current)
                 },
             )?;
             assert_eq!(
@@ -2026,6 +2055,67 @@ mod tests {
         }
 
         assert_eq!(maintenance_calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_readiness_renews_two_owners_under_one_lease_and_cadence() -> Result<()> {
+        let start = Instant::now();
+        let systemd = managed_readiness_identity_for_owner(
+            42,
+            "linux:systemd",
+            ManagedAppServerOwnerKind::SystemdPort8390,
+        );
+        let unix = managed_readiness_identity_for_owner(
+            84,
+            "linux:unix",
+            ManagedAppServerOwnerKind::BuiltinUnixDaemon,
+        );
+        let expected = vec![systemd, unix];
+        let mut cadence = ManagedReadinessCadence::default();
+        let lease_attempts = std::cell::Cell::new(0);
+        let observations = std::cell::Cell::new(0);
+        let maintenance_calls = std::cell::Cell::new(0);
+
+        let result = maintain_managed_readiness_with(
+            &mut cadence,
+            start,
+            || start,
+            || {
+                lease_attempts.set(lease_attempts.get() + 1);
+                Ok(Some(()))
+            },
+            || {
+                observations.set(observations.get() + 1);
+                Ok(expected.clone())
+            },
+            |identities| {
+                maintenance_calls.set(maintenance_calls.get() + 1);
+                assert_eq!(identities, expected.as_slice());
+                Ok(ManagedAppServerAckMaintenance::Renewed {
+                    pids: identities
+                        .iter()
+                        .map(ManagedAppServerIdentity::pid)
+                        .collect(),
+                })
+            },
+        )?;
+
+        assert_eq!(result, ManagedReadinessTick::Renewed { pids: vec![42, 84] });
+        assert_eq!(lease_attempts.get(), 1);
+        assert_eq!(observations.get(), 1);
+        assert_eq!(maintenance_calls.get(), 1);
+
+        let not_due = maintain_managed_readiness_with(
+            &mut cadence,
+            start + Duration::from_secs(1),
+            || panic!("not-due tick requested completion time"),
+            || -> Result<Option<()>> { panic!("not-due tick reacquired activation lease") },
+            || panic!("not-due tick rediscovered managed owners"),
+            |_| panic!("not-due tick repeated readiness maintenance"),
+        )?;
+        assert_eq!(not_due, ManagedReadinessTick::NotDue);
+        assert_eq!(lease_attempts.get(), 1);
         Ok(())
     }
 
@@ -2049,7 +2139,7 @@ mod tests {
             start,
             || start + Duration::from_secs(70),
             || Ok(Some(())),
-            || Ok(Some(identity)),
+            || Ok(vec![identity]),
             |_| {
                 maintenance_calls.set(maintenance_calls.get() + 1);
                 bail!("missing patch support")
@@ -2090,11 +2180,14 @@ mod tests {
             || try_acquire_runtime_activation_lease(&store_path),
             || {
                 observations.set(observations.get() + 1);
-                Ok(Some(identity.clone()))
+                Ok(vec![identity.clone()])
             },
-            |_| {
+            |observed| {
                 reload_or_signal_calls.set(reload_or_signal_calls.get() + 1);
-                Ok(ManagedHeadlessAckMaintenance::Renewed { pid: identity.pid })
+                assert_eq!(observed, std::slice::from_ref(&identity));
+                Ok(ManagedAppServerAckMaintenance::Renewed {
+                    pids: vec![identity.pid()],
+                })
             },
         )?;
 
@@ -2125,18 +2218,22 @@ mod tests {
             || try_acquire_runtime_activation_lease(&store_path),
             || {
                 observations.set(observations.get() + 1);
-                Ok(Some(identity.clone()))
+                Ok(vec![identity.clone()])
             },
             |observed| {
                 reload_or_signal_calls.set(reload_or_signal_calls.get() + 1);
-                assert_eq!(observed, &identity);
-                Ok(ManagedHeadlessAckMaintenance::Renewed { pid: observed.pid })
+                assert_eq!(observed, std::slice::from_ref(&identity));
+                Ok(ManagedAppServerAckMaintenance::Renewed {
+                    pids: vec![observed[0].pid()],
+                })
             },
         )?;
 
         assert_eq!(
             recovered,
-            ManagedReadinessTick::Renewed { pid: identity.pid }
+            ManagedReadinessTick::Renewed {
+                pids: vec![identity.pid()]
+            }
         );
         assert_eq!(observations.get(), 1);
         assert_eq!(reload_or_signal_calls.get(), 1);
@@ -2157,11 +2254,13 @@ mod tests {
             start,
             || start,
             || Ok(Some(())),
-            || Ok(Some(identity.clone())),
+            || Ok(vec![identity.clone()]),
             |observed| {
                 maintenance_calls.set(maintenance_calls.get() + 1);
-                assert_eq!(observed, &identity);
-                Ok(ManagedHeadlessAckMaintenance::Renewed { pid: observed.pid })
+                assert_eq!(observed, std::slice::from_ref(&identity));
+                Ok(ManagedAppServerAckMaintenance::Renewed {
+                    pids: vec![observed[0].pid()],
+                })
             },
         );
         let readiness = readiness?;
@@ -2177,7 +2276,9 @@ mod tests {
 
         assert_eq!(
             readiness,
-            ManagedReadinessTick::Renewed { pid: identity.pid }
+            ManagedReadinessTick::Renewed {
+                pids: vec![identity.pid()]
+            }
         );
         assert_eq!(maintenance_calls.get(), 1);
         assert_eq!(sleep_interval, MANAGED_READINESS_MAINTENANCE_INTERVAL);
@@ -2196,23 +2297,30 @@ mod tests {
             start,
             || start,
             || Ok(Some(())),
-            || Ok(Some(original)),
-            |_| Ok(ManagedHeadlessAckMaintenance::Current),
+            || Ok(vec![original]),
+            |_| Ok(ManagedAppServerAckMaintenance::Current),
         )?;
         let second = maintain_managed_readiness_with(
             &mut cadence,
             start + MANAGED_READINESS_MAINTENANCE_INTERVAL,
             || start + MANAGED_READINESS_MAINTENANCE_INTERVAL,
             || Ok(Some(())),
-            || Ok(Some(restarted.clone())),
-            |identity| {
-                assert_eq!(identity, &restarted);
-                Ok(ManagedHeadlessAckMaintenance::Renewed { pid: identity.pid })
+            || Ok(vec![restarted.clone()]),
+            |identities| {
+                assert_eq!(identities, std::slice::from_ref(&restarted));
+                Ok(ManagedAppServerAckMaintenance::Renewed {
+                    pids: vec![identities[0].pid()],
+                })
             },
         )?;
 
         assert_eq!(first, ManagedReadinessTick::Current);
-        assert_eq!(second, ManagedReadinessTick::Renewed { pid: restarted.pid });
+        assert_eq!(
+            second,
+            ManagedReadinessTick::Renewed {
+                pids: vec![restarted.pid()]
+            }
+        );
         Ok(())
     }
 

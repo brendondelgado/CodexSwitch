@@ -1,3 +1,72 @@
+#[cfg(target_os = "linux")]
+pub(crate) fn managed_app_server_identities() -> Result<Vec<ManagedAppServerIdentity>> {
+    combine_managed_app_server_identities(
+        managed_headless_app_server_identity()?,
+        managed_unix_app_server_identity()?,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn managed_app_server_identities() -> Result<Vec<ManagedAppServerIdentity>> {
+    Ok(Vec::new())
+}
+
+fn combine_managed_app_server_identities(
+    systemd: Option<ManagedAppServerIdentity>,
+    unix_daemon: Option<ManagedAppServerIdentity>,
+) -> Result<Vec<ManagedAppServerIdentity>> {
+    let identities = [systemd, unix_daemon]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    validate_managed_app_server_identities(&identities)?;
+    Ok(identities)
+}
+
+#[cfg(target_os = "linux")]
+fn managed_unix_app_server_identity() -> Result<Option<ManagedAppServerIdentity>> {
+    let current_route = codexswitch_data_dir()?.join("current/patched-codex/codex");
+    let current_runtime = fs::canonicalize(&current_route)
+        .context("failed to resolve the current immutable Codex runtime")?;
+    let codex_home = managed_daemon_codex_home()?;
+    managed_unix_app_server_identity_at(&current_route, &current_runtime, &codex_home)
+}
+
+#[cfg(target_os = "linux")]
+fn managed_unix_app_server_identity_at(
+    current_route: &Path,
+    current_runtime: &Path,
+    codex_home: &Path,
+) -> Result<Option<ManagedAppServerIdentity>> {
+    let record_path = codex_home.join("app-server-daemon/app-server.pid");
+    let record = read_managed_daemon_pid_record(&record_path)?;
+    let exact_pids = scan_linux_exact_managed_unix_daemon_pids(current_route, current_runtime)?;
+    let Some(record) = record else {
+        if exact_pids.is_empty() {
+            return Ok(None);
+        }
+        bail!(
+            "exact current-release Unix app-server process(es) {:?} have no managed daemon PID record",
+            exact_pids
+        );
+    };
+    let identity = bind_managed_daemon_pid_record(
+        HostPlatform::Linux,
+        &record,
+        current_route,
+        current_runtime,
+    )?
+    .context("managed Unix app-server PID record does not name a live exact owner")?;
+    let record_pid = i32::try_from(record.pid).context("managed daemon PID exceeds i32")?;
+    if exact_pids.as_slice() != [record.pid] {
+        bail!(
+            "managed Unix app-server ownership is ambiguous: PID record names {record_pid}, exact current-release processes are {:?}",
+            exact_pids
+        );
+    }
+    Ok(Some(identity))
+}
+
 #[cfg(test)]
 fn install_offline_if_inactive<F>(
     activity: &ManagedRuntimeActivity,
@@ -452,6 +521,9 @@ fn read_managed_daemon_pid_record(path: &Path) -> Result<Option<ManagedDaemonPid
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("managed daemon pid record must be a regular non-symlink file");
     }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("managed daemon pid record is owned by another uid");
+    }
     if metadata.len() > MANAGED_DAEMON_PID_RECORD_MAX_BYTES {
         bail!("managed daemon pid record exceeds its bounded read limit");
     }
@@ -482,29 +554,39 @@ fn observe_managed_daemon_pid_record(
     record: &ManagedDaemonPidRecord,
     current_runtime: Option<&Path>,
 ) -> RuntimeActivityObservation {
+    let Some(current_runtime) = current_runtime else {
+        return RuntimeActivityObservation::Unknown(format!(
+            "managed daemon pid {} is live, but the installed runtime is unavailable for exact process identity verification",
+            record.pid
+        ));
+    };
+    match bind_managed_daemon_pid_record(platform, record, current_runtime, current_runtime) {
+        Ok(Some(_)) => RuntimeActivityObservation::Active,
+        Ok(None) => RuntimeActivityObservation::Inactive,
+        Err(error) => RuntimeActivityObservation::Unknown(format!("{error:#}")),
+    }
+}
+
+fn bind_managed_daemon_pid_record(
+    platform: HostPlatform,
+    record: &ManagedDaemonPidRecord,
+    expected_argv0: &Path,
+    current_runtime: &Path,
+) -> Result<Option<ManagedAppServerIdentity>> {
     if platform != HostPlatform::Linux {
-        return RuntimeActivityObservation::Unknown(
-            "managed daemon pid identity verification is unavailable on this platform".to_string(),
-        );
+        bail!("managed daemon pid identity verification is unavailable on this platform");
     }
     let proc_dir = PathBuf::from(format!("/proc/{}", record.pid));
     let process_metadata = match fs::metadata(&proc_dir) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return RuntimeActivityObservation::Inactive;
-        }
-        Err(error) => {
-            return RuntimeActivityObservation::Unknown(format!(
-                "failed to inspect managed daemon pid {}: {error}",
-                record.pid
-            ));
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => bail!(
+            "failed to inspect managed daemon pid {}: {error}",
+            record.pid
+        ),
     };
     if process_metadata.uid() != unsafe { libc::geteuid() } {
-        return RuntimeActivityObservation::Unknown(format!(
-            "managed daemon pid {} is owned by another uid",
-            record.pid
-        ));
+        bail!("managed daemon pid {} is owned by another uid", record.pid);
     }
 
     let pid = record.pid.to_string();
@@ -513,54 +595,58 @@ fn observe_managed_daemon_pid_record(
         PROBE_COMMAND_TIMEOUT,
         bounded_command::SMALL_OUTPUT_LIMIT,
     );
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => return RuntimeActivityObservation::Unknown(format!("{error:#}")),
-    };
+    let output = output?;
     if !output.status.success() || output.status.code() != Some(0) || !output.stderr.is_empty() {
-        return if proc_dir.exists() {
-            RuntimeActivityObservation::Unknown(format!(
+        return if fs::metadata(&proc_dir).is_ok() {
+            Err(anyhow::anyhow!(
                 "failed to verify start identity for managed daemon pid {}",
                 record.pid
             ))
         } else {
-            RuntimeActivityObservation::Inactive
+            Ok(None)
         };
     }
-    let observed_start = match std::str::from_utf8(&output.stdout) {
-        Ok(start) => start.trim().to_string(),
-        Err(error) => {
-            return RuntimeActivityObservation::Unknown(format!(
-                "managed daemon pid {} start probe returned non-UTF-8 output: {error}",
+    let observed_start = std::str::from_utf8(&output.stdout)
+        .with_context(|| {
+            format!(
+                "managed daemon pid {} start probe returned non-UTF-8 output",
                 record.pid
-            ));
-        }
-    };
+            )
+        })?
+        .trim()
+        .to_string();
     if observed_start != record.process_start_time {
-        return RuntimeActivityObservation::Unknown(format!(
+        bail!(
             "managed daemon pid {} start identity changed from {:?} to {:?}",
-            record.pid, record.process_start_time, observed_start
-        ));
+            record.pid,
+            record.process_start_time,
+            observed_start
+        );
     }
-
-    let Some(current_runtime) = current_runtime else {
-        return RuntimeActivityObservation::Unknown(format!(
-            "managed daemon pid {} is live, but the installed runtime is unavailable for exact process identity verification",
-            record.pid
-        ));
-    };
-    match linux_process_matches_exact_managed_daemon(record.pid, current_runtime) {
-        Ok(ExactManagedProcessObservation::Active) => RuntimeActivityObservation::Active,
+    match linux_process_matches_exact_managed_daemon_with_argv0(
+        record.pid,
+        expected_argv0,
+        current_runtime,
+    ) {
+        Ok(ExactManagedProcessObservation::Active) => {
+            let pid = i32::try_from(record.pid).context("managed daemon PID exceeds i32")?;
+            let executable = fs::canonicalize(current_runtime).with_context(|| {
+                format!(
+                    "failed to resolve managed Unix runtime {}",
+                    current_runtime.display()
+                )
+            })?;
+            bind_managed_unix_app_server_identity(pid, unsafe { libc::geteuid() }, executable)
+                .map(Some)
+        }
         Ok(ExactManagedProcessObservation::Unrelated) => {
-            RuntimeActivityObservation::Unknown(format!(
+            bail!(
                 "managed daemon pid {} is live but does not match the installed runtime inode",
                 record.pid
-            ))
+            )
         }
-        Ok(ExactManagedProcessObservation::IdentityDrift(error)) => {
-            RuntimeActivityObservation::Unknown(error)
-        }
-        Err(error) => RuntimeActivityObservation::Unknown(format!("{error:#}")),
+        Ok(ExactManagedProcessObservation::IdentityDrift(error)) => bail!(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -656,8 +742,104 @@ fn scan_linux_exact_managed_daemon_processes(current_runtime: &Path) -> RuntimeA
     RuntimeActivityObservation::Inactive
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn scan_linux_exact_managed_unix_daemon_pids(
+    expected_argv0: &Path,
+    current_runtime: &Path,
+) -> Result<Vec<u32>> {
+    scan_linux_exact_managed_unix_daemon_pids_at(
+        Path::new("/proc"),
+        expected_argv0,
+        current_runtime,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn scan_linux_exact_managed_unix_daemon_pids_at(
+    proc_root: &Path,
+    expected_argv0: &Path,
+    current_runtime: &Path,
+) -> Result<Vec<u32>> {
+    let expected_metadata = fs::metadata(current_runtime).with_context(|| {
+        format!(
+            "failed to inspect current managed runtime {}",
+            current_runtime.display()
+        )
+    })?;
+    let expected_canonical = fs::canonicalize(current_runtime).with_context(|| {
+        format!(
+            "failed to resolve current managed runtime {}",
+            current_runtime.display()
+        )
+    })?;
+    let entries = fs::read_dir(proc_root)
+        .with_context(|| format!("failed to enumerate {}", proc_root.display()))?;
+    let started = Instant::now();
+    let current_uid = unsafe { libc::geteuid() };
+    let mut scanned = 0_usize;
+    let mut pids = Vec::new();
+    for entry in entries {
+        scanned += 1;
+        if scanned > MANAGED_DAEMON_PROC_SCAN_MAX_ENTRIES
+            || started.elapsed() > MANAGED_DAEMON_PROC_SCAN_TIMEOUT
+        {
+            bail!("exact managed Unix daemon process scan exceeded its bound");
+        }
+        let entry = entry
+            .with_context(|| format!("failed during exact scan of {}", proc_root.display()))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let metadata = match fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("failed to inspect process during exact scan"),
+        };
+        if metadata.uid() != current_uid {
+            continue;
+        }
+        let Some(command_line) = read_linux_proc_file_bounded(
+            &entry.path().join("cmdline"),
+            MANAGED_DAEMON_CMDLINE_MAX_BYTES,
+        )?
+        else {
+            continue;
+        };
+        if !command_line_is_exact_managed_app_server_daemon(&command_line, expected_argv0) {
+            continue;
+        }
+        match linux_process_matches_exact_managed_daemon_with_metadata(
+            proc_root,
+            pid,
+            expected_argv0,
+            &expected_canonical,
+            &expected_metadata,
+        )? {
+            ExactManagedProcessObservation::Active => pids.push(pid),
+            ExactManagedProcessObservation::Unrelated => {
+                bail!("exact managed Unix daemon pid {pid} lost its runtime identity")
+            }
+            ExactManagedProcessObservation::IdentityDrift(error) => bail!(error),
+        }
+    }
+    pids.sort_unstable();
+    Ok(pids)
+}
+
 fn linux_process_matches_exact_managed_daemon(
     pid: u32,
+    current_runtime: &Path,
+) -> Result<ExactManagedProcessObservation> {
+    linux_process_matches_exact_managed_daemon_with_argv0(pid, current_runtime, current_runtime)
+}
+
+fn linux_process_matches_exact_managed_daemon_with_argv0(
+    pid: u32,
+    expected_argv0: &Path,
     current_runtime: &Path,
 ) -> Result<ExactManagedProcessObservation> {
     let expected_metadata = fs::metadata(current_runtime).with_context(|| {
@@ -675,7 +857,7 @@ fn linux_process_matches_exact_managed_daemon(
     linux_process_matches_exact_managed_daemon_with_metadata(
         Path::new("/proc"),
         pid,
-        current_runtime,
+        expected_argv0,
         &expected_canonical,
         &expected_metadata,
     )

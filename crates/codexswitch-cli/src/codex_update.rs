@@ -2,7 +2,11 @@ use crate::bounded_command;
 use crate::patched_codex;
 #[cfg(target_os = "linux")]
 use crate::reload::bind_managed_headless_app_server_identity;
-use crate::reload::ManagedHeadlessAppServerIdentity;
+use crate::reload::bind_managed_unix_app_server_identity;
+use crate::reload::{
+    validate_managed_app_server_identities, ManagedAppServerIdentity,
+    ManagedHeadlessAppServerIdentity,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::blocking::Client;

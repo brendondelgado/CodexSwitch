@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reload::{CodexProcess, HotSwapKernelExecutableIdentity, ManagedAppServerOwnerKind};
     use chrono::TimeZone;
 
     fn automatic_update_test_state(status: UpdateStatus, now: DateTime<Utc>) -> CodexUpdateState {
@@ -403,6 +404,117 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn managed_owner_test_identity(
+        pid: i32,
+        owner_kind: ManagedAppServerOwnerKind,
+    ) -> ManagedAppServerIdentity {
+        let command_line = match owner_kind {
+            ManagedAppServerOwnerKind::SystemdPort8390 => {
+                "/opt/codex app-server --remote-control --listen ws://127.0.0.1:8390"
+            }
+            ManagedAppServerOwnerKind::BuiltinUnixDaemon => {
+                "/opt/codex app-server --listen unix://"
+            }
+        };
+        ManagedAppServerIdentity {
+            owner_kind,
+            process: CodexProcess {
+                pid,
+                owner_uid: 1001,
+                start_identity: format!("linux:{pid}"),
+                started_at_unix: 1_000,
+                command_line: command_line.to_string(),
+                executable: PathBuf::from("/opt/codex"),
+            },
+            kernel_executable_identity: HotSwapKernelExecutableIdentity {
+                canonical_path: "/opt/codex".to_string(),
+                device: 7,
+                inode: u64::try_from(pid).unwrap_or_default(),
+            },
+        }
+    }
+
+    #[test]
+    fn managed_owner_discovery_rejects_duplicate_pid_and_owner_kind() {
+        let duplicate_pid = combine_managed_app_server_identities(
+            Some(managed_owner_test_identity(
+                42,
+                ManagedAppServerOwnerKind::SystemdPort8390,
+            )),
+            Some(managed_owner_test_identity(
+                42,
+                ManagedAppServerOwnerKind::BuiltinUnixDaemon,
+            )),
+        )
+        .unwrap_err();
+        assert!(duplicate_pid.to_string().contains("duplicate pid 42"));
+
+        let duplicate_owner = combine_managed_app_server_identities(
+            Some(managed_owner_test_identity(
+                42,
+                ManagedAppServerOwnerKind::SystemdPort8390,
+            )),
+            Some(managed_owner_test_identity(
+                84,
+                ManagedAppServerOwnerKind::SystemdPort8390,
+            )),
+        )
+        .unwrap_err();
+        assert!(duplicate_owner
+            .to_string()
+            .contains("duplicate SystemdPort8390 owner"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_daemon_scan_matches_stable_route_to_immutable_runtime_and_finds_duplicates(
+    ) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let immutable_runtime = temp.path().join("releases/0.145.0/codex");
+        fs::create_dir_all(immutable_runtime.parent().unwrap())?;
+        fs::write(&immutable_runtime, b"runtime")?;
+        let current_route = temp.path().join("current/patched-codex/codex");
+        fs::create_dir_all(current_route.parent().unwrap())?;
+        symlink(&immutable_runtime, &current_route)?;
+        let proc_root = temp.path().join("proc");
+        fs::create_dir_all(&proc_root)?;
+
+        for pid in [42_u32, 84_u32] {
+            let process = proc_root.join(pid.to_string());
+            fs::create_dir_all(&process)?;
+            fs::write(
+                process.join("stat"),
+                format!("{pid} (codex) {}\n", vec!["1"; 20].join(" ")),
+            )?;
+            fs::write(
+                process.join("cmdline"),
+                [
+                    current_route.as_os_str().as_bytes(),
+                    b"app-server",
+                    b"--listen",
+                    b"unix://",
+                ]
+                .iter()
+                .flat_map(|argument| argument.iter().copied().chain(std::iter::once(0)))
+                .collect::<Vec<_>>(),
+            )?;
+            symlink(&immutable_runtime, process.join("exe"))?;
+        }
+
+        assert_eq!(
+            scan_linux_exact_managed_unix_daemon_pids_at(
+                &proc_root,
+                &current_route,
+                &immutable_runtime,
+            )?,
+            vec![42, 84]
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1248,8 +1360,7 @@ esac
         let mut enumeration = RetentionEnumerationBudget::new(100);
         let prepared = collect_prepared_generations(data_dir, 1024 * 1024, &mut enumeration)?;
 
-        let protected =
-            protected_live_prepared_generations(data_dir, &prepared, &identities)?;
+        let protected = protected_live_prepared_generations(data_dir, &prepared, &identities)?;
         assert_eq!(
             protected,
             HashSet::from([codex_generation, helper_generation])
@@ -1314,15 +1425,14 @@ esac
         );
 
         let state = automatic_update_test_state(UpdateStatus::Idle, Utc::now());
-        enforce_updater_retention_at(
-            &state,
-            data_dir,
-            SystemTime::now(),
-        )?;
+        enforce_updater_retention_at(&state, data_dir, SystemTime::now())?;
 
         assert!(generations[0].exists(), "leased generation was pruned");
         assert!(
-            generations.iter().filter(|generation| generation.exists()).count()
+            generations
+                .iter()
+                .filter(|generation| generation.exists())
+                .count()
                 == PREPARED_TREE_MAX_COUNT,
             "retention did not prune exactly one unleased generation"
         );
@@ -2146,17 +2256,15 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
             adapt_account_updated_notification_template(desktop, false)?,
             desktop
         );
-        let timestamped_desktop =
-            adapt_account_updated_notification_template(desktop, true)?;
-        assert!(timestamped_desktop.contains(
-            "crate::outgoing_message::timestamped_server_notification("
-        ));
+        let timestamped_desktop = adapt_account_updated_notification_template(desktop, true)?;
+        assert!(timestamped_desktop
+            .contains("crate::outgoing_message::timestamped_server_notification("));
         assert!(!timestamped_desktop.contains("AppServerNotification("));
 
         let timestamped_local = adapt_account_updated_notification_template(local, true)?;
-        assert!(timestamped_local.contains(
-            "crate::outgoing_message::timestamped_server_notification("
-        ));
+        assert!(
+            timestamped_local.contains("crate::outgoing_message::timestamped_server_notification(")
+        );
         assert!(!timestamped_local.contains("AppServerNotification("));
         Ok(())
     }
@@ -2226,9 +2334,7 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
 
         for path in [&app_server, &in_process] {
             let patched = fs::read_to_string(path)?;
-            assert!(patched.contains(
-                "crate::outgoing_message::timestamped_server_notification("
-            ));
+            assert!(patched.contains("crate::outgoing_message::timestamped_server_notification("));
             assert!(!patched.contains("OutgoingMessage::AppServerNotification("));
         }
         Ok(())
@@ -2811,10 +2917,7 @@ fn timestamped_server_notification(notification: ServerNotification) -> Outgoing
                 .map(|transaction| transaction.id.as_str()),
             Some("tx-interrupted")
         );
-        assert_eq!(
-            interrupted.prepared_version.as_deref(),
-            Some("0.145.0")
-        );
+        assert_eq!(interrupted.prepared_version.as_deref(), Some("0.145.0"));
 
         let mut activation = automatic_update_test_state(UpdateStatus::Failed, now);
         activation.error = Some("activation acknowledgement failed".to_string());
@@ -4496,12 +4599,9 @@ async fn run_turn() {
         assert!(patched.contains("rejectedFrontendCount"));
         assert!(patched.contains("idleListenerReady"));
         assert!(patched.contains("\"managed-desktop-bridge\" => {"));
-        assert!(patched.contains(
-            "\"headless-remote-control-app-server\" => eligible_frontend_count == 0"
-        ));
-        assert!(patched.contains(
-            "\"external-app-server\" | \"managed-desktop-bridge\" => {"
-        ));
+        assert!(patched
+            .contains("\"headless-remote-control-app-server\" => eligible_frontend_count == 0"));
+        assert!(patched.contains("\"external-app-server\" | \"managed-desktop-bridge\" => {"));
         assert!(patched.contains("initialized_frontend_count == 0"));
         assert!(patched.contains("skipped_frontend_count == 0"));
         assert!(patched.contains("rejected_frontend_count == 0"));
@@ -5002,9 +5102,8 @@ async fn run_turn() {
             "Err(err) => match err.details() { CodexErrorDetails::UsageLimitReached(e) => err }",
         )
         .unwrap();
-        assert!(error_details.contains(
-            "matches!(error.details(), CodexErrorDetails::RefreshTokenFailed(_))"
-        ));
+        assert!(error_details
+            .contains("matches!(error.details(), CodexErrorDetails::RefreshTokenFailed(_))"));
         assert!(!error_details.contains("matches!(error, CodexErr::RefreshTokenFailed(_))"));
 
         assert!(interrupted_turn_template("Err(err) => err").is_err());
@@ -5085,9 +5184,9 @@ async fn run_turn() {
         let second = fs::read_to_string(turn_dir.join("turn.rs")).unwrap();
 
         assert_eq!(second, first, "the 0.146 turn patch must be idempotent");
-        assert!(second.contains(
-            "matches!(error.details(), CodexErrorDetails::RefreshTokenFailed(_))"
-        ));
+        assert!(
+            second.contains("matches!(error.details(), CodexErrorDetails::RefreshTokenFailed(_))")
+        );
         assert!(!second.contains("matches!(error, CodexErr::RefreshTokenFailed(_))"));
         assert_eq!(
             second
