@@ -3710,9 +3710,8 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("no concrete unexpired available credit"));
+        assert!(error.is::<ResetNotSubmitted>());
+        assert!(format!("{error:#}").contains("no concrete unexpired available credit"));
         assert_eq!(*send_calls.lock().unwrap(), 0);
 
         let oversized_send_calls = Arc::new(Mutex::new(0usize));
@@ -3732,9 +3731,8 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("no concrete unexpired available credit"));
+        assert!(error.is::<ResetNotSubmitted>());
+        assert!(format!("{error:#}").contains("no concrete unexpired available credit"));
         assert_eq!(*oversized_send_calls.lock().unwrap(), 0);
 
         let temp = TempDir::new()?;
