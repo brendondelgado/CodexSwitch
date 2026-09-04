@@ -95,6 +95,14 @@ that transaction has committed, its journal and private snapshot have been
 durably removed, both pre-commit runtime observations were positively inactive,
 and the install guards have been released.
 
+During the migration from the former port-8390 unit, the pre-commit observer
+accepts exactly two `ExecStart` argument vectors: the current release contract
+and the immediately prior contract that also held `app-server.pid.lock`. This
+exception is limited to the guarded pre-commit observation, still requires an
+inactive unit with `MainPID=0` at the repository-owned fragment path, and does
+not permit any other argument drift. Post-commit starts accept only the current
+contract.
+
 ## Release Contract
 
 The default layout is:

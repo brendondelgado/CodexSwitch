@@ -370,28 +370,6 @@ else:
 PY
 }
 
-observe_managed_systemd_owner() {
-  local activation_mask=""
-
-  if [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "1" ]] && \
-     awk -F '\t' -v unit="$MANAGED_APP_SERVER_UNIT" \
-       '$1 == unit && $2 == "mask" { found=1 } END { exit(found ? 0 : 1) }' \
-       <<< "$SYSTEMD_START_BARRIER_MODES"; then
-    activation_mask="$(systemd_start_mask_path "$MANAGED_APP_SERVER_UNIT")"
-  fi
-  python3 "$RUNTIME_OBSERVER_HELPER_ROOT/observe-managed-systemd.py" \
-    "$MANAGED_APP_SERVER_UNIT" \
-    "$SERVICE_DIR/$MANAGED_APP_SERVER_UNIT" \
-    "$RUNTIME_OBSERVATION_TIMEOUT_SECONDS" \
-    "$STATE_FILE_MAX_BYTES" \
-    --activation-mask "$activation_mask" \
-    /usr/bin/flock --shared --no-fork \
-    "$RUNTIME_START_INSTALL_GUARD" \
-    "$CURRENT_LINK/patched-codex/codex" \
-    -c features.local_thread_store_compression=true \
-    app-server --remote-control --listen ws://127.0.0.1:8390
-}
-
 observe_managed_app_server_daemon() {
   local reservation_held="${1:-0}"
   local allow_missing_runtime="${2:-0}"
@@ -410,6 +388,7 @@ observe_managed_app_server_daemon() {
 require_managed_runtime_inactive() {
   local context="$1"
   local reservation_held="${2:-0}"
+  local allow_prior_systemd_contract="${3:-0}"
   local systemd_observation=""
   local daemon_observation=""
   local systemd_state=""
@@ -420,7 +399,7 @@ require_managed_runtime_inactive() {
     allow_missing_runtime=1
   fi
 
-  systemd_observation="$(observe_managed_systemd_owner)" || fail "systemd runtime observation failed to execute"
+  systemd_observation="$(observe_managed_systemd_owner "$allow_prior_systemd_contract")" || fail "systemd runtime observation failed to execute"
   daemon_observation="$(observe_managed_app_server_daemon "$reservation_held" "$allow_missing_runtime")" || fail "daemon runtime observation failed to execute"
   systemd_state="${systemd_observation%%$'\t'*}"
   daemon_state="${daemon_observation%%$'\t'*}"
@@ -612,7 +591,7 @@ stop_runtime_guard_holder() {
 
 acquire_runtime_guards_for_commit() {
   [[ "$RUNTIME_GUARDS_HELD" == "0" ]] || fail "runtime guards are already held"
-  require_managed_runtime_inactive initial 0
+  require_managed_runtime_inactive initial 0 1
   require_activation_systemd_units_inactive initial
   mkdir -p "$(dirname "$RUNTIME_START_INSTALL_GUARD")" "$(dirname "$DAEMON_RESERVATION_GUARD")"
   start_runtime_guard_holder
@@ -622,7 +601,7 @@ acquire_runtime_guards_for_commit() {
   verify_runtime_guard_identities || fail "runtime guard path identity changed while activation held the descriptors"
   require_activation_systemd_units_inactive final
   verify_systemd_start_barriers
-  require_managed_runtime_inactive final 1
+  require_managed_runtime_inactive final 1 1
 }
 
 release_runtime_guards() {

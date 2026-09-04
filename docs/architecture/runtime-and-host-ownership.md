@@ -1632,6 +1632,9 @@ actor boundary on every supported Swift 6 toolchain.
   account-bearing runtime and activation-blocking unit is independently
   observed inactive both before and after the continuously held runtime guards.
   Active, unknown, incomplete, or identity-drifted evidence blocks activation.
+  A release migration may recognize one explicitly encoded prior `ExecStart`
+  vector during those pre-commit observations; it never treats arbitrary argv
+  drift as inactive, and post-commit validation accepts only the current vector.
   Deployment accepts no stop or restart compatibility flag and never obtains
   quiescence by stopping an owner itself; an operator must establish the idle
   boundary separately. Quiescence does not relax the runtime ACK contract.

@@ -21,7 +21,12 @@ if remaining_arguments[:1] == ["--activation-mask"]:
     if remaining_arguments[1]:
         activation_mask = Path(remaining_arguments[1])
     remaining_arguments = remaining_arguments[2:]
-expected_argv = remaining_arguments
+expected_argvs = [[]]
+for argument in remaining_arguments:
+    if argument == "--or-argv":
+        expected_argvs.append([])
+    else:
+        expected_argvs[-1].append(argument)
 
 def result(state: str, reason: str) -> None:
     print(f"{state}\t{reason}")
@@ -29,7 +34,7 @@ def result(state: str, reason: str) -> None:
 
 if not fragment.is_absolute() or Path(os.path.realpath(fragment)) != fragment:
     result("unknown", "fragment-canonical-drift")
-if not expected_argv or not os.path.isabs(expected_argv[0]):
+if any(not argv or not os.path.isabs(argv[0]) for argv in expected_argvs):
     result("unknown", "expected-execstart-invalid")
 if activation_mask is not None:
     if (
@@ -158,14 +163,15 @@ path_fields = [
     for field in exec_start.split(" ; ")
     if field.strip().removeprefix("{").strip().startswith("path=")
 ]
-if path_fields != [f"path={expected_argv[0]}"]:
+expected_paths = {f"path={argv[0]}" for argv in expected_argvs}
+if len(path_fields) != 1 or path_fields[0] not in expected_paths:
     result("unknown", "execstart-path-drift")
 argv_text = exec_start.split("argv[]=", 1)[1].split(" ; ", 1)[0].strip()
 try:
     argv = shlex.split(argv_text)
 except ValueError:
     result("unknown", "execstart-argv-malformed")
-if argv != expected_argv:
+if argv not in expected_argvs:
     result("unknown", "execstart-argv-drift")
 active_state = properties["ActiveState"]
 if active_state in {"active", "activating", "reloading", "deactivating"}:

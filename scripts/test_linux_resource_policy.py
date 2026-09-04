@@ -93,14 +93,16 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             text,
         )
         self.assertNotIn("app-server.pid.lock", text)
-        for observer in (installer_common, installer_release):
-            self.assertIn(
-                '"$RUNTIME_START_INSTALL_GUARD" \\\n    "$CURRENT_LINK/patched-codex/codex"',
-                observer,
-            )
-            owner_observer = observer.split("observe_managed_systemd_owner()", 1)[1]
-            owner_observer = owner_observer.split("\n}\n", 1)[0]
-            self.assertNotIn("DAEMON_RESERVATION_GUARD", owner_observer)
+        self.assertNotIn("observe_managed_systemd_owner()", installer_common)
+        self.assertIn(
+            '"$RUNTIME_START_INSTALL_GUARD"\n    "$CURRENT_LINK/patched-codex/codex"',
+            installer_release,
+        )
+        owner_observer = installer_release.split("observe_managed_systemd_owner()", 1)[1]
+        owner_observer = owner_observer.split("\n}\n", 1)[0]
+        self.assertIn('[[ "$allow_prior_contract" == "1" ]]', owner_observer)
+        self.assertIn("--or-argv", owner_observer)
+        self.assertIn("DAEMON_RESERVATION_GUARD", owner_observer)
         for directive in (
             "KillSignal=SIGINT",
             "KillMode=mixed",
@@ -1390,6 +1392,9 @@ PY
                   *) active_state="$observation" ;;
                 esac
                 exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $install_root/runtime-start-install.lock $install_root/current/patched-codex/codex app-server --remote-control --listen ws://127.0.0.1:8390 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+                if [ "${FAKE_RUNTIME_SYSTEMD_EXECSTART:-current}" = prior ]; then
+                  exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $install_root/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork $runtime_storage_root/app-server-daemon/app-server.pid.lock $install_root/current/patched-codex/codex app-server --remote-control --listen ws://127.0.0.1:8390 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+                fi
                 if [ "$observation" = drifted-exec ]; then
                   exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $CODEXSWITCH_INSTALL_ROOT/other.lock $CODEXSWITCH_INSTALL_ROOT/current/patched-codex/codex app-server ; ignore_errors=no ; }"
                 fi
@@ -2978,6 +2983,24 @@ PY
         )
         self.assertNotIn("systemctl\t--user restart", log)
         self.assertNotIn("systemctl\t--user enable", log)
+
+    def test_activation_migrates_exact_prior_app_server_execstart(self):
+        next_sha = self._seed_trusted_inactive_runtime()
+
+        self._activate(
+            next_sha,
+            extra_env={"FAKE_RUNTIME_SYSTEMD_EXECSTART": "prior"},
+        )
+
+        installed = (
+            self.service_dir / "signul-codex-app-server.service"
+        ).read_text()
+        self.assertNotIn("app-server.pid.lock", installed)
+        self.assertIn(
+            "%h/.local/share/codexswitch/current/patched-codex/codex "
+            "app-server --remote-control --listen ws://127.0.0.1:8390",
+            installed,
+        )
 
     def test_activation_migrates_only_the_known_legacy_codex_launcher(self):
         self._stage()

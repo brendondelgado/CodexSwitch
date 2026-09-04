@@ -1,7 +1,14 @@
 # shellcheck shell=bash
 # Keep installer ownership observation aligned with the reviewed checked-in unit.
 observe_managed_systemd_owner() {
+  local allow_prior_contract="${1:-0}"
   local activation_mask=""
+  local -a expected_argv=(
+    /usr/bin/flock --shared --no-fork
+    "$RUNTIME_START_INSTALL_GUARD"
+    "$CURRENT_LINK/patched-codex/codex"
+    app-server --remote-control --listen ws://127.0.0.1:8390
+  )
 
   if [[ "${SYSTEMD_START_BARRIERS_HELD:-0}" == "1" ]] && \
      awk -F '\t' -v unit="$MANAGED_APP_SERVER_UNIT" \
@@ -9,16 +16,24 @@ observe_managed_systemd_owner() {
        <<< "$SYSTEMD_START_BARRIER_MODES"; then
     activation_mask="$(systemd_start_mask_path "$MANAGED_APP_SERVER_UNIT")"
   fi
+  if [[ "$allow_prior_contract" == "1" ]]; then
+    expected_argv+=(
+      --or-argv
+      /usr/bin/flock --shared --no-fork
+      "$RUNTIME_START_INSTALL_GUARD"
+      /usr/bin/flock --exclusive --nonblock --no-fork
+      "$DAEMON_RESERVATION_GUARD"
+      "$CURRENT_LINK/patched-codex/codex"
+      app-server --remote-control --listen ws://127.0.0.1:8390
+    )
+  fi
   python3 "$RUNTIME_OBSERVER_HELPER_ROOT/observe-managed-systemd.py" \
     "$MANAGED_APP_SERVER_UNIT" \
     "$SERVICE_DIR/$MANAGED_APP_SERVER_UNIT" \
     "$RUNTIME_OBSERVATION_TIMEOUT_SECONDS" \
     "$STATE_FILE_MAX_BYTES" \
     --activation-mask "$activation_mask" \
-    /usr/bin/flock --shared --no-fork \
-    "$RUNTIME_START_INSTALL_GUARD" \
-    "$CURRENT_LINK/patched-codex/codex" \
-    app-server --remote-control --listen ws://127.0.0.1:8390
+    "${expected_argv[@]}"
 }
 
 reconcile_stale_systemd_start_barriers() {

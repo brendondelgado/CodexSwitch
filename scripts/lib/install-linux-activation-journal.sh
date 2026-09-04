@@ -537,7 +537,7 @@ PY
   daemon_observation="$(manifest_value "$ACTIVATION_JOURNAL" daemon_observation)"
   [[ "$systemd_observation" == "inactive" && "$daemon_observation" == "inactive" ]] || fail "activation journal lacks positive inactive runtime evidence"
   [[ "$RUNTIME_GUARDS_HELD" == "1" ]] || fail "activation recovery requires both runtime guards"
-  require_managed_runtime_inactive final-recovery 1
+  require_managed_runtime_inactive final-recovery 1 1
   validate_journal_target "$old_current" old_current || return $?
   validate_journal_target "$old_previous" old_previous || return $?
   validate_journal_target "$new_current" new_current || return $?
