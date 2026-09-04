@@ -335,6 +335,11 @@ struct CodexLocalRuntimeEvidenceSnapshot: Equatable, Sendable {
     }
 }
 
+struct CodexLocalRuntimeReadinessObservation: Equatable, Sendable {
+    let discovery: CodexRuntimeDiscoverySnapshot
+    let evidence: CodexLocalRuntimeEvidenceSnapshot
+}
+
 struct CodexSecureFileSnapshot: Equatable, Sendable {
     let canonicalPath: String
     let device: UInt64
@@ -454,8 +459,14 @@ enum SwapEngine {
     private static let maximumReloadArtifactBytes = 65_536
     static let maximumReloadAcknowledgementAge: TimeInterval = 5 * 60
     static let maximumReloadAcknowledgementAgeMilliseconds: Int64 = 5 * 60 * 1_000
-    // Exact live process and auth bindings invalidate replay without a time cutoff.
+    // Callers that require freshness pass an explicit finite age.
     static let maximumIdentityBoundAcknowledgementAgeMilliseconds = Int64.max
+    static let localCLIReadinessRenewalLeadTime: TimeInterval = 60
+    static let localCLIReadinessRenewalAgeMilliseconds =
+        maximumReloadAcknowledgementAgeMilliseconds
+            - Int64(localCLIReadinessRenewalLeadTime * 1_000)
+    static let localCLIReadinessMaximumReusableAcknowledgementAgeMilliseconds =
+        max(0, localCLIReadinessRenewalAgeMilliseconds - 1)
     static let maximumReloadCapabilityAgeMilliseconds: Int64 = 30 * 24 * 60 * 60 * 1_000
     private static let resetTieFiveHourTolerance = 2.0
     private static let resetTieWeeklyTolerance = 5.0
@@ -821,6 +832,8 @@ enum SwapEngine {
     static func signalCodexReload(
         excludingRuntimePIDs: Set<Int32> = [],
         reuseExistingAcknowledgement: Bool = true,
+        maximumReusableAcknowledgementAgeMilliseconds: Int64 =
+            maximumReloadAcknowledgementAgeMilliseconds,
         authorizeEffect: @Sendable () -> Bool = { true }
     ) -> CodexReloadSummary {
         guard authorizeEffect() else {
@@ -873,7 +886,9 @@ enum SwapEngine {
                 let hasStartupAcknowledgement = startupAcknowledgement(
                     matching: binding,
                     homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
-                    now: Date()
+                    now: Date(),
+                    maximumArtifactAgeMilliseconds:
+                        maximumReusableAcknowledgementAgeMilliseconds
                 ) != nil
                 let hasPriorRuntimeCapability = !hasStartupAcknowledgement
                     && ensurePriorRuntimeCapabilityReceipt(
@@ -945,7 +960,9 @@ enum SwapEngine {
                     && startupAcknowledgement(
                         matching: binding,
                         homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
-                        now: Date()
+                        now: Date(),
+                        maximumArtifactAgeMilliseconds:
+                            maximumReusableAcknowledgementAgeMilliseconds
                     ) != nil
             },
             bindingIsCurrent: { reloadBindingIsCurrent($0) },
@@ -970,6 +987,18 @@ enum SwapEngine {
             from: execution.discoverySnapshot,
             acknowledgedPIDs: execution.acknowledgedPIDs,
             operationFailed: execution.operationFailed
+        )
+    }
+
+    @discardableResult
+    static func maintainLocalInteractiveCLIReadiness(
+        authorizeEffect: @Sendable () -> Bool
+    ) -> CodexReloadSummary {
+        signalCodexReload(
+            reuseExistingAcknowledgement: true,
+            maximumReusableAcknowledgementAgeMilliseconds:
+                localCLIReadinessMaximumReusableAcknowledgementAgeMilliseconds,
+            authorizeEffect: authorizeEffect
         )
     }
 
@@ -2017,8 +2046,25 @@ enum SwapEngine {
     nonisolated static func localRuntimeEvidenceSnapshot(
         runtimeKind: HotSwapRuntimeKind,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
-        requiredOwnerUID: UInt32 = UInt32(getuid())
+        requiredOwnerUID: UInt32 = UInt32(getuid()),
+        maximumArtifactAgeMilliseconds: Int64 =
+            maximumIdentityBoundAcknowledgementAgeMilliseconds
     ) -> CodexLocalRuntimeEvidenceSnapshot {
+        localRuntimeReadinessObservation(
+            runtimeKind: runtimeKind,
+            homeDirectory: homeDirectory,
+            requiredOwnerUID: requiredOwnerUID,
+            maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds
+        ).evidence
+    }
+
+    nonisolated static func localRuntimeReadinessObservation(
+        runtimeKind: HotSwapRuntimeKind,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        requiredOwnerUID: UInt32 = UInt32(getuid()),
+        maximumArtifactAgeMilliseconds: Int64 =
+            maximumIdentityBoundAcknowledgementAgeMilliseconds
+    ) -> CodexLocalRuntimeReadinessObservation {
         let result = ProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/pgrep"),
             arguments: localCodexProcessDiscoveryArguments,
@@ -2037,10 +2083,15 @@ enum SwapEngine {
             kernelExecutableIdentityProvider: kernelExecutableIdentity
         )
 
-        return liveLocalRuntimeEvidenceSnapshot(
+        let evidence = liveLocalRuntimeEvidenceSnapshot(
             discoverySnapshot: discovery,
             homeDirectory: homeDirectory,
-            requiredOwnerUID: requiredOwnerUID
+            requiredOwnerUID: requiredOwnerUID,
+            maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds
+        )
+        return CodexLocalRuntimeReadinessObservation(
+            discovery: discovery,
+            evidence: evidence
         )
     }
 
@@ -2078,7 +2129,9 @@ enum SwapEngine {
     private nonisolated static func liveLocalRuntimeEvidenceSnapshot(
         discoverySnapshot: CodexRuntimeDiscoverySnapshot,
         homeDirectory: URL,
-        requiredOwnerUID: UInt32
+        requiredOwnerUID: UInt32,
+        maximumArtifactAgeMilliseconds: Int64 =
+            maximumIdentityBoundAcknowledgementAgeMilliseconds
     ) -> CodexLocalRuntimeEvidenceSnapshot {
         return localRuntimeEvidenceSnapshot(
             discoverySnapshot: discoverySnapshot,
@@ -2101,7 +2154,8 @@ enum SwapEngine {
                 return startupAcknowledgement(
                     matching: candidateBinding,
                     homeDirectory: homeDirectory,
-                    now: Date()
+                    now: Date(),
+                    maximumArtifactAgeMilliseconds: maximumArtifactAgeMilliseconds
                 )
             },
             observationIsCurrent: { observation in

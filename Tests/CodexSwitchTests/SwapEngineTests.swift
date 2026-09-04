@@ -2723,8 +2723,8 @@ struct SwapEngineTests {
         ) == nil)
     }
 
-    @Test("Response ACKs expire while exact identity-bound passive ACKs remain reusable")
-    func responseAndIdentityBoundAcknowledgementAgesAreDistinct() {
+    @Test("Matching nonce ACKs are valid through the five-minute boundary only")
+    func acknowledgementsUseMatchingNonceAndFiveMinuteBoundary() {
         let target = runtimeTarget(pid: 41, runtimeKind: .localInteractiveCLI)
         let timestamp: Int64 = 1_500_000
         let binding = reloadBinding(
@@ -2763,15 +2763,27 @@ struct SwapEngineTests {
             expectedBinding: binding,
             nowUnixMilliseconds: boundary + 1
         ) == nil)
+        let mismatchedBinding = reloadBinding(
+            target: target,
+            requestNonce: "different-nonce",
+            issuedAtUnixMilliseconds: timestamp
+        )
+        let mismatchedArtifacts = artifactSnapshots(
+            binding: binding,
+            acknowledgement: acknowledgement(
+                binding: mismatchedBinding,
+                acknowledgedAtUnixMilliseconds: timestamp
+            ),
+            requestModifiedAt: timestamp,
+            acknowledgementModifiedAt: timestamp
+        )
         #expect(SwapEngine.validatedReloadAcknowledgement(
-            request: artifacts.0,
-            acknowledgement: artifacts.1,
+            request: mismatchedArtifacts.0,
+            acknowledgement: mismatchedArtifacts.1,
             currentBinding: binding,
             expectedBinding: nil,
-            nowUnixMilliseconds: boundary + 1,
-            maximumArtifactAgeMilliseconds:
-                SwapEngine.maximumIdentityBoundAcknowledgementAgeMilliseconds
-        ) != nil)
+            nowUnixMilliseconds: timestamp
+        ) == nil)
     }
 
     @Test("Read-only runtime evidence fails closed on any incomplete proof")

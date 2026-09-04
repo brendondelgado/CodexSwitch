@@ -441,6 +441,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var cliActivationHandoffReconciliationInFlight = false
     private var cliActivationHandoffReconciledGeneration: UUID?
     private var lastCLIActivationHandoffAttemptAt: Date?
+    private var localCLIReadinessMaintainer = LocalCLIReadinessMaintainer()
+    private var localCLIReadinessMaintenanceTask: Task<Void, Never>?
 
     private func installStatusItem() {
         if let existingStatusItem = statusItem {
@@ -603,9 +605,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.scheduleCodexBrowserSessionRepairIfNeeded()
                     self?.reconcileQuotaPollingIfNeeded()
                     self?.scheduleCLIActivationHandoffReconciliationIfNeeded()
-                    CLIStatusChecker.refresh(activeAccountId: self?.accountManager.configuredAccount?.accountId) { [weak self] in
-                        self?.updatePopoverContent()
-                    }
+                    CLIStatusChecker.refresh(
+                        activeAccountId: self?.accountManager.configuredAccount?.accountId,
+                        onRuntimeObservation: { [weak self] observation in
+                            self?.scheduleLocalCLIReadinessMaintenanceIfNeeded(
+                                observation: observation
+                            )
+                        },
+                        onUpdated: { [weak self] in
+                            self?.updatePopoverContent()
+                        }
+                    )
                     self?.scheduleDesktopPatchCheckIfNeeded()
                     self?.resumePendingDesktopUpdateActivationIfNeeded()
                 }
@@ -7900,9 +7910,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         startPollingForAccount(to.id)
         statusBarController.updateIcon()
         updatePopoverContent()
-        CLIStatusChecker.refresh(activeAccountId: to.accountId) { [weak self] in
-            self?.updatePopoverContent()
-        }
+        CLIStatusChecker.refresh(
+            activeAccountId: to.accountId,
+            onUpdated: { [weak self] in self?.updatePopoverContent() }
+        )
 
         // Runtime convergence must inherit the cross-process lease task-local.
         let convergenceTask = Task(priority: .userInitiated) { [weak self] in
@@ -8804,11 +8815,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         statusBarController.updateIcon()
         updatePopoverContent()
-        CLIStatusChecker.refresh(activeAccountId: to.accountId) { [weak self] in
-            self?.updatePopoverContent()
-        }
+        CLIStatusChecker.refresh(
+            activeAccountId: to.accountId,
+            onUpdated: { [weak self] in self?.updatePopoverContent() }
+        )
         if case .runtimeCurrent = completion.outcome {
             scheduleCLIActivationHandoffReconciliationIfNeeded(force: true)
+        }
+    }
+
+    private func scheduleLocalCLIReadinessMaintenanceIfNeeded(
+        observation: CodexLocalRuntimeReadinessObservation,
+        now: Date = Date()
+    ) {
+        guard !isExiting,
+              let state = accountManager.activationState,
+              state.phase == .confirmed,
+              let accountId = state.configuredAccountId,
+              state.runtimeCurrentAccountId == accountId,
+              let configuredAccount = accountManager.configuredAccount,
+              configuredAccount.id == accountId else {
+            localCLIReadinessMaintainer.deactivate()
+            return
+        }
+        guard localCLIReadinessMaintenanceTask == nil else { return }
+
+        let authority = LocalCLIReadinessMaintenanceAuthority(
+            accountId: accountId,
+            providerAccountId: configuredAccount.accountId,
+            activationGeneration: state.activationGeneration
+        )
+        guard let attempt = localCLIReadinessMaintainer.beginMaintenanceIfNeeded(
+            observation: observation,
+            authority: authority,
+            at: now
+        ) else {
+            return
+        }
+
+        localCLIReadinessMaintenanceTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let outcome = await LocalCLIReadinessMaintenanceRunner.run(
+                transaction: self.accountMutationTransaction,
+                authority: authority,
+                makeAuthorization: { [weak self] lease in
+                    guard let self,
+                          !self.isExiting,
+                          self.accountManager.activationState?.phase == .confirmed,
+                          self.accountManager.activationState?.configuredAccountId == accountId,
+                          self.accountManager.activationState?.runtimeCurrentAccountId == accountId,
+                          self.accountManager.activationState?.activationGeneration
+                            == authority.activationGeneration,
+                          self.accountManager.configuredAccount?.id == accountId,
+                          let permit = self.accountMutationTransaction.makeEffectPermit(
+                              lease: lease,
+                              targetAccountId: accountId,
+                              activationGeneration: authority.activationGeneration,
+                              requiredPhase: .confirmed,
+                              runtimePermit: nil,
+                              journal: self.accountActivationCoordinator
+                          ) else {
+                        return nil
+                    }
+                    return {
+                        permit.isCurrentlyAuthorized()
+                            && Self.authFileMatches(
+                                account: configuredAccount,
+                                atPath: Self.codexAuthPath
+                            )
+                    }
+                },
+                reload: { authorization in
+                    await Task.detached(priority: .utility) {
+                        SwapEngine.maintainLocalInteractiveCLIReadiness(
+                            authorizeEffect: authorization
+                        )
+                    }.value
+                }
+            )
+
+            self.localCLIReadinessMaintainer.complete(
+                attempt,
+                outcome: outcome,
+                at: Date()
+            )
+            self.localCLIReadinessMaintenanceTask = nil
+            guard !self.isExiting else { return }
+            CLIStatusChecker.refresh(
+                activeAccountId: self.accountManager.configuredAccount?.accountId
+            )
         }
     }
 
@@ -8860,10 +8955,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ))
                 CLIStatusChecker.invalidateForAccountSwap()
                 CLIStatusChecker.refresh(
-                    activeAccountId: self.accountManager.configuredAccount?.accountId
-                ) { [weak self] in
-                    self?.updatePopoverContent()
-                }
+                    activeAccountId: self.accountManager.configuredAccount?.accountId,
+                    onUpdated: { [weak self] in self?.updatePopoverContent() }
+                )
             } else {
                 SwapLog.append(.debug(
                     "CLI_ACTIVATION_HANDOFF_DEFERRED generation=\(activationGeneration.uuidString) status=\(result.terminationStatus) timed_out=\(result.timedOut)"
@@ -9178,9 +9272,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             updatePopoverContent(forceRefresh: true)
             showPopover(from: button)
             NSApp.activate()
-            CLIStatusChecker.refresh(activeAccountId: accountManager.configuredAccount?.accountId) { [weak self] in
-                self?.updatePopoverContent(forceRefresh: true)
-            }
+            CLIStatusChecker.refresh(
+                activeAccountId: accountManager.configuredAccount?.accountId,
+                onUpdated: { [weak self] in
+                    self?.updatePopoverContent(forceRefresh: true)
+                }
+            )
         }
     }
 
@@ -9370,6 +9467,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         quotaPollingReconciliationTask = nil
         automaticCodexUpdateTask?.cancel()
         automaticCodexUpdateTask = nil
+        localCLIReadinessMaintenanceTask?.cancel()
+        localCLIReadinessMaintenanceTask = nil
         globalCLIRepairInFlight = false
         iconUpdateTimer?.invalidate()
         iconUpdateTimer = nil

@@ -101,6 +101,11 @@ struct CLIHotSwapReadiness: Equatable, Sendable {
     let detail: String?
 }
 
+private struct CLIBackgroundCheck: Sendable {
+    let result: CLICheckResult
+    let runtimeObservation: CodexLocalRuntimeReadinessObservation?
+}
+
 struct CLIStatusRefreshGeneration: Equatable, Sendable {
     private(set) var generation: UInt64 = 0
     private(set) var inFlightGeneration: UInt64?
@@ -148,6 +153,9 @@ enum CLIStatusChecker {
     /// Refresh cached statuses in the background. Call from a timer, not view body.
     static func refresh(
         activeAccountId: String?,
+        onRuntimeObservation: (@MainActor @Sendable (
+            CodexLocalRuntimeReadinessObservation
+        ) -> Void)? = nil,
         onUpdated: (@MainActor @Sendable () -> Void)? = nil
     ) {
         guard let generation = refreshGeneration.begin() else { return }
@@ -165,11 +173,14 @@ enum CLIStatusChecker {
                 : previousDesktopStatus
             await MainActor.run {
                 guard refreshGeneration.complete(generation) else { return }
-                cachedCLIStatus = cliCheck.status
-                cachedCLIStatusDetail = cliCheck.detail
+                cachedCLIStatus = cliCheck.result.status
+                cachedCLIStatusDetail = cliCheck.result.detail
                 cachedDesktopStatus = desktopStatus
                 if shouldRefreshDesktop {
                     lastDesktopRefreshAt = Date()
+                }
+                if let runtimeObservation = cliCheck.runtimeObservation {
+                    onRuntimeObservation?(runtimeObservation)
                 }
                 onUpdated?()
             }
@@ -184,10 +195,24 @@ enum CLIStatusChecker {
 
     // MARK: - Background checks (never call from main thread directly)
 
-    private nonisolated static func _checkCLI(activeAccountId: String?) -> CLICheckResult {
-        cliCheckResult(activeAccountId: activeAccountId) {
-            SwapEngine.localRuntimeEvidenceSnapshot(runtimeKind: .localInteractiveCLI)
+    private nonisolated static func _checkCLI(activeAccountId: String?) -> CLIBackgroundCheck {
+        guard activeAccountId != nil else {
+            return CLIBackgroundCheck(
+                result: CLICheckResult(status: .noActiveAccount, detail: nil),
+                runtimeObservation: nil
+            )
         }
+        let observation = SwapEngine.localRuntimeReadinessObservation(
+            runtimeKind: .localInteractiveCLI,
+            maximumArtifactAgeMilliseconds:
+                SwapEngine.maximumReloadAcknowledgementAgeMilliseconds
+        )
+        return CLIBackgroundCheck(
+            result: cliCheckResult(activeAccountId: activeAccountId) {
+                observation.evidence
+            },
+            runtimeObservation: observation
+        )
     }
 
     nonisolated static func cliCheckResult(
