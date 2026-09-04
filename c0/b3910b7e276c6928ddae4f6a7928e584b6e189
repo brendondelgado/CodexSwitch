@@ -1,0 +1,19 @@
+Tests/CodexSwitchTests/LinuxDevboxMonitorTests.swift
+  s_70c8e194852bb5::t_a87e34ae780ca0 7-28,757,762,804,810,852,857,987-989
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c0b3910b7e276c6928ddae4f6a7928e584b6e189",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
