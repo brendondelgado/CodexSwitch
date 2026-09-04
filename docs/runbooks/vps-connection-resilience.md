@@ -19,6 +19,7 @@ cross_dependencies:
   - crates/codexswitch-cli/src/codex_update/runtime_discovery.rs
   - crates/codexswitch-cli/src/codex_update/generated_systemd.rs
   - crates/codexswitch-cli/src/codex_update/source_patching.rs
+  - crates/codexswitch-cli/src/codex_update/source_daemon_patching.rs
   - crates/codexswitch-cli/src/codex_update/source_app_server_template.rs
   - crates/codexswitch-cli/src/codex_update/source_turn_template.rs
   - crates/codexswitch-cli/src/codex_update/transaction.rs
@@ -41,7 +42,7 @@ version_control:
   branch: main
   commit: pending
   status: local_uncommitted
-  last_updated: 2026-07-13
+  last_updated: 2026-09-04
 ---
 
 # VPS Connection Resilience
@@ -155,10 +156,10 @@ activation journal remains live until a later positively inactive,
 provenance-matching recovery completes; an ambiguous owner never authorizes
 journal removal.
 
-The systemd app-server holds the shared runtime start/install guard and the
-exclusive managed-daemon reservation for its full lifetime. The Codex daemon
-uses that same reservation, so systemd and daemon ownership are mutually
-exclusive before either runtime begins serving.
+The systemd app-server holds the shared runtime start/install guard for its
+full lifetime. The Codex Unix daemon uses its separate managed-daemon
+reservation during startup. The owners can therefore serve concurrently while
+remaining independently observable.
 
 That proof is repeated at the commit boundary. Linux installation pre-stages
 the runtime and code-mode host in the final directory, then holds an exclusive
@@ -166,11 +167,12 @@ the runtime and code-mode host in the final directory, then holds an exclusive
 of `$CODEX_HOME/app-server-daemon/app-server.pid.lock` continuously through the
 final systemd/daemon observation, journaled helper and runtime renames, hash and
 version readback, updater-state commit, directory sync, rollback-file cleanup,
-and journal removal. The repository unit holds a shared no-fork lock for its
-full process lifetime; the managed daemon start path uses its reservation lock.
-A racing start therefore prevents every mutation or waits for the completed
-offline replacement. Crash recovery obtains the same two guards and repeats
-the typed observation before restoring or completing the recorded pair.
+and journal removal. The repository unit holds the runtime lock in shared mode;
+the managed daemon start path uses its separate reservation. An installer owns
+both locks exclusively, so a racing start prevents every mutation or waits for
+the completed offline replacement. Crash recovery obtains the same two guards
+and repeats the typed observation before restoring or completing the recorded
+pair.
 
 An `Installed` updater state confirms only the installed-file version. It does
 not claim the port-8390 service or Unix-socket daemon was reloaded. Likewise,
@@ -227,6 +229,8 @@ ssh signul-vps 'curl -fsS --max-time 3 http://127.0.0.1:8390/healthz'
 ssh signul-vps '~/.local/share/codexswitch/current/patched-codex/codex app-server daemon version'
 ```
 
-The Unix-socket daemon must report `status: running`; the port-8390 service must
-be active and answer its health endpoint. A green result from only one endpoint
-does not establish ChatGPT remote readiness.
+The daemon version output must match the `current` Codex version, its PID and
+Unix socket must identify a running `current` executable, and the port-8390
+service must be active and answer its health endpoint. A green result from only
+one endpoint does not establish ChatGPT remote readiness. The patched daemon
+must not create or update a standalone package generation in the background.

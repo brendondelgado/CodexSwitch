@@ -56,6 +56,7 @@ cross_dependencies:
   - ../../crates/codexswitch-cli/src/import.rs
   - ../../crates/codexswitch-cli/src/reload.rs
   - ../../crates/codexswitch-cli/src/codex_update.rs
+  - ../../crates/codexswitch-cli/src/codex_update/source_daemon_patching.rs
   - ../../scripts/codex-vps
   - ../../scripts/patch-asar.py
   - ../../scripts/test_patch_asar.py
@@ -69,7 +70,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-08-28
+  last_updated: 2026-09-04
 ---
 
 # Runtime And Host Ownership
@@ -1598,6 +1599,12 @@ actor boundary on every supported Swift 6 toolchain.
   immutable `current` release is an explicit convergence blocker. Its ACK can
   never clear a degraded activation, even when its markers and credentials are
   otherwise valid.
+- The built-in SSH daemon resolves its managed executable directly through
+  `~/.local/share/codexswitch/current/patched-codex/codex`. It never resolves or
+  installs `~/.codex/packages/standalone/current/codex`, and the patched daemon
+  update loop never downloads or executes OpenAI's standalone install script.
+  Runtime updates are owned exclusively by the reviewed CodexSwitch release
+  transaction.
 - Service status is readable without starting the service.
 - Remote usage aggregation preserves the model identity supplied by runtime
   evidence. Missing model evidence is reported as `unknown`; it is never
@@ -1666,8 +1673,10 @@ actor boundary on every supported Swift 6 toolchain.
 - Connection loss does not authorize app-server restart if health and ownership are unknown.
 - ChatGPT's SSH version probe, daemon bootstrap, and `app-server proxy` command
   all resolve `codex` through the release-neutral public launcher. A successful
-  release activation therefore advances the built-in SSH daemon and the
-  port-8390 service to the same `current` runtime.
+  release activation therefore advances the port-8390 service to `current`.
+  After bootstrap, the patched built-in daemon also resolves its managed child
+  directly through `current`; it cannot fall back to Codex's independently
+  updated standalone package tree.
 
 ## Status And Repair
 

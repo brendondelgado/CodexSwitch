@@ -5,6 +5,7 @@ include!("source_app_server_patching.rs");
 include!("source_auth_patching.rs");
 include!("source_cargo_patching.rs");
 include!("source_websocket_patching.rs");
+include!("source_daemon_patching.rs");
 include!("source_patch_helpers.rs");
 
 fn patch_codex_source(source_dir: &Path) -> Result<()> {
@@ -20,6 +21,9 @@ fn patch_codex_source(source_dir: &Path) -> Result<()> {
     let client = source_dir.join("codex-rs/core/src/client.rs");
     let turn = source_dir.join("codex-rs/core/src/session/turn.rs");
     let tui = source_dir.join("codex-rs/tui/src/lib.rs");
+    let daemon_managed_install =
+        source_dir.join("codex-rs/app-server-daemon/src/managed_install.rs");
+    let daemon_update_loop = source_dir.join("codex-rs/app-server-daemon/src/update_loop.rs");
     patch_placeholder_workspace_lock_versions_if_present(&workspace_manifest, &lockfile)?;
     patch_workspace_dependency_if_present(&app_server_manifest, "libc")?;
     patch_lockfile_dependency_if_present(&lockfile, "codex-app-server", "libc")?;
@@ -39,5 +43,6 @@ fn patch_codex_source(source_dir: &Path) -> Result<()> {
     )?;
     patch_turn_rotation_templates(&turn)?;
     remove_foreground_tui_sighup_handler(&tui)?;
+    patch_app_server_daemon_source(&daemon_managed_install, &daemon_update_loop)?;
     Ok(())
 }

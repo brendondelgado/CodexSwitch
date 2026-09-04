@@ -221,7 +221,6 @@ fn systemd_activity_from_probe(
 fn managed_systemd_owner_expectation() -> Result<SystemdOwnerExpectation> {
     let home = home_dir()?;
     let data_dir = codexswitch_data_dir()?;
-    let codex_home = managed_daemon_codex_home()?;
     let systemd_root = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(path) => {
             let path = PathBuf::from(path);
@@ -239,14 +238,6 @@ fn managed_systemd_owner_expectation() -> Result<SystemdOwnerExpectation> {
             "--shared".to_string(),
             "--no-fork".to_string(),
             runtime_start_install_guard_path(&data_dir)
-                .display()
-                .to_string(),
-            "/usr/bin/flock".to_string(),
-            "--exclusive".to_string(),
-            "--nonblock".to_string(),
-            "--no-fork".to_string(),
-            codex_home
-                .join("app-server-daemon/app-server.pid.lock")
                 .display()
                 .to_string(),
             data_dir

@@ -17,8 +17,6 @@ observe_managed_systemd_owner() {
     --activation-mask "$activation_mask" \
     /usr/bin/flock --shared --no-fork \
     "$RUNTIME_START_INSTALL_GUARD" \
-    /usr/bin/flock --exclusive --nonblock --no-fork \
-    "$DAEMON_RESERVATION_GUARD" \
     "$CURRENT_LINK/patched-codex/codex" \
     app-server --remote-control --listen ws://127.0.0.1:8390
 }

@@ -77,6 +77,8 @@ class LinuxDeploymentContractTests(unittest.TestCase):
 
     def test_app_server_uses_immutable_current_runtime(self):
         text = (SYSTEMD / "signul-codex-app-server.service").read_text()
+        installer_common = (INSTALLER_LIB / "install-linux-common.sh").read_text()
+        installer_release = (INSTALLER_LIB / "install-linux-release.sh").read_text()
 
         self.assertIn("WorkingDirectory=/home/signul/SIGNUL", text)
         self.assertIn("Environment=CODEX_HOME=/home/signul/.codex", text)
@@ -86,12 +88,19 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         self.assertIn(
             "ExecStart=/usr/bin/flock --shared --no-fork "
             "%h/.local/share/codexswitch/runtime-start-install.lock "
-            "/usr/bin/flock --exclusive --nonblock --no-fork "
-            "%h/.codex/app-server-daemon/app-server.pid.lock "
             "%h/.local/share/codexswitch/current/patched-codex/codex "
             "app-server --remote-control --listen ws://127.0.0.1:8390",
             text,
         )
+        self.assertNotIn("app-server.pid.lock", text)
+        for observer in (installer_common, installer_release):
+            self.assertIn(
+                '"$RUNTIME_START_INSTALL_GUARD" \\\n    "$CURRENT_LINK/patched-codex/codex"',
+                observer,
+            )
+            owner_observer = observer.split("observe_managed_systemd_owner()", 1)[1]
+            owner_observer = owner_observer.split("\n}\n", 1)[0]
+            self.assertNotIn("DAEMON_RESERVATION_GUARD", owner_observer)
         for directive in (
             "KillSignal=SIGINT",
             "KillMode=mixed",
@@ -547,7 +556,7 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             frontmatter,
         )
         self.assertIn("docs/runbooks/linux-repository-deployment.md", frontmatter)
-        self.assertIn("last_updated: 2026-07-13", frontmatter)
+        self.assertIn("last_updated: 2026-09-04", frontmatter)
 
     def test_installer_declares_closed_world_readiness_and_scan_contracts(self):
         installer = installer_source()
@@ -1380,7 +1389,7 @@ PY
                   drifted-exec) active_state=inactive ;;
                   *) active_state="$observation" ;;
                 esac
-                exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $install_root/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork $runtime_storage_root/app-server-daemon/app-server.pid.lock $install_root/current/patched-codex/codex app-server --remote-control --listen ws://127.0.0.1:8390 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+                exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $install_root/runtime-start-install.lock $install_root/current/patched-codex/codex app-server --remote-control --listen ws://127.0.0.1:8390 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
                 if [ "$observation" = drifted-exec ]; then
                   exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $CODEXSWITCH_INSTALL_ROOT/other.lock $CODEXSWITCH_INSTALL_ROOT/current/patched-codex/codex app-server ; ignore_errors=no ; }"
                 fi

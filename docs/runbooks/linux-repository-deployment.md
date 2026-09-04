@@ -46,6 +46,7 @@ cross_dependencies:
   - ../../crates/codexswitch-cli/systemd/signul-codex-app-server.service
   - ../../crates/codexswitch-cli/systemd/signul-codex-app-server.service.d/10-runtime-resources.conf
   - ../../crates/codexswitch-cli/src/codex_update.rs
+  - ../../crates/codexswitch-cli/src/codex_update/source_daemon_patching.rs
   - ../../crates/codexswitch-cli/src/codex_update/state.rs
   - ../../crates/codexswitch-cli/src/codex_update/transaction.rs
   - ../../crates/codexswitch-cli/src/codex_update/preparation.rs
@@ -387,15 +388,21 @@ files in the final runtime directory. It then acquires, in this order:
    `$CODEX_HOME/app-server-daemon/app-server.pid.lock`.
 
 The repository systemd unit executes the foreground app-server under a shared,
-no-fork `flock` on `runtime-start-install.lock` and exclusive ownership of
-`app-server.pid.lock`. Codex's managed daemon start path owns that same
-reservation. Therefore the two runtime owners cannot start together, a start
-that wins either lock blocks installation, and a start arriving after the
-installer owns both locks waits until commit is complete. With both locks
-continuously held, the installer re-observes systemd, PID, socket, reservation,
-and exact process identity. It renames the pre-staged files only if that final
-observation is inactive, and it releases neither lock between observation and
-rename.
+no-fork `flock` on `runtime-start-install.lock`. Codex's managed Unix daemon
+uses its own `app-server.pid.lock` reservation during startup. The owners use
+separate runtime locks so port 8390 and the SSH Unix socket can be healthy at
+the same time. Installation first takes the runtime lock exclusively, blocking
+a new systemd start, and then takes the daemon reservation, blocking a new Unix
+daemon start. With both locks continuously held, the installer re-observes
+systemd, PID, socket, reservation, and exact process identity. It renames the
+pre-staged files only if that final observation is inactive, and it releases
+neither lock between observation and rename.
+
+The patched Unix daemon resolves its managed binary from the immutable
+CodexSwitch `current` release. Its updater remains a generation-change watcher,
+but it never downloads or executes the stock standalone installer. A live
+`~/.codex/packages/standalone/current/codex` file is not part of the managed
+runtime contract and must never become an SSH daemon child.
 
 After both owners are proven inactive, installation performs one recoverable
 two-file transaction. Before the first rename it durably journals the old and

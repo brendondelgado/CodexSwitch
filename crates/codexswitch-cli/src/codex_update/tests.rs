@@ -130,11 +130,6 @@ mod tests {
                 "--shared",
                 "--no-fork",
                 "/home/test/.local/share/codexswitch/runtime-start-install.lock",
-                "/usr/bin/flock",
-                "--exclusive",
-                "--nonblock",
-                "--no-fork",
-                "/home/test/.codex/app-server-daemon/app-server.pid.lock",
                 "/home/test/.local/share/codexswitch/current/patched-codex/codex",
                 "app-server",
                 "--remote-control",
@@ -1107,9 +1102,10 @@ esac
             .expect("fixture must define ExecStart");
         assert!(exec_start.starts_with("ExecStart=/usr/bin/flock --shared --no-fork "));
         assert!(exec_start.contains(
-            "runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork \
-             %h/.codex/app-server-daemon/app-server.pid.lock"
+            "runtime-start-install.lock \
+             %h/.local/share/codexswitch/current/patched-codex/codex"
         ));
+        assert!(!exec_start.contains("app-server.pid.lock"));
         assert!(unit.lines().any(|line| line == "KillSignal=SIGINT"));
         assert!(unit.lines().any(|line| line == "KillMode=mixed"));
         assert!(unit.lines().any(|line| line == "TimeoutStopSec=120"));
@@ -1135,6 +1131,7 @@ esac
             include_str!("source_app_server_patching.rs"),
             include_str!("source_auth_patching.rs"),
             include_str!("source_websocket_patching.rs"),
+            include_str!("source_daemon_patching.rs"),
             include_str!("source_patch_helpers.rs"),
             include_str!("../patched_codex.rs"),
         ]
