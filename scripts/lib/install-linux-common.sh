@@ -48,7 +48,11 @@ systemd_entry_is_managed() {
 preserved_adjacent_systemd_entries() {
   printf '%s\n' \
     "codexswitch-files-sshd.service" \
+    "codexswitch-files-sshd.service.d" \
+    "codexswitch-files-sshd.service.d/zz-restart-bound.conf" \
     "signul-codex-app-server-tailscale-proxy.service" \
+    "signul-codex-app-server-tailscale-proxy.service.d" \
+    "signul-codex-app-server-tailscale-proxy.service.d/zz-restart-bound.conf" \
     "default.target.wants/codexswitch-files-sshd.service" \
     "default.target.wants/signul-codex-app-server-tailscale-proxy.service"
 }

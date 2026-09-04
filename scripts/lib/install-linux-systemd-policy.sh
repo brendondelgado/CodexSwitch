@@ -627,6 +627,7 @@ validate_systemd_preconditions() {
   local dropin_dir=""
   local expected=""
   local entry=""
+  local preserved_relative=""
   local conflict_count=0
 
   verify_runtime_guard_identities || fail "runtime guard path identity changed before systemd precondition validation"
@@ -638,8 +639,21 @@ validate_systemd_preconditions() {
     candidate_name="$(basename "$candidate")"
     systemd_entry_is_managed "$candidate_name" && continue
     if systemd_entry_is_preserved_adjacent "$candidate_name"; then
-      [[ -f "$candidate" && ! -L "$candidate" ]] || \
-        fail "preserved adjacent systemd unit is linked or special: $candidate"
+      if [[ "$candidate_name" == *.service.d ]]; then
+        [[ -d "$candidate" && ! -L "$candidate" ]] || \
+          fail "preserved adjacent systemd drop-in directory is linked or special: $candidate"
+        for entry in "$candidate"/*; do
+          [[ -e "$entry" || -L "$entry" ]] || continue
+          preserved_relative="$candidate_name/$(basename "$entry")"
+          systemd_entry_is_preserved_adjacent "$preserved_relative" || \
+            fail "unexpected preserved adjacent systemd drop-in: $entry"
+          [[ -f "$entry" && ! -L "$entry" ]] || \
+            fail "preserved adjacent systemd drop-in is linked or special: $entry"
+        done
+      else
+        [[ -f "$candidate" && ! -L "$candidate" ]] || \
+          fail "preserved adjacent systemd unit is linked or special: $candidate"
+      fi
       continue
     fi
     case "$candidate_name" in
@@ -768,9 +782,26 @@ with os.scandir(root) as entries:
         if entry.name.startswith(".codexswitch-activation."):
             continue
         if entry.name in preserved:
-            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-                raise SystemExit(f"preserved adjacent systemd unit is linked or special: {top}")
-            continue
+            if stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                continue
+            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                with os.scandir(top) as children:
+                    for child in children:
+                        count += 1
+                        if count > max_entries:
+                            raise SystemExit("systemd manifest scan entry bound exceeded")
+                        relative = f"{entry.name}/{child.name}"
+                        child_metadata = child.stat(follow_symlinks=False)
+                        if (
+                            relative not in preserved
+                            or not stat.S_ISREG(child_metadata.st_mode)
+                            or stat.S_ISLNK(child_metadata.st_mode)
+                        ):
+                            raise SystemExit(
+                                f"unexpected preserved adjacent systemd drop-in: {child.path}"
+                            )
+                continue
+            raise SystemExit(f"preserved adjacent systemd artifact is linked or special: {top}")
         if entry.name in {"codexswitch.service", "signul-codex-app-server.service"}:
             if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise SystemExit(f"managed systemd unit is linked or special: {top}")

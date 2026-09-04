@@ -3879,6 +3879,20 @@ PY
         tailscale_proxy.write_text(
             "[Service]\nExecStart=/usr/bin/socat TCP-LISTEN:8390 TCP:127.0.0.1:8390\n"
         )
+        secure_drop_dropins = self.service_dir / f"{secure_drop.name}.d"
+        tailscale_proxy_dropins = self.service_dir / f"{tailscale_proxy.name}.d"
+        secure_drop_dropins.mkdir()
+        tailscale_proxy_dropins.mkdir()
+        secure_drop_hardening = secure_drop_dropins / "zz-restart-bound.conf"
+        tailscale_proxy_hardening = tailscale_proxy_dropins / "zz-restart-bound.conf"
+        secure_drop_hardening.write_text(
+            "[Unit]\nStartLimitIntervalSec=300\nStartLimitBurst=5\n"
+            "[Service]\nRestartSec=10\nCPUQuota=200%\n"
+        )
+        tailscale_proxy_hardening.write_text(
+            "[Unit]\nStartLimitIntervalSec=300\nStartLimitBurst=5\n"
+            "[Service]\nRestartSec=10\nCPUQuota=200%\n"
+        )
         wants = self.service_dir / "default.target.wants"
         wants.mkdir()
         secure_drop_link = wants / secure_drop.name
@@ -3887,12 +3901,31 @@ PY
         tailscale_proxy_link.symlink_to(tailscale_proxy)
         expected_secure_drop = secure_drop.read_bytes()
         expected_tailscale_proxy = tailscale_proxy.read_bytes()
+        expected_secure_drop_hardening = secure_drop_hardening.read_bytes()
+        expected_tailscale_proxy_hardening = tailscale_proxy_hardening.read_bytes()
+
+        unexpected_dropin = secure_drop_dropins / "unreviewed.conf"
+        unexpected_dropin.write_text("[Service]\nCPUQuota=999%\n")
+        blocked = self._activate(check=False)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn(
+            "unexpected preserved adjacent systemd drop-in",
+            blocked.stderr,
+        )
+        unexpected_dropin.unlink()
 
         result = self._activate(check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
         self.assertEqual(secure_drop.read_bytes(), expected_secure_drop)
         self.assertEqual(tailscale_proxy.read_bytes(), expected_tailscale_proxy)
+        self.assertEqual(
+            secure_drop_hardening.read_bytes(), expected_secure_drop_hardening
+        )
+        self.assertEqual(
+            tailscale_proxy_hardening.read_bytes(),
+            expected_tailscale_proxy_hardening,
+        )
         self.assertEqual(os.readlink(secure_drop_link), str(secure_drop))
         self.assertEqual(os.readlink(tailscale_proxy_link), str(tailscale_proxy))
 

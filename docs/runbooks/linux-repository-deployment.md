@@ -536,6 +536,13 @@ removed, enabled, disabled, started, or stopped by runtime activation. This
 name allowlist is deliberately closed; every other CodexSwitch- or
 Codex-app-server-named entry remains a conflict.
 
+The matching adjacent drop-in directories are also outside installer
+ownership. When present, each may contain only the operator-owned
+`zz-restart-bound.conf` hardening drop-in. Activation validates its regular-file
+shape and preserves its bytes without interpreting, replacing, or reloading the
+adjacent service. Any other file, nested directory, or symlink in either
+adjacent drop-in directory remains a conflict.
+
 Aliases or relationship artifacts using any unit type or dependency directory
 are part of the conflict surface. CodexSwitch-named `.socket`, `.path`, timer,
 target, service alias, `.wants`, `.requires`, `.upholds`, or other relationship
