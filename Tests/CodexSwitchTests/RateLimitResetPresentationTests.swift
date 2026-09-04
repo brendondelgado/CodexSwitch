@@ -354,7 +354,13 @@ struct RateLimitResetPresentationTests {
         ) == "Last known: 2 banked resets • 3m ago")
         #expect(AccountCardView.rateLimitResetText(
             for: .expired(lastKnownCount: 2)
-        ) == "No current banked resets")
+        ) == "Last known: 2 banked resets • snapshot expired; refresh required")
+        #expect(AccountCardView.rateLimitResetText(
+            for: .expired(lastKnownCount: 1)
+        ) == "Last known: 1 banked reset • snapshot expired; refresh required")
+        #expect(AccountCardView.rateLimitResetText(
+            for: .expired(lastKnownCount: 0)
+        ) == "Last known: 0 banked resets • snapshot expired; refresh required")
         #expect(AccountCardView.rateLimitResetText(
             for: .unknown(lastKnownCount: 0)
         ) == "Reset inventory unavailable")
@@ -371,6 +377,59 @@ struct RateLimitResetPresentationTests {
             for: .externalHold(until: now),
             holdUntilText: "4:30 PM"
         ) == "Reset hold until 4:30 PM")
+    }
+
+    @Test("Partial expiry preserves the visible snapshot count without authorizing redemption")
+    @MainActor
+    func partiallyExpiredCardKeepsLastKnownCount() {
+        let bank = makeBank(
+            fetchedAt: now.addingTimeInterval(-30),
+            expirations: [now.addingTimeInterval(-1), now.addingTimeInterval(86_400)]
+        )
+        #expect(bank.isStructurallyValidPersistenceObservation)
+        #expect(bank.credits.filter { $0.isAvailable(at: now) }.count == 1)
+        let presentation = RateLimitResetInventoryPresentation.resolve(
+            availableCount: bank.availableCount,
+            nextExpiration: bank.nextExpiration(at: now),
+            inventoryIsFresh: bank.isFresh(at: now),
+            inventoryHasExpiredAvailableCredit: bank.credits.contains {
+                $0.isAvailable && $0.expiresAt.map { $0 <= now } == true
+            },
+            inventoryIsStructurallyValid: bank.structurallyValidAvailableCredits(at: now) != nil,
+            now: now
+        )
+
+        #expect(presentation == .expired(lastKnownCount: 2))
+        #expect(AccountCardView.rateLimitResetText(
+            for: presentation,
+            storedLastKnownCount: bank.availableCount
+        ) == "Last known: 2 banked resets • snapshot expired; refresh required")
+        #expect(presentation.offersObservationRefresh)
+
+        let observation = RateLimitResetInventoryObservation.resolve(
+            presentation: presentation,
+            bank: bank,
+            now: now
+        )
+        #expect(observation.freshness == .expired)
+        #expect(observation.lastKnownCount == 2)
+        #expect(observation.verifiedCount == nil)
+        #expect(observation.nextExpiration == nil)
+        #expect(!observation.freshness.authorizesCount)
+
+        var account = makeAccount(email: "pro@example.com", providerAccountId: "provider-account")
+        account.rateLimitResetBank = bank
+        account.quotaSnapshot = exhaustedSnapshot(fetchedAt: now)
+        #expect(!RateLimitResetRedemptionActionPresentation.resolve(
+            account: account,
+            inventory: presentation,
+            now: now
+        ).isEnabled)
+        #expect(PooledRateLimitResetPresentation.summarize(
+            accounts: [account],
+            presentations: [account.id: presentation],
+            now: now
+        ).currentAvailableCount == 0)
     }
 
     @Test("Pooled label marks stale inventory as last-known and unverified")

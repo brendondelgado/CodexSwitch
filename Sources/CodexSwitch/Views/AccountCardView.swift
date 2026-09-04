@@ -282,8 +282,11 @@ struct AccountCardView: View {
                 count: lastKnownCount,
                 suffix: lastCheckedText
             )
-        case .expired:
-            return "No current banked resets"
+        case .expired(let lastKnownCount):
+            return lastKnownResetText(
+                count: lastKnownCount,
+                suffix: "snapshot expired; refresh required"
+            )
         case .unknown(let lastKnownCount):
             guard storedLastKnownCount != nil || lastKnownCount > 0 else {
                 return "Reset inventory unavailable"

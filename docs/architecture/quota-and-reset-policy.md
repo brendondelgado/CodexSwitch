@@ -534,6 +534,12 @@ reconciliation in progress may use their distinct operational colors.
   age even after the sixty-second authorization window closes. It must be
   labeled `last known` or `unverified`, excluded from verified pooled capacity,
   and rendered without actionable expiration urgency.
+- When any available credit in a stored snapshot expires, retain the snapshot's
+  last-known count visibly, including known zero. Label it `Last known` with
+  `snapshot expired; refresh required`; partial expiry must not become `No current
+  banked resets` or a locally recomputed available count. This snapshot remains
+  unverified, excluded from verified capacity and expiration urgency, and unable
+  to authorize redemption until refreshed. Availability gates are unchanged.
 - A successful inventory observation queues the complete bank, including its
   response-completion timestamp, for bounded coalesced persistence even when
   count and credit membership are unchanged. Semantic equality may suppress
