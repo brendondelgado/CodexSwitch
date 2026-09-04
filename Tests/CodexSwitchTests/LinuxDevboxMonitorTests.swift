@@ -4,6 +4,28 @@ import Testing
 
 @Suite("Linux devbox monitor")
 struct LinuxDevboxMonitorTests {
+    private func installFixtureFlock(at root: URL) throws -> URL {
+        let executable = root.appendingPathComponent("flock")
+        let script = """
+        #!/bin/sh
+        [ "$1" = "--shared" ] || exit 64
+        [ "$2" = "--no-fork" ] || exit 64
+        shift 3
+        exec "$@"
+        """
+        try Data(script.utf8).write(to: executable)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: executable.path
+        )
+        return executable
+    }
+
+    private func commandUsingFixtureFlock(_ command: String, at root: URL) throws -> String {
+        let executable = try installFixtureFlock(at: root)
+        return command.replacingOccurrences(of: "/usr/bin/flock", with: executable.path)
+    }
+
     @Test("reset authority migration is sticky and fails closed")
     func resetAuthorityMigrationIsStickyAndFailsClosed() throws {
         let suiteName = "LinuxDevboxMonitorTests.\(UUID().uuidString)"
@@ -732,12 +754,12 @@ struct LinuxDevboxMonitorTests {
             ofItemAtPath: fakeCLI.path
         )
 
-        let command = LinuxDevboxMonitor.remoteCredentialSyncCommand(
+        let command = try commandUsingFixtureFlock(LinuxDevboxMonitor.remoteCredentialSyncCommand(
             remoteDirectory: stage.path,
             bundleName: "sync.csbundle",
             passphraseName: "sync.passphrase",
             operationID: "11111111-1111-4111-8111-111111111111"
-        )
+        ), at: root)
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path
         let result = ProcessRunner.run(
@@ -779,13 +801,13 @@ struct LinuxDevboxMonitorTests {
             )
         }
 
-        let command = LinuxDevboxMonitor.remoteCredentialSyncCommand(
+        let command = try commandUsingFixtureFlock(LinuxDevboxMonitor.remoteCredentialSyncCommand(
             remoteDirectory: stage.path,
             bundleName: "sync.csbundle",
             passphraseName: "sync.passphrase",
             operationID: "11111111-1111-4111-8111-111111111111",
             removeExecutable: fakeRM.path
-        )
+        ), at: root)
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path
         let result = ProcessRunner.run(
@@ -827,12 +849,12 @@ struct LinuxDevboxMonitorTests {
             )
         }
 
-        let command = LinuxDevboxMonitor.remoteCredentialSyncCommand(
+        let command = try commandUsingFixtureFlock(LinuxDevboxMonitor.remoteCredentialSyncCommand(
             remoteDirectory: stage.path,
             bundleName: "sync.csbundle",
             passphraseName: "sync.passphrase",
             operationID: "11111111-1111-4111-8111-111111111111"
-        )
+        ), at: root)
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path
         let result = ProcessRunner.run(
@@ -962,7 +984,9 @@ struct LinuxDevboxMonitorTests {
             executionToken: executionToken
         ) { _, arguments, timeout in
             #expect(timeout == LinuxDevboxMonitor.manualResetTimeout)
-            #expect(arguments.last?.contains("codexswitch-cli redeem-reset") == true)
+            #expect(arguments.last?.contains(
+                "\(LinuxDevboxMonitor.remoteCodexSwitchCLI) redeem-reset"
+            ) == true)
             return ProcessRunResult(
                 terminationStatus: 0,
                 stdout: Data(json.utf8),
