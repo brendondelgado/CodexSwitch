@@ -1,0 +1,44 @@
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_339d66e79dd8ff 444-445,9470-9471
+  s_70c8e194852bb5::t_c12a4e3ed902dc 8841
+  s_70c8e194852bb5::t_519b2dc5d78d7b 8845
+  s_70c8e194852bb5::t_e95652f5e719d9 616
+  s_70c8e194852bb5::t_20d8f30fb4887a 608-613,8904
+  s_70c8e194852bb5::t_97724e3de922d8 614-615,617-618,7913-7916,8818-8821,8958-8960,9275-9280
+  s_70c8e194852bb5::t_1a9ba9dbbd2532 8827-8840,8842-8844,8846-8903,8905-8909
+Tests/CodexSwitchTests/LocalCLIReadinessMaintainerTests.swift
+  s_70c8e194852bb5::t_c060b63a241d1c 92,96-97,111,115-116,194
+  s_70c8e194852bb5::t_c063330dac09ba 47-50
+  s_70c8e194852bb5::t_519b2dc5d78d7b 26
+  s_70c8e194852bb5::t_05f9e52a3cf8f8 70-85,211-212,229
+  s_70c8e194852bb5::t_819edc4b93ea75 1-25,27-46,51-69,86-91,93-95,98-110,112-114,117-193,195-210,213-228,230-287
+Sources/CodexSwitch/Services/LocalCLIReadinessMaintainer.swift
+  s_70c8e194852bb5::t_519b2dc5d78d7b 5,83-87
+  s_70c8e194852bb5::t_75d028423feddf 152-154
+  s_70c8e194852bb5::t_b0267ba2b1ea81 1-4,6-82,88-151,155-185
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_70c8e194852bb5::t_c063330dac09ba 468-469,1000
+  s_70c8e194852bb5::t_66b84107fb3c03 338-342,464-467,835-836,889-891,963-965,993-999,1001-1004,2049-2051,2053-2067,2086,2089-2094,2132-2134,2157-2158
+  s_70c8e194852bb5::t_ae41a9f088db25 462
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_70c8e194852bb5::t_e2616bb0d10c4b 2726-2727,2766-2767,2770-2779,2781-2782,2785-2786
+  s_70c8e194852bb5::t_450913328f3096 2768-2769
+Sources/CodexSwitch/Services/CLIStatusChecker.swift
+  s_70c8e194852bb5::t_8d65cb7d3405b3 104-108,156-158,176-177,182-184,198-215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ea46c0bc7b7b910d95a3b440d0aa142c918836ea",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
