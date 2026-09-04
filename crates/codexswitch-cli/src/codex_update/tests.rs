@@ -6010,4 +6010,99 @@ impl ModelClientSession {
         assert!(patched.contains("fresh.agent_identity_telemetry.clone()"));
         assert!(patched.contains("self.websocket_session.auth_generation_at_creation = ag"));
     }
+
+    #[test]
+    fn client_websocket_patch_matches_endpoint_bound_reset_shape() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let client = temp_dir.path().join("client.rs");
+        fs::write(
+            &client,
+            r#"
+struct WebsocketSession {
+    connection: Option<ApiWebSocketConnection>,
+    endpoint: Option<ResponsesEndpoint>,
+}
+
+impl ModelClient {
+    fn take_cached_websocket_session(&self) -> WebsocketSession {
+        let mut cached_websocket_session = self
+            .state
+            .cached_websocket_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *cached_websocket_session)
+    }
+}
+
+impl ModelClientSession {
+    pub async fn preconnect_websocket(&mut self) -> std::result::Result<(), ApiError> {
+        let client_setup = self.client.current_client_setup().await.map_err(|err| {
+            ApiError::Stream(format!(
+                "failed to build websocket prewarm client setup: {err}"
+            ))
+        })?;
+        self.websocket_session.connection = Some(connection);
+        self.websocket_session.endpoint = Some(endpoint);
+        self.websocket_session
+            .set_connection_reused(/*connection_reused*/ false);
+        Ok(())
+    }
+
+    async fn websocket_connection(&mut self) -> std::result::Result<&ApiWebSocketConnection, ApiError> {
+        if needs_new {
+            self.reset_websocket_session();
+            let new_conn = match self
+                .client
+                .connect_websocket(
+                    session_telemetry,
+                    api_provider,
+                    api_auth,
+                    responses_metadata,
+                    auth_context,
+                    request_route_telemetry,
+                    endpoint,
+                )
+                .await
+            {
+                Ok(new_conn) => new_conn,
+                Err(err) => {
+                    if matches!(err, ApiError::Transport(TransportError::Timeout)) {
+                        self.reset_websocket_session();
+                    }
+                    return Err(err);
+                }
+            };
+            self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.endpoint = Some(endpoint);
+            self.websocket_session
+                .set_connection_reused(/*connection_reused*/ false);
+        } else {
+            self.websocket_session
+                .set_connection_reused(/*connection_reused*/ true);
+        }
+
+        self.websocket_session
+            .connection
+            .as_ref()
+            .ok_or(ApiError::Stream(
+                "websocket connection is unavailable".to_string(),
+            ))
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        patch_client_websocket_source(&client).unwrap();
+        let patched = fs::read_to_string(&client).unwrap();
+        assert!(patched.contains("if needs_new || auth_changed"));
+        assert!(patched.contains("self.reset_websocket_session();"));
+        assert!(patched.contains("request_route_telemetry,\n                    endpoint,"));
+        assert!(patched.contains("self.websocket_session.endpoint = Some(endpoint);"));
+        assert!(patched.contains("self.websocket_session.auth_generation_at_creation = ag"));
+        assert!(patched.contains("self.websocket_session.auth_generation_at_creation = auth_gen"));
+
+        patch_client_websocket_source(&client).unwrap();
+        assert_eq!(fs::read_to_string(client).unwrap(), patched);
+    }
 }

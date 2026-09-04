@@ -118,6 +118,12 @@ the patch driver makes only that helper crate-visible and uses it for both
 injected `account/updated` sends. Older bare-notification variants remain
 supported; an envelope-bearing source without the known helper fails closed
 before the release compile begins.
+The WebSocket reconnect patch likewise preserves the upstream endpoint chosen
+for the request while invalidating a cached connection after an auth-generation
+change. Both the older direct session-reset shape and the endpoint-bound
+`reset_websocket_session` shape are deterministic fixture contracts. Any new
+upstream reconnect shape fails closed before compilation until its credential,
+endpoint, telemetry, and generation behavior has an explicit regression test.
 
 ## Verified Runtime Pair Reuse
 
