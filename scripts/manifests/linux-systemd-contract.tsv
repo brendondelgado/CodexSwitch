@@ -27,7 +27,7 @@ unit:signul-codex-app-server.service:TasksMax	2048
 unit:signul-codex-app-server.service:LimitNOFILE	1048576
 unit:signul-codex-app-server.service:WantedBy	default.target
 unit:codexswitch.service:Description	CodexSwitch CLI daemon
-unit:codexswitch.service:ExecStart	%h/.local/bin/codexswitch-cli daemon
+unit:codexswitch.service:ExecStart	/usr/bin/flock --shared --no-fork %h/.local/share/codexswitch/runtime-start-install.lock %h/.local/share/codexswitch/current/codexswitch-cli daemon
 unit:codexswitch.service:Restart	on-failure
 unit:codexswitch.service:RestartSec	5
 unit:codexswitch.service:Nice	10

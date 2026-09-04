@@ -846,7 +846,7 @@ run_transaction_actions() {
   [[ "$ENABLE_APP_SERVER" == "0" ]] || systemctl --user enable signul-codex-app-server.service
   if [[ -n "$IMPORT_BUNDLE" ]]; then
     set +e
-    "$BIN_DIR/codexswitch-cli" \
+    "$CURRENT_LINK/codexswitch-cli" \
       --store "$ACCOUNT_STORE_PATH" \
       --auth "$AUTH_PATH" \
       import --offline-file-only "$IMPORT_BUNDLE_STAGED"
@@ -871,7 +871,13 @@ require_unit_positively_inactive_for_start() {
     return 0
   fi
   case "$unit" in
-    codexswitch.service) expected_argv=("$BIN_DIR/codexswitch-cli" daemon) ;;
+    codexswitch.service)
+      expected_argv=(
+        /usr/bin/flock --shared --no-fork
+        "$RUNTIME_START_INSTALL_GUARD"
+        "$CURRENT_LINK/codexswitch-cli" daemon
+      )
+      ;;
     *) fail "post-commit start has no exact ExecStart contract for $unit" ;;
   esac
   observation="$(python3 "$RUNTIME_OBSERVER_HELPER_ROOT/observe-managed-systemd.py" \

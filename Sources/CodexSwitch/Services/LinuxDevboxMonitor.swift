@@ -869,6 +869,8 @@ enum LinuxDevboxCredentialSyncReconciliation: Equatable, Sendable {
 }
 
 enum LinuxDevboxMonitor {
+    static let remoteCodexSwitchCLI =
+        #"/usr/bin/flock --shared --no-fork "$HOME/.local/share/codexswitch/runtime-start-install.lock" "$HOME/.local/share/codexswitch/current/codexswitch-cli""#
     static let maximumRemoteProviderAccountIdBytes = 256
     static let maximumManualResetResultBytes = 16 * 1_024
     static let maximumAutomaticResetPolicyResultBytes = 16 * 1_024
@@ -2215,7 +2217,7 @@ enum LinuxDevboxMonitor {
 
         let outcome = runSSHOutcome(
             settings: settings,
-            remoteCommand: "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli poll \(shellQuote(selector))",
+            remoteCommand: "\(remoteCodexSwitchCLI) poll \(shellQuote(selector))",
             timeout: 25,
             retryPolicy: pollAccountRetryPolicy
         )
@@ -2709,7 +2711,7 @@ enum LinuxDevboxMonitor {
 
         let diagnosticsResult = runSSH(
             settings: settings,
-            remoteCommand: "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli auth-diagnostics --json",
+            remoteCommand: "\(remoteCodexSwitchCLI) auth-diagnostics --json",
             timeout: 20,
             retryPolicy: .readOnly
         )
@@ -2897,8 +2899,7 @@ enum LinuxDevboxMonitor {
         set -eu
         umask 077
         chmod 600 \(bundle) \(passphrase)
-        export PATH="$HOME/.local/bin:$PATH"
-        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) codexswitch-cli update-bundle --preserve-active --receipt-operation-id \(shellQuote(operationID)) \(bundle)
+        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) \(remoteCodexSwitchCLI) update-bundle --preserve-active --receipt-operation-id \(shellQuote(operationID)) \(bundle)
         """
     }
 
@@ -3043,15 +3044,15 @@ enum LinuxDevboxMonitor {
     }
 
     static func remoteSwapCommand(selector: String) -> String {
-        "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli swap \(shellQuote(selector))"
+        "\(remoteCodexSwitchCLI) swap \(shellQuote(selector))"
     }
 
     static func remotePoolAuthorityStatusCommand() -> String {
-        "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli pool-authority-status --json"
+        "\(remoteCodexSwitchCLI) pool-authority-status --json"
     }
 
     static func remotePoolTargetRequestCommand(_ request: PoolAuthorityRequest) -> String {
-        "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli request-pool-target \(shellQuote(request.selector)) --request-id \(shellQuote(request.requestId)) --expected-epoch \(request.expectedEpoch) --reason \(shellQuote(request.reason)) --json"
+        "\(remoteCodexSwitchCLI) request-pool-target \(shellQuote(request.selector)) --request-id \(shellQuote(request.requestId)) --expected-epoch \(request.expectedEpoch) --reason \(shellQuote(request.reason)) --json"
     }
 
     static func normalizedRemoteProviderAccountId(_ value: String) -> String? {
@@ -3071,16 +3072,16 @@ enum LinuxDevboxMonitor {
         ) else {
             return nil
         }
-        return "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli redeem-reset \(shellQuote(providerAccountId)) --json"
+        return "\(remoteCodexSwitchCLI) redeem-reset \(shellQuote(providerAccountId)) --json"
     }
 
     static func remoteAutomaticResetPolicyGetCommand() -> String {
-        "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy get --json"
+        "\(remoteCodexSwitchCLI) automatic-reset-policy get --json"
     }
 
     static func remoteAutomaticResetPolicySetCommand(enabled: Bool) -> String {
         let state = enabled ? "enabled" : "disabled"
-        return "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy set \(state) --json"
+        return "\(remoteCodexSwitchCLI) automatic-reset-policy set \(state) --json"
     }
 
     static func scpArgumentCandidates(settings: LinuxDevboxMonitorSettings) -> [[String]] {
@@ -3314,8 +3315,7 @@ enum LinuxDevboxMonitor {
 
     static func remoteReadinessCommand() -> String {
         """
-        export PATH="$HOME/.local/bin:$PATH"
-        codexswitch-cli doctor --json
+        \(remoteCodexSwitchCLI) doctor --json
         """
     }
 

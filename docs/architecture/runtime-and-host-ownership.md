@@ -957,10 +957,12 @@ historical connection count. That idle proof is runtime convergence, not
 notification of a live client: it is valid only after the same bound auth reload
 and cache fingerprint checks, and the next client initializes against that
 reloaded auth manager. The managed desktop bridge may use only its separate exact
-all-zero exception. Ordinary `external-app-server` runtimes, including the VPS
-SSH/Unix app-server, remain strict and cannot use idle proof. A timeout from an
-eligible writer, a partial write set, contradictory counts, missing capability
-marker, or runtime-kind mismatch remains degraded.
+all-zero exception. A current-release Linux VPS SSH/Unix
+`external-app-server` may use an exact all-zero idle proof after exact bound
+auth reload; any initialized, skipped, eligible, or rejected writer forbids
+that idle proof, and any eligible writer still requires completed delivery. A timeout from an eligible writer, a partial
+write set, contradictory counts, missing capability marker, or runtime-kind
+mismatch remains degraded.
 
 Successful signal delivery is recorded separately from verified acknowledgement.
 The runtime reloads backend auth before it attempts frontend delivery, so an
@@ -1573,15 +1575,29 @@ actor boundary on every supported Swift 6 toolchain.
 - The CLI submits idempotent authority requests through that shared transaction
   and reads authority observations. It never implements an independent
   desired-target record.
+- Automated Mac-to-VPS commands and `codexswitch.service` execute
+  `~/.local/share/codexswitch/current/codexswitch-cli` directly while holding a
+  shared `runtime-start-install.lock`. They never resolve a separately
+  retargetable `codexswitch-cli` through `PATH`. This
+  binds credential import, authority requests, polling, reset redemption,
+  readiness, and daemon activation semantics to the same immutable release as
+  `current/patched-codex/codex`.
 - The port-8390 WebSocket service and the built-in SSH `unix://` app-server are
   separate account-bearing runtimes. Both participate in discovery and verified
   reload whenever they are running; `app-server proxy` helpers never do. The
   positively classified port-8390
   `headless-remote-control-app-server` service may use its explicit broader
-  headless idle proof. The SSH daemon remains a strict `external-app-server` and
-  must prove frontend delivery whenever it is retained as a live
-  account-bearing runtime. SSH/Unix transport alone never supplies headless
-  classification, and no VPS runtime may claim `managed-desktop-bridge`.
+  headless idle proof. An idle SSH daemon may also acknowledge only after it
+  reloads the exact requested account and complete token fingerprint, reports
+  exact all-zero frontend counts, and marks itself ready for the next client.
+  Any initialized frontend forbids this external idle proof; any live eligible writer still requires a
+  completed `account/updated` write. SSH/Unix transport alone never supplies
+  headless classification, and no VPS runtime may claim
+  `managed-desktop-bridge`.
+- A Linux app-server whose executable is not the canonical runtime in the
+  immutable `current` release is an explicit convergence blocker. Its ACK can
+  never clear a degraded activation, even when its markers and credentials are
+  otherwise valid.
 - Service status is readable without starting the service.
 - Remote usage aggregation preserves the model identity supplied by runtime
   evidence. Missing model evidence is reported as `unknown`; it is never

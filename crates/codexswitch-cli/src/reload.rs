@@ -3120,9 +3120,10 @@ fn hot_swap_ack_matches_request_with_minimum_remaining(
         && ack.loaded_token_fingerprint == expected_fingerprint
         && ack.active_token_fingerprint == expected_fingerprint
         && match runtime_kind {
-            HotSwapRuntimeKind::ExternalAppServer => {
-                external_app_server_ack_is_verified(ack, AppServerIdlePolicy::NoEligibleFrontends)
-            }
+            HotSwapRuntimeKind::ExternalAppServer => external_app_server_ack_is_verified(
+                ack,
+                AppServerIdlePolicy::ZeroInitializedFrontends,
+            ),
             HotSwapRuntimeKind::OfficialDesktopStdioChild => {
                 external_app_server_ack_is_verified(ack, AppServerIdlePolicy::Reject)
             }
@@ -3740,6 +3741,13 @@ pub fn process_is_sighup_safe_target(process: &CodexProcess, binary_has_markers:
 
 pub fn hot_swap_runtime_kind(process: &CodexProcess) -> Option<HotSwapRuntimeKind> {
     let target_is_macos = cfg!(target_os = "macos");
+    #[cfg(target_os = "linux")]
+    if is_codex_app_server_command_line(&process.command_line)
+        && !linux_app_server_uses_current_managed_release(process)
+    {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
     let managed_runtime = (target_is_macos
         && is_managed_desktop_bridge_app_server_command_line(
             &process.command_line,
@@ -3747,6 +3755,8 @@ pub fn hot_swap_runtime_kind(process: &CodexProcess) -> Option<HotSwapRuntimeKin
         ))
     .then(current_managed_desktop_runtime_route)
     .flatten();
+    #[cfg(not(target_os = "macos"))]
+    let managed_runtime = None;
     #[cfg(target_os = "macos")]
     let managed_launchd_pid = (managed_runtime.as_deref() == Some(process.executable.as_path()))
         .then(|| current_managed_desktop_bridge_launchd_pid(process.owner_uid))
@@ -3799,6 +3809,26 @@ fn hot_swap_runtime_kind_for_platform(
         return Some(HotSwapRuntimeKind::LocalInteractiveCli);
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_app_server_uses_current_managed_release(process: &CodexProcess) -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let install_root = PathBuf::from(home).join(".local/share/codexswitch");
+    let managed_releases = install_root.join("releases");
+    match fs::canonicalize(install_root.join("current/patched-codex/codex")) {
+        Ok(expected) => linux_app_server_matches_expected_managed_runtime(process, &expected),
+        Err(_) => !process.executable.starts_with(managed_releases),
+    }
+}
+
+fn linux_app_server_matches_expected_managed_runtime(
+    process: &CodexProcess,
+    expected: &Path,
+) -> bool {
+    process.executable == expected
 }
 
 fn current_managed_desktop_runtime_route() -> Option<PathBuf> {
@@ -4561,6 +4591,39 @@ mod tests {
         ));
         assert!(!is_codex_app_server_command_line(
             "/home/signul/.local/share/codexswitch/patched-codex/codex app-server proxy --sock /tmp/control.sock"
+        ));
+    }
+
+    #[test]
+    fn linux_app_servers_must_execute_the_current_managed_release() {
+        let current = PathBuf::from(
+            "/home/signul/.local/share/codexswitch/releases/current/patched-codex/codex",
+        );
+        let mut process = CodexProcess {
+            pid: 42,
+            owner_uid: 1001,
+            start_identity: "linux:123".to_string(),
+            started_at_unix: 1,
+            command_line: format!(
+                "{} -c features.code_mode_host=true app-server --listen unix://",
+                current.display()
+            ),
+            executable: current.clone(),
+        };
+
+        assert!(linux_app_server_matches_expected_managed_runtime(
+            &process, &current
+        ));
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(&process, false, None, None),
+            Some(HotSwapRuntimeKind::ExternalAppServer)
+        );
+
+        process.executable = PathBuf::from(
+            "/home/signul/.local/share/codexswitch/releases/stale/patched-codex/codex",
+        );
+        assert!(!linux_app_server_matches_expected_managed_runtime(
+            &process, &current
         ));
     }
 
@@ -5756,6 +5819,26 @@ mod tests {
             &strict_request,
             HotSwapRuntimeKind::ExternalAppServer,
             strict_idle.acknowledged_at_unix_milliseconds,
+        ));
+
+        let mut external_skipped = strict_idle.clone();
+        external_skipped.initialized_frontend_count = Some(1);
+        external_skipped.skipped_frontend_count = Some(1);
+        assert!(!hot_swap_ack_matches_request(
+            &external_skipped,
+            &strict_request,
+            HotSwapRuntimeKind::ExternalAppServer,
+            external_skipped.acknowledged_at_unix_milliseconds,
+        ));
+
+        let mut external_rejected = strict_idle.clone();
+        external_rejected.initialized_frontend_count = Some(1);
+        external_rejected.rejected_frontend_count = Some(1);
+        assert!(!hot_swap_ack_matches_request(
+            &external_rejected,
+            &strict_request,
+            HotSwapRuntimeKind::ExternalAppServer,
+            external_rejected.acknowledged_at_unix_milliseconds,
         ));
 
         let mut desktop_request = strict_request.clone();

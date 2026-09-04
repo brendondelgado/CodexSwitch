@@ -4500,7 +4500,10 @@ async fn run_turn() {
         assert!(patched.contains("idleListenerReady"));
         assert!(patched.contains("\"managed-desktop-bridge\" => {"));
         assert!(patched.contains(
-            "\"headless-remote-control-app-server\" | \"external-app-server\" => {"
+            "\"headless-remote-control-app-server\" => eligible_frontend_count == 0"
+        ));
+        assert!(patched.contains(
+            "\"external-app-server\" | \"managed-desktop-bridge\" => {"
         ));
         assert!(patched.contains("initialized_frontend_count == 0"));
         assert!(patched.contains("skipped_frontend_count == 0"));

@@ -132,9 +132,12 @@ An ordinary external app-server, including a non-bridge ChatGPT desktop target
 or a VPS app-server reached through SSH or a Unix socket, uses the strict
 `external-app-server` contract. It must successfully parse the current auth
 source, prove that the newly cached auth fingerprint matches the independently
-parsed `auth.json` fingerprint, and deliver `account/updated` to at least one
-initialized frontend writer. Merely accepting a broadcast into the app-server's
-internal queue is not delivery. This proof is ACK contract version 3 and is advertised by the
+parsed `auth.json` fingerprint, and deliver `account/updated` to every eligible
+frontend writer. An idle current-release Linux VPS SSH/Unix listener may instead
+acknowledge only with exact all-zero frontend counters and explicit readiness
+for the next client after that exact bound-auth reload. Merely accepting a broadcast
+into the app-server's internal queue is not delivery, and transport shape alone
+does not authorize the idle proof. This proof is ACK contract version 3 and is advertised by the
 `codexswitch-hotswap-contract-v3` capability marker together with
 `codexswitch-runtime-convergence-v3` and
 `codexswitch-runtime-rotation-handoff-v1`. Reloading the Rust backend
@@ -644,7 +647,7 @@ CodexSwitch must evaluate these independently:
   unchanged failing topology cannot busy-loop.
 - **Desktop code-mode helper:** `codex-code-mode-host` is a worker owned by the desktop app-server, not an independent interactive CLI. It must not appear as a Mac CLI readiness blocker or receive a standalone auth-reload signal; readiness follows its parent app-server.
 - **Mac remote client:** a `codex --remote` process on the Mac is a transport client, not the account-bearing app-server. It must not be treated as the VPS hot-swap target.
-- **Linux VPS app-server:** ordinary VPS app-servers, including the SSH `unix://` daemon, remain strict `external-app-server` targets and must prove frontend delivery. Only the positively classified port-8390 `headless-remote-control-app-server` retains the broader headless idle contract; SSH/Unix transport or missing frontends do not promote an ordinary external app-server into it.
+- **Linux VPS app-server:** ordinary VPS app-servers, including the SSH `unix://` daemon, remain `external-app-server` targets. Eligible frontends require completed delivery; an idle current-release listener may acknowledge only with exact reloaded credentials, all-zero frontend counts, and explicit idle readiness for the next client. A stale-release process is a convergence blocker. The positively classified port-8390 `headless-remote-control-app-server` retains its separate headless contract.
 - **Remote SSH proxy:** `codex app-server proxy` is a transport bridge, not the account-bearing runtime, so it is excluded from SIGHUP targeting. After promoting a new VPS binary, reconnect the desktop's remote SSH transport so the proxy adopts the new protocol and model catalog; validate auth against the long-running remote-control app-server.
 - **Linux patched CLI:** `/home/signul/.local/share/codexswitch/current/patched-codex/codex ...` is a native Codex runtime even when launched with arguments such as `--yolo`. Detection must inspect the executable token, not only exact command-line suffixes. The app-server detector must also accept `app-server --remote-control --listen ws://...`; otherwise the VPS can write `auth.json` but report `signaled 0 Codex hot-swap process(es)`.
 - **Background ACK repair:** the daemon may repair missing ACKs for live interactive CLI sessions. Discovery attempts are capped at one per 60 seconds even when no ACK is missing; a healthy no-work result must advance the cadence clock. It must not repeatedly signal an app-server that has not proven live reload support, because a supervised WebSocket app-server can exit on `SIGHUP` and enter a disconnecting restart loop.
@@ -1457,8 +1460,8 @@ Before claiming hot-swap is fixed or ready:
   that owns its listening TCP socket. A concurrent managed
   `app-server --listen stdio://` host process is ignored and cannot create a
   phantom missing-socket target.
-- [ ] Every ordinary `external-app-server`, including a desktop or VPS target reached through SSH/Unix, proves matching disk/active auth fingerprints, the current signal nonce, and at least one completed frontend write.
-- [ ] Any broader idle result comes from a positively classified `headless-remote-control-app-server` topology, not from generic `external-app-server`, SSH/Unix transport, or an absent frontend.
+- [ ] Every ordinary `external-app-server`, including a desktop or VPS target reached through SSH/Unix, proves matching disk/active auth fingerprints and the current signal nonce. Eligible frontends require completed writes; an idle current-release Linux VPS listener requires exact all-zero counts and explicit idle readiness.
+- [ ] A `headless-remote-control-app-server` idle result remains separately classified from the bounded idle `external-app-server` proof.
 - [ ] A local interactive CLI ACK identifies `local-interactive-cli`, proves matching disk/active auth fingerprints and the current signal nonce, reports auth-generation/reconnect readiness, and reports zero desktop frontend writes.
 - [ ] The Rust readiness path accepts a Swift UUID request nonce when the full version-3 binding matches, and rejects empty, oversized, whitespace, or control-character nonces.
 - [ ] ChatGPT framework helpers and crash reporters do not appear in CLI readiness or restart target lists.
@@ -1538,10 +1541,11 @@ Every future hot-swap change must include tests for:
   eligibility historical connections may be excluded from its live writer
   count, but any writer that accepted the notification forbids the headless idle
   shape until its transport write completes.
-- Ordinary `external-app-server`, including VPS SSH/Unix targets, always
-  requires positive frontend delivery. Generic idleness, an
+- An `external-app-server` with eligible frontends requires positive completed
+  delivery. A current-release Linux VPS SSH/Unix listener with exact all-zero
+  frontend counts may use the explicit idle-ready proof after exact bound auth reload. An
   accepted-but-undelivered writer, timeout, contradictory counts, or a
-  same-second stale ACK cannot satisfy it.
+  same-second stale ACK cannot satisfy either path.
 - App-server ACK accounting includes initialized
   frontends that were intentionally skipped:
   `skipped + eligible + rejected == initialized`. The live
@@ -1590,8 +1594,9 @@ Every future hot-swap change must include tests for:
   rotation request, then each required host rewrites `auth.json` only for the
   committed epoch.
 - Runtime `UsageLimitReached` inside Codex generates a canonical receipt UUID,
-  invokes only `$HOME/.local/bin/codexswitch-cli`, rotates once, reloads the
-  active turn `AuthManager`, and retries before surfacing the original error.
+  invokes only the managed control CLI whose canonical path and digest match
+  the same immutable `current` release, rotates once, reloads the active turn
+  `AuthManager`, and retries before surfacing the original error.
   Exact-source patching supports both the legacy integer retry counter and the
   newer `ResponsesStreamRetryState` initializer immediately before that loop;
   any other loop shape fails closed.

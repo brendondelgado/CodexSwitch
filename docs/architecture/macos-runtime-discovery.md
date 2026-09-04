@@ -164,10 +164,11 @@ labels that an ACK may select for itself:
   OpenAI-signed ChatGPT app. It uses the strict frontend-delivery ACK
   contract; private transport is not permission to accept an idle ACK.
 - `external-app-server` covers every ordinary external app-server, including a
-  VPS app-server reached through SSH or a Unix socket. It remains strict and
-  must prove delivery of `account/updated` to at least one initialized frontend;
-  transport shape, no connected client, or zero counters never grants the
-  managed bridge exception.
+  VPS app-server reached through SSH or a Unix socket. A runtime with an
+  eligible frontend must prove completed delivery of `account/updated`. An idle
+  current-release Linux VPS SSH/Unix listener may instead use the bounded
+  all-zero proof only after exact bound-auth reload and explicit readiness for
+  the next client. Transport shape alone never grants that proof.
 - `headless-remote-control-app-server` retains its separate, broader idle
   contract after positive topology classification. It does not inherit the
   managed bridge's exact all-zero desktop-counter exception, and SSH, Unix
@@ -354,11 +355,12 @@ eligible count. Initialized frontends that are intentionally skipped remain
 part of the total and do not invalidate an otherwise complete delivery proof.
 The ChatGPT-owned stdio frontend remains connected through SIGHUP, so the
 strict ACK proves backend convergence and a completed outbound transport write.
-An ordinary `external-app-server`, including a VPS target reached through SSH
-or a Unix socket, always requires positive completed frontend delivery and may
-not use an idle-listener shape. The retired Mac bridge wire kind may decode in
-historical artifacts but can never classify a live runtime or authorize a
-signal.
+An `external-app-server` with an eligible frontend requires positive completed
+frontend delivery. An idle current-release Linux VPS SSH/Unix listener may
+acknowledge only after it reloads the exact requested credential generation,
+reports zero initialized, skipped, eligible, rejected, and completed frontend
+writes, and marks itself ready for the next client. The retired Mac bridge wire kind may decode in historical
+artifacts but can never classify a live runtime or authorize a signal.
 A positively classified `headless-remote-control-app-server` keeps its broader
 idle-listener policy because it has no desktop renderer contract; that separate
 policy may account for disconnected historical connections and is not the
@@ -389,9 +391,9 @@ connection-completion path invokes strict reload before its transport-release
 callback. The installed canary confirms the same ordering with the real
 native stdio path. Runtime-kind tests prove that only an
 official-ChatGPT-owned exact stdio child can use
-`official-desktop-stdio-child`, that idle or mixed counters fail, that ordinary
-`external-app-server` targets including VPS SSH/Unix
-topologies require positive frontend delivery, and that
+`official-desktop-stdio-child`, that ordinary desktop external app servers
+require positive frontend delivery, that idle VPS SSH/Unix external listeners
+require the exact bounded all-zero proof from the current Linux release, and that
 `headless-remote-control-app-server` uses only its separately classified idle
 contract. Concurrent batch tests also prove that a competing desktop discovery
 provider cannot run until the first attempt releases PID admission after strict

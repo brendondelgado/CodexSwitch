@@ -93,6 +93,38 @@ else:
         result("unknown", "runtime-not-regular")
     runtime_metadata = runtime_lstat
 runtime_canonical = Path(os.path.realpath(runtime))
+install_root = runtime.parent.parent.parent
+managed_releases_root = Path(os.path.realpath(install_root / "releases"))
+
+def managed_release_runtime_path(path: Path) -> bool:
+    try:
+        relative = path.relative_to(managed_releases_root)
+    except ValueError:
+        return False
+    parts = relative.parts
+    return (
+        len(parts) == 3
+        and parts[0]
+        and parts[0] not in {".", ".."}
+        and "/" not in parts[0]
+        and parts[1:] == ("patched-codex", "codex")
+    )
+
+def account_bearing_app_server_argv(argv) -> bool:
+    indexes = [index for index, value in enumerate(argv[1:], start=1) if value == b"app-server"]
+    if len(indexes) != 1:
+        return False
+    index = indexes[0]
+    return index + 1 >= len(argv) or argv[index + 1] not in {b"proxy", b"daemon"}
+
+def managed_runtime_argv0(value: bytes) -> bool:
+    if value == os.fsencode(runtime):
+        return True
+    try:
+        path = Path(os.fsdecode(value))
+    except UnicodeDecodeError:
+        return False
+    return path.is_absolute() and managed_release_runtime_path(path)
 
 def process_start_ticks(pid: int):
     path = proc_root / str(pid) / "stat"
@@ -123,12 +155,12 @@ def exact_process(pid: int):
     if command_line is None:
         result("unknown", f"process-argv-missing:{pid}")
     argv = [value for value in command_line.split(b"\0") if value]
-    expected = [os.fsencode(runtime), b"app-server", b"--listen", b"unix://"]
-    if not argv or argv[0] != expected[0]:
+    if not argv or not account_bearing_app_server_argv(argv):
         return "unrelated"
+    argv_claims_managed_runtime = managed_runtime_argv0(argv[0])
     if runtime_metadata is None:
-        if argv != expected:
-            result("unknown", f"process-managed-path-argv-drift:{pid}")
+        if not argv_claims_managed_runtime:
+            return "unrelated"
         start_after = process_start_ticks(pid)
         if start_after is None or start_before != start_after:
             result("unknown", f"process-start-drift:{pid}")
@@ -139,18 +171,24 @@ def exact_process(pid: int):
     except FileNotFoundError:
         return "unrelated"
     except OSError as error:
-        result("unknown", f"process-exe:{pid}:{error.__class__.__name__}")
-    if (executable.st_dev, executable.st_ino) != (runtime_metadata.st_dev, runtime_metadata.st_ino):
-        if argv == expected:
-            result("unknown", f"process-exact-managed-argv-replaced-inode:{pid}")
+        if argv_claims_managed_runtime:
+            result("unknown", f"process-exe:{pid}:{error.__class__.__name__}")
         return "unrelated"
     try:
         observed_canonical = Path(os.path.realpath(exe))
     except OSError as error:
         result("unknown", f"process-canonical:{pid}:{error.__class__.__name__}")
-    if observed_canonical != runtime_canonical:
-        result("unknown", f"process-canonical-drift:{pid}")
-    if argv != expected:
+    executable_is_current = (
+        (executable.st_dev, executable.st_ino)
+        == (runtime_metadata.st_dev, runtime_metadata.st_ino)
+        and observed_canonical == runtime_canonical
+    )
+    executable_is_managed_release = managed_release_runtime_path(observed_canonical)
+    if not executable_is_current and not executable_is_managed_release:
+        if argv_claims_managed_runtime:
+            result("unknown", f"process-exact-managed-argv-replaced-inode:{pid}")
+        return "unrelated"
+    if not argv_claims_managed_runtime:
         result("unknown", f"process-argv-drift:{pid}")
     start_after = process_start_ticks(pid)
     if start_after is None or start_before != start_after:

@@ -213,7 +213,7 @@ struct LinuxDevboxStatusTests {
     func remoteSwapCommandTargetsExactActiveAccountSafely() {
         let command = LinuxDevboxMonitor.remoteSwapCommand(selector: "weird'account@example.com")
 
-        #expect(command.contains("codexswitch-cli swap 'weird'\\''account@example.com'"))
+        #expect(command.contains("\(LinuxDevboxMonitor.remoteCodexSwitchCLI) swap 'weird'\\''account@example.com'"))
         #expect(!command.contains("accessToken"))
         #expect(!command.contains("refreshToken"))
         #expect(!command.contains("idToken"))
@@ -267,7 +267,7 @@ struct LinuxDevboxStatusTests {
         #expect(LinuxDevboxMonitor.isInteractiveCodexVPSAttachRunning(psOutput: active))
 
         let monitorOnly = """
-        /usr/bin/ssh -o BatchMode=yes -o ProxyCommand=/Applications/Tailscale.app/Contents/MacOS/Tailscale nc %h %p signul@100.95.84.123 export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli doctor --json
+        /usr/bin/ssh -o BatchMode=yes -o ProxyCommand=/Applications/Tailscale.app/Contents/MacOS/Tailscale nc %h %p signul@100.95.84.123 \"$HOME/.local/share/codexswitch/current/codexswitch-cli\" doctor --json
         /Applications/Tailscale.app/Contents/MacOS/Tailscale nc 100.95.84.123 22
         """
         #expect(!LinuxDevboxMonitor.isInteractiveCodexVPSAttachRunning(psOutput: monitorOnly))

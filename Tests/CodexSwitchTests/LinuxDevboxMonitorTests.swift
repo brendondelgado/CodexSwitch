@@ -679,7 +679,8 @@ struct LinuxDevboxMonitorTests {
 
         #expect(command.contains("stage='/tmp/codexswitch-auto-sync-fixture'"))
         #expect(command.contains("CODEXSWITCH_IMPORT_PASSPHRASE_FILE='/tmp/codexswitch-auto-sync-fixture/sync.passphrase'"))
-        #expect(command.contains("codexswitch-cli update-bundle --preserve-active --receipt-operation-id '11111111-1111-4111-8111-111111111111' '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
+        #expect(command.contains("\(LinuxDevboxMonitor.remoteCodexSwitchCLI) update-bundle --preserve-active --receipt-operation-id '11111111-1111-4111-8111-111111111111' '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
+        #expect(!command.contains("export PATH="))
         #expect(command.contains("chmod 600 '/tmp/codexswitch-auto-sync-fixture/sync.csbundle'"))
         #expect(!command.contains("chmod 600 --"))
         #expect(!command.contains("--ignore-expiry"))
@@ -713,7 +714,10 @@ struct LinuxDevboxMonitorTests {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("codexswitch-remote-cleanup-test-\(UUID().uuidString)", isDirectory: true)
         let home = root.appendingPathComponent("home", isDirectory: true)
-        let bin = home.appendingPathComponent(".local/bin", isDirectory: true)
+        let bin = home.appendingPathComponent(
+            ".local/share/codexswitch/current",
+            isDirectory: true
+        )
         let stage = root.appendingPathComponent("private-stage", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -753,7 +757,10 @@ struct LinuxDevboxMonitorTests {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("codexswitch-remote-cleanup-failure-\(UUID().uuidString)", isDirectory: true)
         let home = root.appendingPathComponent("home", isDirectory: true)
-        let bin = home.appendingPathComponent(".local/bin", isDirectory: true)
+        let bin = home.appendingPathComponent(
+            ".local/share/codexswitch/current",
+            isDirectory: true
+        )
         let stage = root.appendingPathComponent("private-stage", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -798,7 +805,10 @@ struct LinuxDevboxMonitorTests {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("codexswitch-remote-cleanup-shadow-\(UUID().uuidString)", isDirectory: true)
         let home = root.appendingPathComponent("home", isDirectory: true)
-        let bin = home.appendingPathComponent(".local/bin", isDirectory: true)
+        let bin = home.appendingPathComponent(
+            ".local/share/codexswitch/current",
+            isDirectory: true
+        )
         let stage = root.appendingPathComponent("private-stage", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -921,7 +931,7 @@ struct LinuxDevboxMonitorTests {
             providerAccountId: "  Provider'ID  "
         ))
 
-        #expect(command == "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli redeem-reset 'provider'\\''id' --json")
+        #expect(command == "\(LinuxDevboxMonitor.remoteCodexSwitchCLI) redeem-reset 'provider'\\''id' --json")
         #expect(!command.contains("Provider"))
     }
 
@@ -1063,11 +1073,37 @@ struct LinuxDevboxMonitorTests {
     @Test("automatic-reset policy commands match the VPS CLI contract")
     func automaticResetPolicyCommandsMatchContract() {
         #expect(LinuxDevboxMonitor.remoteAutomaticResetPolicyGetCommand()
-            == "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy get --json")
+            == "\(LinuxDevboxMonitor.remoteCodexSwitchCLI) automatic-reset-policy get --json")
         #expect(LinuxDevboxMonitor.remoteAutomaticResetPolicySetCommand(enabled: true)
-            == "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy set enabled --json")
+            == "\(LinuxDevboxMonitor.remoteCodexSwitchCLI) automatic-reset-policy set enabled --json")
         #expect(LinuxDevboxMonitor.remoteAutomaticResetPolicySetCommand(enabled: false)
-            == "export PATH=\"$HOME/.local/bin:$PATH\"; codexswitch-cli automatic-reset-policy set disabled --json")
+            == "\(LinuxDevboxMonitor.remoteCodexSwitchCLI) automatic-reset-policy set disabled --json")
+    }
+
+    @Test("automated VPS commands use the immutable current release CLI")
+    func automatedVPSCommandsUseCurrentReleaseCLI() throws {
+        #expect(LinuxDevboxMonitor.remoteCodexSwitchCLI.hasPrefix(
+            "/usr/bin/flock --shared --no-fork "
+        ))
+        #expect(LinuxDevboxMonitor.remoteCodexSwitchCLI.contains(
+            "runtime-start-install.lock"
+        ))
+        let commands = [
+            LinuxDevboxMonitor.remoteSwapCommand(selector: "account@example.com"),
+            LinuxDevboxMonitor.remotePoolAuthorityStatusCommand(),
+            try #require(LinuxDevboxMonitor.remoteManualResetCommand(
+                providerAccountId: "provider-account-id"
+            )),
+            LinuxDevboxMonitor.remoteAutomaticResetPolicyGetCommand(),
+            LinuxDevboxMonitor.remoteAutomaticResetPolicySetCommand(enabled: true),
+            LinuxDevboxMonitor.remoteReadinessCommand(),
+        ]
+
+        for command in commands {
+            #expect(command.contains(LinuxDevboxMonitor.remoteCodexSwitchCLI))
+            #expect(!command.contains("export PATH="))
+            #expect(!command.contains("; codexswitch-cli "))
+        }
     }
 
     @Test("automatic-reset policy decoding is fail closed")

@@ -100,6 +100,20 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         ):
             self.assertIn(directive, text)
 
+    def test_daemon_uses_same_immutable_release_as_runtime(self):
+        text = (SYSTEMD / "codexswitch.service").read_text()
+
+        self.assertIn(
+            "ExecStart=/usr/bin/flock --shared --no-fork "
+            "%h/.local/share/codexswitch/runtime-start-install.lock "
+            "%h/.local/share/codexswitch/current/codexswitch-cli daemon",
+            text,
+        )
+        self.assertNotIn(
+            "ExecStart=%h/.local/bin/codexswitch-cli daemon",
+            text,
+        )
+
     def test_runtime_and_maintenance_resource_policies_are_complete(self):
         runtime = (
             SYSTEMD
@@ -390,7 +404,60 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 drifted.stdout.strip(),
-                "unknown\tprocess-managed-path-argv-drift:42",
+                "active\texact-process-active",
+            )
+
+    def test_python_daemon_observer_blocks_stale_managed_release_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            proc_root = root / "proc"
+            process = proc_root / "42"
+            codex_home = root / "codex-home"
+            install_root = root / "codexswitch"
+            releases = install_root / "releases"
+            old_runtime = releases / "old-release" / "patched-codex" / "codex"
+            new_runtime = releases / "new-release" / "patched-codex" / "codex"
+            current = install_root / "current"
+            runtime = current / "patched-codex" / "codex"
+            process.mkdir(parents=True)
+            old_runtime.parent.mkdir(parents=True)
+            new_runtime.parent.mkdir(parents=True)
+            codex_home.mkdir()
+            old_runtime.write_bytes(b"old reviewed runtime")
+            new_runtime.write_bytes(b"new reviewed runtime")
+            current.symlink_to(pathlib.Path("releases/new-release"))
+            (process / "stat").write_text(
+                f"42 (codex) {' '.join(['1'] * 20)}\n"
+            )
+            (process / "cmdline").write_bytes(
+                os.fsencode(runtime)
+                + b"\0-c\0features.code_mode_host=true\0"
+                + b"app-server\0--listen\0unix://\0"
+            )
+            (process / "exe").symlink_to(old_runtime)
+
+            observed = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER_LIB / "observe-managed-daemon.py"),
+                    str(proc_root),
+                    str(codex_home),
+                    str(runtime),
+                    str(codex_home / "app-server-daemon/app-server.pid.lock"),
+                    "0",
+                    "2",
+                    "100",
+                    str(1024 * 1024),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+
+            self.assertEqual(
+                observed.stdout.strip(),
+                "active\texact-process-active",
             )
 
     def test_knowledge_sync_is_omitted_and_cleanup_is_part_of_exact_target(self):
@@ -1253,9 +1320,9 @@ PY
                   drifted-exec) active_state=inactive ;;
                   *) active_state="$observation" ;;
                 esac
-                exec_start="{ path=$CODEXSWITCH_BIN_DIR/codexswitch-cli ; argv[]=$CODEXSWITCH_BIN_DIR/codexswitch-cli daemon ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+                exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $CODEXSWITCH_INSTALL_ROOT/runtime-start-install.lock $CODEXSWITCH_INSTALL_ROOT/current/codexswitch-cli daemon ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
                 if [ "$observation" = drifted-exec ]; then
-                  exec_start="{ path=$CODEXSWITCH_BIN_DIR/codexswitch-cli ; argv[]=$CODEXSWITCH_BIN_DIR/codexswitch-cli daemon --spoofed ; ignore_errors=no ; }"
+                  exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $CODEXSWITCH_INSTALL_ROOT/runtime-start-install.lock $CODEXSWITCH_INSTALL_ROOT/current/codexswitch-cli daemon --spoofed ; ignore_errors=no ; }"
                 fi
                 printf 'LoadState=loaded\nActiveState=%s\nFragmentPath=%s\nExecStart=%s\nMainPID=%s\n' \
                   "$active_state" "$fragment" "$exec_start" "$main_pid"

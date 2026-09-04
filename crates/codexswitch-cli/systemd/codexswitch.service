@@ -2,7 +2,7 @@
 Description=CodexSwitch CLI daemon
 
 [Service]
-ExecStart=%h/.local/bin/codexswitch-cli daemon
+ExecStart=/usr/bin/flock --shared --no-fork %h/.local/share/codexswitch/runtime-start-install.lock %h/.local/share/codexswitch/current/codexswitch-cli daemon
 Restart=on-failure
 RestartSec=5
 

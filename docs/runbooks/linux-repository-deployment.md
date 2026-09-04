@@ -119,6 +119,14 @@ plus full Git SHA. Reuse is allowed only when the directory name, manifest,
 binary versions, source provenance, systemd digests, runtime digests, and patch
 marker contract all match.
 
+Background Mac-to-VPS operations and `codexswitch.service` do not trust the
+public convenience link. They invoke
+`~/.local/share/codexswitch/current/codexswitch-cli` directly under a shared
+`runtime-start-install.lock`, keeping the pool authority and credential importer
+on the same immutable release as the patched Codex runtime for the full
+operation. A control-only launcher update cannot change daemon or cross-host
+mutation behavior.
+
 The build root defaults outside all live paths at
 `${XDG_CACHE_HOME:-$HOME/.cache}/codexswitch/build`. The installer rejects a
 build root containing `..`, any canonical overlap or nesting with install,

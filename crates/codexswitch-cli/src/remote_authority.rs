@@ -34,6 +34,7 @@ const REMOTE_ROTATION_JOURNAL_VERSION: u32 = 2;
 const STATUS_RECONCILIATION_ATTEMPTS: usize = 3;
 const TARGET_REQUEST_CONTENTION_ATTEMPTS: usize = 4;
 const TARGET_REQUEST_CONTENTION_BACKOFF_MILLISECONDS: u64 = 250;
+const REMOTE_CODEXSWITCH_CLI: &str = r#"/usr/bin/flock --shared --no-fork "$HOME/.local/share/codexswitch/runtime-start-install.lock" "$HOME/.local/share/codexswitch/current/codexswitch-cli""#;
 const RUNTIME_ACTIVATION_BUSY_DETAIL: &str =
     "runtime activation is busy: another process owns the cross-process runtime-activation lease";
 
@@ -534,7 +535,7 @@ where
         bail!("remote pool-authority expected epoch must be positive");
     }
     let command = format!(
-        "export PATH=\"$HOME/.local/bin:$PATH\"; exec codexswitch-cli request-pool-target {} --request-id {} --expected-epoch {} --reason {} --json",
+        "exec {REMOTE_CODEXSWITCH_CLI} request-pool-target {} --request-id {} --expected-epoch {} --reason {} --json",
         shell_quote(selector),
         shell_quote(&request_id.hyphenated().to_string()),
         expected_epoch,
@@ -588,7 +589,7 @@ fn rotate_with(
     }
 
     let mut command = format!(
-        "export PATH=\"$HOME/.local/bin:$PATH\"; exec codexswitch-cli rotate-now --operation-id {} --reason {} --cooldown-seconds {} --json",
+        "exec {REMOTE_CODEXSWITCH_CLI} rotate-now --operation-id {} --reason {} --cooldown-seconds {} --json",
         shell_quote(&pending.operation_id.hyphenated().to_string()),
         shell_quote(&pending.reason),
         pending.cooldown_seconds,
@@ -1000,7 +1001,7 @@ fn sanitized_stderr(bytes: &[u8]) -> String {
 }
 
 fn remote_status_command() -> &'static str {
-    "export PATH=\"$HOME/.local/bin:$PATH\"; exec codexswitch-cli pool-authority-status --json"
+    r#"exec "$HOME/.local/share/codexswitch/current/codexswitch-cli" pool-authority-status --json"#
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1059,6 +1060,15 @@ mod tests {
             detail: None,
             rotation_operations: Vec::new(),
         }
+    }
+
+    fn assert_uses_current_release_cli(command: &str) {
+        assert!(command.contains(REMOTE_CODEXSWITCH_CLI));
+        assert!(command.contains("/usr/bin/flock --shared --no-fork"));
+        assert!(command.contains("runtime-start-install.lock"));
+        assert!(!command.contains("export PATH="));
+        assert!(!command.contains("exec codexswitch-cli"));
+        assert!(!command.contains(".local/bin/codexswitch-cli"));
     }
 
     #[test]
@@ -1125,6 +1135,7 @@ mod tests {
         assert_eq!(observed.epoch, 2);
         assert_eq!(commands.lock().unwrap().len(), 1);
         assert!(commands.lock().unwrap()[0].contains("request-pool-target"));
+        assert_uses_current_release_cli(&commands.lock().unwrap()[0]);
         Ok(())
     }
 
@@ -1355,6 +1366,7 @@ mod tests {
         let observed_mutations = Arc::clone(&mutation_count);
         let observed_resets = Arc::clone(&reset_count);
         let runner = move |_config: &RemoteAuthorityConfig, command: &str, _timeout: Duration| {
+            assert_uses_current_release_cli(command);
             if command.contains("rotate-now") {
                 *observed_mutations.lock().unwrap() += 1;
                 *observed_resets.lock().unwrap() += 1;
@@ -1481,6 +1493,7 @@ mod tests {
         assert_eq!(commands.lock().unwrap().len(), 1);
         assert!(commands.lock().unwrap()[0].contains("pool-authority-status"));
         assert!(!commands.lock().unwrap()[0].contains("rotate-now"));
+        assert_uses_current_release_cli(&commands.lock().unwrap()[0]);
         Ok(())
     }
 
