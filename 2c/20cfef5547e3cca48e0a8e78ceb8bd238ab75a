@@ -1,0 +1,34 @@
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_9496ed6917a7ba 98-105
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_9496ed6917a7ba 1635-1637
+scripts/lib/install-linux-common.sh
+  s_70c8e194852bb5::t_43b4ce9c885999 391,402,594,604
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_9496ed6917a7ba 1395-1397,2987-3003
+  s_70c8e194852bb5::t_43b4ce9c885999 96-105
+  s_70c8e194852bb5::t_87a58b3452e34c 3004
+scripts/lib/install-linux-release.sh
+  s_70c8e194852bb5::t_43b4ce9c885999 4,6-11,19-29,36
+scripts/lib/install-linux-activation-journal.sh
+  s_70c8e194852bb5::t_43b4ce9c885999 540
+scripts/lib/observe-managed-systemd.py
+  s_70c8e194852bb5::t_43b4ce9c885999 24-29,37,174
+  s_70c8e194852bb5::t_566c9c7948b146 166-167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2c20cfef5547e3cca48e0a8e78ceb8bd238ab75a",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
