@@ -1,0 +1,72 @@
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_57104a6e51f42b 4503-4506
+Tests/CodexSwitchTests/LinuxDevboxStatusTests.swift
+  s_70c8e194852bb5::t_31b69bfd48ff47 216,270
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_5f3d8a28cfcb43 872,2220,2714,2902,3047,3051,3055,3075,3079,3084,3318
+  s_70c8e194852bb5::t_48b7ea02872c4a 873
+crates/codexswitch-cli/src/codex_update/source_app_server_template.rs
+  s_70c8e194852bb5::t_57104a6e51f42b 450-451
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_11cf418accca03 964-965
+  s_70c8e194852bb5::t_df3c35fb7ece82 960-963,1579-1581,1592-1593,1597-1600
+  s_70c8e194852bb5::t_73fcbf1854a08b 1578,1582-1584,1590-1591,1594-1596
+crates/codexswitch-cli/src/reload.rs
+  s_70c8e194852bb5::t_946b886c506911 4598-4613,4617,4619-4624,4628-4629,5824-5842
+  s_70c8e194852bb5::t_16b718371183c2 3744-3749,3758,3815,3819-3831,4597,4614-4616,4618,4625-4627
+  s_70c8e194852bb5::t_4a6305ffb35ed0 3816-3818
+  s_70c8e194852bb5::t_57104a6e51f42b 3124-3126,3750,3759,3814
+  s_70c8e194852bb5::t_38863c69ff3591 3123,3832-3833,5843
+scripts/lib/observe-managed-daemon.py
+  s_70c8e194852bb5::t_0892c4a0e9a84e 96,99-127,158,160,162-163,174-175,181-191
+  s_70c8e194852bb5::t_f075ba32b09713 97
+  s_70c8e194852bb5::t_8460a039fc533f 98
+scripts/manifests/linux-systemd-contract.tsv
+  s_70c8e194852bb5::t_c436b280c95ebf 30
+docs/runbooks/codexswitch-hot-swap-verification.md
+  s_70c8e194852bb5::t_11cf418accca03 1544,1548
+  s_70c8e194852bb5::t_73fcbf1854a08b 1464
+  s_70c8e194852bb5::t_2025470c04ce43 1597-1599
+  s_70c8e194852bb5::t_df3c35fb7ece82 136-138,650,1463,1545-1546
+  s_70c8e194852bb5::t_1d596883d72f9a 135,139-140
+docs/architecture/macos-runtime-discovery.md
+  s_70c8e194852bb5::t_73fcbf1854a08b 358,363
+  s_70c8e194852bb5::t_1d596883d72f9a 167-168,394-395
+  s_70c8e194852bb5::t_df3c35fb7ece82 169-171,359-362,396
+scripts/lib/install-linux-activation.sh
+  s_70c8e194852bb5::t_9dc18bf0c02747 849
+  s_70c8e194852bb5::t_c436b280c95ebf 874-880
+crates/codexswitch-cli/systemd/codexswitch.service
+  s_70c8e194852bb5::t_c436b280c95ebf 5
+crates/codexswitch-cli/src/remote_authority.rs
+  s_70c8e194852bb5::t_48b7ea02872c4a 37
+  s_70c8e194852bb5::t_35b8485d240ea8 538,592,1004
+  s_70c8e194852bb5::t_2025470c04ce43 1065-1066,1069-1073,1138,1369,1496
+  s_70c8e194852bb5::t_c18eff9ebaf67a 1067-1068
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_df3c35fb7ece82 124-128
+  s_70c8e194852bb5::t_73fcbf1854a08b 122-123,129
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_c436b280c95ebf 107-109,1323,1325
+  s_70c8e194852bb5::t_ca854d2d274815 407-460
+  s_70c8e194852bb5::t_247ae811c2bae2 103-106,110-116
+Tests/CodexSwitchTests/LinuxDevboxMonitorTests.swift
+  s_70c8e194852bb5::t_ba821ebe3c63a1 682-683,717-720,760-763,808-811,934,1076,1078,1080-1084,1091-1106
+  s_70c8e194852bb5::t_c18eff9ebaf67a 1085-1090
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0929bf069266028f8d3123f588d3cd78a0b47276",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
