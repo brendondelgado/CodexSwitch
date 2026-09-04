@@ -1484,7 +1484,7 @@ where
     }
     let observed = observe()?;
     require_same_managed_app_server_identities(expected, &observed)
-        .context("managed app-server ownership changed before readiness maintenance")?;
+        .context("managed app-server identity changed before readiness maintenance")?;
     let mut renewed_pids = observed
         .iter()
         .filter(|identity| !has_current_ack(identity, minimum_remaining))
@@ -1503,7 +1503,7 @@ where
     }
     let final_identities = observe()?;
     require_same_managed_app_server_identities(expected, &final_identities)
-        .context("managed app-server ownership changed after readiness renewal")?;
+        .context("managed app-server identity changed after readiness renewal")?;
     if final_identities
         .iter()
         .any(|identity| !has_current_ack(identity, minimum_remaining))
@@ -1544,7 +1544,7 @@ fn require_same_managed_app_server_identities(
     if expected.len() != observed.len()
         || expected.iter().any(|identity| !observed.contains(identity))
     {
-        bail!("managed app-server identity set changed");
+        bail!("managed app-server identity changed");
     }
     Ok(())
 }
