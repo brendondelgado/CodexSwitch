@@ -1,0 +1,30 @@
+crates/codexswitch-cli/systemd/codexswitch.service.d/10-maintenance-resources.conf
+  s_70c8e194852bb5::t_8d9e54f91b0429 3
+scripts/manifests/linux-systemd-contract.tsv
+  s_70c8e194852bb5::t_8d9e54f91b0429 30-31,34,36
+scripts/lib/install-linux-systemd-policy.sh
+  s_70c8e194852bb5::t_8d9e54f91b0429 597,715
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_8d9e54f91b0429 143,152-158,1831-1839,2898-2904,2910-2915
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_3a2e64918ffec1 74
+  s_70c8e194852bb5::t_8d9e54f91b0429 518-524,558-559
+crates/codexswitch-cli/systemd/codexswitch.service
+  s_70c8e194852bb5::t_8d9e54f91b0429 3-4,9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "da72d546336d0f27d23d6a277f12ed17a746e734",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
