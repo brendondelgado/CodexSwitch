@@ -1004,12 +1004,20 @@ fn command_line_is_exact_managed_app_server_daemon(
         .split(|byte| *byte == 0)
         .filter(|arg| !arg.is_empty())
         .collect::<Vec<_>>();
-    args == [
+    let legacy = [
         expected_argv0.as_os_str().as_bytes(),
         b"app-server",
         b"--listen",
         b"unix://",
-    ]
+    ];
+    let remote_control = [
+        expected_argv0.as_os_str().as_bytes(),
+        b"app-server",
+        b"--remote-control",
+        b"--listen",
+        b"unix://",
+    ];
+    args == legacy || args == remote_control
 }
 
 enum DaemonVersionClaim {

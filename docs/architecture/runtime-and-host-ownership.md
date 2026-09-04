@@ -1623,7 +1623,11 @@ actor boundary on every supported Swift 6 toolchain.
 - The port-8390 WebSocket service and the built-in SSH `unix://` app-server are
   separate account-bearing runtimes. Both participate in discovery and verified
   reload whenever they are running; `app-server proxy` helpers never do. The
-  positively classified port-8390
+  Unix-daemon identity gate accepts only the exact upstream managed forms:
+  legacy `app-server --listen unix://` and current
+  `app-server --remote-control --listen unix://`. Reordered, duplicated, or
+  additional arguments remain ownership drift and fail closed. The positively
+  classified port-8390
   `headless-remote-control-app-server` service may use its explicit broader
   headless idle proof. An idle SSH daemon may also acknowledge only after it
   reloads the exact requested account and complete token fingerprint, reports

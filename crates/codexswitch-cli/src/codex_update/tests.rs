@@ -484,21 +484,24 @@ mod tests {
         let proc_root = temp.path().join("proc");
         fs::create_dir_all(&proc_root)?;
 
-        for pid in [42_u32, 84_u32] {
+        for (pid, remote_control) in [(42_u32, false), (84_u32, true)] {
             let process = proc_root.join(pid.to_string());
             fs::create_dir_all(&process)?;
             fs::write(
                 process.join("stat"),
                 format!("{pid} (codex) {}\n", vec!["1"; 20].join(" ")),
             )?;
+            let mut arguments = vec![
+                current_route.as_os_str().as_bytes(),
+                b"app-server".as_slice(),
+            ];
+            if remote_control {
+                arguments.push(b"--remote-control".as_slice());
+            }
+            arguments.extend([b"--listen".as_slice(), b"unix://".as_slice()]);
             fs::write(
                 process.join("cmdline"),
-                [
-                    current_route.as_os_str().as_bytes(),
-                    b"app-server",
-                    b"--listen",
-                    b"unix://",
-                ]
+                arguments
                 .iter()
                 .flat_map(|argument| argument.iter().copied().chain(std::iter::once(0)))
                 .collect::<Vec<_>>(),
@@ -515,6 +518,31 @@ mod tests {
             vec![42, 84]
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_daemon_exact_argv_rejects_remote_control_drift() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let runtime = Path::new("/opt/codex");
+        let command_line = |arguments: &[&[u8]]| {
+            arguments
+                .iter()
+                .flat_map(|argument| argument.iter().copied().chain(std::iter::once(0)))
+                .collect::<Vec<_>>()
+        };
+        let argv0 = runtime.as_os_str().as_bytes();
+
+        for rejected in [
+            command_line(&[argv0, b"app-server", b"--listen", b"unix://", b"--remote-control"]),
+            command_line(&[argv0, b"app-server", b"--remote-control", b"--remote-control", b"--listen", b"unix://"]),
+            command_line(&[argv0, b"app-server", b"--remote-control", b"--listen", b"unix://", b"--extra"]),
+        ] {
+            assert!(!command_line_is_exact_managed_app_server_daemon(
+                &rejected, runtime
+            ));
+        }
     }
 
     #[cfg(unix)]
