@@ -228,7 +228,8 @@ fn fetch_status_with(
     config: &RemoteAuthorityConfig,
     runner: &RemoteRunner,
 ) -> Result<PoolAuthorityStatus> {
-    let bytes = runner(config, remote_status_command(), STATUS_TIMEOUT)
+    let command = remote_status_command();
+    let bytes = runner(config, &command, STATUS_TIMEOUT)
         .context("remote pool-authority status transport failed")?;
     parse_status(&bytes)
 }
@@ -1000,8 +1001,8 @@ fn sanitized_stderr(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn remote_status_command() -> &'static str {
-    r#"exec "$HOME/.local/share/codexswitch/current/codexswitch-cli" pool-authority-status --json"#
+fn remote_status_command() -> String {
+    format!("exec {REMOTE_CODEXSWITCH_CLI} pool-authority-status --json")
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1087,7 +1088,7 @@ mod tests {
     fn ssh_transport_preserves_configured_host_aliases_with_strict_overrides() -> Result<()> {
         let temp = secure_temp_dir()?;
         let config = load_config(&write_config(&temp, true)?)?;
-        let command = ssh_command(&config, remote_status_command());
+        let command = ssh_command(&config, &remote_status_command());
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())

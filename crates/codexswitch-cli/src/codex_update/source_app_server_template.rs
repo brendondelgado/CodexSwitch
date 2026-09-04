@@ -889,8 +889,8 @@ mod managed_desktop_bridge_template_tests {
             ["arguments[2]", " == \"features.code_mode_host=true\""].concat();
         let analytics_argument =
             ["arguments[4]", " == \"--analytics-default-enabled\""].concat();
-        let managed_idle_policy = [
-            "\"managed-desktop-bridge\" => {\n",
+        let strict_external_idle_policy = [
+            "\"external-app-server\" | \"managed-desktop-bridge\" => {\n",
             "                            initialized_frontend_count == 0\n",
             "                                && skipped_frontend_count == 0\n",
             "                                && eligible_frontend_count == 0\n",
@@ -898,12 +898,8 @@ mod managed_desktop_bridge_template_tests {
             "                        }",
         ]
         .concat();
-        let listener_idle_policy = [
-            "\"headless-remote-control-app-server\" | \"external-app-server\" => {\n",
-            "                            eligible_frontend_count == 0\n",
-            "                        }",
-        ]
-        .concat();
+        let headless_idle_policy =
+            "\"headless-remote-control-app-server\" => eligible_frontend_count == 0,";
 
         assert!(source.contains(&format!("\"{managed_wire_name}\"")));
         assert!(source.contains(&managed_match_arm));
@@ -912,7 +908,7 @@ mod managed_desktop_bridge_template_tests {
         assert!(source.contains(&macos_gate));
         assert!(source.contains(&code_mode_argument));
         assert!(source.contains(&analytics_argument));
-        assert!(source.contains(&managed_idle_policy));
-        assert!(source.contains(&listener_idle_policy));
+        assert!(source.contains(&strict_external_idle_policy));
+        assert!(source.contains(&headless_idle_policy));
     }
 }
