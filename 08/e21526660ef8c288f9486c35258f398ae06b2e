@@ -1,0 +1,29 @@
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_3d5c9b7eea2f3c 89,160-164,171-177
+  s_70c8e194852bb5::t_1c6003924f10eb 264-269,271,575-577
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_fadc3946f78a53 1792-1830,2525,2545-2546,2552,2577,2587,2602
+  s_70c8e194852bb5::t_c03c4c6836ec05 947,2509-2516,2609-2617,2620-2622,2624,2637-2684,2706-2710
+  s_70c8e194852bb5::t_703ad213d3c7c7 177-180,938-946,948-949,1002-1003,1596-1607
+  s_70c8e194852bb5::t_421cab35a5903b 2618-2619
+  s_70c8e194852bb5::t_91a0ac21d5beb8 2685-2705
+  s_70c8e194852bb5::t_4ab58836b01c96 2711
+scripts/lib/install-linux-release.sh
+  s_70c8e194852bb5::t_1c6003924f10eb 122-137,146,386,574,593-596,608,621
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "08e21526660ef8c288f9486c35258f398ae06b2e",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
