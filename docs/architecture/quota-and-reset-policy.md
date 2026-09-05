@@ -534,6 +534,11 @@ reconciliation in progress may use their distinct operational colors.
   age even after the sixty-second authorization window closes. It must be
   labeled `last known` or `unverified`, excluded from verified pooled capacity,
   and rendered without actionable expiration urgency.
+- Reset labels occupy their own full-width row and wrap without truncation;
+  `Refresh` and `Redeem` sit below, never competing with the count for width.
+  Accessibility exposes the complete count and freshness label as well as its
+  explanatory help. A saved count that exists only behind an ellipsis is not
+  considered visible inventory.
 - When any available credit in a stored snapshot expires, retain the snapshot's
   last-known count visibly, including known zero. Label it `Last known` with
   `snapshot expired; refresh required`; partial expiry must not become `No current

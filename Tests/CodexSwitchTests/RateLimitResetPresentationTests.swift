@@ -379,6 +379,22 @@ struct RateLimitResetPresentationTests {
         ) == "Reset hold until 4:30 PM")
     }
 
+    @Test("Reset accessibility keeps the saved count alongside freshness and help")
+    @MainActor
+    func accessibilityRetainsCountDuringRefreshAndStaleness() {
+        for presentation in [RateLimitResetInventoryPresentation.refreshing,
+                             .stale(lastKnownCount: 2), .expired(lastKnownCount: 2)] {
+            let text = AccountCardView.rateLimitResetText(
+                for: presentation, storedLastKnownCount: 2, lastCheckedText: "3m ago"
+            )
+            let label = AccountCardView.resetInventoryAccessibilityLabel(
+                text: text, help: "Unverified inventory"
+            )
+            #expect(label.contains("Last known: 2 banked resets"))
+            #expect(label.contains("Unverified inventory"))
+        }
+    }
+
     @Test("Partial expiry preserves the visible snapshot count without authorizing redemption")
     @MainActor
     func partiallyExpiredCardKeepsLastKnownCount() {

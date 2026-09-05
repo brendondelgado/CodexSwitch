@@ -251,6 +251,10 @@ struct AccountCardView: View {
         )
     }
 
+    static func resetInventoryAccessibilityLabel(text: String, help: String) -> String {
+        "\(text). \(help)"
+    }
+
     static func rateLimitResetText(
         for presentation: RateLimitResetInventoryPresentation,
         nextExpirationText: String? = nil,
@@ -496,50 +500,56 @@ struct AccountCardView: View {
                 let redemptionAction = resetRedemptionActionPresentation()
                 let redemptionIsConnected = onRequestResetRedemption != nil
                 let offersRefresh = rateLimitResetPresentation?.offersObservationRefresh == true
-                HStack(spacing: 4) {
-                    HStack(spacing: 4) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .top, spacing: 4) {
                         Image(systemName: rateLimitResetLine.systemImage)
                             .font(.system(size: 9))
                         Text(rateLimitResetLine.text)
                             .font(.system(size: 9, weight: .medium))
-                            .lineLimit(1)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .rateLimitResetUrgencyPulse(rateLimitResetLine.urgency)
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(rateLimitResetLine.help)
+                    .accessibilityLabel(Self.resetInventoryAccessibilityLabel(
+                        text: rateLimitResetLine.text,
+                        help: rateLimitResetLine.help
+                    ))
 
-                    Spacer(minLength: 2)
-
-                    if offersRefresh {
-                        Button {
-                            _ = handleResetInventoryRefresh()
-                        } label: {
-                            Label("Refresh", systemImage: "arrow.clockwise")
+                    HStack(spacing: 4) {
+                        if offersRefresh {
+                            Button {
+                                _ = handleResetInventoryRefresh()
+                            } label: {
+                                Label("Refresh", systemImage: "arrow.clockwise")
+                            }
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .disabled(!resetInventoryRefreshIsAvailable)
+                            .help("Refresh reset inventory for \(account.email)")
+                        } else if let availableCount = currentRateLimitResetCount,
+                                  availableCount > 0 {
+                            Button {
+                                _ = handleResetRedemptionRequest()
+                            } label: {
+                                Label("Redeem", systemImage: "arrow.counterclockwise")
+                            }
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .disabled(!redemptionAction.isEnabled || !redemptionIsConnected)
+                            .help(redemptionIsConnected
+                                ? redemptionAction.helpText
+                                : "Manual reset redemption is not connected")
+                            .accessibilityLabel("Redeem one banked reset for \(account.email)")
+                            .accessibilityHint(redemptionIsConnected
+                                ? redemptionAction.helpText
+                                : "Manual reset redemption is not connected")
                         }
-                        .font(.system(size: 8.5, weight: .semibold))
-                        .buttonStyle(.borderless)
-                        .controlSize(.mini)
-                        .disabled(!resetInventoryRefreshIsAvailable)
-                        .help("Refresh reset inventory for \(account.email)")
-                    } else if let availableCount = currentRateLimitResetCount,
-                              availableCount > 0 {
-                        Button {
-                            _ = handleResetRedemptionRequest()
-                        } label: {
-                            Label("Redeem", systemImage: "arrow.counterclockwise")
-                        }
-                        .font(.system(size: 8.5, weight: .semibold))
-                        .buttonStyle(.borderless)
-                        .controlSize(.mini)
-                        .disabled(!redemptionAction.isEnabled || !redemptionIsConnected)
-                        .help(redemptionIsConnected
-                            ? redemptionAction.helpText
-                            : "Manual reset redemption is not connected")
-                        .accessibilityLabel("Redeem one banked reset for \(account.email)")
-                        .accessibilityHint(redemptionIsConnected
-                            ? redemptionAction.helpText
-                            : "Manual reset redemption is not connected")
                     }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                 }
                 .foregroundStyle(rateLimitResetLine.color)
                 .help(rateLimitResetLine.help)
