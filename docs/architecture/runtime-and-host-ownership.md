@@ -712,6 +712,16 @@ confirmation resets that backoff. Initial discovery runs on a utility task;
 the final discovery runs on the activation coordinator's actor, never the UI
 actor. This renews binding evidence from existing ACKs, not the ACK itself.
 
+Remote account authority has a separate lightweight heartbeat every 15 seconds,
+half of its unchanged 30-second authorization lifetime. It requests only
+`pool-authority-status --json`, retains the existing single-flight gate, and
+does not run the runtime doctor or scan session logs. The 60-second account
+monitor and ten-minute full readiness budget remain independent. A transport
+failure still lets authority expire and blocks redemption; the UI must not
+alternate between current and unknown solely because its normal polling period
+exceeds the authority lifetime. Mutation-time epoch and freshness checks remain
+unchanged.
+
 The Mac menu coordinator separately maintains capability proof for verified
 local interactive CLI runtimes. That maintenance never targets ChatGPT or a
 desktop app-server. It uses the same five-minute ACK lifetime as Rust, schedules

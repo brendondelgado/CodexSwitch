@@ -376,6 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return UUID(uuidString: stored)
     }()
     private var linuxDevboxMonitorTimer: Timer?
+    private var poolAuthorityMonitorTimer: Timer?
     private var tokenUsageMetricsTimer: Timer?
     private var tokenUsageRefreshSequence = 0
     private var tokenUsageRefreshInFlight = false
@@ -9864,6 +9865,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         configMaintenanceTask = nil
         linuxDevboxMonitorTimer?.invalidate()
         linuxDevboxMonitorTimer = nil
+        poolAuthorityMonitorTimer?.invalidate()
+        poolAuthorityMonitorTimer = nil
         tokenUsageMetricsTimer?.invalidate()
         tokenUsageMetricsTimer = nil
 
@@ -9978,10 +9981,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func startLinuxDevboxMonitor() {
+        poolAuthorityMonitorTimer?.invalidate()
+        poolAuthorityMonitorTimer = Timer.scheduledTimer(withTimeInterval: LinuxDevboxMonitor.poolAuthorityPollInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.checkPoolAuthorityStatus()
+            }
+        }
         linuxDevboxMonitorTimer?.invalidate()
         linuxDevboxMonitorTimer = Timer.scheduledTimer(withTimeInterval: LinuxDevboxMonitor.activeRemoteAccountStatePollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.checkPoolAuthorityStatus()
                 self?.checkLinuxDevboxReadiness()
             }
         }

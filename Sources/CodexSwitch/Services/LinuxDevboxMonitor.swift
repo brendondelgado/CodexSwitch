@@ -988,6 +988,8 @@ enum LinuxDevboxMonitor {
     static let remoteCompletionMarkerPrefix = "__CODEXSWITCH_REMOTE_COMMAND_COMPLETED_"
     static let remoteCleanupFailureMarker = "__CODEXSWITCH_REMOTE_CLEANUP_FAILED__"
     static let activeRemoteAccountStatePollInterval: TimeInterval = 60
+    static let poolAuthorityPollInterval: TimeInterval =
+        PoolAuthorityObservation.maximumFreshnessAge / 2
     static let normalReadinessPollInterval: TimeInterval = 10 * 60
     static let readinessEvidenceFreshnessInterval: TimeInterval =
         normalReadinessPollInterval + 2 * 60

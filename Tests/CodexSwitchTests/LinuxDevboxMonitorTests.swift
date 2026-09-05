@@ -147,6 +147,38 @@ struct LinuxDevboxMonitorTests {
         ))
     }
 
+    @Test("authority heartbeat stays inside its lease without accelerating the doctor")
+    func authorityHeartbeatIsIndependentOfReadinessBudget() {
+        let interval = LinuxDevboxMonitor.poolAuthorityPollInterval
+        #expect(interval == 15)
+        #expect(interval * 2 == PoolAuthorityObservation.maximumFreshnessAge)
+        #expect(LinuxDevboxMonitor.activeRemoteAccountStatePollInterval == 60)
+        #expect(LinuxDevboxMonitor.normalReadinessPollInterval == 600)
+
+        let start = Date(timeIntervalSince1970: 2_000)
+        for hasActiveSession in [false, true] {
+            var lastFullCheck = start
+            var fullCheckOffsets: [Int] = []
+            for elapsed in stride(from: 15, through: 1_200, by: 15) {
+                let now = start.addingTimeInterval(TimeInterval(elapsed))
+                if LinuxDevboxMonitor.shouldRunReadinessCheck(
+                    now: now,
+                    lastFullCheckAt: lastFullCheck,
+                    hasActiveRemoteSession: hasActiveSession,
+                    force: false
+                ) {
+                    lastFullCheck = now
+                    fullCheckOffsets.append(elapsed)
+                }
+            }
+            #expect(fullCheckOffsets == [600, 1_200])
+        }
+        let command = LinuxDevboxMonitor.remotePoolAuthorityStatusCommand()
+        #expect(command.contains("pool-authority-status --json"))
+        #expect(!command.contains("doctor"))
+        #expect(!command.contains("auth-diagnostics"))
+    }
+
     @Test("readiness probe uses one CLI process")
     func readinessProbeUsesOneCLIProcess() {
         let command = LinuxDevboxMonitor.remoteReadinessCommand()
