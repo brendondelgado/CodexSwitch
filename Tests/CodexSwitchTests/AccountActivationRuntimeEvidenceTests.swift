@@ -35,7 +35,8 @@ struct AccountActivationRuntimeEvidenceTests {
             nil,
             AccountActivationState.preparing(targetAccountId: accountId, at: now),
             AccountActivationState.committedDegraded(
-                targetAccountId: accountId, detail: .runtimeAcknowledgementIncomplete, at: now
+                targetAccountId: accountId, detail: .runtimeAcknowledgementIncomplete,
+                activationGeneration: UUID(), retryAttempt: 0, nextRetryAt: now, at: now
             ),
             AccountActivationState.manualReview(
                 targetAccountId: accountId, detail: .externalAuthConflict, at: now
@@ -57,9 +58,10 @@ struct AccountActivationRuntimeEvidenceTests {
         var schedule = AccountActivationConfirmationRefreshSchedule()
         var oldAttempt: AccountActivationConfirmationRefresh?
         for delay in [30.0, 60, 60, 60] {
-            let attempt = try #require(schedule.begin(
+            let pendingAttempt = schedule.begin(
                 state: state, configuredAccountId: accountId, at: now
-            ))
+            )
+            let attempt = try #require(pendingAttempt)
             #expect(schedule.begin(
                 state: state, configuredAccountId: accountId, at: now.addingTimeInterval(600)
             ) == nil)
@@ -137,7 +139,8 @@ struct AccountActivationRuntimeEvidenceTests {
             ),
             AccountActivationState.committedDegraded(
                 targetAccountId: accountId, detail: .activeCredentialMutation,
-                activationGeneration: state.activationGeneration, at: now
+                activationGeneration: state.activationGeneration,
+                retryAttempt: 0, nextRetryAt: now, at: now
             ),
         ] {
             #expect(!refresh.authorizesPersistence(
