@@ -174,8 +174,10 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         self.assertIn('ACTIVATE="${CODEXSWITCH_ACTIVATE:-0}"', text)
         self.assertIn("worktree add --detach", text)
         self.assertIn("merge-base --is-ancestor", text)
-        self.assertIn('SOURCE_DATE_EPOCH="$BUILD_EPOCH"', text)
-        self.assertIn('CODEXSWITCH_BUILD_GIT_SHA="$TARGET_SHA"', text)
+        publication = text.split("publish_release() {", 1)[1].split("\natomic_symlink()", 1)[0]
+        self.assertNotIn("run_repository_cargo_build", publication)
+        self.assertNotIn("cargo build", publication)
+        self.assertIn('install -m 0555 "$source_cli" "$STAGE_DIR/codexswitch-cli"', publication)
         self.assertIn("cargo build --locked --release --jobs 1", text)
         self.assertIn("BUILD_TIMEOUT_SECONDS=600", text)
         self.assertIn("start_new_session=True", text)
@@ -933,6 +935,18 @@ class LinuxInstallerFixtureTests(unittest.TestCase):
               printf '%s\n' '{{"packages":[{{"name":"codexswitch-cli","version":"{PACKAGE_VERSION}"}}]}}'
               exit 0
             fi
+            if [ "${{FAKE_ALLOW_CARGO_BUILD_HELPER:-0}}" != 1 ]; then
+              printf '%s\n' 'fixture forbids Cargo compilation during installation' >&2
+              exit 99
+            fi
+            exec "$(dirname "$0")/fixture-cli" "$@"
+            """,
+        )
+        write_executable(
+            self.fake_bin / "fixture-cli",
+            f"""
+            #!/bin/sh
+            set -eu
             if [ "${{FAKE_CARGO_HANG:-0}}" = 1 ]; then
               mkdir -p "$CARGO_TARGET_DIR"
               if [ "${{FAKE_CARGO_ESCAPE_PROCESS_GROUP:-0}}" = 1 ]; then
@@ -985,8 +999,8 @@ PY
             else
               version="codexswitch-cli $CODEXSWITCH_BUILD_PACKAGE_VERSION (git $CODEXSWITCH_BUILD_GIT_SHA, built $SOURCE_DATE_EPOCH)"
             fi
-            mkdir -p "$CARGO_TARGET_DIR/release"
-            binary="$CARGO_TARGET_DIR/release/codexswitch-cli"
+            binary="${{FAKE_CLI_OUTPUT:-$CARGO_TARGET_DIR/release/codexswitch-cli}}"
+            mkdir -p "$(dirname "$binary")"
             {{
               printf '#!/bin/sh\n'
               printf "version='%s'\n" "$version"
@@ -1579,16 +1593,18 @@ PY
             f"codexswitch-cli {PACKAGE_VERSION} "
             f"(git {source_sha}, built {build_epoch})"
         )
-        write_executable(
-            runtime_dir / "codexswitch-cli",
-            f"""
-            #!/bin/sh
-            if [ "${{1:-}}" = --version ]; then
-              printf '%s\n' '{build_version}'
-              exit 0
-            fi
-            exit 0
-            """,
+        subprocess.run(
+            [str(self.fake_bin / "fixture-cli")],
+            env={
+                **self._environment(source_sha),
+                "CODEXSWITCH_BUILD_GIT_SHA": source_sha,
+                "CODEXSWITCH_BUILD_PACKAGE_VERSION": PACKAGE_VERSION,
+                "SOURCE_DATE_EPOCH": build_epoch,
+                "CARGO_TARGET_DIR": str(self.build_root / "cargo-target" / "shared"),
+                "CARGO_BUILD_JOBS": "1",
+                "FAKE_CLI_OUTPUT": str(runtime_dir / "codexswitch-cli"),
+            },
+            check=True,
         )
         files = []
         for name in ("codex", "codex-code-mode-host", "codexswitch-cli"):
@@ -1772,6 +1788,45 @@ PY
                 return
             time.sleep(0.01)
         self.fail(f"fixture process {pid} survived SIGKILL")
+
+    def _run_build_helper(self, extra_env, check=False):
+        # Exercise the retained legacy helper without routing publication through it.
+        target = self.build_root / "cargo-target" / "shared"
+        target.mkdir(parents=True)
+        env = {
+            **self._environment(),
+            **extra_env,
+            "FAKE_ALLOW_CARGO_BUILD_HELPER": "1",
+            "INSTALLER_LIB": str(INSTALLER_LIB),
+            "BUILD_ROOT": str(self.build_root),
+            "INSTALL_ROOT": str(self.install_root),
+            "SOURCE_DIR": str(self.fixture_repo),
+            "BIN_DIR": str(self.bin_dir),
+            "SERVICE_DIR": str(self.service_dir),
+            "CODEX_RUNTIME_DIR": str(self.runtime_dir),
+            "RUNTIME_STORAGE_ROOT": str(self.home / ".codex"),
+            "RELEASES_DIR": str(self.install_root / "releases"),
+            "WORK_DIR": str(self.fixture_repo),
+            "TARGET_SHA": self.first_sha,
+            "BUILD_TIMEOUT_SECONDS": "1",
+            "BUILD_MEMORY_HIGH": "4G",
+            "BUILD_MEMORY_MAX": "6G",
+            "BUILD_SWAP_MAX": "2G",
+            "BUILD_NICE": "10",
+            "CODEXSWITCH_BUILD_GIT_SHA": self.first_sha,
+            "CODEXSWITCH_BUILD_PACKAGE_VERSION": PACKAGE_VERSION,
+            "SOURCE_DATE_EPOCH": self._git("show", "-s", "--format=%ct", self.first_sha, cwd=self.fixture_repo),
+            "CARGO_TARGET_DIR": str(target),
+            "CARGO_BUILD_JOBS": "1",
+        }
+        return subprocess.run(
+            ["bash", "-euc", '''
+source "$INSTALLER_LIB/install-linux-common.sh"
+source "$INSTALLER_LIB/install-linux-release.sh"
+run_repository_cargo_build
+'''],
+            env=env, text=True, capture_output=True, check=check,
+        )
 
     def _release(self, sha):
         return self.install_root / "releases" / f"{PACKAGE_VERSION}-{sha}"
@@ -2451,25 +2506,14 @@ PY
         systemctl_lines = [
             line for line in log.splitlines() if line.startswith("systemctl\t")
         ]
-        self.assertGreater(len(systemctl_lines), 0)
-        for line in systemctl_lines:
-            self.assertRegex(
-                line,
-                r"^systemctl\t--user show codexswitch-build-[^ ]+\.scope "
-                r"--property=ActiveState --value$",
-            )
-        self.assertIn(f"sha={self.first_sha}", log)
-        self.assertIn(f"package={PACKAGE_VERSION}", log)
-        self.assertIn(f"epoch={epoch}", log)
-        self.assertIn(
-            f"target={self.build_root.resolve()}/cargo-target/shared",
-            log,
+        self.assertEqual(systemctl_lines, [])
+        self.assertIn("cargo\tmetadata ", log)
+        self.assertNotIn("cargo\tbuild", log)
+        self.assertNotIn("systemd-run\t", log)
+        self.assertEqual(
+            (release / "codexswitch-cli").read_bytes(),
+            (self.runtime_dir / "codexswitch-cli").read_bytes(),
         )
-        self.assertIn("jobs=1", log)
-        self.assertIn("systemd-run\t--user --scope --quiet", log)
-        self.assertIn("MemoryHigh=4G", log)
-        self.assertIn("MemoryMax=6G", log)
-        self.assertIn("MemorySwapMax=2G", log)
         self.assertFalse((self.build_root / "cargo-target" / "shared").exists())
         self.assertEqual(list((self.build_root / "worktrees").glob("*")), [])
         self.assertEqual(list((self.build_root / "stage").glob("*")), [])
@@ -2478,7 +2522,7 @@ PY
         trace = self.root / "cargo-descendant.trace"
         pid_file = self.root / "cargo-descendant.pid"
         started = time.monotonic()
-        result = self._stage(
+        result = self._run_build_helper(
             extra_env={
                 "CODEXSWITCH_TEST_MODE": "1",
                 "CODEXSWITCH_TEST_BUILD_TIMEOUT_SECONDS": "1",
@@ -2498,15 +2542,14 @@ PY
         trace_size = trace.stat().st_size
         time.sleep(0.2)
         self.assertEqual(trace.stat().st_size, trace_size)
-        self.assertFalse((self.build_root / "cargo-target" / "shared").exists())
-        self.assertEqual(list((self.build_root / "worktrees").glob("*")), [])
-        self.assertNotIn("not proven reaped", result.stderr)
+        self.assertEqual(list(self.build_root.glob(".codexswitch-build-*.reaped")), [])
+        self.assertNotIn("without descendant reap proof", result.stderr)
 
     def test_failed_scope_query_blocks_reap_proof_for_escaped_descendant(self):
         trace = self.root / "escaped-cargo-descendant.trace"
         pid_file = self.root / "escaped-cargo-descendant.pid"
         started = time.monotonic()
-        result = self._stage(
+        result = self._run_build_helper(
             extra_env={
                 "CODEXSWITCH_TEST_MODE": "1",
                 "CODEXSWITCH_TEST_BUILD_TIMEOUT_SECONDS": "1",
@@ -2531,7 +2574,7 @@ PY
                 "(last scope state: unknown)",
                 result.stderr,
             )
-            self.assertIn("build descendants were not proven reaped", result.stderr)
+            self.assertIn("without descendant reap proof", result.stderr)
             self.assertEqual(
                 list(self.build_root.glob(".codexswitch-build-*.reaped")), []
             )
@@ -2541,7 +2584,7 @@ PY
                 self._terminate_fixture_process(descendant_pid)
 
     def test_malformed_scope_state_blocks_reap_proof(self):
-        result = self._stage(
+        result = self._run_build_helper(
             extra_env={
                 "CODEXSWITCH_TEST_MODE": "1",
                 "CODEXSWITCH_TEST_BUILD_TIMEOUT_SECONDS": "1",
@@ -2556,16 +2599,29 @@ PY
             "(last scope state: unknown)",
             result.stderr,
         )
-        self.assertIn("build descendants were not proven reaped", result.stderr)
+        self.assertIn("without descendant reap proof", result.stderr)
         self.assertEqual(
             list(self.build_root.glob(".codexswitch-build-*.reaped")), []
         )
         self.assertTrue((self.build_root / "cargo-target" / "shared").is_dir())
 
     def test_cli_version_mismatch_and_missing_runtime_marker_reject_publication(self):
-        result = self._stage(extra_env={"FAKE_BAD_CLI_VERSION": "1"}, check=False)
+        cli = self.runtime_dir / "codexswitch-cli"
+        cli.chmod(0o700)
+        cli.write_text(cli.read_text().replace("version='codexswitch-cli", "version='wrong-cli"))
+        manifest_path = self.runtime_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        cli_entry = next(item for item in manifest["files"] if item["name"] == cli.name)
+        cli_entry.update(bytes=cli.stat().st_size, sha256=hashlib.sha256(cli.read_bytes()).hexdigest())
+        manifest_path.chmod(0o600)
+        manifest_path.write_text(json.dumps(manifest))
+        manifest_path.chmod(0o400)
+        cli.chmod(0o500)
+        result = self._stage(
+            extra_env={"CODEXSWITCH_LINUX_ARTIFACT_DIR": str(self.runtime_dir)}, check=False
+        )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("built CLI --version did not match", result.stderr)
+        self.assertIn("artifact control-plane version does not match its manifest", result.stderr)
         self.assertFalse(self._release(self.first_sha).exists())
 
         bad_runtime = self.root / "bad-runtime"
@@ -2577,6 +2633,81 @@ PY
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing goal markers", result.stderr)
         self.assertFalse(self._release(self.first_sha).exists())
+
+    def test_tampered_artifact_cli_rejects_publication_without_build(self):
+        cli = self.runtime_dir / "codexswitch-cli"
+        cli.chmod(0o700)
+        cli.write_bytes(cli.read_bytes() + b"# tampered artifact\n")
+        result = self._stage(
+            extra_env={"CODEXSWITCH_LINUX_ARTIFACT_DIR": str(self.runtime_dir)}, check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Linux artifact verification failed", result.stderr)
+        self.assertFalse(self._release(self.first_sha).exists())
+        self.assertNotIn("cargo\tbuild", self.tool_log.read_text())
+
+    def test_staged_cli_hash_must_match_verified_artifact(self):
+        real_install = shutil.which("install")
+        self.assertIsNotNone(real_install)
+        write_executable(
+            self.fake_bin / "install",
+            f"""
+            #!/bin/sh
+            set -eu
+            '{real_install}' "$@"
+            for destination do :; done
+            case "$destination" in
+              */stage/*/codexswitch-cli)
+                chmod u+w "$destination"
+                printf '\\n# tampered staged CLI\\n' >> "$destination"
+                ;;
+            esac
+            """,
+        )
+        result = self._stage(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("staged CLI SHA-256 does not match the verified artifact", result.stderr)
+        self.assertFalse(self._release(self.first_sha).exists())
+        self.assertNotIn("cargo\tbuild", self.tool_log.read_text())
+
+    def test_candidate_cli_requires_exact_artifact_not_self_consistent_hash(self):
+        self._stage()
+        release = self._release(self.first_sha)
+        cli = release / "codexswitch-cli"
+        cli.chmod(0o700)
+        cli.write_bytes(cli.read_bytes() + b"# different same-version CLI\n")
+        manifest_path = release / "release-manifest.tsv"
+        manifest = self._manifest(release)
+        manifest_path.chmod(0o600)
+        manifest_path.write_text(manifest_path.read_text().replace(
+            manifest["cli_sha256"], hashlib.sha256(cli.read_bytes()).hexdigest()
+        ))
+        env = self._environment()
+        for name in ("INSTALL_ROOT", "SCAN_MAX_ENTRIES", "SCAN_MAX_DEPTH",
+                     "SCAN_MAX_BYTES", "STATE_FILE_MAX_BYTES", "RELEASE_MAX_BYTES"):
+            env[name] = env[f"CODEXSWITCH_{name}"]
+        env.update(
+            INSTALLER_LIB=str(INSTALLER_LIB),
+            RELEASES_DIR=str(self.install_root / "releases"),
+            HISTORICAL_TARGET=f"releases/{release.name}",
+            ARTIFACT_CLI_SHA256=manifest["cli_sha256"],
+        )
+        # Historical rollback targets retain their own hash contract, not the artifact's.
+        historical = subprocess.run(
+            ["bash", "-euc", '''
+source "$INSTALLER_LIB/install-linux-common.sh"
+source "$INSTALLER_LIB/install-linux-release.sh"
+source "$INSTALLER_LIB/install-linux-activation-journal.sh"
+validate_journal_target "$HISTORICAL_TARGET" previous
+'''],
+            env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(historical.returncode, 0, historical.stderr)
+        result = self._stage(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("candidate release CLI SHA-256 does not match the verified artifact", result.stderr)
+        self.assertFalse((self.install_root / "current").exists())
+        self.assertNotIn("cargo\tbuild", self.tool_log.read_text())
 
     def test_incompatible_release_reuse_is_rejected(self):
         self._stage()

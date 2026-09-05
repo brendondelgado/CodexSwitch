@@ -86,7 +86,7 @@ authorize access to, mutation of, or restart on the live SIGNUL VPS. Run
 fixtures locally; stage and activate a real release only in separately approved
 operator windows.
 
-Staging and activation are separate transactions. Staging may fetch, build,
+Staging and activation are separate transactions. Staging may fetch,
 publish, and validate one immutable release. It must not change `current`,
 `previous`, the public CLI, user systemd state, imported account data, boot
 policy, or running processes. Activation has one quiescent commit point for
@@ -157,17 +157,24 @@ export CODEXSWITCH_GIT_SHA=<full-git-sha>
 export CODEXSWITCH_APPROVED_ORIGIN_REF=refs/remotes/origin/main
 ```
 
-The build runs from a clean detached Git worktree, not a `.git`-less archive.
-The installer obtains the package version from Cargo metadata and uses the
-commit timestamp as `SOURCE_DATE_EPOCH`. The resulting CLI must report exactly:
+The installer verifies source in a clean detached Git worktree, not a
+`.git`-less archive. It obtains the package version from Cargo metadata and
+checks the commit timestamp against the artifact build epoch. Publication
+copies `codexswitch-cli` from the exact verified Linux artifact; it never runs
+Cargo compilation and has no fallback build. The artifact CLI must report exactly:
 
 ```text
 codexswitch-cli <package-version> (git <full-40-character-sha>, built <commit-epoch>)
 ```
 
 Any `unknown`, `dirty`, version, SHA, or epoch mismatch rejects publication.
-Cargo uses one job, positive niceness, idle IO scheduling, and a
-`CARGO_TARGET_DIR` below the canonical build root.
+The CLI digest is bound to the verified artifact manifest and rechecked before
+copying and after staging. Candidate release reuse must match that exact
+artifact CLI digest, not merely a self-consistent release manifest or version.
+Reviewed source and systemd provenance, immutable publication, leases, and
+rollback checks remain required. A newly reviewed installer may consume an
+already-built artifact at its exact approved `CODEXSWITCH_GIT_SHA`; an
+installer-only fix does not require a new runtime binary.
 
 The remote Linux runtime artifact workflow keeps control-plane provenance
 separate from patched-upstream cache identity. The verified CodexSwitch commit
@@ -254,11 +261,14 @@ including `patched-codex/`, `systemd/`, and both drop-in directories. A derived
 path must remain under its declared root and may not be a symlink or resolve
 through a symlink into a live path.
 
-Build execution runs in a transient user systemd scope with explicit
+Publication performs no compilation or build-scope launch. Before staging, the
+installer checks available bytes and current build-root use; it rechecks
+build-root and staged-release maximums before publication.
+
+The retained legacy build helper (not called by publication) runs in a transient
+user systemd scope with explicit
 `MemoryHigh`, `MemoryMax`, and `MemorySwapMax`, in addition to one Cargo job,
-niceness, and idle IO. Before building, the installer checks available bytes
-and current build-root use. It rechecks build-root and staged-release maximums
-before publication. The repository Cargo build has a hard 60-minute deadline
+niceness, and idle IO. The repository Cargo build has a hard 60-minute deadline
 and runs in both a named user scope and a dedicated process group under a
 subreaping owner. Timeout or an unexpectedly surviving writer kills the whole
 scope and process group, reaps descendants, and records local reap proof before
@@ -562,9 +572,9 @@ scripts/install-linux.sh
 ```
 
 The second command publishes and validates only. Confirm that `current`,
-`previous`, the public CLI target, and systemd files did not change. Do not
-raise build concurrency on a live remote-session host; move the build to an
-idle window or compatible builder.
+`previous`, the public CLI target, and systemd files did not change. Cargo is
+used only for source package metadata; artifact preparation and compilation
+belong on the compatible builder, not the deployment host.
 
 ## Systemd Ownership
 

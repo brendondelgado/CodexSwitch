@@ -119,6 +119,22 @@ for key in (
   ARTIFACT_MANIFEST_SHA256="${values[6]}"
   ARTIFACT_TOTAL_BYTES="${values[7]}"
 
+  # Bind the CLI identity to the manifest bytes accepted by the verifier.
+  ARTIFACT_CLI_SHA256="$(python3 - "$LINUX_ARTIFACT_DIR/manifest.json" "$ARTIFACT_MANIFEST_SHA256" <<'PY'
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    raw = handle.read(65537)
+if hashlib.sha256(raw).hexdigest() != sys.argv[2]:
+    raise SystemExit("Linux artifact manifest changed after verification")
+manifest = json.loads(raw)
+print(next(item["sha256"] for item in manifest["files"] if item["name"] == "codexswitch-cli"))
+PY
+)" || fail "Linux artifact CLI identity could not be loaded"
+  [[ "$ARTIFACT_CLI_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "Linux artifact CLI SHA-256 is invalid"
+
   if [[ -n "$REQUESTED_CODEX_VERSION" ]]; then
     [[ "$REQUESTED_CODEX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "CODEXSWITCH_CODEX_VERSION must be a stable three-component version when supplied as an expectation"
     [[ "$REQUESTED_CODEX_VERSION" == "$CODEX_VERSION" ]] || fail "CODEXSWITCH_CODEX_VERSION does not match the verified artifact manifest"
@@ -127,6 +143,7 @@ for key in (
     [[ "$REQUESTED_CODEX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "CODEXSWITCH_CODEX_SOURCE_SHA must be a full lowercase 40-character Git SHA when supplied as an expectation"
     [[ "$REQUESTED_CODEX_SOURCE_SHA" == "$CODEX_SOURCE_SHA" ]] || fail "CODEXSWITCH_CODEX_SOURCE_SHA does not match the verified artifact manifest"
   fi
+  [[ "$(sha256_file "$LINUX_ARTIFACT_DIR/codexswitch-cli")" == "$ARTIFACT_CLI_SHA256" ]] || fail "artifact CLI SHA-256 does not match the verified artifact"
   [[ "$("$LINUX_ARTIFACT_DIR/codexswitch-cli" --version)" == "$ARTIFACT_BUILD_VERSION" ]] || fail "artifact control-plane version does not match its manifest"
 }
 
@@ -366,6 +383,7 @@ validate_candidate_release() {
   [[ "$(manifest_value "$manifest" package_version)" == "$PACKAGE_VERSION" ]] || fail "candidate release package version mismatch"
   [[ "$(manifest_value "$manifest" build_epoch)" == "$BUILD_EPOCH" ]] || fail "candidate release build epoch mismatch"
   [[ "$(manifest_value "$manifest" cli_version)" == "$EXPECTED_CLI_VERSION" ]] || fail "candidate release CLI version mismatch"
+  [[ "$(manifest_value "$manifest" cli_sha256)" == "$ARTIFACT_CLI_SHA256" ]] || fail "candidate release CLI SHA-256 does not match the verified artifact"
   [[ "$(manifest_value "$manifest" codex_version)" == "$CODEX_VERSION" ]] || fail "candidate release Codex version does not match the verified artifact"
   [[ "$(manifest_value "$manifest" codex_source_sha)" == "$CODEX_SOURCE_SHA" ]] || fail "candidate release Codex source SHA does not match the verified artifact"
   [[ "$(manifest_value "$manifest" upstream_codex_git_sha)" == "$CODEX_SOURCE_SHA" ]] || fail "candidate release upstream peeled SHA does not match the verified artifact"
@@ -553,8 +571,7 @@ PY
 }
 
 publish_release() {
-  local cargo_target="$CARGO_TARGET_DIR_PATH"
-  local built_cli="$cargo_target/release/codexswitch-cli"
+  local source_cli="$LINUX_ARTIFACT_DIR/codexswitch-cli"
   local source_codex="$CODEX_RUNTIME_DIR/codex"
   local source_helper="$CODEX_RUNTIME_DIR/codex-code-mode-host"
   local runtime_target=""
@@ -573,19 +590,11 @@ publish_release() {
   [[ -n "$CODEX_SOURCE_SHA" ]] || fail "CODEXSWITCH_CODEX_SOURCE_SHA is required for a new release"
   validate_runtime_files "$CODEX_RUNTIME_DIR" "$CODEX_VERSION"
 
-  validate_build_derived_path CARGO_TARGET_DIR "$cargo_target"
-  mkdir -p "$cargo_target" "$RELEASES_DIR" "$BUILD_STAGE_ROOT"
-  SOURCE_DATE_EPOCH="$BUILD_EPOCH" \
-  CODEXSWITCH_BUILD_GIT_SHA="$TARGET_SHA" \
-  CODEXSWITCH_BUILD_PACKAGE_VERSION="$PACKAGE_VERSION" \
-  CARGO_TARGET_DIR="$cargo_target" \
-  CARGO_BUILD_JOBS=1 \
-    run_repository_cargo_build
-
+  [[ -f "$source_cli" && ! -L "$source_cli" && -x "$source_cli" ]] || fail "artifact CLI must be a regular executable: $source_cli"
+  [[ "$(sha256_file "$source_cli")" == "$ARTIFACT_CLI_SHA256" ]] || fail "artifact CLI SHA-256 changed before staging"
+  [[ "$("$source_cli" --version)" == "$EXPECTED_CLI_VERSION" ]] || fail "artifact CLI --version does not match the exact CodexSwitch source"
+  mkdir -p "$RELEASES_DIR" "$BUILD_STAGE_ROOT"
   enforce_build_size_bound
-
-  [[ -f "$built_cli" && -x "$built_cli" ]] || fail "Cargo did not produce $built_cli"
-  [[ "$("$built_cli" --version)" == "$EXPECTED_CLI_VERSION" ]] || fail "built CLI --version did not match injected SHA/version/build epoch: expected '$EXPECTED_CLI_VERSION'"
 
   STAGE_DIR="$BUILD_STAGE_ROOT/$RELEASE_ID-$$"
   validate_build_derived_path STAGE_DIR "$STAGE_DIR"
@@ -596,7 +605,7 @@ publish_release() {
     "$runtime_target" \
     "$systemd_target/codexswitch.service.d" \
     "$systemd_target/signul-codex-app-server.service.d"
-  install -m 0555 "$built_cli" "$STAGE_DIR/codexswitch-cli"
+  install -m 0555 "$source_cli" "$STAGE_DIR/codexswitch-cli"
   install -m 0555 "$source_codex" "$runtime_target/codex"
   install -m 0555 "$source_helper" "$runtime_target/codex-code-mode-host"
   install -m 0444 "$WORK_DIR/crates/codexswitch-cli/systemd/codexswitch.service" "$systemd_target/codexswitch.service"
@@ -609,6 +618,7 @@ publish_release() {
   [[ "$(sha256_file "$source_helper")" == "$(sha256_file "$runtime_target/codex-code-mode-host")" ]] || fail "codex-code-mode-host changed while staging"
 
   cli_sha="$(sha256_file "$STAGE_DIR/codexswitch-cli")"
+  [[ "$cli_sha" == "$ARTIFACT_CLI_SHA256" ]] || fail "staged CLI SHA-256 does not match the verified artifact"
   codex_sha="$(sha256_file "$runtime_target/codex")"
   helper_sha="$(sha256_file "$runtime_target/codex-code-mode-host")"
   validate_systemd_payload "$systemd_target"
