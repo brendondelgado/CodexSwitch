@@ -8,6 +8,7 @@ toc:
   - System Topology
   - Core State
   - Active Account Read Model
+  - Mac Account Display Order
   - Shared Account-Store Protocol
   - Control Flow
   - Component Map
@@ -16,6 +17,7 @@ toc:
 cross_dependencies:
   - ../../Sources/CodexSwitch/App/AppDelegate.swift
   - ../../Sources/CodexSwitch/Models/AccountManager.swift
+  - ../../Sources/CodexSwitch/Models/CodexAccount.swift
   - ../../Sources/CodexSwitch/Models/QuotaSnapshot.swift
   - ../../Sources/CodexSwitch/Services/KeychainStore.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
@@ -23,6 +25,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/PoolAuthority.swift
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
   - ../../Tests/CodexSwitchTests/KeychainStoreTests.swift
+  - ../../Tests/CodexSwitchTests/AccountManagerTests.swift
   - ../../Tests/CodexSwitchTests/SharedPolicyFixtureTests.swift
   - ../../Tests/Fixtures/Policy
   - ../../crates/codexswitch-cli/src/daemon.rs
@@ -37,7 +40,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-07-29
+  last_updated: 2026-09-04
 ---
 
 # CodexSwitch System Overview
@@ -160,9 +163,10 @@ runtime-current evidence, or plan ranking to choose an identity.
 - A provider identity resolves to an account only when exactly one account
   record matches it. Missing or duplicate matches fail closed and produce no
   logical active account.
-- Account ordering may place the resolved authority target first, but ordering
-  cannot create a target. Likewise, local activation and runtime evidence are
-  convergence details for that target, not alternative active-account sources.
+- Account ordering may place the resolved authority target first within its
+  plan tier, but ordering cannot create a target. Likewise, local activation
+  and runtime evidence are convergence details for that target, not alternative
+  active-account sources.
 
 This distinction lets local credentials and runtimes remain operational during
 an authority outage without presenting their incidental state as pool truth.
@@ -176,6 +180,27 @@ compares non-secret account, credential-set, active-provider, and active-token
 fingerprints before creating an encrypted bundle. Matching evidence performs no
 remote mutation; mismatched evidence enters the normal journaled encrypted
 credential-sync transaction.
+
+### Mac Account Display Order
+
+Mac account presentation sorts by `CodexAccount.planPriority` descending before
+any health or authority preference: Pro, Pro Lite, Plus/other paid, then
+Free/unknown. Plan aliases and unknown plans with an active subscription follow
+that existing model. An expired subscription or token, exhausted quota, missing
+quota, or reauthentication requirement cannot move an account below a lower
+plan tier. Even a healthy Free account that is the resolved authority target
+remains below Pro and other paid accounts.
+
+Within each tier, retain the existing order: resolved authority target first,
+immediately usable accounts next, descending `SwapEngine.score`, then the
+earliest most-urgent quota reset. Exact ties retain input order. Local
+`isActive` flags do not independently promote an account.
+
+This is a read-only display contract in `AccountManager.sortedAccounts`.
+Automatic rotation eligibility, candidate scoring, and candidate ordering stay
+under the existing quota policy and `SwapEngine`; display position neither
+selects nor activates an account. Regression coverage uses synthetic accounts
+and explicit read models without reading or changing live account state.
 
 ### Reset Attempt
 

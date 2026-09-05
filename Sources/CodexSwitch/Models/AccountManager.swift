@@ -381,6 +381,8 @@ final class AccountManager {
         now: Date
     ) -> [CodexAccount] {
         return accounts.sorted { a, b in
+            // Display tiers stay fixed even when a higher plan is unavailable.
+            if a.planPriority != b.planPriority { return a.planPriority > b.planPriority }
             let aIsPoolTarget = isPoolTarget(a, using: readModel)
             let bIsPoolTarget = isPoolTarget(b, using: readModel)
             if aIsPoolTarget != bIsPoolTarget { return aIsPoolTarget }

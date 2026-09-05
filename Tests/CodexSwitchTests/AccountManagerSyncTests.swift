@@ -1079,8 +1079,8 @@ struct AccountManagerSyncTests {
             planType: "pro",
             isActive: true
         )
-        let usablePlus = CodexAccount(
-            email: "usable-plus@test.com",
+        let usablePro = CodexAccount(
+            email: "usable-pro@test.com",
             accessToken: testInferenceToken(expiresAt: now.addingTimeInterval(3_600)),
             refreshToken: "r2",
             idToken: "i2",
@@ -1090,15 +1090,15 @@ struct AccountManagerSyncTests {
                 weeklyRemaining: 80,
                 fetchedAt: now
             ),
-            planType: "plus"
+            planType: "pro"
         )
 
         manager.addAccount(exhaustedPro)
-        manager.addAccount(usablePlus)
+        manager.addAccount(usablePro)
         manager.setConfiguredAccount(exhaustedPro.id)
 
         let sorted = manager.sortedAccounts(using: .unavailable, now: now)
-        #expect(sorted.first?.id == usablePlus.id)
+        #expect(sorted.first?.id == usablePro.id)
         #expect(sorted.dropFirst().first?.id == exhaustedPro.id)
     }
 

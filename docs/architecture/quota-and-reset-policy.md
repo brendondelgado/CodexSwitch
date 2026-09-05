@@ -588,6 +588,16 @@ reconciliation in progress may use their distinct operational colors.
   still requires explicit confirmation before one credit is submitted.
 - A missing redemption handler is an unavailable action, not an enabled menu
   item that silently does nothing.
+- Mac-only upgrades keep remote redemption disabled until a fresh account
+  mirror proves that the VPS supports request-correlated reset journals. A
+  missing or unsupported protocol version displays an explicit VPS-update reason
+  before confirmation or submission. It does not create an uncertain attempt,
+  discard inventory, fall back to a local redemption, or restart the VPS.
+  A later compatible, unblocked observation re-enables the normal eligibility
+  checks without restarting the Mac app. Duplicate identities, stale mirrors,
+  and observed unresolved journals remain blocked. Protocol support is distinct
+  from per-account attempt history: an account with no recorded attempts may
+  reach the VPS command's existing journal initialization and preflight checks.
 - Show reset attempt states such as pending reconciliation rather than guessing success.
 - Show stale or unknown observations as stale or unknown, never as zero or full.
 - When the provider reports global exhaustion and still supplies quota windows,

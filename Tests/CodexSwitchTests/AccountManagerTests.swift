@@ -10,9 +10,10 @@ struct AccountManagerTests {
         fiveHourRemaining: Double,
         weeklyRemaining: Double,
         planType: String,
-        isActive: Bool = false
+        isActive: Bool = false,
+        fiveHourResetIn: TimeInterval = 3_600,
+        now: Date = Date()
     ) -> CodexAccount {
-        let now = Date()
         return CodexAccount(
             id: id,
             email: "test-\(id.uuidString.prefix(4))@test.com",
@@ -24,7 +25,7 @@ struct AccountManagerTests {
                 fiveHour: QuotaWindow(
                     usedPercent: 100 - fiveHourRemaining,
                     windowDurationMins: 300,
-                    resetsAt: now.addingTimeInterval(3_600)
+                    resetsAt: now.addingTimeInterval(fiveHourResetIn)
                 ),
                 weekly: QuotaWindow(
                     usedPercent: 100 - weeklyRemaining,
@@ -76,7 +77,124 @@ struct AccountManagerTests {
         #expect(manager.sortedAccounts.first?.id == plus.id)
     }
 
-    @Test("Sorted accounts treat weekly-only as usable and windowless as unavailable")
+    @Test("Sorted accounts keep expired Pro above healthy Free", arguments: ["pro", "pro_lite"])
+    func sortedAccountsKeepExpiredProAboveHealthyFree(planType: String) {
+        let manager = AccountManager()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var pro = makeAccount(fiveHourRemaining: 100, weeklyRemaining: 100, planType: planType, now: now)
+        pro.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(-60))
+        pro.subscriptionExpiresAt = now.addingTimeInterval(-3_600)
+        pro.hasActiveSubscription = false
+        let free = makeAccount(fiveHourRemaining: 100, weeklyRemaining: 100, planType: "free", now: now)
+        manager.accounts = [free, pro]
+
+        #expect(!SwapEngine.isImmediatelyUsable(pro, now: now))
+        #expect(SwapEngine.isImmediatelyUsable(free, now: now))
+        #expect(manager.sortedAccounts(using: .unavailable, now: now).map(\.id) == [pro.id, free.id])
+        #expect(SwapEngine.rankedEligibleCandidates(from: manager.accounts, now: now).isEmpty)
+    }
+
+    @Test("Sorted accounts keep exhausted Pro above an active Free pool target")
+    func sortedAccountsKeepExhaustedProAboveActiveFree() throws {
+        let manager = AccountManager()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let pro = makeAccount(fiveHourRemaining: 0, weeklyRemaining: 80, planType: "pro", now: now)
+        let plus = makeAccount(fiveHourRemaining: 80, weeklyRemaining: 80, planType: "plus", now: now)
+        let free = makeAccount(
+            fiveHourRemaining: 100, weeklyRemaining: 100, planType: "free", isActive: true, now: now
+        )
+        let readModel = ActiveAccountReadModel(providerAccountId: try #require(free.normalizedProviderAccountId), epoch: 1, freshness: .current)
+        manager.accounts = [free, plus, pro]
+
+        #expect(!SwapEngine.isImmediatelyUsable(pro, now: now))
+        #expect(SwapEngine.isImmediatelyUsable(free, now: now))
+        #expect(manager.sortedAccounts(using: readModel, now: now).map(\.id) == [pro.id, plus.id, free.id])
+        #expect(manager.logicalActiveAccount(using: readModel)?.id == free.id)
+        #expect(SwapEngine.rankedEligibleCandidates(from: manager.accounts, now: now).map(\.id) == [plus.id])
+        #expect(manager.accounts.map(\.id) == [free.id, plus.id, pro.id])
+    }
+
+    @Test("Sorted accounts keep Pro requiring reauthentication above usable paid and Free accounts")
+    func sortedAccountsKeepReauthenticationProFirst() {
+        let manager = AccountManager()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var pro = makeAccount(fiveHourRemaining: 100, weeklyRemaining: 100, planType: "pro", now: now)
+        pro.runtimeUnusableReason = "reauth_required"
+        pro.runtimeUnusableUntil = now.addingTimeInterval(3_600)
+        let plus = makeAccount(fiveHourRemaining: 80, weeklyRemaining: 80, planType: "plus", now: now)
+        let free = makeAccount(fiveHourRemaining: 100, weeklyRemaining: 100, planType: "free", now: now)
+        manager.accounts = [free, plus, pro]
+
+        #expect(pro.requiresReauthentication(at: now))
+        #expect(manager.sortedAccounts(using: .unavailable, now: now).map(\.id) == [pro.id, plus.id, free.id])
+        #expect(SwapEngine.rankedEligibleCandidates(from: manager.accounts, now: now).map(\.id) == [plus.id])
+    }
+
+    @Test("Sorted accounts use the existing plan model for aliases, paid fallback, and unknown plans")
+    func sortedAccountsFollowPlanModel() {
+        let manager = AccountManager()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let planGroups = [
+            [" pro ", "chatgpt_pro"],
+            ["pro_lite", "pro-lite", "prolite"],
+            ["plus", "team", "business", "enterprise", "edu", "custom_paid"],
+            ["free", "free_workspace", "guest", "unknown"],
+        ]
+        let groups = planGroups.map { plans in
+            plans.map { plan in
+                var account = makeAccount(
+                    fiveHourRemaining: 0, weeklyRemaining: 0, planType: plan, now: now
+                )
+                account.quotaSnapshot = nil
+                account.hasActiveSubscription = plan == "custom_paid" || plan == "free"
+                return account
+            }
+        }
+        manager.accounts = groups.reversed().flatMap { $0 }
+
+        #expect(manager.sortedAccounts(using: .unavailable, now: now).map(\.id) == groups.flatMap { $0 }.map(\.id))
+    }
+
+    @Test("Sorted accounts preserve target, usability, score, and reset ordering within a tier")
+    func sortedAccountsPreserveWithinTierOrdering() throws {
+        let manager = AccountManager()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let target = makeAccount(fiveHourRemaining: 0, weeklyRemaining: 80, planType: "pro", now: now)
+        let higherScore = makeAccount(fiveHourRemaining: 90, weeklyRemaining: 80, planType: "pro", now: now)
+        let earlierReset = makeAccount(
+            fiveHourRemaining: 60, weeklyRemaining: 80, planType: "pro", fiveHourResetIn: 1_800, now: now
+        )
+        let laterReset = makeAccount(
+            fiveHourRemaining: 60, weeklyRemaining: 80, planType: "pro", fiveHourResetIn: 7_200, now: now
+        )
+        var unavailable = makeAccount(
+            fiveHourRemaining: 100, weeklyRemaining: 100, planType: "pro", isActive: true, now: now
+        )
+        unavailable.quotaSnapshot = nil
+        let readModel = ActiveAccountReadModel(providerAccountId: try #require(target.normalizedProviderAccountId), epoch: 1, freshness: .current)
+        manager.accounts = [unavailable, laterReset, earlierReset, higherScore, target]
+
+        #expect(manager.sortedAccounts(using: readModel, now: now).map(\.id) == [
+            target.id, higherScore.id, earlierReset.id, laterReset.id, unavailable.id,
+        ])
+    }
+
+    @Test("Sorted accounts retain input order for exact within-tier ties")
+    func sortedAccountsPreserveWithinTierTieStability() {
+        let manager = AccountManager()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var first = makeAccount(fiveHourRemaining: 0, weeklyRemaining: 0, planType: "plus", now: now)
+        var second = makeAccount(fiveHourRemaining: 0, weeklyRemaining: 0, planType: "plus", now: now)
+        first.quotaSnapshot = nil
+        second.quotaSnapshot = nil
+
+        for accounts in [[first, second], [second, first]] {
+            manager.accounts = accounts
+            #expect(manager.sortedAccounts(using: .unavailable, now: now).map(\.id) == accounts.map(\.id))
+        }
+    }
+
+    @Test("Sorted accounts prefer usable weekly-only quota over windowless quota within a tier")
     func sortedAccountsSupportWeeklyOnlyQuota() {
         let manager = AccountManager()
         let now = Date()
@@ -114,7 +232,7 @@ struct AccountManagerTests {
                 fetchedAt: now,
                 windows: []
             ),
-            planType: "pro"
+            planType: "plus"
         )
 
         manager.accounts = [windowless, weeklyOnly]

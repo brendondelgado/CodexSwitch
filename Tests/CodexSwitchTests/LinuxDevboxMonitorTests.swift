@@ -1209,6 +1209,104 @@ struct LinuxDevboxMonitorTests {
         #expect(!failure.disposition.allowsAutomaticRetry)
     }
 
+    @Test("Remote mirror reports reset protocol support even without account attempt history")
+    func remoteMirrorSeparatesResetProtocolFromAttemptHistory() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("codexswitch-reset-protocol-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storeDirectory = root.appendingPathComponent(".codexswitch", isDirectory: true)
+        let cliDirectory = root.appendingPathComponent(".local/share/codexswitch/current", isDirectory: true)
+        try FileManager.default.createDirectory(at: storeDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cliDirectory, withIntermediateDirectories: true)
+        try Data("""
+        [{"email":"fixture@example.com","accountId":"provider-id"}]
+        """.utf8).write(to: storeDirectory.appendingPathComponent("accounts.json"))
+        let cli = cliDirectory.appendingPathComponent("codexswitch-cli")
+        var environment = ProcessInfo.processInfo.environment
+        environment["HOME"] = root.path
+
+        for (response, expectedVersion) in [
+            ("{\"schemaVersion\":1,\"journalState\":\"observed\",\"accounts\":[]}", 1),
+            ("{\"schemaVersion\":1,\"journalState\":\"unavailable\",\"accounts\":[]}", 1),
+            ("{\"schemaVersion\":2,\"journalState\":\"observed\",\"accounts\":[]}", 0),
+            ("legacy unsupported command", 0),
+        ] {
+            try "#!/bin/sh\nprintf '%s\\n' '\(response)'\n".write(to: cli, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cli.path)
+            let result = ProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", LinuxDevboxMonitor.remoteAccountStateCommand()],
+                timeout: 5, environment: environment
+            )
+            #expect(result.terminationStatus == 0)
+            let report = try #require(JSONSerialization.jsonObject(with: result.stdout) as? [String: Any])
+            let state = try #require((report["accounts"] as? [[String: Any]])?.first)
+            #expect((state["resetProtocolVersion"] as? Int ?? 0) == expectedVersion)
+            #expect(state["resetAttemptStatus"] is NSNull)
+        }
+    }
+
+    @Test("Mac-only upgrades block unsupported VPS reset protocols and recover on a compatible mirror")
+    func manualResetCompatibilityRequiresFreshJournalEvidence() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        func status(
+            version: Int = 1,
+            accountId: String = "provider-id",
+            journal: String = "observed",
+            blocked: Bool = false
+        ) -> LinuxDevboxResetAttemptStatus {
+            .init(schemaVersion: version, accountId: accountId,
+                  journalState: journal, redemptionBlocked: blocked, attempts: [])
+        }
+        func state(
+            _ status: LinuxDevboxResetAttemptStatus?,
+            protocolVersion: Int? = nil
+        ) -> LinuxDevboxAccountState {
+            .init(email: "fixture@example.com", providerAccountId: " PROVIDER-ID ",
+                  isActive: true, quotaSnapshot: nil, planType: "pro",
+                  lastRefreshed: nil, subscriptionRenewsAt: nil,
+                  subscriptionExpiresAt: nil, subscriptionWillRenew: nil,
+                  hasActiveSubscription: nil, resetAttemptStatus: status,
+                  resetProtocolVersion: protocolVersion ?? status?.schemaVersion)
+        }
+        func authorize(
+            _ states: [LinuxDevboxAccountState],
+            observedAt: Date? = nil,
+            useDefaultObservation: Bool = true,
+            providerAccountId: String = "provider-id"
+        ) -> RateLimitResetCoordinatorAuthorization {
+            LinuxDevboxMonitor.manualResetCompatibilityAuthorization(
+                states: states, observedAt: useDefaultObservation ? now : observedAt,
+                providerAccountId: providerAccountId, now: now
+            )
+        }
+
+        let upgradeRequired = RateLimitResetCoordinatorAuthorization.blocked(
+            "VPS update required to redeem resets from this Mac"
+        )
+        #expect(authorize([state(nil)]) == upgradeRequired)
+        #expect(authorize([state(status(version: 2))]) == upgradeRequired)
+        #expect(authorize([state(status())]).isAuthorized)
+        #expect(authorize([state(nil, protocolVersion: 1)]).isAuthorized)
+        #expect(authorize([state(status())], providerAccountId: " PROVIDER-ID ").isAuthorized)
+        #expect(!authorize([]).isAuthorized)
+        #expect(!authorize([state(status()), state(status())]).isAuthorized)
+        #expect(!authorize([state(status())], providerAccountId: "").isAuthorized)
+        #expect(!authorize([state(status())], useDefaultObservation: false).isAuthorized)
+        #expect(!authorize([state(status())], observedAt: now.addingTimeInterval(1),
+                          useDefaultObservation: false).isAuthorized)
+        #expect(!authorize([state(status())], observedAt: now.addingTimeInterval(
+            -LinuxDevboxMonitor.readinessEvidenceFreshnessInterval - 1
+        ), useDefaultObservation: false).isAuthorized)
+        for invalid in [status(accountId: "other-id"), status(journal: "manualReview"),
+                        status(journal: "unavailable"), status(blocked: true)] {
+            #expect(!authorize([state(invalid)]).isAuthorized)
+        }
+        // A new observation, not an app restart or an uncertain request, unblocks it.
+        #expect(authorize([state(nil)]) == upgradeRequired)
+        #expect(authorize([state(status())]).isAuthorized)
+    }
+
     @Test("reset attempt proof requires an exact durable identity and unblocked journal")
     func resetAttemptProofRequiresExactDurableIdentity() throws {
         let requestID = UUID()

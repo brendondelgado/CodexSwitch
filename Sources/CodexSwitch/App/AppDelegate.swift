@@ -4247,6 +4247,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else {
             return .blocked("This account is no longer available")
         }
+        if remoteOwned {
+            let compatibility = LinuxDevboxMonitor.manualResetCompatibilityAuthorization(
+                states: accountManager.linuxDevboxAccountStates,
+                observedAt: accountManager.linuxDevboxAccountStatesObservedAt,
+                providerAccountId: account.accountId,
+                now: now
+            )
+            guard compatibility.isAuthorized else { return compatibility }
+        }
         let configuredAccount = accountManager.configuredAccount
         let activationState = accountManager.activationState
         let remoteCoordinatorReady = accountManager.poolAuthorityObservation.map {

@@ -296,6 +296,7 @@ struct LinuxDevboxAccountState: Codable, Equatable, Sendable {
     let hasActiveSubscription: Bool?
     var rateLimitResetBank: RateLimitResetBank? = nil
     var resetAttemptStatus: LinuxDevboxResetAttemptStatus? = nil
+    var resetProtocolVersion: Int? = nil
     var runtimeUnusableUntil: Date? = nil
     var runtimeUnusableReason: String? = nil
 
@@ -312,6 +313,7 @@ struct LinuxDevboxAccountState: Codable, Equatable, Sendable {
         hasActiveSubscription: Bool?,
         rateLimitResetBank: RateLimitResetBank? = nil,
         resetAttemptStatus: LinuxDevboxResetAttemptStatus? = nil,
+        resetProtocolVersion: Int? = nil,
         runtimeUnusableUntil: Date? = nil,
         runtimeUnusableReason: String? = nil
     ) {
@@ -327,6 +329,7 @@ struct LinuxDevboxAccountState: Codable, Equatable, Sendable {
         self.hasActiveSubscription = hasActiveSubscription
         self.rateLimitResetBank = rateLimitResetBank
         self.resetAttemptStatus = resetAttemptStatus
+        self.resetProtocolVersion = resetProtocolVersion
         self.runtimeUnusableUntil = runtimeUnusableUntil
         self.runtimeUnusableReason = runtimeUnusableReason
     }
@@ -2011,6 +2014,36 @@ enum LinuxDevboxMonitor {
         return .success(resolution(observation))
     }
 
+    static func manualResetCompatibilityAuthorization(
+        states: [LinuxDevboxAccountState],
+        observedAt: Date?,
+        providerAccountId: String,
+        now: Date = Date()
+    ) -> RateLimitResetCoordinatorAuthorization {
+        guard let providerAccountId = normalizedRemoteProviderAccountId(providerAccountId),
+              LinuxDevboxStatus.accountMirrorIsFresh(
+                  observedAt: observedAt,
+                  now: now,
+                  maximumAge: readinessEvidenceFreshnessInterval
+              ) else {
+            return .blocked("Refresh VPS reset status before redeeming")
+        }
+        let matches = states.filter {
+            $0.providerAccountId.flatMap(normalizedRemoteProviderAccountId) == providerAccountId
+        }
+        guard matches.count == 1, let state = matches.first else {
+            return .blocked("VPS reset account identity is unavailable; refresh and try again")
+        }
+        guard state.resetProtocolVersion == 1 else {
+            return .blocked("VPS update required to redeem resets from this Mac")
+        }
+        if let status = state.resetAttemptStatus,
+           !status.provesNoUnresolvedAttempts(providerAccountId: providerAccountId) {
+            return .blocked("VPS reset journal requires reconciliation before redemption")
+        }
+        return .authorized
+    }
+
     static func redeemReset(
         settings: LinuxDevboxMonitorSettings,
         providerAccountId: String,
@@ -3328,22 +3361,22 @@ enum LinuxDevboxMonitor {
                     timeout=2, check=True,
                 )
                 if len(result.stdout) > 128 * 1024:
-                    return {}
+                    return None, {}
                 report = json.loads(result.stdout)
-                if report.get("schemaVersion") != 1 or report.get("journalState") not in ("observed", "manualReview"):
-                    return {}
+                if report.get("schemaVersion") != 1 or report.get("journalState") not in ("observed", "manualReview", "unavailable"):
+                    return None, {}
                 statuses = report.get("accounts", [])
                 if not isinstance(statuses, list) or len(statuses) > 192:
-                    return {}
+                    return None, {}
                 mapped = {}
                 for status in statuses:
                     account_id = stable_id(status.get("accountId"))
                     if account_id is None or account_id.lower() in mapped:
-                        return {}
+                        return None, {}
                     mapped[account_id.lower()] = status
-                return mapped
+                return 1, mapped
             except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
-                return {}
+                return None, {}
 
         def account_value(account, *names):
             for name in names:
@@ -3438,6 +3471,7 @@ enum LinuxDevboxMonitor {
                 "hasActiveSubscription": account_value(account, "hasActiveSubscription", "has_active_subscription"),
                 "rateLimitResetBank": account_value(account, "rateLimitResetBank", "rate_limit_reset_bank"),
                 "resetAttemptStatus": reset_statuses.get(provider_id.lower()) if provider_id else None,
+                "resetProtocolVersion": reset_protocol_version,
                 "runtimeUnusableUntil": account_value(account, "runtimeUnusableUntil", "runtime_unusable_until"),
                 "runtimeUnusableReason": account_value(account, "runtimeUnusableReason", "runtime_unusable_reason"),
             }
@@ -3450,7 +3484,7 @@ enum LinuxDevboxMonitor {
         accounts = raw.get("accounts", []) if isinstance(raw, dict) else raw
         accounts = [account for account in accounts if isinstance(account, dict)]
         fingerprint = credential_set_fingerprint(accounts)
-        reset_statuses = reset_attempt_statuses()
+        reset_protocol_version, reset_statuses = reset_attempt_statuses()
         visible_accounts = [
             public_value(sanitized(account))
             for account in accounts
