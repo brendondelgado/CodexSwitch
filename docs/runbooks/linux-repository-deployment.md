@@ -6,6 +6,7 @@ toc:
   - Scope
   - Release Contract
   - Build Provenance
+  - Attested Upstream Runtime Reuse
   - Path And Storage Bounds
   - Runtime Artifact
   - Runtime Convergence Contract
@@ -72,7 +73,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-09-04
+  last_updated: 2026-09-05
 ---
 
 # Linux Repository Deployment
@@ -195,6 +196,53 @@ Restore is exact-only, and a missed target cache is saved only after source and
 binary validation, manifest verification, attestation, artifact upload, and
 build-evidence recording all succeed. Cache restore or save transport failure
 is non-fatal and never relaxes artifact validation.
+
+## Attested Upstream Runtime Reuse
+
+The Linux build workflow defaults to the full upstream build. For an unchanged
+patched upstream runtime, an operator may supply `base_runtime_run_id`, the exact
+positive decimal ID of a previous successful GitHub run. This is an explicit
+artifact selection, not a latest-run search or a compiled-target cache hit.
+For example, `33913698437` is a candidate only while its artifact remains
+available and all checks below pass; a short SHA such as `b14cca5` is not an
+accepted identity input.
+
+The workflow resolves that run only in `brendondelgado/CodexSwitch`, requires a
+completed successful `workflow_dispatch` from `main` using
+`.github/workflows/build-linux-runtime.yml`, and requires its exact source commit
+to be an ancestor of (or equal to) the new exact main dispatch commit. The source
+must already have passed the repository's main-branch review process; ancestry
+is not a substitute for review. The artifact name is derived from the verified
+source SHA, upstream version, run ID, and successful run attempt. Missing,
+expired, failed, foreign, or ambiguous input fails the job with no silent
+fallback to compilation.
+
+Every dispatch still checks out the exact upstream release tag and applies the
+new CodexSwitch commit's source patches. The prior manifest must match the
+fresh binary diff SHA-256, peeled upstream tag commit, upstream version, Linux
+artifact format, `x86_64-unknown-linux-gnu` target, and `x86_64` architecture.
+The existing Linux artifact verifier checks the exact four-file inventory,
+bounded regular non-symlink files, complete manifest schema, byte lengths, and
+SHA-256 identities. Each downloaded member, including the prior manifest, must
+pass GitHub attestation verification pinned to the same repository, Linux
+workflow, `refs/heads/main`, and prior exact source/signer commit, with
+self-hosted runners denied. Nothing downloaded is executed before those gates.
+
+Only the attested `codex` binary is reused. The workflow always compiles a new
+exact-SHA `codexswitch-cli`, fetches and digest-verifies the exact official
+code-mode host, revalidates both source trees, and checks the current ELF,
+version, command, and runtime marker contracts. Reuse skips upstream Cargo
+compilation and its compiled-target cache restore/save. It does not copy a
+prior controller or helper, mix local live binaries, patch binary bytes, or
+build anything on the VPS.
+
+A new full four-file artifact (`codex`, `codex-code-mode-host`,
+`codexswitch-cli`, `manifest.json`) is generated, verified, and attested at the
+new dispatch SHA and epoch. The build summary records the selected base run,
+source commit, and artifact name without changing the canonical manifest
+schema. No deployment or activation is implied. Replay the focused offline
+workflow and reuse fixtures with `python3 scripts/test_build_linux_runtime.py`;
+these do not compile runtimes or contact GitHub or the VPS.
 
 ## Path And Storage Bounds
 

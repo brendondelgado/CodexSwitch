@@ -39,24 +39,43 @@ fn managed_unix_app_server_identity_at(
     codex_home: &Path,
 ) -> Result<Option<ManagedAppServerIdentity>> {
     let record_path = codex_home.join("app-server-daemon/app-server.pid");
-    let record = read_managed_daemon_pid_record(&record_path)?;
-    let exact_pids = scan_linux_exact_managed_unix_daemon_pids(current_route, current_runtime)?;
+    managed_unix_app_server_identity_with(
+        &record_path,
+        || scan_linux_exact_managed_unix_daemon_pids(current_route, current_runtime),
+        |record| {
+            bind_managed_daemon_pid_record(
+                HostPlatform::Linux,
+                record,
+                current_route,
+                current_runtime,
+            )
+        },
+        |pid| bind_exact_managed_unix_daemon(pid, current_route, current_runtime, codex_home),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn managed_unix_app_server_identity_with<Scan, Recorded, Unrecorded>(
+    record_path: &Path,
+    scan: Scan,
+    bind_record: Recorded,
+    bind_unrecorded: Unrecorded,
+) -> Result<Option<ManagedAppServerIdentity>>
+where
+    Scan: Fn() -> Result<Vec<u32>>,
+    Recorded: FnOnce(&ManagedDaemonPidRecord) -> Result<Option<ManagedAppServerIdentity>>,
+    Unrecorded: Fn(u32) -> Result<ManagedAppServerIdentity>,
+{
+    let record = read_managed_daemon_pid_record(record_path)?;
+    let exact_pids = scan()?;
     let Some(record) = record else {
-        if exact_pids.is_empty() {
-            return Ok(None);
+        let identity =
+            bind_unrecorded_managed_unix_daemon_with(&exact_pids, scan, bind_unrecorded)?;
+        if read_managed_daemon_pid_record(record_path)?.is_some() {
+            bail!("managed Unix app-server PID record appeared during discovery");
         }
-        bail!(
-            "exact current-release Unix app-server process(es) {:?} have no managed daemon PID record",
-            exact_pids
-        );
+        return Ok(identity);
     };
-    let identity = bind_managed_daemon_pid_record(
-        HostPlatform::Linux,
-        &record,
-        current_route,
-        current_runtime,
-    )?
-    .context("managed Unix app-server PID record does not name a live exact owner")?;
     let record_pid = i32::try_from(record.pid).context("managed daemon PID exceeds i32")?;
     if exact_pids.as_slice() != [record.pid] {
         bail!(
@@ -64,7 +83,113 @@ fn managed_unix_app_server_identity_at(
             exact_pids
         );
     }
+    let identity = bind_record(&record)?
+        .context("managed Unix app-server PID record does not name a live exact owner")?;
     Ok(Some(identity))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn bind_unrecorded_managed_unix_daemon_with<Scan, Bind>(
+    exact_pids: &[u32],
+    scan: Scan,
+    bind: Bind,
+) -> Result<Option<ManagedAppServerIdentity>>
+where
+    Scan: FnOnce() -> Result<Vec<u32>>,
+    Bind: Fn(u32) -> Result<ManagedAppServerIdentity>,
+{
+    let pid = match exact_pids {
+        [] => return Ok(None),
+        [pid] => *pid,
+        _ => {
+            bail!("managed Unix app-server ownership is ambiguous: exact processes {exact_pids:?}")
+        }
+    };
+    let identity = bind(pid)?;
+    if scan()?.as_slice() != [pid] || bind(pid)? != identity {
+        bail!("managed Unix app-server identity changed during unrecorded discovery");
+    }
+    Ok(Some(identity))
+}
+
+#[cfg(target_os = "linux")]
+fn bind_exact_managed_unix_daemon(
+    pid: u32,
+    current_route: &Path,
+    current_runtime: &Path,
+    codex_home: &Path,
+) -> Result<ManagedAppServerIdentity> {
+    let executable = fs::canonicalize(current_runtime)?;
+    let metadata = fs::metadata(&executable)?;
+    let identity = bind_managed_unix_app_server_identity(
+        i32::try_from(pid).context("managed daemon PID exceeds i32")?,
+        unsafe { libc::geteuid() },
+        executable.clone(),
+    )?;
+    validate_managed_unix_daemon_codex_home_at(Path::new("/proc"), pid, codex_home)?;
+    if identity.kernel_executable_identity.device != metadata.dev()
+        || identity.kernel_executable_identity.inode != metadata.ino()
+        || linux_process_matches_exact_managed_daemon_with_metadata(
+            Path::new("/proc"),
+            pid,
+            current_route,
+            &executable,
+            &metadata,
+        )? != ExactManagedProcessObservation::Active
+        || !crate::reload::process_identity_is_current(&identity.process)
+    {
+        bail!("managed Unix app-server pid {pid} lost its exact kernel identity");
+    }
+    Ok(identity)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_managed_unix_daemon_codex_home_at(
+    proc_root: &Path,
+    pid: u32,
+    expected_home: &Path,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let environment = read_linux_proc_file_bounded(
+        &proc_root.join(pid.to_string()).join("environ"),
+        MANAGED_DAEMON_CMDLINE_MAX_BYTES,
+    )?
+    .context("managed Unix daemon environment is unavailable")?;
+    let value = |prefix: &[u8]| -> Result<Option<&[u8]>> {
+        let mut values = environment
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| entry.strip_prefix(prefix));
+        let first = values.next();
+        if values.next().is_some() {
+            bail!("managed Unix daemon environment has duplicate home keys");
+        }
+        Ok(first)
+    };
+    let codex_home = value(b"CODEX_HOME=")?;
+    let home = value(b"HOME=")?;
+    let observed_home = match codex_home {
+        Some(path) => PathBuf::from(std::ffi::OsStr::from_bytes(path)),
+        None => {
+            let home = home.context("managed Unix daemon environment has no home identity")?;
+            let home = Path::new(std::ffi::OsStr::from_bytes(home));
+            if !home.is_absolute() {
+                bail!("managed Unix daemon HOME is not absolute");
+            }
+            home.join(".codex")
+        }
+    };
+    if !observed_home.is_absolute() || !expected_home.is_absolute() {
+        bail!("managed Unix daemon CODEX_HOME is not absolute");
+    }
+    let observed_home = fs::canonicalize(observed_home)
+        .context("managed Unix daemon home could not be resolved")?;
+    let expected_home =
+        fs::canonicalize(expected_home).context("coordinator Codex home could not be resolved")?;
+    if observed_home != expected_home || !fs::metadata(&observed_home)?.is_dir() {
+        bail!("managed Unix daemon belongs to a different Codex home");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -809,13 +934,37 @@ fn scan_linux_exact_managed_unix_daemon_pids_at(
         else {
             continue;
         };
-        if !command_line_is_exact_managed_app_server_daemon(&command_line, expected_argv0) {
+        let Some(matched_argv0) =
+            exact_managed_daemon_argv0(&command_line, expected_argv0, &expected_canonical)
+        else {
+            if command_line_is_separate_managed_app_server(&command_line, expected_argv0)
+                || command_line_is_separate_managed_app_server(&command_line, &expected_canonical)
+            {
+                continue;
+            }
+            // A current-runtime listener with unknown argv is a blocker, not absence.
+            let args = managed_process_arguments(&command_line);
+            if arguments_have_app_server_subcommand(&args) {
+                let process_executable =
+                    fs::metadata(entry.path().join("exe")).with_context(|| {
+                        format!("failed to inspect app-server pid {pid} executable")
+                    })?;
+                use std::os::unix::ffi::OsStrExt;
+                let claims_route = args.first().copied()
+                    == Some(expected_argv0.as_os_str().as_bytes())
+                    || args.first().copied() == Some(expected_canonical.as_os_str().as_bytes());
+                let uses_current_inode = process_executable.dev() == expected_metadata.dev()
+                    && process_executable.ino() == expected_metadata.ino();
+                if claims_route || uses_current_inode {
+                    bail!("current managed app-server pid {pid} has unsupported argv; Unix ownership is unknown");
+                }
+            }
             continue;
-        }
+        };
         match linux_process_matches_exact_managed_daemon_with_metadata(
             proc_root,
             pid,
-            expected_argv0,
+            matched_argv0,
             &expected_canonical,
             &expected_metadata,
         )? {
@@ -871,6 +1020,18 @@ fn linux_process_matches_exact_managed_daemon_with_metadata(
     expected_metadata: &fs::Metadata,
 ) -> Result<ExactManagedProcessObservation> {
     let proc_dir = proc_root.join(pid.to_string());
+    let owner = match fs::metadata(&proc_dir) {
+        Ok(metadata) => metadata.uid(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExactManagedProcessObservation::Unrelated);
+        }
+        Err(error) => return Err(error).context("failed to inspect managed daemon owner"),
+    };
+    if owner != unsafe { libc::geteuid() } {
+        return Ok(ExactManagedProcessObservation::IdentityDrift(format!(
+            "managed daemon pid {pid} is owned by another uid"
+        )));
+    }
     let Some(start_before) = read_linux_process_start_ticks(&proc_dir)? else {
         return Ok(ExactManagedProcessObservation::Unrelated);
     };
@@ -893,12 +1054,12 @@ fn linux_process_matches_exact_managed_daemon_with_metadata(
             "managed daemon pid {pid} command line disappeared during identity verification"
         )));
     };
-    let exact_managed_argv =
-        command_line_is_exact_managed_app_server_daemon(&command_line, expected_argv0);
+    let matched_argv0 =
+        exact_managed_daemon_argv0(&command_line, expected_argv0, expected_canonical);
     if process_executable.dev() != expected_metadata.dev()
         || process_executable.ino() != expected_metadata.ino()
     {
-        if exact_managed_argv {
+        if matched_argv0.is_some() {
             return Ok(ExactManagedProcessObservation::IdentityDrift(format!(
                 "managed daemon pid {pid} has the exact managed argv on a replaced executable inode; ownership is ambiguous"
             )));
@@ -914,11 +1075,11 @@ fn linux_process_matches_exact_managed_daemon_with_metadata(
             observed_canonical.display()
         )));
     }
-    if !exact_managed_argv {
+    let Some(matched_argv0) = matched_argv0 else {
         return Ok(ExactManagedProcessObservation::IdentityDrift(format!(
             "managed daemon pid {pid} argv did not match the exact managed daemon command"
         )));
-    }
+    };
     let Some(start_after) = read_linux_process_start_ticks(&proc_dir)? else {
         return Ok(ExactManagedProcessObservation::IdentityDrift(format!(
             "managed daemon pid {pid} start identity disappeared during verification"
@@ -929,11 +1090,12 @@ fn linux_process_matches_exact_managed_daemon_with_metadata(
         expected_metadata.ino(),
         process_executable.dev(),
         process_executable.ino(),
-        expected_argv0,
+        matched_argv0,
         &command_line,
         start_before,
         start_after,
-    ) {
+    ) || fs::metadata(&proc_dir)?.uid() != owner
+    {
         return Ok(ExactManagedProcessObservation::IdentityDrift(format!(
             "managed daemon pid {pid} identity changed during verification"
         )));
@@ -994,30 +1156,132 @@ fn read_linux_proc_file_bounded(path: &Path, max_bytes: u64) -> Result<Option<Ve
     Ok(Some(bytes))
 }
 
+fn exact_managed_daemon_argv0<'a>(
+    command_line: &[u8],
+    current_route: &'a Path,
+    current_canonical: &'a Path,
+) -> Option<&'a Path> {
+    [current_route, current_canonical]
+        .into_iter()
+        .find(|path| command_line_is_exact_managed_app_server_daemon(command_line, path))
+}
+
+fn arguments_have_app_server_subcommand(arguments: &[&[u8]]) -> bool {
+    let mut arguments = arguments.iter().skip(1).copied();
+    while let Some(argument) = arguments.next() {
+        match argument {
+            b"app-server" => return true,
+            b"-c"
+            | b"--config"
+            | b"--enable"
+            | b"--disable"
+            | b"-p"
+            | b"--profile"
+            | b"-m"
+            | b"--model"
+            | b"-C"
+            | b"--cd"
+            | b"-s"
+            | b"--sandbox"
+            | b"-a"
+            | b"--ask-for-approval"
+            | b"-i"
+            | b"--image"
+            | b"--add-dir"
+            | b"--local-provider" => {
+                arguments.next();
+            }
+            b"--oss"
+            | b"--search"
+            | b"--full-auto"
+            | b"--no-alt-screen"
+            | b"--dangerously-bypass-approvals-and-sandbox" => {}
+            _ if argument.len() > 2
+                && [b"-c", b"-p", b"-m", b"-C", b"-s", b"-a", b"-i"]
+                    .iter()
+                    .any(|prefix| argument.starts_with(*prefix)) => {}
+            _ if [
+                b"--config=".as_slice(),
+                b"--enable=",
+                b"--disable=",
+                b"--profile=",
+                b"--model=",
+                b"--cd=",
+                b"--sandbox=",
+                b"--ask-for-approval=",
+                b"--image=",
+                b"--add-dir=",
+                b"--local-provider=",
+            ]
+            .iter()
+            .any(|prefix| argument.starts_with(prefix)) => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn command_line_is_exact_managed_app_server_daemon(
     command_line: &[u8],
     expected_argv0: &Path,
 ) -> bool {
+    let Some(args) = managed_app_server_arguments(command_line, expected_argv0) else {
+        return false;
+    };
+    args == [b"app-server".as_slice(), b"--listen", b"unix://"]
+        || args
+            == [
+                b"app-server".as_slice(),
+                b"--remote-control",
+                b"--listen",
+                b"unix://",
+            ]
+}
+
+fn managed_process_arguments(command_line: &[u8]) -> Vec<&[u8]> {
+    command_line
+        .strip_suffix(&[0])
+        .unwrap_or(command_line)
+        .split(|byte| *byte == 0)
+        .collect()
+}
+
+fn managed_app_server_arguments<'a>(
+    command_line: &'a [u8],
+    expected_argv0: &Path,
+) -> Option<Vec<&'a [u8]>> {
     use std::os::unix::ffi::OsStrExt;
 
-    let args = command_line
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .collect::<Vec<_>>();
-    let legacy = [
-        expected_argv0.as_os_str().as_bytes(),
-        b"app-server",
-        b"--listen",
-        b"unix://",
-    ];
-    let remote_control = [
-        expected_argv0.as_os_str().as_bytes(),
-        b"app-server",
-        b"--remote-control",
-        b"--listen",
-        b"unix://",
-    ];
-    args == legacy || args == remote_control
+    let args = managed_process_arguments(command_line);
+    if args.first().copied() != Some(expected_argv0.as_os_str().as_bytes()) {
+        return None;
+    }
+    let tail = &args[1..];
+    let tail = tail
+        .strip_prefix(&[b"-c".as_slice(), b"features.code_mode_host=true"])
+        .unwrap_or(tail);
+    Some(tail.to_vec())
+}
+
+fn command_line_is_separate_managed_app_server(command_line: &[u8], expected_argv0: &Path) -> bool {
+    let Some(args) = managed_app_server_arguments(command_line, expected_argv0) else {
+        return false;
+    };
+    args.starts_with(&[b"app-server".as_slice(), b"proxy"])
+        || (args.starts_with(&[b"app-server".as_slice(), b"daemon"])
+            && args.get(2).is_some_and(|command| {
+                matches!(
+                    *command,
+                    b"start" | b"stop" | b"restart" | b"status" | b"version" | b"proxy"
+                )
+            }))
+        || args
+            == [
+                b"app-server".as_slice(),
+                b"--remote-control",
+                b"--listen",
+                b"ws://127.0.0.1:8390",
+            ]
 }
 
 enum DaemonVersionClaim {

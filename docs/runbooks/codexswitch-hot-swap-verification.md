@@ -708,9 +708,38 @@ CodexSwitch must evaluate these independently:
 
 ## Managed VPS Readiness Renewal
 
-The Linux daemon maintains readiness for the one managed headless app-server
-owned by `signul-codex-app-server.service`. This maintenance is not generic
-process repair and never targets an external app-server or an interactive CLI.
+The Linux daemon maintains readiness for both exact managed owners: the
+headless app-server owned by `signul-codex-app-server.service` and the
+current-release Unix app-server. This maintenance is not generic process repair
+and never targets an unrelated app-server, a proxy, or an interactive CLI.
+
+Unix discovery accepts only the stable `current/patched-codex/codex` argv route
+or its current canonical immutable executable path, optionally followed by
+exactly `-c features.code_mode_host=true`, then
+`app-server [--remote-control] --listen unix://`. It verifies the current
+immutable executable's UID, device, inode, canonical path, and stable process
+start identity. A present managed PID record remains mandatory evidence and
+must match the unique discovered process; malformed or stale records never
+fall back. When the record is absent, exactly one kernel-verified Unix listener
+may supply ownership without creating a PID record. Its bounded NUL-delimited
+environment must also resolve `CODEX_HOME` (or `HOME/.codex` when unset) to the
+coordinator's canonical Codex home. Missing, duplicate, relative, unreadable,
+or different-home evidence blocks renewal; environment values are never logged.
+Socket existence alone does not establish ownership. The binding is revalidated
+and the complete bounded scan repeated before returning the owner. Duplicates,
+identity drift, and unsupported account-bearing launch shapes fail unknown,
+not absent. The exact systemd WebSocket listener is checked by its separate
+owner path and cannot substitute for missing Unix proof. Recognized
+`app-server daemon` lifecycle/version tooling and `app-server proxy` are not
+account-bearing listeners and do not create Unix ownership blockers.
+Exact separate forms using the current route or canonical argv path are excluded
+before reading `/proc/PID/exe`, so an exited daemon probe cannot invalidate the
+listener scan. A missing executable for an unknown listener still fails closed.
+Blocker classification locates the actual subcommand after recognized global
+options and stops at the first positional command or `--`; an `app-server`
+token inside an `exec` prompt or another command's arguments is not a listener.
+Recognizing a global option for classification never grants reload eligibility:
+unsupported actual listener options still fail unknown.
 
 After every primary daemon attempt, readiness maintenance runs independently of
 quota/API/network success and at most once per four minutes. The four-minute
@@ -732,25 +761,33 @@ busy loop or suppress a later retry.
 Before writing a request or sending `SIGHUP`, it must prove all of the following
 from fresh observations:
 
-1. the systemd unit is active and exposes one nonzero main PID;
+1. the systemd unit exposes its exact active main PID, or Unix discovery proves
+   its unique current-release listener as described above;
 2. process owner, PID, start identity, command shape, and kernel executable
-   identity match the unit observation;
-3. the runtime is the headless remote-control kind;
-4. the kernel-resolved executable contains the complete headless hot-swap marker
-   contract; and
+   identity match that owner observation;
+3. the runtime has the expected kind: headless remote-control for systemd,
+   external app-server for Unix;
+4. the kernel-resolved executable contains the complete kind-specific hot-swap
+   marker contract; and
 5. `auth.json` supplies a complete account identity and token fingerprint.
 
 The request nonce binds that exact process identity, kernel executable,
 canonical auth path, provider account, and complete token fingerprint. The
 daemon revalidates the binding immediately before `SIGHUP`, waits no more than
-the bounded ACK deadline, and accepts only the matching headless ACK contract.
+the bounded ACK deadline, and accepts only the matching kind-specific ACK contract.
 The unit probe has a 15-second command deadline, marker inspection is capped at
 2 GiB in 128 KiB chunks, ACK observation is capped at five seconds, and runtime
-revalidation reads only the unit's exact main PID rather than scanning every
-process for a fallback target.
-Identity drift, missing patch support, an external runtime, an unreadable auth
-source, a skipped target, or an unacknowledged signal remains not ready and
-does not fall back to a broader process scan.
+systemd revalidation reads only the unit's exact main PID. Unix enumeration is
+bounded to three seconds and 200,000 entries and never admits a process solely
+because its argv resembles Codex. Identity drift, missing patch support, an
+unrelated runtime, an unreadable auth source, a skipped target, or an
+unacknowledged signal remains not ready. Renewal must retain the same complete
+owner set and verify every owner's persisted ACK under the one activation lease.
+
+Regression fixtures must cover the config-prefixed Unix launch without a PID
+record, both accepted Unix forms, duplicate listeners, unsupported options,
+proxy/daemon-tool/systemd exclusion, other-home rejection, UID/executable/start
+drift, and present invalid records.
 
 A systemd restart changes PID or start identity and invalidates the prior ACK.
 The next due daemon iteration must establish readiness for the new managed

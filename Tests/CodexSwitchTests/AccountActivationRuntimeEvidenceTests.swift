@@ -18,6 +18,241 @@ struct AccountActivationRuntimeEvidenceTests {
         #expect(!AccountActivationRuntimeEvidencePreflight.requiresFreshAcknowledgements)
     }
 
+    @Test("Passive confirmation refresh is due before expiry and rejects other activation states")
+    func passiveConfirmationRefreshEligibility() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let state = confirmationState(observedAt: now)
+        #expect(AccountActivationConfirmationRefresh(
+            state: state, configuredAccountId: accountId, at: now.addingTimeInterval(4)
+        ) == nil)
+        #expect(AccountActivationConfirmationRefresh(
+            state: state, configuredAccountId: accountId, at: now.addingTimeInterval(5)
+        ) != nil)
+        #expect(AccountActivationConfirmationRefresh(
+            state: state, configuredAccountId: accountId, at: now.addingTimeInterval(60)
+        ) != nil)
+        for invalid in [
+            nil,
+            AccountActivationState.preparing(targetAccountId: accountId, at: now),
+            AccountActivationState.committedDegraded(
+                targetAccountId: accountId, detail: .runtimeAcknowledgementIncomplete, at: now
+            ),
+            AccountActivationState.manualReview(
+                targetAccountId: accountId, detail: .externalAuthConflict, at: now
+            ),
+        ] {
+            #expect(AccountActivationConfirmationRefresh(
+                state: invalid, configuredAccountId: accountId, at: now
+            ) == nil)
+        }
+        #expect(AccountActivationConfirmationRefresh(
+            state: state, configuredAccountId: UUID(), at: now.addingTimeInterval(60)
+        ) == nil)
+    }
+
+    @Test("Failed passive refreshes are single-flight and retry at 30, then 60 seconds")
+    func passiveConfirmationFailureBackoff() throws {
+        var now = Date(timeIntervalSince1970: 1_800_000_000)
+        let state = confirmationState(observedAt: now.addingTimeInterval(-60))
+        var schedule = AccountActivationConfirmationRefreshSchedule()
+        var oldAttempt: AccountActivationConfirmationRefresh?
+        for delay in [30.0, 60, 60, 60] {
+            let attempt = try #require(schedule.begin(
+                state: state, configuredAccountId: accountId, at: now
+            ))
+            #expect(schedule.begin(
+                state: state, configuredAccountId: accountId, at: now.addingTimeInterval(600)
+            ) == nil)
+            if let oldAttempt {
+                schedule.complete(oldAttempt, succeeded: true, at: now)
+                #expect(schedule.begin(
+                    state: state, configuredAccountId: accountId, at: now
+                ) == nil)
+            }
+            schedule.complete(attempt, succeeded: false, at: now)
+            #expect(schedule.begin(
+                state: state, configuredAccountId: accountId,
+                at: now.addingTimeInterval(delay - 0.001)
+            ) == nil)
+            oldAttempt = attempt
+            now = now.addingTimeInterval(delay)
+        }
+        let changed = confirmationState(observedAt: now.addingTimeInterval(-60))
+        #expect(schedule.begin(
+            state: changed, configuredAccountId: accountId, at: now.addingTimeInterval(-1)
+        ) != nil)
+    }
+
+    @Test("Passive confirmation cannot renew from a cached snapshot or missing current ACK proof")
+    func passiveConfirmationRequiresNewCompleteBoundObservation() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let state = confirmationState(observedAt: now.addingTimeInterval(-60))
+        let refresh = try #require(AccountActivationConfirmationRefresh(
+            state: state, configuredAccountId: accountId, at: now
+        ))
+        for snapshots in [
+            snapshot([runtimeEvidence()], at: state.runtimeEvidenceObservedAt!),
+            snapshot([], at: now),
+            snapshot([runtimeEvidence()], at: now, desktopComplete: false),
+            snapshot([runtimeEvidence(), runtimeEvidence()], at: now),
+        ] {
+            #expect(refresh.evidence(
+                from: snapshots, authIdentity: auth, runtimeBindingIsCurrent: { _ in true }
+            ) == nil)
+        }
+        #expect(refresh.evidence(
+            from: snapshot([runtimeEvidence()], at: now),
+            authIdentity: auth, runtimeBindingIsCurrent: { _ in false }
+        ) == nil)
+        let otherAuth = CodexAuthFileIdentity(
+            canonicalPath: auth.canonicalPath, device: auth.device, inode: auth.inode,
+            accountID: auth.accountID,
+            completeTokenFingerprint: String(repeating: "b", count: 64)
+        )
+        #expect(refresh.evidence(
+            from: snapshot([runtimeEvidence()], at: now),
+            authIdentity: otherAuth, runtimeBindingIsCurrent: { _ in true }
+        ) == nil)
+    }
+
+    @Test("Passive confirmation rejects generation, topology, auth and expiry drift before persistence")
+    func passiveConfirmationPersistenceRevalidatesOriginalAuthority() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let state = confirmationState(observedAt: now.addingTimeInterval(-60))
+        let refresh = try #require(AccountActivationConfirmationRefresh(
+            state: state, configuredAccountId: accountId, at: now
+        ))
+        let snapshots = snapshot([runtimeEvidence()], at: now)
+        let evidence = try #require(refresh.evidence(
+            from: snapshots, authIdentity: auth, runtimeBindingIsCurrent: { _ in true }
+        ))
+        #expect(refresh.authorizesPersistence(
+            of: evidence, state: state, snapshots: snapshots, authIdentity: auth,
+            at: now, runtimeBindingIsCurrent: { _ in true }
+        ))
+        for changed in [
+            confirmationState(observedAt: state.runtimeEvidenceObservedAt!),
+            confirmationState(
+                observedAt: now, activationGeneration: state.activationGeneration
+            ),
+            AccountActivationState.committedDegraded(
+                targetAccountId: accountId, detail: .activeCredentialMutation,
+                activationGeneration: state.activationGeneration, at: now
+            ),
+        ] {
+            #expect(!refresh.authorizesPersistence(
+                of: evidence, state: changed, snapshots: snapshots, authIdentity: auth,
+                at: now, runtimeBindingIsCurrent: { _ in true }
+            ))
+        }
+        for changed in [
+            snapshot([runtimeEvidence(pid: 43)], at: now),
+            snapshot([runtimeEvidence(), runtimeEvidence(pid: 43)], at: now),
+            snapshot([runtimeEvidence()], at: now, desktopComplete: false),
+        ] {
+            #expect(!refresh.authorizesPersistence(
+                of: evidence, state: state, snapshots: changed, authIdentity: auth,
+                at: now, runtimeBindingIsCurrent: { _ in true }
+            ))
+        }
+        #expect(!refresh.authorizesPersistence(
+            of: evidence, state: state, snapshots: snapshots, authIdentity: auth,
+            at: now, runtimeBindingIsCurrent: { _ in false }
+        ))
+        #expect(!refresh.authorizesPersistence(
+            of: evidence, state: state, snapshots: snapshots, authIdentity: auth,
+            at: evidence.expiresAt, runtimeBindingIsCurrent: { _ in true }
+        ))
+    }
+
+    @Test("Expired same-generation confirmation recovers through the journal using existing ACKs")
+    @MainActor
+    func passiveConfirmationRefreshPersistsWithoutReload() async throws {
+        let root = try makeSecureTestDirectoryURL(prefix: "codexswitch-passive-confirmation")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let coordinator = AccountActivationCoordinator(url: root.appendingPathComponent("activation.json"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let old = now.addingTimeInterval(-60)
+        let preparing = try await coordinator.beginPreparing(
+            targetAccountId: accountId, kind: .manual, at: old
+        )
+        try await coordinator.markCommittedDegraded(
+            targetAccountId: accountId, discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1, detail: .runtimeConfirmationPending, at: old
+        )
+        let state = try await coordinator.markConfirmed(
+            targetAccountId: accountId,
+            expectedActivationGeneration: preparing.activationGeneration,
+            discoveredRuntimeCount: 1, acknowledgedRuntimeCount: 1,
+            evidenceGeneration: UUID(), evidenceObservedAt: old,
+            evidenceExpiresAt: old.addingTimeInterval(10), at: old
+        )
+        #expect(!state.runtimeIsCurrent(for: accountId, at: now))
+        let refresh = try #require(AccountActivationConfirmationRefresh(
+            state: state, configuredAccountId: accountId, at: now
+        ))
+        let snapshots = snapshot([runtimeEvidence()], at: now)
+        let auth = self.auth
+        let evidence = try #require(refresh.evidence(
+            from: snapshots, authIdentity: auth, runtimeBindingIsCurrent: { _ in true }
+        ))
+        let renewed = try await coordinator.refreshConfirmedRuntimeEvidence(
+            targetAccountId: accountId, expectedActivationGeneration: state.activationGeneration,
+            evidence: evidence, at: now,
+            authorizeEffect: { current in
+                #expect(!Thread.isMainThread)
+                return refresh.authorizesPersistence(
+                    of: evidence, state: current, snapshots: snapshots, authIdentity: auth,
+                    at: now, runtimeBindingIsCurrent: { _ in true }
+                )
+            }
+        )
+        #expect(renewed.runtimeIsCurrent(for: accountId, at: now))
+        #expect(renewed.activationGeneration == state.activationGeneration)
+        #expect(renewed.runtimeEvidenceGeneration != state.runtimeEvidenceGeneration)
+        #expect(renewed.runtimeEvidenceExpiresAt == now.addingTimeInterval(30))
+        #expect(AccountActivationCoordinator.runtimeEvidenceLifetime == 10)
+        #expect(evidence.runtimeBindings == snapshots.cli.runtimes.map(\.startupAcknowledgement.binding))
+        #expect(try await coordinator.load(at: now) == renewed)
+        #expect(!refresh.matches(renewed))
+        #expect(AccountActivationConfirmationRefresh(
+            state: renewed, configuredAccountId: accountId, at: now
+        ) == nil)
+        #expect(AccountActivationConfirmationRefresh(
+            state: renewed, configuredAccountId: accountId, at: now.addingTimeInterval(24.999)
+        ) == nil)
+        #expect(AccountActivationConfirmationRefresh(
+            state: renewed, configuredAccountId: accountId, at: now.addingTimeInterval(25)
+        ) != nil)
+    }
+
+    private func confirmationState(
+        observedAt: Date,
+        activationGeneration: UUID = UUID()
+    ) -> AccountActivationState {
+        AccountActivationState(
+            version: AccountActivationState.currentVersion, phase: .confirmed,
+            activationGeneration: activationGeneration,
+            configuredAccountId: accountId, runtimeCurrentAccountId: accountId,
+            updatedAt: observedAt, retryAttempt: 0, nextRetryAt: nil,
+            discoveredRuntimeCount: 1, acknowledgedRuntimeCount: 1, detail: nil,
+            runtimeEvidenceGeneration: UUID(), runtimeEvidenceObservedAt: observedAt,
+            runtimeEvidenceExpiresAt: observedAt.addingTimeInterval(10), runtimeBlockers: nil
+        )
+    }
+
+    private func snapshot(
+        _ runtimes: [CodexLocalRuntimeEvidence],
+        at date: Date,
+        desktopComplete: Bool = true
+    ) -> AccountActivationRuntimeSnapshotSet {
+        AccountActivationRuntimeSnapshotSet(
+            cli: .init(runtimes: runtimes, isComplete: true),
+            desktop: .init(runtimes: [], isComplete: desktopComplete),
+            observedAt: date
+        )
+    }
+
     @Test("No live runtime is configured-only evidence, never confirmation")
     func noRuntimeDeniesConfirmation() {
         let decision = AccountActivationRuntimeEvidenceEvaluator.evaluate(

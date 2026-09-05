@@ -75,7 +75,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-09-04
+  last_updated: 2026-09-05
 ---
 
 # Runtime And Host Ownership
@@ -689,6 +689,28 @@ read-only runtime-evidence refresh. Successful proof renews `Confirmed` under
 the same activation generation. Missing, incomplete, or transiently unavailable
 proof leaves the expired `Confirmed` record fail closed and retries only the
 read-only observation. It does not create an automatic reload loop.
+
+The Mac status cycle independently refreshes local confirmation with a bounded
+30-second passive evidence lease, including after a same-epoch pool authority
+observation has already been adopted. One in-flight refresh holds the existing
+account activation lease and verifies the durable configured account, complete
+auth identity, and unchanged activation and evidence generations. It captures
+complete CLI and desktop runtime snapshots and reuses only acknowledgements
+whose exact process, executable, auth, and request bindings remain current.
+Immediately before journal persistence it repeats passive discovery and rejects
+account, generation, topology, or acknowledgement drift. The new evidence is
+derived from that current observation, never by extending the old expiry or
+trusting a cached readiness Boolean. Missing evidence, contention, or cancellation
+does not write credentials, change activation phase, issue JSON-RPC or SIGHUP,
+or create a convergence retry. The short mutation-authorization lease and all
+reset-policy gates retain their existing semantics. The five-second renewal
+lead means healthy passive discovery runs about every 25 seconds, not every
+status tick; the default effect-preflight evidence lifetime remains unchanged.
+Unverifiable snapshots, revoked authorization, and lease contention back off
+for 30, then at most 60 seconds per unchanged confirmation. A changed
+confirmation resets that backoff. Initial discovery runs on a utility task;
+the final discovery runs on the activation coordinator's actor, never the UI
+actor. This renews binding evidence from existing ACKs, not the ACK itself.
 
 The Mac menu coordinator separately maintains capability proof for verified
 local interactive CLI runtimes. That maintenance never targets ChatGPT or a

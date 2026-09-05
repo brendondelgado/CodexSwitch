@@ -478,23 +478,39 @@ mod tests {
         let immutable_runtime = temp.path().join("releases/0.145.0/codex");
         fs::create_dir_all(immutable_runtime.parent().unwrap())?;
         fs::write(&immutable_runtime, b"runtime")?;
+        let immutable_runtime = fs::canonicalize(immutable_runtime)?;
         let current_route = temp.path().join("current/patched-codex/codex");
         fs::create_dir_all(current_route.parent().unwrap())?;
         symlink(&immutable_runtime, &current_route)?;
         let proc_root = temp.path().join("proc");
         fs::create_dir_all(&proc_root)?;
 
-        for (pid, remote_control) in [(42_u32, false), (84_u32, true)] {
+        for (pid, remote_control, config, canonical_argv0) in [
+            (42_u32, false, true, true),
+            (84, true, true, true),
+            (126, false, false, true),
+            (168, true, false, true),
+            (210, false, true, false),
+            (252, true, true, false),
+            (294, false, false, false),
+            (336, true, false, false),
+        ] {
             let process = proc_root.join(pid.to_string());
             fs::create_dir_all(&process)?;
             fs::write(
                 process.join("stat"),
                 format!("{pid} (codex) {}\n", vec!["1"; 20].join(" ")),
             )?;
-            let mut arguments = vec![
-                current_route.as_os_str().as_bytes(),
-                b"app-server".as_slice(),
-            ];
+            let argv0 = if canonical_argv0 {
+                &immutable_runtime
+            } else {
+                &current_route
+            };
+            let mut arguments = vec![argv0.as_os_str().as_bytes()];
+            if config {
+                arguments.extend([b"-c".as_slice(), b"features.code_mode_host=true".as_slice()]);
+            }
+            arguments.push(b"app-server".as_slice());
             if remote_control {
                 arguments.push(b"--remote-control".as_slice());
             }
@@ -502,11 +518,21 @@ mod tests {
             fs::write(
                 process.join("cmdline"),
                 arguments
-                .iter()
-                .flat_map(|argument| argument.iter().copied().chain(std::iter::once(0)))
-                .collect::<Vec<_>>(),
+                    .iter()
+                    .flat_map(|argument| argument.iter().copied().chain(std::iter::once(0)))
+                    .collect::<Vec<_>>(),
             )?;
             symlink(&immutable_runtime, process.join("exe"))?;
+        }
+
+        for (pid, argv0) in [(98, &current_route), (99, &immutable_runtime)] {
+            let probe = proc_root.join(pid.to_string());
+            fs::create_dir_all(&probe)?;
+            fs::write(
+                probe.join("cmdline"),
+                daemon_test_command_line(argv0, &[b"app-server", b"daemon", b"version"]),
+            )?;
+            assert!(!probe.join("exe").exists());
         }
 
         assert_eq!(
@@ -515,8 +541,377 @@ mod tests {
                 &current_route,
                 &immutable_runtime,
             )?,
-            vec![42, 84]
+            vec![42, 84, 126, 168, 210, 252, 294, 336]
         );
+        assert_eq!(
+            linux_process_matches_exact_managed_daemon_with_metadata(
+                &proc_root,
+                42,
+                &current_route,
+                &immutable_runtime,
+                &fs::metadata(&immutable_runtime)?,
+            )?,
+            ExactManagedProcessObservation::Active,
+        );
+        let record_path = temp.path().join("app-server.pid");
+        let scan = || {
+            scan_linux_exact_managed_unix_daemon_pids_at(
+                &proc_root,
+                &current_route,
+                &immutable_runtime,
+            )
+        };
+        assert!(managed_unix_app_server_identity_with(
+            &record_path,
+            scan,
+            |_| panic!("absent PID record must not be bound"),
+            |_| panic!("duplicate listeners must not be bound"),
+        )
+        .is_err());
+        for pid in [84, 126, 168, 210, 252, 294, 336] {
+            fs::remove_dir_all(proc_root.join(pid.to_string()))?;
+        }
+        let identity =
+            managed_owner_test_identity(42, ManagedAppServerOwnerKind::BuiltinUnixDaemon);
+        let bindings = std::cell::Cell::new(0);
+        assert_eq!(
+            managed_unix_app_server_identity_with(
+                &record_path,
+                scan,
+                |_| panic!("absent PID record must not be bound"),
+                |pid| {
+                    assert_eq!(pid, 42);
+                    bindings.set(bindings.get() + 1);
+                    Ok(identity.clone())
+                },
+            )?,
+            Some(identity)
+        );
+        assert_eq!(bindings.get(), 2);
+        assert!(!record_path.exists());
+        Ok(())
+    }
+
+    fn daemon_test_command_line(runtime: &Path, arguments: &[&[u8]]) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        std::iter::once(runtime.as_os_str().as_bytes())
+            .chain(arguments.iter().copied())
+            .flat_map(|argument| argument.iter().copied().chain(std::iter::once(0)))
+            .collect()
+    }
+
+    #[test]
+    fn unix_daemon_scan_unknown_argv_is_not_absence_but_tools_are_excluded() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir()?;
+        let runtime = temp.path().join("codex");
+        fs::write(&runtime, b"runtime")?;
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("42");
+        fs::create_dir_all(&process)?;
+        fs::write(
+            process.join("stat"),
+            format!("42 (codex) {}\n", vec!["1"; 20].join(" ")),
+        )?;
+        symlink(&runtime, process.join("exe"))?;
+
+        let rejected: &[&[&[u8]]] = &[
+            &[
+                b"-cfeatures.code_mode_host=true",
+                b"app-server",
+                b"--listen",
+                b"unix://",
+            ],
+            &[
+                b"-c",
+                b"features.code_mode_host=false",
+                b"app-server",
+                b"--listen",
+                b"unix://",
+            ],
+            &[
+                b"--config=features.code_mode_host=false",
+                b"app-server",
+                b"--listen",
+                b"unix://",
+            ],
+            &[
+                b"--enable",
+                b"other_feature",
+                b"app-server",
+                b"--listen",
+                b"unix://",
+            ],
+            &[
+                b"-c",
+                b"features.code_mode_host=true",
+                b"-c",
+                b"features.code_mode_host=true",
+                b"app-server",
+                b"--listen",
+                b"unix://",
+            ],
+            &[
+                b"app-server",
+                b"--listen",
+                b"unix://",
+                b"-c",
+                b"features.code_mode_host=true",
+            ],
+            &[b"app-server", b"--listen", b"unix://", b"--extra"],
+            &[
+                b"app-server",
+                b"--listen",
+                b"unix://",
+                b"--listen",
+                b"unix://",
+            ],
+            &[b"app-server", b"", b"--listen", b"unix://"],
+            &[b"app-server", b"--listen", b"unix:///other.sock"],
+            &[b"app-server", b"--listen", b"stdio://"],
+            &[
+                b"app-server",
+                b"--remote-control",
+                b"--listen",
+                b"ws://127.0.0.1:8390",
+                b"--extra",
+            ],
+        ];
+        for arguments in rejected {
+            fs::write(
+                process.join("cmdline"),
+                daemon_test_command_line(&runtime, arguments),
+            )?;
+            let error =
+                scan_linux_exact_managed_unix_daemon_pids_at(&proc_root, &runtime, &runtime)
+                    .unwrap_err();
+            assert!(error.to_string().contains("unsupported argv"));
+        }
+        let excluded: &[&[&[u8]]] = &[
+            &[b"app-server", b"proxy"],
+            &[
+                b"-c",
+                b"features.code_mode_host=true",
+                b"app-server",
+                b"proxy",
+            ],
+            &[b"app-server", b"daemon", b"start"],
+            &[b"app-server", b"daemon", b"version"],
+            &[b"app-server", b"daemon", b"proxy"],
+            &[
+                b"app-server",
+                b"--remote-control",
+                b"--listen",
+                b"ws://127.0.0.1:8390",
+            ],
+            &[b"exec", b"hello"],
+            &[b"exec", b"app-server"],
+            &[b"-cfeatures.code_mode_host=true", b"exec", b"app-server"],
+            &[b"exec", b"--", b"app-server"],
+            &[b"resume", b"session-id", b"app-server"],
+            &[
+                b"-c",
+                b"features.code_mode_host=true",
+                b"exec",
+                b"app-server",
+            ],
+            &[
+                b"--config=features.code_mode_host=true",
+                b"exec",
+                b"app-server",
+            ],
+            &[b"--profile", b"app-server", b"exec", b"app-server"],
+            &[b"--", b"app-server"],
+            &[b"-c", b"app-server", b"--listen", b"unix://"],
+        ];
+        for arguments in excluded {
+            fs::write(
+                process.join("cmdline"),
+                daemon_test_command_line(&runtime, arguments),
+            )?;
+            assert!(
+                scan_linux_exact_managed_unix_daemon_pids_at(&proc_root, &runtime, &runtime)?
+                    .is_empty()
+            );
+        }
+        fs::write(
+            process.join("cmdline"),
+            daemon_test_command_line(
+                &temp.path().join("other-argv0"),
+                &[b"app-server", b"--listen", b"unix://"],
+            ),
+        )?;
+        assert!(
+            scan_linux_exact_managed_unix_daemon_pids_at(&proc_root, &runtime, &runtime).is_err()
+        );
+        fs::remove_file(process.join("exe"))?;
+        fs::write(
+            process.join("cmdline"),
+            daemon_test_command_line(
+                &runtime,
+                &[b"app-server", b"--listen", b"unix://", b"--extra"],
+            ),
+        )?;
+        let missing_executable =
+            scan_linux_exact_managed_unix_daemon_pids_at(&proc_root, &runtime, &runtime)
+                .unwrap_err();
+        assert!(missing_executable
+            .to_string()
+            .contains("failed to inspect app-server pid 42 executable"));
+        Ok(())
+    }
+
+    #[test]
+    fn unrecorded_unix_binding_rejects_topology_and_identity_drift() {
+        let identity =
+            managed_owner_test_identity(42, ManagedAppServerOwnerKind::BuiltinUnixDaemon);
+        for observed in [vec![], vec![84], vec![42, 84]] {
+            assert!(bind_unrecorded_managed_unix_daemon_with(
+                &[42],
+                || Ok(observed),
+                |_| Ok(identity.clone()),
+            )
+            .is_err());
+        }
+        for field in 0..6 {
+            let calls = std::cell::Cell::new(0);
+            assert!(bind_unrecorded_managed_unix_daemon_with(
+                &[42],
+                || Ok(vec![42]),
+                |_| {
+                    let mut observed = identity.clone();
+                    if calls.replace(calls.get() + 1) > 0 {
+                        match field {
+                            0 => observed.process.start_identity.push_str("-reused"),
+                            1 => observed.process.owner_uid += 1,
+                            2 => observed.kernel_executable_identity.inode += 1,
+                            3 => observed.kernel_executable_identity.device += 1,
+                            4 => observed
+                                .kernel_executable_identity
+                                .canonical_path
+                                .push_str("-other"),
+                            _ => observed.process.command_line.push_str(" --extra"),
+                        }
+                    }
+                    Ok(observed)
+                },
+            )
+            .is_err());
+        }
+        assert!(bind_unrecorded_managed_unix_daemon_with(
+            &[42],
+            || Ok(vec![42]),
+            |_| bail!("kernel binding failed"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unix_pid_record_errors_never_fall_back_or_create_records() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("app-server.pid");
+        for bytes in [
+            b"invalid".as_slice(),
+            b"",
+            br#"{"pid":0,"processStartTime":"start"}"#,
+        ] {
+            fs::write(&path, bytes)?;
+            assert!(managed_unix_app_server_identity_with(
+                &path,
+                || panic!("invalid record must fail before scanning"),
+                |_| panic!("invalid record must not bind"),
+                |_| panic!("invalid record must not fall back"),
+            )
+            .is_err());
+            assert_eq!(fs::read(&path)?, bytes);
+        }
+        let record = br#"{"pid":42,"processStartTime":"stale-start"}"#;
+        fs::write(&path, record)?;
+        for missing in [false, true] {
+            assert!(managed_unix_app_server_identity_with(
+                &path,
+                || Ok(vec![42]),
+                |_| if missing {
+                    Ok(None)
+                } else {
+                    bail!("start identity mismatch")
+                },
+                |_| panic!("stale record must not fall back"),
+            )
+            .is_err());
+        }
+        assert!(managed_unix_app_server_identity_with(
+            &path,
+            || Ok(vec![84]),
+            |_| panic!("mismatched record must not bind"),
+            |_| panic!("mismatched record must not fall back"),
+        )
+        .is_err());
+        assert_eq!(fs::read(&path)?, record);
+        fs::remove_file(&path)?;
+        let identity =
+            managed_owner_test_identity(42, ManagedAppServerOwnerKind::BuiltinUnixDaemon);
+        assert!(managed_unix_app_server_identity_with(
+            &path,
+            || Ok(vec![42]),
+            |_| panic!("record was initially absent"),
+            |_| {
+                fs::write(&path, record)?;
+                Ok(identity.clone())
+            },
+        )
+        .is_err());
+        assert_eq!(fs::read(&path)?, record);
+        Ok(())
+    }
+
+    #[test]
+    fn unrecorded_unix_home_binding_rejects_other_home_and_ambiguous_environment() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        let codex_home = home.join(".codex");
+        let other = temp.path().join("other-home");
+        fs::create_dir_all(&codex_home)?;
+        fs::create_dir_all(&other)?;
+        let alias = temp.path().join("home-alias");
+        symlink(&codex_home, &alias)?;
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("42");
+        fs::create_dir_all(&process)?;
+        let environment = process.join("environ");
+        for accepted in [
+            format!("CODEX_HOME={}\0", codex_home.display()),
+            format!("HOME={}\0", home.display()),
+            format!("CODEX_HOME={}\0HOME={}\0", alias.display(), other.display()),
+        ] {
+            fs::write(&environment, accepted)?;
+            validate_managed_unix_daemon_codex_home_at(&proc_root, 42, &codex_home)?;
+        }
+        for rejected in [
+            format!("CODEX_HOME={}\0", other.display()),
+            format!("HOME={}\0", other.display()),
+            format!(
+                "CODEX_HOME={}\0CODEX_HOME={}\0",
+                codex_home.display(),
+                codex_home.display()
+            ),
+            format!("HOME={}\0HOME={}\0", home.display(), home.display()),
+            format!("CODEX_HOME=\0HOME={}\0", home.display()),
+            "CODEX_HOME=relative\0".to_string(),
+            "HOME=relative\0".to_string(),
+            "UNRELATED=value\0".to_string(),
+            "X".repeat(MANAGED_DAEMON_CMDLINE_MAX_BYTES as usize + 1),
+        ] {
+            fs::write(&environment, rejected)?;
+            assert!(
+                validate_managed_unix_daemon_codex_home_at(&proc_root, 42, &codex_home).is_err()
+            );
+        }
+        fs::remove_file(&environment)?;
+        assert!(validate_managed_unix_daemon_codex_home_at(&proc_root, 42, &codex_home).is_err());
+        symlink(home.join(".codex"), &environment)?;
+        assert!(validate_managed_unix_daemon_codex_home_at(&proc_root, 42, &codex_home).is_err());
         Ok(())
     }
 
@@ -535,9 +930,29 @@ mod tests {
         let argv0 = runtime.as_os_str().as_bytes();
 
         for rejected in [
-            command_line(&[argv0, b"app-server", b"--listen", b"unix://", b"--remote-control"]),
-            command_line(&[argv0, b"app-server", b"--remote-control", b"--remote-control", b"--listen", b"unix://"]),
-            command_line(&[argv0, b"app-server", b"--remote-control", b"--listen", b"unix://", b"--extra"]),
+            command_line(&[
+                argv0,
+                b"app-server",
+                b"--listen",
+                b"unix://",
+                b"--remote-control",
+            ]),
+            command_line(&[
+                argv0,
+                b"app-server",
+                b"--remote-control",
+                b"--remote-control",
+                b"--listen",
+                b"unix://",
+            ]),
+            command_line(&[
+                argv0,
+                b"app-server",
+                b"--remote-control",
+                b"--listen",
+                b"unix://",
+                b"--extra",
+            ]),
         ] {
             assert!(!command_line_is_exact_managed_app_server_daemon(
                 &rejected, runtime

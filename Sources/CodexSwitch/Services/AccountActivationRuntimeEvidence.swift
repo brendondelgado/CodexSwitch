@@ -93,6 +93,121 @@ struct AccountActivationRuntimeSnapshotSet: Sendable {
     let observedAt: Date
 }
 
+struct AccountActivationConfirmationRefreshSchedule {
+    private var observedState: AccountActivationState?
+    private var inFlight: AccountActivationConfirmationRefresh?
+    private var failureCount = 0
+    private var retryAfter: Date?
+
+    mutating func begin(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        at now: Date
+    ) -> AccountActivationConfirmationRefresh? {
+        guard inFlight == nil else { return nil }
+        if observedState != state {
+            failureCount = 0
+            retryAfter = nil
+        }
+        observedState = state
+        guard retryAfter.map({ now >= $0 }) ?? true,
+              let refresh = AccountActivationConfirmationRefresh(
+                  state: state, configuredAccountId: configuredAccountId, at: now
+              ) else { return nil }
+        inFlight = refresh
+        return refresh
+    }
+
+    mutating func complete(
+        _ refresh: AccountActivationConfirmationRefresh,
+        succeeded: Bool,
+        at now: Date
+    ) {
+        guard inFlight == refresh else { return }
+        inFlight = nil
+        if succeeded {
+            failureCount = 0
+            retryAfter = nil
+        } else {
+            failureCount = min(failureCount + 1, 2)
+            retryAfter = now.addingTimeInterval(30 * pow(2, Double(failureCount - 1)))
+        }
+    }
+}
+
+struct AccountActivationConfirmationRefresh: Equatable, Sendable {
+    static let evidenceLifetime: TimeInterval = 30
+    private let id = UUID()
+    let accountId: UUID
+    let expectedState: AccountActivationState
+
+    init?(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        at now: Date
+    ) {
+        guard let state, let configuredAccountId,
+              state.phase == .confirmed,
+              state.configuredAccountId == configuredAccountId,
+              state.runtimeCurrentAccountId == configuredAccountId,
+              state.runtimeEvidenceExpiresAt.map({
+                  $0 <= now.addingTimeInterval(5)
+              }) == true else {
+            return nil
+        }
+        accountId = configuredAccountId
+        expectedState = state
+    }
+
+    func matches(_ state: AccountActivationState?) -> Bool {
+        state == expectedState
+    }
+
+    func evidence(
+        from snapshots: AccountActivationRuntimeSnapshotSet,
+        authIdentity: CodexAuthFileIdentity,
+        runtimeBindingIsCurrent: (CodexReloadBinding) -> Bool
+    ) -> AccountActivationRuntimeEvidence? {
+        guard snapshots.observedAt > (expectedState.runtimeEvidenceObservedAt ?? .distantPast),
+              case .confirmed(let evidence) = AccountActivationRuntimeEvidenceEvaluator.evaluate(
+                  cli: snapshots.cli,
+                  desktop: snapshots.desktop,
+                  expectedAccountId: accountId,
+                  expectedAuthIdentity: authIdentity,
+                  observedAt: snapshots.observedAt,
+                  lifetime: Self.evidenceLifetime,
+                  runtimeBindingIsCurrent: runtimeBindingIsCurrent
+              ), evidence.hasConcreteRuntimeBindings else {
+            return nil
+        }
+        return evidence
+    }
+
+    func authorizesPersistence(
+        of evidence: AccountActivationRuntimeEvidence,
+        state: AccountActivationState?,
+        snapshots: AccountActivationRuntimeSnapshotSet,
+        authIdentity: CodexAuthFileIdentity,
+        at now: Date,
+        runtimeBindingIsCurrent: (CodexReloadBinding) -> Bool
+    ) -> Bool {
+        guard matches(state),
+              evidence.runtimeCurrentAccountId == accountId,
+              evidence.observedAt <= now,
+              evidence.expiresAt > now,
+              snapshots.observedAt >= evidence.observedAt,
+              snapshots.observedAt <= now,
+              let current = self.evidence(
+                  from: snapshots,
+                  authIdentity: authIdentity,
+                  runtimeBindingIsCurrent: runtimeBindingIsCurrent
+              ) else {
+            return false
+        }
+        return evidence.hasSameRuntimeTopology(as: current)
+    }
+}
+
 enum AccountActivationRuntimeEvidencePreflight {
     // Exact process and auth-generation bindings are stronger than wall-clock
     // freshness. Reuse avoids turning read-only policy checks into UI reloads.

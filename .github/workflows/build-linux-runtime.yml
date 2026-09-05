@@ -15,8 +15,13 @@ on:
         description: Exact 40-character peeled commit behind the upstream rust-v version tag
         required: true
         type: string
+      base_runtime_run_id:
+        description: Optional exact successful Linux workflow run whose attested unchanged codex may be reused
+        required: false
+        type: string
 
 permissions:
+  actions: read
   attestations: write
   contents: read
   id-token: write
@@ -51,6 +56,7 @@ jobs:
           EXPECTED_CODEXSWITCH_SHA: ${{ inputs.codexswitch_git_sha }}
           EXPECTED_UPSTREAM_CODEX_SHA: ${{ inputs.upstream_codex_git_sha }}
           UPSTREAM_CODEX_VERSION: ${{ inputs.upstream_codex_version }}
+          BASE_RUNTIME_RUN_ID: ${{ inputs.base_runtime_run_id }}
         run: |
           set -euo pipefail
           sha_pattern='^[0-9a-f]{40}$'
@@ -74,6 +80,10 @@ jobs:
           fi
           if [[ ! "$UPSTREAM_CODEX_VERSION" =~ $version_pattern ]]; then
             echo "::error::upstream_codex_version must be a stable three-component version"
+            exit 1
+          fi
+          if [[ -n "$BASE_RUNTIME_RUN_ID" && ! "$BASE_RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::base_runtime_run_id must be a positive decimal workflow run ID"
             exit 1
           fi
 
@@ -147,6 +157,7 @@ jobs:
             printf 'OFFICIAL_HELPER_DIR=%s/official-linux-code-mode-host\n' "$RUNNER_TEMP"
             printf 'PATCH_DRIVER=%s/patch-codex-linux-source\n' "$RUNNER_TEMP"
             printf 'ARTIFACT_DIR=%s/codexswitch-linux-runtime-artifact\n' "$RUNNER_TEMP"
+            printf 'BASE_ARTIFACT_DIR=%s/codexswitch-linux-base-artifact\n' "$RUNNER_TEMP"
           } >> "$GITHUB_ENV"
 
       - name: Prepare the Rust and native inspection toolchain
@@ -361,6 +372,7 @@ jobs:
           fi
 
       - name: Derive exact upstream target cache ABI
+        if: ${{ inputs.base_runtime_run_id == '' }}
         id: target_cache_abi
         working-directory: ${{ runner.temp }}/codex-linux-upstream/codex-rs
         env:
@@ -416,6 +428,7 @@ jobs:
           echo "Upstream target cache ABI: $cache_abi_sha256"
 
       - name: Restore exact upstream Cargo target cache
+        if: ${{ inputs.base_runtime_run_id == '' }}
         id: upstream_target_cache
         continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -424,6 +437,7 @@ jobs:
           key: linux-runtime-target-v2-${{ runner.arch }}-${{ steps.target_cache_abi.outputs.sha256 }}-${{ steps.upstream.outputs.sha }}-${{ steps.patches.outputs.sha256 }}
 
       - name: Build the patched Codex CLI runtime
+        if: ${{ inputs.base_runtime_run_id == '' }}
         working-directory: ${{ runner.temp }}/codex-linux-upstream/codex-rs
         env:
           SOURCE_DATE_EPOCH: ${{ steps.upstream.outputs.epoch }}
@@ -436,6 +450,95 @@ jobs:
             --target "$TARGET_TRIPLE" \
             --jobs "$CARGO_BUILD_JOBS" \
             -p codex-cli
+
+      - name: Reuse an attested unchanged upstream Linux codex
+        if: ${{ inputs.base_runtime_run_id != '' }}
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_RUNTIME_RUN_ID: ${{ inputs.base_runtime_run_id }}
+          EXPECTED_UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          EXPECTED_PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          trusted_repository="brendondelgado/CodexSwitch"
+          workflow_path=".github/workflows/build-linux-runtime.yml"
+          trusted_workflow="$trusted_repository/$workflow_path"
+          run_json="$RUNNER_TEMP/base-linux-runtime-run.json"
+          comparison_json="$RUNNER_TEMP/base-linux-runtime-comparison.json"
+          report_json="$RUNNER_TEMP/base-linux-runtime-report.json"
+
+          gh api "/repos/$trusted_repository/actions/runs/$BASE_RUNTIME_RUN_ID" > "$run_json"
+          if ! jq -e \
+            --arg runId "$BASE_RUNTIME_RUN_ID" \
+            --arg currentRunId "$GITHUB_RUN_ID" \
+            --arg repository "$trusted_repository" \
+            --arg workflow "$workflow_path" \
+            '
+              type == "object" and
+              (.id | tostring) == $runId and .id < ($currentRunId | tonumber) and
+              .repository.full_name == $repository and .head_repository.full_name == $repository and
+              .path == $workflow and .event == "workflow_dispatch" and .head_branch == "main" and
+              .status == "completed" and .conclusion == "success" and
+              (.head_sha | test("^[0-9a-f]{40}$")) and
+              (.run_attempt | type == "number" and . > 0 and floor == .)
+            ' "$run_json" >/dev/null; then
+            echo "::error::base runtime must be an earlier successful main dispatch of this repository's Linux workflow"
+            exit 1
+          fi
+          base_source_sha="$(jq -r '.head_sha' "$run_json")"
+          base_attempt="$(jq -r '.run_attempt' "$run_json")"
+          base_artifact_name="codexswitch-linux-x86_64-runtime-${base_source_sha:0:12}-codex-${UPSTREAM_CODEX_VERSION}-run-${BASE_RUNTIME_RUN_ID}-${base_attempt}"
+
+          gh api "/repos/$trusted_repository/compare/${base_source_sha}...${CODEXSWITCH_SOURCE_SHA}" > "$comparison_json"
+          if ! jq -e --arg sourceSha "$base_source_sha" '
+            (.status == "ahead" or .status == "identical") and
+            .base_commit.sha == $sourceSha and .merge_base_commit.sha == $sourceSha
+          ' "$comparison_json" >/dev/null; then
+            echo "::error::base runtime source is not an ancestor of the exact reviewed main dispatch"
+            exit 1
+          fi
+
+          if [[ -e "$BASE_ARTIFACT_DIR" || -L "$BASE_ARTIFACT_DIR" ]]; then
+            echo "::error::base artifact destination already exists"
+            exit 1
+          fi
+          install -d -m 0700 "$BASE_ARTIFACT_DIR"
+          gh run download "$BASE_RUNTIME_RUN_ID" \
+            --repo "$trusted_repository" \
+            --name "$base_artifact_name" \
+            --dir "$BASE_ARTIFACT_DIR"
+
+          python3 scripts/verify_linux_runtime_artifact.py verify \
+            --directory "$BASE_ARTIFACT_DIR" --mode source > "$report_json"
+          if ! jq -e \
+            --arg sourceSha "$base_source_sha" \
+            --arg upstreamVersion "$UPSTREAM_CODEX_VERSION" \
+            --arg upstreamSha "$EXPECTED_UPSTREAM_SHA" \
+            --arg patchSha256 "$EXPECTED_PATCH_SHA256" \
+            '
+              .sourceSha == $sourceSha and .upstreamVersion == $upstreamVersion and
+              .upstreamSha == $upstreamSha and .sourcePatchSha256 == $patchSha256
+            ' "$report_json" >/dev/null; then
+            echo "::error::base runtime provenance or freshly patched upstream identity does not match"
+            exit 1
+          fi
+          for member in manifest.json codex codex-code-mode-host codexswitch-cli; do
+            gh attestation verify "$BASE_ARTIFACT_DIR/$member" \
+              --repo "$trusted_repository" \
+              --signer-workflow "$trusted_workflow" \
+              --signer-digest "$base_source_sha" \
+              --source-ref refs/heads/main \
+              --source-digest "$base_source_sha" \
+              --deny-self-hosted-runners >/dev/null
+          done
+
+          # Never replace the freshly built controller or reuse the old helper/manifest.
+          install -m 0755 "$BASE_ARTIFACT_DIR/codex" "$ARTIFACT_DIR/codex"
+          {
+            printf 'source_sha=%s\n' "$base_source_sha"
+            printf 'artifact_name=%s\n' "$base_artifact_name"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Fetch the exact official Linux code-mode host
         env:
@@ -557,19 +660,23 @@ jobs:
           fi
 
       - name: Stage the exact runtime executables
+        env:
+          BASE_RUNTIME_RUN_ID: ${{ inputs.base_runtime_run_id }}
         run: |
           set -euo pipefail
           codex_path="$UPSTREAM_TARGET_DIR/$TARGET_TRIPLE/release/codex"
           helper_path="$OFFICIAL_HELPER_DIR/codex-code-mode-host-x86_64-unknown-linux-musl"
-          if [[ ! -f "$codex_path" || -L "$codex_path" || ! -x "$codex_path" || ! -s "$codex_path" ]]; then
-            echo "::error::Cargo did not produce a regular executable codex"
-            exit 1
+          if [[ -z "$BASE_RUNTIME_RUN_ID" ]]; then
+            if [[ ! -f "$codex_path" || -L "$codex_path" || ! -x "$codex_path" || ! -s "$codex_path" ]]; then
+              echo "::error::Cargo did not produce a regular executable codex"
+              exit 1
+            fi
+            install -m 0755 "$codex_path" "$ARTIFACT_DIR/codex"
           fi
           if [[ ! -f "$helper_path" || -L "$helper_path" || ! -s "$helper_path" ]]; then
             echo "::error::verified official Linux code-mode host is unavailable"
             exit 1
           fi
-          install -m 0755 "$codex_path" "$ARTIFACT_DIR/codex"
           install -m 0755 "$helper_path" "$ARTIFACT_DIR/codex-code-mode-host"
 
       - name: Validate Linux architecture and runtime contracts
@@ -828,6 +935,9 @@ jobs:
           PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}
           MANIFEST_SHA256: ${{ steps.manifest.outputs.sha256 }}
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          BASE_RUNTIME_RUN_ID: ${{ inputs.base_runtime_run_id }}
+          BASE_RUNTIME_SOURCE_SHA: ${{ steps.reuse.outputs.source_sha }}
+          BASE_RUNTIME_ARTIFACT_NAME: ${{ steps.reuse.outputs.artifact_name }}
         run: |
           set -euo pipefail
           {
@@ -842,6 +952,9 @@ jobs:
             echo "| Upstream tag object | \`$UPSTREAM_TAG_OBJECT_SHA\` |"
             echo "| Upstream peeled SHA | \`$UPSTREAM_SHA\` |"
             echo "| Patched diff SHA-256 | \`$PATCH_SHA256\` |"
+            echo "| Reused upstream base run | \`${BASE_RUNTIME_RUN_ID:-none (full build)}\` |"
+            echo "| Reused upstream source SHA | \`${BASE_RUNTIME_SOURCE_SHA:-none}\` |"
+            echo "| Reused upstream artifact | \`${BASE_RUNTIME_ARTIFACT_NAME:-none}\` |"
             echo "| Code-mode host | Official \`x86_64-unknown-linux-musl\` asset from \`$UPSTREAM_TAG\`, GitHub digest verified |"
             echo "| Target | \`$TARGET_TRIPLE\` |"
             echo "| Runner architecture | \`$(uname -m)\` |"
@@ -862,7 +975,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save verified upstream Cargo target cache
-        if: ${{ success() && steps.upstream_target_cache.outputs.cache-hit != 'true' }}
+        if: ${{ success() && inputs.base_runtime_run_id == '' && steps.upstream_target_cache.outputs.cache-hit != 'true' }}
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -876,6 +989,10 @@ jobs:
       - name: Remove ephemeral official Linux helper
         if: ${{ always() }}
         run: rm -rf -- "$RUNNER_TEMP/official-linux-code-mode-host" "$RUNNER_TEMP"/codex-code-mode-host-*.tar.gz
+
+      - name: Remove ephemeral base Linux artifact
+        if: ${{ always() }}
+        run: rm -rf -- "$RUNNER_TEMP/codexswitch-linux-base-artifact"
 
       - name: Save remote Cargo downloads
         if: ${{ always() && steps.cargo_download_cache.outputs.cache-hit != 'true' }}

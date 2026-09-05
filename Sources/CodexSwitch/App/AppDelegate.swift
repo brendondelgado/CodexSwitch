@@ -444,6 +444,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastCLIActivationHandoffAttemptAt: Date?
     private var localCLIReadinessMaintainer = LocalCLIReadinessMaintainer()
     private var localCLIReadinessMaintenanceTask: Task<Void, Never>?
+    private var localConfirmationRefreshTask: Task<Void, Never>?
+    private var localConfirmationRefreshSchedule = AccountActivationConfirmationRefreshSchedule()
 
     private func installStatusItem() {
         if let existingStatusItem = statusItem {
@@ -594,6 +596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
             CLIStatusChecker.refresh(activeAccountId: accountManager.configuredAccount?.accountId)
             scheduleCLIActivationHandoffReconciliationIfNeeded()
+            scheduleLocalConfirmationRefreshIfNeeded()
             iconUpdateTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
                 Task { @MainActor in
                     await self?.reconcileExternalAuthIfNeeded()
@@ -606,6 +609,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.scheduleCodexBrowserSessionRepairIfNeeded()
                     self?.reconcileQuotaPollingIfNeeded()
                     self?.scheduleCLIActivationHandoffReconciliationIfNeeded()
+                    self?.scheduleLocalConfirmationRefreshIfNeeded()
                     CLIStatusChecker.refresh(
                         activeAccountId: self?.accountManager.configuredAccount?.accountId,
                         onRuntimeObservation: { [weak self] observation in
@@ -9096,6 +9100,113 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    private func scheduleLocalConfirmationRefreshIfNeeded(now: Date = Date()) {
+        guard !isExiting,
+              localConfirmationRefreshTask == nil,
+              pendingSwapTargetAccountId == nil,
+              swapConvergenceTask == nil,
+              let account = accountManager.configuredAccount,
+              let refresh = localConfirmationRefreshSchedule.begin(
+                  state: accountManager.activationState,
+                  configuredAccountId: account.id,
+                  at: now
+              ) else { return }
+
+        localConfirmationRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var succeeded = false
+            defer {
+                self.localConfirmationRefreshSchedule.complete(refresh, succeeded: succeeded, at: Date())
+                self.localConfirmationRefreshTask = nil
+            }
+            await self.accountMutationTransaction.withActivationLease(
+                targetAccountId: account.id,
+                activationGeneration: refresh.expectedState.activationGeneration
+            ) { lease in
+                guard !self.isExiting, !Task.isCancelled,
+                      refresh.matches(self.accountManager.activationState),
+                      await self.durableConfiguredFilesMatch(account),
+                      let permit = self.accountMutationTransaction.makeEffectPermit(
+                          lease: lease,
+                          targetAccountId: account.id,
+                          activationGeneration: refresh.expectedState.activationGeneration,
+                          requiredPhase: .confirmed,
+                          runtimePermit: nil,
+                          journal: self.accountActivationCoordinator
+                      ) else { return }
+
+                let captured = await Task.detached(priority: .utility) {
+                    guard Self.authFileMatches(account: account, atPath: Self.codexAuthPath),
+                          let authIdentity = SwapEngine.authFileIdentity(
+                              at: URL(fileURLWithPath: Self.codexAuthPath),
+                              requiredOwnerUID: UInt32(getuid())
+                          ) else { return nil as (CodexAuthFileIdentity, AccountActivationRuntimeEvidence)? }
+                    let snapshots = AccountActivationRuntimeSnapshotSet(
+                        cli: SwapEngine.localRuntimeEvidenceSnapshot(runtimeKind: .localInteractiveCLI),
+                        desktop: SwapEngine.localDesktopRuntimeEvidenceSnapshot(),
+                        observedAt: Date()
+                    )
+                    guard let evidence = refresh.evidence(
+                        from: snapshots,
+                        authIdentity: authIdentity,
+                        runtimeBindingIsCurrent: { SwapEngine.reloadBindingIsCurrent($0) }
+                    ) else { return nil }
+                    return (authIdentity, evidence)
+                }.value
+                guard let (authIdentity, evidence) = captured,
+                      await self.durableConfiguredFilesMatch(account),
+                      !self.isExiting, !Task.isCancelled,
+                      refresh.matches(self.accountManager.activationState),
+                      self.accountManager.configuredAccount.map({
+                          $0.id == account.id && Self.credentialsMatch($0, account)
+                      }) == true,
+                      permit.isCurrentlyAuthorized() else { return }
+
+                // Recheck live ACKs while the coordinator owns the journal transition.
+                let renewed = try? await self.accountActivationCoordinator.refreshConfirmedRuntimeEvidence(
+                    targetAccountId: account.id,
+                    expectedActivationGeneration: refresh.expectedState.activationGeneration,
+                    evidence: evidence,
+                    authorizeEffect: { state in
+                        guard !Task.isCancelled,
+                              permit.authorizes(state: state, at: Date()),
+                              refresh.matches(state),
+                              Self.authFileMatches(account: account, atPath: Self.codexAuthPath) else {
+                            return false
+                        }
+                        let snapshots = AccountActivationRuntimeSnapshotSet(
+                            cli: SwapEngine.localRuntimeEvidenceSnapshot(runtimeKind: .localInteractiveCLI),
+                            desktop: SwapEngine.localDesktopRuntimeEvidenceSnapshot(),
+                            observedAt: Date()
+                        )
+                        let authorized = refresh.authorizesPersistence(
+                            of: evidence,
+                            state: state,
+                            snapshots: snapshots,
+                            authIdentity: authIdentity,
+                            at: Date(),
+                            runtimeBindingIsCurrent: { SwapEngine.reloadBindingIsCurrent($0) }
+                        )
+                        return authorized && !Task.isCancelled
+                            && evidence.expiresAt > Date()
+                            && permit.authorizes(state: state, at: Date())
+                    }
+                )
+                guard let renewed,
+                      !self.isExiting, !Task.isCancelled,
+                      refresh.matches(self.accountManager.activationState),
+                      self.accountManager.configuredAccount.map({
+                          $0.id == account.id && Self.credentialsMatch($0, account)
+                      }) == true,
+                      renewed.runtimeIsCurrent(for: account.id) else { return }
+                self.accountManager.publishActivationState(renewed)
+                succeeded = true
+                self.statusBarController?.updateIcon()
+                self.updatePopoverContent()
+            }
+        }
+    }
+
     private func scheduleLocalCLIReadinessMaintenanceIfNeeded(
         observation: CodexLocalRuntimeReadinessObservation,
         now: Date = Date()
@@ -9742,6 +9853,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         automaticCodexUpdateTask = nil
         localCLIReadinessMaintenanceTask?.cancel()
         localCLIReadinessMaintenanceTask = nil
+        localConfirmationRefreshTask?.cancel()
+        localConfirmationRefreshTask = nil
         globalCLIRepairInFlight = false
         iconUpdateTimer?.invalidate()
         iconUpdateTimer = nil
