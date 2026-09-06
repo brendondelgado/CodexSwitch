@@ -1,9 +1,33 @@
+import AppKit
 import Foundation
 import Testing
 @testable import CodexSwitch
 
 @Suite("Popover UX")
 struct PopoverUXTests {
+    @Test("Popover dismissal preserves child confirmation windows but not unrelated windows")
+    @MainActor
+    func confirmationWindowsRemainInsidePopover() {
+        _ = NSApplication.shared
+        let popover = NSWindow()
+        let confirmation = NSWindow()
+        let descendant = NSWindow()
+        let unrelated = NSWindow()
+        popover.addChildWindow(confirmation, ordered: .above)
+        confirmation.addChildWindow(descendant, ordered: .above)
+        defer {
+            confirmation.removeChildWindow(descendant)
+            popover.removeChildWindow(confirmation)
+        }
+        #expect(AppDelegate.isPopoverInteractionWindow(popover, popoverWindow: popover))
+        #expect(AppDelegate.isPopoverInteractionWindow(confirmation, popoverWindow: popover))
+        #expect(AppDelegate.isPopoverInteractionWindow(descendant, popoverWindow: popover))
+        #expect(!AppDelegate.isPopoverInteractionWindow(unrelated, popoverWindow: popover))
+        #expect(!AppDelegate.isPopoverInteractionWindow(nil, popoverWindow: popover))
+        popover.removeChildWindow(confirmation)
+        #expect(!AppDelegate.isPopoverInteractionWindow(confirmation, popoverWindow: popover))
+    }
+
     @Test("Legacy retry-limit state shows retained partial runtime convergence")
     @MainActor
     func retryExhaustionShowsPartialRuntimeProgress() {
@@ -64,6 +88,8 @@ struct PopoverUXTests {
         #expect(source.contains("NSEvent.addLocalMonitorForEvents"))
         #expect(source.contains("NSEvent.addGlobalMonitorForEvents"))
         #expect(source.contains("closePopoverIfNeeded(forLocalEvent:"))
+        #expect(source.contains("Self.isPopoverInteractionWindow(event.window, popoverWindow: popoverWindow)"))
+        #expect(source.contains("window.sheetParent"))
         #expect(source.contains("if frame.minX < minX"))
         #expect(source.contains("} else if frame.maxX > maxX {"))
         #expect(source.contains("let verticalGap = buttonScreenFrame.minY - frame.maxY"))

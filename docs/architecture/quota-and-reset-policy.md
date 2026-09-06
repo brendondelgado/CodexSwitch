@@ -30,6 +30,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
   - ../../Sources/CodexSwitch/Models/LinuxDevboxResetObservation.swift
   - ../../Tests/CodexSwitchTests/LinuxDevboxResetObservationTests.swift
+  - ../../Tests/CodexSwitchTests/PopoverUXTests.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../crates/codexswitch-cli/src/quota.rs
   - ../../crates/codexswitch-cli/src/account_store.rs
@@ -474,6 +475,9 @@ that session with the selected stable provider account and presents the same
 confirmation action. Cancel, dismissal, a local authorization rejection, a
 transport failure proven not to have started, and a terminal authority response
 all clear the local session so the command can be opened again immediately.
+The popover's outside-click monitor treats its attached sheets and descendant
+windows as inside interactions. It must not close the popover before a native
+confirmation button receives its click; unrelated windows still dismiss it.
 Only an authority response that is genuinely outcome-unknown or reconciling may
 keep a second submission disabled. Rebuilding, reordering, or dismissing the
 menu popover must never leave a hidden card-local presentation flag latched.

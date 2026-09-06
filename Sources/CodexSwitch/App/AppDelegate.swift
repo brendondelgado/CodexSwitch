@@ -9755,7 +9755,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         if let popoverWindow = popover.contentViewController?.view.window,
-           event.window === popoverWindow {
+           Self.isPopoverInteractionWindow(event.window, popoverWindow: popoverWindow) {
             return
         }
         if let statusButtonWindow = statusItem.button?.window,
@@ -9763,6 +9763,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         closePopover()
+    }
+
+    static func isPopoverInteractionWindow(_ eventWindow: NSWindow?, popoverWindow: NSWindow) -> Bool {
+        var candidates = eventWindow.map { [$0] } ?? []
+        var visited = Set<ObjectIdentifier>()
+        while let window = candidates.popLast() {
+            guard visited.insert(ObjectIdentifier(window)).inserted else { continue }
+            if window === popoverWindow { return true }
+            // Native confirmation sheets receive mouse events in their own window.
+            if let parent = window.parent { candidates.append(parent) }
+            if let sheetParent = window.sheetParent { candidates.append(sheetParent) }
+        }
+        return false
     }
 
     private func clampPopoverToVisibleScreen(relativeTo button: NSStatusBarButton) {
