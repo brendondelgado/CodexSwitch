@@ -2,8 +2,10 @@
 import asyncio
 import importlib.util
 import json
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -49,6 +51,7 @@ class CodexThreadToolsMcpTests(unittest.TestCase):
             "set_thread_pinned": "unsupported:no-native-app-server-pin-api",
             "archive_thread": "thread/archive",
             "unarchive_thread": "thread/unarchive",
+            "unsubscribe_thread": "thread/unsubscribe",
             "handoff_thread": "synthetic:thread/start-or-fork+turn/start",
         }
         self.assertEqual(self.module.TOOL_RPC_METHODS, expected)
@@ -102,6 +105,28 @@ class CodexThreadToolsMcpTests(unittest.TestCase):
         message = self.module.build_handoff_message("thr_source", "Please pick this up.")
         self.assertIn("Synthetic Codex thread handoff from thr_source", message)
         self.assertTrue(message.endswith("Please pick this up."))
+
+    def test_socket_follows_codex_home_not_account(self):
+        with patch.object(self.module, "APP_SERVER_URL", "unix://"):
+            with patch.dict(os.environ, {"CODEX_HOME": "/tmp/test-codex"}):
+                self.assertEqual(self.module.desktop_socket_path(),
+                                 "/tmp/test-codex/app-server-control/app-server-control.sock")
+            with patch.dict(os.environ, {"CODEX_HOME": ""}):
+                self.assertEqual(self.module.desktop_socket_path(), str(
+                    pathlib.Path.home() / ".codex/app-server-control/app-server-control.sock"))
+
+    def test_legacy_tcp_and_relative_routes_fail_closed(self):
+        for url in ["ws://127.0.0.1:8390", "wss://example.test", "unix://relative", ""]:
+            with self.subTest(url=url), patch.object(self.module, "APP_SERVER_URL", url):
+                with self.assertRaises(ValueError):
+                    self.module.desktop_socket_path()
+
+    def test_sandbox_compatibility(self):
+        self.assertIsNone(self.module.turn_sandbox_policy(None))
+        self.assertEqual(self.module.turn_sandbox_policy("read-only"),
+                         {"type": "readOnly", "networkAccess": False})
+        with self.assertRaises(ValueError):
+            self.module.turn_sandbox_policy("invalid")
 
     def test_thread_id_extraction_supports_hook_response(self):
         self.assertEqual(self.module.extract_thread_id({"thread": {"id": "thr_123"}}), "thr_123")
@@ -260,6 +285,201 @@ class CodexThreadToolsMcpProtocolTests(unittest.IsolatedAsyncioTestCase):
 
         names = {tool.name for tool in tools.tools}
         self.assertTrue(set(self.module.TOOL_RPC_METHODS).issubset(names))
+
+    async def test_missing_rollout_requires_live_idle_and_empty_turns(self):
+        for status, turns, allowed in [
+            ("idle", [], True), ("active", [], False),
+            ("notLoaded", [], False), ("idle", [{"status": "completed"}], False),
+            ("idle", None, False), ("idle", [{"status": "inProgress"}], False),
+        ]:
+            with self.subTest(status=status, turns=turns):
+                ws = AsyncMock()
+                methods = []
+
+                async def fake(_ws, _id, method, params=None, **kwargs):
+                    methods.append(method)
+                    if method == "thread/read":
+                        if params.get("includeTurns"):
+                            return {"thread": {"status": {"type": status}, "turns": turns}}
+                        return {"thread": {"status": {"type": "idle"}}}
+                    if method == "thread/turns/list":
+                        raise self.module.AppServerRPCError(method, -32600, "missing source rollout")
+                    self.fail(f"mutating preflight: {method}")
+
+                with patch.object(self.module, "_send_request", AsyncMock(side_effect=fake)):
+                    if allowed:
+                        await self.module.assert_thread_has_no_active_turn(ws, "new")
+                    else:
+                        with self.assertRaises((self.module.AppServerRPCError, self.module.ActiveTurnError)):
+                            await self.module.assert_thread_has_no_active_turn(ws, "new")
+                self.assertEqual(methods, ["thread/read", "thread/turns/list", "thread/read"])
+
+    async def test_other_history_errors_fail_without_mutation(self):
+        ws = AsyncMock()
+        request = AsyncMock(side_effect=[
+            {"thread": {"status": {"type": "idle"}}},
+            self.module.AppServerRPCError("thread/turns/list", -32600, "history unavailable"),
+        ])
+        with patch.object(self.module, "_send_request", request):
+            with self.assertRaises(self.module.AppServerRPCError):
+                await self.module.assert_thread_has_no_active_turn(ws, "target")
+        self.assertEqual(request.await_count, 2)
+
+    async def test_lost_turn_start_response_is_not_retried(self):
+        ws = AsyncMock()
+        request = AsyncMock(side_effect=[
+            {"thread": {"status": {"type": "idle"}}}, {"data": []},
+            {}, ConnectionError("response lost after dispatch"),
+        ])
+        connect = AsyncMock(return_value=ws)
+        with patch.object(self.module, "_connect_initialized", connect), patch.object(
+            self.module, "_send_request", request
+        ):
+            with self.assertRaises(ConnectionError):
+                await self.module.start_turn(**self.start_turn_kwargs())
+        self.assertEqual([call.args[2] for call in request.await_args_list],
+                         ["thread/read", "thread/turns/list", "thread/resume", "turn/start"])
+        connect.assert_awaited_once()
+        ws.close.assert_awaited_once()
+
+
+class SharedOwnerSocketTests(unittest.IsolatedAsyncioTestCase):
+    """Real transport fixture; task lifecycle is deliberately deterministic."""
+
+    async def asyncSetUp(self):
+        import fcntl
+        from websockets.asyncio.server import unix_serve
+
+        self.module = load_module()
+        self.temp = tempfile.TemporaryDirectory(prefix="ctm-", dir="/tmp")
+        self.addCleanup(self.temp.cleanup)
+        self.socket = str(pathlib.Path(self.temp.name) / "server.sock")
+        self.lock_path = pathlib.Path(self.temp.name) / "writer.lock"
+        self.writer = self.lock_path.open("w")
+        self.addCleanup(self.writer.close)
+        fcntl.flock(self.writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.active = False
+        self.turn_count = 0
+        self.methods = []
+        self.subscribers = set()
+        self.account_generation = 1
+        self.reject_initialize = False
+        self.connections = 0
+        self.module.APP_SERVER_URL = "unix://" + self.socket
+        self.server = await unix_serve(self.handle, self.socket)
+        self.addAsyncCleanup(self.close_server)
+
+    async def close_server(self):
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def handle(self, ws):
+        self.connections += 1
+        self.assertNotIn("Sec-WebSocket-Extensions", ws.request.headers)
+        initialized = False
+        try:
+            async for raw in ws:
+                request = json.loads(raw)
+                method = request["method"]
+                self.methods.append(method)
+                if method == "initialized":
+                    initialized = True
+                    continue
+                response = {"id": request["id"]}
+                if method == "initialize":
+                    if self.reject_initialize:
+                        response["error"] = {"code": -1, "message": "fixture failure"}
+                    else:
+                        response["result"] = {"userAgent": "fixture"}
+                elif not initialized:
+                    response["error"] = {"code": -1, "message": "not initialized"}
+                else:
+                    result = {}
+                    thread = {"id": "fixture-thread", "status": {
+                        "type": "active" if self.active else "idle"}}
+                    if method in {"thread/start", "thread/fork", "thread/resume"}:
+                        self.subscribers.add(ws)
+                        result = {"thread": thread}
+                    elif method == "thread/read":
+                        result = {"thread": thread, "generation": self.account_generation}
+                    elif method == "thread/turns/list":
+                        result = {"data": []}
+                    elif method == "turn/start":
+                        self.active = True
+                        self.turn_count += 1
+                        result = {"turn": {"id": f"turn-{self.turn_count}", "status": "inProgress"}}
+                    elif method == "thread/unsubscribe":
+                        self.subscribers.discard(ws)
+                        result = {"status": "notSubscribed"}
+                    response["result"] = result
+                await ws.send(json.dumps(response))
+        finally:
+            self.subscribers.discard(ws)
+
+    async def test_active_detach_desktop_progress_followup_and_auth_reconnect_share_owner(self):
+        import fcntl
+
+        created = await self.module.create_thread(initial_message="fixture only")
+        self.assertEqual(created["threadId"], "fixture-thread")
+        self.assertTrue(created["initialTurn"]["detached"])
+        self.assertTrue(self.active)
+        desktop = await self.module._connect_initialized()
+        try:
+            resumed = await self.module._send_request(desktop, 2, "thread/resume", {
+                "threadId": created["threadId"]})
+            self.assertEqual(resumed["thread"]["status"]["type"], "active")
+            with self.lock_path.open("r+") as competing_writer:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(competing_writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for subscriber in list(self.subscribers):
+                await subscriber.send(json.dumps({"method": "item/agentMessage/delta",
+                                                 "params": {"delta": "progress"}}))
+            event = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+            self.assertEqual(event["params"]["delta"], "progress")
+            self.active = False
+        finally:
+            await desktop.close()
+        self.account_generation = 2  # Simulated server auth reload, no endpoint change.
+        read = await self.module.read_thread(created["threadId"])
+        self.assertEqual(read["response"]["generation"], 2)
+        sent = await self.module.send_message_to_thread(created["threadId"], "follow-up")
+        self.assertTrue(sent["response"]["detached"])
+        self.assertEqual(self.turn_count, 2)
+        reconnected = await self.module._connect_initialized()
+        try:
+            resumed = await self.module._send_request(reconnected, 2, "thread/resume", {
+                "threadId": created["threadId"]})
+            self.assertEqual(resumed["thread"]["status"]["type"], "active")
+        finally:
+            await reconnected.close()
+
+    async def test_unsubscribe_never_resumes_or_claims_writer_handoff(self):
+        result = await self.module.unsubscribe_thread("fixture-thread")
+        self.assertNotIn("thread/resume", self.methods)
+        self.assertIn("does not transfer", result["note"])
+
+    async def test_missing_socket_does_not_connect_tcp(self):
+        self.module.APP_SERVER_URL += "-missing"
+        with patch.object(self.module.websockets, "connect") as tcp:
+            with self.assertRaisesRegex(RuntimeError, "no fallback server was started"):
+                await self.module.create_thread()
+            tcp.assert_not_called()
+        self.assertEqual(self.connections, 0)
+
+    async def test_initialization_error_is_not_retried_and_no_task_is_started(self):
+        self.reject_initialize = True
+        with self.assertRaises(self.module.AppServerRPCError):
+            await self.module.create_thread()
+        self.assertEqual(self.methods, ["initialize"])
+        self.assertEqual(self.connections, 1)
+
+    async def test_legacy_tcp_route_never_opens_a_connection(self):
+        self.module.APP_SERVER_URL = "ws://127.0.0.1:8390"
+        with patch.object(self.module.websockets, "connect") as tcp:
+            with self.assertRaisesRegex(ValueError, "separate task owners"):
+                await self.module.create_thread()
+            tcp.assert_not_called()
+        self.assertEqual(self.connections, 0)
 
 
 if __name__ == "__main__":

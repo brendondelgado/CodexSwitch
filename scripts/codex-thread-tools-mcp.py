@@ -3,7 +3,7 @@
 
 This server is intentionally thin: it registers model-callable tools with the
 names Codex agents already look for, then maps them to the VPS app-server's
-native JSON-RPC methods on 127.0.0.1:8390.
+native JSON-RPC methods on the desktop's existing Unix-socket server.
 """
 
 from __future__ import annotations
@@ -13,13 +13,15 @@ import json
 import os
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import websockets
+from websockets.exceptions import InvalidHandshake
 from mcp.server.fastmcp import FastMCP
 
 
-APP_SERVER_URL = os.environ.get("CODEX_THREAD_TOOLS_APP_SERVER_URL", "ws://127.0.0.1:8390")
+APP_SERVER_URL = os.environ.get("CODEX_THREAD_TOOLS_APP_SERVER_URL", "unix://")
 DEFAULT_CWD = os.environ.get("CODEX_THREAD_TOOLS_DEFAULT_CWD", "/home/signul/SIGNUL")
 REQUEST_TIMEOUT_SEC = float(os.environ.get("CODEX_THREAD_TOOLS_TIMEOUT_SEC", "30"))
 
@@ -36,6 +38,7 @@ TOOL_RPC_METHODS = {
     "set_thread_pinned": "unsupported:no-native-app-server-pin-api",
     "archive_thread": "thread/archive",
     "unarchive_thread": "thread/unarchive",
+    "unsubscribe_thread": "thread/unsubscribe",
     "handoff_thread": "synthetic:thread/start-or-fork+turn/start",
 }
 
@@ -139,6 +142,7 @@ def build_turn_start_params(
     approval_policy: str | None,
     service_tier: str | None,
     client_user_message_id: str | None = None,
+    sandbox: str | None = None,
 ) -> dict[str, Any]:
     if not message.strip():
         raise ValueError("message must not be empty")
@@ -151,9 +155,24 @@ def build_turn_start_params(
             "model": model,
             "effort": effort,
             "approvalPolicy": approval_policy,
+            "sandboxPolicy": turn_sandbox_policy(sandbox),
             "serviceTier": service_tier,
         }
     )
+
+
+def turn_sandbox_policy(sandbox: str | None) -> dict[str, Any] | None:
+    """Preserve the installed helper's explicit turn sandbox overrides."""
+    if sandbox is None:
+        return None
+    policies = {
+        "danger-full-access": {"type": "dangerFullAccess"},
+        "read-only": {"type": "readOnly", "networkAccess": False},
+        "workspace-write": {"type": "workspaceWrite", "networkAccess": True},
+    }
+    if sandbox not in policies:
+        raise ValueError(f"unsupported sandbox mode: {sandbox}")
+    return policies[sandbox]
 
 
 def build_handoff_message(source_thread_id: str | None, message: str) -> str:
@@ -256,8 +275,34 @@ async def _send_request(
         return result if isinstance(result, dict) else {"result": result}
 
 
+def desktop_socket_path() -> str:
+    if APP_SERVER_URL == "unix://":
+        home = Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
+        path = home / "app-server-control" / "app-server-control.sock"
+    elif APP_SERVER_URL.startswith("unix:///"):
+        path = Path(APP_SERVER_URL[len("unix://"):])
+    else:
+        raise ValueError(
+            "Desktop task tools require CODEX_THREAD_TOOLS_APP_SERVER_URL=unix:// "
+            "or unix:///absolute/path.sock. TCP app-servers are separate task owners."
+        )
+    if not path.is_absolute() or "?" in str(path) or "#" in str(path):
+        raise ValueError("The desktop app-server socket must be an absolute local path")
+    return str(path)
+
+
 async def _connect_initialized() -> websockets.ClientConnection:
-    ws = await websockets.connect(APP_SERVER_URL, max_size=64 * 1024 * 1024)
+    path = desktop_socket_path()
+    try:
+        ws = await websockets.unix_connect(
+            path, uri="ws://localhost/", max_size=64 * 1024 * 1024,
+            open_timeout=REQUEST_TIMEOUT_SEC, close_timeout=2, compression=None,
+        )
+    except (OSError, asyncio.TimeoutError, InvalidHandshake) as exc:
+        raise RuntimeError(
+            f"Desktop app-server unavailable at {path}. Connect the desktop VPS "
+            "remote and verify CODEX_HOME/socket routing; no fallback server was started."
+        ) from exc
     try:
         await _send_request(
             ws,
@@ -270,8 +315,12 @@ async def _connect_initialized() -> websockets.ClientConnection:
                 "optOutNotificationMethods": ["item/agentMessage/delta"],
             },
         )
+        await asyncio.wait_for(
+            ws.send(json.dumps({"jsonrpc": "2.0", "method": "initialized"})),
+            timeout=REQUEST_TIMEOUT_SEC,
+        )
         return ws
-    except Exception:
+    except BaseException:
         await ws.close()
         raise
 
@@ -309,7 +358,22 @@ async def assert_thread_has_no_active_turn(
                 },
             )
         except AppServerRPCError as exc:
-            if exc.code != -32601:
+            if exc.code == -32601:
+                pass
+            elif "missing source rollout" in str(exc.detail):
+                # A newly started, loaded task has no persisted rollout until its first turn.
+                live = await _send_request(
+                    ws, 6, "thread/read", {"threadId": thread_id, "includeTurns": True}
+                )
+                thread = live.get("thread") or {}
+                evidence = active_turn_evidence_from_thread_read(live)
+                if evidence is None and not (
+                    isinstance(thread, dict)
+                    and normalize_status(thread.get("status")) == "idle"
+                    and thread.get("turns") == []
+                ):
+                    raise exc
+            else:
                 raise
         else:
             evidence = active_turn_evidence_from_turns(
@@ -340,6 +404,7 @@ async def start_turn(
     wait_for_completion: bool,
     wait_timeout_sec: int,
     max_events: int,
+    sandbox: str | None = None,
 ) -> dict[str, Any]:
     params = build_turn_start_params(
         thread_id=thread_id,
@@ -349,6 +414,7 @@ async def start_turn(
         effort=effort,
         approval_policy=approval_policy,
         service_tier=service_tier,
+        sandbox=sandbox,
     )
     ws = await _connect_initialized()
     try:
@@ -461,6 +527,7 @@ async def create_thread(
             wait_for_completion=False,
             wait_timeout_sec=1,
             max_events=1,
+            sandbox=sandbox,
         )
     return {"rpcMethod": TOOL_RPC_METHODS["create_thread"], "threadId": thread_id, "response": result, **extra}
 
@@ -507,6 +574,7 @@ async def send_message_to_thread(
     wait_for_completion: bool = False,
     wait_timeout_sec: int = 30,
     max_events: int = 100,
+    sandbox: str | None = None,
 ) -> dict[str, Any]:
     result = await start_turn(
         thread_id=thread_id,
@@ -519,6 +587,7 @@ async def send_message_to_thread(
         wait_for_completion=wait_for_completion,
         wait_timeout_sec=wait_timeout_sec,
         max_events=max_events,
+        sandbox=sandbox,
     )
     return {"rpcMethod": TOOL_RPC_METHODS["send_message_to_thread"], "response": result}
 
@@ -559,6 +628,17 @@ async def unarchive_thread(thread_id: str) -> dict[str, Any]:
     return {"rpcMethod": TOOL_RPC_METHODS["unarchive_thread"], "response": result}
 
 
+@mcp.tool(description="Unsubscribe only this connection. Does not transfer task ownership or release another writer.")
+async def unsubscribe_thread(thread_id: str) -> dict[str, Any]:
+    result = await app_server_request("thread/unsubscribe", {"threadId": thread_id})
+    return {
+        "rpcMethod": TOOL_RPC_METHODS["unsubscribe_thread"],
+        "threadId": thread_id,
+        "response": result,
+        "note": "Connection-only unsubscribe; this does not transfer or release writer ownership.",
+    }
+
+
 @mcp.tool(
     description=(
         "Synthetic handoff helper. If target_thread_id is provided, send the handoff "
@@ -577,6 +657,7 @@ async def handoff_thread(
     approval_policy: str | None = None,
     service_tier: str | None = None,
     wait_for_completion: bool = False,
+    sandbox: str | None = None,
 ) -> dict[str, Any]:
     handoff_message = build_handoff_message(source_thread_id, message)
     created: dict[str, Any] | None = None
@@ -588,7 +669,7 @@ async def handoff_thread(
             cwd=cwd,
             model=model,
             approval_policy=approval_policy,
-            sandbox=None,
+            sandbox=sandbox,
             service_tier=service_tier,
             ephemeral=False,
             title=title,
@@ -599,7 +680,7 @@ async def handoff_thread(
             cwd=cwd,
             model=model,
             approval_policy=approval_policy,
-            sandbox=None,
+            sandbox=sandbox,
             service_tier=service_tier,
             ephemeral=False,
             title=title,
@@ -619,6 +700,7 @@ async def handoff_thread(
         wait_for_completion=wait_for_completion,
         wait_timeout_sec=30,
         max_events=100,
+        sandbox=sandbox,
     )
     return {
         "rpcMethod": TOOL_RPC_METHODS["handoff_thread"],

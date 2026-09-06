@@ -71,11 +71,12 @@ cross_dependencies:
   - macos-runtime-artifact.md
   - system-overview.md
   - ../runbooks/codexswitch-hot-swap-verification.md
+  - ../runbooks/codex-vps-thread-tools-mcp.md
   - ../runbooks/linux-repository-deployment.md
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-09-05
+  last_updated: 2026-09-06
 ---
 
 # Runtime And Host Ownership
@@ -1668,6 +1669,13 @@ actor boundary on every supported Swift 6 toolchain.
   completed `account/updated` write. SSH/Unix transport alone never supplies
   headless classification, and no VPS runtime may claim
   `managed-desktop-bridge`.
+- Desktop-facing task tools must use the desktop's existing Unix-socket
+  app-server, never the independent port-8390 writer. Shared history is not
+  shared live ownership, and unsubscribe is not an ownership transfer. Missing
+  desktop sockets fail without starting or falling back to another server.
+  This routing invariant does not change either runtime's account reload
+  participation. See `../runbooks/codex-vps-thread-tools-mcp.md` for deployment
+  and disposable-task verification.
 - A Linux app-server whose executable is not the canonical runtime in the
   immutable `current` release is an explicit convergence blocker. Its ACK can
   never clear a degraded activation, even when its markers and credentials are
