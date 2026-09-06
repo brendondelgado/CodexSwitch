@@ -178,13 +178,23 @@ struct PopoverContentView: View {
         for account: CodexAccount,
         now: Date = Date()
     ) {
-        resetRedemptionConfirmation.open(
+        let opened = resetRedemptionConfirmation.open(
             requestedAccount: account,
             accounts: manager.accounts,
             presentations: manager.rateLimitResetPresentations,
             authorization: resetRedemptionAuthorization,
             now: now
         )
+        if !opened {
+            manager.publishActivationNotice(
+                RateLimitResetRedemptionActionPresentation.resolve(
+                    account: account,
+                    inventory: manager.rateLimitResetPresentations[account.id],
+                    coordinatorAuthorization: resetRedemptionAuthorization(account.id),
+                    now: now
+                ).helpText
+            )
+        }
     }
 
     private func confirmResetRedemption(
@@ -474,6 +484,9 @@ struct PopoverContentView: View {
                                     },
                                     onRefreshResetInventory: {
                                         onRefreshResetInventory(account.id)
+                                    },
+                                    onResetRedemptionUnavailable: {
+                                        manager.publishActivationNotice($0)
                                     },
                                     onReauthenticate: {
                                         onReauthenticate(account.id)

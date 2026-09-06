@@ -28,6 +28,8 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/AccountPersistenceCoordinator.swift
   - ../../Sources/CodexSwitch/Services/AccountPersistenceSubmissionQueue.swift
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  - ../../Sources/CodexSwitch/Models/LinuxDevboxResetObservation.swift
+  - ../../Tests/CodexSwitchTests/LinuxDevboxResetObservationTests.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../../crates/codexswitch-cli/src/quota.rs
   - ../../crates/codexswitch-cli/src/account_store.rs
@@ -40,7 +42,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-09-04
+  last_updated: 2026-09-06
 ---
 
 # Quota And Reset Policy
@@ -331,6 +333,22 @@ the prior candidate never started. A timeout, missing completion marker,
 connection loss, or any other failure after launch is outcome-unknown and is
 never replayed automatically. The caller must reconcile durable VPS reset and
 quota state before offering another manual submission.
+
+Manual VPS reset compatibility is a separate observation from runtime hot-swap
+readiness. A successful, bounded account/journal read may authorize that
+compatibility check even when `doctor` reports an unacknowledged app-server
+reload. Bind the observation to the exact VPS settings and its fetch time;
+reject stale, changed-host, invalid, unsupported, or unresolved observations.
+Publishing reset compatibility must not refresh runtime identity, mark the VPS
+ready, adopt remote credentials, or switch an account. The manual action still
+requires fresh authority, inventory, blocked quota, and all redemption guards.
+
+An account with available credits must display the reason when redemption is
+disabled and offer a read-only refresh. That refresh checks VPS reset
+compatibility as well as inventory; refreshing only the count cannot repair a
+stale journal observation. Card and context-menu actions use the same policy.
+If eligibility changes between rendering and clicking, show the current reason
+instead of silently dropping the request. Confirmation remains mandatory.
 
 Reset-inventory provider backoff is scoped to the exact normalized account and
 credential generation. Every inventory call, including final orchestration for

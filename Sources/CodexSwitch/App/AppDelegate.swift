@@ -4255,12 +4255,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return .blocked("This account is no longer available")
         }
         if remoteOwned {
-            let compatibility = LinuxDevboxMonitor.manualResetCompatibilityAuthorization(
-                states: accountManager.linuxDevboxAccountStates,
-                observedAt: accountManager.linuxDevboxAccountStatesObservedAt,
-                providerAccountId: account.accountId,
+            let compatibility = accountManager.linuxDevboxResetObservation?.authorization(
+                for: account.accountId,
+                settings: settings,
                 now: now
-            )
+            ) ?? .blocked("Refresh VPS reset status before redeeming")
             guard compatibility.isAuthorized else { return compatibility }
         }
         let configuredAccount = accountManager.configuredAccount
@@ -5059,6 +5058,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         recordManualRateLimitResetError(nil, for: accountId, reason: .manual)
+        if LinuxDevboxMonitor.settings().usesVPSResetAuthority {
+            checkPoolAuthorityStatus()
+            checkLinuxDevboxReadiness(force: true)
+        }
         scheduleRateLimitResetRefresh(for: accountId, force: true)
         SwapLog.append(.debug(
             "RESET_MANUAL_REFRESH_REQUESTED account=\(account.email)"
@@ -10208,6 +10211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let settings = LinuxDevboxMonitor.settings()
         guard settings.isConfigured else {
             NotificationManager.resolveLinuxDevboxReadinessIssue()
+            accountManager.publishLinuxDevboxResetObservation(nil)
             lastLinuxDevboxReady = nil
             lastLinuxDevboxFullCheckAt = nil
             invalidateLinuxDevboxReadinessTask()
@@ -10319,6 +10323,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     await NetworkBackoffGuard.shared.recordSuccess(operation: "linux_devbox_readiness")
                 }
                 let wasReady = self.lastLinuxDevboxReady
+                let accountStateResult = await Task.detached {
+                    LinuxDevboxMonitor.fetchAccountStates(
+                        settings: taskContext.settings
+                    )
+                }.value
+                guard self.linuxDevboxReadinessTaskIsCurrent(taskContext) else {
+                    SwapLog.append(.debug(
+                        "LINUX_DEVBOX_CHECK_DISCARDED reason=stale_after_account_mirror generation=\(taskContext.generation)"
+                    ))
+                    return
+                }
+                switch accountStateResult {
+                case .success(let states):
+                    self.accountManager.publishLinuxDevboxResetObservation(
+                        LinuxDevboxResetObservation(
+                            states: states,
+                            settings: taskContext.settings,
+                            observedAt: Date()
+                        )
+                    )
+                case .failure:
+                    self.accountManager.publishLinuxDevboxResetObservation(nil)
+                }
                 if readiness.ready {
                     let verifiedReadiness = LinuxDevboxStatus(
                         state: .ready,
@@ -10326,17 +10353,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         activeEmail: readiness.activeEmail,
                         activeProviderAccountId: readiness.activeProviderAccountId
                     )
-                    let accountStateResult = await Task.detached {
-                        LinuxDevboxMonitor.fetchAccountStates(
-                            settings: taskContext.settings
-                        )
-                    }.value
-                    guard self.linuxDevboxReadinessTaskIsCurrent(taskContext) else {
-                        SwapLog.append(.debug(
-                            "LINUX_DEVBOX_CHECK_DISCARDED reason=stale_after_account_mirror generation=\(taskContext.generation)"
-                        ))
-                        return
-                    }
                     switch accountStateResult {
                     case .success(let states):
                         self.lastLinuxDevboxReady = true
@@ -10384,6 +10400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 Task {
                     await NetworkBackoffGuard.shared.recordFailure(failure.message, operation: "linux_devbox_readiness")
                 }
+                self.accountManager.publishLinuxDevboxResetObservation(nil)
                 let wasReady = self.lastLinuxDevboxReady
                 self.linuxDevboxConsecutiveIssueChecks += 1
                 let issueCount = self.linuxDevboxConsecutiveIssueChecks

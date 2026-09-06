@@ -373,6 +373,40 @@ struct AccountCardViewTests {
         #expect(!current.handleResetInventoryRefresh())
     }
 
+    @Test("Fresh reset counts still offer refresh when VPS redemption evidence is unavailable")
+    @MainActor
+    func currentInventoryWithStaleCoordinatorOffersRefreshAndReason() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let account = makeRedeemableAccount(now: now)
+        let reason = "Refresh VPS reset status before redeeming"
+        var refreshed = false
+        var submitted = false
+        var displayedReason: String?
+        let view = AccountCardView(
+            account: account,
+            rateLimitResetPresentation: .current(
+                availableCount: 1, nextExpiration: now.addingTimeInterval(86_400)
+            ),
+            rateLimitResetCoordinatorAuthorization: .blocked(reason),
+            onRequestResetRedemption: { submitted = true },
+            onRefreshResetInventory: { refreshed = true },
+            onResetRedemptionUnavailable: { displayedReason = $0 },
+            onReauthenticate: nil, onForceSwap: nil
+        )
+        #expect(view.resetInventoryRefreshIsAvailable)
+        #expect(view.handleResetInventoryRefresh())
+        #expect(refreshed)
+        #expect(!view.handleResetRedemptionRequest(at: now))
+        #expect(displayedReason == reason)
+        #expect(!submitted)
+        let context = RateLimitResetContextMenuPresentation.resolve(
+            account: account, inventory: view.resetInventoryPresentation,
+            coordinatorAuthorization: .blocked(reason), now: now
+        )
+        #expect(!context.isEnabled)
+        #expect(context.unavailableReason == reason)
+    }
+
     @Test("Inline and context-menu redemption share the parent confirmation session")
     func redemptionUsesParentConfirmationSession() throws {
         let cardSource = try String(

@@ -10,6 +10,7 @@ struct AccountCardView: View {
     var rateLimitResetCoordinatorAuthorization: RateLimitResetCoordinatorAuthorization = .authorized
     var onRequestResetRedemption: (() -> Void)? = nil
     var onRefreshResetInventory: (() -> Void)? = nil
+    var onResetRedemptionUnavailable: ((String) -> Void)? = nil
     let onReauthenticate: (() -> Void)?
     let onForceSwap: (() -> Void)?
     @State private var isHovering = false
@@ -362,8 +363,14 @@ struct AccountCardView: View {
 
     var resetInventoryRefreshIsAvailable: Bool {
         account.planPriority > 1
-            && resetInventoryPresentation?.offersObservationRefresh == true
+            && offersResetStatusRefresh
             && onRefreshResetInventory != nil
+    }
+
+    private var offersResetStatusRefresh: Bool {
+        resetInventoryPresentation?.offersObservationRefresh == true
+            || (currentRateLimitResetCount.map { $0 > 0 } == true
+                && !rateLimitResetCoordinatorAuthorization.isAuthorized)
     }
 
     private var currentRateLimitResetCount: Int? {
@@ -387,8 +394,13 @@ struct AccountCardView: View {
     @discardableResult
     @MainActor
     func handleResetRedemptionRequest(at now: Date = Date()) -> Bool {
-        guard resetRedemptionActionPresentation(at: now).isEnabled,
-              let onRequestResetRedemption else {
+        let action = resetRedemptionActionPresentation(at: now)
+        guard action.isEnabled else {
+            onResetRedemptionUnavailable?(action.helpText)
+            return false
+        }
+        guard let onRequestResetRedemption else {
+            onResetRedemptionUnavailable?("Manual reset redemption is not connected")
             return false
         }
         onRequestResetRedemption()
@@ -518,7 +530,7 @@ struct AccountCardView: View {
             if let rateLimitResetLine {
                 let redemptionAction = resetRedemptionActionPresentation()
                 let redemptionIsConnected = onRequestResetRedemption != nil
-                let offersRefresh = resetInventoryPresentation?.offersObservationRefresh == true
+                let offersRefresh = offersResetStatusRefresh
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .top, spacing: 4) {
                         Image(systemName: rateLimitResetLine.systemImage)
@@ -535,6 +547,7 @@ struct AccountCardView: View {
                         text: rateLimitResetLine.text,
                         help: rateLimitResetLine.help
                     ))
+                    .help(rateLimitResetLine.help)
 
                     HStack(spacing: 4) {
                         if offersRefresh {
@@ -547,7 +560,8 @@ struct AccountCardView: View {
                             .buttonStyle(.borderless)
                             .controlSize(.mini)
                             .disabled(!resetInventoryRefreshIsAvailable)
-                            .help("Refresh reset inventory for \(account.email)")
+                            .help("Refresh reset inventory and redemption status for \(account.email)")
+                            .accessibilityLabel("Refresh reset status for \(account.email)")
                         } else if let availableCount = currentRateLimitResetCount,
                                   availableCount > 0 {
                             Button {
@@ -559,6 +573,7 @@ struct AccountCardView: View {
                             .buttonStyle(.borderless)
                             .controlSize(.mini)
                             .disabled(!redemptionAction.isEnabled || !redemptionIsConnected)
+                            .opacity(redemptionAction.isEnabled && redemptionIsConnected ? 1 : 0.45)
                             .help(redemptionIsConnected
                                 ? redemptionAction.helpText
                                 : "Manual reset redemption is not connected")
@@ -569,9 +584,15 @@ struct AccountCardView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .trailing)
+                    if currentRateLimitResetCount.map({ $0 > 0 }) == true,
+                       !redemptionAction.isEnabled {
+                        Text(redemptionAction.helpText)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .foregroundStyle(rateLimitResetLine.color)
-                .help(rateLimitResetLine.help)
             }
 
             if needsReauthentication {
@@ -680,7 +701,6 @@ struct AccountCardView: View {
                 .allowsHitTesting(false)
         }
         .contentShape(RoundedRectangle(cornerRadius: 8))
-        .help(account.email)
         .zIndex(isHovering ? 1 : 0)
         .onHover { hovering in
             isHovering = hovering
@@ -714,7 +734,7 @@ struct AccountCardView: View {
                     onForceSwap?()
                 }
             }
-            if resetInventoryPresentation?.offersObservationRefresh == true {
+            if offersResetStatusRefresh {
                 Button("Refresh reset inventory") {
                     _ = handleResetInventoryRefresh()
                 }

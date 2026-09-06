@@ -47,6 +47,7 @@ final class AccountManager {
     var linuxDevboxStatus: LinuxDevboxStatus = .notConfigured
     var linuxDevboxAccountStates: [LinuxDevboxAccountState] = []
     var linuxDevboxAccountStatesObservedAt: Date?
+    private(set) var linuxDevboxResetObservation: LinuxDevboxResetObservation?
     var tokenSavingsSummary: CodexTokenSavingsSummary?
     var rateLimitResetPresentations: [UUID: RateLimitResetInventoryPresentation] = [:]
     var activationState: AccountActivationState?
@@ -348,6 +349,11 @@ final class AccountManager {
 
     func invalidateLinuxDevboxRuntimeEvidence() {
         linuxDevboxAccountStatesObservedAt = nil
+    }
+
+    func publishLinuxDevboxResetObservation(_ observation: LinuxDevboxResetObservation?) {
+        guard observation != linuxDevboxResetObservation else { return }
+        linuxDevboxResetObservation = observation
     }
 
     func publishActivationState(_ state: AccountActivationState?) {
