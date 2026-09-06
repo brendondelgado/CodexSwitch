@@ -1,0 +1,39 @@
+docs/runbooks/codex-vps-thread-tools-mcp.md
+  s_70c8e194852bb5::t_745a9ecba6f592 6,18,22,42,55-68,72-84,100,155,190-207
+  s_70c8e194852bb5::t_5015266e6d36c4 11,208-224
+  s_70c8e194852bb5::t_79f100a1eb1aa0 69-71
+  s_70c8e194852bb5::t_984ab92bb56d36 114-117
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_d1408e6e2a07c9 74
+  s_70c8e194852bb5::t_745a9ecba6f592 1672-1678
+  s_70c8e194852bb5::t_1e45dcca6bbc1f 79
+scripts/test_codex_thread_tools_mcp.py
+  s_70c8e194852bb5::t_1e45dcca6bbc1f 5,8,54,109-129
+  s_70c8e194852bb5::t_098d89b6abe409 346-377,379-483
+  s_70c8e194852bb5::t_de98eb742c3ae5 328-344
+  s_70c8e194852bb5::t_79f100a1eb1aa0 378
+  s_70c8e194852bb5::t_984ab92bb56d36 289-327
+  s_70c8e194852bb5::t_c29dd6593ec7ad 130
+  s_70c8e194852bb5::t_fb3f2615cbebcb 345
+scripts/codex-thread-tools-mcp.py
+  s_70c8e194852bb5::t_984ab92bb56d36 361-370,374-376
+  s_70c8e194852bb5::t_de98eb742c3ae5 16,371-373
+  s_70c8e194852bb5::t_79f100a1eb1aa0 20,299,301
+  s_70c8e194852bb5::t_3597f30846e97f 6,24,41,145,158,164-177,278-293,295-298,300,302-305,318-321,323,407,417,530,577,590,631-641,660,672,683,703
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "3bce4da7df260871c68eebc1de57d29a6893014e",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
