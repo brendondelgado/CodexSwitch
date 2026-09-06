@@ -38,6 +38,12 @@ struct SettingsView: View {
     @State private var linuxExportError: String?
     @State private var linuxMonitorResult: String?
     @State private var linuxMonitorHealthy: Bool?
+    @State private var vpsRestartBusy = false
+    @State private var showingVPSRestartConfirmation = false
+    @State private var vpsRestartPlan: VPSCodexRestartPlan?
+    @State private var vpsRestartSettings: LinuxDevboxMonitorSettings?
+    @State private var vpsRestartStatus: String?
+    @State private var vpsRestartFailed = false
     @State private var remoteAutomaticResetPolicy: LinuxDevboxAutomaticResetPolicyObservation?
     @State private var remoteAutomaticResetPolicyStatus: String?
     @State private var remoteAutomaticResetPolicyStatusIsError = false
@@ -415,6 +421,38 @@ struct SettingsView: View {
                 }
                 .disabled(!linuxDevboxSettings.isConfigured)
 
+                HStack {
+                    Button {
+                        prepareVPSRestart()
+                    } label: {
+                        Label("Restart VPS Codex...", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(!linuxDevboxSettings.isConfigured || vpsRestartBusy)
+                    .help("Restart the desktop's VPS server after a configuration change")
+                    .confirmationDialog(
+                        "Restart Codex on \(vpsRestartSettings?.host ?? "VPS")?",
+                        isPresented: $showingVPSRestartConfirmation,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Restart VPS Codex", role: .destructive) {
+                            confirmVPSRestart()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("The VPS connection will briefly close. Saved tasks remain, but running work can be interrupted. Account switching stays running.")
+                    }
+                    if vpsRestartBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+
+                if let vpsRestartStatus {
+                    Text(vpsRestartStatus)
+                        .font(.caption)
+                        .foregroundStyle(vpsRestartFailed ? .red : .secondary)
+                        .textSelection(.enabled)
+                }
+
                 if let linuxMonitorResult {
                     Text(linuxMonitorResult)
                         .font(.caption)
@@ -586,6 +624,62 @@ struct SettingsView: View {
                     linuxMonitorHealthy = false
                     linuxMonitorResult = failure.message
                 }
+            }
+        }
+    }
+
+    private func prepareVPSRestart() {
+        guard !vpsRestartBusy else { return }
+        let settings = linuxDevboxSettings
+        vpsRestartBusy = true
+        vpsRestartFailed = false
+        vpsRestartStatus = "Checking \(settings.host)..."
+        vpsRestartPlan = nil
+        vpsRestartSettings = settings
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) {
+                LinuxDevboxMonitor.restartVPSCodex(settings: settings)
+            }.value
+            vpsRestartBusy = false
+            guard settings == linuxDevboxSettings else {
+                vpsRestartFailed = true
+                vpsRestartStatus = "VPS connection changed; check again before restarting"
+                return
+            }
+            switch result {
+            case .success(let response):
+                vpsRestartPlan = response.plan
+                vpsRestartStatus = nil
+                showingVPSRestartConfirmation = response.plan != nil
+            case .failure(let failure):
+                vpsRestartFailed = true
+                vpsRestartStatus = failure.message
+            }
+        }
+    }
+
+    private func confirmVPSRestart() {
+        guard !vpsRestartBusy, let plan = vpsRestartPlan, let settings = vpsRestartSettings else { return }
+        vpsRestartPlan = nil
+        guard settings == linuxDevboxSettings else {
+            vpsRestartFailed = true
+            vpsRestartStatus = "VPS connection changed; check again before restarting"
+            return
+        }
+        vpsRestartBusy = true
+        vpsRestartFailed = false
+        vpsRestartStatus = "Restarting Codex on \(settings.host)..."
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) {
+                LinuxDevboxMonitor.restartVPSCodex(settings: settings, confirmedPlan: plan)
+            }.value
+            vpsRestartBusy = false
+            switch result {
+            case .success(let response):
+                vpsRestartStatus = "Codex \(response.appServerVersion ?? "") restarted on \(settings.host)"
+            case .failure(let failure):
+                vpsRestartFailed = true
+                vpsRestartStatus = failure.message
             }
         }
     }

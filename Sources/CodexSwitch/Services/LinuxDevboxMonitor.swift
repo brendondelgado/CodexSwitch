@@ -1797,6 +1797,88 @@ enum LinuxDevboxMonitor {
         }
     }
 
+    static func restartVPSCodex(
+        settings: LinuxDevboxMonitorSettings,
+        confirmedPlan: VPSCodexRestartPlan? = nil
+    ) -> Result<VPSCodexRestartResult, LinuxDevboxMonitorFailure> {
+        guard settings.isConfigured else {
+            return .failure(LinuxDevboxMonitorFailure(message: "Configure the VPS connection first"))
+        }
+        guard let scriptURL = Bundle.main.url(forResource: "vps-codex-restart", withExtension: "py"),
+              let script = try? Data(contentsOf: scriptURL),
+              !script.isEmpty, script.count <= 48 * 1_024 else {
+            return .failure(LinuxDevboxMonitorFailure(message: "The VPS restart helper is missing; reinstall CodexSwitch"))
+        }
+        return restartVPSCodexWithCandidates(
+            sshArgumentCandidates(settings: settings), script: script, confirmedPlan: confirmedPlan
+        ) { executableURL, arguments, timeout in
+            ProcessRunner.run(
+                executableURL: executableURL, arguments: arguments, timeout: timeout,
+                maxOutputBytes: 16 * 1_024
+            )
+        }
+    }
+
+    static func remoteVPSCodexRestartCommand(script: Data, confirmedPlan: VPSCodexRestartPlan?) -> String? {
+        guard !script.isEmpty, script.count <= 48 * 1_024,
+              confirmedPlan == nil || confirmedPlan?.isValid == true else { return nil }
+        let program = "import base64; exec(compile(base64.b64decode('\(script.base64EncodedString())'), '<codexswitch-vps-restart>', 'exec'))"
+        let arguments: String
+        if let plan = confirmedPlan {
+            arguments = "--restart --pid \(plan.pid) --process-start \(plan.processStart) --config-digest \(plan.configDigest)"
+        } else {
+            arguments = "--check"
+        }
+        return "PYTHONDONTWRITEBYTECODE=1 python3 -c \(shellQuote(program)) \(arguments)"
+    }
+
+    static func restartVPSCodexWithCandidates(
+        _ candidates: [[String]],
+        script: Data,
+        confirmedPlan: VPSCodexRestartPlan? = nil,
+        executionToken: String = UUID().uuidString.lowercased(),
+        runner: (URL, [String], TimeInterval) -> ProcessRunResult
+    ) -> Result<VPSCodexRestartResult, LinuxDevboxMonitorFailure> {
+        guard let command = remoteVPSCodexRestartCommand(script: script, confirmedPlan: confirmedPlan) else {
+            return .failure(LinuxDevboxMonitorFailure(message: "The VPS restart request is invalid"))
+        }
+        let outcome = runSSHOutcomeWithCandidates(
+            candidates, remoteCommand: command, timeout: confirmedPlan == nil ? 50 : 210,
+            retryPolicy: confirmedPlan == nil ? .readOnly : .preExecutionTransportOnly,
+            executionToken: executionToken, runner: runner
+        )
+        let result = outcome.result
+        guard outcome.executionState == .completed, !result.timedOut,
+              result.terminationStatus == 0, !result.stdoutTruncated, !result.stderrTruncated,
+              result.stdout.count <= 16 * 1_024 else {
+            return .failure(LinuxDevboxMonitorFailure(message: confirmedPlan == nil
+                ? "Could not check VPS restart readiness"
+                : "Restart outcome is unknown. Check VPS readiness before trying again; no automatic retry was made"))
+        }
+        guard let response = try? JSONDecoder().decode(VPSCodexRestartResult.self, from: result.stdout),
+              response.schemaVersion == 1 else {
+            return .failure(LinuxDevboxMonitorFailure(message: "The VPS restart response could not be verified"))
+        }
+        if response.status == "blocked" || response.status == "unknown" {
+            let message = response.message.flatMap { value in
+                value.utf8.count <= 240 && value.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value != 127 }
+                    ? value : nil
+            }
+            return .failure(LinuxDevboxMonitorFailure(message: message ?? "VPS restart is blocked; check readiness"))
+        }
+        guard response.status == (confirmedPlan == nil ? "ready" : "restarted"),
+              let observedPlan = response.plan else {
+            return .failure(LinuxDevboxMonitorFailure(message: "The VPS restart identity could not be verified"))
+        }
+        if let confirmedPlan {
+            guard response.hasValidVersion, observedPlan != confirmedPlan,
+                  observedPlan.configDigest == confirmedPlan.configDigest else {
+                return .failure(LinuxDevboxMonitorFailure(message: "The replacement VPS server could not be verified"))
+            }
+        }
+        return .success(response)
+    }
+
     static func fetchPoolAuthorityStatus(
         settings: LinuxDevboxMonitorSettings
     ) -> Result<PoolAuthorityObservation, LinuxDevboxMonitorFailure> {

@@ -10,6 +10,10 @@ SCRIPT = (ROOT / "scripts" / "build-app.sh").read_text()
 
 
 class BuildAppInstallerTests(unittest.TestCase):
+    def test_bundle_includes_the_vps_restart_helper(self) -> None:
+        self.assertIn('"$PROJECT_DIR/scripts/vps-codex-restart.py"', SCRIPT)
+        self.assertIn('"$APP_BUNDLE/Contents/Resources/vps-codex-restart.py"', SCRIPT)
+
     def test_bundle_prohibits_parallel_app_instances(self) -> None:
         self.assertIn("<key>LSMultipleInstancesProhibited</key>", SCRIPT)
         self.assertIn(

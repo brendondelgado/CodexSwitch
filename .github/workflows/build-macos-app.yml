@@ -111,7 +111,8 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
             scripts.test_patch_asar \
             scripts.test_build_app \
-            scripts.test_macos_app_artifact
+            scripts.test_macos_app_artifact \
+            scripts.test_vps_codex_restart
 
       - name: Prepare the lockfile-pinned ASAR tool
         run: |
@@ -200,6 +201,7 @@ jobs:
             local bundle="$1"
             local executable="$bundle/Contents/MacOS/CodexSwitch"
             local patcher="$bundle/Contents/Resources/patch-asar.py"
+            local vps_restart="$bundle/Contents/Resources/vps-codex-restart.py"
             local asar_cli="$bundle/Contents/Resources/asar-tool/node_modules/@electron/asar/bin/asar.mjs"
             local asar_module="$bundle/Contents/Resources/asar-tool/node_modules/@electron/asar/lib/asar.js"
             local asar_package="$bundle/Contents/Resources/asar-tool/package.json"
@@ -215,6 +217,10 @@ jobs:
               || fail "app executable is missing, linked, or not executable"
             [[ -f "$patcher" && ! -L "$patcher" && -s "$patcher" ]] \
               || fail "bundled patch-asar.py is missing or linked"
+            [[ -f "$vps_restart" && ! -L "$vps_restart" && -s "$vps_restart" ]] \
+              || fail "bundled VPS restart helper is missing or linked"
+            /usr/bin/cmp -s scripts/vps-codex-restart.py "$vps_restart" \
+              || fail "bundled VPS restart helper differs from the dispatched source"
             [[ -f "$asar_cli" && ! -L "$asar_cli" && -s "$asar_cli" ]] \
               || fail "bundled ASAR CLI is missing or linked"
             [[ -f "$asar_module" && ! -L "$asar_module" && -s "$asar_module" ]] \

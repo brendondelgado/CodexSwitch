@@ -3,6 +3,7 @@ title: VPS connection resilience
 description: Fail-closed runtime ownership, resource policy, and non-mutating recovery guidance for CodexSwitch VPS sessions.
 toc:
   - VPS Connection Resilience
+  - Apply VPS Config Changes
   - Failure Model
   - Observational Check Contract
   - Resource Policy
@@ -33,19 +34,79 @@ cross_dependencies:
   - scripts/lib/install-linux-activation.sh
   - scripts/manifests/linux-systemd-contract.tsv
   - scripts/codex-vps
+  - scripts/vps-codex-restart.py
+  - scripts/test_vps_codex_restart.py
+  - scripts/build-app.sh
   - scripts/test_codex_vps.sh
   - Tests/Fixtures/RuntimeConvergence/reload-contract-v3.json
   - docs/linux-cli-only.md
   - docs/runbooks/linux-repository-deployment.md
   - docs/runbooks/codex-vps-thread-tools-mcp.md
+  - Sources/CodexSwitch/Services/VPSCodexRestartResult.swift
+  - Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  - Sources/CodexSwitch/Views/SettingsView.swift
+  - Tests/CodexSwitchTests/VPSCodexRestartTests.swift
 version_control:
   branch: main
   commit: pending
   status: local_uncommitted
-  last_updated: 2026-09-04
+  last_updated: 2026-09-06
 ---
 
 # VPS Connection Resilience
+
+## Apply VPS Config Changes
+
+After editing the VPS `~/.codex/config.toml`, the desktop-facing daemon can be
+restarted from CodexSwitch Settings > Linux Devbox Monitor > **Restart VPS
+Codex...**. The button first checks the desktop socket's kernel owner, current
+managed executable, valid TOML, native `config/read` validation, and idle state
+of every loaded task. Returned config values are never displayed. Active or
+unknown work blocks the action. The confirmation binds the process identity
+and config digest, and both are checked again before shutdown. This is an
+explicit operation, not an automatic or scheduled restart. The final idle read
+cannot atomically prevent another client from starting work, so do not start
+new VPS work while confirming the restart.
+
+The bundled `scripts/vps-codex-restart.py` is sent over the configured SSH
+connection and executed without installing or changing the remote helper.
+`--check` is read-only and returns a confirmation plan. `--restart` requires
+that plan's `--pid`, `--process-start`, and `--config-digest`. The action holds
+the shared runtime installation lock and an exclusive restart lock, signals
+only the reverified desktop owner through a Linux pidfd with SIGINT, and waits
+up to 120 seconds. It never sends SIGKILL to the app-server. Once exit is
+proven, it invokes the current patched `codex app-server daemon start` and
+verifies a new socket owner plus initialized handshake. This supports legacy
+desktop SSH servers that have no native daemon PID record; a bare native
+`daemon restart` would refuse those servers and can also force-kill managed
+servers, so the UI does not use it.
+
+This restarts the Unix-socket server used by ChatGPT's built-in SSH connection.
+It does not restart CodexSwitch account switching, the independent port-8390
+service, or local Mac apps. `codex-vps restart` is not equivalent: it targets
+the port-8390 service and its bridge instead. Keep task helpers routed to the
+desktop Unix socket as specified in the thread-tools runbook.
+
+The UI uses the configured SSH host/user/key/port, snapshots the target when
+confirmation opens, disables duplicate requests, and runs the command off the
+UI thread. A changed target cancels the pending confirmation. It does not echo
+raw remote errors because invalid configuration diagnostics can contain secret
+values. Transport uncertainty does not trigger automatic redispatch. A green
+result requires the helper's complete `restarted` response with a new process
+identity, unchanged config digest, and version. If the outcome is
+unknown, inspect VPS readiness before trying again.
+
+The restarted server rereads configuration. Saved task history remains, but
+interrupted turns may need to be resumed, and explicit task/model overrides
+can still take precedence over config defaults. Reopen the VPS task if the
+desktop does not reconnect automatically. Restarting a server is not proof
+that every pre-existing task adopted a changed default.
+
+Regression coverage uses fake SSH runners, process identities, and lifecycle
+responses, including active tasks, PID/config/socket drift, graceful-stop
+timeout, replacement validation, invalid JSON, rejected execution,
+missing completion markers, and definite local launch failure. Tests
+must not restart the live VPS or require a real config change.
 
 ## Failure Model
 

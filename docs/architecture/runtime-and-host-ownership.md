@@ -72,6 +72,7 @@ cross_dependencies:
   - system-overview.md
   - ../runbooks/codexswitch-hot-swap-verification.md
   - ../runbooks/codex-vps-thread-tools-mcp.md
+  - ../../Sources/CodexSwitch/Services/VPSCodexRestartResult.swift
   - ../runbooks/linux-repository-deployment.md
 version_control:
   branch: main
@@ -1676,6 +1677,19 @@ actor boundary on every supported Swift 6 toolchain.
   This routing invariant does not change either runtime's account reload
   participation. See `../runbooks/codex-vps-thread-tools-mcp.md` for deployment
   and disposable-task verification.
+- Applying VPS `config.toml` changes through the Mac UI is an explicit operator
+  restart of the desktop Unix daemon, not an account reload. The UI must name
+  the selected VPS and require confirmation. A bounded read-only preflight must
+  prove the exact socket owner, current executable, valid configuration, and no
+  active loaded tasks. Confirmation binds PID, process start, and config digest;
+  all are rechecked immediately before a pidfd-bound SIGINT. Never force-kill
+  the app-server. After verified exit, use the immutable-current patched Codex
+  `app-server daemon start` command under the shared runtime installation lock.
+  This also supports legacy SSH-launched servers without native daemon PID
+  records. Never substitute a port-8390 service restart, terminate desktop
+  proxies, or restart the account-switch daemon. Unknown outcomes are not
+  retried automatically. Success requires a new verified Unix owner and a
+  completed initialized handshake, not only native startup command success.
 - A Linux app-server whose executable is not the canonical runtime in the
   immutable `current` release is an explicit convergence blocker. Its ACK can
   never clear a degraded activation, even when its markers and credentials are

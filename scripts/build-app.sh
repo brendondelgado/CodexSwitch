@@ -139,6 +139,8 @@ cp "$BUILD_BINARY" "$APP_BUNDLE/Contents/MacOS/"
 # depending on whichever checkout happens to exist.
 cp "$PROJECT_DIR/scripts/patch-asar.py" "$APP_BUNDLE/Contents/Resources/patch-asar.py"
 chmod 755 "$APP_BUNDLE/Contents/Resources/patch-asar.py"
+cp "$PROJECT_DIR/scripts/vps-codex-restart.py" "$APP_BUNDLE/Contents/Resources/vps-codex-restart.py"
+chmod 644 "$APP_BUNDLE/Contents/Resources/vps-codex-restart.py"
 
 # Bundle the pinned ASAR tool prepared by the artifact build. Local developer
 # builds may omit it, but release artifacts require the self-contained tool so
