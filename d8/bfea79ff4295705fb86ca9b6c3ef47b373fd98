@@ -1,0 +1,38 @@
+Sources/CodexSwitch/Views/AccountCardView.swift
+  s_70c8e194852bb5::t_264e87c91c8930 13,366,370-375,397-403,533,550,563-564,587-593,737
+  s_70c8e194852bb5::t_67a8fcdf36f121 576
+Sources/CodexSwitch/Models/LinuxDevboxResetObservation.swift
+  s_70c8e194852bb5::t_1550e9351e07d3 1-23
+Sources/CodexSwitch/Models/AccountManager.swift
+  s_70c8e194852bb5::t_1550e9351e07d3 50,354-356
+  s_70c8e194852bb5::t_3d2e36d55f71f0 357-358
+Tests/CodexSwitchTests/AccountCardViewTests.swift
+  s_70c8e194852bb5::t_42403c00df1c49 376-409
+Sources/CodexSwitch/Views/PopoverContentView.swift
+  s_70c8e194852bb5::t_264e87c91c8930 181,188-197,488-489
+  s_70c8e194852bb5::t_d8789da9ffb0d7 490
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_1550e9351e07d3 337-352
+  s_70c8e194852bb5::t_6a979627e751d3 45
+  s_70c8e194852bb5::t_495d46ec4f93a5 31-32
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_1550e9351e07d3 4258-4260,4262,5061-5064,10214,10326-10348,10403
+Tests/CodexSwitchTests/LinuxDevboxResetObservationTests.swift
+  s_70c8e194852bb5::t_19bf611ebc63b2 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d8bfea79ff4295705fb86ca9b6c3ef47b373fd98",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
