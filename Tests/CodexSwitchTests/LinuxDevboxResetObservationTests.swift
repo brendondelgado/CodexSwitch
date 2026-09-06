@@ -31,7 +31,8 @@ struct LinuxDevboxResetObservationTests {
     func compatibilityAndRuntimeReadinessAreIndependent() {
         let manager = AccountManager()
         let status = LinuxDevboxStatus(
-            state: .notReady, summary: "App-server has not acknowledged an auth reload"
+            state: .notReady, summary: "App-server has not acknowledged an auth reload",
+            activeEmail: nil
         )
         manager.linuxDevboxStatus = status
         manager.linuxDevboxAccountStatesObservedAt = now
