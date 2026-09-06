@@ -1,0 +1,14 @@
+docs/runbooks/codex-vps-thread-tools-mcp.md
+  h_0ac3831892d2eb 12,204-213,236-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "35209986f5f3ec0317a3785286664260c2fc518a",
+  "prompts": {},
+  "humans": {
+    "h_0ac3831892d2eb": {
+      "author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
