@@ -9,6 +9,7 @@ toc:
   - Mac Sidebar Freshness
   - Verification
   - Staged Canary Evidence
+  - Activated Provider Evidence
 cross_dependencies:
   - scripts/codex-thread-tools-mcp.py
   - scripts/test_codex_thread_tools_mcp.py
@@ -200,6 +201,16 @@ Existing MCP processes keep their old code and environment. Do not restart
 shared services, reload active MCP clients, or switch accounts without approval
 when existing work could be interrupted. New MCP processes pick up the change.
 
+During an approved pause, use the native `config/mcpServer/reload` JSON-RPC
+method with no params on each existing app-server endpoint. The Rust request
+variant is named `McpServerRefresh`, but `mcpServer/refresh` is not a wire method
+in deployed 0.153.2. The reload applies current MCP inputs to loaded tasks
+without restarting either app-server. Its acknowledgment precedes asynchronous
+tool-process replacement: verify the new processes' endpoint environment and a
+real `mcpServer/tool/call` before reporting activation complete. A task waiting
+in a sleep loop may still report `active`; inspect its exact turn and in-flight
+tool activity rather than treating that status as proof of ongoing work.
+
 Check `mcpServerStatus/list` on the desktop Unix endpoint and verify installed
 source hash and selected socket. With a disposable task only: create through
 the helper, open in the desktop while active, follow progress, send a follow-up,
@@ -222,3 +233,25 @@ No shared service, desktop app, or account-switch daemon was restarted, and
 neither protected production task was interrupted or steered. Full desktop
 SSH reconnect and real account-switch testing remain approval-gated; the
 regression fixture covers transport reconnect and simulated auth reload.
+
+## Activated Provider Evidence
+
+After the user's approved pause on 2026-09-06, the installed helper was updated
+to source commit `3bce4da7df260871c68eebc1de57d29a6893014e`, SHA-256
+`02cabfe876144205eda2be496bd704297a9da7dd3904161239fc5efc6fcc2a3a`.
+A TOML-preserving edit changed only the configured provider endpoint to
+`unix://`. The previous helper and configuration are backed up privately at
+`/home/signul/.codexswitch/backups/thread-tools-activation/20260906T200203Z`.
+
+Both existing app-servers acknowledged `config/mcpServer/reload`. All four
+observed replacement provider processes selected `unix://`, with no remaining
+legacy TCP provider process. The desktop endpoint advertised all 12 provider
+tools, and an actual `mcpServer/tool/call` to `read_thread` successfully read the
+disposable canary through its reloaded provider. A follow-up through the
+installed helper completed as `ACTIVATED-UNIX-ROUTE-OK`, turn
+`01a07852-a61b-7af1-bfb1-e1d2f561df16`, on the same canary task.
+
+The Unix app-server, port-8390 app-server, account-switch daemon, ChatGPT, and
+cmux retained their original PIDs and start times. No production task was
+interrupted or steered. This activation did not include a full desktop SSH
+disconnect/reconnect or an actual account switch; those remain separate tests.
