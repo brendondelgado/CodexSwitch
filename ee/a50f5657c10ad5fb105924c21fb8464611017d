@@ -1,0 +1,29 @@
+Sources/CodexSwitch/Models/RateLimitResetPresentation.swift
+  s_70c8e194852bb5::t_a432c6d27a7c50 50-51,93-102
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_a432c6d27a7c50 380,587,4847-4868,4872-4873,4887,4926,9895-9896
+Tests/CodexSwitchTests/AccountCardViewTests.swift
+  s_70c8e194852bb5::t_e38c1ef6f1ef18 289-339
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_a432c6d27a7c50 512-527
+Sources/CodexSwitch/Views/AccountCardView.swift
+  s_70c8e194852bb5::t_a58bd6f4c46abb 17-23,154,274-276,279-281,289-294,357,365,370,521,701,717
+Tests/CodexSwitchTests/RateLimitResetPresentationTests.swift
+  s_70c8e194852bb5::t_d90363ff19b464 91-159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "eea50f5657c10ad5fb105924c21fb8464611017d",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
