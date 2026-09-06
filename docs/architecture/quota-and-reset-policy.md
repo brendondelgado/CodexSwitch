@@ -509,6 +509,22 @@ as manual redemption. Once that bound passes, the UI renders the count as
 last-known/unverified, disables redemption, and suppresses actionable expiration
 urgency until a fresh observation arrives.
 
+The Mac maintains paid-account reset inventory independently of quota polling.
+A fifteen-second, in-memory scheduling tick refreshes a valid bank once it is
+thirty seconds old, including the usable pool target. This leaves time for
+network latency before the unchanged sixty-second evidence deadline. The
+request bypasses only the inventory cache, not provider backoff or the existing
+per-account in-flight guard. It performs an inventory GET only: no full VPS
+doctor, account rotation, reset POST, or quota-log scan. Sleep or a failed
+request still lets evidence expire normally; failure never resets its timestamp.
+
+A read-only refresh does not replace a still-fresh, structurally valid count
+with a loading label. Expired, failed, or missing observations remain explicitly
+non-actionable. A missing transient presentation entry cannot hide a persisted
+count: render it as last-known with an observation-only refresh action, never
+as verified capacity or permission to redeem. Redemption, reconciliation, and
+external-hold labels also retain the saved count when one exists.
+
 Unknown, stale, expired, and refresh-failed reset inventory is neutral
 non-actionable metadata, not an account-health failure. It must not paint an
 account card red or reuse a last-known count as current capacity. Red and

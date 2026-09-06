@@ -47,7 +47,8 @@ enum RateLimitResetInventoryPresentation: Equatable, Sendable {
         if let externalHoldUntil, externalHoldUntil > now {
             return .externalHold(until: externalHoldUntil)
         }
-        if isRefreshing {
+        if isRefreshing && !(inventoryIsFresh && inventoryExists
+            && inventoryIsStructurallyValid && !inventoryHasExpiredAvailableCredit) {
             return .refreshing
         }
         guard inventoryExists else {
@@ -89,6 +90,16 @@ struct VerifiedRateLimitResetCount: Equatable, Sendable {
 
 struct RateLimitResetInventoryObservation: Equatable, Sendable {
     static let presentationMaximumAge: TimeInterval = 60
+    static let refreshInterval: TimeInterval = presentationMaximumAge / 2
+    static let monitorInterval: TimeInterval = refreshInterval / 2
+
+    static func needsRefresh(for account: CodexAccount, at now: Date) -> Bool {
+        guard account.planPriority > 1, account.hasCompleteRuntimeCredentials,
+              account.hasUsableInferenceToken(at: now) else { return false }
+        guard let bank = account.rateLimitResetBank else { return true }
+        return !bank.isFresh(at: now, maxAge: refreshInterval)
+            || bank.structurallyValidAvailableCredits(at: now) == nil
+    }
 
     let freshness: RateLimitResetInventoryFreshness
     let verifiedCount: VerifiedRateLimitResetCount?

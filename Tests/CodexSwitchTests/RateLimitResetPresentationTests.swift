@@ -88,6 +88,75 @@ struct RateLimitResetPresentationTests {
             holdUntil: now.addingTimeInterval(-1),
             refreshing: true,
             fresh: true
+        ) == .current(availableCount: 4, nextExpiration: nil))
+    }
+
+    @Test("Read-only refresh preserves fresh inventory but never extends its deadline")
+    func refreshPreservesOnlyCurrentEvidence() {
+        let expiration = now.addingTimeInterval(600)
+        #expect(resolve(expiration: expiration, refreshing: true, fresh: true)
+            == .current(availableCount: 4, nextExpiration: expiration))
+        #expect(resolve(refreshing: true, fresh: false) == .refreshing)
+        #expect(resolve(refreshing: true, fresh: true, exists: false) == .refreshing)
+        #expect(resolve(refreshing: true, fresh: true, structurallyValid: false) == .refreshing)
+        #expect(resolve(refreshing: true, fresh: true, hasExpiredAvailableCredit: true) == .refreshing)
+        #expect(resolve(error: "offline", refreshing: true, fresh: true)
+            == .error(message: "offline", lastKnownCount: 4))
+    }
+
+    @Test("Paid reset refresh is independent of active-account quota cadence")
+    func paidInventoryRefreshCadence() {
+        var account = makeAccount(email: "active@example.com", providerAccountId: "active")
+        account.rateLimitResetBank = makeBank(fetchedAt: now, expirations: [now.addingTimeInterval(600)])
+        #expect(RateLimitResetInventoryObservation.monitorInterval == 15)
+        #expect(RateLimitResetInventoryObservation.refreshInterval == 30)
+        #expect(RateLimitResetInventoryObservation.presentationMaximumAge
+            == AppDelegate.rateLimitResetDecisionFreshnessInterval)
+        #expect(!RateLimitResetInventoryObservation.needsRefresh(for: account, at: now.addingTimeInterval(29)))
+        #expect(RateLimitResetInventoryObservation.needsRefresh(for: account, at: now.addingTimeInterval(30)))
+        #expect(RateLimitResetInventoryObservation.needsRefresh(for: account, at: now.addingTimeInterval(301)))
+
+        var free = account
+        free.planType = "free"
+        #expect(!RateLimitResetInventoryObservation.needsRefresh(for: free, at: now.addingTimeInterval(301)))
+        var unauthenticated = account
+        unauthenticated.refreshToken = ""
+        #expect(!RateLimitResetInventoryObservation.needsRefresh(for: unauthenticated, at: now.addingTimeInterval(301)))
+        account.rateLimitResetBank = nil
+        #expect(RateLimitResetInventoryObservation.needsRefresh(for: account, at: now))
+    }
+
+    @Test("Normal polling and a slow response keep the bank current across five minutes")
+    func inventoryHeartbeatReplay() {
+        var account = makeAccount(email: "active@example.com", providerAccountId: "active")
+        let expiration = now.addingTimeInterval(3_600)
+        account.rateLimitResetBank = makeBank(fetchedAt: now, expirations: [expiration])
+        var completion: Int?
+        var requests = 0
+        for elapsed in 0...600 {
+            let observedAt = now.addingTimeInterval(TimeInterval(elapsed))
+            if completion == elapsed {
+                account.rateLimitResetBank = makeBank(fetchedAt: observedAt, expirations: [expiration])
+                completion = nil
+            }
+            if elapsed % 15 == 0, completion == nil,
+               RateLimitResetInventoryObservation.needsRefresh(for: account, at: observedAt) {
+                completion = elapsed + 8
+                requests += 1
+            }
+            let fresh = account.rateLimitResetBank!.isFresh(at: observedAt)
+            #expect(fresh)
+            #expect(RateLimitResetInventoryPresentation.resolve(
+                availableCount: 1, nextExpiration: expiration, inventoryIsFresh: fresh,
+                isRefreshing: completion != nil, now: observedAt
+            ) == .current(availableCount: 1, nextExpiration: expiration))
+        }
+        #expect(requests == 13)
+        let offlineAt = now.addingTimeInterval(700)
+        #expect(!account.rateLimitResetBank!.isFresh(at: offlineAt))
+        #expect(RateLimitResetInventoryPresentation.resolve(
+            availableCount: 1, nextExpiration: expiration, inventoryIsFresh: false,
+            isRefreshing: true, now: offlineAt
         ) == .refreshing)
     }
 

@@ -286,6 +286,57 @@ struct AccountCardViewTests {
         #expect(!didRedeem)
     }
 
+    @Test("Missing transient presentation retains saved count without authorizing redemption")
+    @MainActor
+    func missingPresentationRetainsSavedCount() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let account = makeRedeemableAccount(now: now)
+        var didRefresh = false
+        var didRedeem = false
+        let view = AccountCardView(
+            account: account,
+            onRequestResetRedemption: { didRedeem = true },
+            onRefreshResetInventory: { didRefresh = true },
+            onReauthenticate: nil,
+            onForceSwap: nil
+        )
+        #expect(view.resetInventoryPresentation == .unknown(lastKnownCount: 1))
+        #expect(view.resetInventoryRefreshIsAvailable)
+        #expect(view.handleResetInventoryRefresh())
+        #expect(didRefresh)
+        #expect(!view.handleResetRedemptionRequest(at: now))
+        #expect(!didRedeem)
+
+        var noBank = account
+        noBank.rateLimitResetBank = nil
+        #expect(AccountCardView(account: noBank, onReauthenticate: nil, onForceSwap: nil)
+            .resetInventoryPresentation == nil)
+        var zero = account
+        zero.rateLimitResetBank = RateLimitResetBank(
+            availableCount: 0, totalEarnedCount: 0, credits: [], fetchedAt: now
+        )
+        #expect(AccountCardView(account: zero, onReauthenticate: nil, onForceSwap: nil)
+            .resetInventoryPresentation == .unknown(lastKnownCount: 0))
+        var free = account
+        free.planType = "free"
+        #expect(AccountCardView(account: free, onReauthenticate: nil, onForceSwap: nil)
+            .resetInventoryPresentation == nil)
+    }
+
+    @Test("Operation labels preserve the last observed count")
+    @MainActor
+    func operationLabelsRetainCount() {
+        for count in [0, 1, 3] {
+            for state in [RateLimitResetInventoryPresentation.redeeming, .reconciling,
+                          .externalHold(until: Date()), .refreshing] {
+                let text = AccountCardView.rateLimitResetText(
+                    for: state, storedLastKnownCount: count
+                )
+                #expect(text.hasPrefix("Last known: \(count) banked reset"))
+            }
+        }
+    }
+
     @Test("Stale inventory offers an explicit account refresh")
     @MainActor
     func staleInventoryOffersRefresh() {

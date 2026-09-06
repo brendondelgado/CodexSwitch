@@ -14,6 +14,13 @@ struct AccountCardView: View {
     let onForceSwap: (() -> Void)?
     @State private var isHovering = false
 
+    var resetInventoryPresentation: RateLimitResetInventoryPresentation? {
+        guard account.planPriority > 1 else { return nil }
+        return rateLimitResetPresentation ?? account.rateLimitResetBank.map {
+            .unknown(lastKnownCount: max(0, $0.availableCount))
+        }
+    }
+
     private static let activeGreen = Color(red: 0.15, green: 0.68, blue: 0.25)
     static let poolTargetLabel = "Pool Target"
     static let switchPoolTargetLabel = "Switch pool target to this account"
@@ -144,7 +151,7 @@ struct AccountCardView: View {
         systemImage: String,
         urgency: RateLimitResetExpirationUrgency?
     )? {
-        guard account.planPriority > 1, let rateLimitResetPresentation else {
+        guard let rateLimitResetPresentation = resetInventoryPresentation else {
             return nil
         }
 
@@ -264,8 +271,14 @@ struct AccountCardView: View {
     ) -> String {
         switch presentation {
         case .redeeming:
+            if let storedLastKnownCount {
+                return lastKnownResetText(count: storedLastKnownCount, suffix: "redeeming")
+            }
             return "Redeeming banked reset"
         case .reconciling:
+            if let storedLastKnownCount {
+                return lastKnownResetText(count: storedLastKnownCount, suffix: "reconciling")
+            }
             return "Reconciling reset inventory"
         case .error(_, let lastKnownCount):
             return lastKnownResetText(
@@ -273,6 +286,12 @@ struct AccountCardView: View {
                 suffix: "refresh failed"
             )
         case .externalHold:
+            if let storedLastKnownCount {
+                return lastKnownResetText(
+                    count: storedLastKnownCount,
+                    suffix: holdUntilText.map { "on hold until \($0)" } ?? "redemption on hold"
+                )
+            }
             return holdUntilText.map { "Reset hold until \($0)" }
                 ?? "Reset redemption on hold"
         case .refreshing:
@@ -335,7 +354,7 @@ struct AccountCardView: View {
     ) -> RateLimitResetRedemptionActionPresentation {
         RateLimitResetRedemptionActionPresentation.resolve(
             account: account,
-            inventory: rateLimitResetPresentation,
+            inventory: resetInventoryPresentation,
             coordinatorAuthorization: rateLimitResetCoordinatorAuthorization,
             now: now
         )
@@ -343,12 +362,12 @@ struct AccountCardView: View {
 
     var resetInventoryRefreshIsAvailable: Bool {
         account.planPriority > 1
-            && rateLimitResetPresentation?.offersObservationRefresh == true
+            && resetInventoryPresentation?.offersObservationRefresh == true
             && onRefreshResetInventory != nil
     }
 
     private var currentRateLimitResetCount: Int? {
-        guard let rateLimitResetPresentation,
+        guard let rateLimitResetPresentation = resetInventoryPresentation,
               case .current(let availableCount, _) = rateLimitResetPresentation else {
             return nil
         }
@@ -499,7 +518,7 @@ struct AccountCardView: View {
             if let rateLimitResetLine {
                 let redemptionAction = resetRedemptionActionPresentation()
                 let redemptionIsConnected = onRequestResetRedemption != nil
-                let offersRefresh = rateLimitResetPresentation?.offersObservationRefresh == true
+                let offersRefresh = resetInventoryPresentation?.offersObservationRefresh == true
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .top, spacing: 4) {
                         Image(systemName: rateLimitResetLine.systemImage)
@@ -679,7 +698,7 @@ struct AccountCardView: View {
         .contextMenu {
             let resetPresentation = RateLimitResetContextMenuPresentation.resolve(
                 account: account,
-                inventory: rateLimitResetPresentation,
+                inventory: resetInventoryPresentation,
                 coordinatorAuthorization: rateLimitResetCoordinatorAuthorization,
                 redemptionHandlerAvailable: onRequestResetRedemption != nil,
                 now: Date()
@@ -695,7 +714,7 @@ struct AccountCardView: View {
                     onForceSwap?()
                 }
             }
-            if rateLimitResetPresentation?.offersObservationRefresh == true {
+            if resetInventoryPresentation?.offersObservationRefresh == true {
                 Button("Refresh reset inventory") {
                     _ = handleResetInventoryRefresh()
                 }

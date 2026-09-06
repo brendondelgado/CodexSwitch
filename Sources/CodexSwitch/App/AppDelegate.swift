@@ -377,6 +377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }()
     private var linuxDevboxMonitorTimer: Timer?
     private var poolAuthorityMonitorTimer: Timer?
+    private var rateLimitResetInventoryMonitorTimer: Timer?
     private var tokenUsageMetricsTimer: Timer?
     private var tokenUsageRefreshSequence = 0
     private var tokenUsageRefreshInFlight = false
@@ -583,6 +584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             for account in accountManager.accounts {
                 scheduleRateLimitResetRefresh(for: account.id)
             }
+            startRateLimitResetInventoryMonitor()
             primeIdleAccountsIfNeeded()
             refreshSubscriptionInfoIfNeeded(force: true)
             startSwapMonitor()
@@ -4842,10 +4844,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
     }
 
+    private func startRateLimitResetInventoryMonitor() {
+        rateLimitResetInventoryMonitorTimer?.invalidate()
+        rateLimitResetInventoryMonitorTimer = Timer.scheduledTimer(
+            withTimeInterval: RateLimitResetInventoryObservation.monitorInterval,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshRateLimitResetPresentationsIfNeeded()
+            }
+        }
+        refreshRateLimitResetPresentationsIfNeeded()
+    }
+
+    private func refreshRateLimitResetPresentationsIfNeeded() {
+        guard !isExiting else { return }
+        let now = Date()
+        for account in accountManager.accounts where
+            RateLimitResetInventoryObservation.needsRefresh(for: account, at: now) {
+            scheduleRateLimitResetRefresh(for: account.id, refreshForPresentation: true)
+        }
+    }
+
     private func scheduleRateLimitResetRefresh(
         for accountId: UUID,
         force: Bool = false,
-        checkSwapAfter: Bool = false
+        checkSwapAfter: Bool = false,
+        refreshForPresentation: Bool = false
     ) {
         let now = Date()
         guard let currentAccount = accountManager.accounts.first(where: { $0.id == accountId }),
@@ -4859,7 +4884,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ) {
             return
         }
-        if !force,
+        if !force, !refreshForPresentation,
            let storedAccount = accountManager.account(
                matchingProviderAccountId: providerAccountId
            ),
@@ -4898,7 +4923,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 } ?? false
                 let bank = try await service.fetchBank(
                     for: account,
-                    force: force || isReconciling
+                    force: force || isReconciling || refreshForPresentation
                 )
                 refreshSucceeded = true
                 self.rateLimitResetInventoryRetryAfter[providerAccountId] = nil
@@ -9867,6 +9892,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         linuxDevboxMonitorTimer = nil
         poolAuthorityMonitorTimer?.invalidate()
         poolAuthorityMonitorTimer = nil
+        rateLimitResetInventoryMonitorTimer?.invalidate()
+        rateLimitResetInventoryMonitorTimer = nil
         tokenUsageMetricsTimer?.invalidate()
         tokenUsageMetricsTimer = nil
 
