@@ -13,7 +13,7 @@ cross_dependencies:
   - ../../scripts/test_computer_use_mcp.mjs
 version_control:
   branch: codex/computer-use-repair-20260908
-  status: configured-awaiting-app-approval
+  status: live-canary-verified
   last_updated: 2026-09-08
 ---
 
@@ -59,9 +59,18 @@ configuration, so this connection uses a separate server name.
    configuration. Never report completion from configuration alone.
 
 The deployed launcher passed app discovery with the canonical managed CLI
-wrapper retained. Calculator access reached the standard `elicitation/create`
-request for app permission. That request was not automatically approved;
-application control and screenshot verification remain pending user approval.
+wrapper retained. After the user's approval, the installed connection became
+available in the existing ChatGPT conversation as `codexswitch_computer_use`.
+The live canary read Calculator's accessibility tree, clicked its `2` button,
+entered `+ 2` using keyboard actions, and pressed Return. Both the refreshed
+accessibility tree and the returned screenshot showed `2 + 2` and result `4`.
+No ChatGPT restart, app-server replacement, or VPS change was needed.
+
+This verifies app discovery, app-specific authorization, accessibility reads,
+clicking, keyboard input, and screenshots through the installed MCP connection.
+It does not assert that the separate desktop-managed browser/node_repl path
+has been repaired, or that the previously staged re-signed auth bundle has
+been activated or tested with Computer Use.
 
 ## Installation And Rollback
 
