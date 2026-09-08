@@ -50,6 +50,8 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
   - ../../Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
   - ../plans/2026-09-08-chatgpt-hot-swap-repair.md
+  - ../plans/2026-09-08-computer-use-repair.md
+  - ../../scripts/computer-use-mcp.mjs
   - ../../Sources/CodexSwitch/Views/AccountCardView.swift
   - ../../Sources/CodexSwitch/Views/PopoverContentView.swift
   - ../../Sources/CodexSwitch/Views/StatusBarController.swift
@@ -1569,6 +1571,14 @@ actor boundary on every supported Swift 6 toolchain.
   acknowledgement must prove complete-token reload and strict frontend
   delivery. The retired 9223 listener and its launch agent are unsupported and
   make the Computer Use lineage canary fail.
+- A separately configured `codexswitch_computer_use` MCP connection may use
+  ChatGPT's unmodified OpenAI-signed Node runtime to own the official node_repl
+  process. The launcher verifies both executable identities before starting,
+  registers only the bundled sky service, and preserves MCP metadata, approval
+  elicitation, and the configured sandbox CLI. It does not patch peer validation
+  or TCC. This connection is separate from the browser/node_repl configuration
+  that ChatGPT rewrites. Readiness requires a real Computer Use request;
+  application discovery does not prove app-specific control permission.
 - Provider quota is shared, while runtime convergence evidence remains
   host-specific. Exactly one account card may receive pool-target styling, and
   only from an internally consistent authority identity. Retained stale

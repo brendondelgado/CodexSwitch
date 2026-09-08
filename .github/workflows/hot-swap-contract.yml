@@ -52,6 +52,7 @@ jobs:
           command -v node >/dev/null
           command -v python3 >/dev/null
           command -v zsh >/dev/null
+          node --test scripts/test_computer_use_mcp.mjs
           python3 scripts/test_patch_asar.py
           python3 scripts/test_codex_vps.py
           zsh scripts/test_codex_vps.sh
