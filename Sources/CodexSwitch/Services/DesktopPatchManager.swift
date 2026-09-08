@@ -84,6 +84,7 @@ struct DesktopPatchStatus: Sendable, Equatable {
     let bundledCLIVersionCompatible: Bool
     let computerUsePluginSignatureCompatible: Bool
     let lastMessage: String
+    var locallyPatchedAuthInstalled: Bool = false
 
     var allPatchesInstalled: Bool {
         authPatchInstalled
@@ -104,7 +105,8 @@ struct DesktopPatchStatus: Sendable, Equatable {
     }
 
     var desktopIntegrationInstalled: Bool {
-        codexAppSignatureCompatible && computerUsePluginSignatureCompatible
+        locallyPatchedAuthInstalled
+            || (codexAppSignatureCompatible && computerUsePluginSignatureCompatible)
     }
 }
 
@@ -473,6 +475,9 @@ enum DesktopPatchManager {
         let codexAppSignatureCompatible = officialCodexAppSignatureCompatible()
         let codesignIdentityAvailable = codesignIdentityAvailable()
         let runtimeState = running ? runtimeHotSwapState() : .unknown
+        let locallyPatchedAuthInstalled = CodexDesktopAppLocator.localAuthPatchIsTrusted(
+            appPath: codexAppPath
+        )
         let message = statusMessage(
             running: running,
             runtimeState: runtimeState,
@@ -487,13 +492,16 @@ enum DesktopPatchManager {
             isCodexAppRunning: running,
             codexAppSignatureCompatible: codexAppSignatureCompatible,
             codesignIdentityAvailable: codesignIdentityAvailable,
-            authPatchInstalled: markers.auth,
+            authPatchInstalled: markers.auth || locallyPatchedAuthInstalled,
             remoteRecentsPatchInstalled: markers.remoteRecents,
             fastPatchInstalled: markers.fast,
             bundledCLIHotSwapInstalled: markers.bundledCLI,
             bundledCLIVersionCompatible: markers.versionCompatible,
             computerUsePluginSignatureCompatible: markers.computerUsePluginSignatureCompatible,
-            lastMessage: message
+            lastMessage: locallyPatchedAuthInstalled
+                ? "ChatGPT auth hot-swap patch installed; runtime acknowledgement is checked separately. Computer Use is not verified."
+                : message,
+            locallyPatchedAuthInstalled: locallyPatchedAuthInstalled
         )
     }
 

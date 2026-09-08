@@ -113,6 +113,7 @@ AUTH_INVALIDATION_COALESCE_MS = 100
 AUTH_SINGLE_FLIGHT_PATCH_MARKER = "CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1"
 AUTH_SINGLE_FLIGHT_CACHE = "_csAccountReadFlights"
 AUTH_SINGLE_FLIGHT_HELPER = "_codexSwitchReadAccount"
+PRIORITY_AUTH_PATCH_MARKER = "CODEXSWITCH_PRIORITY_AUTH_TRANSITION_V1"
 FAST_FALLBACK_MARKER = "_bundledFastModels"
 HEADROOM_ENV_MARKER = "CODEXSWITCH_HEADROOM_BASE_URL"
 HEADROOM_TRANSPORT_PATCH_MARKER = "CODEXSWITCH_HEADROOM_TRANSPORT_PATCH"
@@ -1578,6 +1579,8 @@ def current_auth_invalidation_patch_present(content: str) -> bool:
 
 def current_auth_patch_present(content: str) -> bool:
     """Return whether the renderer has the complete current auth patch."""
+    if PRIORITY_AUTH_PATCH_MARKER in content:
+        return current_priority_auth_patch_present(content)
     wrapper = renderer_account_read_wrapper(content)
     weakmap_var = find_weakmap_account_cache_var(content)
     helper_cache_ready = (
@@ -1597,6 +1600,164 @@ def current_auth_patch_present(content: str) -> bool:
         )
         and helper_cache_ready
     )
+
+
+PRIORITY_AUTH_EFFECT_TEMPLATE = (
+    "$effect$=()=>{if($connection$==null)return;"
+    "let $cancel$=!1,$done$=!1,$seen$=!1,$sequence$=0,$mode$=null,$timer$=null,"
+    "$read$=()=>{$sequence$+=1;let $readSequence$=$sequence$,"
+    "$account$=$seen$?$connection$.getAccount({priority:$priority$}):$accountHelper$($connection$,$priority$),"
+    "$methodPromise$=$seen$?Promise.resolve($mode$):$methodHelper$($connection$,$priority$);"
+    "Promise.all([$account$,$methodPromise$]).then($results$=>{let[$account$,$method$]=$results$;"
+    "if($cancel$||$readSequence$!==$sequence$)return;let $methodPromise$=$seen$?$mode$:$method$;"
+    "if($done$=!0,$timer$!=null&&clearTimeout($timer$),$setLoading$(!1),$seen$&&$mode$==null){"
+    "$setState$($empty$());return}"
+    "$setState$($convert$($account$,{isCopilotApiAvailable:$copilot$,"
+    "isPersonalAccessTokenAuth:$methodPromise$===`personalAccessToken`,"
+    "useCopilotAuthIfAvailable:$useCopilot$}))}).catch(()=>{"
+    "$cancel$||$readSequence$!==$sequence$||($done$=!0,$timer$!=null&&clearTimeout($timer$),"
+    "$setLoading$(!1),$setState$($errorState$))})};"
+    "$useTimeout$&&($timer$=setTimeout(()=>{$cancel$||$done$||($setLoading$(!1),"
+    "$setState$($timeoutState$))},$timeoutMs$));"
+    "let $callback$=$event$=>{$accountCache$.delete($connection$),$methodCache$.delete($connection$),"
+    "$seen$=!0,$mode$=$event$.authMethod,$setState$($old$=>$event$.authMethod==null&&"
+    "$old$?.authMethod!=null?($logout$?.(),$empty$()):$old$==null||"
+    "$event$.authMethod===`personalAccessToken`||$old$.authMethod===`personalAccessToken`?"
+    "$event$.authMethod==null?$old$:{...$empty$(),authMethod:$event$.authMethod}:"
+    "{...$old$,authMethod:$event$.authMethod??null}),$event$.authMethod!=null&&$read$()};"
+    "return $connection$.addAuthStatusCallback($callback$),$read$(),()=>{$cancel$=!0,"
+    "$accountCache$.delete($connection$),$methodCache$.delete($connection$),"
+    "$timer$!=null&&clearTimeout($timer$),$connection$.removeAuthStatusCallback($callback$)}}"
+)
+
+
+def minified_template_pattern(template: str) -> re.Pattern[str]:
+    """Match one known control-flow shape while allowing minifier renaming."""
+    seen: set[str] = set()
+    pattern = []
+    for part in re.split(r'(\$[A-Za-z]+\$)', template):
+        if part.startswith("$") and part.endswith("$"):
+            name = part[1:-1]
+            pattern.append(
+                rf'(?P={name})' if name in seen else rf'(?P<{name}>[A-Za-z_$][\w$]*)'
+            )
+            seen.add(name)
+        else:
+            pattern.append(re.escape(part))
+    return re.compile("".join(pattern))
+
+
+def priority_auth_effect_patch() -> str:
+    return (
+        'function _codexSwitchPriorityAuthEffect(e,o){'
+        f'"{PRIORITY_AUTH_PATCH_MARKER}";if(e==null)return;'
+        'let stopped=!1,done=!1,seen=!1,mode=null,sequence=0,'
+        '_csAuthEpoch=0,_csLogoutTimer=null,startupTimer=null;'
+        'const clearLogout=()=>{if(_csLogoutTimer!=null)clearTimeout(_csLogoutTimer);'
+        '_csLogoutTimer=null},confirm=epoch=>{clearLogout();'
+        '_csLogoutTimer=setTimeout(()=>{_csLogoutTimer=null;read(epoch,!0)},10000)},'
+        'read=(_csReadEpoch=_csAuthEpoch,confirmed=!1)=>{'
+        'const current=++sequence;'
+        'Promise.all([_codexSwitchReadAccount(e,o.getAccount),'
+        'confirmed||!seen?Promise.resolve().then(o.getAuthMethod):Promise.resolve(mode)])'
+        '.then(([account,method])=>{'
+        'if(stopped||current!==sequence||!(_csReadEpoch===_csAuthEpoch))return;'
+        'done=!0;if(startupTimer!=null)clearTimeout(startupTimer);o.setLoading(!1);'
+        'const next=o.toState(account,method);'
+        'o.setState(previous=>_codexSwitchResolveAuthState('
+        'previous,next,o.onLogout,!0,confirmed));'
+        'if(next?.authMethod==null&&!confirmed)confirm(_csReadEpoch)'
+        '}).catch(()=>{if(stopped||current!==sequence||_csReadEpoch!==_csAuthEpoch)return;'
+        'done=!0;if(startupTimer!=null)clearTimeout(startupTimer);'
+        'o.setLoading(!1);o.setState(o.errorState)})},'
+        'changed=event=>{if(stopped)return;_csAuthEpoch++;seen=!0;mode=event.authMethod;'
+        'o.clearCaches();_invalidateAccountQueries(event);clearLogout();'
+        'if(mode==null)confirm(_csAuthEpoch);else read(_csAuthEpoch)};'
+        'if(o.startupTimeout!=null)startupTimer=setTimeout(()=>{'
+        'if(!stopped&&!done){o.setLoading(!1);o.setState(o.timeoutState)}},o.startupTimeout);'
+        'e.addAuthStatusCallback(changed);read();return()=>{stopped=!0;'
+        '_csAuthEpoch++;clearLogout();if(startupTimer!=null)clearTimeout(startupTimer);'
+        'o.clearCaches();e.removeAuthStatusCallback(changed)}}'
+    )
+
+
+def priority_auth_module_patch() -> str:
+    return (
+        "var _qcRef=null;"
+        + auth_single_flight_module_patch()
+        + auth_invalidation_guard_patch()
+        + guarded_auth_invalidator(
+            'if(_qcRef)void Promise.allSettled(['
+            '_qcRef.invalidateQueries({queryKey:[`accounts`,`check`]}),'
+            '_qcRef.invalidateQueries({queryKey:[`vscode`,`account-info`]}),'
+            '_qcRef.invalidateQueries({queryKey:[`rate-limit-status`]})])'
+        )
+        + auth_transition_module_patch()
+        + priority_auth_effect_patch()
+    )
+
+
+def current_priority_auth_patch_present(content: str) -> bool:
+    return (
+        content.count(PRIORITY_AUTH_PATCH_MARKER) == 1
+        and content.count(priority_auth_module_patch()) == 1
+        and len(re.findall(r'=\(\)=>_codexSwitchPriorityAuthEffect\(', content)) == 1
+        and len(re.findall(r'\{_qcRef=[A-Za-z_$][\w$]*\(\);let ', content)) == 1
+        and minified_template_pattern(PRIORITY_AUTH_EFFECT_TEMPLATE).search(content) is None
+    )
+
+
+def apply_priority_auth_patch(file_path: Path, content: str) -> bool:
+    matches = list(minified_template_pattern(PRIORITY_AUTH_EFFECT_TEMPLATE).finditer(content))
+    if len(matches) != 1:
+        print(f"ERROR: Expected one priority auth effect, found {len(matches)}")
+        return False
+    match = matches[0]
+    v = match.groupdict()
+    query_clients = re.findall(
+        r'([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)=>\{let ([A-Za-z_$][\w$]*)='
+        r'[A-Za-z_$][\w$]*\.useContext\([A-Za-z_$][\w$]*\);if\(\2\)return \2;'
+        r'if\(!\3\)throw Error\(`No QueryClient set, use QueryClientProvider to set one`\);return \3\}',
+        content,
+    )
+    if len(query_clients) != 1:
+        print("ERROR: Cannot bind the priority auth hook to one QueryClient")
+        return False
+    hooks = list(re.finditer(
+        rf'function [A-Za-z_$][\w$]*\({re.escape(v["connection"])},[A-Za-z_$][\w$]*\)\{{let ',
+        content[:match.start()],
+    ))
+    if not hooks or match.start() - hooks[-1].end() > 2_000:
+        print("ERROR: Priority auth effect has no bounded owning hook")
+        return False
+    hook = hooks[-1]
+    if "priority:" + v["priority"] not in content[hook.end():match.start()]:
+        print("ERROR: Priority auth effect options do not match the owning hook")
+        return False
+    replacement = (
+        f'{v["effect"]}=()=>_codexSwitchPriorityAuthEffect({v["connection"]},{{'
+        f'getAccount:()=>{v["connection"]}.getAccount({{priority:{v["priority"]}}}),'
+        f'getAuthMethod:()=>{v["methodHelper"]}({v["connection"]},{v["priority"]}),'
+        f'toState:(account,method)=>{v["convert"]}(account,{{isCopilotApiAvailable:{v["copilot"]},'
+        'isPersonalAccessTokenAuth:method===`personalAccessToken`,'
+        f'useCopilotAuthIfAvailable:{v["useCopilot"]}}}),'
+        f'setState:{v["setState"]},setLoading:{v["setLoading"]},onLogout:{v["logout"]},'
+        f'errorState:{v["errorState"]},timeoutState:{v["timeoutState"]},'
+        f'startupTimeout:{v["useTimeout"]}?{v["timeoutMs"]}:null,'
+        f'clearCaches:()=>{{{v["accountCache"]}.delete({v["connection"]});'
+        f'{v["methodCache"]}.delete({v["connection"]})}}}})'
+    )
+    patched = content[:match.start()] + replacement + content[match.end():]
+    insert = hook.end() - len("let ")
+    patched = patched[:insert] + f'_qcRef={query_clients[0][0]}();' + patched[insert:]
+    insert = module_patch_insert_position(patched)
+    patched = patched[:insert] + priority_auth_module_patch() + patched[insert:]
+    if not current_priority_auth_patch_present(patched):
+        print("ERROR: Priority auth patch did not converge")
+        return False
+    file_path.write_text(patched)
+    print(f"  Patched priority auth effect: {file_path.name}")
+    return True
 
 
 def module_patch_insert_position(content: str) -> int:
@@ -2409,6 +2570,9 @@ def apply_patch(file_path: Path) -> bool:
     if current_auth_patch_present(content):
         print(f"  Already patched: {file_path.name}")
         return True
+
+    if minified_template_pattern(PRIORITY_AUTH_EFFECT_TEMPLATE).search(content):
+        return apply_priority_auth_patch(file_path, content)
 
     if PATCH_MARKER in content:
         if upgrade_scope_safe_auth_patch(file_path, content):
@@ -4634,6 +4798,53 @@ def list_codesign_targets(app_path: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def stage_auth_only_patch() -> bool:
+    """Patch a disposable app copy without enabling unrelated legacy changes."""
+    app_path = APP_PATH.resolve()
+    if Path("/Applications") in app_path.parents:
+        print("ERROR: --stage-auth-only requires an explicit app copy outside /Applications")
+        return False
+    workdir = make_workdir()
+    extracted = workdir / "auth-only-extracted"
+    if not extract_asar(ASAR_PATH, extracted):
+        return False
+    auth_file = find_auth_file(extracted / "webview/assets")
+    if auth_file is None or not apply_patch(auth_file):
+        return False
+    node = resolve_node_path()
+    if node is None:
+        return False
+    syntax = subprocess.run(
+        [node, "--check", str(auth_file)], capture_output=True, text=True, timeout=30
+    )
+    if syntax.returncode != 0:
+        print("ERROR: Patched renderer failed JavaScript syntax validation")
+        return False
+    native_updater_files = find_native_updater_files(extracted)
+    if not native_updater_files or not apply_native_updater_disable_patch(native_updater_files):
+        return False
+    repacked = workdir / "auth-only.asar"
+    if not pack_asar(extracted, repacked) or not validate_asar(repacked):
+        return False
+    unpacked = workdir / "auth-only.asar.unpacked"
+    if not unpacked.is_dir():
+        print("ERROR: Staged auth archive lost its unpacked resources")
+        return False
+    atomic_copy_file(repacked, ASAR_PATH)
+    atomic_replace_tree(unpacked, ASAR_UNPACKED)
+    update_electron_asar_integrity(ASAR_PATH)
+    with INFO_PLIST_PATH.open("rb") as handle:
+        info = plistlib.load(handle)
+    info["CodexSwitchAuthPatchVersion"] = PRIORITY_AUTH_PATCH_MARKER
+    info["CodexSwitchAuthPatchAsarSHA256"] = hashlib.sha256(ASAR_PATH.read_bytes()).hexdigest()
+    with INFO_PLIST_PATH.open("wb") as handle:
+        plistlib.dump(info, handle, sort_keys=True)
+    if not codesign_app():
+        return False
+    print(f"Staged auth-only patch at {APP_PATH}; the installed app was not modified.")
+    return True
+
+
 def main():
     requested_identity = requested_codesign_identity(sys.argv)
     if requested_identity is not None:
@@ -4656,6 +4867,9 @@ def main():
         sys.exit(1)
     if not usable_codesign_identity_available():
         sys.exit(1)
+
+    if "--stage-auth-only" in sys.argv:
+        sys.exit(0 if stage_auth_only_patch() else 1)
 
     # ---- Quick idempotency check: extract to temp, look for marker ----
     # We always extract the *current* asar (not the backup) because that is

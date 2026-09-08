@@ -94,6 +94,9 @@ enum CodexDesktopNativeChildCoordinator {
         executablePath: (Int32) -> String? = { processExecutablePath($0) },
         signatureStatus: (String) -> CodexDesktopAppSignatureStatus = {
             CodexDesktopAppLocator.signatureStatus(appPath: $0)
+        },
+        localAuthPatchIsTrusted: (String) -> Bool = {
+            CodexDesktopAppLocator.localAuthPatchIsTrusted(appPath: $0)
         }
     ) -> Bool {
         guard binding.runtimeKind == .officialDesktopStdioChild,
@@ -119,7 +122,9 @@ enum CodexDesktopNativeChildCoordinator {
             }
             expectedAppPath = appPath
             if path == "\(appPath)/Contents/MacOS/ChatGPT" {
-                return signatureStatus(appPath) == .officialOpenAI
+                let status = signatureStatus(appPath)
+                return status == .officialOpenAI
+                    || (status == .nonOpenAISigned && localAuthPatchIsTrusted(appPath))
             }
             current = parent
         }

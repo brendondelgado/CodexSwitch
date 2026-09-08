@@ -49,6 +49,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeReloadClient.swift
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
   - ../../Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
+  - ../plans/2026-09-08-chatgpt-hot-swap-repair.md
   - ../../Sources/CodexSwitch/Views/AccountCardView.swift
   - ../../Sources/CodexSwitch/Views/PopoverContentView.swift
   - ../../Sources/CodexSwitch/Views/StatusBarController.swift
@@ -77,7 +78,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-09-06
+  last_updated: 2026-09-08
 ---
 
 # Runtime And Host Ownership
@@ -1553,10 +1554,16 @@ actor boundary on every supported Swift 6 toolchain.
   authority observation, retaining only the last committed identity when
   transport becomes stale. Mac and VPS status are per-host convergence details
   for that one target, not separate active-account selections.
-- The official OpenAI-signed ChatGPT desktop owns the local app-server and
+- The ChatGPT desktop owns the local app-server and
   spawns CodexSwitch's prepared CLI through `CODEX_CLI_PATH` as an exact
-  `codex app-server --listen stdio://` child. CodexSwitch does not patch or
-  re-sign the desktop host and does not publish `CODEX_APP_SERVER_WS_URL`.
+  stdio app-server child. CodexSwitch does not automatically patch or re-sign
+  the desktop host and does not publish `CODEX_APP_SERVER_WS_URL`. An explicit
+  operator auth-only patch may be applied to a disposable copy and activated
+  after a coordinated quit. Its signed metadata binds the patch version and
+  complete ASAR SHA-256. First-ACK bootstrap accepts that exact patch only with
+  strict Apple-issued signature validation and the normal process, ancestry,
+  executable, token, and frontend-delivery checks. This mode does not claim
+  Computer Use compatibility.
 - Desktop activation uses the existing identity-bound version-3 SIGHUP
   request/ACK path. The private stdio transport remains owned by ChatGPT; the
   acknowledgement must prove complete-token reload and strict frontend

@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 
 struct CodexDesktopAppInstall: Equatable, Sendable {
@@ -78,10 +79,45 @@ enum CodexDesktopAppLocator {
     }
 
     static func patchMarkerPresent(install: CodexDesktopAppInstall) -> Bool {
+        if localAuthPatchIsTrusted(appPath: install.appPath) { return true }
         guard let data = mappedAsarData(for: install) else { return false }
         return requiredPatchMarkers.allSatisfy { marker in
             data.range(of: Data(marker.utf8)) != nil
         } && !containsLegacyPatchMarker(in: data)
+    }
+
+    static func localAuthPatchIsTrusted(appPath: String) -> Bool {
+        let root = URL(fileURLWithPath: appPath)
+        guard let info = NSDictionary(contentsOf: root.appendingPathComponent("Contents/Info.plist"))
+                as? [String: Any],
+              let data = try? Data(
+                contentsOf: root.appendingPathComponent("Contents/Resources/app.asar"),
+                options: [.mappedIfSafe]
+              ),
+              localAuthPatchMetadataMatches(info, asar: data) else { return false }
+        let verification = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: [
+                "--verify", "--strict", "-R",
+                "=anchor apple generic and identifier \"com.openai.codex\"", appPath,
+            ],
+            timeout: 15
+        )
+        return !verification.timedOut && verification.terminationStatus == 0
+    }
+
+    static func localAuthPatchMetadataMatches(_ info: [String: Any], asar: Data) -> Bool {
+        let marker = "CODEXSWITCH_PRIORITY_AUTH_TRANSITION_V1"
+        guard info["CFBundleIdentifier"] as? String == appBundleIdentifier,
+              info["CodexSwitchAuthPatchVersion"] as? String == marker,
+              let digest = info["CodexSwitchAuthPatchAsarSHA256"] as? String,
+              digest == SHA256.hash(data: asar).map({ String(format: "%02x", $0) }).joined()
+        else { return false }
+        return [
+            marker, "CODEXSWITCH_AUTH_CACHE_INVALIDATION_V3",
+            "CODEXSWITCH_AUTH_EVENT_DEDUPE_V1", "CODEXSWITCH_AUTH_SINGLE_FLIGHT_V1",
+            "CODEXSWITCH_AUTH_TRANSITION_V2", "CODEXSWITCH_NATIVE_UPDATER_DISABLED_V1",
+        ].allSatisfy { asar.range(of: Data($0.utf8)) != nil }
     }
 
     static func legacyPatchMarkerPresent(install: CodexDesktopAppInstall) -> Bool {

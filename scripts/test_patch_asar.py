@@ -566,7 +566,163 @@ CHATGPT_5828_WEAKMAP_AUTH_CONTENT = (
 )
 
 
+PRIORITY_USE_AUTH_CONTENT = r'''
+var HR=new WeakMap,UR=new WeakMap,iFr=2000;
+var Ob=e=>{let t=React.useContext(Context);if(e)return e;if(!t)throw Error(`No QueryClient set, use QueryClientProvider to set one`);return t};
+function useAuth(e,t){let {isCopilotApiAvailable:r,useCopilotAuthIfAvailable:i,shouldUseWindowsStartupAuthTimeout:a,onLogout:o,priority:s}=t;
+let [c,l]=React.useState(true),[state,d]=React.useState(null),m;
+m=()=>{if(e==null)return;let t=!1,n=!1,c=!1,u=0,f=null,p=null,m=()=>{u+=1;let a=u,o=c?e.getAccount({priority:s}):ZPr(e,s),m=c?Promise.resolve(f):QPr(e,s);Promise.all([o,m]).then(e=>{let[o,s]=e;if(t||a!==u)return;let m=c?f:s;if(n=!0,p!=null&&clearTimeout(p),l(!1),c&&f==null){d($Pr());return}d(tFr(o,{isCopilotApiAvailable:r,isPersonalAccessTokenAuth:m===`personalAccessToken`,useCopilotAuthIfAvailable:i}))}).catch(()=>{t||a!==u||(n=!0,p!=null&&clearTimeout(p),l(!1),d(XPr))})};a&&(p=setTimeout(()=>{t||n||(l(!1),d(YPr))},iFr));let h=t=>{HR.delete(e),UR.delete(e),c=!0,f=t.authMethod,d(e=>t.authMethod==null&&e?.authMethod!=null?(o?.(),$Pr()):e==null||t.authMethod===`personalAccessToken`||e.authMethod===`personalAccessToken`?t.authMethod==null?e:{...$Pr(),authMethod:t.authMethod}:{...e,authMethod:t.authMethod??null}),t.authMethod!=null&&m()};return e.addAuthStatusCallback(h),m(),()=>{t=!0,HR.delete(e),UR.delete(e),p!=null&&clearTimeout(p),e.removeAuthStatusCallback(h)}};
+React.useEffect(m);return state}
+function ZPr(e,t){let n=HR.get(e);if(n!=null)return n;let r=e.getAccount({priority:t}).finally(()=>{HR.get(e)===r&&HR.delete(e)});return HR.set(e,r),r}
+function QPr(e,t){let n=UR.get(e);if(n!=null)return n;let r=e.getAuthMethod({priority:t}).catch(()=>null).finally(()=>{UR.get(e)===r&&UR.delete(e)});return UR.set(e,r),r}
+function $Pr(){return{authMethod:null,email:null}}
+function tFr(e,t){return{authMethod:t.isPersonalAccessTokenAuth?`personalAccessToken`:e.account?.type??null,email:e.account?.email??null}}
+function XPr(e){return e??$Pr()}
+function YPr(e){return e??$Pr()}
+'''
+
+
 class PatchAsarTests(unittest.TestCase):
+    def test_auth_only_staging_rejects_installed_app_before_extraction(self):
+        with patch.object(patch_asar, "APP_PATH", Path("/Applications/ChatGPT.app")), \
+                patch.object(patch_asar, "extract_asar") as extract:
+            self.assertFalse(patch_asar.stage_auth_only_patch())
+            extract.assert_not_called()
+
+    def test_auth_only_staging_rejects_symlink_to_installed_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            linked = Path(tmp) / "ChatGPT.app"
+            linked.symlink_to("/Applications/ChatGPT.app")
+            with patch.object(patch_asar, "APP_PATH", linked), \
+                    patch.object(patch_asar, "extract_asar") as extract:
+                self.assertFalse(patch_asar.stage_auth_only_patch())
+                extract.assert_not_called()
+
+    def test_auth_only_staging_extraction_failure_never_replaces_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(patch_asar, "APP_PATH", Path(tmp) / "ChatGPT.app"), \
+                    patch.object(patch_asar, "make_workdir", return_value=Path(tmp)), \
+                    patch.object(patch_asar, "extract_asar", return_value=False), \
+                    patch.object(patch_asar, "atomic_copy_file") as copy, \
+                    patch.object(patch_asar, "codesign_app") as sign:
+                self.assertFalse(patch_asar.stage_auth_only_patch())
+                copy.assert_not_called()
+                sign.assert_not_called()
+
+    def test_priority_auth_patch_is_narrow_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial.js"
+            target.write_text(PRIORITY_USE_AUTH_CONTENT)
+            self.assertTrue(patch_asar.apply_patch(target))
+            patched = target.read_text()
+            self.assertTrue(patch_asar.current_auth_patch_present(patched))
+            self.assertIn("_qcRef=Ob();let ", patched)
+            self.assertIn("getAccount:()=>e.getAccount({priority:s})", patched)
+            self.assertTrue(patch_asar.apply_patch(target))
+            self.assertEqual(target.read_text(), patched)
+            self.assertFalse(patch_asar.current_auth_patch_present(
+                patched.replace("e.removeAuthStatusCallback(changed)", "void 0")
+            ))
+
+    def test_priority_auth_patch_rejects_ambiguous_or_changed_effects(self):
+        for content in (
+            PRIORITY_USE_AUTH_CONTENT * 2,
+            PRIORITY_USE_AUTH_CONTENT.replace("u+=1;", "u+=2;"),
+            PRIORITY_USE_AUTH_CONTENT.replace("priority:s}=t", "unknown:s}=t"),
+            PRIORITY_USE_AUTH_CONTENT.replace("No QueryClient set", "Unknown QueryClient"),
+        ):
+            with self.subTest(content=content[:40]), tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "app-initial.js"
+                target.write_text(content)
+                self.assertFalse(patch_asar.apply_patch(target))
+                self.assertEqual(target.read_text(), content)
+
+    def test_priority_auth_transition_preserves_drafts_and_handles_real_logout(self):
+        node = patch_asar.shutil.which("node")
+        if node is None:
+            self.skipTest("node is required for auth transition replay")
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "app-initial.js"
+            target.write_text(PRIORITY_USE_AUTH_CONTENT)
+            self.assertTrue(patch_asar.apply_patch(target))
+            runtime = target.read_text()
+        script = r'''
+const assert=require(`node:assert/strict`);
+const states=[],cleanups=[],timers=new Map(),invalidations=[];
+let timerId=0,logoutCount=0;
+const view={draft:`keep my unfinished draft`,task:`local-task`,mounted:true};
+globalThis.setTimeout=(fn,delay)=>{timers.set(++timerId,{fn,delay});return timerId};
+globalThis.clearTimeout=id=>timers.delete(id);
+const Context={};
+const queryClient={invalidateQueries:({queryKey})=>{invalidations.push(queryKey);return Promise.resolve()}};
+const React={
+ useContext:()=>queryClient,
+ useState(value){const slot={value};states.push(slot);return[value,next=>{slot.value=typeof next===`function`?next(slot.value):next}]},
+ useEffect:effect=>cleanups.push(effect()),
+};
+''' + runtime + r'''
+const callbacks=new Set(),pending=[];
+let method=`chatgpt`;
+const manager={
+ getAccount(options){assert.equal(options.priority,`critical`);return new Promise((resolve,reject)=>pending.push({resolve,reject}))},
+ getAuthMethod:()=>Promise.resolve(method),
+ addAuthStatusCallback:callback=>callbacks.add(callback),
+ removeAuthStatusCallback:callback=>callbacks.delete(callback),
+ emit(event){for(const callback of [...callbacks])callback(event)},
+};
+const options={isCopilotApiAvailable:false,useCopilotAuthIfAvailable:false,
+ shouldUseWindowsStartupAuthTimeout:false,priority:`critical`,
+ onLogout:()=>{logoutCount++;view.mounted=false}};
+const flush=async()=>{await new Promise(resolve=>setImmediate(resolve))};
+const runTimers=async delay=>{
+ for(const [id,timer] of [...timers])if(timer.delay===delay&&timers.has(id)){
+  timers.delete(id);timer.fn();await flush();
+ }
+};
+const account=email=>({account:{type:`chatgpt`,email}});
+async function replay(){
+ useAuth(manager,options);useAuth(manager,options);await flush();
+ assert.equal(pending.length,1);
+ pending[0].resolve(account(`old@example.com`));await flush();
+ manager.emit({authMethod:null});await flush();
+ assert.equal(logoutCount,0);assert.equal(states[1].value.email,`old@example.com`);
+ manager.emit({authMethod:`chatgpt`});await flush();
+ assert.equal(pending.length,2);
+ pending[1].resolve(account(`new@example.com`));await flush();
+ assert.equal(states[1].value.email,`new@example.com`);
+ assert.equal(states[3].value.email,`new@example.com`);
+ await runTimers(10000);assert.equal(pending.length,2);
+ manager.emit({authMethod:`chatgpt`});await flush();
+ manager.emit({authMethod:`chatgpt`});await flush();
+ assert.equal(pending.length,4);
+ pending[3].resolve(account(`newest@example.com`));await flush();
+ pending[2].resolve(account(`obsolete@example.com`));await flush();
+ assert.equal(states[1].value.email,`newest@example.com`);
+ manager.emit({authMethod:null});await runTimers(10000);
+ assert.equal(pending.length,5);
+ manager.emit({authMethod:`chatgpt`});await flush();
+ pending[5].resolve(account(`final@example.com`));await flush();
+ pending[4].resolve({account:null});await flush();
+ assert.equal(states[1].value.email,`final@example.com`);
+ assert.equal(logoutCount,0);
+ assert.deepEqual(view,{draft:`keep my unfinished draft`,task:`local-task`,mounted:true});
+ assert(invalidations.some(key=>key.join(`/`)===`vscode/account-info`));
+ method=null;manager.emit({authMethod:null});await runTimers(10000);
+ pending[6].resolve({account:null});await flush();
+ assert.equal(states[1].value.authMethod,null);
+ assert.equal(states[3].value.authMethod,null);
+ assert.equal(logoutCount,2);
+ for(const cleanup of cleanups)cleanup?.();
+ assert.equal(callbacks.size,0);
+ assert.equal([...timers.values()].filter(t=>t.delay===10000).length,0);
+}
+replay().catch(error=>{console.error(error.stack);process.exit(1)});
+'''
+        result = patch_asar.subprocess.run(
+            [node, "--eval", script], capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_resolve_asar_cmd_accepts_explicit_cached_script(self):
         with tempfile.TemporaryDirectory() as tmp:
             asar_js = Path(tmp) / "asar.js"

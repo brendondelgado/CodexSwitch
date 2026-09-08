@@ -107,6 +107,25 @@ struct CodexDesktopNativeChildCoordinatorTests {
         ) == nil)
     }
 
+    @Test("Explicit local auth patch needs separate trust and never accepts ad-hoc ancestry")
+    func explicitLocalPatchBootstrap() {
+        for (signature, trusted, expected) in [
+            (CodexDesktopAppSignatureStatus.nonOpenAISigned, true, true),
+            (.nonOpenAISigned, false, false),
+            (.adHoc, true, false),
+            (.unreadable, true, false),
+        ] {
+            #expect(CodexDesktopNativeChildCoordinator.authorizesFirstAcknowledgementBootstrap(
+                binding: nativeBinding(pid: 42),
+                arguments: ["codex", "app-server", "--analytics-default-enabled"],
+                parentPID: { $0 == 42 ? 41 : 1 },
+                executablePath: { _ in "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT" },
+                signatureStatus: { _ in signature },
+                localAuthPatchIsTrusted: { _ in trusted }
+            ) == expected)
+        }
+    }
+
     private func nativeBinding(pid: Int32) -> CodexReloadBinding {
         let runtime = "/Users/me/.local/share/codexswitch/prepared-codex/current/codex"
         return CodexReloadBinding(
