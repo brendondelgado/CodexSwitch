@@ -2884,14 +2884,27 @@ pub fn fetch_rate_limit_reset_bank(account: &CodexAccount) -> Result<RateLimitRe
                 .send()
                 .with_context(|| format!("failed to fetch reset bank for {}", account.email))?;
             let status = response.status().as_u16();
-            let body = response
-                .bytes()
-                .context("failed to read reset-bank response body")?
-                .to_vec();
-            Ok(HttpResponse { status, body })
+            read_reset_bank_response(status, || {
+                response
+                    .bytes()
+                    .map(|body| body.to_vec())
+                    .map_err(Into::into)
+            })
         },
         Utc::now,
     )
+}
+
+fn read_reset_bank_response<F>(status: u16, read_body: F) -> Result<HttpResponse>
+where
+    F: FnOnce() -> Result<Vec<u8>>,
+{
+    let body = if status == 200 {
+        read_body().context("failed to read reset-bank response body")?
+    } else {
+        Vec::new()
+    };
+    Ok(HttpResponse { status, body })
 }
 
 fn fetch_rate_limit_reset_bank_with<F, N>(
@@ -3575,9 +3588,8 @@ mod tests {
             let error = fetch_rate_limit_reset_bank_with(
                 &account("a@example.com", true, 10.0, 10.0),
                 |_| {
-                    Ok(HttpResponse {
-                        status,
-                        body: Vec::new(),
+                    read_reset_bank_response(status, || {
+                        panic!("HTTP {status} must not wait for an error body")
                     })
                 },
                 Utc::now,
@@ -3590,7 +3602,25 @@ mod tests {
                 Some(expected),
                 "unexpected failure class for HTTP {status}"
             );
+            assert_eq!(
+                error.to_string(),
+                format!("reset-bank API returned HTTP {status}")
+            );
         }
+    }
+
+    #[test]
+    fn reset_bank_success_body_failure_does_not_publish_inventory() {
+        let error = fetch_rate_limit_reset_bank_with(
+            &account("a@example.com", true, 10.0, 10.0),
+            |_| read_reset_bank_response(200, || bail!("simulated partial-body timeout")),
+            || panic!("an incomplete body cannot timestamp an inventory observation"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "failed to read reset-bank response body: simulated partial-body timeout"
+        );
     }
 
     #[test]
@@ -3632,10 +3662,9 @@ mod tests {
         let parsed = fetch_rate_limit_reset_bank_with(
             &account("a@example.com", true, 10.0, 10.0),
             move |_| {
-                fetch_events.lock().unwrap().push("response");
-                Ok(HttpResponse {
-                    status: 200,
-                    body: serde_json::to_vec(&response)?,
+                read_reset_bank_response(200, || {
+                    fetch_events.lock().unwrap().push("response");
+                    Ok(serde_json::to_vec(&response)?)
                 })
             },
             move || {

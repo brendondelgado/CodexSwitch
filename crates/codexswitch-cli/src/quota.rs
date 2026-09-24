@@ -80,26 +80,31 @@ pub fn fetch_quota(account: &CodexAccount) -> Result<FetchResult> {
             .with_context(|| format!("failed to fetch quota for {}", account.email))?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .context("failed to read quota response body")?;
-        match status.as_u16() {
-            200 => match parse_usage_response(body.as_bytes()) {
-                Ok(result) => return Ok(result),
-                Err(error)
-                    if error.to_string().contains("placeholder usage window") && attempt < 3 =>
-                {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            },
-            401 => bail!("token expired for {}", account.email),
-            429 => bail!("rate limited while polling {}", account.email),
-            code => bail!("quota API returned HTTP {code} for {}", account.email),
+        let body = read_quota_response_body(status.as_u16(), &account.email, || {
+            response.text().map_err(Into::into)
+        })?;
+        match parse_usage_response(body.as_bytes()) {
+            Ok(result) => return Ok(result),
+            Err(error) if error.to_string().contains("placeholder usage window") && attempt < 3 => {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+            Err(error) => return Err(error),
         }
     }
     bail!("rate limits unavailable: placeholder usage window")
+}
+
+fn read_quota_response_body<F>(status: u16, email: &str, read_body: F) -> Result<String>
+where
+    F: FnOnce() -> Result<String>,
+{
+    match status {
+        200 => read_body().context("failed to read quota response body"),
+        401 => bail!("token expired for {email}"),
+        429 => bail!("rate limited while polling {email}"),
+        code => bail!("quota API returned HTTP {code} for {email}"),
+    }
 }
 
 pub fn parse_usage_response(data: &[u8]) -> Result<FetchResult> {
@@ -327,6 +332,50 @@ pub fn now_swift_reference_value() -> Value {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn http_error_statuses_do_not_read_bodies_or_change_semantics() {
+        for (status, expected) in [
+            (401, "token expired for test@example.com"),
+            (403, "quota API returned HTTP 403 for test@example.com"),
+            (404, "quota API returned HTTP 404 for test@example.com"),
+            (429, "rate limited while polling test@example.com"),
+            (503, "quota API returned HTTP 503 for test@example.com"),
+        ] {
+            let error = read_quota_response_body(status, "test@example.com", || {
+                panic!("HTTP {status} must not wait for an error body")
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn successful_status_preserves_quota_and_denial_parsing() -> Result<()> {
+        for (name, denied) in [("weekly-primary", false), ("denied-weekly", true)] {
+            let reads = std::cell::Cell::new(0);
+            let body = read_quota_response_body(200, "test@example.com", || {
+                reads.set(reads.get() + 1);
+                Ok(String::from_utf8(fixture(name).to_vec())?)
+            })?;
+            let result = parse_usage_response(body.as_bytes())?;
+            assert_eq!(result.snapshot.is_denied(), denied);
+            assert_eq!(reads.get(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn successful_status_body_failure_is_not_a_quota_observation() {
+        let error = read_quota_response_body(200, "test@example.com", || {
+            bail!("simulated partial-body timeout")
+        })
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "failed to read quota response body: simulated partial-body timeout"
+        );
+    }
 
     fn fixture(name: &str) -> &'static [u8] {
         match name {

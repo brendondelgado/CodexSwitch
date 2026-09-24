@@ -4,6 +4,7 @@ mod auth;
 mod bounded_command;
 mod codex_health;
 mod codex_update;
+mod credential_import_receipts;
 mod daemon;
 mod import;
 mod patched_codex;
@@ -66,7 +67,7 @@ use reload::{
     restart_codex_processes, ReloadSummary,
 };
 use ring::digest::{digest, Context as DigestContext, SHA256};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::Cell;
 use std::ffi::OsString;
@@ -126,9 +127,21 @@ enum Command {
             conflicts_with = "offline_file_only"
         )]
         receipt_operation_id: Option<Uuid>,
+        /// Reject a stale sender baseline before preparing the credential import.
+        #[arg(long, requires = "receipt_operation_id", value_parser = credential_import_receipts::parse_fingerprint)]
+        receipt_baseline_fingerprint: Option<String>,
         /// Commit and verify store/auth while an operator-proven runtime is idle.
         #[arg(long)]
         offline_file_only: bool,
+    },
+    /// Replay historical import evidence without importing or claiming current convergence.
+    CredentialImportStatus {
+        #[arg(long, value_parser = parse_canonical_uuid)]
+        operation_id: Uuid,
+        #[arg(long, value_parser = credential_import_receipts::parse_fingerprint)]
+        baseline_fingerprint: String,
+        #[arg(long, value_parser = credential_import_receipts::parse_fingerprint)]
+        incoming_fingerprint: String,
     },
     Status,
     PoolAuthorityStatus {
@@ -349,6 +362,7 @@ fn main() -> Result<()> {
             offline_file_only,
             false,
             None,
+            None,
             "Imported",
         ),
         Command::UpdateBundle {
@@ -356,6 +370,7 @@ fn main() -> Result<()> {
             ignore_expiry,
             preserve_active,
             receipt_operation_id,
+            receipt_baseline_fingerprint,
             offline_file_only,
         } => import_accounts(
             &bundle,
@@ -365,8 +380,16 @@ fn main() -> Result<()> {
             offline_file_only,
             preserve_active,
             receipt_operation_id,
+            receipt_baseline_fingerprint.as_deref(),
             "Updated",
         ),
+        Command::CredentialImportStatus { operation_id, baseline_fingerprint, incoming_fingerprint } => {
+            let status = credential_import_receipts::observe(
+                &store_path, &auth_path, operation_id, &baseline_fingerprint, &incoming_fingerprint,
+            )?;
+            println!("{}", serde_json::to_string(&status)?);
+            Ok(())
+        }
         Command::Status => status(&store_path),
         Command::PoolAuthorityStatus { json } => pool_authority_status(&store_path, json),
         Command::RequestPoolTarget {
@@ -536,6 +559,7 @@ fn import_accounts(
     offline_file_only: bool,
     preserve_active: bool,
     receipt_operation_id: Option<Uuid>,
+    receipt_baseline_fingerprint: Option<&str>,
     verb: &str,
 ) -> Result<()> {
     if receipt_operation_id.is_some() && !preserve_active {
@@ -551,6 +575,7 @@ fn import_accounts(
         imported_accounts,
         preserve_active,
         receipt_operation_id,
+        receipt_baseline_fingerprint,
         !offline_file_only,
         &reload_codex_hot_swap_processes,
     )?;
@@ -580,6 +605,7 @@ fn replace_import_accounts_with_unlocked_reload<R>(
     imported_accounts: Vec<account_store::CodexAccount>,
     preserve_active: bool,
     receipt_operation_id: Option<Uuid>,
+    receipt_baseline_fingerprint: Option<&str>,
     reload_enabled: bool,
     reload: &R,
 ) -> Result<(usize, ActivationOutcome, Option<CredentialImportReceipt>)>
@@ -593,6 +619,19 @@ where
         bail!("an import receipt requires runtime convergence");
     }
     let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    let incoming_credential_set_fingerprint = receipt_operation_id
+        .map(|_| complete_credential_set_fingerprint(&imported_accounts))
+        .transpose()?;
+    // Reject replays before reconciling any activation or changing authority state.
+    let mut receipt_journal = receipt_operation_id
+        .map(|operation_id| credential_import_receipts::Journal::acquire(
+            &runtime_lease,
+            store_path,
+            auth_path,
+            operation_id,
+            incoming_credential_set_fingerprint.as_deref().context("missing incoming fingerprint")?,
+        ))
+        .transpose()?;
     if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
         store_path,
@@ -626,9 +665,6 @@ where
         None
     };
 
-    let incoming_credential_set_fingerprint = receipt_operation_id
-        .map(|_| complete_credential_set_fingerprint(&imported_accounts))
-        .transpose()?;
     let (account_count, prepared, receipt) = {
         let store_lock = lock_account_store(store_path)?;
         let snapshot = store_lock.load()?;
@@ -636,6 +672,11 @@ where
         let baseline_credential_set_fingerprint = receipt_operation_id
             .map(|_| complete_credential_set_fingerprint(&stored_accounts))
             .transpose()?;
+        if let Some(expected) = receipt_baseline_fingerprint {
+            if baseline_credential_set_fingerprint.as_deref() != Some(expected) {
+                bail!("credential import baseline changed before preparation");
+            }
+        }
         let (replacement_accounts, credential_selections) =
             if let Some(authority_target) = authority_target.as_deref() {
                 let merged = merge_authority_preserving_accounts(
@@ -663,6 +704,9 @@ where
                 )
             })
             .transpose()?;
+        if let (Some(journal), Some(receipt)) = (receipt_journal.as_mut(), receipt.as_ref()) {
+            journal.prepare(receipt)?;
+        }
         let mut generation = snapshot.generation;
         let outcome = replace_accounts_with_under_runtime_lease(
             &runtime_lease,
@@ -678,6 +722,11 @@ where
     };
 
     if !reload_enabled || !prepared.is_file_only() {
+        if prepared.is_confirmed() {
+            if let (Some(journal), Some(receipt)) = (receipt_journal.as_mut(), receipt.as_ref()) {
+                journal.complete(receipt)?;
+            }
+        }
         return Ok((account_count, prepared, receipt));
     }
     let outcome = reconcile_activation_barrier_unlocked_under_runtime_lease(
@@ -688,6 +737,11 @@ where
         reload,
     )?
     .context("import activation disappeared before runtime convergence")?;
+    if outcome.is_confirmed() {
+        if let (Some(journal), Some(receipt)) = (receipt_journal.as_mut(), receipt.as_ref()) {
+            journal.complete(receipt)?;
+        }
+    }
     Ok((account_count, outcome, receipt))
 }
 
@@ -749,7 +803,7 @@ fn preserve_host_operational_state(
     incoming.rate_limit_reset_bank = current.rate_limit_reset_bank.clone();
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum CredentialGeneration {
     Matching,
@@ -763,15 +817,15 @@ struct AuthorityPreservingMerge {
     selections: Vec<CredentialImportSelection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CredentialImportSelection {
     provider_account_id: String,
     generation: CredentialGeneration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CredentialImportReceipt {
     version: u32,
     operation_id: Uuid,
@@ -4672,6 +4726,7 @@ mod tests {
             vec![replacement.clone()],
             false,
             None,
+            None,
             true,
             &move |_| {
                 assert_store_lock_available(&reload_store_path)?;
@@ -4690,6 +4745,63 @@ mod tests {
         assert!(auth::auth_file_matches_account(&auth_path, &replacement));
         let successor = acquire_runtime_activation_lease(&store_path)?;
         drop(successor);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_import_receipt_survives_lost_reply_and_prevents_second_activation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = temp.path().join("accounts.json");
+        let auth = temp.path().join("auth.json");
+        let active = account("receipt-fixture@example.com", true, 10.0, 10.0);
+        let incoming = vec![active.clone()];
+        save_accounts(&store, &incoming)?;
+        auth::write_auth_file(&auth, &active)?;
+        let fingerprint = complete_credential_set_fingerprint(&incoming)?;
+        let id = Uuid::new_v4();
+        let (_, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
+            &store, &auth, incoming.clone(), true, Some(id), Some(&fingerprint), true,
+            &|_| {
+                let pending = credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
+                assert_eq!(pending.status, credential_import_receipts::State::Pending);
+                assert!(pending.receipt.is_none());
+                Ok(verified_reload_summary())
+            },
+        )?;
+        assert!(outcome.is_confirmed());
+        let completed = credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
+        assert_eq!(completed.status, credential_import_receipts::State::Completed);
+        assert_eq!(completed.receipt, receipt);
+
+        let rotated = account("later-fixture@example.com", true, 10.0, 10.0);
+        save_accounts(&store, std::slice::from_ref(&rotated))?;
+        auth::write_auth_file(&auth, &rotated)?;
+        let store_before = fs::read(&store)?;
+        let auth_before = fs::read(&auth)?;
+        assert!(replace_import_accounts_with_unlocked_reload(
+            &store, &auth, incoming, true, Some(id), Some(&fingerprint), true,
+            &|_| bail!("duplicate import must not reload"),
+        ).is_err());
+        assert_eq!(fs::read(&store)?, store_before);
+        assert_eq!(fs::read(&auth)?, auth_before);
+        assert_eq!(credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?, completed);
+        Ok(())
+    }
+
+    #[test]
+    fn credential_import_status_requires_canonical_binding_arguments() -> Result<()> {
+        let fingerprint = "1".repeat(64);
+        let args = [
+            "codexswitch-cli", "credential-import-status", "--operation-id",
+            "11111111-1111-4111-8111-111111111111", "--baseline-fingerprint",
+            fingerprint.as_str(), "--incoming-fingerprint", fingerprint.as_str(),
+        ];
+        assert!(matches!(Args::try_parse_from(args)?.command, Command::CredentialImportStatus { .. }));
+        assert!(Args::try_parse_from(&args[..6]).is_err());
+        let mut invalid = args;
+        invalid[7] = "NOT-A-FINGERPRINT";
+        assert!(Args::try_parse_from(invalid).is_err());
         Ok(())
     }
 

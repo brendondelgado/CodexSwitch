@@ -927,12 +927,26 @@ fn scan_linux_exact_managed_unix_daemon_pids_at(
         if metadata.uid() != current_uid {
             continue;
         }
-        let Some(command_line) = read_linux_proc_file_bounded(
+        let command_line = read_linux_proc_file_bounded(
             &entry.path().join("cmdline"),
             MANAGED_DAEMON_CMDLINE_MAX_BYTES,
-        )?
-        else {
-            continue;
+        );
+        let command_line = match command_line {
+            Ok(Some(command_line)) => command_line,
+            Ok(None) => continue,
+            Err(error) => {
+                // Unrelated jobs cannot make runtime discovery unavailable.
+                let executable = fs::metadata(entry.path().join("exe"));
+                if executable.is_ok_and(|metadata| {
+                    metadata.dev() != expected_metadata.dev()
+                        || metadata.ino() != expected_metadata.ino()
+                }) && linux_process_argv0_is_unrelated(
+                    &entry.path().join("cmdline"), expected_argv0, &expected_canonical,
+                ).unwrap_or(false) {
+                    continue;
+                }
+                return Err(error);
+            }
         };
         let Some(matched_argv0) =
             exact_managed_daemon_argv0(&command_line, expected_argv0, &expected_canonical)
@@ -1134,6 +1148,27 @@ fn read_linux_process_start_ticks(proc_dir: &Path) -> Result<Option<u64>> {
         .parse::<u64>()
         .context("process start identity was invalid")?;
     Ok(Some(start_ticks))
+}
+
+fn linux_process_argv0_is_unrelated(
+    path: &Path,
+    current_route: &Path,
+    current_canonical: &Path,
+) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let mut prefix = Vec::new();
+    file.take(MANAGED_DAEMON_CMDLINE_MAX_BYTES).read_to_end(&mut prefix)?;
+    let Some(end) = prefix.iter().position(|byte| *byte == 0) else {
+        return Ok(false);
+    };
+    let argv0 = &prefix[..end];
+    Ok(!argv0.is_empty()
+        && argv0 != current_route.as_os_str().as_bytes()
+        && argv0 != current_canonical.as_os_str().as_bytes())
 }
 
 fn read_linux_proc_file_bounded(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {

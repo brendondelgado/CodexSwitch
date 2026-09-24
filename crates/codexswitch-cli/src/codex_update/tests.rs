@@ -761,6 +761,61 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_daemon_scan_bounds_only_unknown_or_matching_executables() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let runtime = temp.path().join("codex");
+        let unrelated = temp.path().join("other");
+        fs::write(&runtime, b"runtime")?;
+        fs::write(&unrelated, b"other executable")?;
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("42");
+        fs::create_dir_all(&process)?;
+        fs::write(
+            process.join("cmdline"),
+            vec![b'x'; MANAGED_DAEMON_CMDLINE_MAX_BYTES as usize + 1],
+        )?;
+        let scan = || scan_linux_exact_managed_unix_daemon_pids_at(&proc_root, &runtime, &runtime);
+        assert!(scan().is_err(), "unknown executable must fail closed");
+        symlink(&runtime, process.join("exe"))?;
+        assert!(scan().is_err(), "matching executable must retain bounds");
+        fs::remove_file(process.join("exe"))?;
+        symlink(&unrelated, process.join("exe"))?;
+        assert!(scan().is_err(), "incomplete argv0 must fail closed");
+        let oversized = vec![b'x'; MANAGED_DAEMON_CMDLINE_MAX_BYTES as usize + 1];
+        for argv0 in [runtime.as_os_str().as_bytes(), b"".as_slice()] {
+            fs::write(process.join("cmdline"),
+                [argv0, b"\0", oversized.as_slice()].concat())?;
+            assert!(scan().is_err(), "managed or empty argv0 must fail closed");
+        }
+        fs::write(process.join("cmdline"),
+            [b"/usr/bin/python3\0".as_slice(), oversized.as_slice()].concat())?;
+        assert!(scan()?.is_empty(), "proven unrelated executable cannot block discovery");
+
+        let current_route = temp.path().join("current");
+        symlink(&runtime, &current_route)?;
+        let valid = proc_root.join("84");
+        fs::create_dir_all(&valid)?;
+        fs::write(valid.join("stat"), format!("84 (codex) {}\n", vec!["1"; 20].join(" ")))?;
+        symlink(&runtime, valid.join("exe"))?;
+        fs::write(valid.join("cmdline"), daemon_test_command_line(
+            &current_route, &[b"app-server", b"--listen", b"unix://"]))?;
+        assert_eq!(scan_linux_exact_managed_unix_daemon_pids_at(
+            &proc_root, &current_route, &runtime)?, vec![84]);
+        for argv0 in [&current_route, &runtime] {
+            fs::write(process.join("cmdline"),
+                [argv0.as_os_str().as_bytes(), b"\0", oversized.as_slice()].concat())?;
+            assert!(scan_linux_exact_managed_unix_daemon_pids_at(
+                &proc_root, &current_route, &runtime).is_err(),
+                "conflicting oversized owner cannot hide beside a valid owner");
+        }
+        Ok(())
+    }
+
     #[test]
     fn unrecorded_unix_binding_rejects_topology_and_identity_drift() {
         let identity =
