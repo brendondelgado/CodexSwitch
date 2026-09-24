@@ -119,6 +119,18 @@ ignored test (183.65 seconds). This includes receipt-ledger interruption and
 binding tests, reset cooldown boundaries, HTTP error classification, and bounded
 process discovery.
 
+The reviewed repair was integrated locally onto current origin/main
+`3bf50c3f1382c8dfa304346e6ffbff1543b9cb5b`; only documentation dates required
+conflict resolution, and the Rust source is identical to the reviewed repair.
+The 16 Linux artifact workflow tests passed on the Mac. A separate deployment
+contract exposed an obsolete assertion pinning a runbook's update date to
+September 4 even though current main changed it to September 6. The assertion
+now checks the required ISO date field while retaining every behavioral check.
+The full Linux installer suite was interrupted on the Mac during its first
+activation fixture; no Linux activation pass is claimed from that run, and its
+temporary subprocesses were verified exited. Full installer replay remains a
+native Linux CI gate.
+
 The isolated Linux replay passed 20 focused tests, including both production-path
 import fixtures, all six ledger fixtures, three discovery fixtures, and eight
 reset/status regressions. The first attempt refused permissive temporary-root

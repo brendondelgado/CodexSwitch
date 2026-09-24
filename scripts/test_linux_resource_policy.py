@@ -560,7 +560,7 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             frontmatter,
         )
         self.assertIn("docs/runbooks/linux-repository-deployment.md", frontmatter)
-        self.assertIn("last_updated: 2026-09-04", frontmatter)
+        self.assertRegex(frontmatter, r"(?m)^  last_updated: \d{4}-\d{2}-\d{2}$")
 
     def test_installer_declares_closed_world_readiness_and_scan_contracts(self):
         installer = installer_source()
