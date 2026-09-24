@@ -12,6 +12,7 @@ toc:
   - Explicit Legacy Supersession
 cross_dependencies:
   - 2026-09-24-vps-reliability-repair.md
+  - 2026-09-24-legacy-sync-operator-recovery.md
   - ../../crates/codexswitch-cli/src/main.rs
   - ../../crates/codexswitch-cli/src/credential_import_receipts.rs
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
@@ -90,13 +91,18 @@ wrong target, staging remnants, and conflicting local/remote receipts.
 # Legacy Supersession
 
 The September 9 hold has no durable receipt; this change cannot reconstruct one.
-Do not auto-clear it, delete its journal, or label it successful. A future explicit
-reviewed supersession must bind the full local journal generation, target,
+Do not auto-clear it or label it successful. Explicit reviewed supersession must
+bind the full local journal generation, target,
 current authority epoch, store/auth generations, incoming snapshot and absent
 staging, then revalidate under the appropriate local/remote mutation leases.
 The new operator-only local eligibility/backup/CAS API is documented below.
-The existing cross-host APIs still lack its lease-keeping evidence adapter;
-live supersession is not enabled by a blind compare-and-delete or force flag.
+The separate operator workflow now provides a lease-keeping authenticated SSH
+adapter, private backup and exact-generation retirement. It passed 39 offline
+fixtures and independent process-scan review. Live supersession remains gated on
+the fresh attested release and an authenticated read-only review under approved
+Mac quiescence; no blind compare-and-delete or force flag is permitted. See
+`2026-09-24-legacy-sync-operator-recovery.md` for the cooperative-process threat
+boundary and full entrypoint readiness gate.
 
 # Integration And Verification
 
@@ -110,6 +116,9 @@ Linux-only lost-reply integration. The combined Mac suite passed 289 tests acros
 installed at 16:29 UTC and recovered authority selection with verified live
 runtime convergence. The legacy receipt-less hold remains intact. No new server
 release is active, so full credential-pool syncing is not restored yet.
+The installed Mac changes are in the separate Mac recovery worktree and are not
+part of this Linux release branch; the installed dirty-source identifier above
+must not be confused with committed-main Mac behavior.
 The original coordination notes and sketch below are historical, not the current
 caller implementation. The implementation in `AppDelegate.swift` is authoritative.
 
@@ -269,8 +278,10 @@ or converged. No cached success or credential files are written by this API.
 
 Concrete live adapter prerequisites on the existing 7f60 release:
 
-1. Main must quiesce Mac sync/reconciliation submissions and confirm no queued
-   mutation, then read the local review. No restart is needed for this contract.
+1. Main must stop the CodexSwitch primary in the approved window so the operator
+   can hold its existing singleton lock, quiesce sync/reconciliation submissions,
+   and reject remaining import processes before reading the local review.
+   This does not require stopping the user's ChatGPT desktop or local app-server.
 2. An operator-approved authenticated SSH session must hold the EXISTING remote
    account-store runtime lock, accounts.runtime-activation.lock, exclusively and
    nonblocking for the entire local backup/CAS call. Validate owned regular lock
@@ -292,9 +303,10 @@ Concrete live adapter prerequisites on the existing 7f60 release:
    On old 7f60, a new import remains upgrade-deferred by the capability gate.
 
 The local eligibility/backup/CAS API is testable without network or credentials.
-This workstream does not provide a live lease-keeping SSH adapter or invoke it.
-Do not call the function live until main supplies that guard; passing synthetic
-fixture evidence to retire the September 9 journal is explicitly unsafe.
+The separate operator script now supplies the real lease-keeping SSH adapter,
+but it has not been applied live. Its authenticated read-only review must pass
+under the continuously held real guards before apply. Passing synthetic fixture
+evidence to retire the September 9 journal is explicitly unsafe.
 
 Additional Swift fixtures now include two upgrade-capability tests, five legacy
 supersession tests, and two guarded publication tests. `git diff --check` passes;

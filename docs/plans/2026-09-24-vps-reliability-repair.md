@@ -139,6 +139,31 @@ log remained identical and the install root remained absent. The test now
 compares the complete before/after log state instead of requiring nonexistent
 setup output; the installer and non-Git-source safety checks are unchanged.
 
+The corrected dry-run fixture passed in 1.666 seconds. A separate native Linux
+run of snapshot `56cfc89a31579d994ba7a4dbc28c9bc5d8bb55e1` was intentionally
+interrupted after 13m20s because it predated that test correction: 29 passed,
+zero failures/errors, one interrupted, and 58 not started. Its private network
+and PID namespaces hid production home, credentials and service sockets; source
+was read-only and writable paths were limited to fake fixtures. CPU was capped
+at 100%, memory at 2 GiB and tasks at 128. Only the owned test scope was stopped;
+all descendants exited. This is not a full-suite pass. The token-free report was
+verified through SecureDrop at
+`/Users/brendondelgado/CodexSwitch SecureDrop/inbox/codexswitch-linux-resource-policy-partial-56cfc89-qfe7iu8s-20260924T173251Z-161fa7ef.tar.gz`.
+
+The legacy operator adapter passed 39 offline fixtures, three independent live
+read-only process scans, and review of its cooperative-process threat boundary.
+It correctly refuses the still-running Mac primary. Actual authenticated SSH
+entrypoint review and apply have not run; the September 9 hold remains intact.
+Fresh VPS doctor evidence at approximately 17:33 UTC reported ready, confirmed,
+no activation barrier and zero issues. Both managed systemd units are disabled
+at boot; preserve both enable flags at zero. The server's read-only idle check
+passed, while six independent SIGNUL jobs were still running and preserved.
+
+Publication and merge approval remains pending. No push, pull request, merge,
+fresh artifact dispatch or release activation has occurred. After approval,
+full CI must pass before merge, followed by the exact-main attested build and
+the guarded maintenance sequence above.
+
 The isolated Linux replay passed 20 focused tests, including both production-path
 import fixtures, all six ledger fixtures, three discovery fixtures, and eight
 reset/status regressions. The first attempt refused permissive temporary-root
