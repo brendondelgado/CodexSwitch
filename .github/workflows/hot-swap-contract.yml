@@ -113,6 +113,7 @@ jobs:
           set -euo pipefail
           command -v timeout >/dev/null
           python3 scripts/test_linux_resource_policy.py
+          python3 scripts/test_repair_managed_runtime_record.py
 
       - name: Compile and execute generated upstream turn contract
         shell: bash

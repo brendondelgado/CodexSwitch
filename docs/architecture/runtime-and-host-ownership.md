@@ -80,7 +80,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-09-08
+  last_updated: 2026-09-24
 ---
 
 # Runtime And Host Ownership
@@ -205,6 +205,19 @@ two-phase handoff:
 ```text
 pending -> awaiting_caller_acceptance -> locally_converged
 ```
+
+Credential imports separately persist a token-free operation receipt under the
+runtime activation lease. The intent is durable before account mutation and the
+receipt becomes completed only after verified activation. Read-only receipt
+lookup binds the operation, baseline, incoming credential fingerprint, and host
+paths; duplicate operation IDs never repeat the import. A completed historical
+receipt remains historical evidence after later rotations, not proof of current
+convergence. The Mac retires its matching held journal with generation checks,
+invalidates its convergence cache, and requests fresh convergence. Missing or
+pending receipts, including legacy receipt-less holds, require reviewed recovery
+and never become fabricated success. The ledger is bounded and fails closed on
+exhaustion or malformed records. See
+`../plans/2026-09-24-credential-import-receipts.md` for replay fixtures.
 
 The control CLI may enter `awaiting_caller_acceptance` only after Mac
 credentials and every required runtime acknowledgement converge to the recorded
@@ -609,6 +622,22 @@ tick current while any discovered owner is stale. Duplicate PIDs, replaced
 runtime inodes, mismatched owner UIDs, stale daemon PID records, or unexpected
 argv are ambiguous ownership and fail closed without signaling. One owner may
 not silently age out while another owner remains healthy.
+
+A bounded command-line read failure from an unrelated same-user process does
+not invalidate this scan when kernel executable metadata proves a different
+device/inode from the managed runtime and a bounded, complete, nonempty `argv[0]`
+does not claim either managed runtime path. Unknown or matching executable
+identity, incomplete program names, and managed-route claims still fail closed.
+This exception does not relax argument or identity validation for readable
+processes or managed owners.
+
+Stale legacy PID metadata is never silently rewritten during observation.
+The explicit `scripts/repair-managed-runtime-record.py` recovery requires the
+approved stale PID and record SHA-256, absence of that PID, a single exact live
+runtime and matching Unix socket peer, and stable identity under the existing
+installation, legacy startup, modern startup, and activation locks. It preserves
+the original record in a private backup; it neither signals nor restarts the
+runtime. Normal daemon maintenance must independently prove renewed readiness.
 
 The Swift activation journal enforces this lease centrally. Every durable
 journal transition either inherits task-local proof from an enclosing Swift
