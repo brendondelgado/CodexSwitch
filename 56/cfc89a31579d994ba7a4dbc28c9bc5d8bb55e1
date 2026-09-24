@@ -1,0 +1,21 @@
+docs/plans/2026-09-24-vps-reliability-repair.md
+  s_efcd87606c5f73::t_4ded4f7fa1962d 122-133
+scripts/test_linux_resource_policy.py
+  s_efcd87606c5f73::t_4ded4f7fa1962d 563
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "56cfc89a31579d994ba7a4dbc28c9bc5d8bb55e1",
+  "prompts": {},
+  "sessions": {
+    "s_efcd87606c5f73": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08743-ee0f-7983-8d2c-0c51541d985d",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
