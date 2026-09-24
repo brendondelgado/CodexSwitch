@@ -131,6 +131,14 @@ activation fixture; no Linux activation pass is claimed from that run, and its
 temporary subprocesses were verified exited. Full installer replay remains a
 native Linux CI gate.
 
+Existing main CI run `34290121605` completed all 88 installer fixtures in
+2312.835 seconds with two failures. The date assertion above was one; the other
+was dry-run fixture contamination. Artifact setup invokes a mock controller that
+creates the tool log before dry-run begins. A focused replay proved its 152-byte
+log remained identical and the install root remained absent. The test now
+compares the complete before/after log state instead of requiring nonexistent
+setup output; the installer and non-Git-source safety checks are unchanged.
+
 The isolated Linux replay passed 20 focused tests, including both production-path
 import fixtures, all six ledger fixtures, three discovery fixtures, and eight
 reset/status regressions. The first attempt refused permissive temporary-root
