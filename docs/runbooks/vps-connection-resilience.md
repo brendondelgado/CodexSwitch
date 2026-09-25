@@ -13,6 +13,7 @@ toc:
   - Maintenance Build Contract
   - Recovery Verification
 cross_dependencies:
+  - .github/workflows/hot-swap-contract.yml
   - crates/codexswitch-cli/systemd/codexswitch.service
   - crates/codexswitch-cli/systemd/codexswitch.service.d/10-maintenance-resources.conf
   - crates/codexswitch-cli/systemd/signul-codex-app-server.service
@@ -110,6 +111,11 @@ missing completion markers, and definite local launch failure. Tests
 must not restart the live VPS or require a real config change.
 
 ## Stop Desktop Server For Maintenance
+
+The native Linux contract job runs `scripts/test_vps_codex_restart.py` before
+the installer fixtures. Its deterministic checks cover stale confirmation,
+active work, socket and process identity drift, shutdown timeout, and the
+absence of restart or force-kill behavior in stop-only mode.
 
 For an explicitly approved deployment window, the same helper accepts
 `--stop-only` with the exact `pid`, `processStart`, and `configDigest` returned
