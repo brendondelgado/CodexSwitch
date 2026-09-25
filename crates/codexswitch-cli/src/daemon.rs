@@ -336,8 +336,20 @@ fn fetch_reset_bank_with_backoff<B>(
 where
     B: Fn(&CodexAccount) -> Result<RateLimitResetBank>,
 {
-    let now = Utc::now();
-    if !backoff.borrow_mut().should_attempt(account, now) {
+    fetch_reset_bank_with_backoff_and_clock(account, backoff, fetch_reset_bank, Utc::now)
+}
+
+fn fetch_reset_bank_with_backoff_and_clock<B, N>(
+    account: &CodexAccount,
+    backoff: &RefCell<ResetBankRefreshBackoff>,
+    fetch_reset_bank: &B,
+    now: N,
+) -> Result<RateLimitResetBank>
+where
+    B: Fn(&CodexAccount) -> Result<RateLimitResetBank>,
+    N: Fn() -> chrono::DateTime<Utc>,
+{
+    if !backoff.borrow_mut().should_attempt(account, now()) {
         return Err(ResetBankRefreshDeferred.into());
     }
 
@@ -347,7 +359,7 @@ where
             Ok(bank)
         }
         Err(error) => {
-            let retry_at = backoff.borrow_mut().record_failure(account, &error, now);
+            let retry_at = backoff.borrow_mut().record_failure(account, &error, now());
             let retry_detail = retry_at
                 .map(|retry_at| format!("until {retry_at}"))
                 .unwrap_or_else(|| "until the credential generation changes".to_string());
@@ -4059,6 +4071,60 @@ mod tests {
         assert!(acquire_daemon_owner_lease(&store_path).is_err());
         drop(owner);
         assert!(acquire_daemon_owner_lease(&store_path).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn reset_bank_cooldowns_start_after_failure_and_reopen_at_boundary() -> Result<()> {
+        let start =
+            chrono::DateTime::parse_from_rfc3339("2026-09-24T13:00:00Z")?.with_timezone(&Utc);
+        let now = std::cell::Cell::new(start);
+        let account = account("reset@example.com", false, 100.0, 100.0);
+        let backoff = RefCell::new(ResetBankRefreshBackoff::default());
+        let calls = std::cell::Cell::new(0);
+
+        for (attempt, minutes) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let failed_at = now.get() + ChronoDuration::seconds(15);
+            let error = fetch_reset_bank_with_backoff_and_clock(
+                &account,
+                &backoff,
+                &|_| {
+                    calls.set(calls.get() + 1);
+                    now.set(failed_at);
+                    bail!("simulated slow provider timeout")
+                },
+                || now.get(),
+            )
+            .unwrap_err();
+            let retry_at = failed_at + ChronoDuration::minutes(minutes);
+            assert_eq!(calls.get(), attempt + 1);
+            assert_eq!(
+                backoff.borrow().failures[&account.id].retry_at,
+                Some(retry_at)
+            );
+            assert!(format!("{error:#}").contains("simulated slow provider timeout"));
+
+            now.set(retry_at - ChronoDuration::nanoseconds(1));
+            let deferred = fetch_reset_bank_with_backoff_and_clock(
+                &account,
+                &backoff,
+                &|_| panic!("cooldown must prevent provider I/O"),
+                || now.get(),
+            )
+            .unwrap_err();
+            assert!(deferred
+                .downcast_ref::<ResetBankRefreshDeferred>()
+                .is_some());
+            now.set(retry_at);
+        }
+
+        fetch_reset_bank_with_backoff_and_clock(
+            &account,
+            &backoff,
+            &|_| Ok(reset_bank(0, now.get())),
+            || now.get(),
+        )?;
+        assert!(backoff.borrow().failures.is_empty());
         Ok(())
     }
 

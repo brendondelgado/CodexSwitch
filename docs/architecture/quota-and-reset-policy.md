@@ -43,7 +43,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-09-06
+  last_updated: 2026-09-25
 ---
 
 # Quota And Reset Policy
@@ -136,6 +136,23 @@ satisfies that requirement; a five-hour window is not required.
 
 Unknown and stale accounts are observable but cannot outrank confirmed usable accounts.
 
+New automatic pool-target requests with reasons `quotaExhausted`,
+`higherPlanAvailable`, `tokenInvalidated`, `terminalTokenRecovery`, or
+`usageUnavailable` must pass the VPS's stored account eligibility checks, even
+when the requesting Mac considers the target healthy. The target must have
+complete credentials, an inference JWT beyond the five-minute safety window,
+no current runtime block, fresh usable quota, and an automatic-eligible plan.
+This admission check performs no provider calls and does not clear a block or
+redeem a reset. Rejection instructs the caller to resolve VPS credentials,
+runtime blocks, or quota observations before retrying; it does not echo tokens
+or provider responses. Explicit manual selection retains its existing policy.
+Only an exact replay of a stable decision whose target is already active with
+matching, confirmed store/auth state may return without a new eligibility
+decision or any effects. Interrupted, converging, degraded, or unconfirmed
+replays must pass eligibility before recovery. A new same-target automatic
+request must still pass eligibility, without treating the active flag as a
+rejection.
+
 Free-plan accounts are stored and remain visible, but they are not automatic
 capacity. An account whose normalized provider plan is Free, Free Workspace,
 Guest, or another Free/Guest plan variant is ineligible for automatic rotation,
@@ -198,6 +215,24 @@ account blocked as `token_expired` is not polled or refreshed again until the
 block expires or an imported credential generation replaces that account
 record. This prevents a daemon tick from retrying the same rejected refresh
 token across active and inactive candidates.
+
+Quota and reset-inventory GETs classify non-200 HTTP status before reading the
+response body. A stalled error body must not hide status evidence. Quota 401
+retains the existing expired-token signal and the caller's one-refresh path;
+it does not by itself prove that a credential generation is permanently stale.
+Quota 429 remains a polling rate-limit error, not evidence of exhausted account
+quota. Other quota error statuses retain their HTTP error classification.
+Reset inventory retains its separate typed status contract: 401/403 are
+authentication failures, 404 is unsupported, 429 is rate-limited, and other
+non-200 statuses are provider failures. These GET rules do not change reset
+consumption or credential-refresh transport behavior.
+
+HTTP 200 still requires a completely read, valid response before publishing an
+observation. Parsed quota denials and placeholder-window retry behavior remain
+unchanged; a failed body read is not a successful observation. Request timeout,
+proxy policy, and network retry behavior are unchanged. Deterministic fixtures
+must prove that non-200 classification never invokes the body reader, while
+200 responses preserve parsing and body-read failure semantics.
 
 ## Candidate Ranking
 
@@ -357,6 +392,13 @@ an inactive candidate, checks that account's backoff immediately before I/O.
 An authentication block on the active account cannot suppress evaluation of a
 different eligible account, and an inactive account's own block cannot be
 bypassed by a cached inventory observation.
+
+A finite reset-inventory failure cooldown starts when the provider attempt
+finishes, not when it starts. Slow failures must not consume their own cooldown.
+The existing exponential cap, status-specific durations, success clearing,
+account isolation, and credential-generation invalidation remain unchanged.
+Injected-clock fixtures verify the full post-failure cooldown and its exact
+retry boundary without sleeping or contacting the provider.
 
 Reset redemption is a journaled state machine:
 

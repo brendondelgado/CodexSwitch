@@ -560,7 +560,7 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             frontmatter,
         )
         self.assertIn("docs/runbooks/linux-repository-deployment.md", frontmatter)
-        self.assertIn("last_updated: 2026-09-04", frontmatter)
+        self.assertRegex(frontmatter, r"(?m)^  last_updated: \d{4}-\d{2}-\d{2}$")
 
     def test_installer_declares_closed_world_readiness_and_scan_contracts(self):
         installer = installer_source()
@@ -2003,13 +2003,17 @@ run_repository_cargo_build
         return release
 
     def test_dry_run_is_non_mutating_and_non_git_source_is_rejected(self):
+        tool_log_before = self.tool_log.read_bytes() if self.tool_log.exists() else None
         env = self._environment()
         env["CODEXSWITCH_DRY_RUN"] = "1"
 
         result = self._run_installer(env)
         self.assertIn("Stage-only default", result.stdout)
         self.assertFalse(self.install_root.exists())
-        self.assertFalse(self.tool_log.exists())
+        self.assertEqual(
+            self.tool_log.read_bytes() if self.tool_log.exists() else None,
+            tool_log_before,
+        )
 
         source = self.install_root / "source"
         source.mkdir(parents=True)

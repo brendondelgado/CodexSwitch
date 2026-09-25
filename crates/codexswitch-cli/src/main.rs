@@ -4,6 +4,7 @@ mod auth;
 mod bounded_command;
 mod codex_health;
 mod codex_update;
+mod credential_import_receipts;
 mod daemon;
 mod import;
 mod patched_codex;
@@ -66,7 +67,7 @@ use reload::{
     restart_codex_processes, ReloadSummary,
 };
 use ring::digest::{digest, Context as DigestContext, SHA256};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::Cell;
 use std::ffi::OsString;
@@ -126,9 +127,21 @@ enum Command {
             conflicts_with = "offline_file_only"
         )]
         receipt_operation_id: Option<Uuid>,
+        /// Reject a stale sender baseline before preparing the credential import.
+        #[arg(long, requires = "receipt_operation_id", value_parser = credential_import_receipts::parse_fingerprint)]
+        receipt_baseline_fingerprint: Option<String>,
         /// Commit and verify store/auth while an operator-proven runtime is idle.
         #[arg(long)]
         offline_file_only: bool,
+    },
+    /// Replay historical import evidence without importing or claiming current convergence.
+    CredentialImportStatus {
+        #[arg(long, value_parser = parse_canonical_uuid)]
+        operation_id: Uuid,
+        #[arg(long, value_parser = credential_import_receipts::parse_fingerprint)]
+        baseline_fingerprint: String,
+        #[arg(long, value_parser = credential_import_receipts::parse_fingerprint)]
+        incoming_fingerprint: String,
     },
     Status,
     PoolAuthorityStatus {
@@ -349,6 +362,7 @@ fn main() -> Result<()> {
             offline_file_only,
             false,
             None,
+            None,
             "Imported",
         ),
         Command::UpdateBundle {
@@ -356,6 +370,7 @@ fn main() -> Result<()> {
             ignore_expiry,
             preserve_active,
             receipt_operation_id,
+            receipt_baseline_fingerprint,
             offline_file_only,
         } => import_accounts(
             &bundle,
@@ -365,8 +380,16 @@ fn main() -> Result<()> {
             offline_file_only,
             preserve_active,
             receipt_operation_id,
+            receipt_baseline_fingerprint.as_deref(),
             "Updated",
         ),
+        Command::CredentialImportStatus { operation_id, baseline_fingerprint, incoming_fingerprint } => {
+            let status = credential_import_receipts::observe(
+                &store_path, &auth_path, operation_id, &baseline_fingerprint, &incoming_fingerprint,
+            )?;
+            println!("{}", serde_json::to_string(&status)?);
+            Ok(())
+        }
         Command::Status => status(&store_path),
         Command::PoolAuthorityStatus { json } => pool_authority_status(&store_path, json),
         Command::RequestPoolTarget {
@@ -536,6 +559,7 @@ fn import_accounts(
     offline_file_only: bool,
     preserve_active: bool,
     receipt_operation_id: Option<Uuid>,
+    receipt_baseline_fingerprint: Option<&str>,
     verb: &str,
 ) -> Result<()> {
     if receipt_operation_id.is_some() && !preserve_active {
@@ -551,6 +575,7 @@ fn import_accounts(
         imported_accounts,
         preserve_active,
         receipt_operation_id,
+        receipt_baseline_fingerprint,
         !offline_file_only,
         &reload_codex_hot_swap_processes,
     )?;
@@ -580,6 +605,7 @@ fn replace_import_accounts_with_unlocked_reload<R>(
     imported_accounts: Vec<account_store::CodexAccount>,
     preserve_active: bool,
     receipt_operation_id: Option<Uuid>,
+    receipt_baseline_fingerprint: Option<&str>,
     reload_enabled: bool,
     reload: &R,
 ) -> Result<(usize, ActivationOutcome, Option<CredentialImportReceipt>)>
@@ -593,6 +619,19 @@ where
         bail!("an import receipt requires runtime convergence");
     }
     let runtime_lease = acquire_runtime_activation_lease(store_path)?;
+    let incoming_credential_set_fingerprint = receipt_operation_id
+        .map(|_| complete_credential_set_fingerprint(&imported_accounts))
+        .transpose()?;
+    // Reject replays before reconciling any activation or changing authority state.
+    let mut receipt_journal = receipt_operation_id
+        .map(|operation_id| credential_import_receipts::Journal::acquire(
+            &runtime_lease,
+            store_path,
+            auth_path,
+            operation_id,
+            incoming_credential_set_fingerprint.as_deref().context("missing incoming fingerprint")?,
+        ))
+        .transpose()?;
     if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
         store_path,
@@ -626,9 +665,6 @@ where
         None
     };
 
-    let incoming_credential_set_fingerprint = receipt_operation_id
-        .map(|_| complete_credential_set_fingerprint(&imported_accounts))
-        .transpose()?;
     let (account_count, prepared, receipt) = {
         let store_lock = lock_account_store(store_path)?;
         let snapshot = store_lock.load()?;
@@ -636,6 +672,11 @@ where
         let baseline_credential_set_fingerprint = receipt_operation_id
             .map(|_| complete_credential_set_fingerprint(&stored_accounts))
             .transpose()?;
+        if let Some(expected) = receipt_baseline_fingerprint {
+            if baseline_credential_set_fingerprint.as_deref() != Some(expected) {
+                bail!("credential import baseline changed before preparation");
+            }
+        }
         let (replacement_accounts, credential_selections) =
             if let Some(authority_target) = authority_target.as_deref() {
                 let merged = merge_authority_preserving_accounts(
@@ -663,6 +704,9 @@ where
                 )
             })
             .transpose()?;
+        if let (Some(journal), Some(receipt)) = (receipt_journal.as_mut(), receipt.as_ref()) {
+            journal.prepare(receipt)?;
+        }
         let mut generation = snapshot.generation;
         let outcome = replace_accounts_with_under_runtime_lease(
             &runtime_lease,
@@ -678,6 +722,11 @@ where
     };
 
     if !reload_enabled || !prepared.is_file_only() {
+        if prepared.is_confirmed() {
+            if let (Some(journal), Some(receipt)) = (receipt_journal.as_mut(), receipt.as_ref()) {
+                journal.complete(receipt)?;
+            }
+        }
         return Ok((account_count, prepared, receipt));
     }
     let outcome = reconcile_activation_barrier_unlocked_under_runtime_lease(
@@ -688,6 +737,11 @@ where
         reload,
     )?
     .context("import activation disappeared before runtime convergence")?;
+    if outcome.is_confirmed() {
+        if let (Some(journal), Some(receipt)) = (receipt_journal.as_mut(), receipt.as_ref()) {
+            journal.complete(receipt)?;
+        }
+    }
     Ok((account_count, outcome, receipt))
 }
 
@@ -749,7 +803,7 @@ fn preserve_host_operational_state(
     incoming.rate_limit_reset_bank = current.rate_limit_reset_bank.clone();
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum CredentialGeneration {
     Matching,
@@ -763,15 +817,15 @@ struct AuthorityPreservingMerge {
     selections: Vec<CredentialImportSelection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CredentialImportSelection {
     provider_account_id: String,
     generation: CredentialGeneration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CredentialImportReceipt {
     version: u32,
     operation_id: Uuid,
@@ -987,6 +1041,40 @@ fn print_pool_authority_status(status: &PoolAuthorityStatus, json: bool) -> Resu
     Ok(())
 }
 
+fn is_automatic_pool_target_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "quotaExhausted"
+            | "higherPlanAvailable"
+            | "tokenInvalidated"
+            | "terminalTokenRecovery"
+            | "usageUnavailable"
+    )
+}
+
+fn validate_automatic_pool_target_request(
+    target: &account_store::CodexAccount,
+    reason: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    if !is_automatic_pool_target_reason(reason) {
+        return Ok(());
+    }
+    if !target.is_eligible_for_automatic_rotation() {
+        bail!("automatic pool-target request rejected: VPS target plan is excluded from automatic rotation; choose an eligible paid target");
+    }
+    if target.runtime_unusable_at(now) {
+        bail!("automatic pool-target request rejected: VPS target has a current runtime block; resolve that block with verified credentials or quota recovery before retrying");
+    }
+    if !target.has_complete_token_material() || !target.has_usable_inference_token_at(now) {
+        bail!("automatic pool-target request rejected: VPS target credentials are incomplete, expired, or within the five-minute safety window; reauthenticate or import current credentials before retrying");
+    }
+    if quota_availability_at(target, now) != QuotaAvailability::Usable {
+        bail!("automatic pool-target request rejected: VPS target quota is denied, exhausted, stale, or unknown; refresh VPS quota and retry only after it is usable");
+    }
+    Ok(())
+}
+
 fn request_pool_target_with<R>(
     store_path: &Path,
     auth_path: &Path,
@@ -1004,6 +1092,44 @@ where
     let runtime_lease = acquire_runtime_activation_lease(store_path)?;
     let mut authority = PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, store_path)?;
     authority.reject_stale_request_before_io(request_id, expected_epoch)?;
+    let replay = authority
+        .record()
+        .filter(|current| current.request_id == request_id);
+    if is_automatic_pool_target_reason(reason) || replay.is_some() {
+        let store_lock = lock_account_store(store_path)?;
+        let snapshot = store_lock.load()?;
+        let target_id = resolve_account_selector(&snapshot.accounts, selector)?;
+        let target = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.id == target_id)
+            .context("pool-target account disappeared")?;
+        if let Some(current) = replay {
+            if current.desired_provider_account_id != target.account_id || current.reason != reason
+            {
+                bail!("pool-authority request ID was reused with different request content");
+            }
+            // Only a completed, effect-free replay may bypass current eligibility.
+            if is_automatic_pool_target_reason(reason)
+                && current.phase == PoolAuthorityPhase::Stable
+                && target.is_active
+            {
+                let record = activation::read_activation_record(&store_lock)?;
+                let auth_fingerprint = auth::auth_file_fingerprint(auth_path);
+                if record.as_ref().is_some_and(|record| {
+                    activation::activation_record_confirms_current(
+                        record,
+                        target,
+                        &snapshot.generation,
+                        auth_fingerprint.as_deref(),
+                    )
+                }) {
+                    return Ok(PoolAuthorityStatus::from(current));
+                }
+            }
+        }
+        validate_automatic_pool_target_request(target, reason, Utc::now())?;
+    }
     if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
         store_path,
@@ -1029,6 +1155,7 @@ where
         .find(|account| account.id == target_id)
         .cloned()
         .context("pool-target account disappeared")?;
+    validate_automatic_pool_target_request(&target, reason, Utc::now())?;
     authority.bootstrap_from_active(&snapshot.accounts)?;
     let (disposition, record) =
         authority.begin_target_request(&target.account_id, request_id, expected_epoch, reason)?;
@@ -4554,6 +4681,563 @@ mod tests {
     }
 
     #[test]
+    fn automatic_pool_target_reasons_cover_swift_automatic_swaps() {
+        let source = include_str!("../../../Sources/CodexSwitch/Models/SwapEvent.swift");
+        let reasons: Vec<_> = source
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("case "))
+            .collect();
+        assert_eq!(reasons.len(), 7);
+        for reason in reasons {
+            assert_eq!(
+                is_automatic_pool_target_reason(reason),
+                !matches!(reason, "manual" | "poolAuthority"),
+                "{reason}"
+            );
+        }
+        assert!(!is_automatic_pool_target_reason("manual_cli_swap"));
+        assert!(!is_automatic_pool_target_reason("swift_manual_selection"));
+    }
+
+    #[test]
+    fn automatic_pool_target_rejects_vps_ineligible_targets_without_effects() -> Result<()> {
+        for reason in [
+            "quotaExhausted",
+            "higherPlanAvailable",
+            "tokenInvalidated",
+            "terminalTokenRecovery",
+            "usageUnavailable",
+        ] {
+            for condition in [
+                "token-block",
+                "usage-block",
+                "expired",
+                "incomplete",
+                "denied",
+                "exhausted",
+                "stale",
+                "unknown",
+                "free",
+                "guest",
+            ] {
+                let now = Utc::now();
+                let temp = secure_temp_dir()?;
+                let store_path = temp.path().join("accounts.json");
+                let auth_path = temp.path().join("auth.json");
+                let active = account("active@example.com", true, 10.0, 10.0);
+                let mut target = account("target@example.com", false, 10.0, 10.0);
+                match condition {
+                    "token-block" | "usage-block" => {
+                        target.runtime_unusable_until = Some(now + ChronoDuration::days(28));
+                        target.runtime_unusable_reason = Some(if condition == "token-block" {
+                            "token_expired".to_string()
+                        } else {
+                            "usage_limit".to_string()
+                        });
+                    }
+                    "expired" => {
+                        target.access_token =
+                            account_store::test_inference_token(now - ChronoDuration::days(1))
+                    }
+                    "incomplete" => target.refresh_token.clear(),
+                    "denied" => target.quota_snapshot.as_mut().unwrap().allowed = Some(false),
+                    "exhausted" => {
+                        target.quota_snapshot.as_mut().unwrap().windows[1].used_percent = 100.0
+                    }
+                    "stale" => {
+                        target.quota_snapshot.as_mut().unwrap().fetched_at =
+                            now - ChronoDuration::hours(1)
+                    }
+                    "unknown" => target.quota_snapshot = None,
+                    "free" | "guest" => target.plan_type = Some(condition.to_string()),
+                    _ => unreachable!(),
+                }
+                save_accounts(&store_path, &[active.clone(), target.clone()])?;
+                confirm_provider_io_activation(&store_path, &auth_path)?;
+                {
+                    let lease = acquire_runtime_activation_lease(&store_path)?;
+                    let mut authority =
+                        PoolAuthorityLock::acquire_under_runtime_lease(&lease, &store_path)?;
+                    authority.bootstrap_from_active(&[active.clone(), target.clone()])?;
+                }
+                // Even a prior convergence barrier must not reload on rejected admission.
+                set_test_activation_state(&store_path, ActivationState::CommittedDegraded)?;
+                let paths = [
+                    store_path.clone(),
+                    auth_path.clone(),
+                    activation::activation_record_path(&store_path),
+                    pool_authority::pool_authority_path(&store_path),
+                ];
+                let before: Vec<_> = paths.iter().map(fs::read).collect::<std::io::Result<_>>()?;
+                let error = request_pool_target_with(
+                    &store_path,
+                    &auth_path,
+                    &target.account_id,
+                    Uuid::new_v4(),
+                    1,
+                    reason,
+                    &|_| panic!("rejected {reason}/{condition} must not reload"),
+                )
+                .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(
+                    message.starts_with("automatic pool-target request rejected:"),
+                    "{reason}/{condition}: {message}"
+                );
+                assert!(message.len() < 300);
+                for secret in [
+                    &target.access_token,
+                    &target.id_token,
+                    &active.refresh_token,
+                ] {
+                    assert!(!message.contains(secret));
+                }
+                assert!(!message.contains(&target.email));
+                for (path, bytes) in paths.iter().zip(before) {
+                    assert_eq!(
+                        fs::read(path)?,
+                        bytes,
+                        "{reason}/{condition}: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_target_rejects_before_authority_bootstrap() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let mut target = account("target@example.com", false, 10.0, 10.0);
+        target.plan_type = Some("free".to_string());
+        save_accounts(&store_path, &[active, target.clone()])?;
+        let before = fs::read(&store_path)?;
+        let error = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            Uuid::new_v4(),
+            1,
+            "quotaExhausted",
+            &|_| panic!("bootstrap rejection must not reload"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("plan is excluded"));
+        assert_eq!(fs::read(&store_path)?, before);
+        assert!(!auth_path.exists());
+        assert!(!activation::activation_record_path(&store_path).exists());
+        assert!(!pool_authority::pool_authority_path(&store_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_target_uses_exact_token_and_quota_boundaries() -> Result<()> {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-25T12:00:00Z")?.with_timezone(&Utc);
+        let mut target = account("target@example.com", false, 10.0, 10.0);
+        let snapshot = target.quota_snapshot.as_mut().unwrap();
+        snapshot.fetched_at = now;
+        for window in &mut snapshot.windows {
+            window.resets_at = now + ChronoDuration::days(7);
+        }
+        for seconds in [299, 300, 301] {
+            target.access_token =
+                account_store::test_inference_token(now + ChronoDuration::seconds(seconds));
+            assert_eq!(
+                validate_automatic_pool_target_request(&target, "quotaExhausted", now,).is_ok(),
+                seconds > 300
+            );
+        }
+        target.access_token = account_store::test_inference_token(now + ChronoDuration::days(1));
+        for (age, eligible) in [
+            (ChronoDuration::minutes(15), true),
+            (
+                ChronoDuration::minutes(15) + ChronoDuration::nanoseconds(1),
+                false,
+            ),
+            (-ChronoDuration::nanoseconds(1), false),
+        ] {
+            target.quota_snapshot.as_mut().unwrap().fetched_at = now - age;
+            assert_eq!(
+                validate_automatic_pool_target_request(&target, "quotaExhausted", now,).is_ok(),
+                eligible
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_target_preserves_replay_and_new_same_target_epoch() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let target = account("target@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, target.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let reloads = Cell::new(0);
+        let first = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            Uuid::new_v4(),
+            1,
+            "quotaExhausted",
+            &|_| {
+                reloads.set(reloads.get() + 1);
+                Ok(verified_reload_summary())
+            },
+        )?;
+        assert_eq!(first.epoch, 2);
+        assert_eq!(first.phase, PoolAuthorityPhase::Stable);
+        assert_eq!(reloads.get(), 1);
+        let second = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            Uuid::new_v4(),
+            2,
+            "usageUnavailable",
+            &|_| panic!("same target must not reload"),
+        )?;
+        assert_eq!(second.epoch, 2);
+        assert_ne!(second.request_id, first.request_id);
+
+        let mut accounts = load_accounts(&store_path)?;
+        let current = accounts
+            .iter_mut()
+            .find(|account| account.is_active)
+            .unwrap();
+        current.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(28));
+        current.runtime_unusable_reason = Some("token_expired".to_string());
+        current.quota_snapshot = None;
+        save_accounts(&store_path, &accounts)?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let paths = [
+            store_path.clone(),
+            auth_path.clone(),
+            pool_authority::pool_authority_path(&store_path),
+        ];
+        let before: Vec<_> = paths.iter().map(fs::read).collect::<std::io::Result<_>>()?;
+        let replay = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            second.request_id,
+            1,
+            "usageUnavailable",
+            &|_| panic!("exact replay must not reload"),
+        )?;
+        assert_eq!(replay.epoch, second.epoch);
+        assert_eq!(replay.request_id, second.request_id);
+        let rejected = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            Uuid::new_v4(),
+            2,
+            "usageUnavailable",
+            &|_| panic!("new blocked same-target request must not reload"),
+        )
+        .unwrap_err();
+        assert!(rejected.to_string().contains("current runtime block"));
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(fs::read(path)?, bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_target_rejects_stale_epoch_and_changed_replay_content() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let target = account("target@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active.clone(), target.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let first = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            Uuid::new_v4(),
+            1,
+            "quotaExhausted",
+            &|_| Ok(verified_reload_summary()),
+        )?;
+        set_test_activation_state(&store_path, ActivationState::CommittedDegraded)?;
+        let paths = [
+            store_path.clone(),
+            auth_path.clone(),
+            activation::activation_record_path(&store_path),
+            pool_authority::pool_authority_path(&store_path),
+        ];
+        let before: Vec<_> = paths.iter().map(fs::read).collect::<std::io::Result<_>>()?;
+        for (selector, id, epoch, reason, expected) in [
+            (
+                &active.account_id,
+                Uuid::new_v4(),
+                1,
+                "quotaExhausted",
+                "stale pool-authority epoch",
+            ),
+            (
+                &active.account_id,
+                first.request_id,
+                1,
+                "quotaExhausted",
+                "different request content",
+            ),
+            (
+                &target.account_id,
+                first.request_id,
+                1,
+                "usageUnavailable",
+                "different request content",
+            ),
+            (
+                &target.account_id,
+                first.request_id,
+                1,
+                "manual",
+                "different request content",
+            ),
+        ] {
+            let error = request_pool_target_with(
+                &store_path,
+                &auth_path,
+                selector,
+                id,
+                epoch,
+                reason,
+                &|_| panic!("invalid request must not reload"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected));
+            for (path, bytes) in paths.iter().zip(&before) {
+                assert_eq!(&fs::read(path)?, bytes);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_target_interrupted_replay_cannot_activate_ineligible_target() -> Result<()> {
+        for phase in [
+            PoolAuthorityPhase::Converging,
+            PoolAuthorityPhase::Degraded,
+            PoolAuthorityPhase::Stable,
+        ] {
+            for blocked in [false, true] {
+                let temp = secure_temp_dir()?;
+                let store_path = temp.path().join("accounts.json");
+                let auth_path = temp.path().join("auth.json");
+                let active = account("active@example.com", true, 10.0, 10.0);
+                let mut target = account("target@example.com", false, 10.0, 10.0);
+                if blocked {
+                    target.runtime_unusable_reason = Some("token_expired".to_string());
+                    target.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(28));
+                } else {
+                    target.access_token =
+                        account_store::test_inference_token(Utc::now() - ChronoDuration::days(1));
+                }
+                save_accounts(&store_path, &[active.clone(), target.clone()])?;
+                confirm_provider_io_activation(&store_path, &auth_path)?;
+                let request_id = Uuid::new_v4();
+                {
+                    let lease = acquire_runtime_activation_lease(&store_path)?;
+                    let mut authority =
+                        PoolAuthorityLock::acquire_under_runtime_lease(&lease, &store_path)?;
+                    authority.bootstrap_from_active(std::slice::from_ref(&active))?;
+                    // Simulate a crash after choosing the target, before committing credentials.
+                    authority.begin_target_request(
+                        &target.account_id,
+                        request_id,
+                        1,
+                        "quotaExhausted",
+                    )?;
+                    match phase {
+                        PoolAuthorityPhase::Degraded => {
+                            authority.mark_degraded("fixture interruption")?;
+                        }
+                        PoolAuthorityPhase::Stable => {
+                            authority.mark_stable()?;
+                        }
+                        PoolAuthorityPhase::Converging => {}
+                    }
+                }
+                let paths = [
+                    store_path.clone(),
+                    auth_path.clone(),
+                    activation::activation_record_path(&store_path),
+                    pool_authority::pool_authority_path(&store_path),
+                ];
+                let before: Vec<_> = paths.iter().map(fs::read).collect::<std::io::Result<_>>()?;
+                let error = request_pool_target_with(
+                    &store_path,
+                    &auth_path,
+                    &target.account_id,
+                    request_id,
+                    1,
+                    "quotaExhausted",
+                    &|_| panic!("interrupted ineligible replay must not reload"),
+                )
+                .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .starts_with("automatic pool-target request rejected:"));
+                for (path, bytes) in paths.iter().zip(before) {
+                    assert_eq!(fs::read(path)?, bytes);
+                }
+                assert!(auth::auth_file_matches_account(&auth_path, &active));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_target_unconfirmed_replay_does_not_bypass_guard() -> Result<()> {
+        for state in [
+            ActivationState::CommittedDegraded,
+            ActivationState::FileOnly,
+            ActivationState::Confirmed,
+        ] {
+            let temp = secure_temp_dir()?;
+            let store_path = temp.path().join("accounts.json");
+            let auth_path = temp.path().join("auth.json");
+            let mut target = account("target@example.com", true, 10.0, 10.0);
+            target.runtime_unusable_reason = Some("token_expired".to_string());
+            target.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(28));
+            save_accounts(&store_path, std::slice::from_ref(&target))?;
+            confirm_provider_io_activation(&store_path, &auth_path)?;
+            set_test_activation_state(&store_path, state)?;
+            if state == ActivationState::Confirmed {
+                let mut different_credentials = target.clone();
+                different_credentials.refresh_token = "different-fixture-refresh".to_string();
+                auth::write_auth_file(&auth_path, &different_credentials)?;
+            }
+            let request_id = Uuid::new_v4();
+            {
+                let lease = acquire_runtime_activation_lease(&store_path)?;
+                let mut authority =
+                    PoolAuthorityLock::acquire_under_runtime_lease(&lease, &store_path)?;
+                authority.bootstrap_from_active(std::slice::from_ref(&target))?;
+                authority.begin_target_request(
+                    &target.account_id,
+                    request_id,
+                    1,
+                    "quotaExhausted",
+                )?;
+            }
+            let paths = [
+                store_path.clone(),
+                auth_path.clone(),
+                activation::activation_record_path(&store_path),
+                pool_authority::pool_authority_path(&store_path),
+            ];
+            let before: Vec<_> = paths.iter().map(fs::read).collect::<std::io::Result<_>>()?;
+            let error = request_pool_target_with(
+                &store_path,
+                &auth_path,
+                &target.account_id,
+                request_id,
+                1,
+                "quotaExhausted",
+                &|_| panic!("unconfirmed blocked replay must not reload"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("current runtime block"));
+            for (path, bytes) in paths.iter().zip(before) {
+                assert_eq!(fs::read(path)?, bytes);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_target_concurrent_change_after_decision_is_degraded() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let target = account("target@example.com", false, 10.0, 10.0);
+        save_accounts(&store_path, &[active, target.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        let written = std::cell::RefCell::new(None);
+        let result = request_pool_target_with(
+            &store_path,
+            &auth_path,
+            &target.account_id,
+            Uuid::new_v4(),
+            1,
+            "quotaExhausted",
+            &|_| {
+                let mut accounts = load_accounts(&store_path)?;
+                let selected = accounts
+                    .iter_mut()
+                    .find(|account| account.is_active)
+                    .unwrap();
+                assert_eq!(selected.account_id, target.account_id);
+                selected.runtime_unusable_reason = Some("token_expired".to_string());
+                selected.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(28));
+                save_accounts(&store_path, &accounts)?;
+                *written.borrow_mut() = Some(fs::read(&store_path)?);
+                Ok(verified_reload_summary())
+            },
+        );
+        if let Ok(status) = result {
+            assert_eq!(status.phase, PoolAuthorityPhase::Degraded);
+        }
+        let status = observe_pool_authority_status(&store_path)?.unwrap();
+        assert_eq!(status.epoch, 2);
+        assert_eq!(status.phase, PoolAuthorityPhase::Degraded);
+        assert_eq!(status.desired_provider_account_id, target.account_id);
+        assert!(status.detail.is_some());
+        assert_eq!(
+            fs::read(&store_path)?,
+            written.into_inner().expect("fixture must reach reload")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_target_guard_preserves_manual_selection() -> Result<()> {
+        for reason in ["manual", "manual_cli_swap", "swift_manual_selection"] {
+            let temp = secure_temp_dir()?;
+            let store_path = temp.path().join("accounts.json");
+            let auth_path = temp.path().join("auth.json");
+            let active = account("active@example.com", true, 10.0, 10.0);
+            let mut target = account("target@example.com", false, 100.0, 100.0);
+            target.plan_type = Some("free".to_string());
+            target.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(28));
+            target.runtime_unusable_reason = Some("token_expired".to_string());
+            target.access_token =
+                account_store::test_inference_token(Utc::now() - ChronoDuration::days(1));
+            save_accounts(&store_path, &[active, target.clone()])?;
+            confirm_provider_io_activation(&store_path, &auth_path)?;
+            let result = request_pool_target_with(
+                &store_path,
+                &auth_path,
+                &target.account_id,
+                Uuid::new_v4(),
+                1,
+                reason,
+                &|_| Ok(verified_reload_summary()),
+            )?;
+            assert_eq!(result.epoch, 2);
+            assert_eq!(result.phase, PoolAuthorityPhase::Stable);
+            assert_eq!(result.desired_provider_account_id, target.account_id);
+            assert!(auth::auth_file_matches_account(&auth_path, &target));
+            let accounts = load_accounts(&store_path)?;
+            assert!(active_account(&accounts).unwrap().runtime_unusable());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pool_target_request_replay_keeps_epoch_and_skips_second_reload() -> Result<()> {
         let temp = secure_temp_dir()?;
         let store_path = temp.path().join("accounts.json");
@@ -4672,6 +5356,7 @@ mod tests {
             vec![replacement.clone()],
             false,
             None,
+            None,
             true,
             &move |_| {
                 assert_store_lock_available(&reload_store_path)?;
@@ -4690,6 +5375,63 @@ mod tests {
         assert!(auth::auth_file_matches_account(&auth_path, &replacement));
         let successor = acquire_runtime_activation_lease(&store_path)?;
         drop(successor);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_import_receipt_survives_lost_reply_and_prevents_second_activation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = temp.path().join("accounts.json");
+        let auth = temp.path().join("auth.json");
+        let active = account("receipt-fixture@example.com", true, 10.0, 10.0);
+        let incoming = vec![active.clone()];
+        save_accounts(&store, &incoming)?;
+        auth::write_auth_file(&auth, &active)?;
+        let fingerprint = complete_credential_set_fingerprint(&incoming)?;
+        let id = Uuid::new_v4();
+        let (_, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
+            &store, &auth, incoming.clone(), true, Some(id), Some(&fingerprint), true,
+            &|_| {
+                let pending = credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
+                assert_eq!(pending.status, credential_import_receipts::State::Pending);
+                assert!(pending.receipt.is_none());
+                Ok(verified_reload_summary())
+            },
+        )?;
+        assert!(outcome.is_confirmed());
+        let completed = credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
+        assert_eq!(completed.status, credential_import_receipts::State::Completed);
+        assert_eq!(completed.receipt, receipt);
+
+        let rotated = account("later-fixture@example.com", true, 10.0, 10.0);
+        save_accounts(&store, std::slice::from_ref(&rotated))?;
+        auth::write_auth_file(&auth, &rotated)?;
+        let store_before = fs::read(&store)?;
+        let auth_before = fs::read(&auth)?;
+        assert!(replace_import_accounts_with_unlocked_reload(
+            &store, &auth, incoming, true, Some(id), Some(&fingerprint), true,
+            &|_| bail!("duplicate import must not reload"),
+        ).is_err());
+        assert_eq!(fs::read(&store)?, store_before);
+        assert_eq!(fs::read(&auth)?, auth_before);
+        assert_eq!(credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?, completed);
+        Ok(())
+    }
+
+    #[test]
+    fn credential_import_status_requires_canonical_binding_arguments() -> Result<()> {
+        let fingerprint = "1".repeat(64);
+        let args = [
+            "codexswitch-cli", "credential-import-status", "--operation-id",
+            "11111111-1111-4111-8111-111111111111", "--baseline-fingerprint",
+            fingerprint.as_str(), "--incoming-fingerprint", fingerprint.as_str(),
+        ];
+        assert!(matches!(Args::try_parse_from(args)?.command, Command::CredentialImportStatus { .. }));
+        assert!(Args::try_parse_from(&args[..6]).is_err());
+        let mut invalid = args;
+        invalid[7] = "NOT-A-FINGERPRINT";
+        assert!(Args::try_parse_from(invalid).is_err());
         Ok(())
     }
 
