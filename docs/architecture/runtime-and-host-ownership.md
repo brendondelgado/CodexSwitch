@@ -58,6 +58,7 @@ cross_dependencies:
   - ../../crates/codexswitch-cli/src/account_store.rs
   - ../../crates/codexswitch-cli/src/activation.rs
   - ../../crates/codexswitch-cli/src/pool_authority.rs
+  - ../../crates/codexswitch-cli/src/main.rs
   - ../../crates/codexswitch-cli/src/remote_authority.rs
   - ../../crates/codexswitch-cli/src/import.rs
   - ../../crates/codexswitch-cli/src/reload.rs
@@ -80,7 +81,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-09-24
+  last_updated: 2026-09-25
 ---
 
 # Runtime And Host Ownership
@@ -174,6 +175,21 @@ unique request identifier and expected epoch:
 - a request while another target is converging may only reconcile that same
   epoch and target;
 - only a stable current epoch may admit a new cross-target request.
+
+Automatic target requests use the reason set and eligibility contract in
+`quota-and-reset-policy.md`. Under the runtime and authority leases, the VPS
+validates its own stored target before reconciling a prior activation, writing
+the authority journal or credentials, or invoking reload. It rechecks the
+post-reconciliation snapshot before admitting the decision. Ineligible targets
+fail with a bounded, non-secret recovery instruction and no provider calls.
+Manual selection is unchanged. Reused request IDs must match the stored target
+and reason before prior reconciliation, including a reason changed to manual.
+Only a stable exact replay with the target already active and confirmed against
+the current store/auth state may bypass automatic eligibility and return the
+recorded status without effects. Interrupted or degraded replays must pass
+eligibility before any recovery. A new same-target request is not that replay
+exemption; when eligible, it retains the existing epoch behavior rather than
+creating another selection epoch.
 
 Authority observation is read-only. Fetching authority status, per-host
 convergence, or a prior request result does not poll quota, refresh tokens,

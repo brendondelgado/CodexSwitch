@@ -43,7 +43,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-09-24
+  last_updated: 2026-09-25
 ---
 
 # Quota And Reset Policy
@@ -135,6 +135,23 @@ For weekly-only operation, one fresh weekly window with remaining capacity
 satisfies that requirement; a five-hour window is not required.
 
 Unknown and stale accounts are observable but cannot outrank confirmed usable accounts.
+
+New automatic pool-target requests with reasons `quotaExhausted`,
+`higherPlanAvailable`, `tokenInvalidated`, `terminalTokenRecovery`, or
+`usageUnavailable` must pass the VPS's stored account eligibility checks, even
+when the requesting Mac considers the target healthy. The target must have
+complete credentials, an inference JWT beyond the five-minute safety window,
+no current runtime block, fresh usable quota, and an automatic-eligible plan.
+This admission check performs no provider calls and does not clear a block or
+redeem a reset. Rejection instructs the caller to resolve VPS credentials,
+runtime blocks, or quota observations before retrying; it does not echo tokens
+or provider responses. Explicit manual selection retains its existing policy.
+Only an exact replay of a stable decision whose target is already active with
+matching, confirmed store/auth state may return without a new eligibility
+decision or any effects. Interrupted, converging, degraded, or unconfirmed
+replays must pass eligibility before recovery. A new same-target automatic
+request must still pass eligibility, without treating the active flag as a
+rejection.
 
 Free-plan accounts are stored and remain visible, but they are not automatic
 capacity. An account whose normalized provider plan is Free, Free Workspace,
