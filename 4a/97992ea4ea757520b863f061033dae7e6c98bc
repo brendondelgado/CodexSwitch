@@ -1,0 +1,29 @@
+docs/architecture/runtime-and-host-ownership.md
+  s_efcd87606c5f73::t_1c9db478477a6d 1755-1760
+docs/runbooks/vps-connection-resilience.md
+  s_efcd87606c5f73::t_1c9db478477a6d 7,54,112-162
+  s_efcd87606c5f73::t_a991a40129f925 163
+scripts/test_vps_codex_restart.py
+  s_efcd87606c5f73::t_d47f45381940fe 4,9-10,13,117-119,121,131,135-142,158,164,170,198,231-260,269-299
+  s_efcd87606c5f73::t_6fd38de0022679 128-129,132,147-148,176-178,261-268
+  s_efcd87606c5f73::t_27b43edb24fa0c 25-63,173-175
+  s_efcd87606c5f73::t_4fb243f33844af 300
+scripts/vps-codex-restart.py
+  s_efcd87606c5f73::t_a767a639a93018 2,206-218,230-231,234,242,248-253,261-266,277-278,283-284,304,309-310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4a97992ea4ea757520b863f061033dae7e6c98bc",
+  "prompts": {},
+  "sessions": {
+    "s_efcd87606c5f73": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08743-ee0f-7983-8d2c-0c51541d985d",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
