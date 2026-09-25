@@ -1,0 +1,25 @@
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_7f20289ec9783f 537-541
+Sources/CodexSwitch/Views/AccountCardView.swift
+  s_70c8e194852bb5::t_da245d770cf8ee 509,521-549
+  s_70c8e194852bb5::t_55a6aaf5583110 254-257
+  s_70c8e194852bb5::t_7f20289ec9783f 503-504,510,512,515-518,520,552
+Tests/CodexSwitchTests/RateLimitResetPresentationTests.swift
+  s_70c8e194852bb5::t_55a6aaf5583110 382-397
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "57d34a2653014e150180cc5bade8bbc48884c9ac",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

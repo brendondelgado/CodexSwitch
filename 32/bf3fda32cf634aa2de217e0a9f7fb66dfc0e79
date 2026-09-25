@@ -1,0 +1,40 @@
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_70c8e194852bb5::t_c2dd4785742d8b 4250-4258
+docs/architecture/system-overview.md
+  s_70c8e194852bb5::t_afd2d34101a97c 11,20,28,43,166-169,184-203
+  s_70c8e194852bb5::t_219935410428d3 204
+Tests/CodexSwitchTests/AccountManagerSyncTests.swift
+  s_70c8e194852bb5::t_159fc4e9c591ac 1082-1083,1093,1097,1101
+docs/architecture/quota-and-reset-policy.md
+  s_70c8e194852bb5::t_ce1310c88c9f4e 593,598-600
+  s_70c8e194852bb5::t_c2dd4785742d8b 591-592,594-597
+Tests/CodexSwitchTests/AccountManagerTests.swift
+  s_70c8e194852bb5::t_768f29d5397ac9 98,106,159,174
+  s_70c8e194852bb5::t_2b77676be9423b 13-15,28,80-97,99-105,107-158,160-173,175-197,235
+Tests/CodexSwitchTests/LinuxDevboxMonitorTests.swift
+  s_70c8e194852bb5::t_ce1310c88c9f4e 1261-1264,1269-1270,1290
+  s_70c8e194852bb5::t_f2fa9ff2921a65 1212-1248
+  s_70c8e194852bb5::t_2bc054a882faa3 1249-1260,1265-1268,1271-1289,1291-1309
+Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  s_70c8e194852bb5::t_ce1310c88c9f4e 299,316,332,2037,2040-2041,3364,3366-3367,3370,3375,3377,3379,3474,3487
+  s_70c8e194852bb5::t_c2dd4785742d8b 2017-2031,2033-2036,2038-2039,2042-2046
+  s_70c8e194852bb5::t_2bc054a882faa3 2032
+Sources/CodexSwitch/Models/AccountManager.swift
+  s_70c8e194852bb5::t_2b77676be9423b 384-385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "32bf3fda32cf634aa2de217e0a9f7fb66dfc0e79",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

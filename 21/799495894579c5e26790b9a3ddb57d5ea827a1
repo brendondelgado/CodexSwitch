@@ -1,0 +1,43 @@
+docs/runbooks/linux-repository-deployment.md
+  s_70c8e194852bb5::t_b873ebc0567b35 49
+  s_70c8e194852bb5::t_e06d8b4b347fac 391-405
+docs/runbooks/vps-connection-resilience.md
+  s_70c8e194852bb5::t_7dd96b202a8d98 45
+  s_70c8e194852bb5::t_33a1e299b3ad57 159-162,170-175,232-236
+  s_70c8e194852bb5::t_b873ebc0567b35 22
+scripts/manifests/linux-systemd-contract.tsv
+  s_70c8e194852bb5::t_b141dcba3f13d8 10
+crates/codexswitch-cli/src/codex_update/source_patching.rs
+  s_70c8e194852bb5::t_e64bc3235636ff 8,24-26,46
+crates/codexswitch-cli/src/codex_update/source_daemon_patching.rs
+  s_70c8e194852bb5::t_e64bc3235636ff 1-141
+scripts/test_linux_resource_policy.py
+  s_70c8e194852bb5::t_c1cdd3b4821dc9 80-81,95-97,99-103
+  s_70c8e194852bb5::t_e85c4acc7681b7 98
+  s_70c8e194852bb5::t_b141dcba3f13d8 1392
+  s_70c8e194852bb5::t_4a1892329ed699 559
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_7dd96b202a8d98 73
+  s_70c8e194852bb5::t_00c9821f852434 1602-1607,1676-1679
+  s_70c8e194852bb5::t_b873ebc0567b35 59
+crates/codexswitch-cli/systemd/signul-codex-app-server.service
+  s_70c8e194852bb5::t_b141dcba3f13d8 12
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_70c8e194852bb5::t_b141dcba3f13d8 1105-1106,1108,1134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "21799495894579c5e26790b9a3ddb57d5ea827a1",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

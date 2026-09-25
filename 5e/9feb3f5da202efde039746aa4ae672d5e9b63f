@@ -1,0 +1,19 @@
+Tests/CodexSwitchTests/AccountActivationRuntimeEvidenceTests.swift
+  s_70c8e194852bb5::t_53cfd3d483c088 38-39,61,63-64,142-143
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "5e9feb3f5da202efde039746aa4ae672d5e9b63f",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}

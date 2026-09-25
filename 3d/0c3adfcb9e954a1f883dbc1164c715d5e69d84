@@ -1,0 +1,47 @@
+Tests/CodexSwitchTests/CodexDesktopNativeChildCoordinatorTests.swift
+  s_70c8e194852bb5::t_ef2d9e6742d572 110-128
+Sources/CodexSwitch/Services/CodexDesktopAppLocator.swift
+  s_70c8e194852bb5::t_be49df599eaf16 2,82,89-101,103-121
+  s_70c8e194852bb5::t_7cf564321fc9a5 102
+  s_70c8e194852bb5::t_a4d931109438a0 122
+Sources/CodexSwitch/Services/DesktopPatchManager.swift
+  s_70c8e194852bb5::t_be49df599eaf16 87,108-109,478-480,495,501-504
+scripts/patch-asar.py
+  s_70c8e194852bb5::t_61fcd4840e04e2 4801-4803,4805-4847,4871-4872
+  s_70c8e194852bb5::t_d1f9c6c3009277 116,1582-1583,1605-1610,1612-1742,1744-1762,2574-2575
+  s_70c8e194852bb5::t_7629534705e419 1743
+  s_70c8e194852bb5::t_a4d56b0fc12967 1611
+  s_70c8e194852bb5::t_2d48437e8b1b83 4804
+  s_70c8e194852bb5::t_b4d93f013d7113 2576
+  s_70c8e194852bb5::t_1aae0f10d2e504 4873
+docs/plans/2026-09-08-chatgpt-hot-swap-repair.md
+  s_70c8e194852bb5::t_d1f9c6c3009277 3,28-31
+  s_70c8e194852bb5::t_561905fdb6953e 16-18,21,43-44,48-53,64-74
+  s_70c8e194852bb5::t_eef2685f801c5a 1-2,4-15,19-20,22-27,32-42,45-47,54-63,75-82
+Tests/CodexSwitchTests/DesktopAuthPatchTrustTests.swift
+  s_70c8e194852bb5::t_ef2d9e6742d572 1-32
+docs/architecture/runtime-and-host-ownership.md
+  s_70c8e194852bb5::t_be49df599eaf16 1557,1559-1566
+  s_70c8e194852bb5::t_561905fdb6953e 52,81
+Sources/CodexSwitch/Services/CodexDesktopNativeChildCoordinator.swift
+  s_70c8e194852bb5::t_be49df599eaf16 97-99,125-127
+scripts/test_patch_asar.py
+  s_70c8e194852bb5::t_9ec4c70d2e4574 569-584,612-725
+  s_70c8e194852bb5::t_561905fdb6953e 586-611
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "3d0c3adfcb9e954a1f883dbc1164c715d5e69d84",
+  "prompts": {},
+  "sessions": {
+    "s_70c8e194852bb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f459d-c3f3-7ec2-bff6-2ff671d4180b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
