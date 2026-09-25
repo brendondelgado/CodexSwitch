@@ -4,6 +4,7 @@ description: Fail-closed runtime ownership, resource policy, and non-mutating re
 toc:
   - VPS Connection Resilience
   - Apply VPS Config Changes
+  - Stop Desktop Server For Maintenance
   - Failure Model
   - Observational Check Contract
   - Resource Policy
@@ -50,7 +51,7 @@ version_control:
   branch: main
   commit: pending
   status: local_uncommitted
-  last_updated: 2026-09-06
+  last_updated: 2026-09-25
 ---
 
 # VPS Connection Resilience
@@ -107,6 +108,58 @@ responses, including active tasks, PID/config/socket drift, graceful-stop
 timeout, replacement validation, invalid JSON, rejected execution,
 missing completion markers, and definite local launch failure. Tests
 must not restart the live VPS or require a real config change.
+
+## Stop Desktop Server For Maintenance
+
+For an explicitly approved deployment window, the same helper accepts
+`--stop-only` with the exact `pid`, `processStart`, and `configDigest` returned
+by a fresh `--check`. It uses the existing shared runtime installation lock and
+exclusive `vps-config-restart.lock`; it does not alter lock ownership contracts.
+It rechecks the socket owner, loaded-task idle state, executable/start identity,
+and config digest before sending one pidfd-bound SIGINT. PID/config/owner drift,
+busy or unknown tasks, and inspection failures before signalling block without
+a signal. Native daemon PID metadata is not required and is never fabricated.
+
+The wait for exit is bounded to 120 seconds. There is no SIGKILL, alternate PID,
+native stop fallback, or automatic restart, including on timeout or uncertainty.
+Success is a JSON `status: stopped` response with the original bound identity,
+`processExited: true`, and `socketAcceptingConnections: false`. Exit must be
+proven by the pidfd and a subsequent Unix connect must return missing/refused;
+connection success, timeout, permissions errors, or config drift after exit
+produce `unknown`, not success. An unrelated or replacement socket owner is
+never signalled. No thread records, credentials, or daemon PID files are changed.
+
+This is point-in-time evidence for the desktop Unix owner only, not global VPS
+quiescence or a durable prevention of client reconnect. Operators must first
+quiesce clients/new submissions and external restart sources for the maintenance
+window. Idle enumeration cannot atomically prevent a client from starting a
+turn. The helper does not disable those sources or stop other runtime owners.
+The installer must independently repeat its full quiescence checks under its
+own activation locks; a `stopped` response does not replace those checks.
+
+Run the reviewed helper on the VPS using the approved Python environment with
+`websockets` installed, keeping `CODEX_HOME` identical for both commands:
+
+```sh
+python3 -B /reviewed/path/vps-codex-restart.py --check
+python3 -B /reviewed/path/vps-codex-restart.py --stop-only \
+  --pid "$CHECK_PID" --process-start "$CHECK_PROCESS_START" \
+  --config-digest "$CHECK_CONFIG_DIGEST"
+```
+
+Bind the three values to that fresh check, never a historical PID. Require the
+JSON status and proof fields above; process exit code alone is not a completion
+receipt. After `unknown`, inspect fresh state rather than redispatching blindly.
+Starting a replacement is a separate operator/deployment action.
+
+Deterministic replay: `python3 -B scripts/test_vps_codex_restart.py`. Fixtures
+mock sockets, process identities, pidfds, config snapshots, and lifecycle calls;
+they cover stale confirmation, last-moment owner/config/busy drift, one SIGINT,
+zero stop-only startup calls, graceful timeout without escalation, and exit plus
+socket proof. Fixture success is not live Linux readiness: the approved
+entrypoint still requires Linux pidfd support, owned existing installation lock,
+verified current executable/socket peer, parseable config, and an idle check.
+Tests must not signal a real process or connect to the live VPS.
 
 ## Failure Model
 
