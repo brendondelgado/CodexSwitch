@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit, identity-bound restart of the desktop VPS Unix app-server."""
+"""Explicit, identity-bound restart or stop of the desktop VPS Unix app-server."""
 
 from __future__ import annotations
 
@@ -203,6 +203,19 @@ async def wait_for_exit(pidfd: int) -> None:
         await asyncio.sleep(0.1)
 
 
+def require_socket_stopped(socket_path: Path) -> None:
+    # A stale socket pathname is allowed; a listener or ambiguous failure is not.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1)
+        try:
+            probe.connect(str(socket_path))
+        except (FileNotFoundError, ConnectionRefusedError):
+            return
+        except OSError:
+            raise Uncertain("The server exited, but desktop socket absence could not be verified.") from None
+    raise Uncertain("The server exited, but the desktop socket still accepts connections. No other owner was signalled.")
+
+
 async def run(args) -> dict:
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
     install = Path.home() / ".local/share/codexswitch"
@@ -214,9 +227,11 @@ async def run(args) -> dict:
     ws = None
     pidfd = None
     signalled = False
+    stop_only = args.stop_only
+    mutate = args.restart or stop_only
     try:
         locks.append(acquire_lock(install / "runtime-start-install.lock", exclusive=False))
-        if args.restart:
+        if mutate:
             locks.append(acquire_lock(install / "vps-config-restart.lock", exclusive=True, create=True))
         digest = config_digest(codex_home)
         ws, identity = await connect_owner(socket_path, runtime)
@@ -224,15 +239,18 @@ async def run(args) -> dict:
         # Let Codex validate config types too, without displaying the returned values.
         await rpc(ws, 100000, "config/read", {"includeLayers": False})
         plan = dict(identity, configDigest=digest)
-        if not args.restart:
+        if not mutate:
             return {"schemaVersion": 1, "status": "ready", **plan}
         if plan != {"pid": args.pid, "processStart": args.process_start, "configDigest": args.config_digest}:
             raise Blocked("The VPS process or config changed. Check again before restarting.")
         pidfd = os.pidfd_open(identity["pid"])
         verified_ws, verified_identity = await connect_owner(socket_path, runtime)
-        await verified_ws.close()
-        if verified_identity != identity:
-            raise Blocked("The desktop socket owner changed. Nothing was restarted.")
+        try:
+            if verified_identity != identity:
+                raise Blocked("The desktop socket owner changed. Nothing was stopped.")
+            await require_idle(verified_ws)
+        finally:
+            await verified_ws.close()
         if process_identity(identity["pid"], runtime) != identity or config_digest(codex_home) != digest:
             raise Blocked("The VPS process or config changed. Nothing was restarted.")
         signal.pidfd_send_signal(pidfd, signal.SIGINT)
@@ -240,6 +258,12 @@ async def run(args) -> dict:
         await ws.close()
         ws = None
         await wait_for_exit(pidfd)
+        if stop_only:
+            if config_digest(codex_home) != digest:
+                raise Uncertain("The server exited, but the configuration changed. Check VPS readiness.")
+            require_socket_stopped(socket_path)
+            return {"schemaVersion": 1, "status": "stopped", **plan,
+                    "processExited": True, "socketAcceptingConnections": False}
         started = await start_native(runtime, codex_home)
         ws, replacement = await connect_owner(socket_path, runtime)
         if replacement == identity or config_digest(codex_home) != digest:
@@ -250,10 +274,14 @@ async def run(args) -> dict:
         raise
     except Blocked:
         if signalled:
+            if stop_only:
+                raise Uncertain("Stop began, but shutdown could not be verified. No replacement was started.") from None
             raise Uncertain("Restart began, but the replacement server could not be verified. Check VPS readiness.") from None
         raise
     except Exception:
         if signalled:
+            if stop_only:
+                raise Uncertain("Stop outcome is unknown. No replacement was started; inspect VPS readiness.") from None
             raise Uncertain("Restart outcome is unknown. Check VPS readiness before trying again.") from None
         raise Blocked("VPS preflight failed. No server was restarted; check connection, config, and runtime readiness.") from None
     finally:
@@ -273,12 +301,13 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--restart", action="store_true")
+    mode.add_argument("--stop-only", action="store_true")
     parser.add_argument("--pid", type=int)
     parser.add_argument("--process-start")
     parser.add_argument("--config-digest")
     args = parser.parse_args()
-    if args.restart and (not args.pid or not args.process_start or not args.config_digest):
-        parser.error("restart requires the confirmed preflight identity")
+    if (args.restart or args.stop_only) and (not args.pid or not args.process_start or not args.config_digest):
+        parser.error("restart and stop-only require the confirmed preflight identity")
     try:
         result = asyncio.run(run(args))
     except (Blocked, Uncertain) as error:

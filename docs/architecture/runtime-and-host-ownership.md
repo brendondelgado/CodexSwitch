@@ -1752,6 +1752,12 @@ actor boundary on every supported Swift 6 toolchain.
   proxies, or restart the account-switch daemon. Unknown outcomes are not
   retried automatically. Success requires a new verified Unix owner and a
   completed initialized handshake, not only native startup command success.
+  The operator-only `--stop-only` variant uses the same bound identity and locks,
+  rechecks idle state immediately before signalling, and never starts a runtime.
+  It succeeds only after pidfd-proven exit and a missing/refused desktop socket;
+  uncertainty never escalates to SIGKILL or a different owner. This observation
+  is not a client-admission fence or proof that all VPS runtimes are quiescent.
+  Deployment must still establish its own quiescence and activation guards.
 - A Linux app-server whose executable is not the canonical runtime in the
   immutable `current` release is an explicit convergence blocker. Its ACK can
   never clear a degraded activation, even when its markers and credentials are

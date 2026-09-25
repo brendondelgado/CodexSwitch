@@ -107,6 +107,10 @@ jobs:
           export CARGO_TARGET_DIR="$RUNNER_TEMP/hot-swap-cargo-target"
           cargo test --locked --jobs 1 -p codexswitch-cli
 
+      - name: Run verified VPS maintenance contracts
+        shell: bash
+        run: python3 scripts/test_vps_codex_restart.py
+
       - name: Run Linux installer resource-policy contracts
         shell: bash
         run: |
