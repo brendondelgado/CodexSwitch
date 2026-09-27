@@ -1302,7 +1302,8 @@ fn command_line_is_separate_managed_app_server(command_line: &[u8], expected_arg
     let Some(args) = managed_app_server_arguments(command_line, expected_argv0) else {
         return false;
     };
-    args.starts_with(&[b"app-server".as_slice(), b"proxy"])
+    arguments_are_stdio_app_server(&args)
+        || args.starts_with(&[b"app-server".as_slice(), b"proxy"])
         || (args.starts_with(&[b"app-server".as_slice(), b"daemon"])
             && args.get(2).is_some_and(|command| {
                 matches!(
@@ -1317,6 +1318,23 @@ fn command_line_is_separate_managed_app_server(command_line: &[u8], expected_arg
                 b"--listen",
                 b"ws://127.0.0.1:8390",
             ]
+}
+
+fn arguments_are_stdio_app_server(args: &[&[u8]]) -> bool {
+    let Some(options) = args.strip_prefix(&[b"app-server".as_slice()]) else {
+        return false;
+    };
+    // With no listener option, app-server uses stdio. Admit only complete
+    // config pairs here; other shapes still require explicit ownership review.
+    options.chunks(2).all(|pair| {
+        pair.len() == 2
+            && matches!(pair[0], b"-c" | b"--config")
+            && pair[1]
+                .iter()
+                .position(|byte| *byte == b'=')
+                .is_some_and(|index| index > 0 && index + 1 < pair[1].len())
+            && !pair[1].starts_with(b"-")
+    })
 }
 
 enum DaemonVersionClaim {

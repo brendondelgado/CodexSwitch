@@ -182,7 +182,21 @@ impl ReloadSummary {
 
     pub(crate) fn bind_activation(&mut self, expected: &ActivationReloadBinding) -> Result<()> {
         if !self.verified_hot_swap() {
-            bail!("runtime reload is incomplete and cannot be bound to an activation");
+            let blockers = self
+                .skipped
+                .iter()
+                .take(8)
+                .map(|(pid, reason)| {
+                    let reason: String = reason.chars().filter(|c| !c.is_control()).take(256).collect();
+                    format!("pid {pid}: {reason}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!(
+                "runtime reload is incomplete and cannot be bound to an activation: topology_verified={} acknowledged={} requests={} skipped={} [{}]",
+                self.topology_verified, self.signaled.len(),
+                self.generated_request_nonces.len(), self.skipped.len(), blockers
+            );
         }
         if let Some(bound) = self.activation_binding.as_ref() {
             if bound != expected {
@@ -456,13 +470,10 @@ fn discover_macos_named_processes(process_name_pattern: &str) -> Result<Vec<Code
     let current_uid = unsafe { libc_geteuid() };
     let current_uid_text = current_uid.to_string();
     let output = bounded_command::output(
-        Command::new("/usr/bin/pgrep").args([
-            "-l",
-            "-x",
-            "-U",
-            current_uid_text.as_str(),
+        Command::new("/usr/bin/pgrep").args(macos_process_discovery_arguments(
+            &current_uid_text,
             process_name_pattern,
-        ]),
+        )),
         PS_COMMAND_TIMEOUT,
         bounded_command::SMALL_OUTPUT_LIMIT,
     )
@@ -483,6 +494,11 @@ fn discover_macos_named_processes(process_name_pattern: &str) -> Result<Vec<Code
         processes.push(process);
     }
     Ok(processes)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_process_discovery_arguments<'a>(uid: &'a str, pattern: &'a str) -> [&'a str; 6] {
+    ["-a", "-l", "-x", "-U", uid, pattern]
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -4241,6 +4257,10 @@ mod tests {
 
     #[test]
     fn macos_pgrep_snapshot_is_strict_and_deduplicated() -> Result<()> {
+        assert_eq!(
+            macos_process_discovery_arguments("501", "codex"),
+            ["-a", "-l", "-x", "-U", "501", "codex"]
+        );
         assert!(parse_macos_pgrep_snapshot(b"", Some(1))?.is_empty());
         assert_eq!(
             parse_macos_pgrep_snapshot(b"42 codex\n42 codex\n84 codex\n", Some(0))?,
@@ -4250,6 +4270,39 @@ mod tests {
         assert!(parse_macos_pgrep_snapshot(b"42 codex\n", Some(1)).is_err());
         assert!(parse_macos_pgrep_snapshot(b"42 codex\n42 other\n", Some(0)).is_err());
         assert!(parse_macos_pgrep_snapshot(&[0xff], Some(0)).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "launched only by the ancestor-discovery fixture"]
+    fn macos_ancestor_discovery_helper() -> Result<()> {
+        assert_eq!(std::env::var("CODEXSWITCH_ANCESTOR_FIXTURE")?.as_str(), "1");
+        let uid = unsafe { libc_geteuid() }.to_string();
+        let output = bounded_command::output(
+            Command::new("/usr/bin/pgrep").args(macos_process_discovery_arguments(&uid, "codex")),
+            PS_COMMAND_TIMEOUT,
+            bounded_command::SMALL_OUTPUT_LIMIT,
+        )?;
+        let pids = parse_macos_pgrep_snapshot(&output.stdout, output.status.code())?;
+        assert!(pids.contains(&(std::process::id() as i32)));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_discovery_includes_the_calling_runtime() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fixture = temp.path().join("codex");
+        fs::copy(std::env::current_exe()?, &fixture)?;
+        let output = bounded_command::output(
+            Command::new(&fixture)
+                .env("CODEXSWITCH_ANCESTOR_FIXTURE", "1")
+                .args(["--ignored", "--exact", "reload::tests::macos_ancestor_discovery_helper"]),
+            Duration::from_secs(15),
+            bounded_command::SMALL_OUTPUT_LIMIT,
+        )?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
         Ok(())
     }
 
@@ -4815,6 +4868,28 @@ mod tests {
             ),
             Some(HotSwapRuntimeKind::HeadlessRemoteControlAppServer)
         );
+    }
+
+    #[test]
+    fn configured_stdio_server_still_requires_general_reload_ack() {
+        let process = CodexProcess {
+            pid: 42,
+            owner_uid: 1000,
+            start_identity: "test-start".to_string(),
+            started_at_unix: 1_000,
+            command_line: "/home/signul/codex app-server -c mcp_servers.t3-code.url=http://127.0.0.1:3773/mcp -c mcp_servers.t3-code.bearer_token_env_var=\"T3_MCP_BEARER_TOKEN\"".to_string(),
+            executable: PathBuf::from("/home/signul/codex"),
+        };
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(&process, false, None, None),
+            Some(HotSwapRuntimeKind::ExternalAppServer)
+        );
+        let summary = ReloadSummary {
+            sighup_sent: vec![42],
+            skipped: vec![(42, "SIGHUP sent but live reload acknowledgement was not observed".to_string())],
+            ..ReloadSummary::default()
+        };
+        assert!(!summary.verified_hot_swap());
     }
 
     #[test]
@@ -5427,6 +5502,21 @@ mod tests {
             auth_generation: first_auth_generation,
             complete_token_fingerprint: "a".repeat(64),
         };
+        let mut incomplete = ReloadSummary {
+            skipped: vec![(42, "reload acknowledgement was not observed".to_string())],
+            ..ReloadSummary::default()
+        };
+        let failure = incomplete.bind_activation(&first).unwrap_err().to_string();
+        assert!(failure.contains("topology_verified=false acknowledged=0 requests=0 skipped=1"));
+        assert!(failure.contains("pid 42: reload acknowledgement was not observed"));
+        assert!(!failure.contains(&first.complete_token_fingerprint));
+        assert!(!failure.contains("auth-generation-a"));
+        incomplete.skipped = (1..=20).map(|pid| (pid, "x\n".repeat(300))).collect();
+        let bounded = incomplete.bind_activation(&first).unwrap_err().to_string();
+        assert!(bounded.contains("skipped=20"));
+        assert!(!bounded.contains("pid 9:"));
+        assert!(!bounded.contains('\n'));
+        assert!(bounded.len() < 2_500);
         let mut summary = ReloadSummary {
             sighup_sent: vec![42],
             signaled: vec![42],

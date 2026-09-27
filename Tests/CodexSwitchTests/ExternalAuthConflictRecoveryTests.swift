@@ -9,6 +9,85 @@ struct ExternalAuthConflictRecoveryTests {
     private let providerAccountId = "provider-target"
     private let now = Date(timeIntervalSince1970: 1_800_300_000)
 
+    @Test("Confirmed same-account refresh does not depend on an external handoff")
+    func confirmedGenerationRoutesToCredentialTransaction() {
+        var stored = makeAccount(id: targetAccountId, active: true)
+        stored.accountId = providerAccountId
+        stored.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(3_600))
+        var observed = stored
+        observed.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(7_200))
+        observed.refreshToken = "new-refresh"
+        observed.idToken = "new-id"
+
+        func state(
+            phase: AccountActivationPhase = .confirmed,
+            runtimeAccountId: UUID? = nil,
+            expiresAt: Date? = nil
+        ) -> AccountActivationState {
+            AccountActivationState(
+                version: 1, phase: phase, activationGeneration: UUID(),
+                configuredAccountId: targetAccountId,
+                runtimeCurrentAccountId: runtimeAccountId ?? targetAccountId,
+                updatedAt: now, retryAttempt: 0, nextRetryAt: nil,
+                discoveredRuntimeCount: 1, acknowledgedRuntimeCount: 1, detail: nil,
+                runtimeEvidenceGeneration: UUID(), runtimeEvidenceObservedAt: now,
+                runtimeEvidenceExpiresAt: expiresAt ?? now.addingTimeInterval(60),
+                runtimeBlockers: nil
+            )
+        }
+        func admits(
+            activation: AccountActivationState? = nil,
+            configured: UUID? = nil,
+            candidate: CodexAccount? = nil,
+            storedAccount: CodexAccount? = nil,
+            matchingCount: Int = 1
+        ) -> Bool {
+            ExternalAuthConflictRecoveryPolicy.canReconcileConfirmedGeneration(
+                state: activation ?? state(),
+                configuredAccountId: configured ?? targetAccountId,
+                storedTarget: storedAccount ?? stored,
+                observedTarget: candidate ?? observed,
+                matchingProviderAccountCount: matchingCount,
+                now: now
+            )
+        }
+
+        #expect(admits())
+        #expect(!admits(matchingCount: 0))
+        #expect(!admits(matchingCount: 2))
+        #expect(!admits(configured: UUID()))
+        #expect(!admits(activation: state(runtimeAccountId: UUID())))
+        #expect(!admits(activation: state(expiresAt: now)))
+        for phase in [AccountActivationPhase.preparing, .committedDegraded, .manualReview] {
+            #expect(!admits(activation: state(phase: phase)))
+        }
+        var inactive = stored
+        inactive.isActive = false
+        #expect(!admits(storedAccount: inactive))
+        var differentProvider = observed
+        differentProvider.accountId = "different-provider"
+        #expect(!admits(candidate: differentProvider))
+        var differentIdentity = observed
+        differentIdentity = CodexAccount(
+            id: UUID(), email: observed.email, accessToken: observed.accessToken,
+            refreshToken: observed.refreshToken, idToken: observed.idToken,
+            accountId: observed.accountId, isActive: true
+        )
+        #expect(!admits(candidate: differentIdentity))
+        for expiry in [-60.0, 60, 3_600] {
+            var old = observed
+            old.accessToken = testInferenceToken(expiresAt: now.addingTimeInterval(expiry))
+            #expect(!admits(candidate: old))
+        }
+        var partial = observed
+        partial.refreshToken = ""
+        #expect(!admits(candidate: partial))
+        partial = observed
+        partial.idToken = ""
+        #expect(!admits(candidate: partial))
+        #expect(!admits(candidate: stored))
+    }
+
     @Test("Authority target admits a fresh complete observed token generation")
     func authorityTargetAdmitsFreshObservedGeneration() {
         var stored = makeAccount(id: targetAccountId, active: false)

@@ -49,7 +49,7 @@ struct SwapEngineTests {
 
     @Test("CLI and desktop discovery share exact Codex process-name matching")
     func allLocalRuntimeDiscoveryUsesExactProcessName() {
-        #expect(SwapEngine.codexProcessDiscoveryArguments == ["-l", "-x", "codex"])
+        #expect(SwapEngine.codexProcessDiscoveryArguments == ["-a", "-l", "-x", "codex"])
         #expect(
             SwapEngine.localCodexProcessDiscoveryArguments
                 == SwapEngine.codexProcessDiscoveryArguments
@@ -1588,7 +1588,7 @@ struct SwapEngineTests {
     func localCLIPreliminaryDiscoveryIsExact() {
         #expect(
             SwapEngine.localCodexProcessDiscoveryArguments
-                == ["-l", "-x", "codex"]
+                == ["-a", "-l", "-x", "codex"]
         )
         #expect(!SwapEngine.localCodexProcessDiscoveryArguments.contains("-f"))
     }
