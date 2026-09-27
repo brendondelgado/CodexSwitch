@@ -1,0 +1,19 @@
+docs/audits/2026-09-27-swap-convergence.md
+  s_efcd87606c5f73::t_ba705a3da5d76a 9-11,18-20,22-23,31-32,123,141-243
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4ceba02e81b624278d6a7654c030824d733c7fbd",
+  "prompts": {},
+  "sessions": {
+    "s_efcd87606c5f73": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08743-ee0f-7983-8d2c-0c51541d985d",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
