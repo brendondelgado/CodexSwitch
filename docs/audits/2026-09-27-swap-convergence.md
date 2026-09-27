@@ -6,15 +6,21 @@ toc:
   - Evidence
   - Repair Contract
   - Verification
+  - Release Staging
+  - Mac Activation
+  - Remaining VPS Gate
 cross_dependencies:
   - ../architecture/runtime-and-host-ownership.md
   - ../../Sources/CodexSwitch/Services/ExternalAuthConflictRecoveryPolicy.swift
   - ../../Sources/CodexSwitch/App/AppDelegate.swift
   - ../../Sources/CodexSwitch/Services/ProcessRunner.swift
   - ../../crates/codexswitch-cli/src/codex_update/runtime_discovery.rs
+  - ../../scripts/install-macos-cli-artifact.sh
+  - ../../scripts/install-linux.sh
+  - ../runbooks/linux-repository-deployment.md
 version_control:
-  branch: codex/helper-environment-20260927
-  status: implementation
+  branch: codex/swap-release-evidence-20260927
+  status: partial-deployment
   last_updated: 2026-09-27
 ---
 
@@ -22,7 +28,8 @@ version_control:
 
 ## Evidence
 
-The VPS still runs release `7f60ba3c`; release `73ff954d` is staged, not active.
+At the start of this incident, the VPS ran release `7f60ba3c`; release
+`73ff954d` was staged, not active.
 At 04:24 UTC its daemon entered low-quota fast polling. At 04:30 it selected
 another account but could not confirm runtime convergence. Mac manual requests
 at 06:52 and 06:54 were rejected because the authority could not accept a
@@ -113,7 +120,7 @@ Both the clean branch (1,100 tests) and the build preserving the installed Mac
 customizations (1,140 tests) passed their complete Swift suites after the
 ancestor-discovery change. The preserved baseline source fingerprint is
 `bb480eb37db4`, exactly matching the installed app before these repairs.
-Native Linux CI and deployment are not yet verified.
+At that point, native Linux CI and deployment were not yet verified.
 
 The new default-environment regression failed against the original runner, then
 passed after the conditional assignment. All six environment fixtures cover
@@ -131,7 +138,106 @@ completed in 1,585 ms. The existing ChatGPT PID 11872 and native Codex PID 12102
 were preserved. Bundle signing verification passed. Earlier post-install
 deferrals are not evidence of confirmation; only the later positive records are.
 
-The environment correction is a separate follow-up to the runtime repair so
-its long-running native Linux validation can continue unchanged. The VPS still
-runs `7f60ba3c`, and the Mac control CLI still runs `5229bc38`; repository fixes
-and the installed menu-bar app do not establish those runtime deployments.
+The environment correction was a separate follow-up to the runtime repair so
+its long-running native Linux validation could continue unchanged. At 08:09 UTC
+the VPS still ran `7f60ba3c`, and the Mac control CLI still ran `5229bc38`;
+repository fixes and the installed menu-bar app did not establish those runtime
+deployments. Later deployment evidence follows.
+
+## Release Staging
+
+Both full native Linux and Swift contract runs for `ce514f397c56` passed before
+PR #4 merged as `26270ee38d1024932d4b8045370e9593cd8fe094`. The merge tree is
+identical to the tested PR tree. Linux artifact run `36305852058` succeeded
+against that exact main commit and upstream Codex `0.153.2`, commit
+`657a993cbee87acf52d14b758ce49dbd46d1b8eb`. It reused only the independently
+verified unchanged upstream runtime from run `36144987554`; the control CLI
+was rebuilt from the new source.
+
+At approximately 08:32 UTC the four-member Linux artifact passed the native
+staging verifier and all four GitHub attestation checks. Stage-only installation
+published release
+`/home/signul/.local/share/codexswitch/releases/0.1.0-26270ee38d1024932d4b8045370e9593cd8fe094`.
+The published CLI SHA-256 is
+`048d4d47a4f82b042d841b3bb6e865ce2d572c12c7cebb36054b9d844af1514d`;
+the artifact manifest SHA-256 is
+`69fd3d3579c9547d56b719d305aa3b46382ffd1838c0d79461c9802124d5a8d6`.
+
+This one staging invocation retained six releases with a 10 GiB release
+retention bound to preserve all five pre-existing releases. No existing release
+was removed. The active and previous links, public CLI target, and digest of
+all user systemd unit files matched their pre-staging snapshots. Runtime PIDs
+79174 and 2036657, daemon PID 1101286, and the T3 parent PID 769277 retained
+their process identities. Every activation, enablement, and start flag was zero.
+The VPS still runs `7f60ba3c`: connected desktop and T3 clients must quiesce
+before activation or legacy credential-sync retirement can proceed.
+
+The exact-main macOS runtime artifact build is run `36305853246`. Its older
+downloadable base artifact had expired, so this was a full native build, not an
+unattested replacement of the installed control CLI. That run completed
+successfully before the Mac activation below.
+
+Both full native Linux and Swift runs for the environment follow-up
+`370599d47d6f` also passed. PR #5 merged at 09:10 UTC as
+`d6601b275c1a9a13c016be38ca44091146007a3e`, with a tree identical to its tested
+head. Its changes are confined to Swift implementation, Swift tests, and docs.
+The Rust crates, Cargo inputs, runtime workflows, and runtime installer scripts
+are identical to `26270ee38d10`, so the two runtime artifacts include all current
+control-plane fixes.
+
+## Mac Activation
+
+The Mac runtime installer completed successfully at approximately 09:17 UTC
+from a clean local main checkout pinned to the artifact's exact source commit.
+It verified all four GitHub build attestations, native signatures, architecture,
+manifest members, runtime contracts, and the installed route readback.
+The artifact manifest SHA-256 is
+`93455c0c40498516bd9cd8968f3f5911657cc7e17e53bab7f1cd0f568fb37194`;
+the installed control CLI SHA-256 is
+`47024f9e12620cb92f89b5cc73282b3f961d5118db348c36f94df4a1ae5a2dbe`.
+The installed CLI reports git `26270ee38d1024932d4b8045370e9593cd8fe094`.
+The updater reports `installed`, upstream version `0.153.2`, that exact manifest
+digest, no pending transaction, and no error. In-memory before/after comparison
+confirmed unchanged credential inventory and unchanged auth-file content.
+
+Before activation, all four existing prepared runtime generations, the control
+CLI, three launch routes, and updater metadata were copied to
+`~/.local/share/codexswitch/backups/swap-repair-20260927`. Runtime copies passed
+a recursive byte comparison; each saved launch route and CLI matched its source
+digest. No account tokens were included. Normal installer retention removed one
+expired managed `0.149.0` generation, whose matching backup remains available.
+The new generation is
+`prepared-codex/0.153.2/2c4fca26a50047529e77799ea55bb278`.
+
+Only the menu-bar app was then gracefully relaunched with its watchdog held and
+restored. At 09:19:04 UTC its normal pool-authority path started a same-account
+reload and completed in 1,461 ms. It recorded
+`CLI_ACTIVATION_HANDOFF_CONFIRMED` for generation
+`D1BD2501-5261-4D21-8626-C0BFBAD673EE`. An independent invocation of the installed
+CLI from inside the existing native Codex process reported `ready: true`,
+`activationState: confirmed`, a clear activation barrier, one fresh runtime ACK,
+11 accounts, three ready candidates, and no issues. Computer Use lineage also
+reported ready. The app signature remained valid.
+
+ChatGPT PID 11872 and native Codex PID 12102 retained their original start times
+and executable identities throughout. CodexSwitch is now PID 229, with watchdog
+PID 249. The existing native runtime still executes its protected earlier
+`e9344a147ea24306a8df8ec38ddcee39` generation; no current chat was restarted to
+enter the new prepared runtime. The repaired control CLI is already installed
+at its normal path and discovered that ancestor process correctly.
+
+## Remaining VPS Gate
+
+The 09:19 UTC recheck still found VPS release `7f60ba3c` active, with unchanged
+runtime and daemon identities. Release `26270ee38d10` is staged only. The user
+has not yet confirmed that desktop VPS and T3 activity are idle and disconnected.
+Do not treat the Mac's positive reload result as VPS activation evidence.
+
+After explicit client quiescence, use the documented positive process/lease
+observations, bounded graceful stop, attested activation, and post-activation
+checks. Preserve the existing service boot policy and independent SIGNUL jobs.
+The original unresolved legacy credential-sync journal must remain intact until
+the new VPS release is active and the guarded review/apply workflow obtains its
+required local and remote leases and stable repeated observations. Then verify
+normal full-pool synchronization and its durable receipt. Neither the legacy
+journal retirement nor VPS activation occurred during this repair.
