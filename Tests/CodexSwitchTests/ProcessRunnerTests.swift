@@ -5,6 +5,88 @@ import Testing
 
 @Suite("ProcessRunner")
 struct ProcessRunnerTests {
+    @Test("Default subprocess environment inherits HOME")
+    func defaultEnvironmentInheritsHome() throws {
+        let home = try #require(ProcessInfo.processInfo.environment["HOME"])
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/printenv"),
+            arguments: ["HOME"],
+            timeout: 2
+        )
+
+        #expect(!result.timedOut)
+        #expect(result.terminationStatus == 0)
+        #expect(result.stdoutString == home + "\n")
+    }
+
+    @Test("Explicit subprocess environment replaces inherited values")
+    func explicitEnvironmentReplacesInheritedValues() {
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/printenv"),
+            timeout: 2,
+            environment: ["CODEXSWITCH_ENVIRONMENT_FIXTURE": "isolated"]
+        )
+
+        #expect(!result.timedOut)
+        #expect(result.terminationStatus == 0)
+        #expect(result.stdoutString == "CODEXSWITCH_ENVIRONMENT_FIXTURE=isolated\n")
+    }
+
+    @Test("Explicit empty subprocess environment remains empty")
+    func explicitEmptyEnvironmentRemainsEmpty() {
+        let result = ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/printenv"),
+            arguments: ["HOME"],
+            timeout: 2,
+            environment: [:]
+        )
+
+        #expect(!result.timedOut)
+        #expect(result.terminationStatus == 1)
+        #expect(result.stdout.isEmpty)
+    }
+
+    @Test("Desktop updater environment inherits HOME by default")
+    func desktopUpdaterEnvironmentInheritsHome() throws {
+        let home = try #require(ProcessInfo.processInfo.environment["HOME"])
+        let result = DesktopUpdaterProcessRunner().run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/printenv"),
+            arguments: ["HOME"],
+            timeout: 2
+        )
+
+        #expect(!result.timedOut)
+        #expect(result.terminationStatus == 0)
+        #expect(result.standardOutput == home + "\n")
+    }
+
+    @Test("Explicit desktop updater environment replaces inherited values")
+    func explicitDesktopUpdaterEnvironmentReplacesInheritedValues() {
+        let result = DesktopUpdaterProcessRunner().run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/printenv"),
+            timeout: 2,
+            environment: ["CODEXSWITCH_ENVIRONMENT_FIXTURE": "isolated"]
+        )
+
+        #expect(!result.timedOut)
+        #expect(result.terminationStatus == 0)
+        #expect(result.standardOutput == "CODEXSWITCH_ENVIRONMENT_FIXTURE=isolated\n")
+    }
+
+    @Test("Explicit empty desktop updater environment remains empty")
+    func explicitEmptyDesktopUpdaterEnvironmentRemainsEmpty() {
+        let result = DesktopUpdaterProcessRunner().run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/printenv"),
+            arguments: ["HOME"],
+            timeout: 2,
+            environment: [:]
+        )
+
+        #expect(!result.timedOut)
+        #expect(result.terminationStatus == 1)
+        #expect(result.standardOutput.isEmpty)
+    }
+
     @Test("Timeout returns promptly for a hung subprocess")
     func timeoutReturnsPromptly() {
         let startedAt = Date()

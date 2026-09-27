@@ -10,9 +10,10 @@ cross_dependencies:
   - ../architecture/runtime-and-host-ownership.md
   - ../../Sources/CodexSwitch/Services/ExternalAuthConflictRecoveryPolicy.swift
   - ../../Sources/CodexSwitch/App/AppDelegate.swift
+  - ../../Sources/CodexSwitch/Services/ProcessRunner.swift
   - ../../crates/codexswitch-cli/src/codex_update/runtime_discovery.rs
 version_control:
-  branch: codex/swap-reliability-20260927
+  branch: codex/helper-environment-20260927
   status: implementation
   last_updated: 2026-09-27
 ---
@@ -46,6 +47,14 @@ same PID. The GUI's independent invocation can find it, explaining why a manual
 CLI diagnostic and the GUI disagree. This also affects runtime-initiated
 recovery commands; it does not establish the cause of every GUI handoff error.
 
+A separate subprocess replay established the persistent GUI handoff defect:
+assigning `Process.environment = nil` on this Mac empties the child's environment,
+while leaving that property unset inherits it. The shared runner unconditionally
+assigned its default nil argument, stripping `HOME` from the control CLI. An
+independent invocation with inherited environment confirmed the same existing
+activation without any credential or auth change. This explains the GUI's
+repeated immediate handoff failures independently of ancestor enumeration.
+
 ## Repair Contract
 
 Recognize only a bounded, reviewed stdio argv grammar in the Unix-daemon
@@ -57,6 +66,13 @@ Include ancestors in both Mac discovery entrypoints and add a subprocess
 fixture that runs the real enumerator from a disposable Codex-named parent.
 Discovery remains read-only and every candidate still requires kernel binding.
 
+The shared subprocess runner must leave the environment unset when callers do
+not supply one. An explicit dictionary, including an empty dictionary, remains
+an exact replacement, not a merge with ambient credentials. Cover all three
+cases with real subprocess tests, then rerun the complete Swift suites because
+this runner is shared by multiple helper workflows. The separately cancellable
+desktop-updater runner has the same assignment and must obey the same contract.
+
 A confirmed Mac activation may route a complete, strictly newer, usable
 same-account auth generation directly through the existing credential transaction
 instead of waiting for a cross-process handoff receipt. Require one matching
@@ -67,6 +83,10 @@ Preparing, degraded, and unrelated manual-review barriers must not be bypassed.
 Persist bounded per-PID reload blockers and acknowledgement/topology counts in
 activation errors. A generic incomplete-reload message alone is insufficient
 incident evidence. Do not include credentials or unbounded process output.
+
+Mac helper refusals must also report a fixed, secret-safe failure category.
+Exit status alone cannot distinguish a missing environment from a busy
+activation lease or a failed runtime confirmation. Never log raw helper stderr.
 
 ## Verification
 
@@ -94,3 +114,24 @@ customizations (1,140 tests) passed their complete Swift suites after the
 ancestor-discovery change. The preserved baseline source fingerprint is
 `bb480eb37db4`, exactly matching the installed app before these repairs.
 Native Linux CI and deployment are not yet verified.
+
+The new default-environment regression failed against the original runner, then
+passed after the conditional assignment. All six environment fixtures cover
+both runners. The final local suites passed 1,107 tests in 67 suites for the
+clean branch and 1,147 in 68 suites for the customization-preserving build.
+The latest complete Rust replay passed 667 unit tests (two subprocess helpers
+ignored by default) and all three CLI integration tests. The local Swift toolchain
+also requires its explicit `plugins/testing` macro search path when rebuilding
+tests; runtime framework paths alone do not supply compiler macros.
+
+At 08:09 UTC the installed Mac app, source fingerprint
+`9d72354ea759-dirty.e3304f0e9f56`, recorded two
+`CLI_ACTIVATION_HANDOFF_CONFIRMED` generations and a same-account runtime reload
+completed in 1,585 ms. The existing ChatGPT PID 11872 and native Codex PID 12102
+were preserved. Bundle signing verification passed. Earlier post-install
+deferrals are not evidence of confirmation; only the later positive records are.
+
+The environment correction is a separate follow-up to the runtime repair so
+its long-running native Linux validation can continue unchanged. The VPS still
+runs `7f60ba3c`, and the Mac control CLI still runs `5229bc38`; repository fixes
+and the installed menu-bar app do not establish those runtime deployments.

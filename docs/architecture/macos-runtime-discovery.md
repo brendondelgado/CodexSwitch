@@ -15,6 +15,8 @@ toc:
 cross_dependencies:
   - runtime-and-host-ownership.md
   - ../../Sources/CodexSwitch/Services/SwapEngine.swift
+  - ../../Sources/CodexSwitch/Services/ProcessRunner.swift
+  - ../../Sources/CodexSwitch/Services/DesktopBundleTrustValidator.swift
   - ../../Sources/CodexSwitch/Services/CLIStatusChecker.swift
   - ../../Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
   - ../../Sources/CodexSwitch/Services/DesktopPatchManager.swift
@@ -22,6 +24,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/DesktopRuntimeDiagnostics.swift
   - ../../crates/codexswitch-cli/src/reload.rs
   - ../../Tests/CodexSwitchTests/SwapEngineTests.swift
+  - ../../Tests/CodexSwitchTests/ProcessRunnerTests.swift
   - ../../Tests/CodexSwitchTests/DesktopRuntimeHotSwapStateTests.swift
   - ../../Tests/CodexSwitchTests/DesktopRuntimeReloadClientTests.swift
 version_control:
@@ -41,6 +44,13 @@ classifier and the kernel-backed identity checks in the runtime ownership
 contract.
 
 ## Discovery Contract
+
+The shared helper runner inherits the parent environment when no override is
+provided, including `HOME` required by the control CLI. The cancellable desktop
+updater runner follows the same rule. Do not assign nil to
+`Process.environment`: on supported macOS builds that clears the environment.
+Explicit dictionaries remain exact replacements, including an empty dictionary;
+never merge a deliberately isolated helper environment with ambient secrets.
 
 CodexSwitch uses one shared bounded exact-name `/usr/bin/pgrep -a -l -x codex`
 call to enumerate candidate PIDs because macOS has no single structured API

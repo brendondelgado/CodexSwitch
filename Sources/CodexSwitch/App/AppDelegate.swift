@@ -9331,6 +9331,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    nonisolated static func cliActivationHandoffFailureReason(_ result: ProcessRunResult) -> String {
+        if result.timedOut { return "timeout" }
+        if result.terminationStatus == -1 { return "launch_failure" }
+        let signatures = [
+            ("HOME is not set", "home_unset"),
+            ("runtime activation is busy", "activation_lease_busy"),
+            ("runtime-activation lease belongs to", "lease_path_mismatch"),
+            ("failed to decode Swift activation witness", "swift_witness_invalid"),
+            ("durable Confirmed activation is stale", "stale_journal"),
+            ("Mac activation handoff did not obtain fresh runtime confirmation", "runtime_confirmation_missing"),
+            ("Operation not permitted", "permission_denied"),
+            ("Permission denied", "permission_denied"),
+            ("No such file or directory", "missing_path"),
+        ]
+        return signatures.first(where: { result.stderrString.contains($0.0) })?.1
+            ?? "unclassified"
+    }
+
     private func scheduleCLIActivationHandoffReconciliationIfNeeded(
         force: Bool = false,
         now: Date = Date()
@@ -9384,7 +9402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 )
             } else {
                 SwapLog.append(.debug(
-                    "CLI_ACTIVATION_HANDOFF_DEFERRED generation=\(activationGeneration.uuidString) status=\(result.terminationStatus) timed_out=\(result.timedOut)"
+                    "CLI_ACTIVATION_HANDOFF_DEFERRED generation=\(activationGeneration.uuidString) status=\(result.terminationStatus) timed_out=\(result.timedOut) reason=\(Self.cliActivationHandoffFailureReason(result))"
                 ))
             }
         }

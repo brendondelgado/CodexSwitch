@@ -4,6 +4,40 @@ import Testing
 
 @Suite("AppDelegate activation recovery")
 struct AppDelegateActivationRecoveryTests {
+    @Test("CLI handoff failures expose only fixed secret-safe categories")
+    func cliHandoffFailureCategoriesDoNotExposeStderr() {
+        let fixtures: [(String, String)] = [
+            ("HOME is not set", "home_unset"),
+            ("runtime activation is busy", "activation_lease_busy"),
+            ("runtime-activation lease belongs to a different path", "lease_path_mismatch"),
+            ("failed to decode Swift activation witness", "swift_witness_invalid"),
+            ("durable Confirmed activation is stale", "stale_journal"),
+            ("Mac activation handoff did not obtain fresh runtime confirmation", "runtime_confirmation_missing"),
+            ("Operation not permitted", "permission_denied"),
+            ("Permission denied", "permission_denied"),
+            ("No such file or directory", "missing_path"),
+            ("Bearer synthetic-secret-not-for-logging", "unclassified"),
+        ]
+        for (stderr, expected) in fixtures {
+            let result = ProcessRunResult(
+                terminationStatus: 1,
+                stdout: Data(),
+                stderr: Data((stderr + "\nprivate-token").utf8),
+                timedOut: false
+            )
+            #expect(AppDelegate.cliActivationHandoffFailureReason(result) == expected)
+        }
+        for (timedOut, expected) in [(true, "timeout"), (false, "launch_failure")] {
+            let result = ProcessRunResult(
+                terminationStatus: -1,
+                stdout: Data(),
+                stderr: Data("private-token".utf8),
+                timedOut: timedOut
+            )
+            #expect(AppDelegate.cliActivationHandoffFailureReason(result) == expected)
+        }
+    }
+
     @Test("Pool authority cannot reset or bypass the durable retry budget")
     func poolAuthorityUsesDurableRetryBudget() {
         let target = UUID()
