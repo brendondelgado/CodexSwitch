@@ -39,12 +39,23 @@ that recovery. A previous Mac source inspection also identified a same-account
 credential-refresh dead end: external handoff requires matching store/auth
 credentials before the normal credential transaction can reconcile them.
 
+A further live read-only replay found that a CLI invoked from the native Mac
+app-server reports no runtime because macOS `pgrep` excludes ancestors by
+default. Exact-name enumeration with ancestor inclusion immediately finds that
+same PID. The GUI's independent invocation can find it, explaining why a manual
+CLI diagnostic and the GUI disagree. This also affects runtime-initiated
+recovery commands; it does not establish the cause of every GUI handoff error.
+
 ## Repair Contract
 
 Recognize only a bounded, reviewed stdio argv grammar in the Unix-daemon
 ownership scanner. Keep unknown options, explicit listener changes, and malformed
 configuration arguments fail-closed. This classification does not remove the
 stdio process from general reload discovery or deployment quiescence checks.
+
+Include ancestors in both Mac discovery entrypoints and add a subprocess
+fixture that runs the real enumerator from a disposable Codex-named parent.
+Discovery remains read-only and every candidate still requires kernel binding.
 
 A confirmed Mac activation may route a complete, strictly newer, usable
 same-account auth generation directly through the existing credential transaction
@@ -72,5 +83,14 @@ SwiftUI macro host; that initial build failure was environmental.
 
 The focused Unix-scanner regression passed locally. A first full Rust run used
 macOS's symlinked temporary-directory alias and failed lease path-identity
-checks; repeat with a canonical private temporary directory. Native Linux CI
-and deployment are not yet verified.
+checks; the canonical-directory replay passed 666 tests with one ignored
+subprocess helper. The added ancestor-discovery change passed 25 focused Rust
+tests including its real macOS subprocess fixture. Read-only invocation of the
+rebuilt CLI then discovered the live native app-server that the installed CLI
+missed. It still reported a stale CLI journal and an old ACK, not readiness.
+
+Both the clean branch (1,100 tests) and the build preserving the installed Mac
+customizations (1,140 tests) passed their complete Swift suites after the
+ancestor-discovery change. The preserved baseline source fingerprint is
+`bb480eb37db4`, exactly matching the installed app before these repairs.
+Native Linux CI and deployment are not yet verified.

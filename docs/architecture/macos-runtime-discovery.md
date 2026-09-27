@@ -27,7 +27,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical
-  last_updated: 2026-08-01
+  last_updated: 2026-09-27
 ---
 
 # macOS Runtime Discovery
@@ -42,7 +42,7 @@ contract.
 
 ## Discovery Contract
 
-CodexSwitch uses one shared bounded exact-name `/usr/bin/pgrep -l -x codex`
+CodexSwitch uses one shared bounded exact-name `/usr/bin/pgrep -a -l -x codex`
 call to enumerate candidate PIDs because macOS has no single structured API
 that enumerates both CLI and app-server processes. Local CLI discovery,
 official ChatGPT native-child discovery, desktop status, and legacy WebSocket
@@ -51,6 +51,11 @@ expressions such as `pgrep -f "codex.*app-server"` are prohibited: macOS may
 truncate or reshape command output, causing a live native child to disappear
 from an account-swap transaction. The process-name hint emitted by `pgrep` is used
 only to detect duplicate-row ambiguity and is discarded before classification.
+The ancestor-inclusion flag is mandatory: a coordinator invoked by a Codex
+runtime must discover that calling runtime too. macOS otherwise excludes the
+entire parent chain and can falsely report no account-bearing runtime. Rust
+additionally restricts the enumeration to the current UID; both implementations
+retain kernel owner, start-time, executable, and argv validation before effects.
 Every accepted PID is then bound through `proc_pidinfo`, `proc_pidpath`, and a
 bounded `KERN_PROCARGS2` read. Runtime discovery and immediate pre-signal
 revalidation must not invoke `/bin/ps` once per process; serial subprocess

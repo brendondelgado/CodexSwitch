@@ -805,6 +805,7 @@ enum SwapEngine {
     /// Enumerate all Codex processes by exact kernel process name. Runtime
     /// classification happens later from identity-bound argv and executable data.
     nonisolated static let codexProcessDiscoveryArguments = [
+        "-a",
         "-l",
         "-x",
         "codex",

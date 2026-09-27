@@ -470,13 +470,10 @@ fn discover_macos_named_processes(process_name_pattern: &str) -> Result<Vec<Code
     let current_uid = unsafe { libc_geteuid() };
     let current_uid_text = current_uid.to_string();
     let output = bounded_command::output(
-        Command::new("/usr/bin/pgrep").args([
-            "-l",
-            "-x",
-            "-U",
-            current_uid_text.as_str(),
+        Command::new("/usr/bin/pgrep").args(macos_process_discovery_arguments(
+            &current_uid_text,
             process_name_pattern,
-        ]),
+        )),
         PS_COMMAND_TIMEOUT,
         bounded_command::SMALL_OUTPUT_LIMIT,
     )
@@ -497,6 +494,11 @@ fn discover_macos_named_processes(process_name_pattern: &str) -> Result<Vec<Code
         processes.push(process);
     }
     Ok(processes)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_process_discovery_arguments<'a>(uid: &'a str, pattern: &'a str) -> [&'a str; 6] {
+    ["-a", "-l", "-x", "-U", uid, pattern]
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -4255,6 +4257,10 @@ mod tests {
 
     #[test]
     fn macos_pgrep_snapshot_is_strict_and_deduplicated() -> Result<()> {
+        assert_eq!(
+            macos_process_discovery_arguments("501", "codex"),
+            ["-a", "-l", "-x", "-U", "501", "codex"]
+        );
         assert!(parse_macos_pgrep_snapshot(b"", Some(1))?.is_empty());
         assert_eq!(
             parse_macos_pgrep_snapshot(b"42 codex\n42 codex\n84 codex\n", Some(0))?,
@@ -4264,6 +4270,39 @@ mod tests {
         assert!(parse_macos_pgrep_snapshot(b"42 codex\n", Some(1)).is_err());
         assert!(parse_macos_pgrep_snapshot(b"42 codex\n42 other\n", Some(0)).is_err());
         assert!(parse_macos_pgrep_snapshot(&[0xff], Some(0)).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "launched only by the ancestor-discovery fixture"]
+    fn macos_ancestor_discovery_helper() -> Result<()> {
+        assert_eq!(std::env::var("CODEXSWITCH_ANCESTOR_FIXTURE")?.as_str(), "1");
+        let uid = unsafe { libc_geteuid() }.to_string();
+        let output = bounded_command::output(
+            Command::new("/usr/bin/pgrep").args(macos_process_discovery_arguments(&uid, "codex")),
+            PS_COMMAND_TIMEOUT,
+            bounded_command::SMALL_OUTPUT_LIMIT,
+        )?;
+        let pids = parse_macos_pgrep_snapshot(&output.stdout, output.status.code())?;
+        assert!(pids.contains(&(std::process::id() as i32)));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_discovery_includes_the_calling_runtime() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fixture = temp.path().join("codex");
+        fs::copy(std::env::current_exe()?, &fixture)?;
+        let output = bounded_command::output(
+            Command::new(&fixture)
+                .env("CODEXSWITCH_ANCESTOR_FIXTURE", "1")
+                .args(["--ignored", "--exact", "reload::tests::macos_ancestor_discovery_helper"]),
+            Duration::from_secs(15),
+            bounded_command::SMALL_OUTPUT_LIMIT,
+        )?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
         Ok(())
     }
 
