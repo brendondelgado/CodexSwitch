@@ -1,0 +1,40 @@
+Sources/CodexSwitch/Services/ExternalAuthConflictRecoveryPolicy.swift
+  s_efcd87606c5f73::t_ec9bfb8439e3fd 33-52
+Tests/CodexSwitchTests/ExternalAuthConflictRecoveryTests.swift
+  s_efcd87606c5f73::t_b52d964ee85c35 12-90
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_efcd87606c5f73::t_ec9bfb8439e3fd 822-834
+crates/codexswitch-cli/src/codex_update/tests.rs
+  s_efcd87606c5f73::t_ec9bfb8439e3fd 672-678,698-713
+docs/audits/2026-09-27-swap-convergence.md
+  s_efcd87606c5f73::t_b32779cf535b84 56-59
+  s_efcd87606c5f73::t_940846962e77d8 67-76
+  s_efcd87606c5f73::t_306e37799032c6 1-55,60-66
+crates/codexswitch-cli/src/codex_update/runtime_discovery.rs
+  s_efcd87606c5f73::t_ec9bfb8439e3fd 1305-1306,1323-1337
+  s_efcd87606c5f73::t_f4a660461b9686 1338-1339
+crates/codexswitch-cli/src/reload.rs
+  s_efcd87606c5f73::t_b32779cf535b84 195-199,4834-4853
+  s_efcd87606c5f73::t_7816d7fe995b27 5466-5480
+  s_efcd87606c5f73::t_9d7f1c9c8d357e 185-194
+  s_efcd87606c5f73::t_709788fac6a4d3 4854-4855
+docs/architecture/runtime-and-host-ownership.md
+  s_efcd87606c5f73::t_306e37799032c6 1866-1878
+  s_efcd87606c5f73::t_9d7f1c9c8d357e 84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9d72354ea75923b4c0b9a1ab0020eb0e85792969",
+  "prompts": {},
+  "sessions": {
+    "s_efcd87606c5f73": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08743-ee0f-7983-8d2c-0c51541d985d",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
