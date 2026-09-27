@@ -1,0 +1,30 @@
+Tests/CodexSwitchTests/SwapEngineTests.swift
+  s_efcd87606c5f73::t_a05e80e0c3c1c1 52,1591
+docs/architecture/macos-runtime-discovery.md
+  s_efcd87606c5f73::t_a05e80e0c3c1c1 30,45,54-58
+docs/audits/2026-09-27-swap-convergence.md
+  s_efcd87606c5f73::t_52a55fe63e3d04 86-96
+  s_efcd87606c5f73::t_a05e80e0c3c1c1 42-48,56-58
+  s_efcd87606c5f73::t_af3f5d698cd8a0 59
+crates/codexswitch-cli/src/reload.rs
+  s_efcd87606c5f73::t_a05e80e0c3c1c1 473-474,476,499-503,4260-4263,4276-4307
+  s_efcd87606c5f73::t_38735b28207651 4308
+Sources/CodexSwitch/Services/SwapEngine.swift
+  s_efcd87606c5f73::t_a05e80e0c3c1c1 808
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ce514f397c56dfa0ef419d1bb68fbb023698a215",
+  "prompts": {},
+  "sessions": {
+    "s_efcd87606c5f73": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08743-ee0f-7983-8d2c-0c51541d985d",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
