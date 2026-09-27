@@ -1,0 +1,39 @@
+Tests/CodexSwitchTests/AppDelegateActivationRecoveryTests.swift
+  s_efcd87606c5f73::t_96836b115967fd 7-40
+Sources/CodexSwitch/Services/DesktopBundleTrustValidator.swift
+  s_efcd87606c5f73::t_c518a0f0388d9e 151-153
+Sources/CodexSwitch/Services/ProcessRunner.swift
+  s_efcd87606c5f73::t_1817bbb7fe8590 51-53
+Sources/CodexSwitch/App/AppDelegate.swift
+  s_efcd87606c5f73::t_96836b115967fd 9334-9351,9405
+Tests/CodexSwitchTests/ProcessRunnerTests.swift
+  s_efcd87606c5f73::t_f2b07d94841c7f 8-48
+  s_efcd87606c5f73::t_7825cab3bfcd96 49-89
+docs/architecture/macos-runtime-discovery.md
+  s_efcd87606c5f73::t_f2b07d94841c7f 18,48,51-53
+  s_efcd87606c5f73::t_1817bbb7fe8590 27
+  s_efcd87606c5f73::t_c518a0f0388d9e 19,49-50
+  s_efcd87606c5f73::t_74432ec40b6a8f 54
+docs/audits/2026-09-27-swap-convergence.md
+  s_efcd87606c5f73::t_77e11b3283036c 13,50-57,69-72
+  s_efcd87606c5f73::t_40b4c9c96ff8b5 16,117-137
+  s_efcd87606c5f73::t_c518a0f0388d9e 73-74
+  s_efcd87606c5f73::t_96836b115967fd 87-90
+  s_efcd87606c5f73::t_fd595d05ccd305 75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "370599d47d6f7ba1257912c37f56e422cdf24aa7",
+  "prompts": {},
+  "sessions": {
+    "s_efcd87606c5f73": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08743-ee0f-7983-8d2c-0c51541d985d",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "brendondelgado <bd7349@gmail.com>"
+    }
+  }
+}
