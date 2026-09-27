@@ -81,7 +81,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-09-25
+  last_updated: 2026-09-27
 ---
 
 # Runtime And Host Ownership
@@ -1862,6 +1862,19 @@ Runtime discovery classifies the kernel executable as well as the command line.
 ChatGPT framework helpers, renderers, services, and crash reporters are never
 interactive Codex CLI sessions even when an argument or bundle path happens to
 end in `Codex`. They cannot make readiness fail or become signal targets.
+
+Unix-daemon ownership discovery distinguishes a reviewed stdio `app-server`
+with configuration override pairs from the managed Unix listener. Such a stdio
+server remains an account-bearing runtime for general reload and deployment
+quiescence; excluding it from Unix ownership is not an ACK exemption. Unknown
+options and listener shapes remain blockers.
+
+A confirmed Mac activation with matching configured/runtime identity may
+reconcile a complete, strictly newer, usable same-account auth generation through
+the normal credential transaction without first requiring store/auth equality
+from an external handoff. Provider identity must be unique. All transaction
+leases, durable revalidation, and runtime confirmation remain mandatory; this
+routing rule does not relax degraded or manual-review barriers.
 
 A version-3 rotation record carrying the recognized legacy degraded-token
 mismatch may be superseded when the account store has exactly one active known

@@ -819,7 +819,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
-        if let state = accountManager.activationState {
+        // A same-account refresh must not wait for store/auth equality before committing it.
+        let reconcilesConfirmedGeneration = ExternalAuthConflictRecoveryPolicy
+            .canReconcileConfirmedGeneration(
+                state: accountManager.activationState,
+                configuredAccountId: configured?.id,
+                storedTarget: existing,
+                observedTarget: target,
+                matchingProviderAccountCount: accountManager.accounts.filter {
+                    $0.normalizedProviderAccountId == target.normalizedProviderAccountId
+                }.count,
+                now: Date()
+            )
+        if let state = accountManager.activationState, !reconcilesConfirmedGeneration {
             switch await adoptVerifiedExternalHandoffIfPresent(
                 expectedState: state,
                 expectedObservedProviderAccountId: target.accountId,

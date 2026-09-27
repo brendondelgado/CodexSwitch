@@ -182,7 +182,21 @@ impl ReloadSummary {
 
     pub(crate) fn bind_activation(&mut self, expected: &ActivationReloadBinding) -> Result<()> {
         if !self.verified_hot_swap() {
-            bail!("runtime reload is incomplete and cannot be bound to an activation");
+            let blockers = self
+                .skipped
+                .iter()
+                .take(8)
+                .map(|(pid, reason)| {
+                    let reason: String = reason.chars().filter(|c| !c.is_control()).take(256).collect();
+                    format!("pid {pid}: {reason}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!(
+                "runtime reload is incomplete and cannot be bound to an activation: topology_verified={} acknowledged={} requests={} skipped={} [{}]",
+                self.topology_verified, self.signaled.len(),
+                self.generated_request_nonces.len(), self.skipped.len(), blockers
+            );
         }
         if let Some(bound) = self.activation_binding.as_ref() {
             if bound != expected {
@@ -4818,6 +4832,28 @@ mod tests {
     }
 
     #[test]
+    fn configured_stdio_server_still_requires_general_reload_ack() {
+        let process = CodexProcess {
+            pid: 42,
+            owner_uid: 1000,
+            start_identity: "test-start".to_string(),
+            started_at_unix: 1_000,
+            command_line: "/home/signul/codex app-server -c mcp_servers.t3-code.url=http://127.0.0.1:3773/mcp -c mcp_servers.t3-code.bearer_token_env_var=\"T3_MCP_BEARER_TOKEN\"".to_string(),
+            executable: PathBuf::from("/home/signul/codex"),
+        };
+        assert_eq!(
+            hot_swap_runtime_kind_for_platform(&process, false, None, None),
+            Some(HotSwapRuntimeKind::ExternalAppServer)
+        );
+        let summary = ReloadSummary {
+            sighup_sent: vec![42],
+            skipped: vec![(42, "SIGHUP sent but live reload acknowledgement was not observed".to_string())],
+            ..ReloadSummary::default()
+        };
+        assert!(!summary.verified_hot_swap());
+    }
+
+    #[test]
     fn official_desktop_stdio_child_accepts_default_or_exact_private_listener() {
         assert!(is_official_desktop_stdio_child_command_line(
             "/prepared/codex -c features.code_mode_host=true app-server --analytics-default-enabled"
@@ -5427,6 +5463,21 @@ mod tests {
             auth_generation: first_auth_generation,
             complete_token_fingerprint: "a".repeat(64),
         };
+        let mut incomplete = ReloadSummary {
+            skipped: vec![(42, "reload acknowledgement was not observed".to_string())],
+            ..ReloadSummary::default()
+        };
+        let failure = incomplete.bind_activation(&first).unwrap_err().to_string();
+        assert!(failure.contains("topology_verified=false acknowledged=0 requests=0 skipped=1"));
+        assert!(failure.contains("pid 42: reload acknowledgement was not observed"));
+        assert!(!failure.contains(&first.complete_token_fingerprint));
+        assert!(!failure.contains("auth-generation-a"));
+        incomplete.skipped = (1..=20).map(|pid| (pid, "x\n".repeat(300))).collect();
+        let bounded = incomplete.bind_activation(&first).unwrap_err().to_string();
+        assert!(bounded.contains("skipped=20"));
+        assert!(!bounded.contains("pid 9:"));
+        assert!(!bounded.contains('\n'));
+        assert!(bounded.len() < 2_500);
         let mut summary = ReloadSummary {
             sighup_sent: vec![42],
             signaled: vec![42],

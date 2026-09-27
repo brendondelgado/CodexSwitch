@@ -669,6 +669,13 @@ mod tests {
             &[b"app-server", b"", b"--listen", b"unix://"],
             &[b"app-server", b"--listen", b"unix:///other.sock"],
             &[b"app-server", b"--listen", b"stdio://"],
+            &[b"app-server", b"-c"],
+            &[b"app-server", b"-c", b"missing-value="],
+            &[b"app-server", b"-c", b"=missing-key"],
+            &[b"app-server", b"-c", b"--listen=unix://"],
+            &[b"app-server", b"-c", b"not-an-assignment"],
+            &[b"app-server", b"--unknown"],
+            &[b"app-server", b"-c", b"key=value", b"--listen", b"unix://"],
             &[
                 b"app-server",
                 b"--remote-control",
@@ -688,6 +695,22 @@ mod tests {
             assert!(error.to_string().contains("unsupported argv"));
         }
         let excluded: &[&[&[u8]]] = &[
+            &[b"app-server"],
+            &[
+                b"app-server",
+                b"-c",
+                b"mcp_servers.t3-code.url=http://127.0.0.1:3773/mcp",
+                b"-c",
+                b"mcp_servers.t3-code.bearer_token_env_var=\"T3_MCP_BEARER_TOKEN\"",
+            ],
+            &[b"app-server", b"--config", b"features.code_mode_host=true"],
+            &[
+                b"-c",
+                b"features.code_mode_host=true",
+                b"app-server",
+                b"-c",
+                b"key=value",
+            ],
             &[b"app-server", b"proxy"],
             &[
                 b"-c",

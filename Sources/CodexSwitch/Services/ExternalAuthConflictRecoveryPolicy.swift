@@ -30,6 +30,26 @@ struct ExternalAuthConflictRecoveryEvidence: Sendable {
 }
 
 enum ExternalAuthConflictRecoveryPolicy {
+    static func canReconcileConfirmedGeneration(
+        state: AccountActivationState?,
+        configuredAccountId: UUID?,
+        storedTarget: CodexAccount,
+        observedTarget: CodexAccount,
+        matchingProviderAccountCount: Int,
+        now: Date
+    ) -> Bool {
+        state?.runtimeIsCurrent(for: storedTarget.id, at: now) == true
+            && configuredAccountId == storedTarget.id
+            && storedTarget.isActive
+            && observedTarget.id == storedTarget.id
+            && matchingProviderAccountCount == 1
+            && storedTarget.normalizedProviderAccountId != nil
+            && observedTarget.normalizedProviderAccountId == storedTarget.normalizedProviderAccountId
+            && storedTarget.hasCompleteRuntimeCredentials
+            && observedTarget.hasCompleteRuntimeCredentials
+            && observedTarget.hasStrictlyNewerInferenceToken(than: storedTarget, at: now)
+    }
+
     static func newerSameAccountGenerationTarget(
         state: AccountActivationState?,
         configuredAccountId: UUID?,
