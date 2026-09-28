@@ -434,7 +434,6 @@ enum CLIStatusChecker {
             "/applications/codex.app/contents/frameworks/codex helper",
             ".git-ai/bin/git-ai",
             "git-ai checkpoint codex",
-            "headroom wrap codex",
         ]
         guard !excludedFragments.contains(where: { lower.contains($0) }) else {
             return false

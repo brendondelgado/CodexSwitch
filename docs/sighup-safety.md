@@ -5,7 +5,6 @@ toc:
   - Desktop Runtime Truth
   - Bundled Plugin Readiness
   - Permission Prompt Guardrails
-  - Desktop Headroom Removal
   - Verification
 cross_dependencies:
   - Sources/CodexSwitch/Services/SwapEngine.swift
@@ -14,7 +13,6 @@ cross_dependencies:
   - Sources/CodexSwitch/Services/DesktopAppConnector.swift
   - scripts/patch-asar.py
   - scripts/test_patch_asar.py
-  - Sources/CodexSwitch/Services/DesktopHeadroomCleanup.swift
   - Tests/CodexSwitchTests/SwapEngineTests.swift
   - Tests/CodexSwitchTests/DesktopStatusTests.swift
   - Tests/CodexSwitchTests/DesktopRuntimeHotSwapStateTests.swift
@@ -114,20 +112,6 @@ The installed plugin should own its MCP server. A manual global `mcp_servers.com
 
 CodexSwitch also forces `features.chronicle = false` whenever it repairs a bundled-plugin config. Patched desktop builds are locally re-signed, while macOS TCC grants can remain pinned to OpenAI's original code requirement. If Chronicle auto-starts on launch in that state, `codex_chronicle` immediately requests Screen Recording and macOS may repeatedly prompt or deny access. Chronicle must stay disabled for patched desktop builds unless CodexSwitch can prove the current signing requirement already matches the stored TCC grant.
 
-## Desktop Headroom Removal
-
-Codex.app must not be routed through Headroom by CodexSwitch.
-
-The desktop patcher now treats Headroom bridges as legacy state to remove:
-
-- `patch-asar.py` strips `CODEXSWITCH_HEADROOM_BASE_URL` transport propagation from the app-server launcher
-- `patch-asar.py` strips legacy `OPENAI_BASE_URL = CODEXSWITCH_HEADROOM_BASE_URL` bridges when found
-- desktop patch readiness no longer requires Headroom markers
-- the menu bar and settings UI no longer advertise desktop Headroom routing
-- CodexSwitch launch disables the desktop Headroom default, unsets stale launchd routing env, and stops only the Headroom proxy process it previously owned
-
-Account hot-swap remains supported through the auth cache invalidation, bundled CLI SIGHUP patch, `CODEX_CLI_PATH` guard, and bundled plugin-list patch. The desktop app-server traffic stays on stock OpenAI transport so silent optimizer filtering cannot distort app diagnostics, streaming behavior, or model/provider identity.
-
 ## Verification
 
 - Added regression tests for interactive CLI process selection.
@@ -135,7 +119,6 @@ Account hot-swap remains supported through the auth cache invalidation, bundled 
 - Added regression tests for stale SIGHUP verification markers.
 - Added patcher tests that copy a SIGHUP-capable CLI into `Codex.app/Contents/Resources/codex` and treat the copy as idempotent once markers are present.
 - Added patcher tests for local-fork candidate discovery and the desktop `CODEX_CLI_PATH` guard.
-- Added patcher tests that remove current and legacy desktop Headroom env bridges.
 - Added desktop runtime tests for Homebrew vendor app-server detection and Node launcher filtering.
 - Verified `python3 scripts/test_patch_asar.py` passes after the bundled-CLI repair change.
 - Verified `swift build` passes after the SIGHUP target filter change.

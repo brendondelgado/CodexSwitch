@@ -4102,7 +4102,6 @@ pub fn is_codex_cli_command_line(command_line: &str) -> bool {
         "rg ",
         "grep ",
         "git-ai checkpoint codex",
-        "headroom wrap codex",
         "chrome_crashpad_handler",
         "codex helper",
         "/applications/chatgpt.app/contents/macos/chatgpt",
