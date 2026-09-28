@@ -79,7 +79,8 @@ final class StatusBarController {
             return
         }
 
-        let model = manager.displayReadModel(at: Date())
+        let now = Date()
+        let model = manager.displayReadModel(at: now)
         guard let displayedAccount = manager.accounts.first(where: {
             $0.id == model.currentAccountId
         }) else {
