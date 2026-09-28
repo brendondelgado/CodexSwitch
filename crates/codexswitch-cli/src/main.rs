@@ -383,9 +383,17 @@ fn main() -> Result<()> {
             receipt_baseline_fingerprint.as_deref(),
             "Updated",
         ),
-        Command::CredentialImportStatus { operation_id, baseline_fingerprint, incoming_fingerprint } => {
+        Command::CredentialImportStatus {
+            operation_id,
+            baseline_fingerprint,
+            incoming_fingerprint,
+        } => {
             let status = credential_import_receipts::observe(
-                &store_path, &auth_path, operation_id, &baseline_fingerprint, &incoming_fingerprint,
+                &store_path,
+                &auth_path,
+                operation_id,
+                &baseline_fingerprint,
+                &incoming_fingerprint,
             )?;
             println!("{}", serde_json::to_string(&status)?);
             Ok(())
@@ -624,13 +632,17 @@ where
         .transpose()?;
     // Reject replays before reconciling any activation or changing authority state.
     let mut receipt_journal = receipt_operation_id
-        .map(|operation_id| credential_import_receipts::Journal::acquire(
-            &runtime_lease,
-            store_path,
-            auth_path,
-            operation_id,
-            incoming_credential_set_fingerprint.as_deref().context("missing incoming fingerprint")?,
-        ))
+        .map(|operation_id| {
+            credential_import_receipts::Journal::acquire(
+                &runtime_lease,
+                store_path,
+                auth_path,
+                operation_id,
+                incoming_credential_set_fingerprint
+                    .as_deref()
+                    .context("missing incoming fingerprint")?,
+            )
+        })
         .transpose()?;
     if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
@@ -2110,6 +2122,34 @@ impl RedeemResetFailureEnvelope {
     }
 }
 
+impl RedeemResetFailureEnvelope {
+    /// A refusal that happened before any store, journal, or provider access.
+    fn rejected_before_host_access(request_id: Uuid) -> Self {
+        Self {
+            schema_version: REDEEM_RESET_FAILURE_SCHEMA_VERSION,
+            status: "error",
+            disposition: RedeemResetFailureDisposition::Rejected,
+            message: REDEEM_RESET_REJECTED_MESSAGE,
+            account_id: None,
+            request_id,
+            blocking_request_id: None,
+        }
+    }
+}
+
+fn write_redeem_reset_failure_envelope<W: Write>(
+    output: &mut W,
+    envelope: &RedeemResetFailureEnvelope,
+) -> Result<()> {
+    let encoded = serde_json::to_vec(envelope)?;
+    if encoded.len() > REDEEM_RESET_FAILURE_MAX_BYTES {
+        bail!("structured reset failure exceeded its fixed output bound");
+    }
+    output.write_all(&encoded)?;
+    output.write_all(b"\n")?;
+    Ok(())
+}
+
 struct ResetOperation {
     account_id: Option<String>,
     request_id: Uuid,
@@ -2137,6 +2177,34 @@ pub(crate) fn redeem_reset(
     redeem_reset_with_request_id(store_path, auth_path, selector, json_output, None)
 }
 
+const REDEEM_RESET_VPS_OWNED_MESSAGE: &str = "banked resets are owned by the VPS authority (remote-authority.json is enabled); redeem from the CodexSwitch app or run `codexswitch-cli redeem-reset` on the VPS";
+const REDEEM_RESET_MAC_APP_OWNED_MESSAGE: &str = "redeem-reset does not run on macOS: the CodexSwitch app owns banked-reset redemption and its reset journal, and missing or unreadable authority state fails closed to VPS ownership; redeem from the CodexSwitch app or run `codexswitch-cli redeem-reset` on the VPS";
+
+/// Host ownership gate for manual redemption; runs before any store, journal,
+/// lease, or provider access. On Linux (the VPS authority) it is a no-op.
+///
+/// On macOS the CLI store keeps its own `accounts.reset-attempts.json`, which is
+/// not the menu app's `reset-attempts.json`. Redeeming here would create a
+/// second, uncoordinated duplicate-spend journal and bypass the rule that a
+/// configured VPS is the only reset owner, so macOS always refuses. The remote
+/// authority file only selects the explanation.
+fn ensure_redeem_reset_host_owns_resets(
+    target_os: &str,
+    remote_authority_path: Option<&Path>,
+) -> Result<()> {
+    if target_os != "macos" {
+        return Ok(());
+    }
+    let vps_enabled = remote_authority_path
+        .map(remote_authority::observe_enabled_flag)
+        .and_then(|observation| observation.ok().flatten())
+        .unwrap_or(false);
+    if vps_enabled {
+        bail!(REDEEM_RESET_VPS_OWNED_MESSAGE);
+    }
+    bail!(REDEEM_RESET_MAC_APP_OWNED_MESSAGE)
+}
+
 fn redeem_reset_with_request_id(
     store_path: &Path,
     auth_path: &Path,
@@ -2146,7 +2214,7 @@ fn redeem_reset_with_request_id(
 ) -> Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    redeem_reset_with_output_and_request_id(
+    redeem_reset_with_output_request_id_and_policy(
         store_path,
         auth_path,
         selector,
@@ -2156,6 +2224,7 @@ fn redeem_reset_with_request_id(
         fetch_rate_limit_reset_bank,
         consume_rate_limit_reset,
         request_id,
+        &RedeemResetContentionPolicy::production(),
     )
 }
 
@@ -2189,6 +2258,119 @@ where
     )
 }
 
+/// Total wall-clock budget a manual `redeem-reset` may spend waiting for
+/// pre-submission contention to clear. The VPS daemon holds the runtime
+/// activation lease for roughly 0.5-1.2 s of every ~6 s tick, so a first-try
+/// lease failure is routine; 8 s covers more than one full tick while staying
+/// well inside the Mac/T3 bounded SSH request timeouts.
+const REDEEM_RESET_CONTENTION_BUDGET: Duration = Duration::from_secs(8);
+/// Poll interval while waiting. Short enough to catch the multi-second idle
+/// gap between daemon ticks, long enough to keep lock probes negligible.
+const REDEEM_RESET_CONTENTION_POLL: Duration = Duration::from_millis(200);
+/// Races detected after provider observation (a GET was already issued) are
+/// retried at most this many times so contention cannot amplify provider I/O.
+const REDEEM_RESET_MAX_OBSERVATION_RACE_RETRIES: u32 = 2;
+/// Pre-submission store/lease races that a fresh attempt can safely resolve.
+/// They are retried only while the failure envelope would classify the
+/// operation as `Rejected` with no journal attempt for this request ID.
+const REDEEM_RESET_TRANSIENT_RACE_DETAILS: &[&str] = &[
+    "another activation or irreversible provider operation owns the provider-I/O lease",
+    "account store changed before reset provider I/O",
+    "account store changed during targeted reset observation",
+    "account store changed during provider-I/O activation preflight",
+    "provider-I/O activation guard found a changed store generation",
+];
+
+/// Injectable clock and sleeper so contention waits are deterministic in tests.
+struct RedeemResetContentionPolicy<'a> {
+    budget: Duration,
+    poll: Duration,
+    max_observation_race_retries: u32,
+    now: &'a dyn Fn() -> std::time::Instant,
+    sleep: &'a dyn Fn(Duration),
+    host_os: &'a str,
+    remote_authority_path: Option<PathBuf>,
+}
+
+impl RedeemResetContentionPolicy<'static> {
+    fn production() -> Self {
+        Self {
+            budget: REDEEM_RESET_CONTENTION_BUDGET,
+            poll: REDEEM_RESET_CONTENTION_POLL,
+            max_observation_race_retries: REDEEM_RESET_MAX_OBSERVATION_RACE_RETRIES,
+            now: &std::time::Instant::now,
+            sleep: &std::thread::sleep,
+            host_os: std::env::consts::OS,
+            remote_authority_path: remote_authority::default_config_path().ok(),
+        }
+    }
+
+    /// Deterministic policy for tests: Linux host semantics, production budget.
+    #[cfg(test)]
+    fn linux_for_tests() -> Self {
+        Self {
+            host_os: "linux",
+            remote_authority_path: None,
+            ..Self::production()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedeemResetContention {
+    RuntimeActivationLease,
+    ObservationRace,
+}
+
+fn redeem_reset_contention(
+    store_path: &Path,
+    operation: &ResetOperation,
+    error: &anyhow::Error,
+) -> Option<RedeemResetContention> {
+    // Never retry once a consume request may have been sent, or once the flow
+    // produced a journal-relevant state; only a plain pre-submission race is
+    // safe to replay under the same idempotent request ID.
+    if operation.submission_started.get()
+        || !matches!(
+            operation.flow_state.get(),
+            None | Some(ResetFlowState::NoAttempt)
+        )
+    {
+        return None;
+    }
+    let kind = if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<activation::RuntimeActivationBusy>()
+            .is_some()
+    }) {
+        RedeemResetContention::RuntimeActivationLease
+    } else {
+        let rendered = format!("{error:#}");
+        if !REDEEM_RESET_TRANSIENT_RACE_DETAILS
+            .iter()
+            .any(|detail| rendered.contains(detail))
+        {
+            return None;
+        }
+        RedeemResetContention::ObservationRace
+    };
+    let envelope = RedeemResetFailureEnvelope::for_operation(store_path, operation);
+    if envelope.disposition != RedeemResetFailureDisposition::Rejected {
+        return None;
+    }
+    let observation = observe_reset_attempts(store_path);
+    let journal_has_request = observation.accounts.iter().any(|status| {
+        status
+            .attempts
+            .iter()
+            .any(|attempt| attempt.request_id == operation.request_id)
+    });
+    let journal_readable =
+        observation.journal_state == ResetJournalState::Observed || observation.missing;
+    (journal_readable && !journal_has_request).then_some(kind)
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn redeem_reset_with_output_and_request_id<F, B, C, W>(
     store_path: &Path,
@@ -2207,26 +2389,125 @@ where
     C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
     W: Write,
 {
-    let mut operation = ResetOperation::new(request_id);
-    let report = match redeem_reset_with_submission_state(
+    redeem_reset_with_output_request_id_and_policy(
         store_path,
         auth_path,
         selector,
-        &mut operation,
+        json_output,
+        output,
         fetch_quota_fn,
         fetch_reset_bank_fn,
         consume_reset_fn,
+        request_id,
+        &RedeemResetContentionPolicy::linux_for_tests(),
+    )
+}
+
+/// Runs one manual redemption, waiting a bounded time for pre-submission
+/// contention. Every retry reuses the same request ID and starts from fresh
+/// durable state; nothing is retried after a consume request may have started.
+#[allow(clippy::too_many_arguments)]
+fn redeem_reset_with_contention_wait<F, B, C>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    request_id: Uuid,
+    fetch_quota_fn: &F,
+    fetch_reset_bank_fn: &B,
+    consume_reset_fn: &C,
+    policy: &RedeemResetContentionPolicy<'_>,
+) -> (Result<RedeemResetReport>, ResetOperation)
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+{
+    let started = (policy.now)();
+    let mut observation_race_retries = 0_u32;
+    loop {
+        let mut operation = ResetOperation::new(Some(request_id));
+        let result = redeem_reset_with_submission_state(
+            store_path,
+            auth_path,
+            selector,
+            &mut operation,
+            fetch_quota_fn,
+            fetch_reset_bank_fn,
+            consume_reset_fn,
+        );
+        let Err(error) = result else {
+            return (result, operation);
+        };
+        let Some(contention) = redeem_reset_contention(store_path, &operation, &error) else {
+            return (Err(error), operation);
+        };
+        let elapsed = (policy.now)().saturating_duration_since(started);
+        let within_budget = elapsed.saturating_add(policy.poll) <= policy.budget;
+        let retry_allowed = within_budget
+            && (contention == RedeemResetContention::RuntimeActivationLease
+                || observation_race_retries < policy.max_observation_race_retries);
+        if !retry_allowed {
+            let error = error.context(format!(
+                "manual reset redemption gave up after {:.1}s of pre-submission contention; no reset was submitted",
+                elapsed.as_secs_f64()
+            ));
+            return (Err(error), operation);
+        }
+        if contention == RedeemResetContention::ObservationRace {
+            observation_race_retries += 1;
+        }
+        (policy.sleep)(policy.poll);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn redeem_reset_with_output_request_id_and_policy<F, B, C, W>(
+    store_path: &Path,
+    auth_path: &Path,
+    selector: &str,
+    json_output: bool,
+    output: &mut W,
+    fetch_quota_fn: F,
+    fetch_reset_bank_fn: B,
+    consume_reset_fn: C,
+    request_id: Option<Uuid>,
+    policy: &RedeemResetContentionPolicy<'_>,
+) -> Result<()>
+where
+    F: Fn(&account_store::CodexAccount) -> Result<FetchResult>,
+    B: Fn(&account_store::CodexAccount) -> Result<RateLimitResetBank>,
+    C: Fn(&account_store::CodexAccount, &RateLimitResetBank, Uuid) -> Result<ConsumeResult>,
+    W: Write,
+{
+    let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+    if let Err(error) = ensure_redeem_reset_host_owns_resets(
+        policy.host_os,
+        policy.remote_authority_path.as_deref(),
     ) {
+        if json_output {
+            write_redeem_reset_failure_envelope(
+                output,
+                &RedeemResetFailureEnvelope::rejected_before_host_access(request_id),
+            )?;
+        }
+        return Err(error);
+    }
+    let (result, operation) = redeem_reset_with_contention_wait(
+        store_path,
+        auth_path,
+        selector,
+        request_id,
+        &fetch_quota_fn,
+        &fetch_reset_bank_fn,
+        &consume_reset_fn,
+        policy,
+    );
+    let report = match result {
         Ok(report) => report,
         Err(error) => {
             if json_output {
                 let envelope = RedeemResetFailureEnvelope::for_operation(store_path, &operation);
-                let encoded = serde_json::to_vec(&envelope)?;
-                if encoded.len() > REDEEM_RESET_FAILURE_MAX_BYTES {
-                    bail!("structured reset failure exceeded its fixed output bound");
-                }
-                output.write_all(&encoded)?;
-                output.write_all(b"\n")?;
+                write_redeem_reset_failure_envelope(output, &envelope)?;
             }
             return Err(error);
         }
@@ -5391,17 +5672,33 @@ mod tests {
         let fingerprint = complete_credential_set_fingerprint(&incoming)?;
         let id = Uuid::new_v4();
         let (_, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
-            &store, &auth, incoming.clone(), true, Some(id), Some(&fingerprint), true,
+            &store,
+            &auth,
+            incoming.clone(),
+            true,
+            Some(id),
+            Some(&fingerprint),
+            true,
             &|_| {
-                let pending = credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
+                let pending = credential_import_receipts::observe(
+                    &store,
+                    &auth,
+                    id,
+                    &fingerprint,
+                    &fingerprint,
+                )?;
                 assert_eq!(pending.status, credential_import_receipts::State::Pending);
                 assert!(pending.receipt.is_none());
                 Ok(verified_reload_summary())
             },
         )?;
         assert!(outcome.is_confirmed());
-        let completed = credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
-        assert_eq!(completed.status, credential_import_receipts::State::Completed);
+        let completed =
+            credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
+        assert_eq!(
+            completed.status,
+            credential_import_receipts::State::Completed
+        );
         assert_eq!(completed.receipt, receipt);
 
         let rotated = account("later-fixture@example.com", true, 10.0, 10.0);
@@ -5410,12 +5707,22 @@ mod tests {
         let store_before = fs::read(&store)?;
         let auth_before = fs::read(&auth)?;
         assert!(replace_import_accounts_with_unlocked_reload(
-            &store, &auth, incoming, true, Some(id), Some(&fingerprint), true,
+            &store,
+            &auth,
+            incoming,
+            true,
+            Some(id),
+            Some(&fingerprint),
+            true,
             &|_| bail!("duplicate import must not reload"),
-        ).is_err());
+        )
+        .is_err());
         assert_eq!(fs::read(&store)?, store_before);
         assert_eq!(fs::read(&auth)?, auth_before);
-        assert_eq!(credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?, completed);
+        assert_eq!(
+            credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?,
+            completed
+        );
         Ok(())
     }
 
@@ -5423,11 +5730,19 @@ mod tests {
     fn credential_import_status_requires_canonical_binding_arguments() -> Result<()> {
         let fingerprint = "1".repeat(64);
         let args = [
-            "codexswitch-cli", "credential-import-status", "--operation-id",
-            "11111111-1111-4111-8111-111111111111", "--baseline-fingerprint",
-            fingerprint.as_str(), "--incoming-fingerprint", fingerprint.as_str(),
+            "codexswitch-cli",
+            "credential-import-status",
+            "--operation-id",
+            "11111111-1111-4111-8111-111111111111",
+            "--baseline-fingerprint",
+            fingerprint.as_str(),
+            "--incoming-fingerprint",
+            fingerprint.as_str(),
         ];
-        assert!(matches!(Args::try_parse_from(args)?.command, Command::CredentialImportStatus { .. }));
+        assert!(matches!(
+            Args::try_parse_from(args)?.command,
+            Command::CredentialImportStatus { .. }
+        ));
         assert!(Args::try_parse_from(&args[..6]).is_err());
         let mut invalid = args;
         invalid[7] = "NOT-A-FINGERPRINT";
@@ -8024,6 +8339,350 @@ mod tests {
             }
             assert_eq!(calls.get(), 1);
         }
+        Ok(())
+    }
+
+    /// Virtual clock: `sleep` advances time and runs a hook with the sleep count.
+    struct VirtualContention {
+        base: std::time::Instant,
+        elapsed: Cell<Duration>,
+        sleeps: Cell<usize>,
+    }
+
+    impl VirtualContention {
+        fn new() -> Self {
+            Self {
+                base: std::time::Instant::now(),
+                elapsed: Cell::new(Duration::ZERO),
+                sleeps: Cell::new(0),
+            }
+        }
+
+        fn now(&self) -> std::time::Instant {
+            self.base + self.elapsed.get()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.elapsed.set(self.elapsed.get() + duration);
+            self.sleeps.set(self.sleeps.get() + 1);
+        }
+    }
+
+    fn contention_policy<'a>(
+        now: &'a dyn Fn() -> std::time::Instant,
+        sleep: &'a dyn Fn(Duration),
+    ) -> RedeemResetContentionPolicy<'a> {
+        RedeemResetContentionPolicy {
+            budget: REDEEM_RESET_CONTENTION_BUDGET,
+            poll: REDEEM_RESET_CONTENTION_POLL,
+            max_observation_race_retries: REDEEM_RESET_MAX_OBSERVATION_RACE_RETRIES,
+            now,
+            sleep,
+            host_os: "linux",
+            remote_authority_path: None,
+        }
+    }
+
+    fn blocked_reset_fixture(temp: &TempDir) -> Result<(PathBuf, PathBuf, CodexAccount)> {
+        let root = temp.path().canonicalize()?;
+        let store_path = root.join("accounts.json");
+        let auth_path = root.join("auth.json");
+        let active = account("active@example.com", true, 0.0, 10.0);
+        let mut exhausted = account("exhausted@example.com", false, 0.0, 100.0);
+        exhausted.account_id = "exhausted-provider-id".to_string();
+        exhausted.runtime_unusable_until = Some(Utc::now() + ChronoDuration::days(7));
+        exhausted.runtime_unusable_reason = Some("usage_limit".to_string());
+        save_accounts(&store_path, &[active, exhausted.clone()])?;
+        confirm_provider_io_activation(&store_path, &auth_path)?;
+        Ok((store_path, auth_path, exhausted))
+    }
+
+    #[test]
+    fn redeem_reset_waits_for_runtime_lease_then_submits_once() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let (store_path, auth_path, exhausted) = blocked_reset_fixture(&temp)?;
+        let holder = std::cell::RefCell::new(Some(acquire_runtime_activation_lease(&store_path)?));
+        let clock = VirtualContention::new();
+        let now = || clock.now();
+        let sleep = |duration| {
+            clock.sleep(duration);
+            if clock.sleeps.get() == 3 {
+                holder.borrow_mut().take();
+            }
+        };
+        let policy = contention_policy(&now, &sleep);
+        let request_id = Uuid::new_v4();
+        let quota_calls = Cell::new(0usize);
+        let bank_calls = Cell::new(0usize);
+        let consume_calls = Cell::new(0usize);
+        let initial_bank = reset_bank(&["credit-a", "credit-b"]);
+        let consumed_bank = consumed_reset_bank(initial_bank.clone(), "credit-a");
+        let mut output = Vec::new();
+
+        redeem_reset_with_output_request_id_and_policy(
+            &store_path,
+            &auth_path,
+            &exhausted.account_id,
+            true,
+            &mut output,
+            |account| {
+                quota_calls.set(quota_calls.get() + 1);
+                let mut result = fetch_from_account(account)?;
+                if quota_calls.get() > 2 {
+                    for window in &mut result.snapshot.windows {
+                        window.used_percent = 0.0;
+                        window.hard_limit_reached = false;
+                    }
+                    result.snapshot.allowed = Some(true);
+                    result.snapshot.limit_reached = Some(false);
+                }
+                Ok(result)
+            },
+            |_account| {
+                bank_calls.set(bank_calls.get() + 1);
+                let mut bank = if bank_calls.get() <= 2 {
+                    initial_bank.clone()
+                } else {
+                    consumed_bank.clone()
+                };
+                bank.fetched_at = Utc::now();
+                Ok(bank)
+            },
+            |_account, _bank, actual_id| {
+                assert_eq!(actual_id, request_id);
+                consume_calls.set(consume_calls.get() + 1);
+                Ok(ConsumeResult {
+                    code: rate_limit_resets::ConsumeCode::Reset,
+                    credit_id: Some("credit-a".to_string()),
+                })
+            },
+            Some(request_id),
+            &policy,
+        )?;
+
+        assert_eq!(clock.sleeps.get(), 3);
+        assert_eq!(clock.elapsed.get(), REDEEM_RESET_CONTENTION_POLL * 3);
+        assert_eq!(consume_calls.get(), 1);
+        let payload: Value = serde_json::from_slice(&output)?;
+        assert_eq!(payload["submittedReset"], true);
+        assert_eq!(payload["accountId"], exhausted.account_id);
+        let observation = observe_reset_attempts(&store_path);
+        let status = observation.account(&exhausted.account_id).unwrap();
+        assert_eq!(status.attempts.len(), 1);
+        assert_eq!(status.attempts[0].request_id, request_id);
+        Ok(())
+    }
+
+    #[test]
+    fn redeem_reset_rejects_busy_after_bounded_lease_wait_without_provider_io() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let (store_path, auth_path, exhausted) = blocked_reset_fixture(&temp)?;
+        let _holder = acquire_runtime_activation_lease(&store_path)?;
+        let clock = VirtualContention::new();
+        let now = || clock.now();
+        let sleep = |duration| clock.sleep(duration);
+        let policy = contention_policy(&now, &sleep);
+        let request_id = Uuid::new_v4();
+        let mut output = Vec::new();
+
+        let error = redeem_reset_with_output_request_id_and_policy(
+            &store_path,
+            &auth_path,
+            &exhausted.account_id,
+            true,
+            &mut output,
+            |_account| bail!("quota must not be fetched without the runtime lease"),
+            |_account| bail!("inventory must not be fetched without the runtime lease"),
+            |_account, _bank, _request_id| bail!("reset must not be submitted without the lease"),
+            Some(request_id),
+            &policy,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("runtime activation is busy"));
+        assert!(format!("{error:#}").contains("no reset was submitted"));
+        assert!(clock.elapsed.get() <= REDEEM_RESET_CONTENTION_BUDGET);
+        assert!(
+            clock.elapsed.get() + REDEEM_RESET_CONTENTION_POLL > REDEEM_RESET_CONTENTION_BUDGET
+        );
+        assert_eq!(
+            clock.sleeps.get(),
+            (REDEEM_RESET_CONTENTION_BUDGET.as_millis() / REDEEM_RESET_CONTENTION_POLL.as_millis())
+                as usize
+        );
+        let payload: Value = serde_json::from_slice(&output)?;
+        assert_eq!(payload["disposition"], "rejected");
+        assert_eq!(payload["requestId"], request_id.to_string());
+        assert!(!rate_limit_resets::reset_attempt_journal_path(&store_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn redeem_reset_never_retries_once_submission_started() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let (store_path, auth_path, exhausted) = blocked_reset_fixture(&temp)?;
+        let clock = VirtualContention::new();
+        let now = || clock.now();
+        let sleep = |duration| clock.sleep(duration);
+        let policy = contention_policy(&now, &sleep);
+        let consume_calls = Cell::new(0usize);
+        let bank_snapshot = reset_bank(&["credit-a"]);
+        let mut output = Vec::new();
+
+        let error = redeem_reset_with_output_request_id_and_policy(
+            &store_path,
+            &auth_path,
+            &exhausted.account_id,
+            true,
+            &mut output,
+            fetch_from_account,
+            |_account| {
+                let mut bank = bank_snapshot.clone();
+                bank.fetched_at = Utc::now();
+                Ok(bank)
+            },
+            |_account, _bank, _request_id| {
+                consume_calls.set(consume_calls.get() + 1);
+                // Text of a retryable race must not matter once POST may have started.
+                bail!("account store changed before reset provider I/O (simulated)")
+            },
+            None,
+            &policy,
+        )
+        .unwrap_err();
+
+        assert_eq!(consume_calls.get(), 1, "{error:#}");
+        assert_eq!(clock.sleeps.get(), 0);
+        let payload: Value = serde_json::from_slice(&output)?;
+        assert_eq!(payload["disposition"], "outcomeUnknown");
+        Ok(())
+    }
+
+    #[test]
+    fn redeem_reset_does_not_retry_non_transient_rejections() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let (store_path, auth_path, exhausted) = blocked_reset_fixture(&temp)?;
+        let clock = VirtualContention::new();
+        let now = || clock.now();
+        let sleep = |duration| clock.sleep(duration);
+        let policy = contention_policy(&now, &sleep);
+        let quota_calls = Cell::new(0usize);
+
+        redeem_reset_with_output_request_id_and_policy(
+            &store_path,
+            &auth_path,
+            &exhausted.account_id,
+            true,
+            &mut Vec::new(),
+            |_account| {
+                quota_calls.set(quota_calls.get() + 1);
+                bail!("simulated quota transport failure")
+            },
+            |_account| bail!("inventory must not be fetched after quota failure"),
+            |_account, _bank, _request_id| bail!("reset must not be submitted"),
+            None,
+            &policy,
+        )
+        .unwrap_err();
+
+        assert_eq!(quota_calls.get(), 1);
+        assert_eq!(clock.sleeps.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn redeem_reset_bounds_observation_race_retries_and_keeps_request_id() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let (store_path, auth_path, exhausted) = blocked_reset_fixture(&temp)?;
+        let clock = VirtualContention::new();
+        let now = || clock.now();
+        let sleep = |duration| clock.sleep(duration);
+        let policy = contention_policy(&now, &sleep);
+        let quota_calls = Cell::new(0usize);
+        let request_id = Uuid::new_v4();
+        let mut output = Vec::new();
+
+        let error = redeem_reset_with_output_request_id_and_policy(
+            &store_path,
+            &auth_path,
+            &exhausted.account_id,
+            true,
+            &mut output,
+            |account| {
+                quota_calls.set(quota_calls.get() + 1);
+                fetch_from_account(account)
+            },
+            |_account| bail!("account store changed before reset provider I/O (simulated race)"),
+            |_account, _bank, _request_id| bail!("reset must not be submitted after a race"),
+            Some(request_id),
+            &policy,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("account store changed before reset provider I/O"));
+        let attempts = REDEEM_RESET_MAX_OBSERVATION_RACE_RETRIES as usize + 1;
+        assert_eq!(quota_calls.get(), attempts);
+        assert_eq!(clock.sleeps.get(), attempts - 1);
+        let payload: Value = serde_json::from_slice(&output)?;
+        assert_eq!(payload["disposition"], "rejected");
+        assert_eq!(payload["requestId"], request_id.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn redeem_reset_refuses_on_macos_before_store_journal_or_provider_access() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let root = temp.path().canonicalize()?;
+        let store_path = root.join("accounts.json");
+        let auth_path = root.join("auth.json");
+        let config_path = root.join("remote-authority.json");
+        fs::write(
+            &config_path,
+            br#"{"enabled":true,"host":"vps.example","port":22,"sshKeyPath":"/nonexistent/key","user":"signul","version":1}"#,
+        )?;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+        let clock = VirtualContention::new();
+        let now = || clock.now();
+        let sleep = |duration| clock.sleep(duration);
+
+        for (config, expected) in [
+            (Some(config_path.clone()), REDEEM_RESET_VPS_OWNED_MESSAGE),
+            (
+                Some(root.join("missing.json")),
+                REDEEM_RESET_MAC_APP_OWNED_MESSAGE,
+            ),
+            (None, REDEEM_RESET_MAC_APP_OWNED_MESSAGE),
+        ] {
+            let policy = RedeemResetContentionPolicy {
+                host_os: "macos",
+                remote_authority_path: config,
+                ..contention_policy(&now, &sleep)
+            };
+            let request_id = Uuid::new_v4();
+            let mut output = Vec::new();
+            let error = redeem_reset_with_output_request_id_and_policy(
+                &store_path,
+                &auth_path,
+                "exhausted@example.com",
+                true,
+                &mut output,
+                |_account| bail!("macOS must not fetch quota"),
+                |_account| bail!("macOS must not fetch inventory"),
+                |_account, _bank, _request_id| bail!("macOS must not submit a reset"),
+                Some(request_id),
+                &policy,
+            )
+            .unwrap_err();
+            assert_eq!(format!("{error:#}"), expected);
+            let payload: Value = serde_json::from_slice(&output)?;
+            assert_eq!(payload["disposition"], "rejected");
+            assert_eq!(payload["requestId"], request_id.to_string());
+            assert!(payload["accountId"].is_null());
+        }
+        assert!(!store_path.exists());
+        assert!(!rate_limit_resets::reset_attempt_journal_path(&store_path).exists());
+        assert_eq!(clock.sleeps.get(), 0);
+        ensure_redeem_reset_host_owns_resets("linux", Some(&config_path))?;
         Ok(())
     }
 
