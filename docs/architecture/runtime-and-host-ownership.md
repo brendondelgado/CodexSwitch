@@ -15,6 +15,7 @@ toc:
   - Mac Contract
   - VPS Contract
   - Remote Session Contract
+  - Shared App-Server Clients
   - Status And Repair
   - Update And Patch Contract
   - Remote Usage Accounting
@@ -81,6 +82,8 @@ cross_dependencies:
   - ../runbooks/codex-vps-thread-tools-mcp.md
   - ../../Sources/CodexSwitch/Services/VPSCodexRestartResult.swift
   - ../runbooks/linux-repository-deployment.md
+  - shared-app-server-client.md
+  - ../../crates/codexswitch-cli/src/shared_app_server_client.rs
 version_control:
   branch: main
   status: canonical-target
@@ -2021,6 +2024,40 @@ actor boundary on every supported Swift 6 toolchain.
   After bootstrap, the patched built-in daemon also resolves its managed child
   directly through `current`; it cannot fall back to Codex's independently
   updated standalone package tree.
+
+## Shared App-Server Clients
+
+Codex permits one writer per thread across processes and cannot transfer
+ownership. A frontend that spawns a private `codex app-server` per thread
+(T3 Code) therefore cannot open a thread the shared daemon already holds.
+Such frontends use `scripts/codex-shared`, which runs
+`codexswitch-cli app-server-client`; the full contract is
+`shared-app-server-client.md`.
+
+- Only a plain stdio `app-server` invocation with `-c`/`--enable`/`--disable`
+  flags is relayed to the daemon's control socket. Every other invocation,
+  and every case without a verified same-user daemon, executes the real Codex
+  with the original argv and untouched stdin.
+- Invocation overrides become per-thread `config` on `thread/start`,
+  `thread/resume`, and `thread/fork`; client-provided keys win. An MCP
+  `bearer_token_env_var` whose variable is set becomes a literal
+  `Authorization` header because the daemon cannot read the client's
+  environment. Credentials are sent only after the socket peer uid matches,
+  are never logged, and are scrubbed from any daemon the client starts.
+- On Linux a missing or refusing default socket
+  (`$CODEX_HOME/app-server-control/app-server-control.sock`) triggers one
+  bounded `codex app-server daemon start` through the same real Codex the
+  fallback would use. Unlike desktop task tools, the client may start the
+  daemon: the alternative is a second private writer, not no writer.
+- On macOS the client never starts or (without an explicit
+  `CODEXSWITCH_APP_SERVER_SOCKET`) connects to a daemon, because the Mac
+  desktop contract gives ChatGPT ownership of its stdio child and forbids a
+  desktop bridge.
+- The client holds no account credentials and is never a discovery, reload,
+  or restart target in Rust or Swift. Threads it opens run inside the daemon
+  and follow that daemon's reload. A connected client is an initialized
+  frontend, so the VPS external idle proof does not apply while it is
+  connected.
 
 ## Status And Repair
 

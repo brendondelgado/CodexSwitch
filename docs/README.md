@@ -20,10 +20,11 @@ cross_dependencies:
   - architecture/macos-runtime-artifact.md
   - architecture/secure-drop-transport.md
   - architecture/t3-usage-hub.md
+  - architecture/shared-app-server-client.md
 version_control:
   branch: main
   status: canonical
-  last_updated: 2026-07-13
+  last_updated: 2026-09-28
 ---
 
 # CodexSwitch Documentation
@@ -59,6 +60,7 @@ A deployed VPS binary may be older than the repository. A UI can also be stale w
 - [Subprocess execution](architecture/subprocess-execution.md): bounded output capture, timeout escalation, reaping, and actor-isolation rules.
 - [SecureDrop transport](architecture/secure-drop-transport.md): artifact integrity, staging, extraction, deletion safety, and retention.
 - [T3 usage hub](architecture/t3-usage-hub.md): how T3 Code reads VPS usage and redeems banked resets through the CodexSwitch journal.
+- [Shared app-server client](architecture/shared-app-server-client.md): how T3 Code and similar per-thread frontends join the shared Codex daemon instead of competing for a thread's single writer.
 - [Session retention contract](architecture/session-retention-contract.md): preservation and representation of remote thread history.
 
 ## Operations

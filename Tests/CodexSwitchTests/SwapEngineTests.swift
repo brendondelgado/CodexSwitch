@@ -1156,6 +1156,31 @@ struct SwapEngineTests {
         #expect(!SwapEngine.processMatchesRuntime(vendorAppServer, runtimeKind: .externalAppServer))
     }
 
+    @Test("Shared app-server client is never a hot-swap runtime")
+    func sharedAppServerClientIsNeverAHotSwapRuntime() {
+        let path = "/Users/me/.local/share/codexswitch/prepared-codex/0.153.2/abc/codexswitch-cli"
+        let identity = signalIdentity(pid: 43, executablePath: path)
+        let client = CodexIdentityBoundProcess(
+            identity: identity,
+            kernelExecutableIdentity: kernelIdentity(path: path),
+            arguments: [
+                path, "app-server-client", "app-server", "-c",
+                "mcp_servers.t3-code.url=http://127.0.0.1:51870/mcp",
+            ]
+        )
+        let clientLine = "43 \(path) app-server-client app-server -c features.goals=true"
+        let launcherLine = "44 /bin/sh /Users/me/.local/bin/codex-shared app-server"
+
+        #expect(SwapEngine.desktopRuntimeKind(for: client, managedDesktopRuntimePath: nil) == nil)
+        #expect(!SwapEngine.processMatchesRuntime(client, runtimeKind: .localInteractiveCLI))
+        #expect(DesktopRuntimeDiagnostics.parseAppServerProcessLine(clientLine) == nil)
+        #expect(DesktopRuntimeDiagnostics.parseAppServerProcessLine(launcherLine) == nil)
+        #expect(!DesktopPatchManager.isDesktopHotSwapRuntimeLine(clientLine.lowercased()))
+        #expect(!DesktopRuntimeDiagnostics.isSharedAppServerClientCommandLine(
+            "45 /Users/me/.local/share/codexswitch/prepared-codex/0.153.2/abc/codex resume fix-codexswitch-cli"
+        ))
+    }
+
     @Test("Managed desktop bridge has an explicit stable wire kind")
     func managedDesktopBridgeHasStableWireKind() throws {
         #expect(HotSwapRuntimeKind.managedDesktopBridge.rawValue == "managed-desktop-bridge")

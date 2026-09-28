@@ -1,0 +1,9 @@
+#!/bin/sh
+# Codex "binary path" for frontends such as T3 Code that spawn one
+# `codex app-server` per thread. Plain stdio app-server sessions join the
+# host's shared app-server daemon (so a thread already open elsewhere keeps a
+# single writer); every other invocation runs the real Codex unchanged.
+#
+# Install: install -m 0755 scripts/codex-shared ~/.local/bin/codex-shared
+# Contract: docs/architecture/shared-app-server-client.md
+exec "${CODEXSWITCH_CLI:-$HOME/.local/bin/codexswitch-cli}" app-server-client "$@"

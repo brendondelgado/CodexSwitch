@@ -1629,6 +1629,12 @@ enum SwapEngine {
     ) -> Bool {
         let executablePath = process.kernelExecutableIdentity.canonicalPath
         guard executablePath == process.identity.executablePath else { return false }
+        // The shared app-server client relays to an existing daemon and never
+        // holds credentials, even when its binary sits in a runtime directory.
+        guard (executablePath as NSString).lastPathComponent != "codexswitch-cli",
+              process.arguments.dropFirst().first?.lowercased() != "app-server-client" else {
+            return false
+        }
         let runtimeArguments = process.arguments.dropFirst().map { $0.lowercased() }
         let isDesktopAppServer = runtimeArguments.contains("app-server")
             && !runtimeArguments.contains("--remote-control")

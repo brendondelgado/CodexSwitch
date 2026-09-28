@@ -17,6 +17,7 @@ mod reload;
 mod remote_authority;
 mod secure_drop;
 mod secure_file;
+mod shared_app_server_client;
 mod token_refresh;
 
 use account_store::{
@@ -349,6 +350,12 @@ impl AutomaticResetPolicyValue {
 }
 
 fn main() -> Result<()> {
+    // Dispatched before clap so the frontend's argv (including `--help`,
+    // `--version`, and global `-c` flags) reaches the client untouched.
+    let mut raw_arguments = std::env::args_os();
+    if shared_app_server_client::is_subcommand(raw_arguments.nth(1).as_deref()) {
+        shared_app_server_client::run(raw_arguments.collect());
+    }
     codex_update::arm_background_update_deadline();
     let args = Args::parse();
     let store_path = args.store.unwrap_or(default_store_path()?);
