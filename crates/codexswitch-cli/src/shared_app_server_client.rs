@@ -31,7 +31,7 @@ use tungstenite::{Message, WebSocket};
 
 pub const SUBCOMMAND: &str = "app-server-client";
 
-/// Explicit real Codex executable for fallback and daemon start.
+/// Explicit real Codex executable for fallback and starting the shared daemon.
 const REAL_CODEX_ENV: &str = "CODEXSWITCH_REAL_CODEX";
 /// Explicit control socket. When set, it is used on every platform and a
 /// daemon is never started for it.
@@ -386,10 +386,26 @@ fn daemon_absent(error: &io::Error) -> bool {
     )
 }
 
+/// Starts the shared daemon exactly the way ChatGPT's SSH remote does: a
+/// `codex app-server proxy` through the managed launcher auto-starts the
+/// daemon with the launcher's flags (for example `features.code_mode_host`),
+/// then exits when its stdin closes. On Linux it runs inside its own transient
+/// systemd user scope so the daemon never joins the calling frontend's service
+/// cgroup; restarting T3 must not kill the daemon every other client shares.
 fn start_daemon(codex: &Path, secret_env: &[String]) -> Result<()> {
-    let mut command = Command::new(codex);
+    let systemd_run = Path::new("/usr/bin/systemd-run");
+    let mut command = if cfg!(target_os = "linux") && is_executable_file(systemd_run) {
+        let mut command = Command::new(systemd_run);
+        command
+            .args(["--user", "--scope", "--quiet", "--collect", "--"])
+            .arg(codex);
+        command
+    } else {
+        Command::new(codex)
+    };
     command
-        .args(["app-server", "daemon", "start"])
+        .args(["app-server", "proxy"])
+        .env("CODEXSWITCH_SHARED_DAEMON_START", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -404,22 +420,24 @@ fn start_daemon(codex: &Path, secret_env: &[String]) -> Result<()> {
     }
     let mut child = command
         .spawn()
-        .context("failed to run `codex app-server daemon start`")?;
+        .context("failed to run `codex app-server proxy` to start the daemon")?;
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;
     loop {
-        if let Some(status) = child
+        // The proxy's own exit status is not the signal: it may exit non-zero
+        // when stdin closes. Readiness is proven by the socket accepting.
+        if child
             .try_wait()
-            .context("failed to wait for `codex app-server daemon start`")?
+            .context("failed to wait for `codex app-server proxy`")?
+            .is_some()
         {
-            if status.success() {
-                return Ok(());
-            }
-            bail!("`codex app-server daemon start` exited with {status}");
+            return Ok(());
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("`codex app-server daemon start` exceeded {DAEMON_START_TIMEOUT:?}");
+            bail!(
+                "`codex app-server proxy` did not start the daemon within {DAEMON_START_TIMEOUT:?}"
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -535,6 +553,16 @@ fn relay(mut websocket: WebSocket<UnixStream>, config: &Map<String, Value>) -> R
                     break
                 }
                 Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                    return Ok(())
+                }
+                // After the frontend closed stdin the daemon may drop the
+                // socket without a closing handshake; the session is over.
+                Err(tungstenite::Error::Protocol(
+                    tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                )) if !stdin_open => return Ok(()),
+                Err(tungstenite::Error::Io(error))
+                    if !stdin_open && error.kind() == ErrorKind::ConnectionReset =>
+                {
                     return Ok(())
                 }
                 Err(error) => {
