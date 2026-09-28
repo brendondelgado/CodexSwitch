@@ -390,6 +390,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var linuxDevboxReadinessGeneration: UInt64 = 0
     private var linuxDevboxReadinessTaskContext: LinuxDevboxReadinessTaskContext?
     private var linuxDevboxSurfacedCredentialSyncHold: LinuxDevboxSurfacedCredentialSyncHold?
+    private var activationRetryEscalation = ActivationRetryEscalation()
+    private var unmanagedRuntimeRefreshInFlight = false
+    private var lastUnmanagedRuntimeRefreshAt: Date?
     private var linuxDevboxConsecutiveIssueChecks = 0
     private var poolAuthorityClientState = PoolAuthorityClientState()
     private var poolAuthorityStatusCheckInFlight = false
@@ -619,6 +622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.reconcileQuotaPollingIfNeeded()
                     self?.scheduleCLIActivationHandoffReconciliationIfNeeded()
                     self?.scheduleLocalConfirmationRefreshIfNeeded()
+                    self?.refreshUnmanagedRuntimeWarnings()
                     CLIStatusChecker.refresh(
                         activeAccountId: self?.accountManager.configuredAccount?.accountId,
                         onRuntimeObservation: { [weak self] observation in
@@ -8452,11 +8456,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ).authorizesEffect
     }
 
+    static let unmanagedRuntimeRefreshInterval: TimeInterval = 30
+
+    /// Read-only: observes app-servers hosted outside the official desktop
+    /// app and warns about those started before the current credentials were
+    /// written. They are never signalled and never block activation.
+    private func refreshUnmanagedRuntimeWarnings(force: Bool = false) {
+        let now = Date()
+        guard !isExiting, !unmanagedRuntimeRefreshInFlight else { return }
+        if !force,
+           let lastUnmanagedRuntimeRefreshAt,
+           now.timeIntervalSince(lastUnmanagedRuntimeRefreshAt)
+            < Self.unmanagedRuntimeRefreshInterval {
+            return
+        }
+        unmanagedRuntimeRefreshInFlight = true
+        lastUnmanagedRuntimeRefreshAt = now
+        Task { @MainActor [weak self] in
+            let observed = await Task.detached(priority: .utility) {
+                () -> ([CodexUnmanagedRuntime], Date?)? in
+                guard let runtimes = SwapEngine.unmanagedDesktopRuntimes() else {
+                    return nil
+                }
+                let writtenAt = (try? FileManager.default.attributesOfItem(
+                    atPath: Self.codexAuthPath
+                ))?[.modificationDate] as? Date
+                return (runtimes, writtenAt)
+            }.value
+            guard let self else { return }
+            self.unmanagedRuntimeRefreshInFlight = false
+            guard let (runtimes, writtenAt) = observed else { return }
+            let warnings = AccountManager.unmanagedRuntimeWarnings(
+                runtimes: runtimes,
+                credentialsWrittenAt: writtenAt
+            )
+            guard warnings != self.accountManager.unmanagedRuntimeWarnings else {
+                return
+            }
+            self.accountManager.publishUnmanagedRuntimeWarnings(warnings)
+            let detail = warnings
+                .map { "pid=\($0.pid) host=\($0.host) command=\($0.command)" }
+                .joined(separator: "; ")
+            SwapLog.append(.debug(
+                "UNMANAGED_RUNTIME_WARNING count=\(warnings.count) \(detail)"
+            ))
+            self.statusBarController.updateIcon()
+            self.updatePopoverContent()
+        }
+    }
+
     private func retryActivationConvergenceIfDue(at date: Date) {
         guard !isExiting,
-              let targetAccountId = accountManager.activationState?.automaticRetryTarget(at: date),
+              let state = accountManager.activationState,
+              let targetAccountId = state.automaticRetryTarget(at: date),
               let target = accountManager.accounts.first(where: { $0.id == targetAccountId }),
               accountManager.configuredAccount?.id == targetAccountId else {
+            return
+        }
+        // Identical consecutive failures are futile at the journal cadence;
+        // space them out until the outcome changes or the operator retries.
+        guard activationRetryEscalation.permitsAutomaticRetry(
+            activationGeneration: state.activationGeneration,
+            at: date
+        ) else {
             return
         }
         beginSameTargetRuntimeRetry(to: target, source: .automatic)
@@ -8598,6 +8660,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         source: AccountActivationRetrySource,
         operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> Bool {
+        if source != .automatic {
+            activationRetryEscalation.reset()
+        }
         guard !isExiting,
               operationAuthority?.authorizes() ?? true,
               swapConvergenceTask == nil,
@@ -9210,6 +9275,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if case .runtimeCurrent = completion.outcome {
             await releaseManualRateLimitResetSwapSuppressionIfNeeded(for: to)
         }
+        switch completion.outcome {
+        case .restartRequired:
+            activationRetryEscalation.recordFailure(
+                activationGeneration: prepared.activationGeneration,
+                signature: ActivationRetryEscalation.signature(for: completion),
+                at: Date()
+            )
+        case .runtimeCurrent, .configuredOnly:
+            activationRetryEscalation.reset()
+        }
+        refreshUnmanagedRuntimeWarnings(force: true)
 
         switch completion.outcome {
         case .runtimeCurrent where recordsSwap:

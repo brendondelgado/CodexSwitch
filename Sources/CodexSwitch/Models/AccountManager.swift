@@ -54,6 +54,7 @@ final class AccountManager {
     var activationNotice: String?
     var uiRefreshRevision: Int = 0
     private(set) var poolAuthorityObservation: PoolAuthorityObservation?
+    private(set) var unmanagedRuntimeWarnings: [CodexUnmanagedRuntime] = []
     private(set) var remoteAuthorityEndpointConfigured = false
     private var retainedPoolAuthorityObservation: PoolAuthorityObservation?
     private var linuxDevboxTelemetryObservedAtByProviderAccountId: [String: Date] = [:]
@@ -359,6 +360,25 @@ final class AccountManager {
     func publishActivationState(_ state: AccountActivationState?) {
         activationState = state
         activationNotice = nil
+    }
+
+    func publishUnmanagedRuntimeWarnings(_ warnings: [CodexUnmanagedRuntime]) {
+        guard warnings != unmanagedRuntimeWarnings else { return }
+        unmanagedRuntimeWarnings = warnings
+        uiRefreshRevision &+= 1
+    }
+
+    /// Unmanaged runtimes that started before `~/.codex/auth.json` was last
+    /// written have not loaded the committed credentials. Runtimes started
+    /// afterwards read the committed file at startup and need no warning.
+    nonisolated static func unmanagedRuntimeWarnings(
+        runtimes: [CodexUnmanagedRuntime],
+        credentialsWrittenAt: Date?
+    ) -> [CodexUnmanagedRuntime] {
+        guard let credentialsWrittenAt else { return [] }
+        return runtimes
+            .filter { $0.startedAt < credentialsWrittenAt }
+            .sorted { $0.pid < $1.pid }
     }
 
     func publishActivationNotice(_ notice: String?) {
