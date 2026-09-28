@@ -4,6 +4,7 @@ mod auth;
 mod bounded_command;
 mod codex_health;
 mod codex_update;
+mod credential_generations;
 mod credential_import_receipts;
 mod daemon;
 mod import;
@@ -19,8 +20,8 @@ mod secure_file;
 mod token_refresh;
 
 use account_store::{
-    active_account, default_store_path, inference_token_expiration, load_account_store_snapshot,
-    load_accounts, lock_account_store, mark_runtime_unusable, quota_availability_at,
+    active_account, default_store_path, load_account_store_snapshot, load_accounts,
+    lock_account_store, mark_runtime_unusable, quota_availability_at,
     ready_automatic_rotation_candidate_count, real_quota_snapshot, resolve_account_selector,
     select_auto_swap_candidate_from_observations, usage_limit_runtime_block_until,
     validate_accounts, CurrentQuotaObservations, QuotaAvailability, QuotaSnapshot, QuotaWindowKind,
@@ -143,6 +144,11 @@ enum Command {
         #[arg(long, value_parser = credential_import_receipts::parse_fingerprint)]
         incoming_fingerprint: String,
     },
+    /// Print this host's newest credential generation per account as JSON.
+    /// The output contains live tokens and is read only by the authenticated
+    /// Mac return path; it performs no provider I/O and no mutation.
+    #[command(name = "credential-generations", hide = true)]
+    CredentialGenerations,
     Status,
     PoolAuthorityStatus {
         #[arg(long)]
@@ -396,6 +402,11 @@ fn main() -> Result<()> {
                 &incoming_fingerprint,
             )?;
             println!("{}", serde_json::to_string(&status)?);
+            Ok(())
+        }
+        Command::CredentialGenerations => {
+            let report = credential_generations::observe(&store_path, &auth_path)?;
+            println!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
         Command::Status => status(&store_path),
@@ -949,19 +960,16 @@ fn merge_token_generation(
     let preserve_current = if incoming.access_token == current.access_token {
         true
     } else {
+        // Same order as the Mac return path: later expiry, then later issue time.
         match (
-            inference_token_expiration(&incoming.access_token),
-            inference_token_expiration(&current.access_token),
+            credential_generations::generation_key(&incoming.access_token),
+            credential_generations::generation_key(&current.access_token),
         ) {
-            (Some(incoming_expiry), Some(current_expiry)) if current_expiry > incoming_expiry => {
-                true
-            }
-            (Some(incoming_expiry), Some(current_expiry)) if current_expiry < incoming_expiry => {
-                false
-            }
+            (Some(incoming_key), Some(current_key)) if current_key > incoming_key => true,
+            (Some(incoming_key), Some(current_key)) if current_key < incoming_key => false,
             (Some(_), Some(_)) => {
                 bail!(
-                    "cannot order divergent credential generations with equal expiry for provider account {}",
+                    "cannot order divergent credential generations with equal expiry and issue time for provider account {}",
                     incoming.account_id
                 )
             }
@@ -6497,7 +6505,36 @@ mod tests {
         )
         .expect_err("equal-expiry divergent generations must be incomparable");
 
-        assert!(error.to_string().contains("equal expiry"));
+        assert!(error.to_string().contains("equal expiry and issue time"));
+    }
+
+    #[test]
+    fn credential_bundle_merge_orders_equal_expiry_by_issue_time() -> Result<()> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let token = |iat: i64| {
+            let claims = serde_json::json!({ "exp": 4_000_000_000_i64, "iat": iat });
+            format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims.to_string()))
+        };
+        let mut current = account("active@example.com", true, 10.0, 10.0);
+        current.access_token = token(1_000);
+        current.refresh_token = "current-refresh".to_string();
+        let mut incoming = current.clone();
+        incoming.access_token = token(2_000);
+        incoming.refresh_token = "incoming-refresh".to_string();
+
+        let merged = merge_authority_preserving_accounts(
+            vec![incoming],
+            std::slice::from_ref(&current),
+            &current.account_id,
+        )?;
+
+        assert_eq!(merged.accounts[0].refresh_token, "incoming-refresh");
+        assert_eq!(
+            merged.selections[0].generation,
+            CredentialGeneration::Incoming
+        );
+        Ok(())
     }
 
     #[test]
