@@ -3491,63 +3491,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    private func finishLinuxDevboxCredentialSyncReconciliation(
-        _ reconciliation: LinuxDevboxCredentialSyncReconciliation,
-        operation: LinuxDevboxCredentialSyncOperation
-    ) {
-        linuxDevboxCredentialSyncReconciliationInFlight = false
-        switch reconciliation {
-        case .committed:
-            UserDefaults.standard.set(
-                operation.credentialFingerprint,
-                forKey: linuxDevboxLastCredentialSyncFingerprintKey
-            )
-            if let receipt = operation.importReceipt,
-               let proof = LinuxDevboxMonitor.credentialConvergenceProof(
-                   credentialFingerprint: operation.credentialFingerprint,
-                   operation: operation,
-                   receipt: receipt
-               ),
-               let encoded = LinuxDevboxMonitor.encodeCredentialConvergenceProof(proof) {
-                UserDefaults.standard.set(
-                    encoded,
-                    forKey: linuxDevboxCredentialConvergenceProofKey
-                )
-            }
-            clearLinuxDevboxCredentialSyncHold()
-            SwapLog.append(.debug(
-                "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=committed"
-            ))
-            scheduleLinuxDevboxCredentialSyncIfNeeded(context: "load-restore")
-        case .safeToRetry:
-            clearLinuxDevboxCredentialSyncHold()
-            let fingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(
-                accounts: accountManager.accounts
-            )
-            scheduleLinuxDevboxCredentialSyncRetry(
-                LinuxDevboxCredentialSyncRetryPlan(
-                    context: "credential-retry-reconciled",
-                    fingerprint: fingerprint,
-                    delay: Self.linuxDevboxCredentialSyncRetryDelay
-                )
-            )
-        case .unresolved(let reason):
-            UserDefaults.standard.set(
-                operation.credentialFingerprint,
-                forKey: linuxDevboxCredentialSyncUnresolvedFingerprintKey
-            )
-            UserDefaults.standard.set(
-                reason,
-                forKey: linuxDevboxCredentialSyncUnresolvedReasonKey
-            )
-            surfaceLinuxDevboxCredentialSyncHold(
-                fingerprint: operation.credentialFingerprint,
-                reason: reason,
-                context: "reconciliation"
-            )
-        }
-    }
-
     private func scheduleLinuxDevboxCredentialSyncRetry(
         _ plan: LinuxDevboxCredentialSyncRetryPlan
     ) {
