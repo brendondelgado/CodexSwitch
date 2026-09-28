@@ -2406,6 +2406,7 @@ where
 /// Runs one manual redemption, waiting a bounded time for pre-submission
 /// contention. Every retry reuses the same request ID and starts from fresh
 /// durable state; nothing is retried after a consume request may have started.
+#[allow(clippy::too_many_arguments)]
 fn redeem_reset_with_contention_wait<F, B, C>(
     store_path: &Path,
     auth_path: &Path,
