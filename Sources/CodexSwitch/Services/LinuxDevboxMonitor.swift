@@ -245,6 +245,25 @@ struct LinuxDevboxCredentialReconciliationBackoff: Equatable, Sendable {
     }
 }
 
+/// A persisted hold is re-surfaced several times per minute from several contexts
+/// (authority polls, readiness checks, receipt reconciliation). Each distinct
+/// hold, context, and reason is logged once until the hold resolves.
+struct LinuxDevboxCredentialSyncHoldLog: Equatable, Sendable {
+    private static let capacity = 64
+    private var logged: Set<String> = []
+
+    mutating func shouldLog(fingerprint: String, context: String, reason: String) -> Bool {
+        if logged.count >= Self.capacity {
+            logged.removeAll()
+        }
+        return logged.insert("\(fingerprint)\u{1F}\(context)\u{1F}\(reason)").inserted
+    }
+
+    mutating func reset() {
+        logged.removeAll()
+    }
+}
+
 /// The credential-sync hold most recently surfaced as the VPS status.
 ///
 /// A persisted hold is re-surfaced by every authority poll, readiness check,
@@ -844,39 +863,6 @@ enum LinuxDevboxCredentialSyncJournalError: Error, Equatable, LocalizedError {
     }
 }
 
-struct LinuxDevboxLegacyCredentialReview: Sendable {
-    let operation: LinuxDevboxCredentialSyncOperation
-    fileprivate let snapshot: SecureAtomicFileTransaction.Snapshot
-    fileprivate let journalPath: String
-
-    var generation: String { snapshot.generation.value }
-    var confirmation: String { "supersede-unknown:\(operation.operationID):\(generation)" }
-}
-
-struct LinuxDevboxLegacySupersessionEvidence: Equatable, Sendable {
-    let operationID: String
-    let targetFingerprint: String
-    let observedAt: Date
-    let authority: PoolAuthorityObservation
-    let credentials: LinuxDevboxCredentialStateEvidence
-    let storeGeneration: String
-    let authGeneration: String
-    let runtimeLeaseNonce: UUID
-    let runtimeLeaseHeld: Bool
-    let oldImporterAbsent: Bool
-    let remoteStageAbsent: Bool
-    let activationBarrierClear: Bool
-    let localSyncQuiesced: Bool
-}
-
-struct LinuxDevboxLegacySupersessionResult: Equatable, Sendable {
-    enum Disposition: String, Sendable { case supersededUnknownOutcome }
-    let disposition: Disposition
-    let operationID: String
-    let backupPath: String
-    let journalGeneration: String
-}
-
 struct LinuxDevboxCredentialSyncJournal: Sendable {
     static let defaultPath = NSString(
         string: "~/.codexswitch/linux-devbox-credential-sync.json"
@@ -908,88 +894,6 @@ struct LinuxDevboxCredentialSyncJournal: Sendable {
                 )
             }
             _ = try lockedFile.replace(try encode(operation), expectedGeneration: current.generation)
-        }
-    }
-
-    func reviewLegacyUnresolved() throws -> LinuxDevboxLegacyCredentialReview {
-        try transaction.withExclusiveLock { lockedFile in
-            let snapshot = try lockedFile.read(allowMissing: false)
-            guard let bytes = snapshot.bytes, bytes.count <= Self.maximumRecordBytes,
-                  let fields = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-                  Set(fields.keys).isSubset(of: Set([
-                      "version", "operationID", "targetFingerprint", "credentialFingerprint",
-                      "expectedAccountIdentityFingerprint", "expectedCredentialSetFingerprint",
-                      "expectedActiveProviderAccountId", "expectedActiveTokenHashPrefix",
-                      "baselineAccountIdentityFingerprint", "baselineCredentialSetFingerprint",
-                      "baselineActiveProviderAccountId", "baselineActiveTokenHashPrefix",
-                      "baselineAuthMatchesActiveStoreToken", "localDirectory", "remoteDirectory",
-                      "createdAt", "phase", "reason", "importReceipt",
-                  ])) else {
-                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy review refuses oversized or unknown journal fields")
-            }
-            guard let operation = try decode(snapshot.bytes),
-                  operation.phase == .unresolved, operation.importReceipt == nil else {
-                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("only unresolved receipt-less operations can be superseded")
-            }
-            return LinuxDevboxLegacyCredentialReview(
-                operation: operation, snapshot: snapshot, journalPath: transaction.path
-            )
-        }
-    }
-
-    /// The caller must keep its real remote guard alive through this entire synchronous call.
-    func supersedeLegacyUnresolved(
-        review: LinuxDevboxLegacyCredentialReview,
-        confirmation: String,
-        temporaryDirectory: URL = FileManager.default.temporaryDirectory,
-        now: () -> Date = Date.init,
-        revalidateRemoteGuard: () throws -> LinuxDevboxLegacySupersessionEvidence
-    ) throws -> LinuxDevboxLegacySupersessionResult {
-        guard confirmation == review.confirmation, review.journalPath == transaction.path,
-              LinuxDevboxMonitor.credentialSyncOwnsLocalStagePath(
-                  operation: review.operation, temporaryDirectory: temporaryDirectory
-              ) else {
-            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("explicit legacy review or staging ownership does not match")
-        }
-        return try transaction.withExclusiveLock { lockedFile in
-            let current = try lockedFile.read(allowMissing: false)
-            guard current == review.snapshot, let bytes = current.bytes else {
-                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy journal generation or identity changed")
-            }
-            let before = try revalidateRemoteGuard()
-            guard LinuxDevboxMonitor.legacyCredentialSupersessionEligible(
-                operation: review.operation, evidence: before, now: now()
-            ), LinuxDevboxMonitor.legacyCredentialStageIsAbsent(review.operation.localDirectory) else {
-                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy supersession lacks fresh quiescent evidence")
-            }
-            let backupPath = transaction.path + ".legacy-unresolved-backup.json"
-            let backup = SecureAtomicFileTransaction(path: backupPath, subject: "unresolved legacy credential journal backup")
-            try backup.withExclusiveLock { backupFile in
-                let existing = try backupFile.read()
-                if let existingBytes = existing.bytes {
-                    guard existingBytes == bytes else {
-                        throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy backup slot already belongs to another journal generation")
-                    }
-                } else {
-                    _ = try backupFile.replace(bytes, expectedGeneration: existing.generation)
-                }
-                let after = try revalidateRemoteGuard()
-                guard LinuxDevboxMonitor.legacyCredentialSupersessionEligible(
-                    operation: review.operation, evidence: after, now: now()
-                ), LinuxDevboxMonitor.legacySupersessionGuardUnchanged(before, after),
-                   LinuxDevboxMonitor.legacyCredentialStageIsAbsent(review.operation.localDirectory),
-                   try backupFile.read().bytes == bytes,
-                   try lockedFile.read() == review.snapshot else {
-                    throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy supersession guard changed; backup retained and journal not retired")
-                }
-                _ = try lockedFile.remove(expectedGeneration: review.snapshot.generation)
-            }
-            return LinuxDevboxLegacySupersessionResult(
-                disposition: .supersededUnknownOutcome,
-                operationID: review.operation.operationID,
-                backupPath: backupPath,
-                journalGeneration: review.generation
-            )
         }
     }
 
@@ -1216,12 +1120,6 @@ struct LinuxDevboxCredentialSyncJournal: Sendable {
     }
 }
 
-enum LinuxDevboxCredentialSyncReconciliation: Equatable, Sendable {
-    case committed
-    case safeToRetry
-    case unresolved(String)
-}
-
 struct LinuxDevboxCredentialImportStatus: Equatable, Sendable {
     enum State: String, Decodable, Sendable {
         case missing
@@ -1245,57 +1143,12 @@ struct LinuxDevboxUnrecoverableCredentialSyncSupersession: Equatable, Sendable {
 // Historical completion must not enter AppDelegate's current-convergence cache path.
 enum LinuxDevboxCredentialReceiptRecovery: Equatable, Sendable {
     case completed(receipt: LinuxDevboxCredentialImportReceipt, matchesCurrentEvidence: Bool)
-    /// The receipt-aware VPS proved no receipt or intent exists, the operation is older than
-    /// the supersession bound, and neither its stage nor its importer exists.
+    /// The held operation can never execute again: see `unrecoverableCredentialSyncSupersession`.
     case supersedable(LinuxDevboxUnrecoverableCredentialSyncSupersession)
     case unresolved(String)
 }
 
 enum LinuxDevboxMonitor {
-    static func legacyCredentialStageIsAbsent(_ path: String) -> Bool {
-        var metadata = stat()
-        return lstat(path, &metadata) != 0 && errno == ENOENT
-    }
-
-    static func legacyCredentialSupersessionEligible(
-        operation: LinuxDevboxCredentialSyncOperation,
-        evidence: LinuxDevboxLegacySupersessionEvidence,
-        now: Date
-    ) -> Bool {
-        let age = now.timeIntervalSince(evidence.observedAt)
-        let authorityAge = now.timeIntervalSince(evidence.authority.observedAt)
-        return operation.phase == .unresolved && operation.importReceipt == nil
-            && operation.createdAt < evidence.observedAt
-            && evidence.operationID == operation.operationID
-            && evidence.targetFingerprint == operation.targetFingerprint
-            && age.isFinite && age >= 0 && age <= 10
-            && authorityAge.isFinite && authorityAge >= 0 && authorityAge <= 10
-            && evidence.authority.phase == .stable
-            && evidence.authority.desiredProviderAccountId == evidence.credentials.activeProviderAccountId
-            && evidence.credentials.authMatchesActiveStoreToken
-            && isLowercaseHex(evidence.storeGeneration, count: 64)
-            && isLowercaseHex(evidence.authGeneration, count: 64)
-            && isLowercaseHex(evidence.credentials.credentialSetFingerprint, count: 64)
-            && isLowercaseHex(evidence.credentials.accountIdentityFingerprint, count: 64)
-            && isLowercaseHex(evidence.credentials.activeTokenHashPrefix, count: 12)
-            && evidence.runtimeLeaseHeld && evidence.oldImporterAbsent
-            && evidence.remoteStageAbsent && evidence.activationBarrierClear && evidence.localSyncQuiesced
-    }
-
-    static func legacySupersessionGuardUnchanged(
-        _ before: LinuxDevboxLegacySupersessionEvidence,
-        _ after: LinuxDevboxLegacySupersessionEvidence
-    ) -> Bool {
-        before.operationID == after.operationID && before.targetFingerprint == after.targetFingerprint
-            && before.runtimeLeaseNonce == after.runtimeLeaseNonce
-            && before.authority.epoch == after.authority.epoch
-            && before.authority.requestId == after.authority.requestId
-            && before.authority.desiredProviderAccountId == after.authority.desiredProviderAccountId
-            && before.credentials == after.credentials
-            && before.storeGeneration == after.storeGeneration && before.authGeneration == after.authGeneration
-            && after.observedAt >= before.observedAt
-    }
-
     static let remoteCodexSwitchCLI =
         #"/usr/bin/flock --shared --no-fork "$HOME/.local/share/codexswitch/runtime-start-install.lock" "$HOME/.local/share/codexswitch/current/codexswitch-cli""#
     static let maximumRemoteProviderAccountIdBytes = 256
@@ -1733,36 +1586,6 @@ enum LinuxDevboxMonitor {
             createdAt: createdAt,
             reason: "Credential sync may have started; reconciliation is required after interruption"
         ))
-    }
-
-    static func credentialSyncReconciliation(
-        operation: LinuxDevboxCredentialSyncOperation,
-        remoteStageAbsent: Bool,
-        observed: LinuxDevboxCredentialStateEvidence?
-    ) -> LinuxDevboxCredentialSyncReconciliation {
-        guard remoteStageAbsent else {
-            return .unresolved("Private remote credential staging still exists at \(operation.remoteDirectory)")
-        }
-        guard let observed else {
-            return .unresolved("Remote credential-state evidence is unavailable")
-        }
-        if let receipt = operation.importReceipt {
-            guard credentialImportReceiptMatchesOperation(receipt, operation: operation) else {
-                return .unresolved("Recorded credential import receipt is invalid")
-            }
-            return observed == receipt.committedEvidence
-                ? .committed
-                : .unresolved(
-                    "Remote credential state does not match the recorded import receipt"
-                )
-        }
-        if observed == operation.expected {
-            return .committed
-        }
-        if observed == operation.baseline {
-            return .safeToRetry
-        }
-        return .unresolved("Remote credential state does not match the pre-mutation baseline and no import receipt was recorded")
     }
 
     static func credentialSyncOwnsLocalStagePath(
@@ -3222,8 +3045,7 @@ enum LinuxDevboxMonitor {
                 ? "Linux devbox credential update failed with status \(importResult.terminationStatus)"
                 : message
             if importOutcome.executionState != .notStarted,
-               completedCredentialImportFailureDisposition(importResult.terminationStatus)
-                == .outcomeUnknown {
+               isCredentialMutationSignalStatus(importResult.terminationStatus) {
                 return .failure(LinuxDevboxMonitorFailure(
                     message: "\(detail); signal interrupted the remote mutation and its outcome is unknown",
                     credentialSyncDisposition: .outcomeUnknown
@@ -3238,9 +3060,9 @@ enum LinuxDevboxMonitor {
                     disposition: .retryablePreExecution
                 ))
             case .completed:
-                return .failure(LinuxDevboxMonitorFailure(
-                    message: "\(detail); credential import receipt reconciliation is required",
-                    credentialSyncDisposition: .outcomeUnknown
+                return .failure(completedCredentialImportFailure(
+                    detail: detail,
+                    status: fetchCredentialImportStatus(settings: settings, operation: operation)
                 ))
             case .unknown:
                 return .failure(LinuxDevboxMonitorFailure(
@@ -3257,10 +3079,23 @@ enum LinuxDevboxMonitor {
         status == 129 || status == 130 || status == 143
     }
 
-    static func completedCredentialImportFailureDisposition(
-        _ status: Int32
-    ) -> CredentialSyncFailureDisposition {
-        isCredentialMutationSignalStatus(status) ? .outcomeUnknown : .rejected
+    /// An importer changes credentials only after persisting its intent. A `missing`
+    /// status read after the import command's own completed nonzero exit therefore
+    /// proves this operation changed nothing: it is a rejection, not a hold.
+    static func completedCredentialImportFailure(
+        detail: String,
+        status: Result<LinuxDevboxCredentialImportStatus, LinuxDevboxMonitorFailure>
+    ) -> LinuxDevboxMonitorFailure {
+        if case .success(let observed) = status, observed.status == .missing {
+            return LinuxDevboxMonitorFailure(
+                message: "\(detail); the VPS recorded no import intent, so no credentials changed",
+                credentialSyncDisposition: .rejected
+            )
+        }
+        return LinuxDevboxMonitorFailure(
+            message: "\(detail); credential import receipt reconciliation is required",
+            credentialSyncDisposition: .outcomeUnknown
+        )
     }
 
     static func credentialSyncHoldReason(
@@ -3599,9 +3434,10 @@ enum LinuxDevboxMonitor {
             return .unresolved("Private remote credential staging is not proven absent")
         }
         if status.operationId.uuidString.lowercased() == operation.operationID,
-           status.status == .missing {
+           status.status == .missing || status.status == .pending {
             return unrecoverableCredentialSyncSupersession(
                 operation: operation,
+                remoteStatus: status.status,
                 remoteImporterAbsent: remoteImporterAbsent,
                 observed: observed,
                 now: now
@@ -3619,20 +3455,24 @@ enum LinuxDevboxMonitor {
         return .completed(receipt: receipt, matchesCurrentEvidence: observed == receipt.committedEvidence)
     }
 
-    /// `missing` never proves non-execution, so supersession never claims an outcome. It
-    /// only proves the held operation can no longer run: no receipt or intent exists on the
-    /// receipt-aware VPS, the bundle expired long ago, and stage plus importer are absent.
+    /// Neither `missing` nor `pending` proves what the operation did, so supersession never
+    /// claims an outcome. It only proves the held operation can no longer run: stage and
+    /// importer are absent, and either no intent exists and the bundle expired long ago
+    /// (`missing`), or the intent's recorded ID already rejects any replay (`pending`).
     static func unrecoverableCredentialSyncSupersession(
         operation: LinuxDevboxCredentialSyncOperation,
+        remoteStatus: LinuxDevboxCredentialImportStatus.State,
         remoteImporterAbsent: Bool,
         observed: LinuxDevboxCredentialStateEvidence?,
         now: Date
     ) -> LinuxDevboxCredentialReceiptRecovery {
-        guard operation.phase == .unresolved, operation.importReceipt == nil else {
+        guard operation.phase == .unresolved, operation.importReceipt == nil,
+              remoteStatus != .completed else {
             return .unresolved("No completed operation-bound historical receipt; reviewed recovery is required")
         }
         let age = now.timeIntervalSince(operation.createdAt)
-        guard age.isFinite, age >= unrecoverableCredentialSyncSupersessionAge else {
+        guard remoteStatus == .pending
+                || (age.isFinite && age >= unrecoverableCredentialSyncSupersessionAge) else {
             return .unresolved(
                 "No historical receipt exists; supersession is allowed once the operation is 24 hours old"
             )
@@ -3673,7 +3513,26 @@ enum LinuxDevboxMonitor {
         "\(remoteCodexSwitchCLI) credential-import-status --operation-id \(shellQuote(operation.operationID)) --baseline-fingerprint \(shellQuote(operation.baselineCredentialSetFingerprint)) --incoming-fingerprint \(shellQuote(operation.expectedCredentialSetFingerprint))"
     }
 
-    /// Additive integration point: persist history before the caller retires its held operation.
+    static func fetchCredentialImportStatus(
+        settings: LinuxDevboxMonitorSettings,
+        operation: LinuxDevboxCredentialSyncOperation
+    ) -> Result<LinuxDevboxCredentialImportStatus, LinuxDevboxMonitorFailure> {
+        let result = runSSH(
+            settings: settings,
+            remoteCommand: remoteCredentialImportStatusCommand(operation: operation),
+            timeout: 15,
+            retryPolicy: .readOnly
+        )
+        guard !result.timedOut, result.terminationStatus == 0 else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Historical credential receipt unavailable; no import was replayed",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
+        return decodeCredentialImportStatus(output: result.stdoutString, operation: operation)
+    }
+
+    /// Persists history before the caller retires its held operation.
     static func recoverCredentialSyncReceipt(
         settings: LinuxDevboxMonitorSettings,
         operation: LinuxDevboxCredentialSyncOperation,
@@ -3699,21 +3558,12 @@ enum LinuxDevboxMonitor {
         guard !stage.timedOut, stage.terminationStatus == 0 else {
             return .unresolved("Private remote credential staging is not proven absent")
         }
-        let result = runSSH(
-            settings: settings,
-            remoteCommand: remoteCredentialImportStatusCommand(operation: operation),
-            timeout: 15,
-            retryPolicy: .readOnly
-        )
-        guard !result.timedOut, result.terminationStatus == 0 else {
-            return .unresolved("Historical credential receipt unavailable; no import was replayed")
-        }
-        switch decodeCredentialImportStatus(output: result.stdoutString, operation: operation) {
+        switch fetchCredentialImportStatus(settings: settings, operation: operation) {
         case .failure(let failure):
             return .unresolved(failure.message)
         case .success(let status):
             var importerAbsent = false
-            if status.status == .missing,
+            if status.status != .completed,
                let importerProbe = remoteCredentialImporterAbsenceCommand(operation: operation) {
                 let importer = runSSH(
                     settings: settings,
@@ -3741,53 +3591,6 @@ enum LinuxDevboxMonitor {
             }
             return recovery
         }
-    }
-
-    static func reconcileCredentialSync(
-        settings: LinuxDevboxMonitorSettings,
-        operation: LinuxDevboxCredentialSyncOperation
-    ) -> LinuxDevboxCredentialSyncReconciliation {
-        guard credentialSyncTargetFingerprint(settings: settings) == operation.targetFingerprint else {
-            return .unresolved("Configured Linux devbox target changed while credential sync was pending")
-        }
-        guard credentialSyncOwnsLocalStagePath(operation: operation) else {
-            return .unresolved("Credential sync local staging path is not operation-owned")
-        }
-        if let cleanupFailure = cleanupLocalCredentialStage(
-            at: URL(fileURLWithPath: operation.localDirectory, isDirectory: true)
-        ) {
-            return .unresolved(cleanupFailure)
-        }
-
-        let stageResult = runSSH(
-            settings: settings,
-            remoteCommand: remoteCredentialStageAbsenceCommand(
-                remoteDirectory: operation.remoteDirectory
-            ),
-            timeout: 15,
-            retryPolicy: .readOnly
-        )
-        guard !stageResult.timedOut, stageResult.terminationStatus == 0 else {
-            if stageResult.terminationStatus == 75 {
-                return .unresolved(
-                    "Private remote credential staging still exists at \(operation.remoteDirectory)"
-                )
-            }
-            return .unresolved("Remote credential staging could not be inspected")
-        }
-
-        let observed: LinuxDevboxCredentialStateEvidence?
-        switch captureCredentialStateEvidence(settings: settings) {
-        case .success(let evidence):
-            observed = evidence
-        case .failure:
-            return .unresolved("Remote credential-state evidence could not be collected")
-        }
-        return credentialSyncReconciliation(
-            operation: operation,
-            remoteStageAbsent: true,
-            observed: observed
-        )
     }
 
     static func decodeAccountStates(data: Data) throws -> [LinuxDevboxAccountState] {

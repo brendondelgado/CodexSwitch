@@ -7,7 +7,6 @@ toc:
   - Mac Recovery
   - Legacy Supersession
   - Integration And Verification
-  - Original Caller Sketch
   - Upgrade Compatibility
   - Explicit Legacy Supersession
 cross_dependencies:
@@ -21,7 +20,7 @@ version_control:
   branch: codex/vps-reliability-20260924
   base_commit: 7f60ba3c691ea9bafe91df66f0b8abc266a769b6
   status: verified-mac-installed-vps-protocol-not-deployed
-  last_updated: 2026-09-24
+  last_updated: 2026-09-28
 ---
 
 # Contract
@@ -48,11 +47,22 @@ Rejection before intent persistence remains `missing`, not a durable rejection
 receipt; Mac conservatively holds it for review. A future explicit non-execution
 receipt must also guard against an outstanding original import process.
 
-Under the runtime activation lease, reject duplicate operations and unresolved
-intents before any activation reconciliation. Persist an intent before replacing
-accounts; publish completed only after the existing activation outcome is
-confirmed. Persist completed before printing the success response. A lost SSH
-reply is recoverable from the completed record even after later rotation.
+Under the runtime activation lease, reject duplicate operations before any
+activation reconciliation. Persist an intent before replacing accounts.
+
+Update 2026-09-28: publish completed as soon as the store and auth files are
+committed and read back, not after runtime confirmation. The receipt attests
+the credential effect; runtime convergence belongs to the activation barrier.
+The original rule turned a committed import whose runtime reload could not
+confirm (the VPS had zero app-servers during a release activation) into a
+permanent `pending` record, a nonzero exit, and a Mac hold, although the
+credentials were durably committed. The importer now prints the completed
+receipt and exits 0 while reporting pending runtime convergence on stderr.
+Pending intents of other operations no longer block new imports: under the
+exclusive runtime lease their importer has ended, their IDs still reject replay,
+and the monotonic merge keeps later imports safe. Persist completed before
+printing the success response. A lost SSH reply is recoverable from the
+completed record even after later rotation.
 
 The read-only `credential-import-status` command requires operation UUID,
 baseline fingerprint and incoming fingerprint. It returns a strict versioned
@@ -63,8 +73,11 @@ Reissuing update-bundle with an existing operation cannot mutate again; callers
 must use status to replay. Even an expired bundle is unnecessary for status.
 
 Crash after intent but before completed is intentionally pending, including a
-crash after actual convergence but before completion persistence. Do not infer
-its historical outcome from a current matching store. Automatic crash recovery
+crash after the credential commit but before completion persistence. Do not
+infer its historical outcome from a current matching store. Since 2026-09-28 the
+Mac supersedes such a `pending` operation (outcome unknown) once its importer and
+staging are absent, then re-baselines with a fresh operation; see
+`../architecture/runtime-and-host-ownership.md`. Automatic crash recovery
 would require activation-journal operation binding outside this workstream.
 
 Retention is bounded to 1024 operations and 8 MiB, with individual receipts at
@@ -83,7 +96,10 @@ the old local fingerprint synchronized. Fresh sync must start with a fresh
 operation and current baseline/authority observation. Persist a recovered receipt
 with the existing operation-CAS journal API before releasing the old hold.
 
-Missing/pending/unsupported status never proves non-execution. Legacy exact
+Missing/pending/unsupported status never proves non-execution of a held
+operation. The one exception is observed directly by the caller: a `missing`
+status read right after the import command's own completed nonzero exit proves
+that importer finished without an intent, so it is a rejection, not a hold. Legacy exact
 current-state checks remain available separately, but are not historical proof.
 Reject unknown fields, malformed states, mismatched UUID/baseline/incoming,
 wrong target, staging remnants, and conflicting local/remote receipts.
@@ -103,8 +119,7 @@ Do not auto-clear it or label it successful. Explicit reviewed supersession must
 bind the full local journal generation, target,
 current authority epoch, store/auth generations, incoming snapshot and absent
 staging, then revalidate under the appropriate local/remote mutation leases.
-The new operator-only local eligibility/backup/CAS API is documented below.
-The separate operator workflow now provides a lease-keeping authenticated SSH
+The separate operator workflow provides a lease-keeping authenticated SSH
 adapter, private backup and exact-generation retirement. It passed 39 offline
 fixtures and independent process-scan review. Live supersession remains gated on
 the fresh attested release and an authenticated read-only review under approved
@@ -127,7 +142,7 @@ release is active, so full credential-pool syncing is not restored yet.
 The installed Mac changes are in the separate Mac recovery worktree and are not
 part of this Linux release branch; the installed dirty-source identifier above
 must not be confused with committed-main Mac behavior.
-The original coordination notes and sketch below are historical, not the current
+The original coordination notes below are historical, not the current
 caller implementation. The implementation in `AppDelegate.swift` is authoritative.
 
 Exclusive edits: Rust main/new receipt module/tests; Swift LinuxDevboxMonitor
@@ -173,89 +188,6 @@ tests) plus existing `LinuxDevboxMonitorTests` and credential convergence tests.
 Do not run the live recovery APIs as fixtures. The Mac caller remains unapplied
 by this owner so James can integrate it without overlapping writes.
 
-# Original Caller Sketch
-
-Superseded by Main's integrated caller and the subsequent stale-publication guard.
-This original handoff sketch omits that guard and must not be used as deployment
-code. See the current integration status above.
-
-Requested edit, not applied by this owner: replace only
-`reconcileLinuxDevboxCredentialSyncIfNeeded(operation:settings:)` with the body
-below in the Mac worktree. Keep the existing finish helper for unrelated callers.
-The new journal `clearRecoveredImport` checks the entire held operation including
-its receipt under the exclusive lock and removes with file-generation CAS; a
-same-ID record modified during recovery fails closed. Both current-equal and
-drifted historical completion invalidate caches and require fresh convergence.
-Missing/pending/unsupported status does NOT fall back to a current-state guess.
-If James already has a recovery-generation token, also bind this closure to it.
-
-P2 follow-up for main: both the `.unresolved` publication and the
-clearRecoveredImport-failure publication must use
-`journal.withCurrentRecoveryOperation(operation:receipt:body:)`. For the clear
-failure supply the recovered receipt; for unresolved supply no additional
-receipt. It compares the full expected operation while holding the exclusive
-journal lock and runs the synchronous publication body only on exact match.
-False or thrown read failures must not publish an obsolete hold. No nested
-journal calls or asynchronous work are allowed in the body. The original hunk
-below predates this integration requirement; main owns those two caller edits.
-
-```swift
-private func reconcileLinuxDevboxCredentialSyncIfNeeded(
-    operation: LinuxDevboxCredentialSyncOperation,
-    settings: LinuxDevboxMonitorSettings
-) {
-    guard !linuxDevboxCredentialSyncInFlight,
-          !linuxDevboxCredentialSyncReconciliationInFlight else { return }
-    linuxDevboxCredentialSyncReconciliationInFlight = true
-    let journal = linuxDevboxCredentialSyncJournal
-    let finish: @MainActor @Sendable (LinuxDevboxCredentialReceiptRecovery) -> Void = { [weak self] recovery in
-        guard let self else { return }
-        self.linuxDevboxCredentialSyncReconciliationInFlight = false
-        guard LinuxDevboxMonitor.settings() == settings else { return }
-        switch recovery {
-        case .completed(let receipt, _):
-            do {
-                try journal.clearRecoveredImport(operation: operation, receipt: receipt)
-            } catch {
-                self.surfaceLinuxDevboxCredentialSyncHold(
-                    operation: operation, context: "historical-receipt-journal-changed"
-                )
-                return
-            }
-            UserDefaults.standard.removeObject(forKey: linuxDevboxLastCredentialSyncFingerprintKey)
-            UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialConvergenceProofKey)
-            self.clearLegacyLinuxDevboxCredentialSyncHold()
-            SwapLog.append(.debug(
-                "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=historical_completed_requires_fresh_convergence"
-            ))
-            self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "authority-reconciliation")
-        case .unresolved(let reason):
-            // Preserve the durable journal; transient observation failures need not rewrite it.
-            self.surfaceLinuxDevboxCredentialSyncHold(
-                fingerprint: operation.credentialFingerprint,
-                reason: reason,
-                context: "historical-receipt-reconciliation"
-            )
-        }
-    }
-    Task.detached {
-        let recovery = LinuxDevboxMonitor.recoverCredentialSyncReceipt(
-            settings: settings,
-            operation: operation,
-            recordImportReceipt: { receipt in
-                try journal.recordImportReceipt(operationID: operation.operationID, receipt: receipt)
-            }
-        )
-        await finish(recovery)
-    }
-}
-```
-
-Legacy recovery is deliberately not included in this hunk. Main/James must review
-supersession separately with a fresh authority/store/auth observation and local
-journal-generation guard. The reported live runtime repair and subsequent daemon
-rotation do not establish what the September 9 credential import did.
-
 # Upgrade Compatibility
 
 Mac operation preparation now performs a read-only help capability probe before
@@ -268,55 +200,9 @@ These gates do not authorize runtime activation while work is active.
 
 # Explicit Legacy Supersession
 
-Separate local API, not historical receipt recovery: review the exact unresolved,
-receipt-less journal snapshot (bytes, content generation, file identity, path).
-Require the operator's operation-and-generation-specific confirmation. Pure
-eligibility requires a stable fresh authority target matching current store/auth
-evidence, SHA-256 store/auth generations, cleared activation barrier, absent
-operation staging and importer processes, and a continuously held runtime lease.
-Revalidate immediately before backup and again before compare-and-delete. Epoch,
-request ID, credentials, file generations and lease nonce must not change.
-
-One fixed adjacent private backup slot retains the old unresolved journal
-byte-for-byte. A different existing backup is never overwritten. Backup failure,
-guard loss, stale evidence, changed journal, receipt arrival or staging remnants
-leave the hold intact. Only after durable backup/readback may exact-generation
-CAS retire the old journal. Result is `supersededUnknownOutcome`, never completed
-or converged. No cached success or credential files are written by this API.
-
-Concrete live adapter prerequisites on the existing 7f60 release:
-
-1. Main must stop the CodexSwitch primary in the approved window so the operator
-   can hold its existing singleton lock, quiesce sync/reconciliation submissions,
-   and reject remaining import processes before reading the local review.
-   This does not require stopping the user's ChatGPT desktop or local app-server.
-2. An operator-approved authenticated SSH session must hold the EXISTING remote
-   account-store runtime lock, accounts.runtime-activation.lock, exclusively and
-   nonblocking for the entire local backup/CAS call. Validate owned regular lock
-   inode with no-follow; do not unlink/recreate it. Keep the shared runtime
-   start/install lock too, preserving release routing. Never hold the store lock
-   while invoking CLI status commands that may need it.
-3. Under that lease, inspect all owned process identities/argv/start times to
-   exclude this operation's update-bundle importer and staging shell (including
-   an importer between decryption and lease acquisition), prove its exact remote
-   stage absent with no-follow checks, and read authority/store/auth/barrier
-   without writing or refreshing. Freeze new submissions until local retirement
-   returns. Recheck the process set, lock inode/owner and stage on each challenge.
-4. Supply two fresh token-free observations from the same still-live lease nonce
-   to the injected revalidation callback. A completed `flock -n ... true` probe,
-   stale doctor report, stage absence alone, or booleans typed from memory are
-   NOT valid evidence. On SSH/lease loss the callback must throw.
-5. After successful local retirement, release the remote guard. Main separately
-   invalidates stale sync caches and lets normal authority-based observation run.
-   On old 7f60, a new import remains upgrade-deferred by the capability gate.
-
-The local eligibility/backup/CAS API is testable without network or credentials.
-The separate operator script now supplies the real lease-keeping SSH adapter,
-but it has not been applied live. Its authenticated read-only review must pass
-under the continuously held real guards before apply. Passing synthetic fixture
-evidence to retire the September 9 journal is explicitly unsafe.
-
-Additional Swift fixtures now include two upgrade-capability tests, five legacy
-supersession tests, and two guarded publication tests. `git diff --check` passes;
-all Swift compilation/tests remain reserved for main's integrated run. No live
-recovery, provider calls, Cargo jobs or Swift builds were performed by this owner.
+Removed 2026-09-28. The Swift operator-only review/backup/CAS API described
+here was never called by the app; `scripts/recover-legacy-credential-sync.py`
+implements its own adapter, and automatic supersession (see Legacy
+Supersession) retired the September 9 hold at 2026-09-28T06:04:24Z. The
+operator script remains for receipt-less holds on hosts that cannot run
+`credential-import-status`.

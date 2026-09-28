@@ -588,7 +588,7 @@ fn import_accounts(
         bail!("an import receipt requires runtime convergence");
     }
     let imported_accounts = prepare_import_bundle(bundle, ignore_expiry)?;
-    let (account_count, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
+    let import = replace_import_accounts_with_unlocked_reload(
         store_path,
         auth_path,
         imported_accounts,
@@ -598,24 +598,58 @@ fn import_accounts(
         !offline_file_only,
         &reload_codex_hot_swap_processes,
     )?;
-    require_rotation_activation(outcome, !offline_file_only)?;
-    if let Some(receipt) = receipt {
+    if let Some(receipt) = import.committed_receipt {
+        // The receipt attests the durable credential commit. Runtime convergence
+        // is the activation barrier's separate job, which the daemon retries.
+        if let Err(error) = import.runtime.and_then(require_confirmed_activation) {
+            eprintln!("credentials committed; runtime convergence remains pending: {error:#}");
+        }
         println!("{}", serde_json::to_string(&receipt)?);
-    } else if offline_file_only {
+        return Ok(());
+    }
+    require_rotation_activation(import.runtime?, !offline_file_only)?;
+    if offline_file_only {
         println!(
             "Prepared {} account(s) in file-only mode; runtime convergence is pending for {}",
-            account_count,
+            import.account_count,
             auth_path.display()
         );
     } else {
         println!(
             "{} {} account(s); active account written to {}",
             verb,
-            account_count,
+            import.account_count,
             auth_path.display()
         );
     }
     Ok(())
+}
+
+struct ImportCommit {
+    account_count: usize,
+    /// Present only for a receipt-bound import whose credential files were
+    /// durably committed and whose receipt was recorded as completed.
+    committed_receipt: Option<CredentialImportReceipt>,
+    runtime: Result<ActivationOutcome>,
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn import_authority_target(_: &RuntimeActivationLease, _: &Path) -> Result<String> {
+    let status = remote_authority::fetch_status()?;
+    remote_authority::validate_adoptable_status(&status)?;
+    Ok(status.desired_provider_account_id)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn import_authority_target(
+    runtime_lease: &RuntimeActivationLease,
+    store_path: &Path,
+) -> Result<String> {
+    let snapshot = load_account_store_snapshot(store_path)?;
+    let mut authority = PoolAuthorityLock::acquire_under_runtime_lease(runtime_lease, store_path)?;
+    Ok(authority
+        .bootstrap_from_active(&snapshot.accounts)?
+        .desired_provider_account_id)
 }
 
 fn replace_import_accounts_with_unlocked_reload<R>(
@@ -627,7 +661,7 @@ fn replace_import_accounts_with_unlocked_reload<R>(
     receipt_baseline_fingerprint: Option<&str>,
     reload_enabled: bool,
     reload: &R,
-) -> Result<(usize, ActivationOutcome, Option<CredentialImportReceipt>)>
+) -> Result<ImportCommit>
 where
     R: Fn(&Path) -> Result<ReloadSummary>,
 {
@@ -666,27 +700,9 @@ where
             .context("import is blocked by unresolved prior runtime convergence")?;
     }
 
-    let authority_target = if preserve_active {
-        #[cfg(target_os = "macos")]
-        {
-            let status = remote_authority::fetch_status()?;
-            remote_authority::validate_adoptable_status(&status)?;
-            Some(status.desired_provider_account_id)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let snapshot = load_account_store_snapshot(store_path)?;
-            let mut authority =
-                PoolAuthorityLock::acquire_under_runtime_lease(&runtime_lease, store_path)?;
-            Some(
-                authority
-                    .bootstrap_from_active(&snapshot.accounts)?
-                    .desired_provider_account_id,
-            )
-        }
-    } else {
-        None
-    };
+    let authority_target = preserve_active
+        .then(|| import_authority_target(&runtime_lease, store_path))
+        .transpose()?;
 
     let (account_count, prepared, receipt) = {
         let store_lock = lock_account_store(store_path)?;
@@ -744,28 +760,42 @@ where
         (account_count, outcome, receipt)
     };
 
-    if !reload_enabled || !prepared.is_file_only() {
-        if prepared.is_confirmed() {
-            if let (Some(journal), Some(receipt)) = (receipt_journal.as_mut(), receipt.as_ref()) {
-                journal.complete(receipt)?;
-            }
-        }
-        return Ok((account_count, prepared, receipt));
+    // `FileOnly` means the store and auth files were committed and read back.
+    // Any other preparation outcome left the receipt pending: its credential
+    // effect is not proven, so the caller holds the operation for reconciliation.
+    if !prepared.is_file_only() {
+        return Ok(ImportCommit {
+            account_count,
+            committed_receipt: None,
+            runtime: Ok(prepared),
+        });
     }
-    let outcome = reconcile_activation_barrier_unlocked_under_runtime_lease(
-        &runtime_lease,
-        store_path,
-        auth_path,
-        true,
-        reload,
-    )?
-    .context("import activation disappeared before runtime convergence")?;
-    if outcome.is_confirmed() {
-        if let (Some(journal), Some(receipt)) = (receipt_journal.as_mut(), receipt.as_ref()) {
-            journal.complete(receipt)?;
+    let committed_receipt = match (receipt_journal.as_mut(), receipt) {
+        (Some(journal), Some(receipt)) => {
+            journal.complete(&receipt)?;
+            Some(receipt)
         }
-    }
-    Ok((account_count, outcome, receipt))
+        _ => None,
+    };
+    let runtime = if reload_enabled {
+        reconcile_activation_barrier_unlocked_under_runtime_lease(
+            &runtime_lease,
+            store_path,
+            auth_path,
+            true,
+            reload,
+        )
+        .and_then(|outcome| {
+            outcome.context("import activation disappeared before runtime convergence")
+        })
+    } else {
+        Ok(prepared)
+    };
+    Ok(ImportCommit {
+        account_count,
+        committed_receipt,
+        runtime,
+    })
 }
 
 fn merge_authority_preserving_accounts(
@@ -3006,7 +3036,7 @@ where
         next_token_fingerprint,
         auth_path: auth_path.display().to_string(),
         activation_state: adoption.activation_state,
-        runtime_converged: adoption.reload.verified_hot_swap(),
+        runtime_converged: adoption.reload.runtime_converged(),
         reload_attempted: adoption.reload_attempted,
         topology_verified: adoption.reload.topology_verified,
         request_count: adoption.reload.generated_request_nonces.len(),
@@ -3514,7 +3544,7 @@ where
                         next_token_fingerprint,
                         auth_path: auth_path.display().to_string(),
                         activation_state,
-                        runtime_converged: summary.verified_hot_swap(),
+                        runtime_converged: summary.runtime_converged(),
                         reload_attempted: reload_processes,
                         topology_verified: summary.topology_verified,
                         request_count: summary.generated_request_nonces.len(),
@@ -3628,7 +3658,7 @@ where
         authority.mark_degraded(&detail)?;
         return Err(error).context("rotate-now pool authority remains degraded");
     }
-    if summary.verified_hot_swap() {
+    if summary.runtime_converged() {
         authority.mark_stable()?;
     } else {
         authority.mark_degraded("VPS rotate-now completed without live runtime convergence")?;
@@ -3661,7 +3691,7 @@ where
         next_token_fingerprint,
         auth_path: auth_path.display().to_string(),
         activation_state,
-        runtime_converged: summary.verified_hot_swap(),
+        runtime_converged: summary.runtime_converged(),
         reload_attempted: reload_processes,
         topology_verified: summary.topology_verified,
         request_count: summary.generated_request_nonces.len(),
@@ -5639,7 +5669,7 @@ mod tests {
         auth::write_auth_file(&auth_path, &active)?;
         let reload_store_path = store_path.clone();
 
-        let (count, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
+        let import = replace_import_accounts_with_unlocked_reload(
             &store_path,
             &auth_path,
             vec![replacement.clone()],
@@ -5654,9 +5684,9 @@ mod tests {
             },
         )?;
 
-        assert_eq!(count, 1);
-        assert_eq!(receipt, None);
-        assert!(outcome.is_confirmed());
+        assert_eq!(import.account_count, 1);
+        assert_eq!(import.committed_receipt, None);
+        assert!(import.runtime?.is_confirmed());
         assert_eq!(
             active_account(&load_accounts(&store_path)?).map(|account| account.account_id.clone()),
             Some(replacement.account_id.clone())
@@ -5667,7 +5697,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn durable_import_receipt_survives_lost_reply_and_prevents_second_activation() -> Result<()> {
         let temp = TempDir::new()?;
@@ -5679,7 +5708,7 @@ mod tests {
         auth::write_auth_file(&auth, &active)?;
         let fingerprint = complete_credential_set_fingerprint(&incoming)?;
         let id = Uuid::new_v4();
-        let (_, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
+        let import = replace_import_accounts_with_unlocked_reload(
             &store,
             &auth,
             incoming.clone(),
@@ -5687,20 +5716,10 @@ mod tests {
             Some(id),
             Some(&fingerprint),
             true,
-            &|_| {
-                let pending = credential_import_receipts::observe(
-                    &store,
-                    &auth,
-                    id,
-                    &fingerprint,
-                    &fingerprint,
-                )?;
-                assert_eq!(pending.status, credential_import_receipts::State::Pending);
-                assert!(pending.receipt.is_none());
-                Ok(verified_reload_summary())
-            },
+            &|_| Ok(verified_reload_summary()),
         )?;
-        assert!(outcome.is_confirmed());
+        let receipt = import.committed_receipt;
+        assert!(import.runtime?.is_confirmed());
         let completed =
             credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
         assert_eq!(
@@ -5731,6 +5750,76 @@ mod tests {
             credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?,
             completed
         );
+        Ok(())
+    }
+
+    /// Production incident 2026-09-28: the VPS committed the Mac's credentials,
+    /// but runtime convergence stayed pending, so the receipt stayed `pending`,
+    /// the CLI exited nonzero, and the Mac held the pool for reconciliation.
+    #[test]
+    fn receipt_attests_committed_credentials_while_runtime_convergence_is_pending() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = temp.path().join("accounts.json");
+        let auth = temp.path().join("auth.json");
+        let active = account("active-fixture@example.com", true, 10.0, 10.0);
+        let mut stale = account("stale-fixture@example.com", false, 10.0, 10.0);
+        stale.access_token =
+            account_store::test_inference_token(Utc::now() - ChronoDuration::days(1));
+        let mut fresh = stale.clone();
+        fresh.access_token =
+            account_store::test_inference_token(Utc::now() + ChronoDuration::days(9));
+        fresh.refresh_token = "mac-fresh-refresh-fixture".to_string();
+        let current = vec![active.clone(), stale];
+        let incoming = vec![active.clone(), fresh.clone()];
+        save_accounts(&store, &current)?;
+        auth::write_auth_file(&auth, &active)?;
+        let baseline = complete_credential_set_fingerprint(&current)?;
+        let incoming_fingerprint = complete_credential_set_fingerprint(&incoming)?;
+        let id = Uuid::new_v4();
+
+        let import = replace_import_accounts_with_unlocked_reload(
+            &store,
+            &auth,
+            incoming,
+            true,
+            Some(id),
+            Some(&baseline),
+            true,
+            &|_| {
+                let status = credential_import_receipts::observe(
+                    &store,
+                    &auth,
+                    id,
+                    &baseline,
+                    &incoming_fingerprint,
+                )?;
+                assert_eq!(status.status, credential_import_receipts::State::Completed);
+                // Runtimes that never acknowledge leave the activation degraded.
+                Ok(ReloadSummary::default())
+            },
+        )?;
+
+        let receipt = import
+            .committed_receipt
+            .context("committed credentials must produce a receipt")?;
+        assert_eq!(import.runtime?.state, ActivationState::CommittedDegraded);
+        let status = credential_import_receipts::observe(
+            &store,
+            &auth,
+            id,
+            &baseline,
+            &incoming_fingerprint,
+        )?;
+        assert_eq!(status.receipt, Some(receipt.clone()));
+        let stored = load_accounts(&store)?;
+        assert_eq!(
+            complete_credential_set_fingerprint(&stored)?,
+            receipt.committed_credential_set_fingerprint
+        );
+        assert!(stored
+            .iter()
+            .any(|account| account.refresh_token == fresh.refresh_token));
+        assert!(auth::auth_file_matches_account(&auth, &active));
         Ok(())
     }
 

@@ -227,16 +227,32 @@ pending -> awaiting_caller_acceptance -> locally_converged
 ```
 
 Credential imports separately persist a token-free operation receipt under the
-runtime activation lease. The intent is durable before account mutation and the
-receipt becomes completed only after verified activation. Read-only receipt
-lookup binds the operation, baseline, incoming credential fingerprint, and host
-paths; duplicate operation IDs never repeat the import. A completed historical
-receipt remains historical evidence after later rotations, not proof of current
-convergence. The Mac retires its matching held journal with generation checks,
+runtime activation lease. The intent is durable before account mutation. The
+receipt attests what the import did to credentials, so it becomes completed as
+soon as the store and auth files are committed and read back (`FileOnly`),
+before runtime reload. Runtime convergence is a separate obligation of the
+host's activation barrier: when reload leaves the activation
+`CommittedDegraded`, the importer still prints the completed receipt and exits
+0, reports the pending runtime state on stderr, and the VPS daemon keeps
+retrying convergence. A credential sync therefore succeeds once credentials are
+committed; it never waits on, or holds the pool for, runtime acknowledgement.
+Read-only receipt lookup binds the operation, baseline, incoming credential
+fingerprint, and host paths; duplicate operation IDs never repeat the import. A
+completed historical receipt remains historical evidence after later rotations,
+not proof of current convergence.
+
+A `pending` record means the intent was persisted but completion was not. Under
+the exclusive runtime lease, a pending record from another operation belongs to
+an importer that has already ended (crashed, was killed, or failed before its
+credential commit was proven). Its outcome stays unknown and is never rewritten,
+but it cannot execute again because its ID is recorded, so it does not block
+later imports: each later import is an independent monotonic merge against the
+current store. The Mac retires its matching held journal with generation checks,
 invalidates its convergence cache, and requests fresh convergence. Missing or
-pending receipts never become fabricated success; receipt-less legacy holds
-follow the bounded supersession rule below. The Mac surfaces an unresolved hold from
-its local journal on every poll. The SSH-backed receipt lookup for the same
+pending receipts never become fabricated success; they follow the supersession
+rule below. The Mac surfaces an unresolved hold from
+its local journal on every poll, but logs `LINUX_DEVBOX_CREDENTIAL_SYNC_HELD`
+only once per distinct hold, context, and reason until the hold resolves. The SSH-backed receipt lookup for the same
 operation is spaced out, starting at one minute and doubling to thirty
 minutes, because an unresolved lookup is deterministic until the VPS release or
 the operator changes something. Re-surfacing the same hold never discards an
@@ -244,21 +260,29 @@ in-flight readiness check. The ledger is bounded and fails closed on
 exhaustion or malformed records. See
 `../plans/2026-09-24-credential-import-receipts.md` for replay fixtures.
 
+Only a credential write whose outcome is genuinely unknown may create a hold.
+When the import command completes with a nonzero, non-signal exit, the Mac
+immediately reads the operation's status. `missing` proves the finished importer
+never persisted an intent, so it changed no credentials: the attempt is an
+ordinary rejection that the next sync retries, not a hold. Any other status,
+or an unreadable one, holds the operation for reconciliation.
+
 A held operation must not block credential replication forever. The Mac
 supersedes an unresolved, receipt-less operation, with outcome recorded as
 `superseded_unknown_outcome` and never as completed, only when every condition
 below holds in one read-only observation:
 
-- the receipt-aware VPS reports `missing` for the exact operation binding (an
-  older CLI without `credential-import-status` keeps the hold);
-- the operation is at least 24 hours old. The bundle lifetime is 10 minutes and
-  every SSH or import timeout is shorter, so the bundle cannot be imported after
-  that age;
+- the receipt-aware VPS reports `missing` or `pending` for the exact operation
+  binding (an older CLI without `credential-import-status` keeps the hold);
+- for `missing`, the operation is at least 24 hours old. The bundle lifetime is
+  10 minutes and every SSH or import timeout is shorter, so the bundle cannot
+  be imported after that age. `pending` needs no age: its importer already
+  passed decryption and the lease, and the recorded ID rejects any replay;
 - no same-user remote process mentions the operation stage, and neither remote
   nor local staging exists;
 - a fresh remote credential-state observation succeeds.
 
-`pending` (a durable intent) is never superseded automatically. Supersession
+Supersession
 backs up the exact journal bytes to the single slot
 `linux-devbox-credential-sync.json.superseded.json`, which holds the latest
 superseded operation, and removes the journal with a generation check. It then
@@ -618,7 +642,9 @@ explicit state machine is `Preparing`, `CommittedDegraded`, `Confirmed`, and
 - `CommittedDegraded` proves the files selected the target but no complete live
   runtime acknowledgement has been observed. Zero discovered runtimes, zero
   acknowledgements, partial acknowledgements, and reload uncertainty all produce
-  this state.
+  this state. (This is the Mac coordinator. The Linux Rust coordinator's
+  positive zero-runtime proof is described under Rust CLI Activation And
+  Handoff.)
 - `Confirmed` names both the configured account and the same runtime-current
   account, with acknowledgement counts from at least one verified live local
   runtime. The record binds the proof to an activation generation, an evidence
@@ -1384,11 +1410,28 @@ retries the interrupted operation once.
 ## Rust CLI Activation And Handoff
 
 The Rust coordinator uses distinct durable outcomes for file convergence and
-runtime convergence. `Confirmed` means at least one expected live runtime was
-signalled and returned an acknowledgement bound to its PID/start identity, the
-exact configured auth path, the request nonce, and the complete token
-fingerprint. An empty reload summary, a skipped reload, or zero discovered
-targets can never produce `Confirmed`. A deliberate operator-only offline
+runtime convergence. `Confirmed` means no runtime can still hold credentials
+older than the committed auth file. There are exactly two proofs:
+
+- every discovered runtime was signalled and returned an acknowledgement bound
+  to its PID/start identity, the exact configured auth path, the request nonce,
+  and the complete token fingerprint; or
+- on Linux, a positive zero-runtime discovery: the reload's initial and final
+  `/proc` discoveries both succeeded, both found no account-bearing runtime,
+  the auth file generation did not change in between, and no receipt nonce was
+  requested. Discovery runs after the auth commit, so no runtime that read the
+  old file is alive, and every later runtime reads the committed file at start.
+  Final activation revalidation repeats the discovery and still requires it to
+  be empty. This is how the VPS converges while its app-servers are stopped for
+  a release activation.
+
+An empty reload summary (reload skipped, failed, or not run), a failed or
+partial discovery, a runtime that appeared or vanished during reload, or any
+skipped target can never produce `Confirmed`. A receipt-bound rotation handoff
+still requires the calling runtime's acknowledgement. On macOS the Swift
+coordinator owns runtime discovery and the Rust `pgrep` snapshot cannot prove
+that no desktop runtime exists, so zero Rust-discovered targets there remain
+incomplete. A deliberate operator-only offline
 operation may produce `FileOnly`; daemon and automatic rotation paths reject
 that outcome as an incomplete hot swap. An unresolved prior `FileOnly` barrier
 must fail before quota polling, reset redemption, replacement selection, or a
@@ -1666,7 +1709,10 @@ write the store. Under the account-store lock, an offline file-only import
 records the exact pre-import store and auth rollback state, commits and verifies
 the replacement files, and durably publishes an `Import`/`FileOnly` activation
 barrier. It does not attempt reload and does not treat zero runtime targets as a
-reason to claim success or roll back a valid file-only preparation. After the
+reason to claim success or roll back a valid file-only preparation: it performs
+no discovery at all, so it has no evidence about runtimes. The daemon and online
+imports differ because they discover runtimes after the commit; their positive
+zero-runtime discovery is the proof described above. After the
 managed runtime starts, the coordinator must reconcile that same barrier with
 the canonical v3 request/ACK exchange before advancing it to `Confirmed`; failed
 or absent ACK evidence leaves the activation degraded. A write or crash-recovery

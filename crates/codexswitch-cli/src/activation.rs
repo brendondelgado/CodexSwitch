@@ -118,7 +118,7 @@ pub struct ActivationOutcome {
 impl ActivationOutcome {
     pub fn is_confirmed(&self) -> bool {
         self.state == ActivationState::Confirmed
-            && self.reload.verified_hot_swap()
+            && self.reload.runtime_converged()
             && self.reload.has_bound_activation_proof()
     }
 
@@ -4563,6 +4563,104 @@ mod tests {
             read_activation_record(&store_lock)?.unwrap().state,
             ActivationState::Confirmed
         );
+        Ok(())
+    }
+
+    /// Production incident 2026-09-28: the VPS app-servers were stopped for a
+    /// release activation, so the import's reload found zero runtimes and the
+    /// daemon kept the committed import `CommittedDegraded` forever.
+    #[test]
+    fn positive_zero_runtime_discovery_confirms_a_degraded_activation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let store_path = dir.path().join("accounts.json");
+        let auth_path = dir.path().join("auth.json");
+        let initial = vec![
+            account("first@example.com", true),
+            account("second@example.com", false),
+        ];
+        save_accounts(&store_path, &initial)?;
+        commit_auth_file(&auth_path, &initial[0])?;
+        {
+            let store_lock = lock_account_store(&store_path)?;
+            let snapshot = store_lock.load()?;
+            let mut generation = snapshot.generation;
+            let mut accounts = snapshot.accounts;
+            let target_id = accounts[1].id;
+            let degraded = activate_with(
+                ActivationContext {
+                    store_lock: &store_lock,
+                    generation: &mut generation,
+                    accounts: &mut accounts,
+                    auth_path: &auth_path,
+                    target_id,
+                    reload_enabled: true,
+                },
+                |_| Ok(ReloadSummary::default()),
+            )?;
+            assert_eq!(degraded.state, ActivationState::CommittedDegraded);
+        }
+        let retry = |reload: &dyn Fn(&Path) -> Result<ReloadSummary>| -> Result<ActivationState> {
+            let lease = acquire_runtime_activation_lease(&store_path)?;
+            let outcome = reconcile_activation_barrier_unlocked_with_topology_under_runtime_lease(
+                &lease,
+                &store_path,
+                &auth_path,
+                true,
+                &|path: &Path| reload(path),
+                |_, _| Ok(()),
+            )?
+            .context("degraded activation disappeared")?;
+            Ok(outcome.state)
+        };
+
+        // Unknown or non-empty discovery never proves convergence.
+        let failed_discovery = |path: &Path| {
+            crate::reload::reload_after_empty_discovery_for_test(path, None, || {
+                bail!("process table unavailable")
+            })
+        };
+        assert_eq!(
+            retry(&failed_discovery)?,
+            ActivationState::CommittedDegraded
+        );
+        let appeared = |path: &Path| {
+            crate::reload::reload_after_empty_discovery_for_test(path, None, || {
+                Ok(vec![crate::reload::CodexProcess {
+                    pid: 4242,
+                    owner_uid: 501,
+                    start_identity: "linux:1".to_string(),
+                    started_at_unix: 1,
+                    command_line: "codex app-server".to_string(),
+                    executable: PathBuf::from("/usr/bin/codex"),
+                }])
+            })
+        };
+        assert_eq!(retry(&appeared)?, ActivationState::CommittedDegraded);
+        let receipt_bound = |path: &Path| {
+            let summary = crate::reload::reload_after_empty_discovery_for_test(
+                path,
+                Some(Uuid::new_v4()),
+                || Ok(Vec::new()),
+            )?;
+            assert!(!summary.runtime_converged());
+            Ok(summary)
+        };
+        assert_eq!(retry(&receipt_bound)?, ActivationState::CommittedDegraded);
+
+        let empty = |path: &Path| {
+            crate::reload::reload_after_empty_discovery_for_test(path, None, || Ok(Vec::new()))
+        };
+        assert_eq!(retry(&empty)?, ActivationState::Confirmed);
+        let store_lock = lock_account_store(&store_path)?;
+        assert_eq!(
+            read_activation_record(&store_lock)?.unwrap().state,
+            ActivationState::Confirmed
+        );
+        assert!(auth_file_matches_account(
+            &auth_path,
+            &store_lock.load()?.accounts[1]
+        ));
         Ok(())
     }
 

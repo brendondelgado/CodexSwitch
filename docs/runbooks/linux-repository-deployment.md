@@ -73,7 +73,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-09-05
+  last_updated: 2026-09-28
 ---
 
 # Linux Repository Deployment
@@ -1002,9 +1002,13 @@ Idle import is a two-step operation, not one in-process reload transaction:
    `Import`/`FileOnly` and retains its target identity, complete fingerprint,
    and owned generations.
 2. After a separately requested service start, reconcile that exact barrier
-   against a live managed runtime. Only a matching convergence-v3 ACK may
-   publish `Confirmed`; absent, partial, stale, or mismatched evidence remains
-   degraded and blocks normal mutation.
+   against the live runtimes. Only a matching convergence-v3 ACK from every
+   discovered runtime, or a positive zero-runtime discovery (see "Rust CLI
+   Activation And Handoff" in `runtime-and-host-ownership.md`), may publish
+   `Confirmed`; failed discovery and absent, partial, stale, or mismatched
+   evidence remain degraded and block normal mutation. A `Confirmed` barrier
+   proves credential convergence, not service health: the requested starts
+   verify the services themselves.
 
 The installer pins the immutable identity of the just-created barrier before
 committing its own activation journal. When both post-commit starts are

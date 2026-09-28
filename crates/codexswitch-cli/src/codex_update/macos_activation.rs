@@ -138,6 +138,24 @@ pub fn activate_macos_runtime_artifact(directory: &Path) -> Result<CodexUpdateRe
     Ok(installed)
 }
 
+/// A failed registry lookup (for example a transient DNS error) owns no prepared,
+/// installing, or activation state, so it must not block staging a verified
+/// artifact; the next scheduled metadata check observes the registry again.
+/// Preparation, installation, and activation failures can leave runtime state
+/// inconsistent and still require reconciliation first.
+fn retire_failure_before_artifact_staging(state: &mut CodexUpdateState) -> Result<()> {
+    if state.unresolved_failure.is_none() {
+        return Ok(());
+    }
+    if metadata_failure_is_observation_only(state) {
+        clear_unresolved_failure(state);
+        state.error = None;
+        return Ok(());
+    }
+    restore_unresolved_failure(state);
+    bail!("cannot stage a macOS runtime while an updater failure requires reconciliation");
+}
+
 fn acquire_macos_artifact_lease() -> Result<UpdaterOperationLock> {
     acquire_macos_artifact_lease_at(&codexswitch_data_dir()?.join("codex-update.lock"))
 }
@@ -156,10 +174,7 @@ fn stage_macos_runtime_artifact_with_lock_held(directory: &Path) -> Result<Codex
         bail!("cannot stage a macOS runtime while activation recovery is pending");
     }
     fail_if_macos_activation_journal_is_missing(&state_path()?, &mut state)?;
-    if state.unresolved_failure.is_some() {
-        restore_unresolved_failure(&mut state);
-        bail!("cannot stage a macOS runtime while an updater failure requires reconciliation");
-    }
+    retire_failure_before_artifact_staging(&mut state)?;
     if busy_update_state_is_fresh(&state, Utc::now()) {
         bail!("another fresh updater operation prevents macOS artifact staging");
     }
@@ -1877,6 +1892,25 @@ mod macos_activation_tests {
                 .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn only_observation_metadata_failures_are_retired_by_artifact_staging() {
+        let mut dns = CodexUpdateState::default();
+        apply_metadata_failure(
+            &mut dns,
+            "failed to resolve registry.npmjs.org".to_string(),
+            Utc::now(),
+        );
+        assert!(retire_failure_before_artifact_staging(&mut dns).is_ok());
+        assert!(dns.unresolved_failure.is_none());
+        assert_eq!(dns.error, None);
+
+        let mut install = CodexUpdateState::default();
+        record_interrupted_install_block(&mut install, "launcher swap interrupted".to_string());
+        assert!(retire_failure_before_artifact_staging(&mut install).is_err());
+        assert!(install.unresolved_failure.is_some());
+        assert_eq!(install.status, UpdateStatus::Failed);
     }
 
     #[test]

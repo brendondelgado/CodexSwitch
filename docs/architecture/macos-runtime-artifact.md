@@ -29,7 +29,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-08-21
+  last_updated: 2026-09-28
 ---
 
 # macOS Runtime Artifact
@@ -277,6 +277,15 @@ control plane never builds, downloads, or re-signs on the Mac. An existing
 same-version generation is reused only when a full revalidation proves the exact
 manifest and all three executable identities. Reuse refreshes the observed
 installed route before a journal records its rollback baseline.
+
+An unresolved updater failure blocks staging only when it can own runtime
+state. A typed, observation-only metadata failure (a registry lookup that
+failed, for example on a transient DNS error, with no preparation markers,
+installation markers, or installation transaction) owns nothing a verified
+artifact could conflict with, so staging retires it and proceeds; the next
+scheduled metadata check observes the registry again. Preparation,
+installation, and activation failures still block staging until their own
+recovery contracts succeed.
 
 `stage-macos-runtime-artifact` remains a diagnostic operator command, but it
 fails closed on contention and does not authorize a later unrelated artifact.
