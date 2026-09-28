@@ -38,6 +38,7 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/AccountPersistenceCoordinator.swift
   - ../../Sources/CodexSwitch/Services/KeychainStore.swift
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
+  - ../runbooks/credential-sync-hold-recovery.md
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
   - ../../Sources/CodexSwitch/Services/PoolAuthority.swift
   - ../../Sources/CodexSwitch/Services/CodexVersionChecker.swift
@@ -230,8 +231,8 @@ paths; duplicate operation IDs never repeat the import. A completed historical
 receipt remains historical evidence after later rotations, not proof of current
 convergence. The Mac retires its matching held journal with generation checks,
 invalidates its convergence cache, and requests fresh convergence. Missing or
-pending receipts, including legacy receipt-less holds, require reviewed recovery
-and never become fabricated success. The Mac surfaces an unresolved hold from
+pending receipts never become fabricated success; receipt-less legacy holds
+follow the bounded supersession rule below. The Mac surfaces an unresolved hold from
 its local journal on every poll. The SSH-backed receipt lookup for the same
 operation is spaced out, starting at one minute and doubling to thirty
 minutes, because an unresolved lookup is deterministic until the VPS release or
@@ -239,6 +240,57 @@ the operator changes something. Re-surfacing the same hold never discards an
 in-flight readiness check. The ledger is bounded and fails closed on
 exhaustion or malformed records. See
 `../plans/2026-09-24-credential-import-receipts.md` for replay fixtures.
+
+A held operation must not block credential replication forever. The Mac
+supersedes an unresolved, receipt-less operation, with outcome recorded as
+`superseded_unknown_outcome` and never as completed, only when every condition
+below holds in one read-only observation:
+
+- the receipt-aware VPS reports `missing` for the exact operation binding (an
+  older CLI without `credential-import-status` keeps the hold);
+- the operation is at least 24 hours old. The bundle lifetime is 10 minutes and
+  every SSH or import timeout is shorter, so the bundle cannot be imported after
+  that age;
+- no same-user remote process mentions the operation stage, and neither remote
+  nor local staging exists;
+- a fresh remote credential-state observation succeeds.
+
+`pending` (a durable intent) is never superseded automatically. Supersession
+backs up the exact journal bytes to the single slot
+`linux-devbox-credential-sync.json.superseded.json`, which holds the latest
+superseded operation, and removes the journal with a generation check. It then
+clears cached convergence claims and schedules a fresh operation. That operation
+takes a new baseline and must earn its own receipt. This is safe whatever the
+old operation did, because the importer's per-account monotonic merge (above)
+never replaces a newer destination generation with an older Mac generation.
+Read-only receipt recovery for a held operation follows the backoff above. The
+operator procedure is
+`../runbooks/credential-sync-hold-recovery.md`.
+
+### Token refresh ownership
+
+OpenAI refresh tokens are single-use: each refresh rotates the token, and the
+old one fails with `invalid_refresh_token` or `refresh_token_reused`. When two
+hosts hold the same refresh token, the first to refresh invalidates the other
+host's copy. The target policy is one refresh owner per credential chain; every
+other holder receives the refreshed generation. The current implementation
+violates that policy:
+
+- the VPS daemon refreshes any polled account 5 minutes before access-token
+  expiry (`fetch_quota_with_refresh`);
+- the Mac refreshes an account after a poll reports an expired token
+  (`AppDelegate.refreshToken(for:)`), and the Mac Codex runtime refreshes the
+  account it is running;
+- delivery runs only Mac-to-VPS (full-pool sync and targeted reauthentication).
+  There is no VPS-to-Mac return path.
+
+Consequently, each Mac-to-VPS delivery puts both hosts on one chain until one
+of them refreshes. If the Mac refreshes first, the VPS copy is dead until the
+next successful sync. If the VPS refreshes first, the Mac copy is dead
+permanently. Restoring Mac-to-VPS sync closes the first case within one sync
+cycle. The second case needs a single-owner protocol that has not been built:
+either the VPS returns refreshed generations to the Mac, or only one host
+refreshes each account.
 
 The control CLI may enter `awaiting_caller_acceptance` only after Mac
 credentials and every required runtime acknowledgement converge to the recorded

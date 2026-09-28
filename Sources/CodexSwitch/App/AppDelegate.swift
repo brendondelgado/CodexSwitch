@@ -3437,6 +3437,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=historical_completed_requires_fresh_convergence"
                 ))
                 self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "authority-reconciliation")
+            case .supersedable(let proof):
+                let backupPath: String
+                do {
+                    backupPath = try journal.supersedeUnrecoverable(operation: operation, proof: proof)
+                } catch {
+                    _ = try? journal.withCurrentRecoveryOperation(operation: operation) {
+                        self.surfaceLinuxDevboxCredentialSyncHold(
+                            operation: operation, context: "unrecoverable-supersession-journal-changed"
+                        )
+                    }
+                    return
+                }
+                // Unknown historical outcome: invalidate every cached convergence claim so
+                // the next sync re-baselines from a fresh remote observation.
+                UserDefaults.standard.removeObject(forKey: linuxDevboxLastCredentialSyncFingerprintKey)
+                UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialConvergenceProofKey)
+                self.linuxDevboxCredentialReconciliationBackoff.reset()
+                self.clearLegacyLinuxDevboxCredentialSyncHold()
+                SwapLog.append(.debug(
+                    "LINUX_DEVBOX_CREDENTIAL_SYNC_SUPERSEDED operation=\(operation.operationID) outcome=superseded_unknown_outcome remote_active=\(proof.remoteEvidence.activeProviderAccountId) backup=\(backupPath)"
+                ))
+                self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "authority-reconciliation")
             case .unresolved(let reason):
                 self.linuxDevboxCredentialReconciliationBackoff.recordUnresolved(
                     operationID: operation.operationID,

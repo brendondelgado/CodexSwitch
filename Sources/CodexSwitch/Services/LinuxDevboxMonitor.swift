@@ -993,6 +993,55 @@ struct LinuxDevboxCredentialSyncJournal: Sendable {
         }
     }
 
+    static func supersededBackupPath(journalPath: String) -> String {
+        journalPath + ".superseded.json"
+    }
+
+    /// Retires an unresolved, receipt-less operation whose outcome can never be recovered.
+    /// The exact journal bytes are kept in one private backup slot (retention bound: the most
+    /// recently superseded operation) before a generation-checked removal. Callers must
+    /// supply a `supersedable` proof from `recoverCredentialSyncReceipt`.
+    func supersedeUnrecoverable(
+        operation: LinuxDevboxCredentialSyncOperation,
+        proof: LinuxDevboxUnrecoverableCredentialSyncSupersession
+    ) throws -> String {
+        guard proof.operationID == operation.operationID,
+              operation.phase == .unresolved,
+              operation.importReceipt == nil else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                "only an unresolved receipt-less operation with a matching proof can be superseded"
+            )
+        }
+        let backupPath = Self.supersededBackupPath(journalPath: transaction.path)
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read(allowMissing: false)
+            guard let bytes = current.bytes,
+                  let recorded = try decode(bytes),
+                  recorded == operation else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                    "held operation changed before supersession"
+                )
+            }
+            let backup = SecureAtomicFileTransaction(
+                path: backupPath,
+                subject: "superseded credential-sync journal backup"
+            )
+            try backup.withExclusiveLock { backupFile in
+                let existing = try backupFile.read()
+                if existing.bytes != bytes {
+                    _ = try backupFile.replace(bytes, expectedGeneration: existing.generation)
+                }
+                guard try backupFile.read().bytes == bytes else {
+                    throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                        "superseded journal backup could not be verified"
+                    )
+                }
+            }
+            _ = try lockedFile.remove(expectedGeneration: current.generation)
+        }
+        return backupPath
+    }
+
     func markUnresolved(operationID: String, reason: String) throws {
         try transaction.withExclusiveLock { lockedFile in
             let current = try lockedFile.read()
@@ -1185,9 +1234,20 @@ struct LinuxDevboxCredentialImportStatus: Equatable, Sendable {
     let receipt: LinuxDevboxCredentialImportReceipt?
 }
 
+/// Proof that a held operation can no longer execute. It says nothing about what the
+/// operation historically did; a fresh operation must re-baseline and earn its own receipt.
+struct LinuxDevboxUnrecoverableCredentialSyncSupersession: Equatable, Sendable {
+    let operationID: String
+    let observedAt: Date
+    let remoteEvidence: LinuxDevboxCredentialStateEvidence
+}
+
 // Historical completion must not enter AppDelegate's current-convergence cache path.
 enum LinuxDevboxCredentialReceiptRecovery: Equatable, Sendable {
     case completed(receipt: LinuxDevboxCredentialImportReceipt, matchesCurrentEvidence: Bool)
+    /// The receipt-aware VPS proved no receipt or intent exists, the operation is older than
+    /// the supersession bound, and neither its stage nor its importer exists.
+    case supersedable(LinuxDevboxUnrecoverableCredentialSyncSupersession)
     case unresolved(String)
 }
 
@@ -3488,14 +3548,29 @@ enum LinuxDevboxMonitor {
         }
     }
 
+    /// Far beyond the automatic bundle lifetime (10 minutes) and every SSH/import timeout:
+    /// after this age an operation whose stage and importer are absent cannot execute.
+    static let unrecoverableCredentialSyncSupersessionAge: TimeInterval = 24 * 60 * 60
+
     static func credentialReceiptRecovery(
         operation: LinuxDevboxCredentialSyncOperation,
         remoteStageAbsent: Bool,
         status: LinuxDevboxCredentialImportStatus,
-        observed: LinuxDevboxCredentialStateEvidence?
+        observed: LinuxDevboxCredentialStateEvidence?,
+        remoteImporterAbsent: Bool = false,
+        now: Date = Date()
     ) -> LinuxDevboxCredentialReceiptRecovery {
         guard remoteStageAbsent else {
             return .unresolved("Private remote credential staging is not proven absent")
+        }
+        if status.operationId.uuidString.lowercased() == operation.operationID,
+           status.status == .missing {
+            return unrecoverableCredentialSyncSupersession(
+                operation: operation,
+                remoteImporterAbsent: remoteImporterAbsent,
+                observed: observed,
+                now: now
+            )
         }
         guard status.operationId.uuidString.lowercased() == operation.operationID,
               status.status == .completed,
@@ -3507,6 +3582,54 @@ enum LinuxDevboxMonitor {
             return .unresolved("Local and remote historical import receipts conflict")
         }
         return .completed(receipt: receipt, matchesCurrentEvidence: observed == receipt.committedEvidence)
+    }
+
+    /// `missing` never proves non-execution, so supersession never claims an outcome. It
+    /// only proves the held operation can no longer run: no receipt or intent exists on the
+    /// receipt-aware VPS, the bundle expired long ago, and stage plus importer are absent.
+    static func unrecoverableCredentialSyncSupersession(
+        operation: LinuxDevboxCredentialSyncOperation,
+        remoteImporterAbsent: Bool,
+        observed: LinuxDevboxCredentialStateEvidence?,
+        now: Date
+    ) -> LinuxDevboxCredentialReceiptRecovery {
+        guard operation.phase == .unresolved, operation.importReceipt == nil else {
+            return .unresolved("No completed operation-bound historical receipt; reviewed recovery is required")
+        }
+        let age = now.timeIntervalSince(operation.createdAt)
+        guard age.isFinite, age >= unrecoverableCredentialSyncSupersessionAge else {
+            return .unresolved(
+                "No historical receipt exists; supersession is allowed once the operation is 24 hours old"
+            )
+        }
+        guard remoteImporterAbsent else {
+            return .unresolved("The held operation's remote importer is not proven absent")
+        }
+        guard let observed else {
+            return .unresolved("Fresh remote credential evidence is unavailable; supersession deferred")
+        }
+        return .supersedable(LinuxDevboxUnrecoverableCredentialSyncSupersession(
+            operationID: operation.operationID,
+            observedAt: now,
+            remoteEvidence: observed
+        ))
+    }
+
+    /// Read-only. Exit 0 only when no same-user process mentions the operation's stage and
+    /// the stage is absent. Linux pgrep does not exclude its ancestors, so this command's
+    /// own text must never contain the contiguous stage name: the pattern is bracketed and
+    /// the stage path is assembled from two pieces.
+    static func remoteCredentialImporterAbsenceCommand(
+        operation: LinuxDevboxCredentialSyncOperation
+    ) -> String? {
+        let prefix = "/tmp/codexswitch-auto-sync-"
+        guard operation.remoteDirectory == prefix + operation.operationID else { return nil }
+        let pattern = shellQuote("[c]odexswitch-auto-sync-\(operation.operationID)")
+        return "/usr/bin/pgrep -u \"$(/usr/bin/id -u)\" -f -- \(pattern) >/dev/null; "
+            + "status=$?; if [ \"$status\" -eq 0 ]; then exit 75; fi; "
+            + "if [ \"$status\" -ne 1 ]; then exit 76; fi; "
+            + "stage=\(shellQuote(prefix))\(shellQuote(operation.operationID)); "
+            + "if [ -e \"$stage\" ] || [ -L \"$stage\" ]; then exit 75; fi"
     }
 
     static func remoteCredentialImportStatusCommand(
@@ -3554,9 +3677,25 @@ enum LinuxDevboxMonitor {
         case .failure(let failure):
             return .unresolved(failure.message)
         case .success(let status):
+            var importerAbsent = false
+            if status.status == .missing,
+               let importerProbe = remoteCredentialImporterAbsenceCommand(operation: operation) {
+                let importer = runSSH(
+                    settings: settings,
+                    remoteCommand: importerProbe,
+                    timeout: 15,
+                    retryPolicy: .readOnly
+                )
+                importerAbsent = !importer.timedOut && importer.terminationStatus == 0
+            }
             let observed = try? captureCredentialStateEvidence(settings: settings).get()
             let recovery = credentialReceiptRecovery(
-                operation: operation, remoteStageAbsent: true, status: status, observed: observed
+                operation: operation,
+                remoteStageAbsent: true,
+                status: status,
+                observed: observed,
+                remoteImporterAbsent: importerAbsent,
+                now: Date()
             )
             if case .completed(let receipt, _) = recovery {
                 do {
@@ -3658,7 +3797,8 @@ enum LinuxDevboxMonitor {
 
     static func remoteCredentialStageAbsenceCommand(remoteDirectory: String) -> String {
         let stage = shellQuote(remoteDirectory)
-        return "if /usr/bin/test -e \(stage) || /usr/bin/test -L \(stage); then exit 75; fi"
+        // Shell builtins: a missing external `test` binary must not read as "absent".
+        return "if [ -e \(stage) ] || [ -L \(stage) ]; then exit 75; fi"
     }
 
     static func remoteCredentialStagingCommand(remoteDirectory: String) -> String {

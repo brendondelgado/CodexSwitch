@@ -389,6 +389,105 @@ struct AppDelegateCredentialSyncTests {
         }
     }
 
+    @Test("unrecoverable receipt-less hold is superseded only when it can no longer execute, then a fresh sync can begin")
+    func unrecoverableHoldSupersessionReleasesSync() throws {
+        let fixture = try JournalFixture()
+        defer { fixture.cleanup() }
+        let journal = LinuxDevboxCredentialSyncJournal(path: fixture.journalPath)
+        try journal.begin(fixture.operation())
+        let begun = try #require(try journal.load())
+        try journal.markUnresolved(operationID: begun.operationID, reason: "legacy baseline mismatch")
+        let held = try #require(try journal.load())
+        let old = held.createdAt.addingTimeInterval(25 * 60 * 60)
+        func status(_ state: String) throws -> LinuxDevboxCredentialImportStatus {
+            try LinuxDevboxMonitor.decodeCredentialImportStatus(output: """
+            {"version":1,"operationId":"\(held.operationID)","status":"\(state)","receipt":null}
+            """, operation: held).get()
+        }
+        func recovery(
+            _ state: String = "missing", stageAbsent: Bool = true, importerAbsent: Bool = true,
+            observed: LinuxDevboxCredentialStateEvidence? = nil, now: Date? = nil
+        ) throws -> LinuxDevboxCredentialReceiptRecovery {
+            LinuxDevboxMonitor.credentialReceiptRecovery(
+                operation: held, remoteStageAbsent: stageAbsent, status: try status(state),
+                observed: observed ?? held.expected, remoteImporterAbsent: importerAbsent, now: now ?? old
+            )
+        }
+        // Every missing precondition keeps the hold: young, pending intent, live importer,
+        // stage remnant, or no fresh remote observation.
+        for blocked in [
+            try recovery(now: held.createdAt.addingTimeInterval(60 * 60)),
+            try recovery("pending"),
+            try recovery(importerAbsent: false),
+            try recovery(stageAbsent: false),
+            LinuxDevboxMonitor.credentialReceiptRecovery(
+                operation: held, remoteStageAbsent: true, status: try status("missing"),
+                observed: nil, remoteImporterAbsent: true, now: old
+            ),
+        ] {
+            guard case .unresolved = blocked else {
+                Issue.record("Supersession was allowed without every precondition: \(blocked)")
+                return
+            }
+        }
+        guard case .supersedable(let proof) = try recovery() else {
+            Issue.record("An expired, absent, receipt-less hold stayed blocked forever")
+            return
+        }
+        #expect(proof.remoteEvidence == held.expected)
+
+        // A same-ID journal change after observation fails closed and keeps the hold.
+        try journal.markUnresolved(operationID: held.operationID, reason: "newer reviewed hold")
+        #expect(throws: LinuxDevboxCredentialSyncJournalError.self) {
+            try journal.supersedeUnrecoverable(operation: held, proof: proof)
+        }
+        let current = try #require(try journal.load())
+        #expect(current.reason == "newer reviewed hold")
+
+        let bytes = try Data(contentsOf: URL(fileURLWithPath: fixture.journalPath))
+        let backupPath = try journal.supersedeUnrecoverable(operation: current, proof: proof)
+        #expect(try journal.load() == nil)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: backupPath)) == bytes)
+        // The fresh operation re-baselines and journals normally.
+        let fresh = fixture.operation()
+        try journal.begin(fresh)
+        #expect(try journal.load()?.operationID == fresh.operationID)
+    }
+
+    @Test("importer absence probe detects the operation's process and stage but never itself")
+    func importerAbsenceProbeRunsReadOnly() throws {
+        let fixture = try JournalFixture()
+        defer { fixture.cleanup() }
+        let operation = fixture.operation()
+        let command = try #require(LinuxDevboxMonitor.remoteCredentialImporterAbsenceCommand(operation: operation))
+        // Linux pgrep matches its parent shell, whose argv is this command.
+        #expect(!command.contains("codexswitch-auto-sync-\(operation.operationID)"))
+        func probe() throws -> Int32 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", command]
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        }
+        #expect(try probe() == 0)
+
+        let importer = Process()
+        importer.executableURL = URL(fileURLWithPath: "/bin/sh")
+        importer.arguments = ["-c", "sleep 30; true", "codexswitch-auto-sync-\(operation.operationID)"]
+        try importer.run()
+        defer { if importer.isRunning { importer.terminate() } }
+        #expect(try probe() == 75)
+        importer.terminate()
+        importer.waitUntilExit()
+
+        try FileManager.default.createDirectory(atPath: operation.remoteDirectory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(atPath: operation.remoteDirectory) }
+        #expect(try probe() == 75)
+        try FileManager.default.removeItem(atPath: operation.remoteDirectory)
+        #expect(try probe() == 0)
+    }
+
     @Test("historical receipt requires absence of staging and exact operation binding")
     func historicalRecoveryRequiresBindingAndStageAbsence() throws {
         let fixture = try JournalFixture()
