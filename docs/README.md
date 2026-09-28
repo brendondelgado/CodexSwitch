@@ -76,6 +76,7 @@ A deployed VPS binary may be older than the repository. A UI can also be stale w
 - [Clean-code recovery plan](plans/2026-07-12-codexswitch-clean-code-recovery.md): ordered remediation work and verification gates.
 - [Hot-swap reliability closure](plans/2026-07-21-hot-swap-reliability-closure.md): incident evidence, permanent invariants, replay gates, and controlled activation procedure.
 - [Codebase audit](audits/2026-07-12-codebase-audit.md): findings, impact, and current disposition.
+- [Mac/VPS sync recovery](audits/2026-09-28-mac-vps-sync-recovery.md): 2026-09-28 desync and reset-failure root causes, deployment record, and remaining risk.
 - [Runtime storage plan](plans/2026-07-12-runtime-storage-hardening.md): archive and storage lifecycle work.
 
 Plans authorize repository changes only. They do not authorize live service interruption, reset redemption, destructive cleanup, or deployment activation.
