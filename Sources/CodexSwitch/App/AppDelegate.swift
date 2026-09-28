@@ -391,6 +391,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var linuxDevboxReadinessTaskContext: LinuxDevboxReadinessTaskContext?
     private var linuxDevboxSurfacedCredentialSyncHold: LinuxDevboxSurfacedCredentialSyncHold?
     private var activationRetryEscalation = ActivationRetryEscalation()
+    private var linuxDevboxCredentialReconciliationBackoff =
+        LinuxDevboxCredentialReconciliationBackoff()
     private var unmanagedRuntimeRefreshInFlight = false
     private var lastUnmanagedRuntimeRefreshAt: Date?
     private var linuxDevboxConsecutiveIssueChecks = 0
@@ -3397,7 +3399,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         settings: LinuxDevboxMonitorSettings
     ) {
         guard !linuxDevboxCredentialSyncInFlight,
-              !linuxDevboxCredentialSyncReconciliationInFlight else { return }
+              !linuxDevboxCredentialSyncReconciliationInFlight,
+              linuxDevboxCredentialReconciliationBackoff.permitsAttempt(
+                  operationID: operation.operationID,
+                  at: Date()
+              ) else { return }
         linuxDevboxCredentialSyncReconciliationInFlight = true
         let journal = linuxDevboxCredentialSyncJournal
         let finish: @MainActor @Sendable (
@@ -3408,6 +3414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard LinuxDevboxMonitor.settings() == settings else { return }
             switch recovery {
             case .completed(let receipt, _):
+                self.linuxDevboxCredentialReconciliationBackoff.reset()
                 do {
                     try journal.clearRecoveredImport(operation: operation, receipt: receipt)
                 } catch {
@@ -3428,6 +3435,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ))
                 self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "authority-reconciliation")
             case .unresolved(let reason):
+                self.linuxDevboxCredentialReconciliationBackoff.recordUnresolved(
+                    operationID: operation.operationID,
+                    at: Date()
+                )
                 _ = try? journal.withCurrentRecoveryOperation(operation: operation) {
                     self.surfaceLinuxDevboxCredentialSyncHold(
                         fingerprint: operation.credentialFingerprint,

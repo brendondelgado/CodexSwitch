@@ -585,3 +585,32 @@ struct LinuxDevboxCredentialSyncHoldResurfaceTests {
         ))
     }
 }
+
+@Suite("Linux devbox credential reconciliation backoff")
+struct LinuxDevboxCredentialReconciliationBackoffTests {
+    @Test("Unresolved historical-receipt recovery is not retried over SSH every poll")
+    func unresolvedRecoveryBacksOff() {
+        // Production: the deployed VPS CLI lacks credential-import-status, so
+        // recovery failed deterministically ~every 15s (5,629 times on
+        // 2026-09-27), two SSH calls each.
+        let operation = "6bcae028-1fdf-4e44-a003-e8b659719670"
+        let start = Date(timeIntervalSince1970: 1_000)
+        var backoff = LinuxDevboxCredentialReconciliationBackoff()
+        #expect(backoff.permitsAttempt(operationID: operation, at: start))
+
+        backoff.recordUnresolved(operationID: operation, at: start)
+        #expect(!backoff.permitsAttempt(operationID: operation, at: start.addingTimeInterval(15)))
+        #expect(backoff.permitsAttempt(operationID: operation, at: start.addingTimeInterval(60)))
+
+        for _ in 0..<10 {
+            backoff.recordUnresolved(operationID: operation, at: start)
+        }
+        #expect(backoff.nextAttemptAt
+            == start.addingTimeInterval(LinuxDevboxCredentialReconciliationBackoff.maximumDelay))
+        // A different unresolved operation is attempted immediately.
+        #expect(backoff.permitsAttempt(operationID: "other", at: start))
+
+        backoff.reset()
+        #expect(backoff.permitsAttempt(operationID: operation, at: start))
+    }
+}
