@@ -127,7 +127,6 @@ struct CLIStatusCheckerTests {
             "/Users/me/Developer/codex/codex-rs/target/fork-release/codex resume thread --yolo",
         ]
         let rejected = [
-            "/Users/me/.local/bin/headroom wrap codex",
             "node /opt/homebrew/bin/codex",
             "/Users/me/Developer/codex/codex-rs/target/fork-release/codex --remote ws://127.0.0.1:18390 resume thread",
             "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex exec --ephemeral review",

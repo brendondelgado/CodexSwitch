@@ -89,49 +89,6 @@ NATIVE_UPDATER_MAIN_CONTENT = (
     "g=i.a.allowDevtools(o)"
 )
 
-APP_SERVER_LAUNCHER_LEGACY_HEADROOM_CONTENT = (
-    "var ae=new Set([`BREAKPAD_DUMP_LOCATION`,`CHROME_CRASHPAD_PIPE_NAME`,"
-    "`CRASHPAD_HANDLER_PID`,`ELECTRON_CRASH_REPORTER_PROCESS_TYPE`]);"
-    "function F(e){let t={...e};"
-    "e&&e.CODEXSWITCH_HEADROOM_BASE_URL&&("
-    "\"CODEXSWITCH_HEADROOM_GLOBAL_ENV_PATCH\","
-    "t.OPENAI_BASE_URL=e.CODEXSWITCH_HEADROOM_BASE_URL);"
-    "delete t.CODEX_CLI_PATH;"
-    "for(let e of Object.keys(t))ae.has(e.toUpperCase())&&delete t[e];"
-    "return t}"
-    "class Gl{ensureStarted(){"
-    "this.options.logger.info(`Starting local app-server sidecar`)"
-    "}createEnvironment(){let e={...F(process.env)};"
-    "process.env.CODEXSWITCH_HEADROOM_BASE_URL&&("
-    "e.OPENAI_BASE_URL=process.env.CODEXSWITCH_HEADROOM_BASE_URL);"
-    "let t=this.getCodexCliBinDirectoryFromExecutablePath();"
-    "return t!=null&&Ml(e,Kl(jl(e),t)),e}"
-    "getCodexCliBinDirectoryFromExecutablePath(){return null}}"
-)
-
-APP_SERVER_LAUNCHER_CURRENT_HEADROOM_CONTENT = (
-    "var ae=new Set([`BREAKPAD_DUMP_LOCATION`,`CHROME_CRASHPAD_PIPE_NAME`,"
-    "`CRASHPAD_HANDLER_PID`,`ELECTRON_CRASH_REPORTER_PROCESS_TYPE`]);"
-    "function F(e){let t={...e};"
-    "e&&e.CODEXSWITCH_HEADROOM_BASE_URL&&("
-    "\"CODEXSWITCH_HEADROOM_GLOBAL_ENV_PATCH\","
-    "t.CODEXSWITCH_HEADROOM_BASE_URL=e.CODEXSWITCH_HEADROOM_BASE_URL,"
-    "delete t.OPENAI_BASE_URL);"
-    "delete t.CODEX_CLI_PATH;"
-    "for(let e of Object.keys(t))ae.has(e.toUpperCase())&&delete t[e];"
-    "return t}"
-    "class Gl{ensureStarted(){"
-    "this.options.logger.info(`Starting local app-server sidecar`)"
-    "}createEnvironment(){let e={...F(process.env)};"
-    "process.env.CODEXSWITCH_HEADROOM_BASE_URL&&("
-    "\"CODEXSWITCH_HEADROOM_TRANSPORT_PATCH\","
-    "e.CODEXSWITCH_HEADROOM_BASE_URL=process.env.CODEXSWITCH_HEADROOM_BASE_URL,"
-    "delete e.OPENAI_BASE_URL);"
-    "let t=this.getCodexCliBinDirectoryFromExecutablePath();"
-    "return t!=null&&Ml(e,Kl(jl(e),t)),e}"
-    "getCodexCliBinDirectoryFromExecutablePath(){return null}}"
-)
-
 BUNDLED_PLUGIN_SYNC_CONTENT = (
     "var H=t.Or(`BundledPluginsMarketplace`);"
     "async function cr(e){await ur({appServerConnection:e.appServerConnection,"
@@ -2742,75 +2699,6 @@ replay().catch(error=>{console.error(error.stack);process.exit(1)});
 
         self.assertIn("native_updater=native_updater_already_patched", source)
         self.assertIn("apply_native_updater_disable_patch(native_updater_files)", source)
-
-    def test_remove_headroom_env_patch_leaves_stock_launcher_unchanged(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "workspace-root-drop-handler.js"
-            target.write_text(APP_SERVER_LAUNCHER_CONTENT)
-
-            self.assertTrue(patch_asar.remove_headroom_env_patch(target))
-
-            self.assertEqual(target.read_text(), APP_SERVER_LAUNCHER_CONTENT)
-
-    def test_remove_headroom_env_patch_removes_current_bridge(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "workspace-root-drop-handler.js"
-            target.write_text(APP_SERVER_LAUNCHER_CURRENT_HEADROOM_CONTENT)
-
-            self.assertTrue(patch_asar.remove_headroom_env_patch(target))
-
-            patched = target.read_text()
-            self.assertNotIn(patch_asar.HEADROOM_TRANSPORT_PATCH_MARKER, patched)
-            self.assertNotIn(
-                "e.CODEXSWITCH_HEADROOM_BASE_URL=process.env.CODEXSWITCH_HEADROOM_BASE_URL",
-                patched,
-            )
-            self.assertNotIn("delete e.OPENAI_BASE_URL", patched)
-            self.assertIn("t=this.getCodexCliBinDirectoryFromExecutablePath()", patched)
-
-    def test_remove_headroom_env_patch_removes_legacy_openai_base_url_bridge(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "workspace-root-drop-handler.js"
-            target.write_text(APP_SERVER_LAUNCHER_LEGACY_HEADROOM_CONTENT)
-
-            self.assertTrue(patch_asar.remove_headroom_env_patch(target))
-
-            patched = target.read_text()
-            self.assertNotIn("e.OPENAI_BASE_URL=process.env.CODEXSWITCH_HEADROOM_BASE_URL", patched)
-            self.assertFalse(patch_asar.has_headroom_env_bridge(patched))
-
-    def test_remove_headroom_global_env_patch_leaves_stock_launcher_unchanged(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "workspace-root-drop-handler.js"
-            target.write_text(APP_SERVER_LAUNCHER_CONTENT)
-
-            self.assertTrue(patch_asar.remove_headroom_global_env_patch(target))
-
-            self.assertEqual(target.read_text(), APP_SERVER_LAUNCHER_CONTENT)
-
-    def test_remove_headroom_global_env_patch_removes_current_bridge(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "workspace-root-drop-handler.js"
-            target.write_text(APP_SERVER_LAUNCHER_CURRENT_HEADROOM_CONTENT)
-
-            self.assertTrue(patch_asar.remove_headroom_global_env_patch(target))
-
-            patched = target.read_text()
-            self.assertNotIn(patch_asar.HEADROOM_GLOBAL_ENV_MARKER, patched)
-            self.assertNotIn("t.CODEXSWITCH_HEADROOM_BASE_URL=e.CODEXSWITCH_HEADROOM_BASE_URL", patched)
-            self.assertNotIn("delete t.OPENAI_BASE_URL", patched)
-            self.assertIn("delete t.CODEX_CLI_PATH", patched)
-
-    def test_remove_headroom_global_env_patch_removes_legacy_openai_base_url_bridge(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "workspace-root-drop-handler.js"
-            target.write_text(APP_SERVER_LAUNCHER_LEGACY_HEADROOM_CONTENT)
-
-            self.assertTrue(patch_asar.remove_headroom_global_env_patch(target))
-
-            patched = target.read_text()
-            self.assertNotIn("t.OPENAI_BASE_URL=e.CODEXSWITCH_HEADROOM_BASE_URL", patched)
-            self.assertFalse(patch_asar.has_headroom_global_env_bridge(patched))
 
     def test_iter_sighup_cli_candidates_includes_local_fork_release(self):
         candidates = [str(path) for path in patch_asar.iter_sighup_cli_candidates()]

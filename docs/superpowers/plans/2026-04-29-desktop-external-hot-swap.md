@@ -477,7 +477,6 @@ Expected:
 ## Execution Notes
 
 - Do not patch or re-sign `/Applications/Codex.app` as part of normal desktop hot-swap work.
-- Do not use Headroom in desktop routing.
 - Do not install alpha Codex CLI globally.
 - Do not kill live Codex.app from CodexSwitch or from implementation sessions unless the user explicitly asks.
 - If no supported external reload RPC exists, stop and pursue the upstream hook. Do not resurrect ASAR mutation as the default path.

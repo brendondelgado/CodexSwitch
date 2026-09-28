@@ -63,7 +63,7 @@ CodexSwitch manages multiple paid ChatGPT accounts through a native Mac menu app
 
 **🖥 Desktop Runtime Reload** — Sends the complete access, refresh, and identity token set through the supported desktop app-server RPC path and records acknowledgement.
 
-**🧭 Direct Desktop Routing** — Codex.app stays on stock OpenAI transport. CodexSwitch removes legacy desktop Headroom env bridges while preserving account hot-swap, bundled CLI repair, and plugin readiness patches.
+**🧭 Direct Desktop Routing** — Codex.app stays on stock OpenAI transport while CodexSwitch preserves account hot-swap, bundled CLI repair, and plugin readiness patches.
 
 **📊 Pooled Usage Meter** — Aggregates only observed windows and keeps Mac and VPS state distinct. Missing data is displayed as unknown or absent, never as zero or full.
 

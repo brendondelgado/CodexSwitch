@@ -9,19 +9,16 @@ This script:
 1. Extracts app.asar to a temp directory (alongside the .unpacked companion)
 2. Finds the use-auth JS file (by content pattern, not filename)
 3. Patches it to invalidate React Query caches on account/updated
-4. Removes CodexSwitch Headroom env bridges from desktop app-server launch paths
-5. Removes inherited CODEX_CLI_PATH from desktop app-server launch paths so
+4. Removes inherited CODEX_CLI_PATH from desktop app-server launch paths so
    Codex.app cannot be forced onto a stale Homebrew wrapper
-6. Repacks with --unpack to preserve native modules (.node, spawn-helper)
-7. Re-signs the app
+5. Repacks with --unpack to preserve native modules (.node, spawn-helper)
+6. Re-signs the app
 
 The patch adds:
 - Module-level vars to capture the QueryClient instance from React hooks
 - _invalidateAccountQueries() to bust `accounts/check` and `account-info` caches
 - A call to _invalidateAccountQueries() in the auth status callback, before
   the getAccount() refresh, so the UI picks up the new account immediately
-- No Headroom bridge for Codex.app: desktop traffic stays on stock OpenAI
-  transport so silent optimizer filtering cannot affect app-server diagnostics
 
 Exit codes:
   0 = patched successfully (or already patched)
@@ -115,9 +112,6 @@ AUTH_SINGLE_FLIGHT_CACHE = "_csAccountReadFlights"
 AUTH_SINGLE_FLIGHT_HELPER = "_codexSwitchReadAccount"
 PRIORITY_AUTH_PATCH_MARKER = "CODEXSWITCH_PRIORITY_AUTH_TRANSITION_V1"
 FAST_FALLBACK_MARKER = "_bundledFastModels"
-HEADROOM_ENV_MARKER = "CODEXSWITCH_HEADROOM_BASE_URL"
-HEADROOM_TRANSPORT_PATCH_MARKER = "CODEXSWITCH_HEADROOM_TRANSPORT_PATCH"
-HEADROOM_GLOBAL_ENV_MARKER = "CODEXSWITCH_HEADROOM_GLOBAL_ENV_PATCH"
 DESKTOP_CLI_PATH_GUARD_MARKER = "CODEXSWITCH_DESKTOP_CLI_PATH_GUARD"
 BUNDLED_PLUGIN_SYNC_COMPAT_MARKER = "CODEXSWITCH_BUNDLED_PLUGIN_SYNC_COMPAT"
 BUNDLED_PLUGIN_LIST_ROOT_MARKER = "CODEXSWITCH_BUNDLED_PLUGIN_LIST_ROOT_PATCH"
@@ -3004,85 +2998,6 @@ def required_desktop_patches_present(
     )
 
 
-def has_legacy_headroom_env_bridge(content: str) -> bool:
-    return f".OPENAI_BASE_URL=process.env.{HEADROOM_ENV_MARKER}" in content
-
-
-def has_legacy_headroom_global_env_bridge(content: str) -> bool:
-    return re.search(
-        rf"\w+\.OPENAI_BASE_URL=\w+\.{HEADROOM_ENV_MARKER}",
-        content,
-    ) is not None
-
-
-def has_headroom_env_bridge(content: str) -> bool:
-    return HEADROOM_TRANSPORT_PATCH_MARKER in content or has_legacy_headroom_env_bridge(content)
-
-
-def has_headroom_global_env_bridge(content: str) -> bool:
-    return HEADROOM_GLOBAL_ENV_MARKER in content or has_legacy_headroom_global_env_bridge(content)
-
-
-def remove_headroom_env_patch(file_path: Path) -> bool:
-    """Remove Codex.app app-server Headroom transport overrides.
-
-    CodexSwitch used to preserve CODEXSWITCH_HEADROOM_BASE_URL for desktop
-    app-server processes. Desktop traffic now intentionally stays direct so
-    account hot-swap cannot be coupled to silent token optimizers.
-    """
-    content = file_path.read_text()
-    patched = content
-
-    current_pattern = re.compile(
-        rf'createEnvironment\(\)\{{let (\w)=\{{\.\.\.F\(process\.env\)\}};'
-        rf'process\.env\.{HEADROOM_ENV_MARKER}&&'
-        rf'\("{HEADROOM_TRANSPORT_PATCH_MARKER}",'
-        rf'\1\.{HEADROOM_ENV_MARKER}=process\.env\.{HEADROOM_ENV_MARKER},'
-        rf'delete \1\.OPENAI_BASE_URL\);'
-        r'let (\w)='
-    )
-    legacy_pattern = re.compile(
-        rf'createEnvironment\(\)\{{let (\w)=\{{\.\.\.F\(process\.env\)\}};'
-        rf'process\.env\.{HEADROOM_ENV_MARKER}&&'
-        rf'\(\1\.OPENAI_BASE_URL=process\.env\.{HEADROOM_ENV_MARKER}\);'
-        r'let (\w)='
-    )
-
-    patched = current_pattern.sub(
-        lambda match: (
-            f"createEnvironment(){{let {match.group(1)}={{...F(process.env)}},"
-            f"{match.group(2)}="
-        ),
-        patched,
-        count=1,
-    )
-    patched = legacy_pattern.sub(
-        lambda match: (
-            f"createEnvironment(){{let {match.group(1)}={{...F(process.env)}},"
-            f"{match.group(2)}="
-        ),
-        patched,
-        count=1,
-    )
-
-    if patched == content:
-        print(f"  No desktop Headroom transport bridge found: {file_path.name}")
-        return True
-    if HEADROOM_TRANSPORT_PATCH_MARKER in patched:
-        print("ERROR: Headroom transport marker remained after removal")
-        return False
-    if has_legacy_headroom_env_bridge(patched):
-        print("ERROR: Legacy Headroom transport bridge remained after removal")
-        return False
-    if "Starting local app-server sidecar" not in patched:
-        print("ERROR: app-server launcher marker disappeared after Headroom removal")
-        return False
-
-    file_path.write_text(patched)
-    print(f"  Removed desktop Headroom env bridge: {file_path.name}")
-    return True
-
-
 def apply_desktop_cli_path_guard_patch(file_path: Path) -> bool:
     """Prevent launchd/shell CODEX_CLI_PATH from hijacking Codex.app.
 
@@ -4088,69 +4003,6 @@ def apply_remote_model_refresh_patch(file_path: Path) -> bool:
     return True
 
 
-def remove_headroom_global_env_patch(file_path: Path) -> bool:
-    """Remove CodexSwitch Headroom propagation from the shared env sanitizer."""
-    content = file_path.read_text()
-    patched = content
-
-    current_pattern = re.compile(
-        rf"function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)"
-        rf"\{{let ([A-Za-z_$][\w$]*)=\{{\.\.\.\2\}};"
-        rf"\2&&\2\.{HEADROOM_ENV_MARKER}&&"
-        rf'\("{HEADROOM_GLOBAL_ENV_MARKER}",'
-        rf"\3\.{HEADROOM_ENV_MARKER}=\2\.{HEADROOM_ENV_MARKER},"
-        rf"delete \3\.OPENAI_BASE_URL\);"
-        rf"delete \3\.CODEX_CLI_PATH;"
-        rf"for\(let ([A-Za-z_$][\w$]*) of Object\.keys\(\3\)\)"
-        rf"([A-Za-z_$][\w$]*)\.has\(\4\.toUpperCase\(\)\)&&delete \3\[\4\];"
-        rf"return \3\}}"
-    )
-    legacy_pattern = re.compile(
-        rf"function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)"
-        rf"\{{let ([A-Za-z_$][\w$]*)=\{{\.\.\.\2\}};"
-        rf"\2&&\2\.{HEADROOM_ENV_MARKER}&&"
-        rf'\("{HEADROOM_GLOBAL_ENV_MARKER}",'
-        rf"\3\.OPENAI_BASE_URL=\2\.{HEADROOM_ENV_MARKER}\);"
-        rf"delete \3\.CODEX_CLI_PATH;"
-        rf"for\(let ([A-Za-z_$][\w$]*) of Object\.keys\(\3\)\)"
-        rf"([A-Za-z_$][\w$]*)\.has\(\4\.toUpperCase\(\)\)&&delete \3\[\4\];"
-        rf"return \3\}}"
-    )
-
-    def replacement(match: re.Match[str]) -> str:
-        func_name, env_var, output_var, loop_var, blocked_var = match.groups()
-        return (
-            f"function {func_name}({env_var}){{let {output_var}={{...{env_var}}};"
-            f"delete {output_var}.CODEX_CLI_PATH;"
-            f"for(let {loop_var} of Object.keys({output_var}))"
-            f"{blocked_var}.has({loop_var}.toUpperCase())&&delete {output_var}[{loop_var}];"
-            f"return {output_var}}}"
-        )
-
-    patched = current_pattern.sub(replacement, patched, count=1)
-    patched = legacy_pattern.sub(replacement, patched, count=1)
-
-    if patched == content:
-        print(f"  No global Headroom env bridge found: {file_path.name}")
-        return True
-    if HEADROOM_GLOBAL_ENV_MARKER in patched:
-        print("ERROR: Global Headroom marker remained after removal")
-        return False
-    if has_legacy_headroom_global_env_bridge(patched):
-        print("ERROR: Legacy global Headroom bridge remained after removal")
-        return False
-    if "Starting local app-server sidecar" not in patched:
-        print("ERROR: app-server launcher marker disappeared after global Headroom removal")
-        return False
-
-    file_path.write_text(patched)
-    print(f"  Removed global Headroom env bridge: {file_path.name}")
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Code signing
-# ---------------------------------------------------------------------------
 def codesign_app():
     """Re-sign Codex.app after modification.
 
