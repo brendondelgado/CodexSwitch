@@ -45,6 +45,7 @@ Start with [the documentation index](docs/README.md). Do not derive architecture
 | How do Mac, VPS, remote sessions, reloads, and updates interact? | `docs/architecture/runtime-and-host-ownership.md` |
 | How are artifacts transferred safely between the Mac and VPS? | `docs/architecture/secure-drop-transport.md` |
 | How does T3 Code read usage and redeem resets? | `docs/architecture/t3-usage-hub.md` |
+| How do T3 Code threads share the Codex app-server daemon? | `docs/architecture/shared-app-server-client.md` |
 | What is currently being cleaned up? | `docs/plans/2026-07-12-codexswitch-clean-code-recovery.md` |
 | What defects were found and what remains? | `docs/audits/2026-07-12-codebase-audit.md` |
 | How is hot-swap verified? | `docs/runbooks/codexswitch-hot-swap-verification.md` |

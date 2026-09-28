@@ -14,6 +14,7 @@ cross_dependencies:
   - ../../integrations/t3-usage-hub/install.sh
   - ../../integrations/t3-usage-hub/codex-usage-hub.service
   - ./quota-and-reset-policy.md
+  - ./shared-app-server-client.md
 version_control:
   branch: main
   status: canonical-target

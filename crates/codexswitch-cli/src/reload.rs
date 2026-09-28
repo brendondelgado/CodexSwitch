@@ -4165,6 +4165,14 @@ pub fn is_codex_app_server_command_line(command_line: &str) -> bool {
         return false;
     }
     let parts = lower.split_whitespace().collect::<Vec<_>>();
+    // The shared app-server client and its `codex-shared` launcher relay a
+    // frontend to an existing daemon; they never hold account credentials.
+    if parts.iter().any(|part| {
+        *part == crate::shared_app_server_client::SUBCOMMAND
+            || part.rsplit('/').next() == Some("codex-shared")
+    }) {
+        return false;
+    }
     let Some(index) = parts.iter().position(|part| *part == "app-server") else {
         return false;
     };
@@ -4873,6 +4881,30 @@ mod tests {
         assert!(!is_codex_app_server_command_line(
             "/home/signul/.local/share/codexswitch/patched-codex/codex app-server proxy --sock /tmp/control.sock"
         ));
+    }
+
+    #[test]
+    fn shared_app_server_client_is_never_an_account_bearing_runtime() {
+        let client = "/home/signul/.local/share/codexswitch/current/codexswitch-cli app-server-client -c features.code_mode_host=true app-server -c mcp_servers.t3-code.url=http://127.0.0.1:51870/mcp -c mcp_servers.t3-code.bearer_token_env_var=\"T3_MCP_BEARER_TOKEN\"";
+        let launcher = "/bin/sh /home/signul/.local/bin/codex-shared app-server -c mcp_servers.t3-code.url=http://127.0.0.1:51870/mcp";
+        for command_line in [client, launcher] {
+            assert!(!is_codex_app_server_command_line(command_line));
+            assert!(!is_codex_cli_command_line(command_line));
+            // Also covers the fail-closed Linux unreadable-process probe.
+            assert!(!command_line_claims_codex_runtime(command_line, true));
+        }
+        let client_process = CodexProcess {
+            pid: 42,
+            owner_uid: 1001,
+            start_identity: "linux:123".to_string(),
+            started_at_unix: 1,
+            command_line: client.to_string(),
+            executable: PathBuf::from(
+                "/home/signul/.local/share/codexswitch/releases/0.1.0-abc/codexswitch-cli",
+            ),
+        };
+        assert!(!process_matches_discovery_scope(&client_process, true));
+        assert_eq!(hot_swap_runtime_kind(&client_process), None);
     }
 
     #[test]

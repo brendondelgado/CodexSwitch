@@ -578,6 +578,9 @@ enum DesktopPatchManager {
     }
 
     nonisolated static func isDesktopHotSwapRuntimeLine(_ lowercasedProcessLine: String) -> Bool {
+        if DesktopRuntimeDiagnostics.isSharedAppServerClientCommandLine(lowercasedProcessLine) {
+            return false
+        }
         if lowercasedProcessLine.contains(" app-server")
             && lowercasedProcessLine.contains("/applications/codex.app/contents/resources/codex") {
             return true

@@ -60,7 +60,8 @@ struct DesktopRuntimeDiagnostics: Sendable, Equatable {
         let lower = commandLine.lowercased()
         guard lower.contains(" app-server") else { return nil }
         guard !lower.contains("/applications/codexswitch.app/contents/macos/codexswitch"),
-              !lower.contains("pgrep") else { return nil }
+              !lower.contains("pgrep"),
+              !isSharedAppServerClientCommandLine(lower) else { return nil }
 
         let executablePath = executablePath(fromAppServerCommandLine: commandLine)
         let classification = classifyAppServerPath(executablePath ?? commandLine)
@@ -72,6 +73,22 @@ struct DesktopRuntimeDiagnostics: Sendable, Equatable {
             commandLine: commandLine,
             classification: classification
         )
+    }
+
+    /// `codexswitch-cli app-server-client` (and its `codex-shared` launcher)
+    /// relays a frontend to an existing app-server; it never holds account
+    /// credentials, even when its binary lives inside a managed runtime
+    /// directory. See docs/architecture/shared-app-server-client.md.
+    nonisolated static func isSharedAppServerClientCommandLine(_ commandLine: String) -> Bool {
+        let parts = commandLine.lowercased().split(whereSeparator: \.isWhitespace)
+        // Only the executable or a shell's script operand (after an optional
+        // pgrep PID) and the exact subcommand token identify the client;
+        // prompt text never does.
+        return parts.contains("app-server-client")
+            || parts.prefix(3).contains { part in
+                let name = part.split(separator: "/").last.map(String.init) ?? ""
+                return name == "codexswitch-cli" || name == "codex-shared"
+            }
     }
 
     nonisolated static func classifyAppServerPath(_ path: String) -> DesktopRuntimeAppServerClassification {
