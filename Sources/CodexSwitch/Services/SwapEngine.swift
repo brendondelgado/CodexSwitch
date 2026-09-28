@@ -805,6 +805,7 @@ enum SwapEngine {
     /// Enumerate all Codex processes by exact kernel process name. Runtime
     /// classification happens later from identity-bound argv and executable data.
     nonisolated static let codexProcessDiscoveryArguments = [
+        "-a",
         "-l",
         "-x",
         "codex",
@@ -3561,6 +3562,8 @@ enum SwapEngine {
     static func writeAuthFile(
         for account: CodexAccount,
         path: String? = nil,
+        expectedSnapshot: SecureAtomicFileTransaction.Snapshot? = nil,
+        authorizeEffect: @Sendable () -> Bool = { true },
         testHooks: AuthFileWriteTestHooks = AuthFileWriteTestHooks()
     ) throws {
         let targetPath = path ?? codexAuthPath
@@ -3573,6 +3576,14 @@ enum SwapEngine {
 
         try transaction.withExclusiveLock { lockedFile in
             let current = try lockedFile.read()
+            if let expectedSnapshot, current != expectedSnapshot {
+                throw SecureAtomicFileError.staleGeneration(
+                    expected: expectedSnapshot.generation.value, actual: current.generation.value
+                )
+            }
+            guard authorizeEffect() else {
+                throw AccountActivationCoordinatorError.authorizationRevoked
+            }
             let committed = try lockedFile.replace(data, expectedGeneration: current.generation)
             guard let committedBytes = committed.bytes,
                   committedBytes == data,

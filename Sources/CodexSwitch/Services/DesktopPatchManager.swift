@@ -226,6 +226,7 @@ private final class DesktopPatchMutationLease {
 }
 
 enum DesktopPatchManager {
+    private nonisolated static let markerScanCache = RuntimeMarkerScanCache(capacity: 128)
     struct InstallationFingerprint: Sendable, Equatable {
         struct FileFingerprint: Sendable, Equatable {
             let path: String
@@ -791,46 +792,19 @@ enum DesktopPatchManager {
             return false
         }
 
-        let fileDescriptor = open(path, O_RDONLY)
-        guard fileDescriptor >= 0 else { return false }
-        defer { close(fileDescriptor) }
-
-        let needle = Array(marker.utf8)
-        var failure = Array(repeating: 0, count: needle.count)
-        if needle.count > 1 {
-            for index in 1..<needle.count {
-                var matched = failure[index - 1]
-                while matched > 0, needle[index] != needle[matched] {
-                    matched = failure[matched - 1]
+        return markerScanCache.result(at: path, marker: marker, chunkSize: chunkSize) { handle in
+            let needle = Data(marker.utf8)
+            var overlap = Data()
+            do {
+                while let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty {
+                    var window = overlap
+                    window.append(chunk)
+                    if window.range(of: needle) != nil { return true }
+                    overlap = Data(window.suffix(needle.count - 1))
                 }
-                if needle[index] == needle[matched] {
-                    matched += 1
-                }
-                failure[index] = matched
-            }
-        }
-
-        var buffer = Array(repeating: UInt8(0), count: chunkSize)
-        var matched = 0
-        while true {
-            let bytesRead = read(fileDescriptor, &buffer, buffer.count)
-            if bytesRead == 0 { return false }
-            if bytesRead < 0 {
-                if errno == EINTR { continue }
                 return false
-            }
-
-            for index in 0..<bytesRead {
-                let byte = buffer[index]
-                while matched > 0, byte != needle[matched] {
-                    matched = failure[matched - 1]
-                }
-                if byte == needle[matched] {
-                    matched += 1
-                    if matched == needle.count {
-                        return true
-                    }
-                }
+            } catch {
+                return nil
             }
         }
     }

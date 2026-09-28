@@ -87,6 +87,17 @@ actor AccountActivationCoordinator {
         }
     }
 
+    nonisolated func snapshotForAuthorityRecovery() throws -> (
+        state: AccountActivationState, snapshot: SecureAtomicFileTransaction.Snapshot
+    )? {
+        try transaction.withExclusiveLock { lockedFile in
+            let snapshot = try lockedFile.read(allowMissing: false)
+            guard let state = try Self.decode(snapshot.bytes),
+                  state.phase == .manualReview, state.detail == .externalAuthConflict else { return nil }
+            return (state, snapshot)
+        }
+    }
+
     @discardableResult
     func beginPreparing(
         targetAccountId: UUID,
@@ -148,24 +159,41 @@ actor AccountActivationCoordinator {
     func beginVerifiedExternalAuthConflictRecovery(
         targetAccountId: UUID,
         durableSourceAccountId: UUID,
+        recoveryWitness: AuthorityConflictRecoveryWitness? = nil,
         requestedActivationGeneration: UUID = UUID(),
         authorizeEffect: @escaping StateEffectAuthorization = { _ in true },
         at date: Date = Date()
     ) throws -> AccountActivationCredentialMutationDecision {
         try withRuntimeLease {
-            try transaction.withExclusiveLock { lockedFile in
+            if let witness = recoveryWitness {
+                guard witness.authorizes(at: date), witness.filesUnchanged(),
+                      witness.target.id == targetAccountId,
+                      witness.source.id == durableSourceAccountId,
+                      witness.storePath == url.deletingLastPathComponent()
+                        .appendingPathComponent("accounts.json").path else {
+                    throw AccountActivationCoordinatorError.authorizationRevoked
+                }
+            }
+            return try transaction.withExclusiveLock { lockedFile in
                 let snapshot = try lockedFile.read()
                 let current = try Self.decode(snapshot.bytes)
                 guard let current,
                       current.phase == .manualReview,
                       current.detail == .externalAuthConflict,
-                      current.configuredAccountId == durableSourceAccountId
-                        || current.configuredAccountId == targetAccountId,
+                      (current.configuredAccountId == durableSourceAccountId
+                        || current.configuredAccountId == targetAccountId
+                        || recoveryWitness != nil),
                       targetAccountId != durableSourceAccountId else {
                     return .blocked(
                         current,
                         "authority recovery requires the matching external-auth conflict"
                     )
+                }
+                if let witness = recoveryWitness {
+                    guard snapshot == witness.journalSnapshot, current == witness.state,
+                          witness.authorizes(at: date) else {
+                        throw AccountActivationCoordinatorError.authorizationRevoked
+                    }
                 }
                 guard authorizeEffect(current) else {
                     throw AccountActivationCoordinatorError.authorizationRevoked
