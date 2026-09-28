@@ -295,6 +295,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     nonisolated static let rateLimitResetDecisionFreshnessInterval: TimeInterval = 60
     nonisolated static let configMaintenanceInterval: TimeInterval = 15 * 60
     nonisolated static let linuxDevboxCredentialSyncRetryDelay: TimeInterval = 5
+    /// Bounds read-only SSH receipt recovery for a held operation (previously every ~15 s).
+    nonisolated static let linuxDevboxCredentialReceiptRecoveryInterval: TimeInterval = 2 * 60
     nonisolated static let automaticPolicyGateTimeout: TimeInterval = 30
 
     // Set in applicationDidFinishLaunching before any other access
@@ -420,6 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var linuxDevboxCredentialSyncReconciliationInFlight = false
     private var pendingLinuxDevboxCredentialSyncFingerprint: String?
     private var lastLinuxDevboxCredentialSyncAttemptAt: Date?
+    private var lastLinuxDevboxCredentialReceiptRecoveryAt: Date?
     private var linuxDevboxCredentialSyncRetryTask: Task<Void, Never>?
     private var exhaustedPoolAlertGate = ExhaustedPoolAlertGate()
     private var codexAppTerminationObserver: NSObjectProtocol?
@@ -3393,6 +3396,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     ) {
         guard !linuxDevboxCredentialSyncInFlight,
               !linuxDevboxCredentialSyncReconciliationInFlight else { return }
+        let now = Date()
+        if let last = lastLinuxDevboxCredentialReceiptRecoveryAt,
+           now.timeIntervalSince(last) < Self.linuxDevboxCredentialReceiptRecoveryInterval {
+            return
+        }
+        lastLinuxDevboxCredentialReceiptRecoveryAt = now
         linuxDevboxCredentialSyncReconciliationInFlight = true
         let journal = linuxDevboxCredentialSyncJournal
         let finish: @MainActor @Sendable (
@@ -3420,6 +3429,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.clearLegacyLinuxDevboxCredentialSyncHold()
                 SwapLog.append(.debug(
                     "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=historical_completed_requires_fresh_convergence"
+                ))
+                self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "authority-reconciliation")
+            case .supersedable(let proof):
+                let backupPath: String
+                do {
+                    backupPath = try journal.supersedeUnrecoverable(operation: operation, proof: proof)
+                } catch {
+                    _ = try? journal.withCurrentRecoveryOperation(operation: operation) {
+                        self.surfaceLinuxDevboxCredentialSyncHold(
+                            operation: operation, context: "unrecoverable-supersession-journal-changed"
+                        )
+                    }
+                    return
+                }
+                // Unknown historical outcome: invalidate every cached convergence claim so
+                // the next sync re-baselines from a fresh remote observation.
+                UserDefaults.standard.removeObject(forKey: linuxDevboxLastCredentialSyncFingerprintKey)
+                UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialConvergenceProofKey)
+                self.clearLegacyLinuxDevboxCredentialSyncHold()
+                SwapLog.append(.debug(
+                    "LINUX_DEVBOX_CREDENTIAL_SYNC_SUPERSEDED operation=\(operation.operationID) outcome=superseded_unknown_outcome remote_active=\(proof.remoteEvidence.activeProviderAccountId) backup=\(backupPath)"
                 ))
                 self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "authority-reconciliation")
             case .unresolved(let reason):
