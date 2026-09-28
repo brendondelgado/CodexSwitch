@@ -43,7 +43,7 @@ version_control:
   branch: main
   commit: pending
   status: canonical
-  last_updated: 2026-09-25
+  last_updated: 2026-09-27
 ---
 
 # Quota And Reset Policy
@@ -193,6 +193,34 @@ does not advance that account's quota freshness. A required rotation is
 different: before ranking a destination, CodexSwitch refreshes every candidate
 whose current observation cannot safely authorize selection.
 
+Blocked reset holders have their own bounded freshness rule on the VPS. When
+automatic redemption is disabled, each daemon tick selects inactive paid
+accounts whose last quota observation was blocked (or that carry a usage-limit
+block) and whose last-known inventory lists available credits. For each, the
+daemon refreshes quota and reset inventory only when that observation is at
+least five minutes old, using the tick's provider-I/O guard, the one-refresh
+credential path, and the per-account, per-credential-generation inventory
+backoff. The set is limited to affected accounts, so this adds at most two GETs
+per holder per five minutes and no fan-out across usable or free accounts. A
+current non-quota runtime block such as `token_expired` excludes the account:
+no provider observation can succeed until its credential is re-imported, so
+its stored quota and inventory remain last-known and must be presented that
+way.
+
+Every inventory refreshed this way passes through the reset-journal classifier
+with submission disabled. An unexplained decrease of an unexpired available
+credit (for example a redemption made from T3, the Mac app, or directly in a
+Codex app-server) is journaled as external evidence with its 15-minute hold,
+and the account's quota is reconciled immediately in the same tick before the
+store commit, so readers such as the T3 usage hub stop showing pre-reset
+usage. In automatic mode the existing one-minute resettable-inventory refresh
+routes any inactive decrease through the same classifier instead of
+overwriting it; if classification fails the prior inventory is kept so the
+decrease is re-detected later. Rationale: five minutes matches the background
+inventory freshness bound, keeps usage views within one bound of an external
+redemption, and preserves duplicate-spend protection because the observation
+path can never submit a reset.
+
 Quota success does not prove inference readiness. Every active-readiness,
 failover, plan-upgrade, reset-conservation, and diagnostic candidate check must
 also parse the account's inference access-token JWT and require an `exp` value
@@ -233,6 +261,14 @@ unchanged; a failed body read is not a successful observation. Request timeout,
 proxy policy, and network retry behavior are unchanged. Deterministic fixtures
 must prove that non-200 classification never invokes the body reader, while
 200 responses preserve parsing and body-read failure semantics.
+
+A quota poll that completes with HTTP 200 but no recognised window
+(`usageUnavailable`, typical of free plans) is not capacity evidence. The Mac
+retries an inactive account in that state with exponential backoff from one
+minute to a one-hour cap, resetting on the next successful poll. The
+authority-selected account and transport, HTTP, and 429 failures keep the
+one-minute retry. Rationale: such accounts previously produced about 1,400
+identical poll errors per day each without ever yielding usable evidence.
 
 ## Candidate Ranking
 
@@ -346,9 +382,10 @@ reconciliation before the UI reports the current VPS value. Until a valid VPS
 observation exists, the remote toggle displays disabled and rejects mutation.
 An unconfigured standalone Mac continues to use its local preference.
 
-`codexswitch-cli redeem-reset <account>` is the manual entrypoint. On a
-configured Mac it submits one idempotent request to the VPS daemon; on the VPS
-it enters the daemon's local serialized policy transaction. It accepts one
+`codexswitch-cli redeem-reset <account>` is the manual entrypoint. It runs on
+the VPS, where it enters the daemon's local serialized policy transaction; the
+Mac menu app and T3 reach it through the bounded SSH/hub transports described
+below. It accepts one
 exact account selector, requires a paid account with complete runtime
 credentials, a normalized stable provider identity, a fresh blocked quota
 observation, and a fresh available credit with an explicit future expiration,
@@ -359,6 +396,38 @@ account, a free account, an unknown or stale quota, or an unresolved prior
 attempt fails closed without sending a consume request. The command may still
 reconcile an existing journaled attempt after quota becomes usable; that replay
 is observation-only and cannot submit another credit.
+
+On macOS the CLI refuses `redeem-reset` before reading the account store,
+reset journal, runtime-activation lease, or any provider endpoint, and emits a
+bounded `rejected` envelope when `--json` is set. When
+`~/.codexswitch/remote-authority.json` is enabled the message names the VPS as
+the reset owner and directs the operator to the CodexSwitch app or to the VPS
+CLI; otherwise it names the menu app as owner. The refusal is unconditional on
+macOS because the CLI store's journal (`accounts.reset-attempts.json`) is not
+the menu app's `reset-attempts.json`: a local CLI redemption would create a
+second, uncoordinated duplicate-spend journal and bypass the rule that a
+configured VPS is the only reset owner. Missing or unreadable authority state
+therefore still fails closed. Linux/VPS behavior is unchanged.
+
+The VPS daemon holds the runtime-activation lease for roughly 0.5-1.2 s of
+every ~6 s tick, so a manual request routinely arrives during a tick.
+`redeem-reset` therefore waits up to 8 s total, polling every 200 ms, for the
+lease instead of failing on first contention. Within the same budget it also
+retries the known pre-submission races (another owner of the provider-I/O
+lease, or the account store changing before reset provider I/O, during the
+targeted observation, or during activation preflight), at most twice because
+those follow a provider GET. A retry is allowed only while no consume request
+has started and the failure envelope would classify the operation as
+`rejected` with no journal attempt for the request ID; every retry reuses that
+request ID and starts from fresh durable state. Anything after submission may
+have started is never retried. When the budget is exhausted the command
+returns the original contention error with a `rejected` envelope. Rationale:
+8 s covers more than one full daemon tick while staying well inside the Mac
+and T3 bounded request timeouts, and 200 ms reliably lands in the multi-second
+idle gap between ticks without meaningful lock-probe load. The daemon does not
+yet yield a tick to a pending manual request; the bounded wait is the
+contract, and a longer tick (for example a rotation with runtime reload) can
+still exhaust the budget and return a retryable rejection.
 
 The Mac manual-control transport invokes `codexswitch-cli redeem-reset
 <provider-account-id> --json` through the bounded mutating SSH envelope. It
@@ -532,6 +601,26 @@ includes read-only journal metadata, without provider requests or a full health
 scan. Missing, unreadable, mismatched, or unresolved journal evidence stays
 blocked. Reopening the Mac app also restores unresolved remote-account holds
 from that journal observation.
+Because the rejection envelope message is identical for every cause, the Mac
+reads the specific reason from the command's bounded stderr error chain and
+shows it with an explicit statement that no reset was spent; that message is
+retained briefly so the follow-up observation does not erase it before it can
+be read, and an explicit refresh clears it. A rejection whose reason is that a
+VPS runtime activation owns the mutation lease is resubmitted at most once,
+after five seconds, with a new request UUID; the VPS command owns any longer
+lease wait. Unknown outcomes are never resubmitted. After every result,
+including timeout, the Mac immediately refreshes that account's provider
+inventory and quota (observation only) so the card converges within seconds.
+
+Redemptions made by any other client (the VPS daemon, T3, a Codex app-server)
+are detected from inventory evidence: a count drop beyond natural expiry, or a
+previously available unexpired credit identifier that disappeared, which also
+catches a consumption hidden by a simultaneous new grant. The Mac applies this
+rule both to its own inventory polls and to banks first learned through the
+VPS account mirror, and refreshes quota immediately on detection. When newer
+usable quota clears an external hold early, the in-memory copy is removed
+before the durable readback check; an intentional clear is not a lost write
+and must not disable automatic redemption.
 
 ## Reset Expiration Urgency
 
@@ -605,6 +694,14 @@ reconciliation in progress may use their distinct operational colors.
 - Render only observed windows.
 - Render an observation older than the runtime freshness contract as
   `quota=stale`; never print its cached percentages as current capacity.
+  In the menu app, an account card whose reading is older than
+  `QuotaFreshnessPolicy.maximumSnapshotAge` (15 minutes) shows a
+  `Stale usage — as of <age> ago` caption with the latest polling error, the
+  menu-bar tooltip appends `(stale, as of <age> ago)`, and the ring uses a
+  neutral color. Healthy accounts poll at least once a minute, so fifteen
+  minutes without success is unambiguous staleness.
+- Log reset-inventory refreshes only when the count, earned total, or credit
+  set changed; inventory failures log the HTTP status or transport error.
 - Label weekly-only operation through the meter itself; do not show an alarming missing-five-hour error.
 - Present exactly one authority-selected pool target, plus separate Mac and VPS
   convergence details for that target. Never style two accounts as current.

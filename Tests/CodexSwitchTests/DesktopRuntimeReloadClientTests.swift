@@ -899,6 +899,72 @@ struct DesktopRuntimeReloadClientTests {
         #expect(requests.map(\.port) == [9223, 9223])
     }
 
+    @Test("An unmanaged app-server beside the ChatGPT child does not block convergence")
+    func unmanagedAppServerDoesNotBlockDesktopConvergence() async {
+        let official = runtimeTarget(pid: 12_102)
+        let nativeTarget = CodexRuntimeTarget(
+            process: official.process,
+            runtimeKind: .officialDesktopStdioChild
+        )
+        let unmanaged = CodexUnmanagedRuntime(
+            pid: 81_444,
+            startSeconds: 1_000,
+            startMicroseconds: 0,
+            host: "T3 Code (Alpha)",
+            command: "codex app-server"
+        )
+        let strictTargets = LockedTestState<[Int32]>([])
+        let client = DesktopRuntimeReloadClient(
+            requestSender: { _, _ in .transportClosed("unused") },
+            dependencies: DesktopRuntimeReloadDependencies(
+                requiredOwnerUID: 501,
+                gate: CodexReloadAttemptGate(),
+                preliminaryDiscovery: {
+                    .snapshot(CodexPGrepProcessSnapshot(
+                        pids: [12_102, 81_444],
+                        isComplete: true
+                    ))
+                },
+                runtimeDiscovery: { _, _ in
+                    CodexRuntimeDiscoverySnapshot(
+                        targets: [nativeTarget],
+                        blockers: [],
+                        processSnapshotIsComplete: true,
+                        unmanagedRuntimes: [unmanaged]
+                    )
+                },
+                socketBinding: { _ in nil },
+                socketBindingIsCurrent: { _, _ in true },
+                alreadyAcknowledgedRuntimePIDs: { _, _, _, _ in [] },
+                strictReload: { discovery, _, _, _, _, _ in
+                    let pids = discovery.targets.map { $0.process.identity.pid }
+                    strictTargets.update { $0 = pids }
+                    return CodexReloadSummary(
+                        discoveredRuntimeCount: discovery.targets.count,
+                        acknowledgedRuntimeCount: discovery.targets.count
+                    )
+                }
+            )
+        )
+
+        let result = await client.reloadAuth(account: makeAccount())
+
+        #expect(strictTargets.read() == [12_102])
+        #expect(result == .reloaded(
+            method: "v3-native-stdio-ack",
+            discoveredRuntimeCount: 1,
+            acknowledgedRuntimeCount: 1
+        ))
+        let completion = AccountActivationConvergenceEvaluator.completion(
+            cliReload: CodexReloadSummary(
+                discoveredRuntimeCount: 0,
+                acknowledgedRuntimeCount: 0
+            ),
+            desktopReload: result
+        )
+        #expect(completion.outcome == .runtimeCurrent)
+    }
+
     @Test("Pre-admission failure preserves all discovered runtime counts")
     func preAdmissionFailurePreservesDiscoveredCounts() async {
         let (client, sender) = makeClient(

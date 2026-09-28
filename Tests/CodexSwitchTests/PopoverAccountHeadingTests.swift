@@ -5,58 +5,68 @@ import Testing
 @Suite("Active account presentation")
 @MainActor
 struct PopoverAccountHeadingTests {
-    @Test("Menubar follows the fresh pool target during Mac divergence")
-    func menubarUsesPoolTargetInsteadOfConfiguredAccount() {
+    @Test("Menubar follows the Mac-committed account and names a differing pool target")
+    func menubarUsesCommittedAccountAndNamesPoolTarget() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
         let configured = account(email: "configured@example.com", isActive: true)
         let poolTarget = account(email: "target@example.com", isActive: false)
-        let readModel = ActiveAccountReadModel(
-            providerAccountId: poolTarget.accountId,
-            epoch: 4,
-            freshness: .current
-        )
-
         let manager = AccountManager()
         manager.accounts = [configured, poolTarget]
+        manager.linuxDevboxStatus = LinuxDevboxStatus(
+            state: .ready,
+            summary: "Ready",
+            activeEmail: poolTarget.email,
+            activeProviderAccountId: poolTarget.accountId
+        )
+        manager.publishPoolAuthorityObservation(try PoolAuthorityObservation(
+            epoch: 4,
+            phase: .stable,
+            desiredProviderAccountId: poolTarget.accountId,
+            requestId: "44444444-4444-4444-8444-444444444444",
+            reason: "manual",
+            observedAt: now,
+            updatedAt: now,
+            previousProviderAccountId: configured.accountId,
+            detail: nil
+        ))
 
-        #expect(manager.logicalActiveAccount(using: readModel)?.id == poolTarget.id)
-        #expect(StatusBarController.poolTargetScopeLabel(
-            poolTargetAccountId: poolTarget.id,
-            runtimeCurrentAccountId: configured.id
-        ) == "Pool Target; Mac Runtime Not Current")
+        let display = manager.displayReadModel(at: now)
+        #expect(manager.logicalActiveAccount(at: now)?.id == poolTarget.id)
+        #expect(display.currentAccountId == configured.id)
+        #expect(display.poolTargetAccountId == poolTarget.id)
+        #expect(StatusBarController.currentScopeLabel(for: display)
+            == "Current: configured@example.com; Mac runtime unconfirmed; VPS target: target@example.com")
     }
 
-    @Test("Menubar preserves stale authority and never invents a fallback")
-    func menubarUsesOnlyAuthorityReadModel() {
-        let configured = account(email: "configured@example.com", isActive: true)
-        let staleTarget = account(email: "target@example.com", isActive: false)
+    @Test("Missing or contradictory Mac credentials never invent a current account")
+    func missingOrAmbiguousCommittedAccountFailsClosed() {
+        let first = account(email: "first@example.com", isActive: true)
+        let second = account(email: "second@example.com", isActive: true)
         let manager = AccountManager()
-        manager.accounts = [configured, staleTarget]
+        manager.accounts = [first, second]
 
-        #expect(manager.logicalActiveAccount(
-            using: ActiveAccountReadModel(
-                providerAccountId: staleTarget.accountId,
-                epoch: 5,
-                freshness: .stale
-            )
-        )?.id == staleTarget.id)
-        #expect(manager.logicalActiveAccount(using: .unavailable) == nil)
-        manager.accounts.append(staleTarget)
-        #expect(manager.logicalActiveAccount(
-            using: ActiveAccountReadModel(
-                providerAccountId: staleTarget.accountId,
-                epoch: 5,
-                freshness: .current
-            )
-        ) == nil)
-        #expect(StatusBarController.poolTargetScopeLabel(
-            poolTargetAccountId: staleTarget.id,
-            runtimeCurrentAccountId: configured.id,
-            freshness: .stale
-        ) == "Pool Target; Mac Runtime Not Current")
-        #expect(AccountCardView.poolTargetLabel(for: .stale)
-            == "Pool Target")
-        #expect(PopoverContentView.poolTargetLabel(for: .stale)
-            == "Pool Target")
+        let ambiguous = manager.displayReadModel()
+        #expect(ambiguous.currentAccountId == nil)
+        #expect(ambiguous.currentIsAmbiguous)
+        #expect(PopoverContentView.missingCurrentAccountLabel(for: ambiguous)
+            == "Mac committed account is ambiguous")
+
+        manager.accounts = [account(email: "idle@example.com", isActive: false)]
+        let none = manager.displayReadModel()
+        #expect(none.currentAccountId == nil)
+        #expect(!none.currentIsAmbiguous)
+        #expect(PopoverContentView.missingCurrentAccountLabel(for: none)
+            == "No account committed on this Mac")
+        #expect(AccountCardView.currentLabel == "Current")
+        #expect(PopoverContentView.currentAccountLabel == "Current (Mac)")
+    }
+
+    @Test("Stale ages are compact")
+    func staleAgesAreCompact() {
+        #expect(AccountDisplayReadModel.compactAge(45) == "45s")
+        #expect(AccountDisplayReadModel.compactAge(12 * 60) == "12m")
+        #expect(AccountDisplayReadModel.compactAge(9 * 3_600 + 59) == "9h")
+        #expect(AccountDisplayReadModel.compactAge(3 * 86_400) == "3d")
     }
 
     private func account(email: String, isActive: Bool) -> CodexAccount {

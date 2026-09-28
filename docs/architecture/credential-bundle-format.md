@@ -251,9 +251,10 @@ incoming credential generation also preserves that host's runtime blocker. A
 strictly newer incoming generation instead carries its own runtime-blocker
 state, because a blocker observed against the replaced generation must not make
 freshly reauthenticated credentials appear to require login. Generation order
-must remain provable from inference-token expiry. Divergent access-token sets
-with equal expiry are not ordered; malformed, equal-expiry, or otherwise
-unordered divergent generations fail closed.
+must remain provable from inference-token expiry, with issue time (`iat`)
+ordering equal expiries. Divergent access-token sets with equal expiry and
+issue time are not ordered; malformed, tied, or otherwise unordered divergent
+generations fail closed.
 
 ## Reconciliation and Retry
 

@@ -27,23 +27,46 @@ final class StatusBarController {
         return rate > 0 ? window.effectiveRemainingPercent / rate : .infinity
     }
 
-    static func poolTargetScopeLabel(
-        poolTargetAccountId: UUID,
-        runtimeCurrentAccountId: UUID?,
-        freshness: ActiveAccountAuthorityFreshness = .current
-    ) -> String {
-        let target: String
-        switch freshness {
-        case .current:
-            target = "Pool Target"
-        case .stale:
-            target = "Pool Target"
-        case .unavailable:
-            target = "Pool Target unavailable"
+    static func macRuntimeLabel(_ state: MacCredentialRuntimeState) -> String? {
+        switch state {
+        case .confirmed:
+            return nil
+        case .activating:
+            return "Mac activation pending"
+        case .restartRequired:
+            return "Mac runtime restart required"
+        case .configuredOnly:
+            return "no local Codex runtime"
+        case .manualReview:
+            return "Mac activation needs review"
+        case .unconfirmed:
+            return "Mac runtime unconfirmed"
         }
-        return runtimeCurrentAccountId == poolTargetAccountId
-            ? "\(target); Mac Runtime Current"
-            : "\(target); Mac Runtime Not Current"
+    }
+
+    /// Tooltip scope for the account the ring shows: the Mac-committed
+    /// current account, plus the VPS target only when it differs or is stale.
+    static func currentScopeLabel(for model: AccountDisplayReadModel) -> String {
+        var parts = ["Current: \(model.currentEmail ?? "none")"]
+        if let runtime = macRuntimeLabel(model.macRuntime) {
+            parts.append(runtime)
+        }
+        if let note = model.poolTargetNote {
+            parts.append(note)
+        }
+        if !model.unmanagedRuntimes.isEmpty {
+            let count = model.unmanagedRuntimes.count
+            parts.append(count == 1
+                ? "1 unmanaged runtime needs restart"
+                : "\(count) unmanaged runtimes need restart")
+        }
+        return parts.joined(separator: "; ")
+    }
+
+    /// Tooltip suffix marking a cached reading older than the freshness contract.
+    static func staleQuotaTooltipSuffix(for snapshot: QuotaSnapshot, now: Date) -> String {
+        QuotaFreshnessPolicy.staleAgeLabel(fetchedAt: snapshot.fetchedAt, now: now)
+            .map { " (stale, \($0))" } ?? ""
     }
 
     /// Update the menu bar icon — circular ring with percentage
@@ -57,21 +80,17 @@ final class StatusBarController {
         }
 
         let now = Date()
-        let readModel = manager.activeAccountReadModel(at: now)
-        guard let displayedAccount = manager.logicalActiveAccount(
-            using: readModel
-        ) else {
-            button.toolTip = readModel.freshness == .unavailable
-                ? "Pool authority unavailable"
-                : "Pool target missing or ambiguous"
+        let model = manager.displayReadModel(at: now)
+        guard let displayedAccount = manager.accounts.first(where: {
+            $0.id == model.currentAccountId
+        }) else {
+            button.toolTip = model.currentIsAmbiguous
+                ? "Mac committed account is ambiguous"
+                : "No account committed on this Mac"
             applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "...")
             return
         }
-        let scope = Self.poolTargetScopeLabel(
-            poolTargetAccountId: displayedAccount.id,
-            runtimeCurrentAccountId: manager.runtimeCurrentAccount?.id,
-            freshness: readModel.freshness
-        )
+        let scope = Self.currentScopeLabel(for: model)
 
         guard let snapshot = displayedAccount.realQuotaSnapshot else {
             button.toolTip = "\(scope): rate limits unavailable"
@@ -79,15 +98,16 @@ final class StatusBarController {
             return
         }
 
+        let staleSuffix = Self.staleQuotaTooltipSuffix(for: snapshot, now: now)
         if snapshot.isDenied {
             let quota = snapshot.limitReached == true ? "quota exhausted" : "quota unavailable"
-            button.toolTip = "\(scope): \(quota)"
+            button.toolTip = "\(scope): \(quota)\(staleSuffix)"
             applyRingIcon(button: button, percent: 0, color: .systemRed, text: "!")
             return
         }
 
         guard let window = urgentWindow(from: snapshot) else {
-            button.toolTip = "\(scope): quota unknown"
+            button.toolTip = "\(scope): quota unknown\(staleSuffix)"
             applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "--")
             return
         }
@@ -95,13 +115,14 @@ final class StatusBarController {
         let remaining = window.effectiveRemainingPercent
         let color: NSColor
         switch remaining {
+        case _ where !staleSuffix.isEmpty: color = .secondaryLabelColor
         case 50...: color = .systemGreen
         case 20..<50: color = .systemYellow
         case 5..<20: color = .systemOrange
         default: color = .systemRed
         }
 
-        button.toolTip = "\(scope): \(QuotaWindowDisplay.label(for: window)) \(Int(remaining))% remaining"
+        button.toolTip = "\(scope): \(QuotaWindowDisplay.label(for: window)) \(Int(remaining))% remaining\(staleSuffix)"
         applyRingIcon(button: button, percent: remaining, color: color, text: "\(Int(remaining))")
     }
 

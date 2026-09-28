@@ -147,7 +147,7 @@ struct AccountCardViewTests {
         #expect(menuSource.contains("Button(\"Reauthenticate\")"))
     }
 
-    @Test("A pool target never becomes a second switch action during host mismatch")
+    @Test("The current account never becomes a second switch action during host mismatch")
     @MainActor
     func poolTargetDoesNotBecomeAnotherSwitchActionDuringMismatch() {
         let account = makeAccount(isActive: true)
@@ -162,7 +162,7 @@ struct AccountCardViewTests {
             }
         )
 
-        #expect(AccountCardView.poolTargetLabel == "Pool Target")
+        #expect(AccountCardView.currentLabel == "Current")
         #expect(!view.handlePrimaryClick())
         #expect(!didSwap)
     }
@@ -208,7 +208,7 @@ struct AccountCardViewTests {
             pollingError: nil,
             onReauthenticate: nil,
             onForceSwap: {}
-        ).primaryActionAccessibilityHint == "This account is the pool target")
+        ).primaryActionAccessibilityHint == "This account is current on this Mac")
 
         #expect(AccountCardView(
             account: account,

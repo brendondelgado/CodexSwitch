@@ -208,3 +208,75 @@ struct AccountActivationConfirmationTransaction: Sendable {
         return .confirmed(confirmed)
     }
 }
+
+/// In-memory spacing for automatic same-target retries that keep failing the
+/// same way. The journal cadence (capped at five minutes) remains the lower
+/// bound; identical consecutive failures for one activation generation double
+/// the spacing up to one hour. A different failure signature, a new
+/// activation generation, a confirmed runtime, an explicit operator retry, or
+/// an app relaunch restores the normal journal cadence.
+struct ActivationRetryEscalation: Equatable, Sendable {
+    static let baseInterval: TimeInterval = 5 * 60
+    static let maximumInterval: TimeInterval = 60 * 60
+
+    private(set) var activationGeneration: UUID?
+    private(set) var signature: String?
+    private(set) var identicalFailureCount = 0
+    private(set) var lastFailureAt: Date?
+
+    static func signature(for completion: AccountActivationRuntimeCompletion) -> String {
+        let blockers = completion.blockers
+            .map { "\($0.pid):\($0.reason.rawValue)" }
+            .sorted()
+            .joined(separator: ";")
+        return [
+            completion.detail ?? "none",
+            "\(completion.discoveredRuntimeCount)",
+            "\(completion.acknowledgedRuntimeCount)",
+            blockers,
+        ].joined(separator: "|")
+    }
+
+    mutating func recordFailure(
+        activationGeneration: UUID,
+        signature: String,
+        at date: Date
+    ) {
+        if self.activationGeneration == activationGeneration,
+           self.signature == signature {
+            identicalFailureCount = min(identicalFailureCount + 1, 64)
+        } else {
+            self.activationGeneration = activationGeneration
+            self.signature = signature
+            identicalFailureCount = 1
+        }
+        lastFailureAt = date
+    }
+
+    mutating func reset() {
+        self = ActivationRetryEscalation()
+    }
+
+    func nextAutomaticRetryAt(activationGeneration: UUID) -> Date? {
+        guard self.activationGeneration == activationGeneration,
+              identicalFailureCount >= 2,
+              let lastFailureAt else {
+            return nil
+        }
+        let exponent = Double(min(identicalFailureCount - 1, 16))
+        let interval = min(
+            Self.baseInterval * pow(2, exponent),
+            Self.maximumInterval
+        )
+        return lastFailureAt.addingTimeInterval(interval)
+    }
+
+    func permitsAutomaticRetry(activationGeneration: UUID, at date: Date) -> Bool {
+        guard let next = nextAutomaticRetryAt(
+            activationGeneration: activationGeneration
+        ) else {
+            return true
+        }
+        return date >= next
+    }
+}

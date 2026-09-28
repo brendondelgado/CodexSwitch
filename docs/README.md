@@ -19,6 +19,7 @@ cross_dependencies:
   - architecture/macos-runtime-discovery.md
   - architecture/macos-runtime-artifact.md
   - architecture/secure-drop-transport.md
+  - architecture/t3-usage-hub.md
 version_control:
   branch: main
   status: canonical
@@ -57,6 +58,7 @@ A deployed VPS binary may be older than the repository. A UI can also be stale w
 - [macOS CLI launcher](architecture/macos-cli-launcher.md): prevalidated runtime routing without per-invocation binary scans or fallback ambiguity.
 - [Subprocess execution](architecture/subprocess-execution.md): bounded output capture, timeout escalation, reaping, and actor-isolation rules.
 - [SecureDrop transport](architecture/secure-drop-transport.md): artifact integrity, staging, extraction, deletion safety, and retention.
+- [T3 usage hub](architecture/t3-usage-hub.md): how T3 Code reads VPS usage and redeems banked resets through the CodexSwitch journal.
 - [Session retention contract](architecture/session-retention-contract.md): preservation and representation of remote thread history.
 
 ## Operations
@@ -66,6 +68,7 @@ A deployed VPS binary may be older than the repository. A UI can also be stale w
 - [VPS connection resilience](runbooks/vps-connection-resilience.md): transport and service resource policy.
 - [VPS thread repair](runbooks/codex-vps-thread-state-heal.md): explicit thread-state recovery; status checks never heal.
 - [Runtime storage hardening](runbooks/runtime-storage-hardening-deployment.md): bounded rollout and runtime storage.
+- [Credential sync hold recovery](runbooks/credential-sync-hold-recovery.md): retire an unrecoverable sync hold and deliver fresh Mac credentials.
 - [SIGHUP safety](sighup-safety.md): signal target verification and historical failure modes.
 
 ## Plans And Audits

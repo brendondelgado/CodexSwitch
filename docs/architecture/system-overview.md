@@ -40,7 +40,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-09-04
+  last_updated: 2026-09-28
 ---
 
 # CodexSwitch System Overview
@@ -142,34 +142,42 @@ readiness-notification enablement.
 
 ### Active Account Read Model
 
-Every Mac presentation surface consumes one immutable active-account read
-model derived only from the last accepted pool-authority observation. The model
-contains exactly one provider account identifier, its monotonically increasing
-authority epoch, and a freshness state (`current`, `stale`, or `unavailable`).
-It never inspects account `isActive` flags, list position, quota movement,
-runtime-current evidence, or plan ranking to choose an identity.
+Every Mac presentation surface consumes one immutable display read model,
+`AccountManager.displayReadModel(at:)`. The menu-bar ring, tooltip, popover
+header, account cards, and current-account section all read it, so they cannot
+disagree.
 
-- A current observation exposes its provider identity and epoch as `current`
-  only while authority transport and readiness configuration coherently report
-  available. A fresh cached observation behind a disabled or unavailable
-  readiness path is presented as `stale`, not current.
-- When that observation ages out or authority transport becomes unavailable,
-  the same provider identity and epoch remain visible as `stale`. Staleness may
-  change styling and health text, but it cannot select or highlight a different
-  account.
-- Before any authority observation has been accepted, the model is
-  `unavailable` and has no identity. The UI must show an unavailable target; it
-  must not fall back to a locally configured account.
-- A provider identity resolves to an account only when exactly one account
-  record matches it. Missing or duplicate matches fail closed and produce no
-  logical active account.
-- Account ordering may place the resolved authority target first within its
-  plan tier, but ordering cannot create a target. Likewise, local activation
-  and runtime evidence are convergence details for that target, not alternative
-  active-account sources.
+- **Current** is the account whose credentials are committed on the Mac: the
+  single account whose local active flag matches the committed
+  `~/.codex/auth.json`. Local Codex runtimes draw from it. Contradictory local
+  active flags fail closed to "ambiguous" and never pick one. No account is
+  ever presented as current merely because the pool authority names it.
+- **Mac runtime state** for the current account comes from the activation
+  journal: `confirmed`, `activating`, `restartRequired`, `configuredOnly`,
+  `manualReview`, or `unconfirmed`.
+- **VPS target** is the last accepted pool-authority observation, resolved to
+  exactly one account and carrying a freshness state (`current`, `stale`, or
+  `unavailable`). A fresh observation behind a disabled or unavailable
+  readiness path is `stale`. The target is shown separately only when it
+  differs from the current account or is not `current`, for example
+  "VPS target: X (stale 9h)" or "VPS target: X (VPS not verified)".
+- **Unmanaged runtime warnings** list foreign-hosted app-servers that started
+  before the last credential write (see `macos-runtime-discovery.md`).
 
-This distinction lets local credentials and runtimes remain operational during
-an authority outage without presenting their incidental state as pool truth.
+Account ordering may place the current account first within its plan tier, but
+ordering never selects or activates an account. Policy, remote-first swaps, and
+adoption still use the pool-authority observation (`logicalActiveAccount`,
+`isPoolTarget`), not this display model.
+
+Rationale: the previous model derived the displayed account only from the pool
+authority. The Mac went hours without accepting a fresh VPS observation
+(2026-09-27: every readiness check discarded, and a persistent credential-sync
+hold kept readiness unverified). Meanwhile activation sat in
+`CommittedDegraded`. The menu bar then showed the stale authority target or an
+exhausted previous account while Codex actually drew from the account committed
+in `auth.json`. Showing the committed credentials as current, and the VPS
+target as a separate, explicitly stale detail, keeps the display truthful
+during a VPS outage without letting local state become pool authority.
 
 One `authorityConfigured` predicate, derived from a valid remote endpoint,
 governs transport publication, authority polling, credential convergence, and
@@ -184,17 +192,17 @@ credential-sync transaction.
 ### Mac Account Display Order
 
 Mac account presentation sorts by `CodexAccount.planPriority` descending before
-any health or authority preference: Pro, Pro Lite, Plus/other paid, then
+any health or current-account preference: Pro, Pro Lite, Plus/other paid, then
 Free/unknown. Plan aliases and unknown plans with an active subscription follow
 that existing model. An expired subscription or token, exhausted quota, missing
 quota, or reauthentication requirement cannot move an account below a lower
-plan tier. Even a healthy Free account that is the resolved authority target
+plan tier. Even a healthy Free account that is the current account
 remains below Pro and other paid accounts.
 
-Within each tier, retain the existing order: resolved authority target first,
-immediately usable accounts next, descending `SwapEngine.score`, then the
-earliest most-urgent quota reset. Exact ties retain input order. Local
-`isActive` flags do not independently promote an account.
+Within each tier, retain the existing order: the Mac-committed current account
+first, immediately usable accounts next, descending `SwapEngine.score`, then
+the earliest most-urgent quota reset. Exact ties retain input order.
+Contradictory local active flags promote no account.
 
 This is a read-only display contract in `AccountManager.sortedAccounts`.
 Automatic rotation eligibility, candidate scoring, and candidate ordering stay

@@ -90,6 +90,14 @@ wrong target, staging remnants, and conflicting local/remote receipts.
 
 # Legacy Supersession
 
+Update 2026-09-27: automatic bounded supersession replaces the rule below that
+forbade automatic clearing. The receipt-aware VPS must report `missing`, the
+operation must be at least 24 hours old, and its importer and staging must be
+absent. The result is `superseded_unknown_outcome`, never success. See
+`../architecture/runtime-and-host-ownership.md` and
+`../runbooks/credential-sync-hold-recovery.md`. The operator script below remains
+available for receipt-less holds on hosts that cannot run the status command.
+
 The September 9 hold has no durable receipt; this change cannot reconstruct one.
 Do not auto-clear it or label it successful. Explicit reviewed supersession must
 bind the full local journal generation, target,

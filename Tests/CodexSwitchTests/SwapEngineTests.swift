@@ -1297,6 +1297,108 @@ struct SwapEngineTests {
         )
     }
 
+    @Test("Stdio app-servers hosted outside ChatGPT are unmanaged, not targets or blockers")
+    func foreignHostedStdioAppServerIsUnmanaged() {
+        // Production 2026-09-27: pid 81444, a stdio `codex app-server`
+        // spawned by another app, was classified as the official desktop
+        // child, could never bootstrap, and held activation in
+        // CommittedDegraded for ~9h (106 identical retries).
+        let officialPID: Int32 = 12_102
+        let foreignPID: Int32 = 81_444
+        let unknownPID: Int32 = 81_445
+        let managedPath =
+            "/Users/me/.local/share/codexswitch/prepared-codex/0.153.2/runtime/codex"
+        let identities = [
+            officialPID: signalIdentity(pid: officialPID, executablePath: managedPath),
+            foreignPID: signalIdentity(pid: foreignPID, executablePath: managedPath),
+            unknownPID: signalIdentity(pid: unknownPID, executablePath: managedPath),
+        ]
+        let arguments = [
+            "codex", "-c", "features.code_mode_host=true", "app-server",
+            "--analytics-default-enabled",
+        ]
+        let discovery = SwapEngine.desktopRuntimeDiscoverySnapshot(
+            from: CodexPGrepProcessSnapshot(
+                pids: [officialPID, foreignPID, unknownPID],
+                isComplete: true
+            ),
+            requiredOwnerUID: 501,
+            identityProvider: { identities[$0] },
+            argumentProvider: { identities[$0] == nil ? nil : arguments },
+            kernelExecutableIdentityProvider: { pid in
+                guard let identity = identities[pid] else { return nil }
+                return self.kernelIdentity(
+                    path: identity.executablePath,
+                    inode: 10_000 + UInt64(pid)
+                )
+            },
+            managedDesktopRuntimePath: managedPath,
+            desktopHostAncestry: { pid in
+                switch pid {
+                case officialPID: return .officialDesktopHost
+                case foreignPID: return .foreignHost("T3 Code (Alpha)")
+                default: return .unknown
+                }
+            }
+        )
+
+        #expect(discovery.isComplete)
+        #expect(discovery.blockers.isEmpty)
+        // An unreadable chain stays strict: it remains a target.
+        #expect(discovery.targets.map { $0.process.identity.pid } == [officialPID, unknownPID])
+        #expect(discovery.targets.allSatisfy { $0.runtimeKind == .officialDesktopStdioChild })
+        #expect(discovery.unmanagedRuntimes.map(\.pid) == [foreignPID])
+        #expect(discovery.unmanagedRuntimes.first?.host == "T3 Code (Alpha)")
+        #expect(discovery.unmanagedRuntimes.first?.command
+            == "codex -c features.code_mode_host=true app-server --analytics-default-enabled")
+
+        let summary = SwapEngine.desktopReloadSummary(
+            from: discovery,
+            acknowledgedPIDs: [officialPID, unknownPID]
+        )
+        #expect(summary.outcome == .allDiscoveredRuntimesAcknowledged)
+        #expect(summary.discoveredRuntimeCount == 2)
+    }
+
+    @Test("Desktop host ancestry distinguishes ChatGPT, foreign apps, and unreadable chains")
+    func desktopHostAncestryClassification() {
+        let parents: [Int32: Int32] = [
+            100: 90, 90: 1,          // ChatGPT child
+            200: 190, 190: 180, 180: 1,  // T3 helper chain
+            300: 290, 290: 1,        // shell-launched
+            400: 390,                // unreadable parent executable
+            500: 490, 490: 1,        // orphan-like chain inside a nested helper
+        ]
+        let paths: [Int32: String] = [
+            90: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            190: "/Applications/T3 Code (Alpha).app/Contents/Frameworks/T3 Code (Alpha) Helper.app/Contents/MacOS/T3 Code (Alpha) Helper",
+            180: "/Applications/T3 Code (Alpha).app/Contents/MacOS/T3 Code (Alpha)",
+            290: "/bin/zsh",
+            490: "/Applications/ChatGPT.app/Contents/Resources/helper",
+        ]
+        func ancestry(_ pid: Int32) -> CodexDesktopHostAncestry {
+            CodexDesktopNativeChildCoordinator.desktopHostAncestry(
+                pid: pid,
+                parentPID: { parents[$0] },
+                executablePath: { paths[$0] }
+            )
+        }
+
+        #expect(ancestry(100) == .officialDesktopHost)
+        #expect(ancestry(200) == .foreignHost("T3 Code (Alpha)"))
+        #expect(ancestry(300) == .foreignHost("zsh"))
+        #expect(ancestry(400) == .unknown)
+        #expect(ancestry(600) == .unknown)
+        // A non-main executable inside ChatGPT.app is not the host itself.
+        #expect(ancestry(500) == .foreignHost("ChatGPT"))
+        #expect(CodexDesktopNativeChildCoordinator.isOfficialDesktopHostExecutable(
+            "/Applications/Codex.app/Contents/MacOS/Codex"
+        ))
+        #expect(!CodexDesktopNativeChildCoordinator.isOfficialDesktopHostExecutable(
+            "/Users/me/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        ))
+    }
+
     @Test("Identity-bound argv capture requires owner and matching identities")
     func identityBoundArgumentsRequireStableOwnedIdentity() {
         let expected = signalIdentity(pid: 41)

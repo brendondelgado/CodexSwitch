@@ -140,6 +140,26 @@ pub fn load_config(path: &Path) -> Result<RemoteAuthorityConfig> {
     Ok(config)
 }
 
+/// Read-only observation of whether the Mac app has published an enabled
+/// remote-authority transport. Unlike [`load_config`], this does not validate
+/// the endpoint or key path: a corrupt endpoint must never be mistaken for
+/// "no VPS authority". Returns `None` when the file is absent.
+pub fn observe_enabled_flag(path: &Path) -> Result<Option<bool>> {
+    let snapshot = secure_file::observe(path, REMOTE_AUTHORITY_CONFIG_MAX_BYTES, false)
+        .context("failed to securely observe remote-authority transport config")?;
+    let Some(bytes) = snapshot.bytes() else {
+        return Ok(None);
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("remote-authority transport config is malformed")?;
+    Ok(Some(
+        value
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    ))
+}
+
 pub fn fetch_status() -> Result<PoolAuthorityStatus> {
     let config = load_default_config()?;
     fetch_status_with(&config, &run_ssh)

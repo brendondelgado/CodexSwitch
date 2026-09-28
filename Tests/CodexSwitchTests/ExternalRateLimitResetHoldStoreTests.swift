@@ -400,6 +400,114 @@ struct ExternalRateLimitResetHoldStoreTests {
         return (suiteName, defaults)
     }
 
+    @Test("Quota-recovery clear keeps restore readable and drops the in-memory hold")
+    func quotaRecoveryClearThenRestoreStaysReadable() throws {
+        let storeURL = temporaryStoreURL()
+        defer { try? FileManager.default.removeItem(at: storeURL.deletingLastPathComponent()) }
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let rawProviderAccountId = "  Provider-Account-1 "
+        let key = "provider-account-1"
+        let otherKey = "provider-account-2"
+        let store = ExternalRateLimitResetHoldStore(url: storeURL, legacyUserDefaults: nil)
+        let known: Set<String> = [key, otherKey]
+
+        // Observation path: durable record, then the same value in memory, then restore.
+        let recorded = try #require(try store.record(
+            providerAccountId: rawProviderAccountId,
+            observedAt: observedAt,
+            blockedUntil: observedAt.addingTimeInterval(900)
+        ))
+        let other = try #require(try store.record(
+            providerAccountId: otherKey,
+            observedAt: observedAt,
+            blockedUntil: observedAt.addingTimeInterval(600)
+        ))
+        var inMemory = [key: recorded.blockedUntil, otherKey: other.blockedUntil]
+        let afterRecord = try #require(AppDelegate.reconciledExternalRateLimitResetHolds(
+            inMemory: inMemory,
+            persisted: try store.activeHolds(at: observedAt.addingTimeInterval(1)),
+            knownProviderAccountIds: known,
+            now: observedAt.addingTimeInterval(1)
+        ))
+        #expect(afterRecord == inMemory)
+
+        // Quota-recovery path: durable clear, in-memory removal, then restore readback.
+        let clearAt = observedAt.addingTimeInterval(31)
+        let cleared = try #require(try store.clearIfQuotaRecovered(
+            providerAccountId: rawProviderAccountId,
+            snapshot: quotaSnapshot(fetchedAt: observedAt.addingTimeInterval(30), usedPercent: 10),
+            at: clearAt
+        ))
+        let persistedAfterClear = try store.activeHolds(at: clearAt)
+
+        // Regression guard (45ebc50): restoring without dropping the in-memory copy
+        // reports a readback mismatch and would disable automatic redemption.
+        #expect(AppDelegate.reconciledExternalRateLimitResetHolds(
+            inMemory: inMemory,
+            persisted: persistedAfterClear,
+            knownProviderAccountIds: known,
+            now: clearAt
+        ) == nil)
+
+        inMemory = AppDelegate.externalRateLimitResetHolds(
+            inMemory,
+            removingRecoveredHold: cleared,
+            providerAccountId: rawProviderAccountId
+        )
+        let restored = try #require(AppDelegate.reconciledExternalRateLimitResetHolds(
+            inMemory: inMemory,
+            persisted: persistedAfterClear,
+            knownProviderAccountIds: known,
+            now: clearAt
+        ))
+        #expect(restored[key] == nil)
+        #expect(restored[otherKey] == other.blockedUntil)
+    }
+
+    @Test("A newer in-memory hold survives a recovery clear of an older hold")
+    func recoveryClearRetainsNewerInMemoryHold() {
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let cleared = ExternalRateLimitResetHoldStore.Hold(
+            observedAt: observedAt,
+            blockedUntil: observedAt.addingTimeInterval(900)
+        )
+        let newer = observedAt.addingTimeInterval(1_200)
+        let holds = AppDelegate.externalRateLimitResetHolds(
+            ["provider-account-1": newer],
+            removingRecoveredHold: cleared,
+            providerAccountId: "PROVIDER-ACCOUNT-1"
+        )
+        #expect(holds["provider-account-1"] == newer)
+        // The retained hold is missing from disk, so restore still fails closed.
+        #expect(AppDelegate.reconciledExternalRateLimitResetHolds(
+            inMemory: holds,
+            persisted: [:],
+            knownProviderAccountIds: ["provider-account-1"],
+            now: observedAt.addingTimeInterval(10)
+        ) == nil)
+        // Blank identifiers never remove anything.
+        #expect(AppDelegate.externalRateLimitResetHolds(
+            ["provider-account-1": newer],
+            removingRecoveredHold: cleared,
+            providerAccountId: "   "
+        ) == ["provider-account-1": newer])
+    }
+
+    @Test("Restore ignores expired and unknown-account in-memory holds")
+    func restoreIgnoresExpiredAndUnknownHolds() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let restored = AppDelegate.reconciledExternalRateLimitResetHolds(
+            inMemory: [
+                "expired": now.addingTimeInterval(-1),
+                "removed-account": now.addingTimeInterval(600),
+            ],
+            persisted: [:],
+            knownProviderAccountIds: ["expired"],
+            now: now
+        )
+        #expect(restored == [:])
+    }
+
     private func temporaryStoreURL() -> URL {
         makeSecureTestFileURL(
             prefix: "codexswitch-external-reset-holds",

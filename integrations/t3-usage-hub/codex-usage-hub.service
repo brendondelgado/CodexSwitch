@@ -1,0 +1,11 @@
+[Unit]
+Description=CodexSwitch usage hub for T3 Code (127.0.0.1:8319, CLIProxyAPI-compatible subset)
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/share/signul/codex-usage-hub/hub.py
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

@@ -1847,7 +1847,8 @@ struct LinuxDevboxMonitorTests {
     func credentialSyncContextsExcludeQuotaOnlyRefreshesAndRemoteMirrorPersistence() {
         #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "token-refresh"))
         #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "swap"))
-        #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "reauth-account"))
+        #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "reauth-account"))
+        #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "queued-after-reauth-account"))
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "quota-update"))
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "quota-primed"))
         #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "subscription-info"))

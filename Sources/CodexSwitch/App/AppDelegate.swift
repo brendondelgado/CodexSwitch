@@ -160,11 +160,13 @@ private struct PreparedAccountActivation: Sendable {
     let expectedConfiguredAccountId: UUID?
     let previousActivationState: AccountActivationState?
     let lease: AccountMutationLease
+    var authorityConflictRecovery: AuthorityConflictRecoveryWitness? = nil
 }
 
 @MainActor
 private final class ConfiguredCredentialPublicationBuffer {
     var persistedAccounts: [CodexAccount]?
+    var recoveryStoreSnapshot: SecureAtomicFileTransaction.Snapshot?
 }
 
 private enum AccountActivationPreparationResult: Sendable {
@@ -357,6 +359,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var rateLimitResetManualErrors: [UUID: String] = [:] {
         didSet { publishRateLimitResetPresentations() }
     }
+    /// Manual errors that an immediate follow-up inventory refresh must not erase before
+    /// the user can read them (for example, a VPS rejection's specific reason).
+    private var rateLimitResetManualErrorPinnedUntil: [UUID: Date] = [:]
     private var rateLimitResetUnresolvedProviderAccountIds: Set<String> = [] {
         didSet { publishRateLimitResetPresentations() }
     }
@@ -387,6 +392,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var linuxDevboxReadinessCheckInFlight = false
     private var linuxDevboxReadinessGeneration: UInt64 = 0
     private var linuxDevboxReadinessTaskContext: LinuxDevboxReadinessTaskContext?
+    private var linuxDevboxSurfacedCredentialSyncHold: LinuxDevboxSurfacedCredentialSyncHold?
+    private var activationRetryEscalation = ActivationRetryEscalation()
+    private var linuxDevboxCredentialReconciliationBackoff =
+        LinuxDevboxCredentialReconciliationBackoff()
+    private var unmanagedRuntimeRefreshInFlight = false
+    private var lastUnmanagedRuntimeRefreshAt: Date?
     private var linuxDevboxConsecutiveIssueChecks = 0
     private var poolAuthorityClientState = PoolAuthorityClientState()
     private var poolAuthorityStatusCheckInFlight = false
@@ -412,6 +423,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastCodexBrowserSessionRepairCheck: Date?
     private var lastLinuxDevboxAccountRefreshByKey: [String: Date] = [:]
     private var linuxDevboxCredentialSyncInFlight = false
+    private var linuxDevboxReauthInFlight = false
+    private var linuxDevboxTokenConvergenceTask: Task<Void, Never>?
+    private var lastLinuxDevboxTokenConvergenceAt: Date?
+    private var lastLinuxDevboxTokenExpiredProviderIds: Set<String> = []
+    private var lastLinuxDevboxReauthAttempt: Date?
+    private var lastLinuxDevboxReauthAccountID: UUID?
     private var linuxDevboxCredentialSyncReconciliationInFlight = false
     private var pendingLinuxDevboxCredentialSyncFingerprint: String?
     private var lastLinuxDevboxCredentialSyncAttemptAt: Date?
@@ -613,6 +630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self?.reconcileQuotaPollingIfNeeded()
                     self?.scheduleCLIActivationHandoffReconciliationIfNeeded()
                     self?.scheduleLocalConfirmationRefreshIfNeeded()
+                    self?.refreshUnmanagedRuntimeWarnings()
                     CLIStatusChecker.refresh(
                         activeAccountId: self?.accountManager.configuredAccount?.accountId,
                         onRuntimeObservation: { [weak self] observation in
@@ -3100,7 +3118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             return
         }
-        if context != "authority-reconciliation",
+        // These contexts carry fresh evidence that the VPS diverged even though
+        // the Mac pool is unchanged since the last recorded sync.
+        if context != "authority-reconciliation", context != "token-convergence",
            UserDefaults.standard.string(forKey: linuxDevboxLastCredentialSyncFingerprintKey) == fingerprint {
             return
         }
@@ -3387,38 +3407,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         settings: LinuxDevboxMonitorSettings
     ) {
         guard !linuxDevboxCredentialSyncInFlight,
-              !linuxDevboxCredentialSyncReconciliationInFlight else { return }
+              !linuxDevboxCredentialSyncReconciliationInFlight,
+              linuxDevboxCredentialReconciliationBackoff.permitsAttempt(
+                  operationID: operation.operationID,
+                  at: Date()
+              ) else { return }
         linuxDevboxCredentialSyncReconciliationInFlight = true
         let journal = linuxDevboxCredentialSyncJournal
         let finish: @MainActor @Sendable (
-            LinuxDevboxCredentialSyncReconciliation
-        ) -> Void = { [weak self] reconciliation in
-            self?.finishLinuxDevboxCredentialSyncReconciliation(
-                reconciliation,
-                operation: operation
-            )
-        }
-        Task.detached {
-            var reconciliation = LinuxDevboxMonitor.reconcileCredentialSync(
-                settings: settings,
-                operation: operation
-            )
-            do {
-                switch reconciliation {
-                case .committed, .safeToRetry:
-                    try journal.clear(operationID: operation.operationID)
-                case .unresolved(let reason):
-                    try journal.markUnresolved(
-                        operationID: operation.operationID,
-                        reason: reason
+            LinuxDevboxCredentialReceiptRecovery
+        ) -> Void = { [weak self] recovery in
+            guard let self else { return }
+            self.linuxDevboxCredentialSyncReconciliationInFlight = false
+            guard LinuxDevboxMonitor.settings() == settings else { return }
+            switch recovery {
+            case .completed(let receipt, _):
+                self.linuxDevboxCredentialReconciliationBackoff.reset()
+                do {
+                    try journal.clearRecoveredImport(operation: operation, receipt: receipt)
+                } catch {
+                    _ = try? journal.withCurrentRecoveryOperation(
+                        operation: operation, receipt: receipt
+                    ) {
+                        self.surfaceLinuxDevboxCredentialSyncHold(
+                            operation: operation, context: "historical-receipt-journal-changed"
+                        )
+                    }
+                    return
+                }
+                UserDefaults.standard.removeObject(forKey: linuxDevboxLastCredentialSyncFingerprintKey)
+                UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialConvergenceProofKey)
+                self.clearLegacyLinuxDevboxCredentialSyncHold()
+                SwapLog.append(.debug(
+                    "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=historical_completed_requires_fresh_convergence"
+                ))
+                self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "authority-reconciliation")
+            case .supersedable(let proof):
+                let backupPath: String
+                do {
+                    backupPath = try journal.supersedeUnrecoverable(operation: operation, proof: proof)
+                } catch {
+                    _ = try? journal.withCurrentRecoveryOperation(operation: operation) {
+                        self.surfaceLinuxDevboxCredentialSyncHold(
+                            operation: operation, context: "unrecoverable-supersession-journal-changed"
+                        )
+                    }
+                    return
+                }
+                // Unknown historical outcome: invalidate every cached convergence claim so
+                // the next sync re-baselines from a fresh remote observation.
+                UserDefaults.standard.removeObject(forKey: linuxDevboxLastCredentialSyncFingerprintKey)
+                UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialConvergenceProofKey)
+                self.linuxDevboxCredentialReconciliationBackoff.reset()
+                self.clearLegacyLinuxDevboxCredentialSyncHold()
+                SwapLog.append(.debug(
+                    "LINUX_DEVBOX_CREDENTIAL_SYNC_SUPERSEDED operation=\(operation.operationID) outcome=superseded_unknown_outcome remote_active=\(proof.remoteEvidence.activeProviderAccountId) backup=\(backupPath)"
+                ))
+                self.scheduleLinuxDevboxCredentialSyncIfNeeded(context: "authority-reconciliation")
+            case .unresolved(let reason):
+                self.linuxDevboxCredentialReconciliationBackoff.recordUnresolved(
+                    operationID: operation.operationID,
+                    at: Date()
+                )
+                _ = try? journal.withCurrentRecoveryOperation(operation: operation) {
+                    self.surfaceLinuxDevboxCredentialSyncHold(
+                        fingerprint: operation.credentialFingerprint,
+                        reason: reason,
+                        context: "historical-receipt-reconciliation"
                     )
                 }
-            } catch {
-                reconciliation = .unresolved(
-                    "Credential-sync reconciliation could not update its journal: \(error.localizedDescription)"
-                )
             }
-            await finish(reconciliation)
+        }
+        Task.detached {
+            let recovery = LinuxDevboxMonitor.recoverCredentialSyncReceipt(
+                settings: settings,
+                operation: operation,
+                recordImportReceipt: { receipt in
+                    try journal.recordImportReceipt(operationID: operation.operationID, receipt: receipt)
+                }
+            )
+            await finish(recovery)
         }
     }
 
@@ -3513,9 +3581,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         context: String
     ) {
         let summary = Self.linuxDevboxCredentialSyncHoldSummary(reason: reason)
-        publishLinuxDevboxInvalidation(
-            .barrierBlocked,
-            summary: summary
+        if LinuxDevboxSurfacedCredentialSyncHold.resurfaceIsUnchanged(
+            lastSurfaced: linuxDevboxSurfacedCredentialSyncHold,
+            currentStatus: accountManager.linuxDevboxStatus,
+            fingerprint: fingerprint
+        ) {
+            // Same persisted hold: refresh its text without discarding the
+            // in-flight readiness check or its remote account mirror.
+            let status = LinuxDevboxStatus.invalidated(
+                by: .barrierBlocked,
+                summary: summary
+            )
+            if accountManager.linuxDevboxStatus != status {
+                accountManager.linuxDevboxStatus = status
+            }
+        } else {
+            publishLinuxDevboxInvalidation(
+                .barrierBlocked,
+                summary: summary
+            )
+        }
+        linuxDevboxSurfacedCredentialSyncHold = LinuxDevboxSurfacedCredentialSyncHold(
+            fingerprint: fingerprint,
+            publishedStatus: accountManager.linuxDevboxStatus
         )
         SwapLog.append(.debug(
             "LINUX_DEVBOX_CREDENTIAL_SYNC_HELD context=\(context) unresolved_fingerprint=\(fingerprint) reason=\(reason)"
@@ -3616,12 +3704,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
              "auth-json-token-import",
              "auth-json-sync",
              "load-restore",
-             "reauth-account",
              "reauth-added-different-account",
              "authority-reconciliation",
              "subscription-info",
              "reset-consumed",
              "swap",
+             "token-convergence",
              "token-refresh":
             return true
         default:
@@ -3664,7 +3752,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
              "quota-update",
              "reset-consumed",
              "subscription-info",
-             "authority-reconciliation":
+             "authority-reconciliation",
+             "token-convergence":
             return 60
         default:
             if context.hasPrefix("credential-retry-") {
@@ -3932,90 +4021,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func refreshToken(for accountId: UUID) async {
         guard !isExiting else { return }
-        guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
-        guard !account.isRuntimeUnusable else {
+        guard let observed = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
+        guard !observed.isRuntimeUnusable else {
             await quotaPoller.stopPolling(for: accountId)
             return
         }
+        // Adopt before refreshing: if the VPS already rotated this chain, the Mac
+        // copy is dead and refreshing it would fail or strand the VPS instead.
+        if await adoptedNewerLinuxDevboxGeneration(for: observed) { return }
+        guard let account = accountManager.accounts.first(where: { $0.id == accountId }),
+              !account.isRuntimeUnusable else { return }
         let shouldNotifyRefreshFailure = !account.requiresReauthentication
         if accountManager.configuredAccount?.id == accountId {
-            guard let activationState = await activationStateForRequest(),
-                  activationState.phase == .confirmed,
-                  await requireFreshLocalRuntimePermit(
-                      for: account,
-                      activationGeneration: activationState.activationGeneration,
-                      requiredPhase: .confirmed
-                  ) != nil else {
-                await handleTokenRefreshFailure(
-                    account: account,
-                    error: PollerError.tokenExpired,
-                    shouldNotify: shouldNotifyRefreshFailure
-                )
-                return
-            }
-            let committed = await withPreparedActiveCredentialMutation(
-                targetAccountId: account.id,
-                expectedConfiguredAccountId: account.id,
+            let committed = await commitActiveCredentialGeneration(
+                account: account,
                 source: "token-refresh",
-                requestKind: .automatic
-            ) { [weak self] prepared in
-                guard let self else { return false }
-                do {
-                    let refreshed = try await AccountCredentialMutationBoundary.performAsync(
-                        route: .tokenRefresh,
-                        authorize: { [weak self] in
-                            guard let self else { return nil }
-                            return await self.revalidateCredentialMutation(
-                                route: .tokenRefresh,
-                                from: account,
-                                to: account,
-                                reason: .manual,
-                                authAlreadyConfigured: false,
-                                prepared: prepared
-                            )
-                        },
-                        mutation: { _ in
-                            try await TokenRefresher.refresh(account)
-                        }
+                produce: { try await TokenRefresher.refresh(account) },
+                onUnauthorized: { [weak self] in
+                    await self?.handleTokenRefreshFailure(
+                        account: account,
+                        error: PollerError.tokenExpired,
+                        shouldNotify: shouldNotifyRefreshFailure
                     )
-                    guard let refreshed else {
-                        await self.failConfiguredCredentialMutation(
-                            target: account,
-                            prepared: prepared,
-                            stage: .mutationAuthorization,
-                            detail: .runtimeEvidenceExpired,
-                            failure: "active token refresh authorization changed before submission"
-                        )
-                        return false
-                    }
-                    return await self.commitConfiguredCredentialMutation(
-                        from: account,
-                        to: refreshed,
-                        reason: .manual,
-                        mutationRoute: .tokenRefresh,
-                        persistenceContext: "token-refresh",
-                        authAlreadyConfigured: false,
-                        swapStart: Date(),
-                        prepared: prepared,
-                        recordsSwap: false,
-                        committedDetail: .activeCredentialMutation
-                    )
-                } catch {
-                    await self.failConfiguredCredentialMutation(
-                        target: account,
-                        prepared: prepared,
-                        stage: .credentialMutation,
-                        detail: .fileCommitFailed,
-                        failure: "active token refresh failed or was cancelled before commit"
-                    )
-                    await self.handleTokenRefreshFailure(
+                },
+                onProduceFailure: { [weak self] error in
+                    await self?.handleTokenRefreshFailure(
                         account: account,
                         error: error,
                         shouldNotify: shouldNotifyRefreshFailure
                     )
-                    return false
                 }
-            }
+            )
             guard committed else { return }
             refreshSubscriptionInfoIfNeeded(force: true)
             SwapLog.append(.tokenRefreshed(email: account.email))
@@ -4039,6 +4075,213 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 error: error,
                 shouldNotify: shouldNotifyRefreshFailure
             )
+        }
+    }
+
+    /// Commits a new token generation for the configured account through the
+    /// activation transaction (store, auth.json, runtime reload). `source` is
+    /// also the persistence context that decides Mac-to-VPS sync.
+    private func commitActiveCredentialGeneration(
+        account: CodexAccount,
+        source: String,
+        produce: @escaping @Sendable () async throws -> CodexAccount,
+        onUnauthorized: @escaping @MainActor () async -> Void,
+        onProduceFailure: @escaping @MainActor (Error) async -> Void
+    ) async -> Bool {
+        guard let activationState = await activationStateForRequest(),
+              activationState.phase == .confirmed,
+              await requireFreshLocalRuntimePermit(
+                  for: account,
+                  activationGeneration: activationState.activationGeneration,
+                  requiredPhase: .confirmed
+              ) != nil else {
+            await onUnauthorized()
+            return false
+        }
+        return await withPreparedActiveCredentialMutation(
+            targetAccountId: account.id,
+            expectedConfiguredAccountId: account.id,
+            source: source,
+            requestKind: .automatic
+        ) { [weak self] prepared in
+            guard let self else { return false }
+            do {
+                let generation = try await AccountCredentialMutationBoundary.performAsync(
+                    route: .tokenRefresh,
+                    authorize: { [weak self] in
+                        guard let self else { return nil }
+                        return await self.revalidateCredentialMutation(
+                            route: .tokenRefresh,
+                            from: account,
+                            to: account,
+                            reason: .manual,
+                            authAlreadyConfigured: false,
+                            prepared: prepared
+                        )
+                    },
+                    mutation: { _ in try await produce() }
+                )
+                guard let generation else {
+                    await self.failConfiguredCredentialMutation(
+                        target: account,
+                        prepared: prepared,
+                        stage: .mutationAuthorization,
+                        detail: .runtimeEvidenceExpired,
+                        failure: "active token generation authorization changed before submission"
+                    )
+                    return false
+                }
+                return await self.commitConfiguredCredentialMutation(
+                    from: account,
+                    to: generation,
+                    reason: .manual,
+                    mutationRoute: .tokenRefresh,
+                    persistenceContext: source,
+                    authAlreadyConfigured: false,
+                    swapStart: Date(),
+                    prepared: prepared,
+                    recordsSwap: false,
+                    committedDetail: .activeCredentialMutation
+                )
+            } catch {
+                await self.failConfiguredCredentialMutation(
+                    target: account,
+                    prepared: prepared,
+                    stage: .credentialMutation,
+                    detail: .fileCommitFailed,
+                    failure: "active token generation failed or was cancelled before commit"
+                )
+                await onProduceFailure(error)
+                return false
+            }
+        }
+    }
+
+    /// Pulls the VPS generations (bounded by `triggeredInterval`) and reports
+    /// whether this account now holds a different, usable access token.
+    private func adoptedNewerLinuxDevboxGeneration(for account: CodexAccount) async -> Bool {
+        guard LinuxDevboxMonitor.settings().isConfigured else { return false }
+        await convergeLinuxDevboxTokens(context: "pre-refresh", triggered: true)
+        guard let current = accountManager.accounts.first(where: { $0.id == account.id }),
+              current.accessToken != account.accessToken,
+              current.hasUsableInferenceToken(at: Date()) else {
+            return false
+        }
+        SwapLog.append(.debug(
+            "TOKEN_REFRESH_SKIPPED email=\(account.email) reason=adopted_vps_generation"
+        ))
+        return true
+    }
+
+    /// One convergence round: read the VPS's newest generation per account,
+    /// adopt strictly newer ones, and push when the Mac holds a newer chain.
+    private func convergeLinuxDevboxTokens(context: String, triggered: Bool) async {
+        if let inFlight = linuxDevboxTokenConvergenceTask {
+            await inFlight.value
+            return
+        }
+        let now = Date()
+        let interval = triggered
+            ? LinuxDevboxTokenConvergence.triggeredInterval
+            : LinuxDevboxTokenConvergence.periodicInterval
+        if let last = lastLinuxDevboxTokenConvergenceAt, now.timeIntervalSince(last) < interval {
+            return
+        }
+        let settings = LinuxDevboxMonitor.settings()
+        guard !isExiting, settings.isConfigured, !accountManager.accounts.isEmpty else { return }
+        lastLinuxDevboxTokenConvergenceAt = now
+        let task = Task { @MainActor [weak self] in
+            let result = await Task.detached {
+                LinuxDevboxMonitor.fetchCredentialGenerations(settings: settings)
+            }.value
+            await self?.applyLinuxDevboxTokenConvergence(result, context: context)
+        }
+        linuxDevboxTokenConvergenceTask = task
+        await task.value
+        linuxDevboxTokenConvergenceTask = nil
+    }
+
+    /// A newly token_expired VPS account means the VPS lost a refresh race or
+    /// holds a dead chain; converge now instead of waiting for the periodic pull.
+    private func convergeLinuxDevboxTokensAfterVPSTokenExpiry(
+        _ states: [LinuxDevboxAccountState]
+    ) {
+        let now = Date()
+        let expired = Set(states.compactMap { state -> String? in
+            guard CodexAccount.requiresReauthentication(
+                runtimeUnusableUntil: state.runtimeUnusableUntil,
+                runtimeUnusableReason: state.runtimeUnusableReason,
+                at: now
+            ) else { return nil }
+            return CodexAccount.normalizedProviderAccountId(state.providerAccountId)
+        })
+        let newlyExpired = !expired.isSubset(of: lastLinuxDevboxTokenExpiredProviderIds)
+        lastLinuxDevboxTokenExpiredProviderIds = expired
+        guard newlyExpired else { return }
+        Task { [weak self] in
+            await self?.convergeLinuxDevboxTokens(context: "vps-token-expired", triggered: true)
+        }
+    }
+
+    private func applyLinuxDevboxTokenConvergence(
+        _ result: Result<[LinuxDevboxCredentialGeneration], LinuxDevboxMonitorFailure>,
+        context: String
+    ) async {
+        let remote: [LinuxDevboxCredentialGeneration]
+        switch result {
+        case .success(let value):
+            remote = value
+        case .failure(let failure):
+            SwapLog.append(.debug(
+                "LINUX_DEVBOX_TOKEN_CONVERGENCE_FAILED context=\(context) error=\(failure.message)"
+            ))
+            return
+        }
+        guard !isExiting else { return }
+        let plan = LinuxDevboxTokenConvergence.plan(local: accountManager.accounts, remote: remote)
+        for adoption in plan.adoptions {
+            let original = adoption.original
+            let adopted: Bool
+            if original.isActive || accountManager.configuredAccount?.id == original.id {
+                // auth.json may hold a runtime refresh the app has not adopted
+                // yet; that generation could be newer, so never overwrite it.
+                guard Self.authFileMatches(account: original, atPath: Self.codexAuthPath) else {
+                    SwapLog.append(.debug(
+                        "LINUX_DEVBOX_TOKEN_ADOPT_DEFERRED email=\(original.email) reason=auth_json_diverged"
+                    ))
+                    continue
+                }
+                adopted = await commitActiveCredentialGeneration(
+                    account: original,
+                    source: "vps-token-adopt",
+                    produce: { adoption.candidate },
+                    onUnauthorized: {},
+                    onProduceFailure: { _ in }
+                )
+            } else {
+                adopted = await persistInactiveCredentialUpdate(
+                    original: original,
+                    candidate: adoption.candidate,
+                    context: "vps-token-adopt"
+                )
+            }
+            SwapLog.append(.debug(
+                "LINUX_DEVBOX_TOKEN_ADOPTED email=\(original.email) context=\(context) committed=\(adopted)"
+            ))
+            if adopted {
+                accountManager.clearPollingError(for: original.id)
+                startPollingForAccount(original.id)
+            }
+        }
+        if !plan.newerLocalProviderAccountIds.isEmpty {
+            SwapLog.append(.debug(
+                "LINUX_DEVBOX_TOKEN_PUSH_REQUIRED context=\(context) accounts=\(plan.newerLocalProviderAccountIds.count)"
+            ))
+            scheduleLinuxDevboxCredentialSyncIfNeeded(context: "token-convergence")
+        }
+        if !plan.adoptions.isEmpty {
+            statusBarController?.updateIcon()
+            updatePopoverContent()
         }
     }
 
@@ -4412,20 +4655,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         rateLimitResetOperationProviderAccountId = providerAccountId
-        let requestID = UUID()
-        remoteRateLimitResetPendingRequestIds[providerAccountId] = requestID
+        let initialRequestID = UUID()
+        remoteRateLimitResetPendingRequestIds[providerAccountId] = initialRequestID
         recordManualRateLimitResetError(nil, for: account.id, reason: .manual)
         SwapLog.append(.debug(
             "RESET_REMOTE_REDEMPTION_STARTED account=\(account.email) owner=vps_authority"
         ))
         rateLimitResetRedemptionTask = Task { @MainActor [weak self] in
-            let result = await Task.detached(priority: .userInitiated) {
-                LinuxDevboxMonitor.redeemReset(
-                    settings: settings,
-                    providerAccountId: providerAccountId,
-                    requestID: requestID
-                )
-            }.value
+            var requestID = initialRequestID
+            var attempt = 0
+            var result: Result<LinuxDevboxManualResetResult, LinuxDevboxManualResetFailure>
+            while true {
+                let submittedRequestID = requestID
+                result = await Task.detached(priority: .userInitiated) {
+                    LinuxDevboxMonitor.redeemReset(
+                        settings: settings,
+                        providerAccountId: providerAccountId,
+                        requestID: submittedRequestID
+                    )
+                }.value
+                guard let self else { return }
+                guard case .failure(let failure) = result,
+                      !self.isExiting,
+                      Self.remoteRateLimitResetShouldRetry(
+                          failure: failure,
+                          completedAttempts: attempt + 1
+                      ) else {
+                    break
+                }
+                // A busy rejection spent nothing. Retry once with a new request ID after
+                // a short bounded delay; the VPS CLI owns any longer lease wait.
+                attempt += 1
+                SwapLog.append(.debug(
+                    "RESET_REMOTE_REDEMPTION_RETRY account=\(account.email) reason=runtime_activation_busy attempt=\(attempt + 1) delay_seconds=\(Int(Self.remoteRateLimitResetBusyRetryDelay))"
+                ))
+                try? await Task.sleep(for: .seconds(Self.remoteRateLimitResetBusyRetryDelay))
+                requestID = UUID()
+                self.remoteRateLimitResetPendingRequestIds[providerAccountId] = requestID
+            }
             guard let self else { return }
             self.rateLimitResetOperationProviderAccountId = nil
             self.rateLimitResetRedemptionTask = nil
@@ -4452,6 +4719,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     "RESET_REMOTE_REDEMPTION_COMPLETED account=\(account.email) submitted=\(response.submittedReset) remaining=\(response.bankedResetsRemaining) owner=vps_authority"
                 ))
             case .failure(let failure):
+                let userMessage = failure.userFacingMessage
                 if Self.remoteRateLimitResetFailureRequiresReconciliation(
                     failure.disposition
                 ) {
@@ -4463,32 +4731,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         matchingProviderAccountId: providerAccountId
                     )?.id {
                         self.recordManualRateLimitResetError(
-                            failure.message,
+                            userMessage,
                             for: liveAccountId,
                             reason: .manual
                         )
                     }
                 } else {
+                    // Rejected or never started: nothing was spent. Release the operation
+                    // and show the specific reason long enough to read; the follow-up
+                    // inventory refresh must not erase it immediately.
                     self.remoteRateLimitResetUnknownProviderAccountIds.remove(providerAccountId)
                     self.remoteRateLimitResetPendingRequestIds[providerAccountId] = nil
                     if let liveAccountId = self.accountManager.account(
                         matchingProviderAccountId: providerAccountId
                     )?.id {
                         self.recordManualRateLimitResetError(
-                            nil,
+                            userMessage,
                             for: liveAccountId,
-                            reason: .manual
+                            reason: .manual,
+                            displayDuration: Self.remoteRateLimitResetRejectionDisplayDuration,
+                            pinned: true
                         )
                     }
                 }
-                self.accountManager.publishActivationNotice(failure.message)
+                self.accountManager.publishActivationNotice(userMessage)
                 SwapLog.append(.debug(
-                    "RESET_REMOTE_REDEMPTION_FAILED account=\(account.email) disposition=\(String(describing: failure.disposition)) owner=vps_authority"
+                    "RESET_REMOTE_REDEMPTION_FAILED account=\(account.email) disposition=\(String(describing: failure.disposition)) attempts=\(attempt + 1) detail=\(failure.detail ?? "none") owner=vps_authority"
                 ))
             }
             self.checkPoolAuthorityStatus()
             self.checkLinuxDevboxReadiness(force: true)
+            self.refreshRateLimitResetStateAfterRemoteRedemption(
+                providerAccountId: providerAccountId,
+                email: account.email
+            )
             self.updatePopoverContent()
+        }
+    }
+
+    static let remoteRateLimitResetBusyRetryDelay: TimeInterval = 5
+    static let remoteRateLimitResetRejectionDisplayDuration: TimeInterval = 30
+
+    /// At most one extra submission, and only for a rejection (nothing spent) caused
+    /// by a concurrent VPS runtime activation holding the mutation lease.
+    nonisolated static func remoteRateLimitResetShouldRetry(
+        failure: LinuxDevboxManualResetFailure,
+        completedAttempts: Int
+    ) -> Bool {
+        completedAttempts < 2 && failure.isRuntimeActivationBusyRejection
+    }
+
+    /// After any VPS redemption result (success, rejection, unknown, or timeout), observe
+    /// the provider directly so inventory and usage converge without waiting for the
+    /// periodic monitors. Observation only; never redeems or mutates the VPS.
+    private func refreshRateLimitResetStateAfterRemoteRedemption(
+        providerAccountId: String,
+        email: String
+    ) {
+        guard !isExiting,
+              let liveAccountId = accountManager.account(
+                  matchingProviderAccountId: providerAccountId
+              )?.id else {
+            return
+        }
+        scheduleRateLimitResetRefresh(for: liveAccountId, force: true)
+        Task { @MainActor [weak self] in
+            await self?.refreshQuotaAfterRateLimitResetRedemption(
+                providerAccountId: providerAccountId,
+                email: email
+            )
         }
     }
 
@@ -4588,17 +4899,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func recordManualRateLimitResetError(
         _ message: String?,
         for accountId: UUID,
-        reason: RateLimitResetRedemptionReason
+        reason: RateLimitResetRedemptionReason,
+        displayDuration: TimeInterval = 10,
+        pinned: Bool = false
     ) {
         guard reason == .manual else { return }
         rateLimitResetManualErrors[accountId] = message
+        rateLimitResetManualErrorPinnedUntil[accountId] = message != nil && pinned
+            ? Date().addingTimeInterval(displayDuration)
+            : nil
         guard let message else { return }
         Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(10))
+            try? await Task.sleep(for: .seconds(displayDuration))
             guard let self,
                   self.rateLimitResetManualErrors[accountId] == message else {
                 return
             }
+            self.rateLimitResetManualErrorPinnedUntil[accountId] = nil
             if let providerAccountId = self.accountManager.accounts.first(where: {
                 $0.id == accountId
             })?.normalizedProviderAccountId,
@@ -4663,18 +4980,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             return
         }
-        let restored = activeHolds.mapValues(\.blockedUntil)
-        let knownProviderAccountIds = Set(accountManager.accounts.compactMap(\.normalizedProviderAccountId))
-        let isMissingKnownActiveHold = externalRateLimitResetRedemptionBlockedUntil.contains {
-            providerAccountId, blockedUntil in
-            guard blockedUntil > now,
-                  knownProviderAccountIds.contains(providerAccountId) else {
-                return false
-            }
-            guard let persisted = activeHolds[providerAccountId] else { return true }
-            return persisted.blockedUntil < blockedUntil
-        }
-        guard !isMissingKnownActiveHold else {
+        guard let restored = Self.reconciledExternalRateLimitResetHolds(
+            inMemory: externalRateLimitResetRedemptionBlockedUntil,
+            persisted: activeHolds,
+            knownProviderAccountIds: Set(
+                accountManager.accounts.compactMap(\.normalizedProviderAccountId)
+            ),
+            now: now
+        ) else {
             markExternalRateLimitResetHoldStateUnavailable(
                 ExternalRateLimitResetHoldStoreError.readbackMismatch,
                 context: "restore-readback"
@@ -4683,6 +4996,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         externalRateLimitResetRedemptionBlockedUntil = restored
         markExternalRateLimitResetHoldStateReadable()
+    }
+
+    /// Returns the in-memory hold map implied by the durable store, or `nil` when an
+    /// active in-memory hold for a known account is missing from (or longer than) the
+    /// durable readback. `nil` means the durable write was lost and automatic
+    /// redemption must fail closed until a later bounded read proves the state.
+    nonisolated static func reconciledExternalRateLimitResetHolds(
+        inMemory: [String: Date],
+        persisted: [String: ExternalRateLimitResetHoldStore.Hold],
+        knownProviderAccountIds: Set<String>,
+        now: Date
+    ) -> [String: Date]? {
+        let isMissingKnownActiveHold = inMemory.contains { providerAccountId, blockedUntil in
+            guard blockedUntil > now,
+                  knownProviderAccountIds.contains(providerAccountId) else {
+                return false
+            }
+            guard let persisted = persisted[providerAccountId] else { return true }
+            return persisted.blockedUntil < blockedUntil
+        }
+        return isMissingKnownActiveHold ? nil : persisted.mapValues(\.blockedUntil)
+    }
+
+    /// Removes the in-memory copy of a hold that the durable store just cleared because
+    /// newer usable quota proved recovery. A newer in-memory hold (recorded after the
+    /// cleared one) is retained so the readback check still protects it.
+    nonisolated static func externalRateLimitResetHolds(
+        _ holds: [String: Date],
+        removingRecoveredHold clearedHold: ExternalRateLimitResetHoldStore.Hold,
+        providerAccountId: String
+    ) -> [String: Date] {
+        guard let key = RateLimitResetProviderAccountIdentity.normalize(providerAccountId),
+              let inMemoryBlockedUntil = holds[key],
+              inMemoryBlockedUntil <= clearedHold.blockedUntil else {
+            return holds
+        }
+        var updated = holds
+        updated.removeValue(forKey: key)
+        return updated
     }
 
     private func externalRateLimitResetHold(for account: CodexAccount) -> Date? {
@@ -4739,6 +5091,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         guard let hold else { return }
+        // The durable store no longer has this hold; drop the in-memory copy before the
+        // readback check, otherwise restore treats the intentional clear as a lost write
+        // and disables automatic redemption for every account until the hold expires.
+        externalRateLimitResetRedemptionBlockedUntil = Self.externalRateLimitResetHolds(
+            externalRateLimitResetRedemptionBlockedUntil,
+            removingRecoveredHold: hold,
+            providerAccountId: account.accountId
+        )
         await restoreExternalRateLimitResetHolds(at: now)
         SwapLog.append(.debug(
             "RESET_EXTERNAL_REDEMPTION_HOLD_CLEARED account=\(account.email) blocked_until=\(Int(hold.blockedUntil.timeIntervalSince1970)) quota_fetched=\(Int(snapshot.fetchedAt.timeIntervalSince1970)) reason=quota_recovered"
@@ -4959,9 +5319,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 )
                 externalRedemptionObserved = observation.transition
                     .observedExternalRedemption
-                SwapLog.append(.debug(
-                    "RESET_BANK_REFRESHED account=\(account.email) available=\(bank.availableCount)"
-                ))
+                if Self.rateLimitResetInventorySemanticallyChanged(
+                    previous: previous,
+                    refreshed: bank
+                ) {
+                    SwapLog.append(.debug(
+                        "RESET_BANK_REFRESHED account=\(account.email) previous_available=\(previous.map { String($0.availableCount) } ?? "none") available=\(bank.availableCount) transition=\(observation.transition.disposition)"
+                    ))
+                }
 
                 if unresolvedAttempt != nil {
                     if let providerAccountId = account.normalizedProviderAccountId {
@@ -4983,46 +5348,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     if let liveAccountId = self.accountManager.account(
                         matchingProviderAccountId: providerAccountId
-                    )?.id {
+                    )?.id,
+                       !((self.rateLimitResetManualErrorPinnedUntil[liveAccountId]).map {
+                           $0 > Date()
+                       } ?? false) {
                         self.rateLimitResetManualErrors[liveAccountId] = nil
                     }
                     if externalRedemptionObserved {
-                        if let quotaAccount = self.accountManager.account(
-                            matchingProviderAccountId: providerAccountId
-                        ) {
-                            do {
-                                let quota = try await poller.fetchQuota(for: quotaAccount)
-                                if self.accountManager.updateQuota(
-                                    forProviderAccountId: providerAccountId,
-                                    snapshot: quota.snapshot,
-                                    planType: quota.planType
-                                ) != nil {
-                                    await self.clearExternalRateLimitResetHoldIfQuotaRecovered(
-                                        forProviderAccountId: providerAccountId,
-                                        snapshot: quota.snapshot,
-                                        at: Date()
-                                    )
-                                    self.queueTelemetryPersistence(context: "quota-update")
-                                    self.statusBarController.updateIcon()
-                                    self.updatePopoverContent()
-                                    SwapLog.append(.debug(
-                                        "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESHED account=\(account.email) fetched=\(Int(quota.snapshot.fetchedAt.timeIntervalSince1970))"
-                                    ))
-                                } else {
-                                    SwapLog.append(.debug(
-                                        "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_SKIPPED account=\(account.email) reason=provider_identity_unavailable"
-                                    ))
-                                }
-                            } catch {
-                                SwapLog.append(.debug(
-                                    "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_FAILED account=\(account.email) error=\(error.localizedDescription)"
-                                ))
-                            }
-                        } else {
-                            SwapLog.append(.debug(
-                                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_SKIPPED account=\(account.email) reason=provider_identity_unavailable"
-                            ))
-                        }
+                        await self.refreshQuotaAfterRateLimitResetRedemption(
+                            providerAccountId: providerAccountId,
+                            email: account.email,
+                            poller: poller
+                        )
                     }
                 }
             } catch {
@@ -5061,6 +5398,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 self.checkAndSwapIfNeeded()
             }
+        }
+    }
+
+    /// Fetches quota for an account whose banked reset was just consumed (by this Mac,
+    /// the VPS, T3, or any other client) so the card and menu bar show recovered usage
+    /// within seconds instead of waiting for the next adaptive poll.
+    private func refreshQuotaAfterRateLimitResetRedemption(
+        providerAccountId: String,
+        email: String,
+        poller: QuotaPoller? = nil
+    ) async {
+        let poller = poller ?? quotaPoller
+        guard let quotaAccount = accountManager.account(
+            matchingProviderAccountId: providerAccountId
+        ) else {
+            SwapLog.append(.debug(
+                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_SKIPPED account=\(email) reason=provider_identity_unavailable"
+            ))
+            return
+        }
+        do {
+            let quota = try await poller.fetchQuota(for: quotaAccount)
+            guard accountManager.updateQuota(
+                forProviderAccountId: providerAccountId,
+                snapshot: quota.snapshot,
+                planType: quota.planType
+            ) != nil else {
+                SwapLog.append(.debug(
+                    "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_SKIPPED account=\(email) reason=provider_identity_unavailable"
+                ))
+                return
+            }
+            if let liveAccountId = accountManager.account(
+                matchingProviderAccountId: providerAccountId
+            )?.id {
+                accountManager.clearPollingError(for: liveAccountId)
+            }
+            await clearExternalRateLimitResetHoldIfQuotaRecovered(
+                forProviderAccountId: providerAccountId,
+                snapshot: quota.snapshot,
+                at: Date()
+            )
+            queueTelemetryPersistence(context: "quota-update")
+            statusBarController.updateIcon()
+            updatePopoverContent()
+            SwapLog.append(.debug(
+                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESHED account=\(email) fetched=\(Int(quota.snapshot.fetchedAt.timeIntervalSince1970))"
+            ))
+        } catch {
+            SwapLog.append(.debug(
+                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_FAILED account=\(email) error=\(Self.pollerErrorDescription(error))"
+            ))
+        }
+    }
+
+    nonisolated static func pollerErrorDescription(_ error: Error) -> String {
+        guard let pollerError = error as? PollerError else {
+            return error.localizedDescription
+        }
+        switch pollerError {
+        case .invalidResponse: return "invalid_response"
+        case .tokenExpired: return "http_401"
+        case .rateLimited: return "http_429"
+        case .usageUnavailable: return "usage_unavailable"
+        case .httpError(let code): return "http_\(code)"
+        case .networkError(let message): return "network: \(message)"
         }
     }
 
@@ -5146,9 +5549,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ? .distantFuture
             : state.decision.retryAt
         SwapLog.append(.debug(
-            "RESET_INVENTORY_FAILED account=\(account.email) context=\(context) classification=\(state.decision.classification.rawValue) failures=\(state.consecutiveFailureCount) waits_for_credentials=\(state.decision.waitsForCredentialChange)"
+            "RESET_INVENTORY_FAILED account=\(account.email) context=\(context) classification=\(state.decision.classification.rawValue) failures=\(state.consecutiveFailureCount) waits_for_credentials=\(state.decision.waitsForCredentialChange) error=\(Self.rateLimitResetInventoryFailureDescription(serviceError))"
         ))
         return true
+    }
+
+    /// Bounded, token-free description of an inventory failure for the swap log.
+    nonisolated static func rateLimitResetInventoryFailureDescription(
+        _ error: RateLimitResetServiceError
+    ) -> String {
+        let description: String
+        switch error {
+        case .httpError(let statusCode):
+            description = "http_\(statusCode)"
+        case .transport(let message):
+            description = "transport: \(message)"
+        default:
+            description = String(describing: error)
+        }
+        let singleLine = description
+            .components(separatedBy: .newlines)
+            .joined(separator: " ")
+        return singleLine.count > 200 ? String(singleLine.prefix(199)) + "…" : singleLine
     }
 
     nonisolated static func rateLimitResetServiceError(
@@ -6128,6 +6550,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return lhs.availableCount == rhs.availableCount && lhsCredits == rhsCredits
     }
 
+    nonisolated static func rateLimitResetBanksByProviderAccountId(
+        _ accounts: [CodexAccount]
+    ) -> [String: RateLimitResetBank] {
+        var banks: [String: RateLimitResetBank] = [:]
+        for account in accounts {
+            guard let providerAccountId = account.normalizedProviderAccountId,
+                  let bank = account.rateLimitResetBank else { continue }
+            banks[providerAccountId] = bank
+        }
+        return banks
+    }
+
+    /// Accounts whose bank changed through a non-local observation in a way that proves
+    /// a credit was consumed: the available count fell below natural expiry, or a
+    /// previously available, unexpired credit ID disappeared (which also catches a
+    /// consumption hidden by a simultaneous new grant).
+    nonisolated static func accountsWithMirroredRateLimitResetRedemption(
+        previous: [String: RateLimitResetBank],
+        current: [CodexAccount],
+        now: Date
+    ) -> [CodexAccount] {
+        current.filter { account in
+            guard let providerAccountId = account.normalizedProviderAccountId,
+                  let previousBank = previous[providerAccountId],
+                  let refreshedBank = account.rateLimitResetBank,
+                  refreshedBank != previousBank,
+                  refreshedBank.fetchedAt > previousBank.fetchedAt else {
+                return false
+            }
+            return RateLimitResetInventoryTransition.classify(
+                previousBank: previousBank,
+                refreshedBank: refreshedBank,
+                localExpectation: nil,
+                observedProviderAccountId: providerAccountId,
+                now: now
+            ).observedExternalRedemption
+        }
+    }
+
     nonisolated static func rateLimitResetInventorySemanticallyChanged(
         previous: RateLimitResetBank?,
         refreshed: RateLimitResetBank
@@ -6975,6 +7436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         requestKind: AccountActivationRequestKind,
         verifiedExternalAuthConflictRecovery: Bool = false,
         verifiedSameAccountGenerationRecovery: Bool = false,
+        authorityConflictRecovery: AuthorityConflictRecoveryWitness? = nil,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil,
         operationAuthority: PoolAuthorityOperationAuthority? = nil,
         operation: @escaping @MainActor @Sendable (PreparedAccountActivation) async -> Bool
@@ -7008,6 +7470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 requestKind: requestKind,
                 verifiedExternalAuthConflictRecovery: verifiedExternalAuthConflictRecovery,
                 verifiedSameAccountGenerationRecovery: verifiedSameAccountGenerationRecovery,
+                authorityConflictRecovery: authorityConflictRecovery,
                 activationGeneration: activationGeneration,
                 lease: lease,
                 policyAuthority: policyAuthority,
@@ -7053,6 +7516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         requestKind: AccountActivationRequestKind,
         verifiedExternalAuthConflictRecovery: Bool,
         verifiedSameAccountGenerationRecovery: Bool,
+        authorityConflictRecovery: AuthorityConflictRecoveryWitness?,
         activationGeneration: UUID,
         lease: AccountMutationLease,
         policyAuthority: AccountAutomaticPolicyAuthority? = nil,
@@ -7087,6 +7551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     .beginVerifiedExternalAuthConflictRecovery(
                         targetAccountId: targetAccountId,
                         durableSourceAccountId: expectedConfiguredAccountId,
+                        recoveryWitness: authorityConflictRecovery,
                         requestedActivationGeneration: activationGeneration,
                         authorizeEffect: authorizeEffect
                     )
@@ -7151,7 +7616,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 activationGeneration: activationGeneration,
                 expectedConfiguredAccountId: expectedConfiguredAccountId,
                 previousActivationState: previousActivationState,
-                lease: lease
+                lease: lease,
+                authorityConflictRecovery: authorityConflictRecovery
             ))
         } catch {
             let recoveryAuthorization: AccountActivationCoordinator.StateEffectAuthorization = {
@@ -7513,11 +7979,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let recoversExternalAuthConflict =
                 self.accountManager.activationState?.phase == .manualReview
                 && self.accountManager.activationState?.detail == .externalAuthConflict
+            let recoveryWitness: AuthorityConflictRecoveryWitness?
             let adoptionTarget: CodexAccount
             if recoversExternalAuthConflict {
-                guard let observedTarget = await self
-                    .externalAuthConflictAuthorityTarget(
-                        storedTarget: target,
+                guard let witness = await self
+                    .captureAuthorityConflictRecovery(
                         observation: observation,
                         operationAuthority: operationAuthority
                     ) else {
@@ -7529,22 +7995,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     SwapLog.append(.debug(
                         "POOL_AUTHORITY_EXTERNAL_AUTH_RECOVERY_BLOCKED reason=observed_target_generation"
                     ))
+                    self.accountManager.publishActivationNotice(
+                        "Mac account recovery needs review: the authority target and local credentials do not safely agree. Reauthenticate the selected account if its credentials cannot be ordered."
+                    )
                     return
                 }
-                adoptionTarget = observedTarget
+                recoveryWitness = witness
+                adoptionTarget = witness.target
             } else {
+                recoveryWitness = nil
                 adoptionTarget = target
             }
             let from: CodexAccount
             if let configured = self.accountManager.configuredAccount {
                 from = configured
-            } else if recoversExternalAuthConflict,
-                      let durableSource = await self
-                        .restoreDurableExternalAuthConflictSource(
-                            target: adoptionTarget,
-                            operationAuthority: operationAuthority
-                        ) {
-                from = durableSource
+            } else if let witness = recoveryWitness,
+                      witness.authorizes(), witness.filesUnchanged() {
+                self.accountManager.setConfiguredAccount(witness.source.id)
+                from = witness.source
             } else {
                 self.poolAuthorityClientState.finishAdoption(
                     epoch: observation.epoch,
@@ -7556,22 +8024,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ))
                 return
             }
-            if recoversExternalAuthConflict {
-                let recoveryDecision = await self
-                    .poolAuthorityExternalAuthConflictRecoveryDecision(
-                        observation: observation,
-                        from: from,
-                        to: adoptionTarget,
-                        operationAuthority: operationAuthority
-                    )
-                guard recoveryDecision == .recover else {
+            if let witness = recoveryWitness {
+                guard witness.source.id == from.id, witness.authorizes(),
+                      witness.filesUnchanged(),
+                      ExternalAuthConflictRecoveryPolicy.storeSnapshot(
+                        witness.storeSnapshot, matches: self.accountManager.accounts
+                      ),
+                      RustActivationJournal.handoffDisposition(for: adoptionTarget) == .ready else {
                     self.poolAuthorityClientState.finishAdoption(
                         epoch: observation.epoch,
                         succeeded: false,
                         at: Date()
                     )
                     SwapLog.append(.debug(
-                        "POOL_AUTHORITY_EXTERNAL_AUTH_RECOVERY_BLOCKED reason=\(String(describing: recoveryDecision))"
+                        "POOL_AUTHORITY_EXTERNAL_AUTH_RECOVERY_BLOCKED reason=witness_changed"
                     ))
                     return
                 }
@@ -7582,6 +8048,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 source: "pool-authority",
                 requestKind: .poolAuthority,
                 verifiedExternalAuthConflictRecovery: recoversExternalAuthConflict,
+                authorityConflictRecovery: recoveryWitness,
                 policyAuthority: automaticPolicyLease?.authority,
                 operationAuthority: operationAuthority
             ) { [weak self] prepared in
@@ -7606,104 +8073,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    private func externalAuthConflictAuthorityTarget(
-        storedTarget: CodexAccount,
+    private func captureAuthorityConflictRecovery(
         observation: PoolAuthorityObservation,
         operationAuthority: PoolAuthorityOperationAuthority
-    ) async -> CodexAccount? {
-        guard operationAuthority.authorizes() else { return nil }
-        let authObservation = await Task.detached(priority: .userInitiated) {
-            AccountImporter.observeCurrentAccount(from: Self.codexAuthPath)
-        }.value
-        guard operationAuthority.authorizes(),
-              case .valid(let observedAuth) = authObservation else {
-            return nil
-        }
-        return ExternalAuthConflictRecoveryPolicy.authorityTarget(
-            storedTarget: storedTarget,
-            observedAuth: observedAuth,
-            authorityProviderAccountId: observation.desiredProviderAccountId,
-            now: Date()
-        )
-    }
-
-    private func restoreDurableExternalAuthConflictSource(
-        target: CodexAccount,
-        operationAuthority: PoolAuthorityOperationAuthority
-    ) async -> CodexAccount? {
-        guard operationAuthority.authorizes(),
-              accountManager.activationState?.phase == .manualReview,
-              accountManager.activationState?.detail == .externalAuthConflict,
-              accountManager.configuredAccount == nil else {
-            return nil
-        }
-
+    ) async -> AuthorityConflictRecoveryWitness? {
         do {
+            guard operationAuthority.authorizes(),
+                  let journal = try accountActivationCoordinator.snapshotForAuthorityRecovery(),
+                  journal.state == accountManager.activationState else { return nil }
+            let storePath = AccountActivationCoordinator.defaultURL.deletingLastPathComponent()
+                .appendingPathComponent("accounts.json").path
+            let files = try await Task.detached(priority: .userInitiated) {
+                let store = try SecureAtomicFileTransaction(path: storePath).withExclusiveLock {
+                    try $0.read(allowMissing: false)
+                }
+                let auth = try SecureAtomicFileTransaction(path: Self.codexAuthPath).withExclusiveLock {
+                    try $0.read(allowMissing: false)
+                }
+                return (store, auth)
+            }.value
             let durableAccounts = try await accountPersistence.loadAll()
-            guard operationAuthority.authorizes(),
-                  let source = ExternalAuthConflictRecoveryPolicy.durableSource(
-                      durableAccounts: durableAccounts,
-                      inMemoryAccounts: accountManager.accounts,
-                      targetAccountId: target.id
-                  ) else {
-                return nil
-            }
-            accountManager.setConfiguredAccount(source.id)
-            guard operationAuthority.authorizes(),
-                  accountManager.configuredAccount?.id == source.id,
-                  Self.accountStoreMatches(
-                      account: source,
-                      accounts: durableAccounts
-                  ) else {
-                return nil
-            }
-            SwapLog.append(.debug(
-                "POOL_AUTHORITY_DURABLE_SOURCE_RESTORED source=\(source.id.uuidString) target=\(target.id.uuidString)"
-            ))
-            return accountManager.configuredAccount
+            guard journal.state == accountManager.activationState,
+                  let witness = ExternalAuthConflictRecoveryPolicy.authorityRecoveryWitness(
+                    state: journal.state, journalSnapshot: journal.snapshot,
+                    storePath: storePath, storeSnapshot: files.0,
+                    authPath: Self.codexAuthPath, authSnapshot: files.1,
+                    accounts: durableAccounts, observation: observation,
+                    authority: operationAuthority, now: Date()
+                  ), witness.filesUnchanged(), witness.authorizes(),
+                  durableAccounts.count == accountManager.accounts.count,
+                  durableAccounts.allSatisfy({ durable in
+                      accountManager.accounts.contains { memory in
+                          memory.id == durable.id && memory.accountId == durable.accountId
+                              && memory.accessToken == durable.accessToken
+                              && memory.refreshToken == durable.refreshToken
+                              && memory.idToken == durable.idToken
+                      }
+                  }) else { return nil }
+            return witness
         } catch {
             SwapLog.append(.debug(
-                "POOL_AUTHORITY_DURABLE_SOURCE_READ_FAILED error=\(error.localizedDescription)"
+                "POOL_AUTHORITY_EXTERNAL_AUTH_RECOVERY_BLOCKED reason=witness_unavailable"
             ))
             return nil
         }
-    }
-
-    private func poolAuthorityExternalAuthConflictRecoveryDecision(
-        observation: PoolAuthorityObservation,
-        from source: CodexAccount,
-        to target: CodexAccount,
-        operationAuthority: PoolAuthorityOperationAuthority
-    ) async -> ExternalAuthConflictRecoveryDecision {
-        let matchingProviderAccountCount = accountManager.accounts.filter {
-            $0.normalizedProviderAccountId == observation.desiredProviderAccountId
-        }.count
-        let durableStoreMatchesSource = await durableAccountStoreMatches(source)
-        let authMatchesTarget = Self.authFileMatches(
-            account: target,
-            atPath: Self.codexAuthPath
-        )
-        let rustHandoffDisposition = RustActivationJournal.handoffDisposition(
-            for: target
-        )
-        return ExternalAuthConflictRecoveryPolicy.decision(
-            ExternalAuthConflictRecoveryEvidence(
-                activationState: accountManager.activationState,
-                sourceAccountId: source.id,
-                targetAccountId: target.id,
-                authorityProviderAccountId: observation.desiredProviderAccountId,
-                targetProviderAccountId: target.normalizedProviderAccountId,
-                matchingProviderAccountCount: matchingProviderAccountCount,
-                authorityIsFresh: observation.isFresh(at: Date()),
-                authorityOperationIsAuthorized: operationAuthority.authorizes()
-                    && operationAuthority.epoch == observation.epoch
-                    && operationAuthority.providerAccountId
-                        == observation.desiredProviderAccountId,
-                durableStoreMatchesSource: durableStoreMatchesSource,
-                authMatchesTarget: authMatchesTarget,
-                rustHandoffDisposition: rustHandoffDisposition
-            )
-        )
     }
 
     private func executeSwapTransaction(
@@ -7745,7 +8158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             persistenceContext: verifiedExternalAuthConflictRecovery
                 ? "pool-authority-external-auth-recovery"
                 : "swap",
-            authAlreadyConfigured: verifiedExternalAuthConflictRecovery,
+            authAlreadyConfigured: verifiedExternalAuthConflictRecovery
+                && prepared.authorityConflictRecovery == nil,
             swapStart: swapStart,
             prepared: prepared,
             recordsSwap: true,
@@ -7787,9 +8201,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         atPath: Self.codexAuthPath
                     ))
         case .externalAuthObservation:
-            durableConfiguredTargetMatches = await durableAccountStoreMatches(from)
-                && authAlreadyConfigured
-                && Self.authFileMatches(account: to, atPath: Self.codexAuthPath)
+            if let witness = prepared.authorityConflictRecovery {
+                durableConfiguredTargetMatches = witness.authorizes()
+                    && witness.source.id == from.id && witness.target.id == to.id
+                    && witness.filesUnchanged()
+                    && ExternalAuthConflictRecoveryPolicy.storeSnapshot(
+                        witness.storeSnapshot, matches: accountManager.accounts
+                    )
+                    && RustActivationJournal.handoffDisposition(for: to) == .ready
+            } else {
+                durableConfiguredTargetMatches = await durableAccountStoreMatches(from)
+                    && authAlreadyConfigured
+                    && Self.authFileMatches(account: to, atPath: Self.codexAuthPath)
+            }
         case .swap, .tokenRefresh, .activeReauthentication, .planUpgrade:
             durableConfiguredTargetMatches = await durableConfiguredFilesMatch(from)
         }
@@ -7942,7 +8366,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 },
                 authorizePreparingEffect: { [weak self] in
                     guard let self,
-                          operationAuthority?.authorizes() ?? true else { return nil }
+                          operationAuthority?.authorizes() ?? true,
+                          prepared.authorityConflictRecovery?.authorizes() ?? true else { return nil }
                     let configuredAccountId =
                         self.accountManager.configuredAccount?.id
                     guard configuredAccountId
@@ -7960,6 +8385,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 persistAccountStore: { [weak self] permit in
                     guard let self,
                           operationAuthority?.authorizes() ?? true else { return false }
+                    if let witness = prepared.authorityConflictRecovery {
+                        await self.accountPersistenceSubmissions.drain()
+                        guard ExternalAuthConflictRecoveryPolicy.storeSnapshot(
+                            witness.storeSnapshot, matches: self.accountManager.accounts
+                        ), let committed = await self.accountActivationCredentialCommitter
+                            .persistRecoveryAccountStore(witness: witness, permit: permit) else { return false }
+                        publicationBuffer.recoveryStoreSnapshot = committed
+                        publicationBuffer.persistedAccounts = witness.replacementAccounts
+                        self.accountPersistenceRevision &+= 1
+                        do {
+                            _ = try await self.accountPersistence.adoptExternalSnapshot(
+                                revision: self.accountPersistenceRevision
+                            )
+                        } catch { return false }
+                        return true
+                    }
                     guard let configuredCredentialSnapshot =
                             AccountManager.configuredCredentialSnapshot(
                                 from: expectedCredentialAuthority,
@@ -7980,6 +8421,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 persistAuth: { [weak self] permit in
                     guard let self,
                           operationAuthority?.authorizes() ?? true else { return false }
+                    if let witness = prepared.authorityConflictRecovery {
+                        return await self.accountActivationCredentialCommitter.persistAuth(
+                            for: to, path: Self.codexAuthPath, permit: permit,
+                            recoveryWitness: witness,
+                            committedStoreSnapshot: publicationBuffer.recoveryStoreSnapshot
+                        ) == .committed
+                    }
                     if authAlreadyConfigured {
                         let matches = permit.isCurrentlyAuthorized()
                             && Self.authFileMatches(
@@ -8005,6 +8453,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     guard let self,
                           operationAuthority?.authorizes() ?? true,
                           permit.isCurrentlyAuthorized() else { return false }
+                    if let witness = prepared.authorityConflictRecovery {
+                        guard witness.authorizes(),
+                              let committed = publicationBuffer.recoveryStoreSnapshot,
+                              let current = try? SecureAtomicFileTransaction(path: witness.storePath)
+                                .withExclusiveLock({ try $0.read(allowMissing: false) }),
+                              current == committed else { return false }
+                    }
                     let matches = await self.durableConfiguredFilesMatch(to)
                     return matches && permit.isCurrentlyAuthorized()
                 },
@@ -8099,7 +8554,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 detail: stage == .journalPersistence
                     ? .committedJournalUpdateFailed
                     : .fileCommitFailed,
-                failure: "activation transaction stopped at \(String(describing: stage))"
+                failure: "activation transaction stopped at \(String(describing: stage))",
+                recoveryStoreSnapshot: publicationBuffer.recoveryStoreSnapshot
             )
             return false
         }
@@ -8111,13 +8567,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         prepared: PreparedAccountActivation,
         stage: AccountActivationCommitFailureStage,
         detail: AccountActivationDetail,
-        failure: String
+        failure: String,
+        recoveryStoreSnapshot: SecureAtomicFileTransaction.Snapshot? = nil
     ) async {
-        if stage == .mutationAuthorization,
-           await restoreUncommittedPreparation(
-               target: target,
-               prepared: prepared
-           ) {
+        let compensable = stage == .accountStorePersistence || stage == .authAuthorization
+            || stage == .authPersistence
+        var restored = false
+        if compensable, let recoveryStoreSnapshot {
+            restored = await compensateRecoveryStoreSelection(prepared: prepared, committed: recoveryStoreSnapshot)
+        }
+        if !restored, stage == .mutationAuthorization || prepared.authorityConflictRecovery != nil {
+            restored = await restoreUncommittedPreparation(target: target, prepared: prepared)
+        }
+        if restored {
             if prepared.swapGeneration == swapGeneration,
                pendingSwapTargetAccountId == target.id {
                 pendingSwapTargetAccountId = nil
@@ -8128,7 +8590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "ACTIVATION_UNCOMMITTED_PREPARATION_RESTORED generation=\(prepared.swapGeneration) target=\(target.email)"
             ))
             SwapLog.append(.swapFailed(error: failure))
-            logger.error("Configured credential mutation failed before file mutation: \(failure)")
+            logger.error("Configured credential mutation stopped with original review restored: \(failure)")
             return
         }
 
@@ -8152,10 +8614,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         logger.error("Configured credential mutation failed: \(failure)")
     }
 
+    private func compensateRecoveryStoreSelection(
+        prepared: PreparedAccountActivation,
+        committed: SecureAtomicFileTransaction.Snapshot
+    ) async -> Bool {
+        guard let witness = prepared.authorityConflictRecovery,
+              ExternalAuthConflictRecoveryPolicy.storeSnapshot(
+                witness.storeSnapshot, matches: accountManager.accounts
+              ) else { return false }
+        let transaction = accountMutationTransaction
+        let coordinator = accountActivationCoordinator
+        let authorizeOwner: @Sendable () -> Bool = {
+            transaction.ownerAuthorizes(
+                prepared.lease, state: try? coordinator.loadDurableState(),
+                targetAccountId: witness.target.id,
+                activationGeneration: prepared.activationGeneration, allowedPhases: [.preparing]
+            )
+        }
+        guard let restored = await accountActivationCredentialCommitter.compensateRecoveryStoreSelection(
+            witness: witness, committedSnapshot: committed, authorizeOwner: authorizeOwner
+        ), let bytes = restored.bytes,
+              let accounts = try? JSONDecoder().decode([CodexAccount].self, from: bytes) else { return false }
+        do {
+            accountPersistenceRevision &+= 1
+            _ = try await accountPersistence.adoptExternalSnapshot(revision: accountPersistenceRevision)
+            guard authorizeOwner(),
+                  try SecureAtomicFileTransaction(path: witness.storePath)
+                    .withExclusiveLock({ try $0.read(allowMissing: false) }) == restored,
+                  accountManager.adoptVerifiedCommittedCredentialHandoff(
+                    accounts, expectedCredentialAuthority: witness.originalAccounts,
+                    targetAccountId: witness.source.id
+                  ) else { return false }
+            let review = try await coordinator.restoreUncommittedPreparation(
+                targetAccountId: witness.target.id,
+                expectedActivationGeneration: prepared.activationGeneration,
+                previousState: witness.state,
+                authorizeEffect: { state in
+                    transaction.ownerAuthorizes(
+                        prepared.lease, state: state, targetAccountId: witness.target.id,
+                        activationGeneration: prepared.activationGeneration, allowedPhases: [.preparing]
+                    )
+                }
+            )
+            accountManager.publishActivationState(review)
+            return true
+        } catch { return false }
+    }
+
     private func restoreUncommittedPreparation(
         target: CodexAccount,
         prepared: PreparedAccountActivation
     ) async -> Bool {
+        if let witness = prepared.authorityConflictRecovery {
+            guard witness.filesUnchanged(),
+                  accountManager.configuredAccount?.id == witness.source.id,
+                  await accountMutationTransaction.owns(prepared.lease) else { return false }
+            do {
+                let restored = try await accountActivationCoordinator.restoreUncommittedPreparation(
+                    targetAccountId: target.id,
+                    expectedActivationGeneration: prepared.activationGeneration,
+                    previousState: witness.state,
+                    authorizeEffect: { [accountMutationTransaction] state in
+                        accountMutationTransaction.ownerAuthorizes(
+                            prepared.lease, state: state, targetAccountId: target.id,
+                            activationGeneration: prepared.activationGeneration,
+                            allowedPhases: [.preparing]
+                        )
+                    }
+                )
+                accountManager.publishActivationState(restored)
+                return true
+            } catch { return false }
+        }
         guard let previousState = prepared.previousActivationState,
               let previousTargetAccountId = previousState.configuredAccountId,
               let previousTarget = accountManager.accounts.first(where: {
@@ -8341,11 +8871,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ).authorizesEffect
     }
 
+    static let unmanagedRuntimeRefreshInterval: TimeInterval = 30
+
+    /// Read-only: observes app-servers hosted outside the official desktop
+    /// app and warns about those started before the current credentials were
+    /// written. They are never signalled and never block activation.
+    private func refreshUnmanagedRuntimeWarnings(force: Bool = false) {
+        let now = Date()
+        guard !isExiting, !unmanagedRuntimeRefreshInFlight else { return }
+        if !force,
+           let lastUnmanagedRuntimeRefreshAt,
+           now.timeIntervalSince(lastUnmanagedRuntimeRefreshAt)
+            < Self.unmanagedRuntimeRefreshInterval {
+            return
+        }
+        unmanagedRuntimeRefreshInFlight = true
+        lastUnmanagedRuntimeRefreshAt = now
+        Task { @MainActor [weak self] in
+            let observed = await Task.detached(priority: .utility) {
+                () -> ([CodexUnmanagedRuntime], Date?)? in
+                guard let runtimes = SwapEngine.unmanagedDesktopRuntimes() else {
+                    return nil
+                }
+                let writtenAt = (try? FileManager.default.attributesOfItem(
+                    atPath: Self.codexAuthPath
+                ))?[.modificationDate] as? Date
+                return (runtimes, writtenAt)
+            }.value
+            guard let self else { return }
+            self.unmanagedRuntimeRefreshInFlight = false
+            guard let (runtimes, writtenAt) = observed else { return }
+            let warnings = AccountManager.unmanagedRuntimeWarnings(
+                runtimes: runtimes,
+                credentialsWrittenAt: writtenAt
+            )
+            guard warnings != self.accountManager.unmanagedRuntimeWarnings else {
+                return
+            }
+            self.accountManager.publishUnmanagedRuntimeWarnings(warnings)
+            let detail = warnings
+                .map { "pid=\($0.pid) host=\($0.host) command=\($0.command)" }
+                .joined(separator: "; ")
+            SwapLog.append(.debug(
+                "UNMANAGED_RUNTIME_WARNING count=\(warnings.count) \(detail)"
+            ))
+            self.statusBarController.updateIcon()
+            self.updatePopoverContent()
+        }
+    }
+
     private func retryActivationConvergenceIfDue(at date: Date) {
         guard !isExiting,
-              let targetAccountId = accountManager.activationState?.automaticRetryTarget(at: date),
+              let state = accountManager.activationState,
+              let targetAccountId = state.automaticRetryTarget(at: date),
               let target = accountManager.accounts.first(where: { $0.id == targetAccountId }),
               accountManager.configuredAccount?.id == targetAccountId else {
+            return
+        }
+        // Identical consecutive failures are futile at the journal cadence;
+        // space them out until the outcome changes or the operator retries.
+        guard activationRetryEscalation.permitsAutomaticRetry(
+            activationGeneration: state.activationGeneration,
+            at: date
+        ) else {
             return
         }
         beginSameTargetRuntimeRetry(to: target, source: .automatic)
@@ -8487,6 +9075,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         source: AccountActivationRetrySource,
         operationAuthority: PoolAuthorityOperationAuthority? = nil
     ) async -> Bool {
+        if source != .automatic {
+            activationRetryEscalation.reset()
+        }
         guard !isExiting,
               operationAuthority?.authorizes() ?? true,
               swapConvergenceTask == nil,
@@ -9099,6 +9690,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if case .runtimeCurrent = completion.outcome {
             await releaseManualRateLimitResetSwapSuppressionIfNeeded(for: to)
         }
+        switch completion.outcome {
+        case .restartRequired:
+            activationRetryEscalation.recordFailure(
+                activationGeneration: prepared.activationGeneration,
+                signature: ActivationRetryEscalation.signature(for: completion),
+                at: Date()
+            )
+        case .runtimeCurrent, .configuredOnly:
+            activationRetryEscalation.reset()
+        }
+        refreshUnmanagedRuntimeWarnings(force: true)
 
         switch completion.outcome {
         case .runtimeCurrent where recordsSwap:
@@ -9553,6 +10155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 queueTelemetryPersistence(context: "reauth-account-validation")
                 startPollingForAccount(accountId)
+                queueLinuxDevboxReauthentication(accountId)
                 refreshSubscriptionInfoIfNeeded(force: true)
                 statusBarController.updateIcon()
                 updatePopoverContent()
@@ -10250,7 +10853,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         updatePopoverContent()
     }
 
+    private func queueLinuxDevboxReauthentication(_ accountId: UUID) {
+        guard LinuxDevboxMonitor.settings().isConfigured,
+              let account = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
+        var queue = UserDefaults.standard.dictionary(forKey: LinuxDevboxReauthentication.queueKey) as? [String: String] ?? [:]
+        queue[accountId.uuidString] = LinuxDevboxReauthentication.fingerprint(account)
+        UserDefaults.standard.set(queue, forKey: LinuxDevboxReauthentication.queueKey)
+        deliverPendingLinuxDevboxReauthentication(force: true)
+    }
+
+    private func deliverPendingLinuxDevboxReauthentication(force: Bool = false) {
+        let settings = LinuxDevboxMonitor.settings()
+        guard !isExiting, settings.isConfigured, !linuxDevboxReauthInFlight,
+              !linuxDevboxCredentialSyncInFlight else { return }
+        if !force, let lastLinuxDevboxReauthAttempt,
+           Date().timeIntervalSince(lastLinuxDevboxReauthAttempt) < 60 { return }
+        var queue = UserDefaults.standard.dictionary(forKey: LinuxDevboxReauthentication.queueKey) as? [String: String] ?? [:]
+        let eligible = accountManager.accounts.filter {
+            queue[$0.id.uuidString] != nil && $0.hasCompleteRuntimeCredentials
+        }
+        guard !eligible.isEmpty else { return }
+        let previousIndex = eligible.firstIndex(where: { $0.id == lastLinuxDevboxReauthAccountID })
+        let account = eligible[previousIndex.map { ($0 + 1) % eligible.count } ?? 0]
+        let fingerprint = LinuxDevboxReauthentication.fingerprint(account)
+        queue[account.id.uuidString] = fingerprint
+        UserDefaults.standard.set(queue, forKey: LinuxDevboxReauthentication.queueKey)
+        linuxDevboxReauthInFlight = true
+        lastLinuxDevboxReauthAccountID = account.id
+        lastLinuxDevboxReauthAttempt = Date()
+        Task { @MainActor [weak self] in
+            let success = await Task.detached {
+                LinuxDevboxReauthentication.deliver(account, settings: settings)
+            }.value
+            guard let self else { return }
+            self.linuxDevboxReauthInFlight = false
+            var pending = UserDefaults.standard.dictionary(forKey: LinuxDevboxReauthentication.queueKey) as? [String: String] ?? [:]
+            if success, pending[account.id.uuidString] == fingerprint {
+                pending = LinuxDevboxReauthentication.acknowledge(
+                    pending, accountID: account.id.uuidString, fingerprint: fingerprint
+                )
+                UserDefaults.standard.set(pending, forKey: LinuxDevboxReauthentication.queueKey)
+                if self.accountManager.activationNotice == LinuxDevboxReauthentication.pendingNotice {
+                    self.accountManager.publishActivationNotice(nil)
+                }
+                SwapLog.append(.debug("LINUX_DEVBOX_REAUTH_VERIFIED account=\(account.id)"))
+            } else if !success {
+                self.accountManager.publishActivationNotice(
+                    LinuxDevboxReauthentication.pendingNotice
+                )
+                SwapLog.append(.debug("LINUX_DEVBOX_REAUTH_PENDING account=\(account.id)"))
+            }
+            self.updatePopoverContent()
+        }
+    }
+
     private func checkLinuxDevboxReadiness(force: Bool = false) {
+        deliverPendingLinuxDevboxReauthentication()
         let settings = LinuxDevboxMonitor.settings()
         guard settings.isConfigured else {
             NotificationManager.resolveLinuxDevboxReadinessIssue()
@@ -10264,6 +10922,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             accountManager.linuxDevboxStatus = .notConfigured
             updatePopoverContent()
             return
+        }
+        // Launch and every five minutes: return VPS-refreshed chains to the Mac.
+        Task { [weak self] in
+            await self?.convergeLinuxDevboxTokens(context: "periodic", triggered: false)
         }
         let supersededReadinessTask: Bool
         if let activeContext = linuxDevboxReadinessTaskContext,
@@ -10412,6 +11074,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             states,
                             context: "linux-devbox-status-sync"
                         )
+                        self.convergeLinuxDevboxTokensAfterVPSTokenExpiry(states)
                         SwapLog.append(.debug("LINUX_DEVBOX_REMOTE_ACCOUNT_STATUS_SYNCED remote_active=\(accountStateActiveEmail ?? "none") readiness_active=\(self.accountManager.linuxDevboxStatus.activeEmail ?? "none") local_configured=\(self.accountManager.configuredAccount?.email ?? "none") accounts=\(states.count) reason=headless-readiness"))
                         SwapLog.append(.debug("LINUX_DEVBOX_READY summary=\(readiness.summary)"))
                     case .failure(let failure):
@@ -10527,9 +11190,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         context: String
     ) {
         let previousBanks = accountManager.accounts.map(\.rateLimitResetBank)
+        let previousBanksByProviderAccountId = Self.rateLimitResetBanksByProviderAccountId(
+            accountManager.accounts
+        )
         let result = accountManager.applyLinuxDevboxAccountStates(states)
         if previousBanks != accountManager.accounts.map(\.rateLimitResetBank) {
             queueTelemetryPersistence(context: "remote-reset-inventory")
+            // A VPS-mirrored bank can be the first evidence of a redemption made through
+            // the VPS, T3, or another client. The Mac's own inventory poll would then see
+            // no change, so refresh usage now instead of waiting for the adaptive poll.
+            for account in Self.accountsWithMirroredRateLimitResetRedemption(
+                previous: previousBanksByProviderAccountId,
+                current: accountManager.accounts,
+                now: Date()
+            ) {
+                guard let providerAccountId = account.normalizedProviderAccountId else { continue }
+                SwapLog.append(.debug(
+                    "RESET_EXTERNAL_REDEMPTION_OBSERVED account=\(account.email) source=vps-mirror available=\(account.rateLimitResetBank?.availableCount ?? 0) quota_refresh=required"
+                ))
+                Task { @MainActor [weak self] in
+                    await self?.refreshQuotaAfterRateLimitResetRedemption(
+                        providerAccountId: providerAccountId,
+                        email: account.email
+                    )
+                }
+            }
         }
         var resetReconciliationChanged = false
         for state in states {

@@ -241,10 +241,78 @@ struct CodexRuntimeDiscoveryBlocker: Codable, Equatable, Hashable, Sendable {
     let reason: CodexRuntimeDiscoveryBlockerReason
 }
 
+/// Where the kernel parent chain of a stdio app-server leads.
+enum CodexDesktopHostAncestry: Equatable, Sendable {
+    /// An ancestor is the main executable of a top-level `/Applications`
+    /// ChatGPT (or legacy Codex) app bundle.
+    case officialDesktopHost
+    /// The complete chain reached launchd without an official desktop host;
+    /// the associated value names the hosting app or parent process.
+    case foreignHost(String)
+    /// The chain could not be read completely; classification stays strict.
+    case unknown
+}
+
+/// A live, identity-bound Codex app-server that CodexSwitch has no authority
+/// to reload: it is hosted by another application (for example an IDE or
+/// T3 Code session) rather than the official ChatGPT desktop app. It is never
+/// signalled, is not an activation target or blocker, and is surfaced to the
+/// operator as a restart-to-switch warning instead.
+struct CodexUnmanagedRuntime: Codable, Equatable, Hashable, Sendable {
+    static let maximumCommandCharacters = 80
+
+    let pid: Int32
+    let startSeconds: UInt64
+    let startMicroseconds: UInt64
+    let host: String
+    let command: String
+
+    var startedAt: Date {
+        Date(
+            timeIntervalSince1970: TimeInterval(startSeconds)
+                + TimeInterval(startMicroseconds) / 1_000_000
+        )
+    }
+
+    init(
+        pid: Int32,
+        startSeconds: UInt64,
+        startMicroseconds: UInt64,
+        host: String,
+        command: String
+    ) {
+        self.pid = pid
+        self.startSeconds = startSeconds
+        self.startMicroseconds = startMicroseconds
+        self.host = host
+        self.command = command
+    }
+
+    init(process: CodexIdentityBoundProcess, host: String) {
+        let executable = process.arguments.first.map {
+            URL(fileURLWithPath: $0).lastPathComponent
+        } ?? URL(fileURLWithPath: process.identity.executablePath).lastPathComponent
+        let command = ([executable] + process.arguments.dropFirst())
+            .joined(separator: " ")
+        self.init(
+            pid: process.identity.pid,
+            startSeconds: process.identity.startSeconds,
+            startMicroseconds: process.identity.startMicroseconds,
+            host: host,
+            command: command.count > Self.maximumCommandCharacters
+                ? String(command.prefix(Self.maximumCommandCharacters - 3)) + "..."
+                : command
+        )
+    }
+}
+
 struct CodexRuntimeDiscoverySnapshot: Equatable, Sendable {
     let targets: [CodexRuntimeTarget]
     let blockers: Set<CodexRuntimeDiscoveryBlocker>
     let processSnapshotIsComplete: Bool
+    /// Classified runtimes excluded from targets because CodexSwitch cannot
+    /// manage them. They never affect completeness or convergence.
+    let unmanagedRuntimes: [CodexUnmanagedRuntime]
 
     var isComplete: Bool {
         processSnapshotIsComplete && blockers.isEmpty
@@ -254,16 +322,19 @@ struct CodexRuntimeDiscoverySnapshot: Equatable, Sendable {
         self.targets = targets
         self.blockers = []
         self.processSnapshotIsComplete = isComplete
+        self.unmanagedRuntimes = []
     }
 
     init(
         targets: [CodexRuntimeTarget],
         blockers: Set<CodexRuntimeDiscoveryBlocker>,
-        processSnapshotIsComplete: Bool
+        processSnapshotIsComplete: Bool,
+        unmanagedRuntimes: [CodexUnmanagedRuntime] = []
     ) {
         self.targets = targets
         self.blockers = blockers
         self.processSnapshotIsComplete = processSnapshotIsComplete
+        self.unmanagedRuntimes = unmanagedRuntimes
     }
 }
 
@@ -1052,7 +1123,8 @@ enum SwapEngine {
                     from: discoveryResult,
                     requiredOwnerUID: UInt32(getuid()),
                     identityProvider: signalProcessIdentity,
-                    argumentProvider: processArguments
+                    argumentProvider: processArguments,
+                    desktopHostAncestry: liveDesktopHostAncestry
                 )
             },
             requiredOwnerUID: UInt32(getuid()),
@@ -1295,7 +1367,8 @@ enum SwapEngine {
         kernelExecutableIdentityProvider: (Int32) -> CodexKernelExecutableIdentity? = {
             kernelExecutableIdentity(pid: $0)
         },
-        managedDesktopRuntimePath: String? = installedManagedDesktopRuntimePath()
+        managedDesktopRuntimePath: String? = installedManagedDesktopRuntimePath(),
+        desktopHostAncestry: (Int32) -> CodexDesktopHostAncestry = { _ in .unknown }
     ) -> CodexRuntimeDiscoverySnapshot {
         switch discoveryResult {
         case .noMatches:
@@ -1307,7 +1380,8 @@ enum SwapEngine {
                 identityProvider: identityProvider,
                 argumentProvider: argumentProvider,
                 kernelExecutableIdentityProvider: kernelExecutableIdentityProvider,
-                managedDesktopRuntimePath: managedDesktopRuntimePath
+                managedDesktopRuntimePath: managedDesktopRuntimePath,
+                desktopHostAncestry: desktopHostAncestry
             )
         case .failed:
             return CodexRuntimeDiscoverySnapshot(targets: [], isComplete: false)
@@ -1323,8 +1397,17 @@ enum SwapEngine {
             requiredOwnerUID: requiredOwnerUID,
             identityProvider: signalProcessIdentity,
             argumentProvider: processArguments,
-            kernelExecutableIdentityProvider: kernelExecutableIdentity
+            kernelExecutableIdentityProvider: kernelExecutableIdentity,
+            desktopHostAncestry: liveDesktopHostAncestry
         )
+    }
+
+    /// Live kernel parent-chain classification used by every production
+    /// desktop discovery path.
+    nonisolated static func liveDesktopHostAncestry(
+        _ pid: Int32
+    ) -> CodexDesktopHostAncestry {
+        CodexDesktopNativeChildCoordinator.desktopHostAncestry(pid: pid)
     }
 
     nonisolated static func desktopRuntimeDiscoverySnapshot(
@@ -1335,20 +1418,49 @@ enum SwapEngine {
         kernelExecutableIdentityProvider: (Int32) -> CodexKernelExecutableIdentity? = {
             kernelExecutableIdentity(pid: $0)
         },
-        managedDesktopRuntimePath: String? = installedManagedDesktopRuntimePath()
+        managedDesktopRuntimePath: String? = installedManagedDesktopRuntimePath(),
+        desktopHostAncestry: (Int32) -> CodexDesktopHostAncestry = { _ in .unknown }
     ) -> CodexRuntimeDiscoverySnapshot {
-        classifiedRuntimeDiscoverySnapshot(
+        classifyRuntimeDiscoverySnapshot(
             from: processSnapshot,
             requiredOwnerUID: requiredOwnerUID,
             identityProvider: identityProvider,
             argumentProvider: argumentProvider,
             kernelExecutableIdentityProvider: kernelExecutableIdentityProvider
         ) { process in
-            desktopRuntimeKind(
+            guard let kind = desktopRuntimeKind(
                 for: process,
                 managedDesktopRuntimePath: managedDesktopRuntimePath
-            )
+            ) else {
+                return .excluded
+            }
+            // A stdio app-server is an official desktop child only when its
+            // parent chain reaches the ChatGPT app. A readable chain that
+            // ends elsewhere (IDE, T3 Code, terminal) is unmanaged: it can
+            // never pass first-ACK bootstrap, so treating it as a target
+            // would wedge every activation in CommittedDegraded forever.
+            if kind == .officialDesktopStdioChild,
+               case .foreignHost(let host) = desktopHostAncestry(
+                   process.identity.pid
+               ) {
+                return .unmanaged(CodexUnmanagedRuntime(
+                    process: process,
+                    host: host
+                ))
+            }
+            return .target(kind)
         }
+    }
+
+    /// Read-only observation of unmanaged local app-servers.
+    nonisolated static func unmanagedDesktopRuntimes()
+        -> [CodexUnmanagedRuntime]? {
+        let discovery = desktopRuntimeDiscoverySnapshot(
+            from: discoverCodexProcesses(),
+            requiredOwnerUID: UInt32(getuid())
+        )
+        guard discovery.processSnapshotIsComplete else { return nil }
+        return discovery.unmanagedRuntimes
     }
 
     private nonisolated static func classifiedRuntimeDiscoverySnapshot(
@@ -1359,8 +1471,34 @@ enum SwapEngine {
         kernelExecutableIdentityProvider: (Int32) -> CodexKernelExecutableIdentity?,
         runtimeClassifier: (CodexIdentityBoundProcess) -> HotSwapRuntimeKind?
     ) -> CodexRuntimeDiscoverySnapshot {
+        classifyRuntimeDiscoverySnapshot(
+            from: processSnapshot,
+            requiredOwnerUID: requiredOwnerUID,
+            identityProvider: identityProvider,
+            argumentProvider: argumentProvider,
+            kernelExecutableIdentityProvider: kernelExecutableIdentityProvider
+        ) { process in
+            runtimeClassifier(process).map { .target($0) } ?? .excluded
+        }
+    }
+
+    private enum CodexRuntimeClassification {
+        case target(HotSwapRuntimeKind)
+        case unmanaged(CodexUnmanagedRuntime)
+        case excluded
+    }
+
+    private nonisolated static func classifyRuntimeDiscoverySnapshot(
+        from processSnapshot: CodexPGrepProcessSnapshot,
+        requiredOwnerUID: UInt32,
+        identityProvider: (Int32) -> CodexSignalProcessIdentity?,
+        argumentProvider: (Int32) -> [String]?,
+        kernelExecutableIdentityProvider: (Int32) -> CodexKernelExecutableIdentity?,
+        classifier: (CodexIdentityBoundProcess) -> CodexRuntimeClassification
+    ) -> CodexRuntimeDiscoverySnapshot {
         var targets: [CodexRuntimeTarget] = []
         var blockers: Set<CodexRuntimeDiscoveryBlocker> = []
+        var unmanagedRuntimes: [CodexUnmanagedRuntime] = []
 
         for pid in processSnapshot.pids {
             let binding = identityBindingResult(
@@ -1379,16 +1517,24 @@ enum SwapEngine {
                 }
                 continue
             }
-            guard let runtimeKind = runtimeClassifier(process) else {
+            switch classifier(process) {
+            case .target(let runtimeKind):
+                targets.append(CodexRuntimeTarget(
+                    process: process,
+                    runtimeKind: runtimeKind
+                ))
+            case .unmanaged(let runtime):
+                unmanagedRuntimes.append(runtime)
+            case .excluded:
                 continue
             }
-            targets.append(CodexRuntimeTarget(process: process, runtimeKind: runtimeKind))
         }
 
         return CodexRuntimeDiscoverySnapshot(
             targets: targets,
             blockers: blockers,
-            processSnapshotIsComplete: processSnapshot.isComplete
+            processSnapshotIsComplete: processSnapshot.isComplete,
+            unmanagedRuntimes: unmanagedRuntimes
         )
     }
 
@@ -2117,7 +2263,8 @@ enum SwapEngine {
             kernelExecutableIdentityProvider: kernelExecutableIdentity,
             managedDesktopRuntimePath: installedManagedDesktopRuntimePath(
                 homeDirectory: homeDirectory
-            )
+            ),
+            desktopHostAncestry: liveDesktopHostAncestry
         )
 
         return liveLocalRuntimeEvidenceSnapshot(
@@ -3562,6 +3709,8 @@ enum SwapEngine {
     static func writeAuthFile(
         for account: CodexAccount,
         path: String? = nil,
+        expectedSnapshot: SecureAtomicFileTransaction.Snapshot? = nil,
+        authorizeEffect: @Sendable () -> Bool = { true },
         testHooks: AuthFileWriteTestHooks = AuthFileWriteTestHooks()
     ) throws {
         let targetPath = path ?? codexAuthPath
@@ -3574,6 +3723,14 @@ enum SwapEngine {
 
         try transaction.withExclusiveLock { lockedFile in
             let current = try lockedFile.read()
+            if let expectedSnapshot, current != expectedSnapshot {
+                throw SecureAtomicFileError.staleGeneration(
+                    expected: expectedSnapshot.generation.value, actual: current.generation.value
+                )
+            }
+            guard authorizeEffect() else {
+                throw AccountActivationCoordinatorError.authorizationRevoked
+            }
             let committed = try lockedFile.replace(data, expectedGeneration: current.generation)
             guard let committedBytes = committed.bytes,
                   committedBytes == data,
