@@ -60,6 +60,10 @@ source_revision() {
 
 SOURCE_REVISION="$(source_revision)"
 
+if [[ "${1:-}" == "--install" ]]; then
+    python3 "$PROJECT_DIR/scripts/check-app-provenance.py" "$PROJECT_DIR" "/Applications/${APP_NAME}.app"
+fi
+
 select_codesign_identity() {
     if [[ -n "${CODEXSWITCH_CODESIGN_IDENTITY:-}" ]]; then
         printf '%s\n' "$CODEXSWITCH_CODESIGN_IDENTITY"

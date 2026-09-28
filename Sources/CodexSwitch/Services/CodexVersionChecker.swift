@@ -27,6 +27,7 @@ final class CodexVersionChecker {
     nonisolated static let automaticUpdateFailureBackoff: TimeInterval = 6 * 60 * 60
     nonisolated static let automaticRuntimeRepairInterval: TimeInterval = 5 * 60
     private nonisolated static let homebrewCodexPath = "/opt/homebrew/bin/codex"
+    private nonisolated static let runtimeMarkerCache = RuntimeMarkerScanCache()
 
     struct CodexCLIRepairResult: Sendable, Equatable {
         let attempted: Bool
@@ -841,12 +842,15 @@ final class CodexVersionChecker {
         at path: String,
         chunkSize: Int = 1024 * 1024
     ) -> Bool {
-        guard chunkSize > 0,
-              let handle = FileHandle(forReadingAtPath: path) else {
-            return false
+        runtimeMarkerCache.result(at: path, chunkSize: chunkSize) { handle in
+            scanRequiredRuntimeMarkers(handle: handle, chunkSize: chunkSize)
         }
-        defer { try? handle.close() }
+    }
 
+    private nonisolated static func scanRequiredRuntimeMarkers(
+        handle: FileHandle,
+        chunkSize: Int
+    ) -> Bool? {
         do {
             let header = try handle.read(upToCount: 4096) ?? Data()
             guard binaryIsMachOExecutableData(header) else { return false }
@@ -880,7 +884,7 @@ final class CodexVersionChecker {
                 overlap = Data(window.suffix(overlapCount))
             }
         } catch {
-            return false
+            return nil
         }
         return false
     }

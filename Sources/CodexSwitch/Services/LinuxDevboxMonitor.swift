@@ -1,3 +1,4 @@
+import CoreFoundation
 import CryptoKit
 import Darwin
 import Foundation
@@ -753,6 +754,39 @@ enum LinuxDevboxCredentialSyncJournalError: Error, Equatable, LocalizedError {
     }
 }
 
+struct LinuxDevboxLegacyCredentialReview: Sendable {
+    let operation: LinuxDevboxCredentialSyncOperation
+    fileprivate let snapshot: SecureAtomicFileTransaction.Snapshot
+    fileprivate let journalPath: String
+
+    var generation: String { snapshot.generation.value }
+    var confirmation: String { "supersede-unknown:\(operation.operationID):\(generation)" }
+}
+
+struct LinuxDevboxLegacySupersessionEvidence: Equatable, Sendable {
+    let operationID: String
+    let targetFingerprint: String
+    let observedAt: Date
+    let authority: PoolAuthorityObservation
+    let credentials: LinuxDevboxCredentialStateEvidence
+    let storeGeneration: String
+    let authGeneration: String
+    let runtimeLeaseNonce: UUID
+    let runtimeLeaseHeld: Bool
+    let oldImporterAbsent: Bool
+    let remoteStageAbsent: Bool
+    let activationBarrierClear: Bool
+    let localSyncQuiesced: Bool
+}
+
+struct LinuxDevboxLegacySupersessionResult: Equatable, Sendable {
+    enum Disposition: String, Sendable { case supersededUnknownOutcome }
+    let disposition: Disposition
+    let operationID: String
+    let backupPath: String
+    let journalGeneration: String
+}
+
 struct LinuxDevboxCredentialSyncJournal: Sendable {
     static let defaultPath = NSString(
         string: "~/.codexswitch/linux-devbox-credential-sync.json"
@@ -784,6 +818,88 @@ struct LinuxDevboxCredentialSyncJournal: Sendable {
                 )
             }
             _ = try lockedFile.replace(try encode(operation), expectedGeneration: current.generation)
+        }
+    }
+
+    func reviewLegacyUnresolved() throws -> LinuxDevboxLegacyCredentialReview {
+        try transaction.withExclusiveLock { lockedFile in
+            let snapshot = try lockedFile.read(allowMissing: false)
+            guard let bytes = snapshot.bytes, bytes.count <= Self.maximumRecordBytes,
+                  let fields = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+                  Set(fields.keys).isSubset(of: Set([
+                      "version", "operationID", "targetFingerprint", "credentialFingerprint",
+                      "expectedAccountIdentityFingerprint", "expectedCredentialSetFingerprint",
+                      "expectedActiveProviderAccountId", "expectedActiveTokenHashPrefix",
+                      "baselineAccountIdentityFingerprint", "baselineCredentialSetFingerprint",
+                      "baselineActiveProviderAccountId", "baselineActiveTokenHashPrefix",
+                      "baselineAuthMatchesActiveStoreToken", "localDirectory", "remoteDirectory",
+                      "createdAt", "phase", "reason", "importReceipt",
+                  ])) else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy review refuses oversized or unknown journal fields")
+            }
+            guard let operation = try decode(snapshot.bytes),
+                  operation.phase == .unresolved, operation.importReceipt == nil else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("only unresolved receipt-less operations can be superseded")
+            }
+            return LinuxDevboxLegacyCredentialReview(
+                operation: operation, snapshot: snapshot, journalPath: transaction.path
+            )
+        }
+    }
+
+    /// The caller must keep its real remote guard alive through this entire synchronous call.
+    func supersedeLegacyUnresolved(
+        review: LinuxDevboxLegacyCredentialReview,
+        confirmation: String,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory,
+        now: () -> Date = Date.init,
+        revalidateRemoteGuard: () throws -> LinuxDevboxLegacySupersessionEvidence
+    ) throws -> LinuxDevboxLegacySupersessionResult {
+        guard confirmation == review.confirmation, review.journalPath == transaction.path,
+              LinuxDevboxMonitor.credentialSyncOwnsLocalStagePath(
+                  operation: review.operation, temporaryDirectory: temporaryDirectory
+              ) else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("explicit legacy review or staging ownership does not match")
+        }
+        return try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read(allowMissing: false)
+            guard current == review.snapshot, let bytes = current.bytes else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy journal generation or identity changed")
+            }
+            let before = try revalidateRemoteGuard()
+            guard LinuxDevboxMonitor.legacyCredentialSupersessionEligible(
+                operation: review.operation, evidence: before, now: now()
+            ), LinuxDevboxMonitor.legacyCredentialStageIsAbsent(review.operation.localDirectory) else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy supersession lacks fresh quiescent evidence")
+            }
+            let backupPath = transaction.path + ".legacy-unresolved-backup.json"
+            let backup = SecureAtomicFileTransaction(path: backupPath, subject: "unresolved legacy credential journal backup")
+            try backup.withExclusiveLock { backupFile in
+                let existing = try backupFile.read()
+                if let existingBytes = existing.bytes {
+                    guard existingBytes == bytes else {
+                        throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy backup slot already belongs to another journal generation")
+                    }
+                } else {
+                    _ = try backupFile.replace(bytes, expectedGeneration: existing.generation)
+                }
+                let after = try revalidateRemoteGuard()
+                guard LinuxDevboxMonitor.legacyCredentialSupersessionEligible(
+                    operation: review.operation, evidence: after, now: now()
+                ), LinuxDevboxMonitor.legacySupersessionGuardUnchanged(before, after),
+                   LinuxDevboxMonitor.legacyCredentialStageIsAbsent(review.operation.localDirectory),
+                   try backupFile.read().bytes == bytes,
+                   try lockedFile.read() == review.snapshot else {
+                    throw LinuxDevboxCredentialSyncJournalError.invalidRecord("legacy supersession guard changed; backup retained and journal not retired")
+                }
+                _ = try lockedFile.remove(expectedGeneration: review.snapshot.generation)
+            }
+            return LinuxDevboxLegacySupersessionResult(
+                disposition: .supersededUnknownOutcome,
+                operationID: review.operation.operationID,
+                backupPath: backupPath,
+                journalGeneration: review.generation
+            )
         }
     }
 
@@ -823,14 +939,57 @@ struct LinuxDevboxCredentialSyncJournal: Sendable {
                     "import receipt does not match the pending operation"
                 )
             }
-            if let recorded = operation.importReceipt, recorded != receipt {
-                throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
-                    "a different import receipt is already recorded"
-                )
+            if let recorded = operation.importReceipt {
+                guard recorded == receipt else {
+                    throw LinuxDevboxCredentialSyncJournalError.invalidRecord(
+                        "a different import receipt is already recorded"
+                    )
+                }
+                return
             }
             operation.importReceipt = receipt
             try validate(operation)
             _ = try lockedFile.replace(try encode(operation), expectedGeneration: current.generation)
+        }
+    }
+
+    /// Body must be synchronous and must not call another journal method.
+    func withCurrentRecoveryOperation(
+        operation: LinuxDevboxCredentialSyncOperation,
+        receipt: LinuxDevboxCredentialImportReceipt? = nil,
+        body: () -> Void
+    ) throws -> Bool {
+        var expected = operation
+        if let receipt {
+            guard LinuxDevboxMonitor.credentialImportReceiptMatchesOperation(receipt, operation: operation) else {
+                return false
+            }
+            expected.importReceipt = receipt
+        }
+        return try transaction.withExclusiveLock { lockedFile in
+            guard let current = try decode(lockedFile.read().bytes), current == expected else {
+                return false
+            }
+            body()
+            return true
+        }
+    }
+
+    func clearRecoveredImport(
+        operation: LinuxDevboxCredentialSyncOperation,
+        receipt: LinuxDevboxCredentialImportReceipt
+    ) throws {
+        guard LinuxDevboxMonitor.credentialImportReceiptMatchesOperation(receipt, operation: operation) else {
+            throw LinuxDevboxCredentialSyncJournalError.invalidRecord("recovery receipt is not operation-bound")
+        }
+        var expected = operation
+        expected.importReceipt = receipt
+        try transaction.withExclusiveLock { lockedFile in
+            let current = try lockedFile.read()
+            guard let recorded = try decode(current.bytes), recorded == expected else {
+                throw LinuxDevboxCredentialSyncJournalError.invalidRecord("held operation changed during receipt recovery")
+            }
+            _ = try lockedFile.remove(expectedGeneration: current.generation)
         }
     }
 
@@ -924,7 +1083,69 @@ enum LinuxDevboxCredentialSyncReconciliation: Equatable, Sendable {
     case unresolved(String)
 }
 
+struct LinuxDevboxCredentialImportStatus: Equatable, Sendable {
+    enum State: String, Decodable, Sendable {
+        case missing
+        case pending
+        case completed
+    }
+
+    let operationId: UUID
+    let status: State
+    let receipt: LinuxDevboxCredentialImportReceipt?
+}
+
+// Historical completion must not enter AppDelegate's current-convergence cache path.
+enum LinuxDevboxCredentialReceiptRecovery: Equatable, Sendable {
+    case completed(receipt: LinuxDevboxCredentialImportReceipt, matchesCurrentEvidence: Bool)
+    case unresolved(String)
+}
+
 enum LinuxDevboxMonitor {
+    static func legacyCredentialStageIsAbsent(_ path: String) -> Bool {
+        var metadata = stat()
+        return lstat(path, &metadata) != 0 && errno == ENOENT
+    }
+
+    static func legacyCredentialSupersessionEligible(
+        operation: LinuxDevboxCredentialSyncOperation,
+        evidence: LinuxDevboxLegacySupersessionEvidence,
+        now: Date
+    ) -> Bool {
+        let age = now.timeIntervalSince(evidence.observedAt)
+        let authorityAge = now.timeIntervalSince(evidence.authority.observedAt)
+        return operation.phase == .unresolved && operation.importReceipt == nil
+            && operation.createdAt < evidence.observedAt
+            && evidence.operationID == operation.operationID
+            && evidence.targetFingerprint == operation.targetFingerprint
+            && age.isFinite && age >= 0 && age <= 10
+            && authorityAge.isFinite && authorityAge >= 0 && authorityAge <= 10
+            && evidence.authority.phase == .stable
+            && evidence.authority.desiredProviderAccountId == evidence.credentials.activeProviderAccountId
+            && evidence.credentials.authMatchesActiveStoreToken
+            && isLowercaseHex(evidence.storeGeneration, count: 64)
+            && isLowercaseHex(evidence.authGeneration, count: 64)
+            && isLowercaseHex(evidence.credentials.credentialSetFingerprint, count: 64)
+            && isLowercaseHex(evidence.credentials.accountIdentityFingerprint, count: 64)
+            && isLowercaseHex(evidence.credentials.activeTokenHashPrefix, count: 12)
+            && evidence.runtimeLeaseHeld && evidence.oldImporterAbsent
+            && evidence.remoteStageAbsent && evidence.activationBarrierClear && evidence.localSyncQuiesced
+    }
+
+    static func legacySupersessionGuardUnchanged(
+        _ before: LinuxDevboxLegacySupersessionEvidence,
+        _ after: LinuxDevboxLegacySupersessionEvidence
+    ) -> Bool {
+        before.operationID == after.operationID && before.targetFingerprint == after.targetFingerprint
+            && before.runtimeLeaseNonce == after.runtimeLeaseNonce
+            && before.authority.epoch == after.authority.epoch
+            && before.authority.requestId == after.authority.requestId
+            && before.authority.desiredProviderAccountId == after.authority.desiredProviderAccountId
+            && before.credentials == after.credentials
+            && before.storeGeneration == after.storeGeneration && before.authGeneration == after.authGeneration
+            && after.observedAt >= before.observedAt
+    }
+
     static let remoteCodexSwitchCLI =
         #"/usr/bin/flock --shared --no-fork "$HOME/.local/share/codexswitch/runtime-start-install.lock" "$HOME/.local/share/codexswitch/current/codexswitch-cli""#
     static let maximumRemoteProviderAccountIdBytes = 256
@@ -1321,7 +1542,8 @@ enum LinuxDevboxMonitor {
         baseline: LinuxDevboxCredentialStateEvidence,
         operationID: UUID = UUID(),
         createdAt: Date = Date(),
-        temporaryDirectory: URL = FileManager.default.temporaryDirectory
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory,
+        protocolProbe: (() -> Result<Void, LinuxDevboxMonitorFailure>)? = nil
     ) -> Result<LinuxDevboxCredentialSyncOperation, LinuxDevboxMonitorFailure> {
         guard accounts.filter(\.isActive).count == 1,
               let active = accounts.first(where: \.isActive),
@@ -1331,6 +1553,12 @@ enum LinuxDevboxMonitor {
                 message: "Credential sync requires exactly one active account with complete tokens",
                 credentialSyncDisposition: .rejected
             ))
+        }
+
+        // The caller persists its journal only after this preparation succeeds.
+        switch protocolProbe?() ?? checkCredentialImportProtocol(settings: settings) {
+        case .failure(let failure): return .failure(failure)
+        case .success: break
         }
 
         let identifier = operationID.uuidString.lowercased()
@@ -2506,6 +2734,9 @@ enum LinuxDevboxMonitor {
                 credentialSyncDisposition: .rejected
             ))
         }
+        if case .failure(let failure) = checkCredentialImportProtocol(settings: settings) {
+            return .failure(failure)
+        }
         guard credentialSyncOwnsLocalStagePath(operation: operation) else {
             return .failure(LinuxDevboxMonitorFailure(
                 message: "Credential sync local staging path is not operation-owned",
@@ -2756,7 +2987,8 @@ enum LinuxDevboxMonitor {
                 remoteDirectory: remoteDirectory,
                 bundleName: bundleURL.lastPathComponent,
                 passphraseName: passphraseURL.lastPathComponent,
-                operationID: operation.operationID
+                operationID: operation.operationID,
+                baselineFingerprint: operation.baselineCredentialSetFingerprint
             ),
             timeout: 45,
             retryPolicy: .preExecutionTransportOnly
@@ -2803,8 +3035,8 @@ enum LinuxDevboxMonitor {
                 ))
             case .completed:
                 return .failure(LinuxDevboxMonitorFailure(
-                    message: detail,
-                    credentialSyncDisposition: .rejected
+                    message: "\(detail); credential import receipt reconciliation is required",
+                    credentialSyncDisposition: .outcomeUnknown
                 ))
             case .unknown:
                 return .failure(LinuxDevboxMonitorFailure(
@@ -3018,6 +3250,181 @@ enum LinuxDevboxMonitor {
         ))
     }
 
+    static func remoteCredentialImportProtocolCommand() -> String {
+        "\(remoteCodexSwitchCLI) credential-import-status --help && \(remoteCodexSwitchCLI) update-bundle --help"
+    }
+
+    static func credentialImportProtocolReadiness(
+        terminationStatus: Int32,
+        timedOut: Bool,
+        output: String
+    ) -> Result<Void, LinuxDevboxMonitorFailure> {
+        if timedOut || terminationStatus == 255 {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Credential import capability check unavailable; no mutation attempted",
+                credentialSyncDisposition: .retryablePreExecution
+            ))
+        }
+        let boundedOutput = output.utf8.count <= 32 * 1_024 ? output : ""
+        let words = Set(boundedOutput.split(whereSeparator: \.isWhitespace).map(String.init))
+        guard terminationStatus == 0,
+              Set(["credential-import-status", "update-bundle", "--operation-id", "--baseline-fingerprint",
+                   "--incoming-fingerprint", "--receipt-operation-id", "--receipt-baseline-fingerprint"])
+                .isSubset(of: words) else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "VPS credential import protocol upgrade required; sync deferred before journal or staging",
+                credentialSyncDisposition: .rejected
+            ))
+        }
+        return .success(())
+    }
+
+    static func checkCredentialImportProtocol(
+        settings: LinuxDevboxMonitorSettings
+    ) -> Result<Void, LinuxDevboxMonitorFailure> {
+        guard settings.isConfigured else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Linux devbox monitor is not configured", credentialSyncDisposition: .rejected
+            ))
+        }
+        let result = runSSH(
+            settings: settings,
+            remoteCommand: remoteCredentialImportProtocolCommand(),
+            timeout: 15,
+            retryPolicy: .readOnly
+        )
+        return credentialImportProtocolReadiness(
+            terminationStatus: result.terminationStatus,
+            timedOut: result.timedOut,
+            output: result.stdoutString
+        )
+    }
+
+    static func decodeCredentialImportStatus(
+        output: String,
+        operation: LinuxDevboxCredentialSyncOperation
+    ) -> Result<LinuxDevboxCredentialImportStatus, LinuxDevboxMonitorFailure> {
+        let invalid = LinuxDevboxMonitorFailure(
+            message: "Invalid or unbound historical credential import status",
+            credentialSyncDisposition: .outcomeUnknown
+        )
+        let data = Data(output.utf8)
+        guard !data.isEmpty, data.count <= 72 * 1_024 else { return .failure(invalid) }
+        do {
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  Set(object.keys) == Set(["version", "operationId", "status", "receipt"]),
+                  let version = object["version"] as? NSNumber,
+                  CFGetTypeID(version) != CFBooleanGetTypeID(), version == 1,
+                  let operationID = object["operationId"] as? String,
+                  operationID == operation.operationID,
+                  let uuid = UUID(uuidString: operationID),
+                  uuid.uuidString.lowercased() == operationID,
+                  let rawState = object["status"] as? String,
+                  let state = LinuxDevboxCredentialImportStatus.State(rawValue: rawState) else {
+                return .failure(invalid)
+            }
+            let receipt: LinuxDevboxCredentialImportReceipt?
+            if state == .completed {
+                guard let object = object["receipt"] as? [String: Any] else {
+                    return .failure(invalid)
+                }
+                let bytes = try JSONSerialization.data(withJSONObject: object)
+                receipt = try decodeCredentialImportReceipt(
+                    output: String(decoding: bytes, as: UTF8.self), operation: operation
+                ).get()
+            } else {
+                guard object["receipt"] is NSNull else { return .failure(invalid) }
+                receipt = nil
+            }
+            return .success(LinuxDevboxCredentialImportStatus(
+                operationId: uuid, status: state, receipt: receipt
+            ))
+        } catch {
+            return .failure(invalid)
+        }
+    }
+
+    static func credentialReceiptRecovery(
+        operation: LinuxDevboxCredentialSyncOperation,
+        remoteStageAbsent: Bool,
+        status: LinuxDevboxCredentialImportStatus,
+        observed: LinuxDevboxCredentialStateEvidence?
+    ) -> LinuxDevboxCredentialReceiptRecovery {
+        guard remoteStageAbsent else {
+            return .unresolved("Private remote credential staging is not proven absent")
+        }
+        guard status.operationId.uuidString.lowercased() == operation.operationID,
+              status.status == .completed,
+              let receipt = status.receipt,
+              credentialImportReceiptMatchesOperation(receipt, operation: operation) else {
+            return .unresolved("No completed operation-bound historical receipt; reviewed recovery is required")
+        }
+        if let recorded = operation.importReceipt, recorded != receipt {
+            return .unresolved("Local and remote historical import receipts conflict")
+        }
+        return .completed(receipt: receipt, matchesCurrentEvidence: observed == receipt.committedEvidence)
+    }
+
+    static func remoteCredentialImportStatusCommand(
+        operation: LinuxDevboxCredentialSyncOperation
+    ) -> String {
+        "\(remoteCodexSwitchCLI) credential-import-status --operation-id \(shellQuote(operation.operationID)) --baseline-fingerprint \(shellQuote(operation.baselineCredentialSetFingerprint)) --incoming-fingerprint \(shellQuote(operation.expectedCredentialSetFingerprint))"
+    }
+
+    /// Additive integration point: persist history before the caller retires its held operation.
+    static func recoverCredentialSyncReceipt(
+        settings: LinuxDevboxMonitorSettings,
+        operation: LinuxDevboxCredentialSyncOperation,
+        recordImportReceipt: (LinuxDevboxCredentialImportReceipt) throws -> Void
+    ) -> LinuxDevboxCredentialReceiptRecovery {
+        guard settings.isConfigured,
+              credentialSyncTargetFingerprint(settings: settings) == operation.targetFingerprint,
+              credentialSyncOwnsLocalStagePath(operation: operation),
+              operation.remoteDirectory == "/tmp/codexswitch-auto-sync-\(operation.operationID)" else {
+            return .unresolved("Credential receipt recovery target or staging ownership changed")
+        }
+        if let failure = cleanupLocalCredentialStage(
+            at: URL(fileURLWithPath: operation.localDirectory, isDirectory: true)
+        ) {
+            return .unresolved(failure)
+        }
+        let stage = runSSH(
+            settings: settings,
+            remoteCommand: remoteCredentialStageAbsenceCommand(remoteDirectory: operation.remoteDirectory),
+            timeout: 15,
+            retryPolicy: .readOnly
+        )
+        guard !stage.timedOut, stage.terminationStatus == 0 else {
+            return .unresolved("Private remote credential staging is not proven absent")
+        }
+        let result = runSSH(
+            settings: settings,
+            remoteCommand: remoteCredentialImportStatusCommand(operation: operation),
+            timeout: 15,
+            retryPolicy: .readOnly
+        )
+        guard !result.timedOut, result.terminationStatus == 0 else {
+            return .unresolved("Historical credential receipt unavailable; no import was replayed")
+        }
+        switch decodeCredentialImportStatus(output: result.stdoutString, operation: operation) {
+        case .failure(let failure):
+            return .unresolved(failure.message)
+        case .success(let status):
+            let observed = try? captureCredentialStateEvidence(settings: settings).get()
+            let recovery = credentialReceiptRecovery(
+                operation: operation, remoteStageAbsent: true, status: status, observed: observed
+            )
+            if case .completed(let receipt, _) = recovery {
+                do {
+                    try recordImportReceipt(receipt)
+                } catch {
+                    return .unresolved("Historical credential import receipt could not be persisted")
+                }
+            }
+            return recovery
+        }
+    }
+
     static func reconcileCredentialSync(
         settings: LinuxDevboxMonitorSettings,
         operation: LinuxDevboxCredentialSyncOperation
@@ -3119,12 +3526,16 @@ enum LinuxDevboxMonitor {
         bundleName: String,
         passphraseName: String,
         operationID: String,
+        baselineFingerprint: String? = nil,
         removeExecutable: String = "/bin/rm"
     ) -> String {
         let stage = shellQuote(remoteDirectory)
         let bundle = shellQuote("\(remoteDirectory)/\(bundleName)")
         let passphrase = shellQuote("\(remoteDirectory)/\(passphraseName)")
         let remover = shellQuote(removeExecutable)
+        let baselineArgument = baselineFingerprint.map {
+            " --receipt-baseline-fingerprint \(shellQuote($0))"
+        } ?? ""
         return """
         stage=\(stage)
         cleanup_with_status() {
@@ -3146,7 +3557,7 @@ enum LinuxDevboxMonitor {
         set -eu
         umask 077
         chmod 600 \(bundle) \(passphrase)
-        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) \(remoteCodexSwitchCLI) update-bundle --preserve-active --receipt-operation-id \(shellQuote(operationID)) \(bundle)
+        CODEXSWITCH_IMPORT_PASSPHRASE_FILE=\(passphrase) \(remoteCodexSwitchCLI) update-bundle --preserve-active --receipt-operation-id \(shellQuote(operationID))\(baselineArgument) \(bundle)
         """
     }
 

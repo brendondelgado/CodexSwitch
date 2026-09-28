@@ -43,7 +43,8 @@ enum ProcessRunner {
         timeout: TimeInterval,
         environment: [String: String]? = nil,
         currentDirectoryURL: URL? = nil,
-        maxOutputBytes: Int = defaultOutputLimit
+        maxOutputBytes: Int = defaultOutputLimit,
+        standardInput: FileHandle? = nil
     ) -> ProcessRunResult {
         let process = Process()
         process.executableURL = executableURL
@@ -52,6 +53,7 @@ enum ProcessRunner {
             process.environment = environment
         }
         process.currentDirectoryURL = currentDirectoryURL
+        if let standardInput { process.standardInput = standardInput }
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
