@@ -19,6 +19,7 @@ cross_dependencies:
   - architecture/macos-runtime-discovery.md
   - architecture/macos-runtime-artifact.md
   - architecture/secure-drop-transport.md
+  - architecture/t3-usage-hub.md
 version_control:
   branch: main
   status: canonical
@@ -57,6 +58,7 @@ A deployed VPS binary may be older than the repository. A UI can also be stale w
 - [macOS CLI launcher](architecture/macos-cli-launcher.md): prevalidated runtime routing without per-invocation binary scans or fallback ambiguity.
 - [Subprocess execution](architecture/subprocess-execution.md): bounded output capture, timeout escalation, reaping, and actor-isolation rules.
 - [SecureDrop transport](architecture/secure-drop-transport.md): artifact integrity, staging, extraction, deletion safety, and retention.
+- [T3 usage hub](architecture/t3-usage-hub.md): how T3 Code reads VPS usage and redeems banked resets through the CodexSwitch journal.
 - [Session retention contract](architecture/session-retention-contract.md): preservation and representation of remote thread history.
 
 ## Operations
