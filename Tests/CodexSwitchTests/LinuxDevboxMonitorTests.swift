@@ -386,6 +386,33 @@ struct LinuxDevboxMonitorTests {
         #expect(LinuxDevboxMonitor.credentialSyncFingerprint(accounts: [account]) != quotaFingerprint)
 
         let runtimeFingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(accounts: [account])
+        let credit = RateLimitResetCredit(
+            id: "credit-1",
+            resetType: "codex_rate_limits",
+            status: "available",
+            grantedAt: nil,
+            expiresAt: Date(timeIntervalSince1970: 9_000),
+            redeemedAt: nil,
+            title: nil,
+            description: nil
+        )
+        account.rateLimitResetBank = RateLimitResetBank(
+            availableCount: 1, totalEarnedCount: 1, credits: [credit],
+            fetchedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        let bankFingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(accounts: [account])
+        #expect(bankFingerprint != runtimeFingerprint)
+        account.rateLimitResetBank = RateLimitResetBank(
+            availableCount: 1, totalEarnedCount: 1, credits: [credit],
+            fetchedAt: Date(timeIntervalSince1970: 2_030)
+        )
+        #expect(LinuxDevboxMonitor.credentialSyncFingerprint(accounts: [account]) == bankFingerprint)
+        account.rateLimitResetBank = RateLimitResetBank(
+            availableCount: 0, totalEarnedCount: 1, credits: [],
+            fetchedAt: Date(timeIntervalSince1970: 2_060)
+        )
+        #expect(LinuxDevboxMonitor.credentialSyncFingerprint(accounts: [account]) != bankFingerprint)
+
         account.refreshToken = "refresh-2"
         #expect(LinuxDevboxMonitor.credentialSyncFingerprint(accounts: [account]) != runtimeFingerprint)
     }
