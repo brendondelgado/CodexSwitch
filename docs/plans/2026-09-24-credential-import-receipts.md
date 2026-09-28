@@ -21,7 +21,7 @@ version_control:
   branch: codex/vps-reliability-20260924
   base_commit: 7f60ba3c691ea9bafe91df66f0b8abc266a769b6
   status: verified-mac-installed-vps-protocol-not-deployed
-  last_updated: 2026-09-24
+  last_updated: 2026-09-28
 ---
 
 # Contract
@@ -48,11 +48,22 @@ Rejection before intent persistence remains `missing`, not a durable rejection
 receipt; Mac conservatively holds it for review. A future explicit non-execution
 receipt must also guard against an outstanding original import process.
 
-Under the runtime activation lease, reject duplicate operations and unresolved
-intents before any activation reconciliation. Persist an intent before replacing
-accounts; publish completed only after the existing activation outcome is
-confirmed. Persist completed before printing the success response. A lost SSH
-reply is recoverable from the completed record even after later rotation.
+Under the runtime activation lease, reject duplicate operations before any
+activation reconciliation. Persist an intent before replacing accounts.
+
+Update 2026-09-28: publish completed as soon as the store and auth files are
+committed and read back, not after runtime confirmation. The receipt attests
+the credential effect; runtime convergence belongs to the activation barrier.
+The original rule turned a committed import whose runtime reload could not
+confirm (the VPS had zero app-servers during a release activation) into a
+permanent `pending` record, a nonzero exit, and a Mac hold, although the
+credentials were durably committed. The importer now prints the completed
+receipt and exits 0 while reporting pending runtime convergence on stderr.
+Pending intents of other operations no longer block new imports: under the
+exclusive runtime lease their importer has ended, their IDs still reject replay,
+and the monotonic merge keeps later imports safe. Persist completed before
+printing the success response. A lost SSH reply is recoverable from the
+completed record even after later rotation.
 
 The read-only `credential-import-status` command requires operation UUID,
 baseline fingerprint and incoming fingerprint. It returns a strict versioned
@@ -63,8 +74,11 @@ Reissuing update-bundle with an existing operation cannot mutate again; callers
 must use status to replay. Even an expired bundle is unnecessary for status.
 
 Crash after intent but before completed is intentionally pending, including a
-crash after actual convergence but before completion persistence. Do not infer
-its historical outcome from a current matching store. Automatic crash recovery
+crash after the credential commit but before completion persistence. Do not
+infer its historical outcome from a current matching store. Since 2026-09-28 the
+Mac supersedes such a `pending` operation (outcome unknown) once its importer and
+staging are absent, then re-baselines with a fresh operation; see
+`../architecture/runtime-and-host-ownership.md`. Automatic crash recovery
 would require activation-journal operation binding outside this workstream.
 
 Retention is bounded to 1024 operations and 8 MiB, with individual receipts at
@@ -83,7 +97,10 @@ the old local fingerprint synchronized. Fresh sync must start with a fresh
 operation and current baseline/authority observation. Persist a recovered receipt
 with the existing operation-CAS journal API before releasing the old hold.
 
-Missing/pending/unsupported status never proves non-execution. Legacy exact
+Missing/pending/unsupported status never proves non-execution of a held
+operation. The one exception is observed directly by the caller: a `missing`
+status read right after the import command's own completed nonzero exit proves
+that importer finished without an intent, so it is a rejection, not a hold. Legacy exact
 current-state checks remain available separately, but are not historical proof.
 Reject unknown fields, malformed states, mismatched UUID/baseline/incoming,
 wrong target, staging remnants, and conflicting local/remote receipts.

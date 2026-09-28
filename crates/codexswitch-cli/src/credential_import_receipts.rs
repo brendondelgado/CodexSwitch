@@ -216,9 +216,10 @@ impl Journal {
             }
             bail!("credential import operation already recorded; use credential-import-status without reimporting");
         }
-        if ledger.records.iter().any(|r| r.state == State::Pending) {
-            bail!("an unresolved credential import intent requires review");
-        }
+        // A pending record seen under the runtime lease belongs to an importer
+        // that ended before recording its credential commit. Its outcome stays
+        // unknown, but it can never execute again (its ID is recorded), and the
+        // monotonic merge keeps this new import safe whatever it did.
         if ledger.records.len() >= MAX_OPERATIONS {
             bail!("credential import receipt capacity exhausted; reviewed retention required");
         }
@@ -394,7 +395,8 @@ mod tests {
     }
 
     #[test]
-    fn crash_after_intent_never_publishes_a_success_receipt_or_reimports() -> Result<()> {
+    fn crash_after_intent_stays_pending_and_never_replays_without_blocking_new_imports(
+    ) -> Result<()> {
         let temp = private_temp()?;
         let store = temp.path().join("accounts.json");
         let auth = temp.path().join("auth.json");
@@ -420,14 +422,19 @@ mod tests {
             &receipt.incoming_credential_set_fingerprint
         )
         .is_err());
-        assert!(Journal::acquire(
+        let mut next = Journal::acquire(
             &lease,
             &store,
             &auth,
             Uuid::new_v4(),
-            &receipt.incoming_credential_set_fingerprint
-        )
-        .is_err());
+            &receipt.incoming_credential_set_fingerprint,
+        )?;
+        let mut later = self::receipt();
+        later.operation_id = next.operation_id;
+        next.prepare(&later)?;
+        next.complete(&later)?;
+        assert_eq!(status(&store, &auth, &receipt)?.status, State::Pending);
+        assert_eq!(status(&store, &auth, &later)?.status, State::Completed);
         Ok(())
     }
 

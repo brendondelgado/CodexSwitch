@@ -116,10 +116,20 @@ struct RuntimeReloadEvidence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadConvergence {
+    /// Every discovered runtime acknowledged the exact auth generation.
     VerifiedHotSwap,
-    NoRuntimeTargets,
+    /// Initial and final discovery both succeeded and found no account-bearing
+    /// runtime while the auth generation stayed fixed: nothing holds the old
+    /// credentials, and any later runtime reads the committed auth file at start.
+    VerifiedNoRuntimeTargets,
     Incomplete,
 }
+
+/// Linux `/proc` enumeration is this host's complete account-bearing runtime
+/// discovery, so a positive empty result proves convergence. On macOS the Swift
+/// coordinator owns runtime discovery; the Rust `pgrep` snapshot cannot prove
+/// that no desktop runtime exists, so zero targets there stay incomplete.
+const POSITIVE_EMPTY_DISCOVERY_PROVES_CONVERGENCE: bool = cfg!(any(target_os = "linux", test));
 
 impl ReloadSummary {
     #[cfg(test)]
@@ -169,19 +179,43 @@ impl ReloadSummary {
             && self.receipt_proof_is_complete()
         {
             ReloadConvergence::VerifiedHotSwap
-        } else if self.signaled.is_empty() && self.restarted.is_empty() && self.skipped.is_empty() {
-            ReloadConvergence::NoRuntimeTargets
+        } else if self.proves_no_runtime_targets() {
+            ReloadConvergence::VerifiedNoRuntimeTargets
         } else {
             ReloadConvergence::Incomplete
         }
     }
 
+    fn proves_no_runtime_targets(&self) -> bool {
+        POSITIVE_EMPTY_DISCOVERY_PROVES_CONVERGENCE
+            && self.topology_verified
+            // A receipt-bound handoff needs the calling runtime's acknowledgement.
+            && self.receipt_nonce.is_none()
+            && self.sighup_sent.is_empty()
+            && self.signaled.is_empty()
+            && self.restarted.is_empty()
+            && self.skipped.is_empty()
+            && self.generated_request_nonces.is_empty()
+            && self.acknowledged_request_nonces.is_empty()
+            && self
+                .runtime_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.topology.is_empty() && evidence.proofs.is_empty())
+    }
+
+    /// At least one runtime acknowledged the reload. Receipt-bound handoffs and
+    /// managed app-server maintenance require this; activation does not.
     pub fn verified_hot_swap(&self) -> bool {
         self.convergence() == ReloadConvergence::VerifiedHotSwap
     }
 
+    /// No runtime can still hold credentials older than the committed auth file.
+    pub fn runtime_converged(&self) -> bool {
+        self.convergence() != ReloadConvergence::Incomplete
+    }
+
     pub(crate) fn bind_activation(&mut self, expected: &ActivationReloadBinding) -> Result<()> {
-        if !self.verified_hot_swap() {
+        if !self.runtime_converged() {
             let blockers = self
                 .skipped
                 .iter()
@@ -228,7 +262,7 @@ impl ReloadSummary {
     }
 
     pub(crate) fn proves_activation(&self, expected: &ActivationReloadBinding) -> bool {
-        self.verified_hot_swap()
+        self.runtime_converged()
             && self.activation_binding.as_ref() == Some(expected)
             && match self.runtime_evidence.as_ref() {
                 Some(evidence) => {
@@ -2305,6 +2339,35 @@ where
     Ok(summary)
 }
 
+/// Drives the production reload state machine when initial discovery found no
+/// runtime, with an injected final discovery result.
+#[cfg(test)]
+pub(crate) fn reload_after_empty_discovery_for_test<Discover>(
+    auth_path: &Path,
+    receipt_nonce: Option<Uuid>,
+    final_discover: Discover,
+) -> Result<ReloadSummary>
+where
+    Discover: FnOnce() -> Result<Vec<CodexProcess>>,
+{
+    reload_discovered_codex_processes_with(
+        Vec::new(),
+        auth_path,
+        receipt_nonce,
+        true,
+        || Ok(()),
+        final_discover,
+        |_| Ok(()),
+        |_, _, _, _| None,
+        |_, _, _, _, _| bail!("no runtime may receive a request"),
+        |_| false,
+        |_, _, _, _| false,
+        |_, _| None,
+        |_, _| Err(std::io::Error::other("no runtime may be signalled")),
+        |_, _, _, _| false,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RuntimeTopologyIdentity {
     pid: i32,
@@ -2441,9 +2504,10 @@ fn collect_runtime_reload_evidence(
     Ok(evidence)
 }
 
+/// An empty topology is complete evidence of a positive zero-runtime discovery;
+/// `ReloadSummary::convergence` decides whether this host may rely on it.
 fn runtime_reload_evidence_is_complete(evidence: &RuntimeReloadEvidence) -> bool {
-    if evidence.topology.is_empty()
-        || evidence.proofs.len() != evidence.topology.len()
+    if evidence.proofs.len() != evidence.topology.len()
         || evidence.topology.iter().collect::<HashSet<_>>().len() != evidence.topology.len()
     {
         return false;
