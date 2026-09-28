@@ -746,6 +746,15 @@ fn normalized_runtime_reason_is_token_expired(reason: &str) -> bool {
 }
 
 pub fn inference_token_expiration(token: &str) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(inference_token_claim_seconds(token, "exp")?, 0)
+}
+
+/// Issue time of an access token; orders two generations whose expiry is equal.
+pub fn inference_token_issued_at(token: &str) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(inference_token_claim_seconds(token, "iat")?, 0)
+}
+
+fn inference_token_claim_seconds(token: &str, claim: &str) -> Option<i64> {
     let mut segments = token.split('.');
     segments.next()?;
     let payload = segments.next()?;
@@ -764,13 +773,10 @@ pub fn inference_token_expiration(token: &str) -> Option<DateTime<Utc>> {
         return None;
     }
     let claims: Value = serde_json::from_slice(&decoded).ok()?;
-    let expiration = claims.get("exp")?.as_i64().or_else(|| {
-        claims
-            .get("exp")?
-            .as_u64()
-            .and_then(|value| i64::try_from(value).ok())
-    })?;
-    DateTime::from_timestamp(expiration, 0)
+    let value = claims.get(claim)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
 }
 
 fn plan_matches(normalized: &str, plan: &str) -> bool {
