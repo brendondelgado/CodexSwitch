@@ -130,7 +130,12 @@ explicit socket is never started; if it is absent the client falls back.
 Otherwise, on Linux the socket is
 `$CODEX_HOME/app-server-control/app-server-control.sock` (`CODEX_HOME`
 defaults to `~/.codex`). If it is absent or refuses connections, the client
-runs `<real codex> app-server daemon start` once:
+starts it the way ChatGPT's SSH remote does, by running `<real codex> app-server
+proxy` once with stdin closed. The proxy auto-starts the daemon with the managed
+launcher's flags (such as `features.code_mode_host`), so the daemon has one
+configuration regardless of which frontend connects first. On Linux the proxy
+runs in its own transient `systemd-run --user --scope`, so the daemon never joins
+the frontend's service cgroup (restarting T3 must not kill the shared daemon):
 
 - bounded to 30 seconds, then up to 15 seconds for the socket to accept;
 - in its own process group with null stdio, so the daemon cannot hold the

@@ -48,7 +48,7 @@ fn write_fake_codex(dir: &Path) -> PathBuf {
     fs::write(
         &path,
         r#"#!/bin/sh
-if [ "$1 $2 $3" = "app-server daemon start" ]; then
+if [ -n "$CODEXSWITCH_SHARED_DAEMON_START" ] && [ "$1 $2" = "app-server proxy" ]; then
   echo started > "$DAEMON_START_MARKER"
   exit 1
 fi
@@ -299,7 +299,7 @@ fn missing_shared_daemon_falls_back_to_a_private_app_server() {
     );
     assert!(!marker.exists());
 
-    // Default discovery: Linux tries `codex app-server daemon start` once
+    // Default discovery: Linux starts the daemon once via `codex app-server proxy`
     // (the fake fails it); macOS never starts a desktop daemon. Both then run
     // the private app-server with the untouched argv and stdin.
     let codex_home = temp.path().join("codex-home");
