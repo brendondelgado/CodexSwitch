@@ -3655,6 +3655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
              "load-restore",
              "reauth-added-different-account",
              "authority-reconciliation",
+             "authority-status",
              "subscription-info",
              "reset-consumed",
              "swap",
@@ -3702,6 +3703,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
              "reset-consumed",
              "subscription-info",
              "authority-reconciliation",
+             "authority-status",
              "token-convergence":
             return 60
         default:
@@ -10670,8 +10672,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             if self.accountManager.configuredAccount?.normalizedProviderAccountId
                 == observation.desiredProviderAccountId {
+                // A routine status poll is not evidence of VPS divergence, so it
+                // honors the unchanged-pool shortcut. Remote divergence arrives
+                // through receipt reconciliation or token convergence, which
+                // force a push.
                 self.scheduleLinuxDevboxCredentialSyncIfNeeded(
-                    context: "authority-reconciliation"
+                    context: "authority-status"
                 )
             }
         }
