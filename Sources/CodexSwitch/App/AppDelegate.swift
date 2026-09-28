@@ -389,6 +389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var linuxDevboxReadinessCheckInFlight = false
     private var linuxDevboxReadinessGeneration: UInt64 = 0
     private var linuxDevboxReadinessTaskContext: LinuxDevboxReadinessTaskContext?
+    private var linuxDevboxSurfacedCredentialSyncHold: LinuxDevboxSurfacedCredentialSyncHold?
     private var linuxDevboxConsecutiveIssueChecks = 0
     private var poolAuthorityClientState = PoolAuthorityClientState()
     private var poolAuthorityStatusCheckInFlight = false
@@ -3535,9 +3536,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         context: String
     ) {
         let summary = Self.linuxDevboxCredentialSyncHoldSummary(reason: reason)
-        publishLinuxDevboxInvalidation(
-            .barrierBlocked,
-            summary: summary
+        if LinuxDevboxSurfacedCredentialSyncHold.resurfaceIsUnchanged(
+            lastSurfaced: linuxDevboxSurfacedCredentialSyncHold,
+            currentStatus: accountManager.linuxDevboxStatus,
+            fingerprint: fingerprint
+        ) {
+            // Same persisted hold: refresh its text without discarding the
+            // in-flight readiness check or its remote account mirror.
+            let status = LinuxDevboxStatus.invalidated(
+                by: .barrierBlocked,
+                summary: summary
+            )
+            if accountManager.linuxDevboxStatus != status {
+                accountManager.linuxDevboxStatus = status
+            }
+        } else {
+            publishLinuxDevboxInvalidation(
+                .barrierBlocked,
+                summary: summary
+            )
+        }
+        linuxDevboxSurfacedCredentialSyncHold = LinuxDevboxSurfacedCredentialSyncHold(
+            fingerprint: fingerprint,
+            publishedStatus: accountManager.linuxDevboxStatus
         )
         SwapLog.append(.debug(
             "LINUX_DEVBOX_CREDENTIAL_SYNC_HELD context=\(context) unresolved_fingerprint=\(fingerprint) reason=\(reason)"

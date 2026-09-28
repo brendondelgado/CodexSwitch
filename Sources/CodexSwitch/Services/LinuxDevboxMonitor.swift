@@ -208,6 +208,30 @@ struct LinuxDevboxReadinessTaskContext: Equatable, Sendable {
     }
 }
 
+/// The credential-sync hold most recently surfaced as the VPS status.
+///
+/// A persisted hold is re-surfaced by every authority poll, readiness check,
+/// and historical-receipt reconciliation (several times per minute) while it
+/// stays unresolved, and its human-readable reason alternates between those
+/// sources. Only a different hold (a new unresolved operation fingerprint) or a
+/// status that changed since the hold was surfaced is a semantic change that
+/// must discard an in-flight readiness check; re-surfacing the same hold only
+/// refreshes the displayed summary.
+struct LinuxDevboxSurfacedCredentialSyncHold: Equatable, Sendable {
+    let fingerprint: String
+    let publishedStatus: LinuxDevboxStatus
+
+    static func resurfaceIsUnchanged(
+        lastSurfaced: LinuxDevboxSurfacedCredentialSyncHold?,
+        currentStatus: LinuxDevboxStatus,
+        fingerprint: String
+    ) -> Bool {
+        guard let lastSurfaced else { return false }
+        return lastSurfaced.fingerprint == fingerprint
+            && lastSurfaced.publishedStatus == currentStatus
+    }
+}
+
 struct LinuxDevboxReadiness: Codable, Equatable, Sendable {
     let ready: Bool
     let summary: String

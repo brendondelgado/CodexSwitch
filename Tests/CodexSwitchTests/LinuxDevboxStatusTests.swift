@@ -509,3 +509,79 @@ struct LinuxDevboxStatusTests {
         return (report, output)
     }
 }
+
+@Suite("Linux devbox credential-sync hold re-surfacing")
+struct LinuxDevboxCredentialSyncHoldResurfaceTests {
+    private let fingerprint = String(repeating: "1e", count: 32)
+
+    private func held(_ reason: String) -> LinuxDevboxStatus {
+        .invalidated(
+            by: .barrierBlocked,
+            summary: AppDelegate.linuxDevboxCredentialSyncHoldSummary(reason: reason)
+        )
+    }
+
+    @Test("The same persisted hold with alternating reasons does not discard a readiness check")
+    func samePersistedHoldWithAlternatingReasonsIsUnchanged() {
+        // Production 2026-09-27: authority-reconciliation and
+        // historical-receipt-reconciliation re-surfaced one unresolved
+        // operation every ~7.5s with two different reasons, discarding every
+        // VPS readiness check as stale_after_account_mirror.
+        let baselineReason = "Remote credential state does not match the pre-mutation baseline and no import receipt was recorded"
+        let receiptReason = "Historical credential receipt unavailable; no import was replayed"
+        var surfaced: LinuxDevboxSurfacedCredentialSyncHold?
+        var status = LinuxDevboxStatus.notConfigured
+
+        #expect(!LinuxDevboxSurfacedCredentialSyncHold.resurfaceIsUnchanged(
+            lastSurfaced: surfaced,
+            currentStatus: status,
+            fingerprint: fingerprint
+        ))
+        status = held(baselineReason)
+        surfaced = .init(fingerprint: fingerprint, publishedStatus: status)
+
+        for reason in [receiptReason, baselineReason, receiptReason, baselineReason] {
+            #expect(LinuxDevboxSurfacedCredentialSyncHold.resurfaceIsUnchanged(
+                lastSurfaced: surfaced,
+                currentStatus: status,
+                fingerprint: fingerprint
+            ))
+            status = held(reason)
+            surfaced = .init(fingerprint: fingerprint, publishedStatus: status)
+        }
+    }
+
+    @Test("A different unresolved operation is a semantic change")
+    func differentHoldFingerprintInvalidates() {
+        let status = held("Credential sync may have started")
+        let surfaced = LinuxDevboxSurfacedCredentialSyncHold(
+            fingerprint: fingerprint,
+            publishedStatus: status
+        )
+
+        #expect(!LinuxDevboxSurfacedCredentialSyncHold.resurfaceIsUnchanged(
+            lastSurfaced: surfaced,
+            currentStatus: status,
+            fingerprint: String(repeating: "ab", count: 32)
+        ))
+    }
+
+    @Test("A hold re-applied after a readiness publication invalidates again")
+    func holdAfterStatusChangeInvalidates() {
+        let surfaced = LinuxDevboxSurfacedCredentialSyncHold(
+            fingerprint: fingerprint,
+            publishedStatus: held("Credential sync may have started")
+        )
+        let ready = LinuxDevboxStatus(
+            state: .ready,
+            summary: "Ready",
+            activeEmail: "ready@example.com"
+        )
+
+        #expect(!LinuxDevboxSurfacedCredentialSyncHold.resurfaceIsUnchanged(
+            lastSurfaced: surfaced,
+            currentStatus: ready,
+            fingerprint: fingerprint
+        ))
+    }
+}
