@@ -251,7 +251,8 @@ current store. The Mac retires its matching held journal with generation checks,
 invalidates its convergence cache, and requests fresh convergence. Missing or
 pending receipts never become fabricated success; they follow the supersession
 rule below. The Mac surfaces an unresolved hold from
-its local journal on every poll. The SSH-backed receipt lookup for the same
+its local journal on every poll, but logs `LINUX_DEVBOX_CREDENTIAL_SYNC_HELD`
+only once per distinct hold, context, and reason until the hold resolves. The SSH-backed receipt lookup for the same
 operation is spaced out, starting at one minute and doubling to thirty
 minutes, because an unresolved lookup is deterministic until the VPS release or
 the operator changes something. Re-surfacing the same hold never discards an

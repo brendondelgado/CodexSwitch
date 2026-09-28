@@ -413,11 +413,11 @@ struct AppDelegateCredentialSyncTests {
                 observed: observed ?? held.expected, remoteImporterAbsent: importerAbsent, now: now ?? old
             )
         }
-        // Every missing precondition keeps the hold: young, pending intent, live importer,
+        // Every missing precondition keeps the hold: young without an intent, live importer,
         // stage remnant, or no fresh remote observation.
         for blocked in [
             try recovery(now: held.createdAt.addingTimeInterval(60 * 60)),
-            try recovery("pending"),
+            try recovery("pending", importerAbsent: false),
             try recovery(importerAbsent: false),
             try recovery(stageAbsent: false),
             LinuxDevboxMonitor.credentialReceiptRecovery(
@@ -429,6 +429,11 @@ struct AppDelegateCredentialSyncTests {
                 Issue.record("Supersession was allowed without every precondition: \(blocked)")
                 return
             }
+        }
+        // A recorded intent whose importer ended can never replay: no 24-hour wait.
+        guard case .supersedable = try recovery("pending", now: held.createdAt.addingTimeInterval(60)) else {
+            Issue.record("A pending intent with no importer stayed blocked")
+            return
         }
         guard case .supersedable(let proof) = try recovery() else {
             Issue.record("An expired, absent, receipt-less hold stayed blocked forever")

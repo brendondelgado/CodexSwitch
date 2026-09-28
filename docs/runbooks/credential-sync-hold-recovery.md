@@ -1,7 +1,8 @@
 ---
 title: Credential sync hold recovery
-description: Retire the receipt-less September 9 credential-sync hold and deliver fresh Mac credentials to the VPS through the verified import path.
+description: Retire held Mac-to-VPS credential-sync operations (the September 28 pending-receipt hold and the executed September 9 receipt-less hold) and deliver fresh Mac credentials through the verified import path.
 toc:
+  - September 28 Pending-Receipt Hold
   - Scope
   - Preconditions
   - 1. Backups
@@ -18,10 +19,47 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/App/AppDelegate.swift
   - ../../scripts/credential-freshness-report.py
 version_control:
-  branch: claude/fix-cred-sync
-  status: ready-not-executed
-  last_updated: 2026-09-27
+  branch: claude/fix-degraded-sync
+  status: sep28-ready-not-executed; sep09-executed-2026-09-28T06:04:24Z
+  last_updated: 2026-09-28
 ---
+
+# September 28 Pending-Receipt Hold
+
+Operation `07749631-6e4d-462d-9cb3-2241802f2ba0` (hold fingerprint
+`7d10597c...`, created 2026-09-28T06:04:27Z, Mac journal SHA-256
+`fdf52e20b8665cab07bbfb27c22e62c9d5badd00451481295581125ce70a3f71`) committed
+the Mac credentials on the VPS while its app-servers were stopped. The old CLI
+completed receipts only after runtime confirmation, so the VPS ledger holds a
+`pending` record for it and the Mac recorded `outcomeUnknown`. The VPS store
+fingerprint equalled the receipt's committed fingerprint
+(`7d1e7215...`) at 06:09Z, but that is current evidence, not a historical
+receipt, and daemon token refreshes will change it.
+
+The fixed release resolves it through normal reconciliation, no manual edits:
+
+1. Deploy the VPS release from the merged commit (see
+   `linux-repository-deployment.md`). Its importer no longer rejects new imports
+   because of a `pending` record.
+2. Back up the single supersession slot, which the next supersession replaces:
+   `cp -p ~/.codexswitch/linux-devbox-credential-sync.json.superseded.json ~/.codexswitch/backups/sep09-superseded-journal.json`
+   (SHA-256 must be `5af82d38...`), and copy the live journal next to it.
+3. Install the Mac build (section 3 below). On launch the app reads status
+   `pending`, proves the importer and staging absent, and supersedes the hold at
+   once (no 24-hour wait for `pending`).
+4. Watch the log as in section 4. Expected within about a minute:
+   `LINUX_DEVBOX_CREDENTIAL_SYNC_SUPERSEDED operation=07749631-... outcome=superseded_unknown_outcome`,
+   then `LINUX_DEVBOX_CREDENTIAL_SYNC_SYNCED context=authority-reconciliation`
+   with `credentials already converged` or `credentials synchronized with exact import receipt`.
+5. Verify: the journal is gone, `pool-authority-status --json` shows phase
+   `stable`, and the newest VPS receipt record (section 5 command) is
+   `completed`. The `07749631` record stays `pending` forever by design.
+
+If the VPS is updated but the Mac is not, the old Mac keeps the hold. If the
+Mac is updated but the VPS is not, the supersession still happens, but every
+new import fails on the old VPS with `an unresolved credential import intent
+requires review`. The new Mac reads `missing` for that operation, so it logs a
+`rejected` failure and retries instead of holding. Deploy the VPS first.
 
 # Scope
 
@@ -151,7 +189,7 @@ action. Run it only after the checks above pass.
 | `remote importer is not proven absent` | A process mentions the operation stage, or `pgrep` failed | Run `ssh signul-vps "pgrep -af '[c]odexswitch-auto-sync-6bcae028'"`; do not kill it; review |
 | `staging is not proven absent` | `/tmp/codexswitch-auto-sync-6bcae028-...` exists on the VPS | Review the stage; never delete it blindly |
 | `Fresh remote credential evidence is unavailable` | The VPS store/auth read failed | Fix connectivity or store readability; the app retries every 2 minutes |
-| `pending` status (reviewed recovery) | The VPS holds a durable intent for the operation | Not auto-superseded; escalate |
+| `The held operation's remote importer is not proven absent` with status `pending` | The import may still be running, or `pgrep` failed | Wait; recovery retries with backoff. Do not kill it |
 
 If `SYNCED` never follows `SUPERSEDED`, read the `FAILED` line. A new hold now
 belongs to a fresh, receipt-bound operation, so historical receipt recovery

@@ -393,6 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var linuxDevboxReadinessGeneration: UInt64 = 0
     private var linuxDevboxReadinessTaskContext: LinuxDevboxReadinessTaskContext?
     private var linuxDevboxSurfacedCredentialSyncHold: LinuxDevboxSurfacedCredentialSyncHold?
+    private var linuxDevboxCredentialSyncHoldLog = LinuxDevboxCredentialSyncHoldLog()
     private var activationRetryEscalation = ActivationRetryEscalation()
     private var linuxDevboxCredentialReconciliationBackoff =
         LinuxDevboxCredentialReconciliationBackoff()
@@ -3343,7 +3344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     forKey: linuxDevboxCredentialConvergenceProofKey
                 )
             }
-            clearLegacyLinuxDevboxCredentialSyncHold()
+            clearLinuxDevboxCredentialSyncHold()
             pendingLinuxDevboxCredentialSyncFingerprint = nil
             Task {
                 await NetworkBackoffGuard.shared.recordSuccess(operation: "linux_devbox_credential_sync")
@@ -3377,10 +3378,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 originalContext: context,
                 fingerprint: fingerprint
             ) {
-                clearLegacyLinuxDevboxCredentialSyncHold()
+                clearLinuxDevboxCredentialSyncHold()
                 scheduleLinuxDevboxCredentialSyncRetry(retryPlan)
             } else {
-                clearLegacyLinuxDevboxCredentialSyncHold()
+                clearLinuxDevboxCredentialSyncHold()
                 pendingLinuxDevboxCredentialSyncFingerprint = nil
             }
             Task {
@@ -3437,7 +3438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 UserDefaults.standard.removeObject(forKey: linuxDevboxLastCredentialSyncFingerprintKey)
                 UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialConvergenceProofKey)
-                self.clearLegacyLinuxDevboxCredentialSyncHold()
+                self.clearLinuxDevboxCredentialSyncHold()
                 SwapLog.append(.debug(
                     "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=historical_completed_requires_fresh_convergence"
                 ))
@@ -3459,7 +3460,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 UserDefaults.standard.removeObject(forKey: linuxDevboxLastCredentialSyncFingerprintKey)
                 UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialConvergenceProofKey)
                 self.linuxDevboxCredentialReconciliationBackoff.reset()
-                self.clearLegacyLinuxDevboxCredentialSyncHold()
+                self.clearLinuxDevboxCredentialSyncHold()
                 SwapLog.append(.debug(
                     "LINUX_DEVBOX_CREDENTIAL_SYNC_SUPERSEDED operation=\(operation.operationID) outcome=superseded_unknown_outcome remote_active=\(proof.remoteEvidence.activeProviderAccountId) backup=\(backupPath)"
                 ))
@@ -3513,13 +3514,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     forKey: linuxDevboxCredentialConvergenceProofKey
                 )
             }
-            clearLegacyLinuxDevboxCredentialSyncHold()
+            clearLinuxDevboxCredentialSyncHold()
             SwapLog.append(.debug(
                 "LINUX_DEVBOX_CREDENTIAL_SYNC_RECONCILED operation=\(operation.operationID) outcome=committed"
             ))
             scheduleLinuxDevboxCredentialSyncIfNeeded(context: "load-restore")
         case .safeToRetry:
-            clearLegacyLinuxDevboxCredentialSyncHold()
+            clearLinuxDevboxCredentialSyncHold()
             let fingerprint = LinuxDevboxMonitor.credentialSyncFingerprint(
                 accounts: accountManager.accounts
             )
@@ -3605,9 +3606,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             fingerprint: fingerprint,
             publishedStatus: accountManager.linuxDevboxStatus
         )
-        SwapLog.append(.debug(
-            "LINUX_DEVBOX_CREDENTIAL_SYNC_HELD context=\(context) unresolved_fingerprint=\(fingerprint) reason=\(reason)"
-        ))
+        if linuxDevboxCredentialSyncHoldLog.shouldLog(
+            fingerprint: fingerprint, context: context, reason: reason
+        ) {
+            SwapLog.append(.debug(
+                "LINUX_DEVBOX_CREDENTIAL_SYNC_HELD context=\(context) unresolved_fingerprint=\(fingerprint) reason=\(reason)"
+            ))
+        }
     }
 
     private func publishLinuxDevboxInvalidation(
@@ -3666,9 +3671,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         linuxDevboxReadinessCheckInFlight = false
     }
 
-    private func clearLegacyLinuxDevboxCredentialSyncHold() {
+    private func clearLinuxDevboxCredentialSyncHold() {
         UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialSyncUnresolvedFingerprintKey)
         UserDefaults.standard.removeObject(forKey: linuxDevboxCredentialSyncUnresolvedReasonKey)
+        linuxDevboxCredentialSyncHoldLog.reset()
     }
 
     nonisolated static func linuxDevboxCredentialSyncHoldSummary(reason: String) -> String {

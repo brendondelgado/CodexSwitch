@@ -930,18 +930,47 @@ struct LinuxDevboxMonitorTests {
         #expect(failure?.contains(directory.path) == true)
     }
 
-    @Test("signals after credential import starts are outcome unknown")
-    func credentialImportSignalsAreOutcomeUnknown() {
+    @Test("a finished import holds only when it may have recorded an intent")
+    func completedImportFailureHoldsOnlyUnknownCredentialWrites() throws {
         for status: Int32 in [129, 130, 143] {
-            #expect(
-                LinuxDevboxMonitor.completedCredentialImportFailureDisposition(status)
-                    == .outcomeUnknown
-            )
+            #expect(LinuxDevboxMonitor.isCredentialMutationSignalStatus(status))
         }
-        #expect(
-            LinuxDevboxMonitor.completedCredentialImportFailureDisposition(23)
-                == .rejected
+        #expect(!LinuxDevboxMonitor.isCredentialMutationSignalStatus(1))
+        let operationID = UUID()
+        func status(_ state: LinuxDevboxCredentialImportStatus.State) -> Result<
+            LinuxDevboxCredentialImportStatus, LinuxDevboxMonitorFailure
+        > {
+            .success(LinuxDevboxCredentialImportStatus(operationId: operationID, status: state, receipt: nil))
+        }
+        let rejected = LinuxDevboxMonitor.completedCredentialImportFailure(
+            detail: "import is blocked by unresolved prior runtime convergence", status: status(.missing)
         )
+        #expect(rejected.credentialSyncDisposition == .rejected)
+        #expect(!rejected.credentialSyncDisposition.requiresPersistentHold)
+        for unknown in [
+            status(.pending),
+            .failure(LinuxDevboxMonitorFailure(message: "ssh failed")),
+        ] {
+            #expect(LinuxDevboxMonitor.completedCredentialImportFailure(
+                detail: "import failed", status: unknown
+            ).credentialSyncDisposition == .outcomeUnknown)
+        }
+    }
+
+    @Test("a persisted hold is logged once per context and reason until it resolves")
+    func credentialSyncHoldLogDeduplicatesPolls() {
+        var log = LinuxDevboxCredentialSyncHoldLog()
+        func logs(_ context: String, _ reason: String = "unknown") -> Bool {
+            log.shouldLog(fingerprint: "7d10", context: context, reason: reason)
+        }
+        #expect(logs("readiness"))
+        let repeats = (0..<20).map { _ in logs("readiness") }
+        #expect(!repeats.contains(true))
+        #expect(logs("authority-reconciliation"))
+        #expect(logs("readiness", "receipt unavailable"))
+        #expect(!logs("authority-reconciliation"))
+        log.reset()
+        #expect(logs("readiness"))
     }
 
     @Test("automatic credential bundles expire and never bypass expiry checks")

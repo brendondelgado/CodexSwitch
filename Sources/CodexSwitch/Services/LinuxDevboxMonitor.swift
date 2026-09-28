@@ -245,6 +245,25 @@ struct LinuxDevboxCredentialReconciliationBackoff: Equatable, Sendable {
     }
 }
 
+/// A persisted hold is re-surfaced several times per minute from several contexts
+/// (authority polls, readiness checks, receipt reconciliation). Each distinct
+/// hold, context, and reason is logged once until the hold resolves.
+struct LinuxDevboxCredentialSyncHoldLog: Equatable, Sendable {
+    private static let capacity = 64
+    private var logged: Set<String> = []
+
+    mutating func shouldLog(fingerprint: String, context: String, reason: String) -> Bool {
+        if logged.count >= Self.capacity {
+            logged.removeAll()
+        }
+        return logged.insert("\(fingerprint)\u{1F}\(context)\u{1F}\(reason)").inserted
+    }
+
+    mutating func reset() {
+        logged.removeAll()
+    }
+}
+
 /// The credential-sync hold most recently surfaced as the VPS status.
 ///
 /// A persisted hold is re-surfaced by every authority poll, readiness check,
@@ -1245,8 +1264,7 @@ struct LinuxDevboxUnrecoverableCredentialSyncSupersession: Equatable, Sendable {
 // Historical completion must not enter AppDelegate's current-convergence cache path.
 enum LinuxDevboxCredentialReceiptRecovery: Equatable, Sendable {
     case completed(receipt: LinuxDevboxCredentialImportReceipt, matchesCurrentEvidence: Bool)
-    /// The receipt-aware VPS proved no receipt or intent exists, the operation is older than
-    /// the supersession bound, and neither its stage nor its importer exists.
+    /// The held operation can never execute again: see `unrecoverableCredentialSyncSupersession`.
     case supersedable(LinuxDevboxUnrecoverableCredentialSyncSupersession)
     case unresolved(String)
 }
@@ -3222,8 +3240,7 @@ enum LinuxDevboxMonitor {
                 ? "Linux devbox credential update failed with status \(importResult.terminationStatus)"
                 : message
             if importOutcome.executionState != .notStarted,
-               completedCredentialImportFailureDisposition(importResult.terminationStatus)
-                == .outcomeUnknown {
+               isCredentialMutationSignalStatus(importResult.terminationStatus) {
                 return .failure(LinuxDevboxMonitorFailure(
                     message: "\(detail); signal interrupted the remote mutation and its outcome is unknown",
                     credentialSyncDisposition: .outcomeUnknown
@@ -3238,9 +3255,9 @@ enum LinuxDevboxMonitor {
                     disposition: .retryablePreExecution
                 ))
             case .completed:
-                return .failure(LinuxDevboxMonitorFailure(
-                    message: "\(detail); credential import receipt reconciliation is required",
-                    credentialSyncDisposition: .outcomeUnknown
+                return .failure(completedCredentialImportFailure(
+                    detail: detail,
+                    status: fetchCredentialImportStatus(settings: settings, operation: operation)
                 ))
             case .unknown:
                 return .failure(LinuxDevboxMonitorFailure(
@@ -3257,10 +3274,23 @@ enum LinuxDevboxMonitor {
         status == 129 || status == 130 || status == 143
     }
 
-    static func completedCredentialImportFailureDisposition(
-        _ status: Int32
-    ) -> CredentialSyncFailureDisposition {
-        isCredentialMutationSignalStatus(status) ? .outcomeUnknown : .rejected
+    /// An importer changes credentials only after persisting its intent. A `missing`
+    /// status read after the import command's own completed nonzero exit therefore
+    /// proves this operation changed nothing: it is a rejection, not a hold.
+    static func completedCredentialImportFailure(
+        detail: String,
+        status: Result<LinuxDevboxCredentialImportStatus, LinuxDevboxMonitorFailure>
+    ) -> LinuxDevboxMonitorFailure {
+        if case .success(let observed) = status, observed.status == .missing {
+            return LinuxDevboxMonitorFailure(
+                message: "\(detail); the VPS recorded no import intent, so no credentials changed",
+                credentialSyncDisposition: .rejected
+            )
+        }
+        return LinuxDevboxMonitorFailure(
+            message: "\(detail); credential import receipt reconciliation is required",
+            credentialSyncDisposition: .outcomeUnknown
+        )
     }
 
     static func credentialSyncHoldReason(
@@ -3599,9 +3629,10 @@ enum LinuxDevboxMonitor {
             return .unresolved("Private remote credential staging is not proven absent")
         }
         if status.operationId.uuidString.lowercased() == operation.operationID,
-           status.status == .missing {
+           status.status == .missing || status.status == .pending {
             return unrecoverableCredentialSyncSupersession(
                 operation: operation,
+                remoteStatus: status.status,
                 remoteImporterAbsent: remoteImporterAbsent,
                 observed: observed,
                 now: now
@@ -3619,20 +3650,24 @@ enum LinuxDevboxMonitor {
         return .completed(receipt: receipt, matchesCurrentEvidence: observed == receipt.committedEvidence)
     }
 
-    /// `missing` never proves non-execution, so supersession never claims an outcome. It
-    /// only proves the held operation can no longer run: no receipt or intent exists on the
-    /// receipt-aware VPS, the bundle expired long ago, and stage plus importer are absent.
+    /// Neither `missing` nor `pending` proves what the operation did, so supersession never
+    /// claims an outcome. It only proves the held operation can no longer run: stage and
+    /// importer are absent, and either no intent exists and the bundle expired long ago
+    /// (`missing`), or the intent's recorded ID already rejects any replay (`pending`).
     static func unrecoverableCredentialSyncSupersession(
         operation: LinuxDevboxCredentialSyncOperation,
+        remoteStatus: LinuxDevboxCredentialImportStatus.State,
         remoteImporterAbsent: Bool,
         observed: LinuxDevboxCredentialStateEvidence?,
         now: Date
     ) -> LinuxDevboxCredentialReceiptRecovery {
-        guard operation.phase == .unresolved, operation.importReceipt == nil else {
+        guard operation.phase == .unresolved, operation.importReceipt == nil,
+              remoteStatus != .completed else {
             return .unresolved("No completed operation-bound historical receipt; reviewed recovery is required")
         }
         let age = now.timeIntervalSince(operation.createdAt)
-        guard age.isFinite, age >= unrecoverableCredentialSyncSupersessionAge else {
+        guard remoteStatus == .pending
+                || (age.isFinite && age >= unrecoverableCredentialSyncSupersessionAge) else {
             return .unresolved(
                 "No historical receipt exists; supersession is allowed once the operation is 24 hours old"
             )
@@ -3673,7 +3708,26 @@ enum LinuxDevboxMonitor {
         "\(remoteCodexSwitchCLI) credential-import-status --operation-id \(shellQuote(operation.operationID)) --baseline-fingerprint \(shellQuote(operation.baselineCredentialSetFingerprint)) --incoming-fingerprint \(shellQuote(operation.expectedCredentialSetFingerprint))"
     }
 
-    /// Additive integration point: persist history before the caller retires its held operation.
+    static func fetchCredentialImportStatus(
+        settings: LinuxDevboxMonitorSettings,
+        operation: LinuxDevboxCredentialSyncOperation
+    ) -> Result<LinuxDevboxCredentialImportStatus, LinuxDevboxMonitorFailure> {
+        let result = runSSH(
+            settings: settings,
+            remoteCommand: remoteCredentialImportStatusCommand(operation: operation),
+            timeout: 15,
+            retryPolicy: .readOnly
+        )
+        guard !result.timedOut, result.terminationStatus == 0 else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "Historical credential receipt unavailable; no import was replayed",
+                credentialSyncDisposition: .outcomeUnknown
+            ))
+        }
+        return decodeCredentialImportStatus(output: result.stdoutString, operation: operation)
+    }
+
+    /// Persists history before the caller retires its held operation.
     static func recoverCredentialSyncReceipt(
         settings: LinuxDevboxMonitorSettings,
         operation: LinuxDevboxCredentialSyncOperation,
@@ -3699,21 +3753,12 @@ enum LinuxDevboxMonitor {
         guard !stage.timedOut, stage.terminationStatus == 0 else {
             return .unresolved("Private remote credential staging is not proven absent")
         }
-        let result = runSSH(
-            settings: settings,
-            remoteCommand: remoteCredentialImportStatusCommand(operation: operation),
-            timeout: 15,
-            retryPolicy: .readOnly
-        )
-        guard !result.timedOut, result.terminationStatus == 0 else {
-            return .unresolved("Historical credential receipt unavailable; no import was replayed")
-        }
-        switch decodeCredentialImportStatus(output: result.stdoutString, operation: operation) {
+        switch fetchCredentialImportStatus(settings: settings, operation: operation) {
         case .failure(let failure):
             return .unresolved(failure.message)
         case .success(let status):
             var importerAbsent = false
-            if status.status == .missing,
+            if status.status != .completed,
                let importerProbe = remoteCredentialImporterAbsenceCommand(operation: operation) {
                 let importer = runSSH(
                     settings: settings,
