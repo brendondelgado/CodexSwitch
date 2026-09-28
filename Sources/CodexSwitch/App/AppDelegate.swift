@@ -4684,18 +4684,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             return
         }
-        let restored = activeHolds.mapValues(\.blockedUntil)
-        let knownProviderAccountIds = Set(accountManager.accounts.compactMap(\.normalizedProviderAccountId))
-        let isMissingKnownActiveHold = externalRateLimitResetRedemptionBlockedUntil.contains {
-            providerAccountId, blockedUntil in
-            guard blockedUntil > now,
-                  knownProviderAccountIds.contains(providerAccountId) else {
-                return false
-            }
-            guard let persisted = activeHolds[providerAccountId] else { return true }
-            return persisted.blockedUntil < blockedUntil
-        }
-        guard !isMissingKnownActiveHold else {
+        guard let restored = Self.reconciledExternalRateLimitResetHolds(
+            inMemory: externalRateLimitResetRedemptionBlockedUntil,
+            persisted: activeHolds,
+            knownProviderAccountIds: Set(
+                accountManager.accounts.compactMap(\.normalizedProviderAccountId)
+            ),
+            now: now
+        ) else {
             markExternalRateLimitResetHoldStateUnavailable(
                 ExternalRateLimitResetHoldStoreError.readbackMismatch,
                 context: "restore-readback"
@@ -4704,6 +4700,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         externalRateLimitResetRedemptionBlockedUntil = restored
         markExternalRateLimitResetHoldStateReadable()
+    }
+
+    /// Returns the in-memory hold map implied by the durable store, or `nil` when an
+    /// active in-memory hold for a known account is missing from (or longer than) the
+    /// durable readback. `nil` means the durable write was lost and automatic
+    /// redemption must fail closed until a later bounded read proves the state.
+    nonisolated static func reconciledExternalRateLimitResetHolds(
+        inMemory: [String: Date],
+        persisted: [String: ExternalRateLimitResetHoldStore.Hold],
+        knownProviderAccountIds: Set<String>,
+        now: Date
+    ) -> [String: Date]? {
+        let isMissingKnownActiveHold = inMemory.contains { providerAccountId, blockedUntil in
+            guard blockedUntil > now,
+                  knownProviderAccountIds.contains(providerAccountId) else {
+                return false
+            }
+            guard let persisted = persisted[providerAccountId] else { return true }
+            return persisted.blockedUntil < blockedUntil
+        }
+        return isMissingKnownActiveHold ? nil : persisted.mapValues(\.blockedUntil)
+    }
+
+    /// Removes the in-memory copy of a hold that the durable store just cleared because
+    /// newer usable quota proved recovery. A newer in-memory hold (recorded after the
+    /// cleared one) is retained so the readback check still protects it.
+    nonisolated static func externalRateLimitResetHolds(
+        _ holds: [String: Date],
+        removingRecoveredHold clearedHold: ExternalRateLimitResetHoldStore.Hold,
+        providerAccountId: String
+    ) -> [String: Date] {
+        guard let key = RateLimitResetProviderAccountIdentity.normalize(providerAccountId),
+              let inMemoryBlockedUntil = holds[key],
+              inMemoryBlockedUntil <= clearedHold.blockedUntil else {
+            return holds
+        }
+        var updated = holds
+        updated.removeValue(forKey: key)
+        return updated
     }
 
     private func externalRateLimitResetHold(for account: CodexAccount) -> Date? {
@@ -4760,6 +4795,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         guard let hold else { return }
+        // The durable store no longer has this hold; drop the in-memory copy before the
+        // readback check, otherwise restore treats the intentional clear as a lost write
+        // and disables automatic redemption for every account until the hold expires.
+        externalRateLimitResetRedemptionBlockedUntil = Self.externalRateLimitResetHolds(
+            externalRateLimitResetRedemptionBlockedUntil,
+            removingRecoveredHold: hold,
+            providerAccountId: account.accountId
+        )
         await restoreExternalRateLimitResetHolds(at: now)
         SwapLog.append(.debug(
             "RESET_EXTERNAL_REDEMPTION_HOLD_CLEARED account=\(account.email) blocked_until=\(Int(hold.blockedUntil.timeIntervalSince1970)) quota_fetched=\(Int(snapshot.fetchedAt.timeIntervalSince1970)) reason=quota_recovered"
