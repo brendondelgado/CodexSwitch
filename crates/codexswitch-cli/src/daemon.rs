@@ -26,10 +26,12 @@ use crate::codex_update;
 use crate::pool_authority::{PoolAuthorityLock, PoolAuthorityPhase, TargetRequestDisposition};
 use crate::quota::{apply_fetch_result, fetch_quota, FetchResult};
 use crate::rate_limit_resets::{
-    consume_rate_limit_reset, fetch_rate_limit_reset_bank,
-    orchestrate_pool_reset_with_selection_and_provider_guard, select_smart_reset_candidate,
+    consume_rate_limit_reset, external_inventory_decrease_observed, fetch_rate_limit_reset_bank,
+    orchestrate_pool_reset_with_selection_and_provider_guard,
+    reconcile_or_attempt_reset_with_provider_guard_and_request_id, select_smart_reset_candidate,
     ConsumeResult, RateLimitResetBank, RateLimitResetFetchError, RateLimitResetFetchFailureKind,
     ResetOrchestrationContext, ResetOrchestrationDependencies, ResetQuotaRefreshStrategy,
+    ResetReconciliationContext, ResetReconciliationDependencies,
 };
 use crate::reload::{
     maintain_managed_app_server_acks, reload_codex_hot_swap_processes,
@@ -65,6 +67,12 @@ const RESET_BANK_UNSUPPORTED_BACKOFF: ChronoDuration = ChronoDuration::hours(1);
 const RESET_BANK_MALFORMED_RESPONSE_BACKOFF: ChronoDuration = ChronoDuration::minutes(30);
 const RESET_BANK_TRANSIENT_MAX_BACKOFF: ChronoDuration = ChronoDuration::minutes(30);
 const RESET_CANDIDATE_OBSERVATION_INTERVAL: ChronoDuration = ChronoDuration::minutes(1);
+/// Maximum age of quota and reset inventory for an inactive, blocked paid
+/// account that still holds banked credits. Five minutes matches the
+/// background reset-inventory freshness bound: it keeps T3/Mac usage views
+/// within one bound of an external redemption while costing at most two GETs
+/// per affected account per five minutes.
+const BLOCKED_RESET_HOLDER_OBSERVATION_INTERVAL: ChronoDuration = ChronoDuration::minutes(5);
 const DAEMON_POLICY_SCHEMA_VERSION: u32 = 1;
 const DAEMON_POLICY_MAX_BYTES: usize = 4 * 1024;
 
@@ -759,17 +767,49 @@ where
         );
     }
 
+    let refresh_holder_quota = |account: &mut CodexAccount| -> Result<()> {
+        let result = fetch_quota_with_refresh(account, &fetch_quota_fn, &refresh_token_fn)?;
+        apply_fetch_result(account, result);
+        Ok(())
+    };
+    let validate_holder_provider_io = |store_lock: &crate::account_store::AccountStoreLock| {
+        validate_provider_io_activation_locked(store_lock, auth_path, &activation_guard)
+    };
+    if !consume_banked_resets {
+        observe_blocked_reset_holders(
+            store_path,
+            &mut accounts,
+            Utc::now(),
+            &fetch_reset_bank_fn,
+            &refresh_holder_quota,
+            &validate_holder_provider_io,
+        );
+    }
+
     let previous_reset_banks = accounts
         .iter()
         .map(|account| account.rate_limit_reset_bank.clone())
         .collect::<Vec<_>>();
     let reset_bank_observations = if consume_banked_resets {
-        refresh_stale_reset_bank_observations(
+        let refreshed = refresh_stale_reset_bank_observations(
             &mut accounts,
             Utc::now(),
             reset_bank_refresh_backoff,
             &fetch_reset_bank_fn,
-        )
+        );
+        // Automatic mode overwrites refreshed inventories directly. Route any
+        // inactive decrease through the journal classifier first so external
+        // redemption evidence (and its hold) is persisted, not silently lost.
+        classify_refreshed_inventory_decreases(
+            store_path,
+            &mut accounts,
+            &previous_reset_banks,
+            &refreshed,
+            Utc::now(),
+            &refresh_holder_quota,
+            &validate_holder_provider_io,
+        );
+        refreshed
     } else {
         HashSet::new()
     };
@@ -1563,6 +1603,219 @@ where
         }
     }
     refreshed
+}
+
+/// An inactive paid account whose last observation was quota-blocked (or which
+/// carries a usage-limit block) and whose last-known inventory still lists
+/// available credits. A non-quota runtime block such as `token_expired` is
+/// excluded: without usable credentials no provider observation can succeed,
+/// and the credential must be re-imported instead.
+fn is_blocked_reset_holder(account: &CodexAccount, now: chrono::DateTime<Utc>) -> bool {
+    if account.is_active
+        || account.plan_priority() < 2
+        || !account.has_complete_token_material()
+        || (account.runtime_unusable_at(now) && !account.runtime_block_is_usage_limit())
+    {
+        return false;
+    }
+    let observed_blocked = real_quota_snapshot(account).is_some_and(|snapshot| {
+        snapshot.availability_at(snapshot.fetched_at) == QuotaAvailability::Blocked
+    });
+    let usage_limit_block =
+        account.runtime_unusable_at(now) && account.runtime_block_is_usage_limit();
+    (observed_blocked || usage_limit_block)
+        && account
+            .rate_limit_reset_bank
+            .as_ref()
+            .is_some_and(|bank| bank.available_count > 0)
+}
+
+fn observation_is_due(
+    observed_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    observed_at.is_none_or(|observed_at| {
+        now.signed_duration_since(observed_at) >= BLOCKED_RESET_HOLDER_OBSERVATION_INTERVAL
+    })
+}
+
+fn last_quota_observation_at(account: &CodexAccount) -> Option<chrono::DateTime<Utc>> {
+    last_refresh_unix_seconds(account).and_then(|seconds| {
+        chrono::DateTime::<Utc>::from_timestamp_millis((seconds * 1_000.0).round() as i64)
+    })
+}
+
+/// Observation-only freshness for blocked reset holders when automatic
+/// redemption is disabled. Quota and inventory are each refreshed at most once
+/// per [`BLOCKED_RESET_HOLDER_OBSERVATION_INTERVAL`], through the tick's
+/// provider guard and reset-inventory backoff. A refreshed inventory is
+/// classified by the durable reset journal: an unexplained decrease (for
+/// example a redemption from T3, the Mac, or a Codex app-server) is journaled
+/// as external evidence and its quota is reconciled immediately. Nothing here
+/// can submit a reset.
+fn observe_blocked_reset_holders<B, Q, V>(
+    store_path: &Path,
+    accounts: &mut [CodexAccount],
+    now: chrono::DateTime<Utc>,
+    fetch_reset_bank: &B,
+    refresh_quota: &Q,
+    validate_provider_io: &V,
+) where
+    B: Fn(&CodexAccount) -> Result<RateLimitResetBank>,
+    Q: Fn(&mut CodexAccount) -> Result<()>,
+    V: Fn(&crate::account_store::AccountStoreLock) -> Result<()>,
+{
+    let holders = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, account)| is_blocked_reset_holder(account, now))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for index in holders {
+        if observation_is_due(last_quota_observation_at(&accounts[index]), now) {
+            if let Err(error) = refresh_quota(&mut accounts[index]) {
+                eprintln!(
+                    "warning: failed to refresh quota for blocked reset holder {}: {error:#}",
+                    accounts[index].email
+                );
+                if let Some((reason, cooldown)) = poll_error_runtime_block(&error) {
+                    let until = runtime_block_until(&accounts[index], reason, cooldown);
+                    mark_runtime_unusable(&mut accounts[index], reason, until);
+                }
+                continue;
+            }
+        }
+        let bank_due = observation_is_due(
+            accounts[index]
+                .rate_limit_reset_bank
+                .as_ref()
+                .map(|bank| bank.fetched_at),
+            now,
+        );
+        if !bank_due || !accounts[index].has_usable_inference_token_at(Utc::now()) {
+            continue;
+        }
+        let observed_bank = match fetch_reset_bank(&accounts[index]) {
+            Ok(bank) => bank,
+            Err(error) if error.downcast_ref::<ResetBankRefreshDeferred>().is_some() => continue,
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to refresh reset inventory for blocked reset holder {}: {error:#}",
+                    accounts[index].email
+                );
+                continue;
+            }
+        };
+        let previous_bank = accounts[index].rate_limit_reset_bank.clone();
+        if let Err(error) = classify_reset_inventory_observation(
+            store_path,
+            &mut accounts[index],
+            previous_bank.as_ref(),
+            observed_bank,
+            refresh_quota,
+            validate_provider_io,
+        ) {
+            eprintln!(
+                "warning: reset inventory classification failed for {}; keeping the prior inventory: {error:#}",
+                accounts[index].email
+            );
+        }
+    }
+}
+
+/// Automatic-mode companion: an inactive account whose freshly refreshed
+/// inventory shows an unexplained decrease is re-classified through the
+/// journal. On failure the prior inventory is restored so the decrease is
+/// re-detected on a later tick instead of being committed unclassified.
+fn classify_refreshed_inventory_decreases<Q, V>(
+    store_path: &Path,
+    accounts: &mut [CodexAccount],
+    previous_banks: &[Option<RateLimitResetBank>],
+    refreshed: &HashSet<Uuid>,
+    now: chrono::DateTime<Utc>,
+    refresh_quota: &Q,
+    validate_provider_io: &V,
+) where
+    Q: Fn(&mut CodexAccount) -> Result<()>,
+    V: Fn(&crate::account_store::AccountStoreLock) -> Result<()>,
+{
+    for (index, previous_bank) in previous_banks.iter().enumerate() {
+        let account = &mut accounts[index];
+        if account.is_active || !refreshed.contains(&account.id) {
+            continue;
+        }
+        let (Some(previous_bank), Some(observed_bank)) = (
+            previous_bank.as_ref(),
+            account.rate_limit_reset_bank.clone(),
+        ) else {
+            continue;
+        };
+        if !external_inventory_decrease_observed(previous_bank, &observed_bank, now) {
+            continue;
+        }
+        if let Err(error) = classify_reset_inventory_observation(
+            store_path,
+            account,
+            Some(previous_bank),
+            observed_bank,
+            refresh_quota,
+            validate_provider_io,
+        ) {
+            eprintln!(
+                "warning: reset inventory decrease classification failed for {}; keeping the prior inventory: {error:#}",
+                account.email
+            );
+            account.rate_limit_reset_bank = Some(previous_bank.clone());
+        }
+    }
+}
+
+/// Runs the shared reset-journal classifier with submission disabled. It
+/// records external-decrease evidence, reconciles any unresolved attempt for
+/// the account (refreshing its quota), and adopts the observed inventory only
+/// on success. The consume dependency fails closed if ever reached.
+fn classify_reset_inventory_observation<Q, V>(
+    store_path: &Path,
+    account: &mut CodexAccount,
+    previous_bank: Option<&RateLimitResetBank>,
+    observed_bank: RateLimitResetBank,
+    refresh_quota: &Q,
+    validate_provider_io: &V,
+) -> Result<()>
+where
+    Q: Fn(&mut CodexAccount) -> Result<()>,
+    V: Fn(&crate::account_store::AccountStoreLock) -> Result<()>,
+{
+    let store_lock = lock_account_store(store_path)?;
+    validate_provider_io(&store_lock)
+        .context("daemon activation changed before reset inventory classification")?;
+    let now = std::cmp::max(Utc::now(), observed_bank.fetched_at);
+    reconcile_or_attempt_reset_with_provider_guard_and_request_id(
+        ResetReconciliationContext {
+            store_lock: &store_lock,
+            account,
+            previous_bank,
+            observed_bank,
+            attempt_reset: false,
+            now,
+        },
+        ResetReconciliationDependencies::new(
+            |_account: &CodexAccount| -> Result<RateLimitResetBank> {
+                bail!("observation-only reset classification cannot fetch additional inventory")
+            },
+            |account: &mut CodexAccount| refresh_quota(account),
+            |_account: &CodexAccount,
+             _bank: &RateLimitResetBank,
+             _request_id: Uuid|
+             -> Result<ConsumeResult> {
+                bail!("observation-only reset classification cannot submit a reset")
+            },
+        ),
+        validate_provider_io,
+        None,
+        true,
+    )?;
+    Ok(())
 }
 
 fn should_probe_inactive_account(account: &CodexAccount, now: chrono::DateTime<Utc>) -> bool {
@@ -4869,6 +5122,321 @@ mod tests {
         assert!(format!("{error:#}").contains("duplicate provider account identity"));
         assert!(!store_path.exists());
         assert!(!auth_path.exists());
+        Ok(())
+    }
+
+    fn stale_blocked_holder(email: &str, observed_at: chrono::DateTime<Utc>) -> CodexAccount {
+        let mut holder = account(email, false, 20.0, 100.0);
+        holder.quota_snapshot.as_mut().unwrap().fetched_at = observed_at;
+        holder.last_refreshed = None;
+        holder.rate_limit_reset_bank = Some(reset_bank(2, observed_at));
+        holder
+    }
+
+    fn usable_fetch(account: &CodexAccount) -> Result<FetchResult> {
+        let mut result = ready_fetch(account)?;
+        for window in &mut result.snapshot.windows {
+            window.used_percent = 0.0;
+        }
+        Ok(result)
+    }
+
+    fn observation_tick<F, B>(
+        store_path: &Path,
+        auth_path: &Path,
+        fetch_quota: F,
+        fetch_reset_bank: B,
+        consume_calls: &Arc<Mutex<usize>>,
+    ) -> Result<DaemonTick>
+    where
+        F: Fn(&CodexAccount) -> Result<FetchResult>,
+        B: Fn(&CodexAccount) -> Result<RateLimitResetBank>,
+    {
+        let consume_calls = Arc::clone(consume_calls);
+        run_once_report_with_resets(
+            DaemonTickContext {
+                store_path,
+                auth_path,
+                base_interval: Duration::from_secs(300),
+                consume_banked_resets: false,
+                reset_bank_refresh_backoff: None,
+            },
+            DaemonTickDependencies::new(
+                fetch_quota,
+                |_| Ok(()),
+                fetch_reset_bank,
+                move |_account, _bank, _request_id| {
+                    *consume_calls.lock().unwrap() += 1;
+                    bail!("observation mode must never submit a reset")
+                },
+                |_| Ok(verified_reload_summary()),
+            ),
+        )
+    }
+
+    #[test]
+    fn observation_mode_refreshes_stale_blocked_reset_holder_inventory() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let observed_at = Utc::now() - ChronoDuration::minutes(10);
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let holder = stale_blocked_holder("holder@example.com", observed_at);
+        let previous_bank = holder.rate_limit_reset_bank.clone().unwrap();
+        save_accounts(&store_path, &[active, holder])?;
+        confirm_daemon_activation(&store_path, &auth_path)?;
+
+        let holder_quota_calls = Arc::new(Mutex::new(0usize));
+        let holder_bank_calls = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        let tick = observation_tick(
+            &store_path,
+            &auth_path,
+            {
+                let calls = Arc::clone(&holder_quota_calls);
+                move |account| {
+                    if account.email == "holder@example.com" {
+                        *calls.lock().unwrap() += 1;
+                    }
+                    ready_fetch(account)
+                }
+            },
+            {
+                let calls = Arc::clone(&holder_bank_calls);
+                move |account| {
+                    if account.email != "holder@example.com" {
+                        return Ok(reset_bank(0, Utc::now()));
+                    }
+                    *calls.lock().unwrap() += 1;
+                    let mut bank = previous_bank.clone();
+                    bank.fetched_at = Utc::now();
+                    Ok(bank)
+                }
+            },
+            &consume_calls,
+        )?;
+
+        assert!(!tick.swapped);
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        assert_eq!(*holder_bank_calls.lock().unwrap(), 1);
+        assert!(*holder_quota_calls.lock().unwrap() >= 1);
+        let now = Utc::now();
+        let stored = load_accounts(&store_path)?;
+        let holder = stored
+            .iter()
+            .find(|account| account.email == "holder@example.com")
+            .unwrap();
+        let bank = holder.rate_limit_reset_bank.as_ref().unwrap();
+        assert_eq!(bank.available_count, 2);
+        assert!(!observation_is_due(Some(bank.fetched_at), now));
+        assert!(!observation_is_due(last_quota_observation_at(holder), now));
+        let journal = crate::rate_limit_resets::observe_reset_attempts(&store_path);
+        assert!(journal.account("holder@example.com").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn observation_mode_external_decrease_journals_hold_and_refreshes_quota() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let auth_path = temp.path().join("auth.json");
+        let observed_at = Utc::now() - ChronoDuration::minutes(10);
+        let active = account("active@example.com", true, 10.0, 10.0);
+        let holder = stale_blocked_holder("holder@example.com", observed_at);
+        let previous_bank = holder.rate_limit_reset_bank.clone().unwrap();
+        save_accounts(&store_path, &[active, holder])?;
+        confirm_daemon_activation(&store_path, &auth_path)?;
+
+        let decrease_observed = Arc::new(Mutex::new(false));
+        let quota_after_decrease = Arc::new(Mutex::new(0usize));
+        let consume_calls = Arc::new(Mutex::new(0usize));
+        observation_tick(
+            &store_path,
+            &auth_path,
+            {
+                let decrease_observed = Arc::clone(&decrease_observed);
+                let quota_after_decrease = Arc::clone(&quota_after_decrease);
+                move |account| {
+                    if account.email == "holder@example.com" && *decrease_observed.lock().unwrap() {
+                        *quota_after_decrease.lock().unwrap() += 1;
+                        return usable_fetch(account);
+                    }
+                    ready_fetch(account)
+                }
+            },
+            {
+                let decrease_observed = Arc::clone(&decrease_observed);
+                move |account| {
+                    if account.email != "holder@example.com" {
+                        return Ok(reset_bank(0, Utc::now()));
+                    }
+                    *decrease_observed.lock().unwrap() = true;
+                    Ok(consumed_reset_bank(
+                        previous_bank.clone(),
+                        "credit-0",
+                        Utc::now(),
+                    ))
+                }
+            },
+            &consume_calls,
+        )?;
+
+        assert_eq!(*consume_calls.lock().unwrap(), 0);
+        assert_eq!(*quota_after_decrease.lock().unwrap(), 1);
+        let stored = load_accounts(&store_path)?;
+        let holder = stored
+            .iter()
+            .find(|account| account.email == "holder@example.com")
+            .unwrap();
+        assert_eq!(
+            holder
+                .rate_limit_reset_bank
+                .as_ref()
+                .unwrap()
+                .available_count,
+            1
+        );
+        assert_eq!(
+            quota_availability_at(holder, Utc::now()),
+            QuotaAvailability::Usable
+        );
+        let journal = crate::rate_limit_resets::observe_reset_attempts(&store_path);
+        let status = journal.account("holder@example.com").unwrap();
+        assert_eq!(status.attempts.len(), 1);
+        assert!(
+            status.redemption_blocked,
+            "an external decrease keeps its durable hold"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observation_mode_skips_fresh_holders_and_non_holders() -> Result<()> {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let now = Utc::now();
+        let fresh = stale_blocked_holder("fresh@example.com", now - ChronoDuration::minutes(1));
+        let mut expired =
+            stale_blocked_holder("expired@example.com", now - ChronoDuration::hours(9));
+        expired.runtime_unusable_until = Some(now + ChronoDuration::days(30));
+        expired.runtime_unusable_reason = Some("token_expired".to_string());
+        let mut free = stale_blocked_holder("free@example.com", now - ChronoDuration::hours(9));
+        free.plan_type = Some("free".to_string());
+        let mut empty = stale_blocked_holder("empty@example.com", now - ChronoDuration::hours(9));
+        empty.rate_limit_reset_bank = Some(reset_bank(0, now - ChronoDuration::hours(9)));
+        let mut usable = stale_blocked_holder("usable@example.com", now - ChronoDuration::hours(9));
+        for window in &mut usable.quota_snapshot.as_mut().unwrap().windows {
+            window.used_percent = 10.0;
+        }
+        let mut active = stale_blocked_holder("active@example.com", now - ChronoDuration::hours(9));
+        active.is_active = true;
+        let mut accounts = vec![fresh, expired, free, empty, usable, active];
+        save_accounts(&store_path, &accounts)?;
+        for account in &accounts {
+            assert!(
+                !is_blocked_reset_holder(account, now) || account.email == "fresh@example.com",
+                "{} must not be a blocked reset holder",
+                account.email
+            );
+        }
+        assert!(is_blocked_reset_holder(&accounts[0], now));
+
+        let calls = Mutex::new(Vec::new());
+        observe_blocked_reset_holders(
+            &store_path,
+            &mut accounts,
+            now,
+            &|account: &CodexAccount| {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("bank:{}", account.email));
+                Ok(reset_bank(2, Utc::now()))
+            },
+            &|account: &mut CodexAccount| {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("quota:{}", account.email));
+                Ok(())
+            },
+            &|_store_lock: &crate::account_store::AccountStoreLock| Ok(()),
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "{:?}",
+            calls.lock().unwrap()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_mode_classifies_inactive_inventory_decrease_or_restores_prior_bank() -> Result<()>
+    {
+        let temp = secure_temp_dir()?;
+        let store_path = temp.path().join("accounts.json");
+        let now = Utc::now();
+        let holder = stale_blocked_holder("holder@example.com", now - ChronoDuration::minutes(2));
+        let previous_bank = holder.rate_limit_reset_bank.clone().unwrap();
+        let observed_bank = consumed_reset_bank(previous_bank.clone(), "credit-0", now);
+        let active = account("active@example.com", true, 10.0, 10.0);
+        save_accounts(&store_path, &[active.clone(), holder.clone()])?;
+        let refreshed = HashSet::from([holder.id]);
+        let previous_banks = vec![None, Some(previous_bank.clone())];
+
+        let mut rejected = vec![active.clone(), holder.clone()];
+        rejected[1].rate_limit_reset_bank = Some(observed_bank.clone());
+        classify_refreshed_inventory_decreases(
+            &store_path,
+            &mut rejected,
+            &previous_banks,
+            &refreshed,
+            now,
+            &|_account: &mut CodexAccount| bail!("quota must not be fetched without a guard"),
+            &|_store_lock: &crate::account_store::AccountStoreLock| {
+                bail!("simulated activation change")
+            },
+        );
+        assert_eq!(
+            rejected[1].rate_limit_reset_bank,
+            Some(previous_bank.clone())
+        );
+        assert!(
+            crate::rate_limit_resets::observe_reset_attempts(&store_path)
+                .account("holder@example.com")
+                .is_none()
+        );
+
+        let mut accounts = vec![active, holder];
+        accounts[1].rate_limit_reset_bank = Some(observed_bank);
+        let quota_calls = Mutex::new(0usize);
+        classify_refreshed_inventory_decreases(
+            &store_path,
+            &mut accounts,
+            &previous_banks,
+            &refreshed,
+            now,
+            &|account: &mut CodexAccount| {
+                *quota_calls.lock().unwrap() += 1;
+                let result = usable_fetch(account)?;
+                apply_fetch_result(account, result);
+                Ok(())
+            },
+            &|_store_lock: &crate::account_store::AccountStoreLock| Ok(()),
+        );
+        assert_eq!(*quota_calls.lock().unwrap(), 1);
+        assert_eq!(
+            accounts[1]
+                .rate_limit_reset_bank
+                .as_ref()
+                .unwrap()
+                .available_count,
+            1
+        );
+        let journal = crate::rate_limit_resets::observe_reset_attempts(&store_path);
+        assert!(journal
+            .account("holder@example.com")
+            .is_some_and(|status| status.redemption_blocked && status.attempts.len() == 1));
         Ok(())
     }
 }

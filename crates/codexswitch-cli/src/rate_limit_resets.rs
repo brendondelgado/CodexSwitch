@@ -2287,6 +2287,17 @@ fn external_inventory_decrease_evidence(
     Some(ExternalInventoryDecreaseEvidence { selected_credit_id })
 }
 
+/// True when `observed` lost an unexpired available credit relative to
+/// `previous` that natural expiry cannot explain. Observation-only callers use
+/// this to decide whether a refreshed inventory must pass through the journal.
+pub(crate) fn external_inventory_decrease_observed(
+    previous: &RateLimitResetBank,
+    observed: &RateLimitResetBank,
+    now: DateTime<Utc>,
+) -> bool {
+    external_inventory_decrease_evidence(previous, observed, now).is_some()
+}
+
 fn inventory_generation(bank: &RateLimitResetBank) -> String {
     let mut digest = DigestContext::new(&SHA256);
     digest.update(&bank.fetched_at.timestamp_millis().to_be_bytes());
