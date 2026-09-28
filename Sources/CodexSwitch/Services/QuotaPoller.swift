@@ -81,6 +81,31 @@ actor QuotaPoller {
         return min(interval, inactivePlanUpgradePollInterval)
     }
 
+    static let errorRetryInterval: TimeInterval = 60
+    static let maximumUsageUnavailableRetryInterval: TimeInterval = 60 * 60
+
+    /// Retry delay after a failed poll. Inactive accounts whose usage endpoint keeps
+    /// answering without any recognised quota window (typically free plans) back off
+    /// exponentially from one minute to one hour instead of polling every minute
+    /// forever. The count resets on the next successful poll. Transport, HTTP, and
+    /// rate-limit errors, and the active account, keep the one-minute retry.
+    static func errorRetryInterval(
+        for error: PollerError,
+        consecutiveUsageUnavailableFailures: Int,
+        isActive: Bool
+    ) -> TimeInterval {
+        guard case .usageUnavailable = error,
+              !isActive,
+              consecutiveUsageUnavailableFailures > 1 else {
+            return errorRetryInterval
+        }
+        let exponent = min(consecutiveUsageUnavailableFailures - 1, 16)
+        return min(
+            errorRetryInterval * pow(2, Double(exponent)),
+            maximumUsageUnavailableRetryInterval
+        )
+    }
+
     struct FetchResult: Sendable {
         let snapshot: QuotaSnapshot
         let planType: String
@@ -205,6 +230,7 @@ actor QuotaPoller {
         guard generationIsCurrent(generation, for: accountId) else { return }
         let hasData = initialAccount?.quotaSnapshot != nil
         var interval = max(0, initialDelay(hasData))
+        var consecutiveUsageUnavailableFailures = 0
 
         logger.info("Starting poll for \(accountId) — initial interval: \(String(format: "%.0f", interval))s, hasData: \(hasData)")
 
@@ -232,6 +258,7 @@ actor QuotaPoller {
             do {
                 let result = try await self.fetchQuota(for: currentAccount)
                 guard generationIsCurrent(generation, for: accountId) else { return }
+                consecutiveUsageUnavailableFailures = 0
                 onUpdate(accountId, result.snapshot, result.planType)
 
                 if currentAccount.isActive {
@@ -243,14 +270,21 @@ actor QuotaPoller {
                 logger.info("Poll success for \(currentAccount.email, privacy: .private) [active=\(currentAccount.isActive)] — next in \(String(format: "%.0f", interval))s")
             } catch let error as PollerError {
                 guard generationIsCurrent(generation, for: accountId) else { return }
-                logger.error("Poll error for \(currentAccount.email, privacy: .private): \(String(describing: error), privacy: .public)")
+                if case .usageUnavailable = error {
+                    consecutiveUsageUnavailableFailures += 1
+                }
+                interval = Self.errorRetryInterval(
+                    for: error,
+                    consecutiveUsageUnavailableFailures: consecutiveUsageUnavailableFailures,
+                    isActive: currentAccount.isActive
+                )
+                logger.error("Poll error for \(currentAccount.email, privacy: .private): \(String(describing: error), privacy: .public) — next in \(String(format: "%.0f", interval))s")
                 onError(accountId, error)
-                interval = 60
             } catch {
                 guard generationIsCurrent(generation, for: accountId) else { return }
                 logger.error("Poll network error for \(currentAccount.email, privacy: .private): \(error.localizedDescription, privacy: .public)")
                 onError(accountId, .networkError(error.localizedDescription))
-                interval = 60
+                interval = Self.errorRetryInterval
             }
         }
     }
