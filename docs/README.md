@@ -68,6 +68,7 @@ A deployed VPS binary may be older than the repository. A UI can also be stale w
 - [VPS connection resilience](runbooks/vps-connection-resilience.md): transport and service resource policy.
 - [VPS thread repair](runbooks/codex-vps-thread-state-heal.md): explicit thread-state recovery; status checks never heal.
 - [Runtime storage hardening](runbooks/runtime-storage-hardening-deployment.md): bounded rollout and runtime storage.
+- [Credential sync hold recovery](runbooks/credential-sync-hold-recovery.md): retire an unrecoverable sync hold and deliver fresh Mac credentials.
 - [SIGHUP safety](sighup-safety.md): signal target verification and historical failure modes.
 
 ## Plans And Audits
