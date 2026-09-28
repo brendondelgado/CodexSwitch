@@ -187,7 +187,11 @@ impl ReloadSummary {
                 .iter()
                 .take(8)
                 .map(|(pid, reason)| {
-                    let reason: String = reason.chars().filter(|c| !c.is_control()).take(256).collect();
+                    let reason: String = reason
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(256)
+                        .collect();
                     format!("pid {pid}: {reason}")
                 })
                 .collect::<Vec<_>>()
@@ -4298,11 +4302,19 @@ mod tests {
         let output = bounded_command::output(
             Command::new(&fixture)
                 .env("CODEXSWITCH_ANCESTOR_FIXTURE", "1")
-                .args(["--ignored", "--exact", "reload::tests::macos_ancestor_discovery_helper"]),
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "reload::tests::macos_ancestor_discovery_helper",
+                ]),
             Duration::from_secs(15),
             bounded_command::SMALL_OUTPUT_LIMIT,
         )?;
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         Ok(())
     }
 
@@ -4886,7 +4898,10 @@ mod tests {
         );
         let summary = ReloadSummary {
             sighup_sent: vec![42],
-            skipped: vec![(42, "SIGHUP sent but live reload acknowledgement was not observed".to_string())],
+            skipped: vec![(
+                42,
+                "SIGHUP sent but live reload acknowledgement was not observed".to_string(),
+            )],
             ..ReloadSummary::default()
         };
         assert!(!summary.verified_hot_swap());

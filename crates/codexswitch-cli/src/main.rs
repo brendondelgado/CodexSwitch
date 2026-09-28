@@ -383,9 +383,17 @@ fn main() -> Result<()> {
             receipt_baseline_fingerprint.as_deref(),
             "Updated",
         ),
-        Command::CredentialImportStatus { operation_id, baseline_fingerprint, incoming_fingerprint } => {
+        Command::CredentialImportStatus {
+            operation_id,
+            baseline_fingerprint,
+            incoming_fingerprint,
+        } => {
             let status = credential_import_receipts::observe(
-                &store_path, &auth_path, operation_id, &baseline_fingerprint, &incoming_fingerprint,
+                &store_path,
+                &auth_path,
+                operation_id,
+                &baseline_fingerprint,
+                &incoming_fingerprint,
             )?;
             println!("{}", serde_json::to_string(&status)?);
             Ok(())
@@ -624,13 +632,17 @@ where
         .transpose()?;
     // Reject replays before reconciling any activation or changing authority state.
     let mut receipt_journal = receipt_operation_id
-        .map(|operation_id| credential_import_receipts::Journal::acquire(
-            &runtime_lease,
-            store_path,
-            auth_path,
-            operation_id,
-            incoming_credential_set_fingerprint.as_deref().context("missing incoming fingerprint")?,
-        ))
+        .map(|operation_id| {
+            credential_import_receipts::Journal::acquire(
+                &runtime_lease,
+                store_path,
+                auth_path,
+                operation_id,
+                incoming_credential_set_fingerprint
+                    .as_deref()
+                    .context("missing incoming fingerprint")?,
+            )
+        })
         .transpose()?;
     if let Some(outcome) = reconcile_activation_barrier_unlocked_under_runtime_lease(
         &runtime_lease,
@@ -5391,17 +5403,33 @@ mod tests {
         let fingerprint = complete_credential_set_fingerprint(&incoming)?;
         let id = Uuid::new_v4();
         let (_, outcome, receipt) = replace_import_accounts_with_unlocked_reload(
-            &store, &auth, incoming.clone(), true, Some(id), Some(&fingerprint), true,
+            &store,
+            &auth,
+            incoming.clone(),
+            true,
+            Some(id),
+            Some(&fingerprint),
+            true,
             &|_| {
-                let pending = credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
+                let pending = credential_import_receipts::observe(
+                    &store,
+                    &auth,
+                    id,
+                    &fingerprint,
+                    &fingerprint,
+                )?;
                 assert_eq!(pending.status, credential_import_receipts::State::Pending);
                 assert!(pending.receipt.is_none());
                 Ok(verified_reload_summary())
             },
         )?;
         assert!(outcome.is_confirmed());
-        let completed = credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
-        assert_eq!(completed.status, credential_import_receipts::State::Completed);
+        let completed =
+            credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?;
+        assert_eq!(
+            completed.status,
+            credential_import_receipts::State::Completed
+        );
         assert_eq!(completed.receipt, receipt);
 
         let rotated = account("later-fixture@example.com", true, 10.0, 10.0);
@@ -5410,12 +5438,22 @@ mod tests {
         let store_before = fs::read(&store)?;
         let auth_before = fs::read(&auth)?;
         assert!(replace_import_accounts_with_unlocked_reload(
-            &store, &auth, incoming, true, Some(id), Some(&fingerprint), true,
+            &store,
+            &auth,
+            incoming,
+            true,
+            Some(id),
+            Some(&fingerprint),
+            true,
             &|_| bail!("duplicate import must not reload"),
-        ).is_err());
+        )
+        .is_err());
         assert_eq!(fs::read(&store)?, store_before);
         assert_eq!(fs::read(&auth)?, auth_before);
-        assert_eq!(credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?, completed);
+        assert_eq!(
+            credential_import_receipts::observe(&store, &auth, id, &fingerprint, &fingerprint)?,
+            completed
+        );
         Ok(())
     }
 
@@ -5423,11 +5461,19 @@ mod tests {
     fn credential_import_status_requires_canonical_binding_arguments() -> Result<()> {
         let fingerprint = "1".repeat(64);
         let args = [
-            "codexswitch-cli", "credential-import-status", "--operation-id",
-            "11111111-1111-4111-8111-111111111111", "--baseline-fingerprint",
-            fingerprint.as_str(), "--incoming-fingerprint", fingerprint.as_str(),
+            "codexswitch-cli",
+            "credential-import-status",
+            "--operation-id",
+            "11111111-1111-4111-8111-111111111111",
+            "--baseline-fingerprint",
+            fingerprint.as_str(),
+            "--incoming-fingerprint",
+            fingerprint.as_str(),
         ];
-        assert!(matches!(Args::try_parse_from(args)?.command, Command::CredentialImportStatus { .. }));
+        assert!(matches!(
+            Args::try_parse_from(args)?.command,
+            Command::CredentialImportStatus { .. }
+        ));
         assert!(Args::try_parse_from(&args[..6]).is_err());
         let mut invalid = args;
         invalid[7] = "NOT-A-FINGERPRINT";
