@@ -60,6 +60,7 @@ jobs:
           python3 scripts/test_build_linux_runtime.py
           python3 scripts/test_linux_runtime_artifact.py
           python3 scripts/test_macos_runtime_artifact.py
+          python3 integrations/t3-usage-hub/test_hub.py
 
       - name: Run full Swift contract suite
         shell: bash
