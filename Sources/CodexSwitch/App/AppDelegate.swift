@@ -359,6 +359,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var rateLimitResetManualErrors: [UUID: String] = [:] {
         didSet { publishRateLimitResetPresentations() }
     }
+    /// Manual errors that an immediate follow-up inventory refresh must not erase before
+    /// the user can read them (for example, a VPS rejection's specific reason).
+    private var rateLimitResetManualErrorPinnedUntil: [UUID: Date] = [:]
     private var rateLimitResetUnresolvedProviderAccountIds: Set<String> = [] {
         didSet { publishRateLimitResetPresentations() }
     }
@@ -4433,20 +4436,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         rateLimitResetOperationProviderAccountId = providerAccountId
-        let requestID = UUID()
-        remoteRateLimitResetPendingRequestIds[providerAccountId] = requestID
+        let initialRequestID = UUID()
+        remoteRateLimitResetPendingRequestIds[providerAccountId] = initialRequestID
         recordManualRateLimitResetError(nil, for: account.id, reason: .manual)
         SwapLog.append(.debug(
             "RESET_REMOTE_REDEMPTION_STARTED account=\(account.email) owner=vps_authority"
         ))
         rateLimitResetRedemptionTask = Task { @MainActor [weak self] in
-            let result = await Task.detached(priority: .userInitiated) {
-                LinuxDevboxMonitor.redeemReset(
-                    settings: settings,
-                    providerAccountId: providerAccountId,
-                    requestID: requestID
-                )
-            }.value
+            var requestID = initialRequestID
+            var attempt = 0
+            var result: Result<LinuxDevboxManualResetResult, LinuxDevboxManualResetFailure>
+            while true {
+                let submittedRequestID = requestID
+                result = await Task.detached(priority: .userInitiated) {
+                    LinuxDevboxMonitor.redeemReset(
+                        settings: settings,
+                        providerAccountId: providerAccountId,
+                        requestID: submittedRequestID
+                    )
+                }.value
+                guard let self else { return }
+                guard case .failure(let failure) = result,
+                      !self.isExiting,
+                      Self.remoteRateLimitResetShouldRetry(
+                          failure: failure,
+                          completedAttempts: attempt + 1
+                      ) else {
+                    break
+                }
+                // A busy rejection spent nothing. Retry once with a new request ID after
+                // a short bounded delay; the VPS CLI owns any longer lease wait.
+                attempt += 1
+                SwapLog.append(.debug(
+                    "RESET_REMOTE_REDEMPTION_RETRY account=\(account.email) reason=runtime_activation_busy attempt=\(attempt + 1) delay_seconds=\(Int(Self.remoteRateLimitResetBusyRetryDelay))"
+                ))
+                try? await Task.sleep(for: .seconds(Self.remoteRateLimitResetBusyRetryDelay))
+                requestID = UUID()
+                self.remoteRateLimitResetPendingRequestIds[providerAccountId] = requestID
+            }
             guard let self else { return }
             self.rateLimitResetOperationProviderAccountId = nil
             self.rateLimitResetRedemptionTask = nil
@@ -4473,6 +4500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     "RESET_REMOTE_REDEMPTION_COMPLETED account=\(account.email) submitted=\(response.submittedReset) remaining=\(response.bankedResetsRemaining) owner=vps_authority"
                 ))
             case .failure(let failure):
+                let userMessage = failure.userFacingMessage
                 if Self.remoteRateLimitResetFailureRequiresReconciliation(
                     failure.disposition
                 ) {
@@ -4484,32 +4512,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         matchingProviderAccountId: providerAccountId
                     )?.id {
                         self.recordManualRateLimitResetError(
-                            failure.message,
+                            userMessage,
                             for: liveAccountId,
                             reason: .manual
                         )
                     }
                 } else {
+                    // Rejected or never started: nothing was spent. Release the operation
+                    // and show the specific reason long enough to read; the follow-up
+                    // inventory refresh must not erase it immediately.
                     self.remoteRateLimitResetUnknownProviderAccountIds.remove(providerAccountId)
                     self.remoteRateLimitResetPendingRequestIds[providerAccountId] = nil
                     if let liveAccountId = self.accountManager.account(
                         matchingProviderAccountId: providerAccountId
                     )?.id {
                         self.recordManualRateLimitResetError(
-                            nil,
+                            userMessage,
                             for: liveAccountId,
-                            reason: .manual
+                            reason: .manual,
+                            displayDuration: Self.remoteRateLimitResetRejectionDisplayDuration,
+                            pinned: true
                         )
                     }
                 }
-                self.accountManager.publishActivationNotice(failure.message)
+                self.accountManager.publishActivationNotice(userMessage)
                 SwapLog.append(.debug(
-                    "RESET_REMOTE_REDEMPTION_FAILED account=\(account.email) disposition=\(String(describing: failure.disposition)) owner=vps_authority"
+                    "RESET_REMOTE_REDEMPTION_FAILED account=\(account.email) disposition=\(String(describing: failure.disposition)) attempts=\(attempt + 1) detail=\(failure.detail ?? "none") owner=vps_authority"
                 ))
             }
             self.checkPoolAuthorityStatus()
             self.checkLinuxDevboxReadiness(force: true)
+            self.refreshRateLimitResetStateAfterRemoteRedemption(
+                providerAccountId: providerAccountId,
+                email: account.email
+            )
             self.updatePopoverContent()
+        }
+    }
+
+    static let remoteRateLimitResetBusyRetryDelay: TimeInterval = 5
+    static let remoteRateLimitResetRejectionDisplayDuration: TimeInterval = 30
+
+    /// At most one extra submission, and only for a rejection (nothing spent) caused
+    /// by a concurrent VPS runtime activation holding the mutation lease.
+    nonisolated static func remoteRateLimitResetShouldRetry(
+        failure: LinuxDevboxManualResetFailure,
+        completedAttempts: Int
+    ) -> Bool {
+        completedAttempts < 2 && failure.isRuntimeActivationBusyRejection
+    }
+
+    /// After any VPS redemption result (success, rejection, unknown, or timeout), observe
+    /// the provider directly so inventory and usage converge without waiting for the
+    /// periodic monitors. Observation only; never redeems or mutates the VPS.
+    private func refreshRateLimitResetStateAfterRemoteRedemption(
+        providerAccountId: String,
+        email: String
+    ) {
+        guard !isExiting,
+              let liveAccountId = accountManager.account(
+                  matchingProviderAccountId: providerAccountId
+              )?.id else {
+            return
+        }
+        scheduleRateLimitResetRefresh(for: liveAccountId, force: true)
+        Task { @MainActor [weak self] in
+            await self?.refreshQuotaAfterRateLimitResetRedemption(
+                providerAccountId: providerAccountId,
+                email: email
+            )
         }
     }
 
@@ -4609,17 +4680,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func recordManualRateLimitResetError(
         _ message: String?,
         for accountId: UUID,
-        reason: RateLimitResetRedemptionReason
+        reason: RateLimitResetRedemptionReason,
+        displayDuration: TimeInterval = 10,
+        pinned: Bool = false
     ) {
         guard reason == .manual else { return }
         rateLimitResetManualErrors[accountId] = message
+        rateLimitResetManualErrorPinnedUntil[accountId] = message != nil && pinned
+            ? Date().addingTimeInterval(displayDuration)
+            : nil
         guard let message else { return }
         Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(10))
+            try? await Task.sleep(for: .seconds(displayDuration))
             guard let self,
                   self.rateLimitResetManualErrors[accountId] == message else {
                 return
             }
+            self.rateLimitResetManualErrorPinnedUntil[accountId] = nil
             if let providerAccountId = self.accountManager.accounts.first(where: {
                 $0.id == accountId
             })?.normalizedProviderAccountId,
@@ -5047,46 +5124,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                     if let liveAccountId = self.accountManager.account(
                         matchingProviderAccountId: providerAccountId
-                    )?.id {
+                    )?.id,
+                       !((self.rateLimitResetManualErrorPinnedUntil[liveAccountId]).map {
+                           $0 > Date()
+                       } ?? false) {
                         self.rateLimitResetManualErrors[liveAccountId] = nil
                     }
                     if externalRedemptionObserved {
-                        if let quotaAccount = self.accountManager.account(
-                            matchingProviderAccountId: providerAccountId
-                        ) {
-                            do {
-                                let quota = try await poller.fetchQuota(for: quotaAccount)
-                                if self.accountManager.updateQuota(
-                                    forProviderAccountId: providerAccountId,
-                                    snapshot: quota.snapshot,
-                                    planType: quota.planType
-                                ) != nil {
-                                    await self.clearExternalRateLimitResetHoldIfQuotaRecovered(
-                                        forProviderAccountId: providerAccountId,
-                                        snapshot: quota.snapshot,
-                                        at: Date()
-                                    )
-                                    self.queueTelemetryPersistence(context: "quota-update")
-                                    self.statusBarController.updateIcon()
-                                    self.updatePopoverContent()
-                                    SwapLog.append(.debug(
-                                        "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESHED account=\(account.email) fetched=\(Int(quota.snapshot.fetchedAt.timeIntervalSince1970))"
-                                    ))
-                                } else {
-                                    SwapLog.append(.debug(
-                                        "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_SKIPPED account=\(account.email) reason=provider_identity_unavailable"
-                                    ))
-                                }
-                            } catch {
-                                SwapLog.append(.debug(
-                                    "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_FAILED account=\(account.email) error=\(error.localizedDescription)"
-                                ))
-                            }
-                        } else {
-                            SwapLog.append(.debug(
-                                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_SKIPPED account=\(account.email) reason=provider_identity_unavailable"
-                            ))
-                        }
+                        await self.refreshQuotaAfterRateLimitResetRedemption(
+                            providerAccountId: providerAccountId,
+                            email: account.email,
+                            poller: poller
+                        )
                     }
                 }
             } catch {
@@ -5125,6 +5174,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 self.checkAndSwapIfNeeded()
             }
+        }
+    }
+
+    /// Fetches quota for an account whose banked reset was just consumed (by this Mac,
+    /// the VPS, T3, or any other client) so the card and menu bar show recovered usage
+    /// within seconds instead of waiting for the next adaptive poll.
+    private func refreshQuotaAfterRateLimitResetRedemption(
+        providerAccountId: String,
+        email: String,
+        poller: QuotaPoller? = nil
+    ) async {
+        let poller = poller ?? quotaPoller
+        guard let quotaAccount = accountManager.account(
+            matchingProviderAccountId: providerAccountId
+        ) else {
+            SwapLog.append(.debug(
+                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_SKIPPED account=\(email) reason=provider_identity_unavailable"
+            ))
+            return
+        }
+        do {
+            let quota = try await poller.fetchQuota(for: quotaAccount)
+            guard accountManager.updateQuota(
+                forProviderAccountId: providerAccountId,
+                snapshot: quota.snapshot,
+                planType: quota.planType
+            ) != nil else {
+                SwapLog.append(.debug(
+                    "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_SKIPPED account=\(email) reason=provider_identity_unavailable"
+                ))
+                return
+            }
+            if let liveAccountId = accountManager.account(
+                matchingProviderAccountId: providerAccountId
+            )?.id {
+                accountManager.clearPollingError(for: liveAccountId)
+            }
+            await clearExternalRateLimitResetHoldIfQuotaRecovered(
+                forProviderAccountId: providerAccountId,
+                snapshot: quota.snapshot,
+                at: Date()
+            )
+            queueTelemetryPersistence(context: "quota-update")
+            statusBarController.updateIcon()
+            updatePopoverContent()
+            SwapLog.append(.debug(
+                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESHED account=\(email) fetched=\(Int(quota.snapshot.fetchedAt.timeIntervalSince1970))"
+            ))
+        } catch {
+            SwapLog.append(.debug(
+                "RESET_EXTERNAL_REDEMPTION_QUOTA_REFRESH_FAILED account=\(email) error=\(Self.pollerErrorDescription(error))"
+            ))
+        }
+    }
+
+    nonisolated static func pollerErrorDescription(_ error: Error) -> String {
+        guard let pollerError = error as? PollerError else {
+            return error.localizedDescription
+        }
+        switch pollerError {
+        case .invalidResponse: return "invalid_response"
+        case .tokenExpired: return "http_401"
+        case .rateLimited: return "http_429"
+        case .usageUnavailable: return "usage_unavailable"
+        case .httpError(let code): return "http_\(code)"
+        case .networkError(let message): return "network: \(message)"
         }
     }
 
