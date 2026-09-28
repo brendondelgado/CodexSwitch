@@ -7,6 +7,25 @@ enum QuotaFreshnessPolicy {
         let age = now.timeIntervalSince(fetchedAt)
         return age >= 0 && age <= maximumSnapshotAge
     }
+
+    /// Presentation label for a reading older than the freshness contract, such as
+    /// `as of 3 h ago`; `nil` while the reading is current. Every account polls at
+    /// most once a minute while healthy, so fifteen minutes without a successful poll
+    /// means the displayed percentages can no longer be presented as current capacity.
+    /// Future timestamps (clock skew) are not labeled stale here.
+    static func staleAgeLabel(fetchedAt: Date, now: Date) -> String? {
+        let age = now.timeIntervalSince(fetchedAt)
+        guard age > maximumSnapshotAge, age.isFinite else { return nil }
+        let minutes = Int(age / 60)
+        if minutes < 60 {
+            return "as of \(minutes) min ago"
+        }
+        let hours = minutes / 60
+        if hours < 48 {
+            return "as of \(hours) h ago"
+        }
+        return "as of \(hours / 24) d ago"
+    }
 }
 
 enum QuotaWindowKind: String, Codable, Sendable, Equatable {

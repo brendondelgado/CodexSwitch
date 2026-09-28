@@ -495,6 +495,44 @@ struct QuotaPollerTests {
         #expect(QuotaPoller.inactivePollInterval(for: account, snapshot: snapshot) == 60)
     }
 
+    @Test("Repeated unrecognised-window results back off to one hour for inactive accounts")
+    func usageUnavailableBacksOffExponentially() {
+        let intervals = (1...9).map {
+            QuotaPoller.errorRetryInterval(
+                for: .usageUnavailable,
+                consecutiveUsageUnavailableFailures: $0,
+                isActive: false
+            )
+        }
+        #expect(intervals == [60, 120, 240, 480, 960, 1_920, 3_600, 3_600, 3_600])
+        #expect(QuotaPoller.errorRetryInterval(
+            for: .usageUnavailable,
+            consecutiveUsageUnavailableFailures: 10_000,
+            isActive: false
+        ) == 3_600)
+        #expect(QuotaPoller.errorRetryInterval(
+            for: .usageUnavailable,
+            consecutiveUsageUnavailableFailures: 0,
+            isActive: false
+        ) == 60)
+    }
+
+    @Test("Active accounts and other poll errors keep the one-minute retry")
+    func otherErrorsKeepOneMinuteRetry() {
+        #expect(QuotaPoller.errorRetryInterval(
+            for: .usageUnavailable,
+            consecutiveUsageUnavailableFailures: 8,
+            isActive: true
+        ) == 60)
+        for error in [PollerError.networkError("offline"), .httpError(500), .rateLimited, .invalidResponse] {
+            #expect(QuotaPoller.errorRetryInterval(
+                for: error,
+                consecutiveUsageUnavailableFailures: 8,
+                isActive: false
+            ) == 60)
+        }
+    }
+
     @Test("A completed poll generation removes itself from supervision")
     func completedPollGenerationCleansUp() async {
         let poller = QuotaPoller()

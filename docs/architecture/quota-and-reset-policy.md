@@ -262,6 +262,14 @@ proxy policy, and network retry behavior are unchanged. Deterministic fixtures
 must prove that non-200 classification never invokes the body reader, while
 200 responses preserve parsing and body-read failure semantics.
 
+A quota poll that completes with HTTP 200 but no recognised window
+(`usageUnavailable`, typical of free plans) is not capacity evidence. The Mac
+retries an inactive account in that state with exponential backoff from one
+minute to a one-hour cap, resetting on the next successful poll. The
+authority-selected account and transport, HTTP, and 429 failures keep the
+one-minute retry. Rationale: such accounts previously produced about 1,400
+identical poll errors per day each without ever yielding usable evidence.
+
 ## Candidate Ranking
 
 The policy optimizes for fast inference first, usable capacity second, and churn avoidance third.
@@ -593,6 +601,26 @@ includes read-only journal metadata, without provider requests or a full health
 scan. Missing, unreadable, mismatched, or unresolved journal evidence stays
 blocked. Reopening the Mac app also restores unresolved remote-account holds
 from that journal observation.
+Because the rejection envelope message is identical for every cause, the Mac
+reads the specific reason from the command's bounded stderr error chain and
+shows it with an explicit statement that no reset was spent; that message is
+retained briefly so the follow-up observation does not erase it before it can
+be read, and an explicit refresh clears it. A rejection whose reason is that a
+VPS runtime activation owns the mutation lease is resubmitted at most once,
+after five seconds, with a new request UUID; the VPS command owns any longer
+lease wait. Unknown outcomes are never resubmitted. After every result,
+including timeout, the Mac immediately refreshes that account's provider
+inventory and quota (observation only) so the card converges within seconds.
+
+Redemptions made by any other client (the VPS daemon, T3, a Codex app-server)
+are detected from inventory evidence: a count drop beyond natural expiry, or a
+previously available unexpired credit identifier that disappeared, which also
+catches a consumption hidden by a simultaneous new grant. The Mac applies this
+rule both to its own inventory polls and to banks first learned through the
+VPS account mirror, and refreshes quota immediately on detection. When newer
+usable quota clears an external hold early, the in-memory copy is removed
+before the durable readback check; an intentional clear is not a lost write
+and must not disable automatic redemption.
 
 ## Reset Expiration Urgency
 
@@ -666,6 +694,14 @@ reconciliation in progress may use their distinct operational colors.
 - Render only observed windows.
 - Render an observation older than the runtime freshness contract as
   `quota=stale`; never print its cached percentages as current capacity.
+  In the menu app, an account card whose reading is older than
+  `QuotaFreshnessPolicy.maximumSnapshotAge` (15 minutes) shows a
+  `Stale usage — as of <age> ago` caption with the latest polling error, the
+  menu-bar tooltip appends `(stale, as of <age> ago)`, and the ring uses a
+  neutral color. Healthy accounts poll at least once a minute, so fifteen
+  minutes without success is unambiguous staleness.
+- Log reset-inventory refreshes only when the count, earned total, or credit
+  set changed; inventory failures log the HTTP status or transport error.
 - Label weekly-only operation through the meter itself; do not show an alarming missing-five-hour error.
 - Present exactly one authority-selected pool target, plus separate Mac and VPS
   convergence details for that target. Never style two accounts as current.

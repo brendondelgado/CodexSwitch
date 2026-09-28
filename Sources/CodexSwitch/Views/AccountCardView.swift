@@ -75,6 +75,25 @@ struct AccountCardView: View {
         return formatter
     }()
 
+    /// Caption for a quota reading older than the freshness contract. The cached
+    /// windows stay visible for context but are explicitly labeled as not current.
+    static func staleQuotaLabel(
+        for snapshot: QuotaSnapshot,
+        pollingError: String?,
+        now: Date
+    ) -> String? {
+        guard let age = QuotaFreshnessPolicy.staleAgeLabel(
+            fetchedAt: snapshot.fetchedAt,
+            now: now
+        ) else {
+            return nil
+        }
+        guard let pollingError, !pollingError.isEmpty else {
+            return "Stale usage — \(age)"
+        }
+        return "Stale usage — \(age) · \(pollingError)"
+    }
+
     private var statusDot: Color {
         if needsReauthentication { return .red }
         if account.hasHardRuntimeBlock { return .orange }
@@ -622,6 +641,18 @@ struct AccountCardView: View {
                         .foregroundStyle(.tertiary)
                 }
             } else if let snapshot = account.realQuotaSnapshot {
+                if let staleLabel = Self.staleQuotaLabel(
+                    for: snapshot,
+                    pollingError: pollingError,
+                    now: Date()
+                ) {
+                    Label(staleLabel, systemImage: "clock.badge.exclamationmark")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                        .help("This usage reading is not current; percentages are the last successful poll")
+                        .accessibilityLabel("Usage is stale, \(staleLabel)")
+                }
                 switch QuotaSnapshotPresentation(snapshot: snapshot) {
                 case .windows(let rows):
                     ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
@@ -669,7 +700,7 @@ struct AccountCardView: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.red)
                         .lineLimit(2)
-                    Text("Will retry in 60s")
+                    Text("Retrying automatically")
                         .font(.system(size: 9))
                         .foregroundStyle(.tertiary)
                 }

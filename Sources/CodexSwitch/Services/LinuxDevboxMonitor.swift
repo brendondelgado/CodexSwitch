@@ -544,18 +544,47 @@ enum LinuxDevboxManualResetFailureDisposition: Equatable, Sendable {
 }
 
 struct LinuxDevboxManualResetFailure: Error, Equatable, Sendable {
+    static let runtimeActivationBusyMarker = "runtime activation is busy"
+
     let message: String
     let disposition: LinuxDevboxManualResetFailureDisposition
     let reconciliationRequestID: UUID?
+    /// Bounded, single-line reason from the VPS CLI's stderr (`Error: ...` plus its
+    /// `Caused by` chain). The JSON envelope message is identical for every rejection,
+    /// so this is the only place the specific cause is available.
+    let detail: String?
 
     init(
         message: String,
         disposition: LinuxDevboxManualResetFailureDisposition,
-        reconciliationRequestID: UUID? = nil
+        reconciliationRequestID: UUID? = nil,
+        detail: String? = nil
     ) {
         self.message = message
         self.disposition = disposition
         self.reconciliationRequestID = reconciliationRequestID
+        self.detail = detail
+    }
+
+    /// A rejected request spent nothing; this marks the one rejection cause that is
+    /// expected to clear by itself once the VPS finishes a runtime activation.
+    var isRuntimeActivationBusyRejection: Bool {
+        disposition == .rejected
+            && detail?.localizedCaseInsensitiveContains(Self.runtimeActivationBusyMarker) == true
+    }
+
+    /// Text shown on the account card. Rejections state explicitly that no reset was
+    /// spent and that the user may retry; unknown outcomes keep the reconcile message.
+    var userFacingMessage: String {
+        switch disposition {
+        case .rejected:
+            guard let detail else { return message }
+            return "VPS did not redeem a reset (nothing was spent): \(detail). Refresh and try again."
+        case .retryablePreExecution:
+            return detail.map { "\(message): \($0)" } ?? message
+        case .outcomeUnknown:
+            return detail.map { "\(message) (\($0))" } ?? message
+        }
     }
 }
 
@@ -2582,7 +2611,8 @@ enum LinuxDevboxMonitor {
             return .failure(decodeManualResetFailure(
                 result.stdout,
                 expectedProviderAccountId: normalizedProviderAccountId,
-                expectedRequestID: requestID
+                expectedRequestID: requestID,
+                stderr: result.stderr
             ))
         }
 
@@ -2592,14 +2622,65 @@ enum LinuxDevboxMonitor {
         )
     }
 
+    static let maximumManualResetFailureDetailCharacters = 240
+
+    /// Extracts the CLI's `anyhow` error chain from stderr as one bounded line.
+    /// Only text after an `Error:` line is trusted; SSH banners, warnings, and
+    /// execution markers are ignored. Returns `nil` when no error line exists.
+    static func manualResetFailureDetail(fromStderr stderr: Data) -> String? {
+        guard !stderr.isEmpty else { return nil }
+        let text = String(decoding: stderr.prefix(maximumManualResetResultBytes), as: UTF8.self)
+        var parts: [String] = []
+        var collecting = false
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if !collecting {
+                guard line.hasPrefix("Error:") else { continue }
+                collecting = true
+                parts.append(String(line.dropFirst("Error:".count)))
+                continue
+            }
+            if line.isEmpty || line == "Caused by:" { continue }
+            if line.hasPrefix(remoteExecutionMarkerPrefix)
+                || line.hasPrefix(remoteCompletionMarkerPrefix)
+                || line.hasPrefix("__CODEXSWITCH_") {
+                break
+            }
+            // anyhow numbers multi-cause chains as "0: ...", "1: ...".
+            var cause = Substring(line)
+            if let colon = cause.firstIndex(of: ":"),
+               cause[..<colon].allSatisfy(\.isNumber),
+               !cause[..<colon].isEmpty {
+                cause = cause[cause.index(after: colon)...]
+            }
+            parts.append(String(cause))
+        }
+        let sanitized = parts
+            .map { part in
+                String(String.UnicodeScalarView(part.unicodeScalars.filter {
+                    $0.value >= 32 && $0.value != 127
+                })).trimmingCharacters(in: .whitespaces)
+            }
+            .filter { !$0.isEmpty }
+            .joined(separator: ": ")
+        guard !sanitized.isEmpty else { return nil }
+        guard sanitized.count > maximumManualResetFailureDetailCharacters else {
+            return sanitized
+        }
+        return String(sanitized.prefix(maximumManualResetFailureDetailCharacters - 1)) + "…"
+    }
+
     static func decodeManualResetFailure(
         _ data: Data,
         expectedProviderAccountId: String,
-        expectedRequestID: UUID? = nil
+        expectedRequestID: UUID? = nil,
+        stderr: Data = Data()
     ) -> LinuxDevboxManualResetFailure {
+        let detail = manualResetFailureDetail(fromStderr: stderr)
         let fallback = LinuxDevboxManualResetFailure(
             message: "Manual reset outcome is unknown; reconcile VPS reset state before retrying",
-            disposition: .outcomeUnknown
+            disposition: .outcomeUnknown,
+            detail: detail
         )
         guard data.count <= maximumManualResetResultBytes else { return fallback }
 
@@ -2621,7 +2702,8 @@ enum LinuxDevboxMonitor {
                       response.blockingRequestId == nil else { return fallback }
                 return LinuxDevboxManualResetFailure(
                     message: remoteManualResetRejectedMessage,
-                    disposition: .rejected
+                    disposition: .rejected,
+                    detail: detail
                 )
             case .outcomeUnknown:
                 guard response.message == remoteManualResetOutcomeUnknownMessage else {
@@ -2630,7 +2712,8 @@ enum LinuxDevboxMonitor {
                 return LinuxDevboxManualResetFailure(
                     message: remoteManualResetOutcomeUnknownMessage,
                     disposition: .outcomeUnknown,
-                    reconciliationRequestID: expectedRequestID == nil ? nil : response.blockingRequestId
+                    reconciliationRequestID: expectedRequestID == nil ? nil : response.blockingRequestId,
+                    detail: detail
                 )
             }
         } catch {
