@@ -2705,12 +2705,28 @@ fn runtime_activation_lease_path(store_path: &Path) -> PathBuf {
     store_path.with_extension("runtime-activation")
 }
 
+/// Typed contention signal for the cross-process runtime-activation lease.
+///
+/// The display text is a stable contract: remote callers and tests match it.
+/// Local callers that may wait for the lease downcast to this type instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeActivationBusy;
+
+impl std::fmt::Display for RuntimeActivationBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "runtime activation is busy: another process owns the cross-process runtime-activation lease",
+        )
+    }
+}
+
+impl std::error::Error for RuntimeActivationBusy {}
+
 pub(crate) fn acquire_runtime_activation_lease(
     store_path: &Path,
 ) -> Result<RuntimeActivationLease> {
-    try_acquire_runtime_activation_lease(store_path)?.context(
-        "runtime activation is busy: another process owns the cross-process runtime-activation lease",
-    )
+    try_acquire_runtime_activation_lease(store_path)?
+        .ok_or_else(|| anyhow::Error::new(RuntimeActivationBusy))
 }
 
 pub(crate) fn try_acquire_runtime_activation_lease(
