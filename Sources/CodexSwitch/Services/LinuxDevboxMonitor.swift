@@ -3345,6 +3345,41 @@ enum LinuxDevboxMonitor {
         }
     }
 
+    /// Reads the VPS's newest credential generation per account. The response
+    /// holds live tokens, so no path here logs or retains stdout.
+    static func fetchCredentialGenerations(
+        settings: LinuxDevboxMonitorSettings,
+        remoteCommand: String = LinuxDevboxTokenConvergence.remoteCommand(),
+        runner: (URL, [String], TimeInterval) -> ProcessRunResult = { executable, arguments, timeout in
+            ProcessRunner.run(executableURL: executable, arguments: arguments, timeout: timeout)
+        }
+    ) -> Result<[LinuxDevboxCredentialGeneration], LinuxDevboxMonitorFailure> {
+        guard settings.isConfigured else {
+            return .failure(LinuxDevboxMonitorFailure(message: "Linux devbox monitor is not configured"))
+        }
+        let outcome = runSSHOutcomeWithCandidates(
+            sshArgumentCandidates(settings: settings),
+            remoteCommand: remoteCommand,
+            timeout: 20,
+            retryPolicy: .readOnly,
+            runner: runner
+        )
+        let result = outcome.result
+        guard !result.timedOut, outcome.executionState == .completed,
+              result.terminationStatus == 0, !result.stdoutTruncated else {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "VPS credential generations are unavailable (status \(result.terminationStatus), timedOut=\(result.timedOut))"
+            ))
+        }
+        do {
+            return .success(try LinuxDevboxTokenConvergence.decodeReport(result.stdout))
+        } catch {
+            return .failure(LinuxDevboxMonitorFailure(
+                message: "VPS credential generations report is malformed"
+            ))
+        }
+    }
+
     private static func fetchAccountStateReport(
         settings: LinuxDevboxMonitorSettings
     ) -> Result<LinuxDevboxAccountStateReport, LinuxDevboxMonitorFailure> {

@@ -424,6 +424,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastLinuxDevboxAccountRefreshByKey: [String: Date] = [:]
     private var linuxDevboxCredentialSyncInFlight = false
     private var linuxDevboxReauthInFlight = false
+    private var linuxDevboxTokenConvergenceTask: Task<Void, Never>?
+    private var lastLinuxDevboxTokenConvergenceAt: Date?
+    private var lastLinuxDevboxTokenExpiredProviderIds: Set<String> = []
     private var lastLinuxDevboxReauthAttempt: Date?
     private var lastLinuxDevboxReauthAccountID: UUID?
     private var linuxDevboxCredentialSyncReconciliationInFlight = false
@@ -3115,7 +3118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             )
             return
         }
-        if context != "authority-reconciliation",
+        // These contexts carry fresh evidence that the VPS diverged even though
+        // the Mac pool is unchanged since the last recorded sync.
+        if context != "authority-reconciliation", context != "token-convergence",
            UserDefaults.standard.string(forKey: linuxDevboxLastCredentialSyncFingerprintKey) == fingerprint {
             return
         }
@@ -3704,6 +3709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
              "subscription-info",
              "reset-consumed",
              "swap",
+             "token-convergence",
              "token-refresh":
             return true
         default:
@@ -3746,7 +3752,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
              "quota-update",
              "reset-consumed",
              "subscription-info",
-             "authority-reconciliation":
+             "authority-reconciliation",
+             "token-convergence":
             return 60
         default:
             if context.hasPrefix("credential-retry-") {
@@ -4014,90 +4021,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func refreshToken(for accountId: UUID) async {
         guard !isExiting else { return }
-        guard let account = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
-        guard !account.isRuntimeUnusable else {
+        guard let observed = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
+        guard !observed.isRuntimeUnusable else {
             await quotaPoller.stopPolling(for: accountId)
             return
         }
+        // Adopt before refreshing: if the VPS already rotated this chain, the Mac
+        // copy is dead and refreshing it would fail or strand the VPS instead.
+        if await adoptedNewerLinuxDevboxGeneration(for: observed) { return }
+        guard let account = accountManager.accounts.first(where: { $0.id == accountId }),
+              !account.isRuntimeUnusable else { return }
         let shouldNotifyRefreshFailure = !account.requiresReauthentication
         if accountManager.configuredAccount?.id == accountId {
-            guard let activationState = await activationStateForRequest(),
-                  activationState.phase == .confirmed,
-                  await requireFreshLocalRuntimePermit(
-                      for: account,
-                      activationGeneration: activationState.activationGeneration,
-                      requiredPhase: .confirmed
-                  ) != nil else {
-                await handleTokenRefreshFailure(
-                    account: account,
-                    error: PollerError.tokenExpired,
-                    shouldNotify: shouldNotifyRefreshFailure
-                )
-                return
-            }
-            let committed = await withPreparedActiveCredentialMutation(
-                targetAccountId: account.id,
-                expectedConfiguredAccountId: account.id,
+            let committed = await commitActiveCredentialGeneration(
+                account: account,
                 source: "token-refresh",
-                requestKind: .automatic
-            ) { [weak self] prepared in
-                guard let self else { return false }
-                do {
-                    let refreshed = try await AccountCredentialMutationBoundary.performAsync(
-                        route: .tokenRefresh,
-                        authorize: { [weak self] in
-                            guard let self else { return nil }
-                            return await self.revalidateCredentialMutation(
-                                route: .tokenRefresh,
-                                from: account,
-                                to: account,
-                                reason: .manual,
-                                authAlreadyConfigured: false,
-                                prepared: prepared
-                            )
-                        },
-                        mutation: { _ in
-                            try await TokenRefresher.refresh(account)
-                        }
+                produce: { try await TokenRefresher.refresh(account) },
+                onUnauthorized: { [weak self] in
+                    await self?.handleTokenRefreshFailure(
+                        account: account,
+                        error: PollerError.tokenExpired,
+                        shouldNotify: shouldNotifyRefreshFailure
                     )
-                    guard let refreshed else {
-                        await self.failConfiguredCredentialMutation(
-                            target: account,
-                            prepared: prepared,
-                            stage: .mutationAuthorization,
-                            detail: .runtimeEvidenceExpired,
-                            failure: "active token refresh authorization changed before submission"
-                        )
-                        return false
-                    }
-                    return await self.commitConfiguredCredentialMutation(
-                        from: account,
-                        to: refreshed,
-                        reason: .manual,
-                        mutationRoute: .tokenRefresh,
-                        persistenceContext: "token-refresh",
-                        authAlreadyConfigured: false,
-                        swapStart: Date(),
-                        prepared: prepared,
-                        recordsSwap: false,
-                        committedDetail: .activeCredentialMutation
-                    )
-                } catch {
-                    await self.failConfiguredCredentialMutation(
-                        target: account,
-                        prepared: prepared,
-                        stage: .credentialMutation,
-                        detail: .fileCommitFailed,
-                        failure: "active token refresh failed or was cancelled before commit"
-                    )
-                    await self.handleTokenRefreshFailure(
+                },
+                onProduceFailure: { [weak self] error in
+                    await self?.handleTokenRefreshFailure(
                         account: account,
                         error: error,
                         shouldNotify: shouldNotifyRefreshFailure
                     )
-                    return false
                 }
-            }
+            )
             guard committed else { return }
             refreshSubscriptionInfoIfNeeded(force: true)
             SwapLog.append(.tokenRefreshed(email: account.email))
@@ -4121,6 +4075,213 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 error: error,
                 shouldNotify: shouldNotifyRefreshFailure
             )
+        }
+    }
+
+    /// Commits a new token generation for the configured account through the
+    /// activation transaction (store, auth.json, runtime reload). `source` is
+    /// also the persistence context that decides Mac-to-VPS sync.
+    private func commitActiveCredentialGeneration(
+        account: CodexAccount,
+        source: String,
+        produce: @escaping @Sendable () async throws -> CodexAccount,
+        onUnauthorized: @escaping @MainActor () async -> Void,
+        onProduceFailure: @escaping @MainActor (Error) async -> Void
+    ) async -> Bool {
+        guard let activationState = await activationStateForRequest(),
+              activationState.phase == .confirmed,
+              await requireFreshLocalRuntimePermit(
+                  for: account,
+                  activationGeneration: activationState.activationGeneration,
+                  requiredPhase: .confirmed
+              ) != nil else {
+            await onUnauthorized()
+            return false
+        }
+        return await withPreparedActiveCredentialMutation(
+            targetAccountId: account.id,
+            expectedConfiguredAccountId: account.id,
+            source: source,
+            requestKind: .automatic
+        ) { [weak self] prepared in
+            guard let self else { return false }
+            do {
+                let generation = try await AccountCredentialMutationBoundary.performAsync(
+                    route: .tokenRefresh,
+                    authorize: { [weak self] in
+                        guard let self else { return nil }
+                        return await self.revalidateCredentialMutation(
+                            route: .tokenRefresh,
+                            from: account,
+                            to: account,
+                            reason: .manual,
+                            authAlreadyConfigured: false,
+                            prepared: prepared
+                        )
+                    },
+                    mutation: { _ in try await produce() }
+                )
+                guard let generation else {
+                    await self.failConfiguredCredentialMutation(
+                        target: account,
+                        prepared: prepared,
+                        stage: .mutationAuthorization,
+                        detail: .runtimeEvidenceExpired,
+                        failure: "active token generation authorization changed before submission"
+                    )
+                    return false
+                }
+                return await self.commitConfiguredCredentialMutation(
+                    from: account,
+                    to: generation,
+                    reason: .manual,
+                    mutationRoute: .tokenRefresh,
+                    persistenceContext: source,
+                    authAlreadyConfigured: false,
+                    swapStart: Date(),
+                    prepared: prepared,
+                    recordsSwap: false,
+                    committedDetail: .activeCredentialMutation
+                )
+            } catch {
+                await self.failConfiguredCredentialMutation(
+                    target: account,
+                    prepared: prepared,
+                    stage: .credentialMutation,
+                    detail: .fileCommitFailed,
+                    failure: "active token generation failed or was cancelled before commit"
+                )
+                await onProduceFailure(error)
+                return false
+            }
+        }
+    }
+
+    /// Pulls the VPS generations (bounded by `triggeredInterval`) and reports
+    /// whether this account now holds a different, usable access token.
+    private func adoptedNewerLinuxDevboxGeneration(for account: CodexAccount) async -> Bool {
+        guard LinuxDevboxMonitor.settings().isConfigured else { return false }
+        await convergeLinuxDevboxTokens(context: "pre-refresh", triggered: true)
+        guard let current = accountManager.accounts.first(where: { $0.id == account.id }),
+              current.accessToken != account.accessToken,
+              current.hasUsableInferenceToken(at: Date()) else {
+            return false
+        }
+        SwapLog.append(.debug(
+            "TOKEN_REFRESH_SKIPPED email=\(account.email) reason=adopted_vps_generation"
+        ))
+        return true
+    }
+
+    /// One convergence round: read the VPS's newest generation per account,
+    /// adopt strictly newer ones, and push when the Mac holds a newer chain.
+    private func convergeLinuxDevboxTokens(context: String, triggered: Bool) async {
+        if let inFlight = linuxDevboxTokenConvergenceTask {
+            await inFlight.value
+            return
+        }
+        let now = Date()
+        let interval = triggered
+            ? LinuxDevboxTokenConvergence.triggeredInterval
+            : LinuxDevboxTokenConvergence.periodicInterval
+        if let last = lastLinuxDevboxTokenConvergenceAt, now.timeIntervalSince(last) < interval {
+            return
+        }
+        let settings = LinuxDevboxMonitor.settings()
+        guard !isExiting, settings.isConfigured, !accountManager.accounts.isEmpty else { return }
+        lastLinuxDevboxTokenConvergenceAt = now
+        let task = Task { @MainActor [weak self] in
+            let result = await Task.detached {
+                LinuxDevboxMonitor.fetchCredentialGenerations(settings: settings)
+            }.value
+            await self?.applyLinuxDevboxTokenConvergence(result, context: context)
+        }
+        linuxDevboxTokenConvergenceTask = task
+        await task.value
+        linuxDevboxTokenConvergenceTask = nil
+    }
+
+    /// A newly token_expired VPS account means the VPS lost a refresh race or
+    /// holds a dead chain; converge now instead of waiting for the periodic pull.
+    private func convergeLinuxDevboxTokensAfterVPSTokenExpiry(
+        _ states: [LinuxDevboxAccountState]
+    ) {
+        let now = Date()
+        let expired = Set(states.compactMap { state -> String? in
+            guard CodexAccount.requiresReauthentication(
+                runtimeUnusableUntil: state.runtimeUnusableUntil,
+                runtimeUnusableReason: state.runtimeUnusableReason,
+                at: now
+            ) else { return nil }
+            return CodexAccount.normalizedProviderAccountId(state.providerAccountId)
+        })
+        let newlyExpired = !expired.isSubset(of: lastLinuxDevboxTokenExpiredProviderIds)
+        lastLinuxDevboxTokenExpiredProviderIds = expired
+        guard newlyExpired else { return }
+        Task { [weak self] in
+            await self?.convergeLinuxDevboxTokens(context: "vps-token-expired", triggered: true)
+        }
+    }
+
+    private func applyLinuxDevboxTokenConvergence(
+        _ result: Result<[LinuxDevboxCredentialGeneration], LinuxDevboxMonitorFailure>,
+        context: String
+    ) async {
+        let remote: [LinuxDevboxCredentialGeneration]
+        switch result {
+        case .success(let value):
+            remote = value
+        case .failure(let failure):
+            SwapLog.append(.debug(
+                "LINUX_DEVBOX_TOKEN_CONVERGENCE_FAILED context=\(context) error=\(failure.message)"
+            ))
+            return
+        }
+        guard !isExiting else { return }
+        let plan = LinuxDevboxTokenConvergence.plan(local: accountManager.accounts, remote: remote)
+        for adoption in plan.adoptions {
+            let original = adoption.original
+            let adopted: Bool
+            if original.isActive || accountManager.configuredAccount?.id == original.id {
+                // auth.json may hold a runtime refresh the app has not adopted
+                // yet; that generation could be newer, so never overwrite it.
+                guard Self.authFileMatches(account: original, atPath: Self.codexAuthPath) else {
+                    SwapLog.append(.debug(
+                        "LINUX_DEVBOX_TOKEN_ADOPT_DEFERRED email=\(original.email) reason=auth_json_diverged"
+                    ))
+                    continue
+                }
+                adopted = await commitActiveCredentialGeneration(
+                    account: original,
+                    source: "vps-token-adopt",
+                    produce: { adoption.candidate },
+                    onUnauthorized: {},
+                    onProduceFailure: { _ in }
+                )
+            } else {
+                adopted = await persistInactiveCredentialUpdate(
+                    original: original,
+                    candidate: adoption.candidate,
+                    context: "vps-token-adopt"
+                )
+            }
+            SwapLog.append(.debug(
+                "LINUX_DEVBOX_TOKEN_ADOPTED email=\(original.email) context=\(context) committed=\(adopted)"
+            ))
+            if adopted {
+                accountManager.clearPollingError(for: original.id)
+                startPollingForAccount(original.id)
+            }
+        }
+        if !plan.newerLocalProviderAccountIds.isEmpty {
+            SwapLog.append(.debug(
+                "LINUX_DEVBOX_TOKEN_PUSH_REQUIRED context=\(context) accounts=\(plan.newerLocalProviderAccountIds.count)"
+            ))
+            scheduleLinuxDevboxCredentialSyncIfNeeded(context: "token-convergence")
+        }
+        if !plan.adoptions.isEmpty {
+            statusBarController?.updateIcon()
+            updatePopoverContent()
         }
     }
 
@@ -10762,6 +10923,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             updatePopoverContent()
             return
         }
+        // Launch and every five minutes: return VPS-refreshed chains to the Mac.
+        Task { [weak self] in
+            await self?.convergeLinuxDevboxTokens(context: "periodic", triggered: false)
+        }
         let supersededReadinessTask: Bool
         if let activeContext = linuxDevboxReadinessTaskContext,
            force || activeContext.settings != settings {
@@ -10909,6 +11074,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             states,
                             context: "linux-devbox-status-sync"
                         )
+                        self.convergeLinuxDevboxTokensAfterVPSTokenExpiry(states)
                         SwapLog.append(.debug("LINUX_DEVBOX_REMOTE_ACCOUNT_STATUS_SYNCED remote_active=\(accountStateActiveEmail ?? "none") readiness_active=\(self.accountManager.linuxDevboxStatus.activeEmail ?? "none") local_configured=\(self.accountManager.configuredAccount?.email ?? "none") accounts=\(states.count) reason=headless-readiness"))
                         SwapLog.append(.debug("LINUX_DEVBOX_READY summary=\(readiness.summary)"))
                     case .failure(let failure):

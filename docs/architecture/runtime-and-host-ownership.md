@@ -40,6 +40,8 @@ cross_dependencies:
   - ../../Sources/CodexSwitch/Services/SecureAtomicFileTransaction.swift
   - ../runbooks/credential-sync-hold-recovery.md
   - ../../Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  - ../../Sources/CodexSwitch/Services/LinuxDevboxTokenConvergence.swift
+  - ../../crates/codexswitch-cli/src/credential_generations.rs
   - ../../Sources/CodexSwitch/Services/PoolAuthority.swift
   - ../../Sources/CodexSwitch/Services/CodexVersionChecker.swift
   - ../../Sources/CodexSwitch/Services/CodexManagedRuntimeTrust.swift
@@ -82,7 +84,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical-target
-  last_updated: 2026-09-27
+  last_updated: 2026-09-28
 ---
 
 # Runtime And Host Ownership
@@ -128,7 +130,8 @@ monotonically:
 - equal access-token generations with different refresh-token material preserve
   the destination's complete token set;
 - different access-token generations with equal inference-token expiry are
-  incomparable and fail closed;
+  ordered by issue time (`iat`); equal expiry and issue time are incomparable
+  and fail closed;
 - incomparable, incomplete, or malformed generations fail closed before any
   credential mutation;
 - destination quota observations, runtime blocks, reset inventory, and other
@@ -271,26 +274,95 @@ operator procedure is
 
 OpenAI refresh tokens are single-use: each refresh rotates the token, and the
 old one fails with `invalid_refresh_token` or `refresh_token_reused`. When two
-hosts hold the same refresh token, the first to refresh invalidates the other
-host's copy. The target policy is one refresh owner per credential chain; every
-other holder receives the refreshed generation. The current implementation
-violates that policy:
+hosts hold the same chain, the first to refresh invalidates the other host's
+copy. Several actors refresh:
 
-- the VPS daemon refreshes any polled account 5 minutes before access-token
-  expiry (`fetch_quota_with_refresh`);
-- the Mac refreshes an account after a poll reports an expired token
-  (`AppDelegate.refreshToken(for:)`), and the Mac Codex runtime refreshes the
-  account it is running;
-- delivery runs only Mac-to-VPS (full-pool sync and targeted reauthentication).
-  There is no VPS-to-Mac return path.
+- the VPS daemon refreshes a polled account 5 minutes before access-token
+  expiry, or after a 401 (`fetch_quota_with_refresh`);
+- the Mac app refreshes an account only after its poll reports an expired
+  token (`AppDelegate.refreshToken(for:)`);
+- Codex runtimes on either host refresh the account they run and write
+  `~/.codex/auth.json`.
 
-Consequently, each Mac-to-VPS delivery puts both hosts on one chain until one
-of them refreshes. If the Mac refreshes first, the VPS copy is dead until the
-next successful sync. If the VPS refreshes first, the Mac copy is dead
-permanently. Restoring Mac-to-VPS sync closes the first case within one sync
-cycle. The second case needs a single-owner protocol that has not been built:
-either the VPS returns refreshed generations to the Mac, or only one host
-refreshes each account.
+Forbidding refresh on one host is not possible: the runtime that serves a user
+turn must be able to renew its own token. The protocol instead makes every
+refresh converge, by exchanging generations in both directions and letting the
+newest win.
+
+**Generation order.** Per normalized provider account ID (never email), a
+generation is newer when its access-token `exp` is later, then when its `iat`
+is later. Both hosts use this order: the VPS import merge
+(`merge_token_generation`) and the Mac return path
+(`LinuxDevboxTokenConvergence`). A tie, or an unordered pair, keeps the local
+copy. Rationale: a refresh always issues a later `exp`, so the chain with the
+later `exp` is the successor and the other chain's refresh token is already
+spent or about to be.
+
+**Mac to VPS.** Unchanged transport: the authority-preserving full-pool sync.
+The VPS merge keeps its own copy of any account whose generation is newer. A
+Mac refresh (`token-refresh`) bypasses the sync throttle, and a Mac
+reauthentication also uses the targeted delivery path, so a new Mac generation
+reaches the VPS within one sync.
+
+**VPS to Mac.** `codexswitch-cli credential-generations` is a read-only,
+hidden command. It emits one `store` entry per VPS account with complete tokens,
+plus one `auth` entry when VPS `auth.json` holds a strictly newer generation for
+a store account (a runtime refresh not yet adopted into the store). The output
+contains live tokens. It travels only over the authenticated SSH envelope used
+by credential sync, and neither side logs it. The Mac runs one convergence
+round:
+
+- on app launch and every 5 minutes, from the readiness timer;
+- immediately when the VPS account mirror shows a newly token-expired account;
+- before any Mac token refresh, with a 30-second floor so pollers expiring
+  together share one SSH round trip.
+
+For each Mac account with a unique provider ID, the round adopts the newest
+account-bound VPS entry when it is strictly newer than the Mac copy. Account
+binding means that an access-token `chatgpt_account_id` claim, if present,
+names the same account. An inactive account commits through
+`persistInactiveCredentialUpdate`, which compare-and-swaps against the observed
+Mac copy. The configured account commits through the same activation
+transaction as a Mac token refresh (store, `auth.json`, runtime reload). That
+path is skipped while `auth.json` diverges from the store, because the
+unadopted runtime generation may be newer. Adoption clears a
+reauthentication-class runtime block, because that block was observed against
+the replaced chain. It then restarts polling for the account. Adoption never
+schedules a Mac-to-VPS sync.
+
+After adoption, if the Mac generation is one the VPS merge would take over the
+VPS **store** entry, the round schedules a `token-convergence` sync. That
+context bypasses the unchanged-fingerprint shortcut, because the evidence is
+new even though the Mac pool is unchanged. Comparing against the store entry,
+not the `auth` entry, lets a dead VPS store chain be repaired while a VPS
+runtime holds the live one.
+
+**Fewer rotations.** The Mac never refreshes proactively. On a 401 it adopts
+first and refreshes only if the account still lacks a usable token, for
+example when the VPS is unreachable, not configured, or also expired. The VPS
+daemon is therefore the effective proactive refresher for inactive accounts. It
+refreshes 5 minutes before expiry, while the Mac waits for expiry, so the Mac
+normally finds a newer VPS generation. Each host's runtime still refreshes the
+account it runs, and the other host converges within one round.
+
+**Remaining races** (each self-heals within one round, about 5 minutes):
+
+- Both hosts refresh the same chain within one round. For example, the Mac
+  falls back to a refresh while the VPS daemon refreshes the same account. The
+  loser gets `refresh_token_reused` and records `token_expired`. The winner's
+  generation then reaches it by push (the VPS import clears the block) or by
+  pull (adoption clears the block). The Mac may show one transient
+  reauthentication notice.
+- Mac and VPS runtimes that both run the pool's active account can cross the
+  runtime's staleness threshold together, because converged hosts share one
+  `iat`. The losing runtime fails until the next round reloads it with the
+  winning generation.
+- Accounts whose generations tie (equal `exp` and `iat`, different tokens) are
+  never adopted or pushed. Any other full-pool push that includes such an
+  account still fails closed in the VPS merge.
+- Adoption and push need SSH. While the VPS is unreachable, the Mac falls back
+  to its own refresh and the VPS copy of that account dies until the next
+  successful sync.
 
 The control CLI may enter `awaiting_caller_acceptance` only after Mac
 credentials and every required runtime acknowledgement converge to the recorded
