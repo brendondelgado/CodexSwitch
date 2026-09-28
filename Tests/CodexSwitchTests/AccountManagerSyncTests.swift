@@ -1060,8 +1060,8 @@ struct AccountManagerSyncTests {
         #expect(manager.accounts.first?.quotaSnapshot?.fiveHour == nil)
     }
 
-    @Test("Sorted accounts do not treat a local active flag as pool authority")
-    @MainActor func sortedAccountsIgnoreLocalActiveFlagWithoutAuthority() {
+    @Test("Sorted accounts lead with the Mac-committed current account even when exhausted")
+    @MainActor func sortedAccountsLeadWithCommittedCurrentAccount() {
         let defaults = isolatedDefaults()
         let manager = AccountManager(userDefaults: defaults)
         let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -1097,9 +1097,11 @@ struct AccountManagerSyncTests {
         manager.addAccount(usablePro)
         manager.setConfiguredAccount(exhaustedPro.id)
 
-        let sorted = manager.sortedAccounts(using: .unavailable, now: now)
-        #expect(sorted.first?.id == usablePro.id)
-        #expect(sorted.dropFirst().first?.id == exhaustedPro.id)
+        // What Codex draws from is shown first; ordering never selects it.
+        #expect(manager.sortedAccounts.first?.id == exhaustedPro.id)
+        let withoutCurrent = manager.sortedAccounts(currentAccountId: nil, now: now)
+        #expect(withoutCurrent.first?.id == usablePro.id)
+        #expect(withoutCurrent.dropFirst().first?.id == exhaustedPro.id)
     }
 
     @Test("Inactive imported credentials refresh an existing account")

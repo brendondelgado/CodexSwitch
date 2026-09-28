@@ -231,7 +231,12 @@ receipt remains historical evidence after later rotations, not proof of current
 convergence. The Mac retires its matching held journal with generation checks,
 invalidates its convergence cache, and requests fresh convergence. Missing or
 pending receipts, including legacy receipt-less holds, require reviewed recovery
-and never become fabricated success. The ledger is bounded and fails closed on
+and never become fabricated success. The Mac surfaces an unresolved hold from
+its local journal on every poll. The SSH-backed receipt lookup for the same
+operation is spaced out, starting at one minute and doubling to thirty
+minutes, because an unresolved lookup is deterministic until the VPS release or
+the operator changes something. Re-surfacing the same hold never discards an
+in-flight readiness check. The ledger is bounded and fails closed on
 exhaustion or malformed records. See
 `../plans/2026-09-24-credential-import-receipts.md` for replay fixtures.
 
@@ -1044,7 +1049,10 @@ Runtime kind is an authorization contract derived from verified process and
 ancestry topology, never a label trusted from the acknowledgement. On macOS,
 only an exact `codex app-server --listen stdio://` process whose kernel ancestry
 reaches the observed top-level OpenAI-signed ChatGPT app may classify as
-`official-desktop-stdio-child`. Any WebSocket desktop bridge is unsupported.
+`official-desktop-stdio-child`. A stdio app-server whose readable ancestry ends
+elsewhere is an unmanaged runtime. It is never signalled and never blocks
+convergence, and it is reported as a restart-to-switch warning (see
+`macos-runtime-discovery.md`). Any WebSocket desktop bridge is unsupported.
 
 Runtime discovery lanes must not count the same PID twice. After the desktop
 transaction admits and acknowledges a desktop or managed-bridge PID, the

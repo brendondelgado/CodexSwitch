@@ -131,7 +131,65 @@ enum CodexDesktopNativeChildCoordinator {
         return false
     }
 
-    static func topLevelChatGPTAppPath(containing executablePath: String) -> String? {
+    static let maximumHostAncestryDepth = 16
+    static let officialDesktopHostExecutableNames: Set<String> = ["ChatGPT", "Codex"]
+
+    /// Classifies which application hosts a stdio app-server using read-only
+    /// kernel parent and executable-path reads. This never authorizes a
+    /// signal: official hosts still require the strict signed first-ACK
+    /// bootstrap. It only separates runtimes that could become managed from
+    /// runtimes hosted by other applications, which CodexSwitch must not
+    /// signal and must not wait for.
+    nonisolated static func desktopHostAncestry(
+        pid: Int32,
+        parentPID: (Int32) -> Int32? = { processParentPID($0) },
+        executablePath: (Int32) -> String? = { processExecutablePath($0) }
+    ) -> CodexDesktopHostAncestry {
+        var current = pid
+        var visited: Set<Int32> = [pid]
+        var firstAppName: String?
+        var firstProcessName: String?
+        for _ in 0..<maximumHostAncestryDepth {
+            guard let parent = parentPID(current) else { return .unknown }
+            if parent <= 1 {
+                return .foreignHost(firstAppName ?? firstProcessName ?? "launchd")
+            }
+            guard visited.insert(parent).inserted,
+                  let path = executablePath(parent) else {
+                return .unknown
+            }
+            if isOfficialDesktopHostExecutable(path) {
+                return .officialDesktopHost
+            }
+            if firstAppName == nil {
+                firstAppName = outermostAppBundleName(containing: path)
+            }
+            if firstProcessName == nil {
+                let name = URL(fileURLWithPath: path).lastPathComponent
+                firstProcessName = name.isEmpty ? nil : name
+            }
+            current = parent
+        }
+        return .unknown
+    }
+
+    nonisolated static func isOfficialDesktopHostExecutable(_ path: String) -> Bool {
+        guard let appPath = topLevelChatGPTAppPath(containing: path) else {
+            return false
+        }
+        return officialDesktopHostExecutableNames.contains {
+            path == "\(appPath)/Contents/MacOS/\($0)"
+        }
+    }
+
+    nonisolated static func outermostAppBundleName(containing path: String) -> String? {
+        guard let marker = path.range(of: ".app/") else { return nil }
+        let bundlePath = String(path[..<marker.lowerBound])
+        let name = URL(fileURLWithPath: bundlePath).lastPathComponent
+        return name.isEmpty ? nil : name
+    }
+
+    nonisolated static func topLevelChatGPTAppPath(containing executablePath: String) -> String? {
         let applicationsPrefix = "/Applications/"
         let contentsMarker = ".app/Contents/"
         guard executablePath.hasPrefix(applicationsPrefix),
@@ -153,7 +211,7 @@ enum CodexDesktopNativeChildCoordinator {
         return !result.timedOut && result.terminationStatus == 0
     }
 
-    private static func processParentPID(_ pid: Int32) -> Int32? {
+    nonisolated private static func processParentPID(_ pid: Int32) -> Int32? {
         var info = proc_bsdinfo()
         let size = MemoryLayout<proc_bsdinfo>.stride
         guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(size)) == size else {
@@ -162,7 +220,7 @@ enum CodexDesktopNativeChildCoordinator {
         return Int32(info.pbi_ppid)
     }
 
-    private static func processExecutablePath(_ pid: Int32) -> String? {
+    nonisolated private static func processExecutablePath(_ pid: Int32) -> String? {
         // PROC_PIDPATHINFO_MAXSIZE is not imported by every macOS SDK.
         var buffer = [CChar](repeating: 0, count: 4_096)
         let count = proc_pidpath(pid, &buffer, UInt32(buffer.count))

@@ -32,7 +32,13 @@ struct AccountHostOwnershipPresentationTests {
         #expect(manager.poolTargetAccount?.id == authority.id)
         #expect(manager.accounts.filter { manager.isPoolTarget($0) }.map(\.id)
             == [authority.id])
-        #expect(manager.sortedAccounts.first?.id == authority.id)
+        // The display leads with what the Mac draws from; the authority target
+        // is presented separately as the VPS target.
+        #expect(manager.sortedAccounts.first?.id == mac.id)
+        let display = manager.displayReadModel(at: now)
+        #expect(display.currentAccountId == mac.id)
+        #expect(display.poolTargetAccountId == authority.id)
+        #expect(display.poolTargetNote == "VPS target: authority-b@example.com")
         let convergence = manager.hostConvergencePresentation(
             forPoolTarget: authority,
             now: now
@@ -64,7 +70,11 @@ struct AccountHostOwnershipPresentationTests {
         #expect(manager.activeAccountReadModel(at: now).providerAccountId
             == authority.accountId)
         #expect(manager.logicalActiveAccount(at: now)?.id == authority.id)
-        #expect(manager.sortedAccounts.first?.id == authority.id)
+        // Contradictory local flags fail closed: no current account and no
+        // promotion, rather than guessing one of them.
+        #expect(manager.macCommittedAccount == nil)
+        #expect(manager.displayReadModel(at: now).currentIsAmbiguous)
+        #expect(manager.sortedAccounts.first?.id == firstLocal.id)
         #expect(manager.accounts.filter { manager.isPoolTarget($0, at: now) }.map(\.id)
             == [authority.id])
 
@@ -255,6 +265,108 @@ struct AccountHostOwnershipPresentationTests {
             mac: .converged,
             vps: .converged
         ))
+    }
+
+    @Test("After a committed swap the exhausted previous account is never shown as current")
+    func committedCredentialsDriveCurrentDisplay() throws {
+        // Production 2026-09-27 17:57: auth.json committed to 07 while the
+        // activation stayed CommittedDegraded and the VPS authority
+        // observation went stale for ~9h.
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let now = observedAt.addingTimeInterval(9 * 3_600 + 60)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        var exhausted = makeAccount(email: "shopszn17@example.com")
+        exhausted.quotaSnapshot = quotaSnapshot()
+        let committed = makeAccount(email: "brendondelgado07@example.com", active: true)
+        manager.accounts = [exhausted, committed]
+        manager.publishActivationState(.committedDegraded(
+            targetAccountId: committed.id,
+            detail: .runtimeAcknowledgementIncomplete,
+            activationGeneration: UUID(),
+            retryAttempt: 3,
+            nextRetryAt: now.addingTimeInterval(300),
+            discoveredRuntimeCount: 2,
+            acknowledgedRuntimeCount: 1,
+            at: now
+        ))
+        manager.publishPoolAuthorityObservation(try PoolAuthorityObservation(
+            epoch: 41,
+            phase: .degraded,
+            desiredProviderAccountId: exhausted.accountId,
+            requestId: "12121212-1212-4121-8121-121212121212",
+            reason: "automatic",
+            observedAt: observedAt,
+            updatedAt: observedAt,
+            previousProviderAccountId: nil,
+            detail: nil
+        ))
+        manager.publishUnmanagedRuntimeWarnings([CodexUnmanagedRuntime(
+            pid: 81_444,
+            startSeconds: 1_799_990_000,
+            startMicroseconds: 0,
+            host: "T3 Code (Alpha)",
+            command: "codex app-server"
+        )])
+
+        let display = manager.displayReadModel(at: now)
+        #expect(display.currentAccountId == committed.id)
+        #expect(display.macRuntime == .restartRequired)
+        #expect(display.poolTargetAccountId == exhausted.id)
+        #expect(display.poolTargetFreshness == .stale)
+        #expect(display.poolTargetNote == "VPS target: shopszn17@example.com (stale 9h)")
+        #expect(manager.sortedAccounts.first?.id == committed.id)
+        #expect(StatusBarController.currentScopeLabel(for: display)
+            == "Current: brendondelgado07@example.com; Mac runtime restart required; "
+            + "VPS target: shopszn17@example.com (stale 9h); 1 unmanaged runtime needs restart")
+        #expect(PopoverContentView.syncNotices(for: display) == [
+            "VPS target: shopszn17@example.com (stale 9h)",
+            "Unmanaged Codex runtime pid 81444 (T3 Code (Alpha): codex app-server) "
+                + "is still using the previous account — restart it to switch",
+        ])
+        let convergence = PopoverContentView.hostConvergence(
+            for: display,
+            poolTargetPresentation: nil
+        )
+        #expect(convergence == AccountHostConvergencePresentation(mac: .degraded, vps: .degraded))
+    }
+
+    @Test("A fresh pool target matching the committed account adds no VPS notice")
+    func matchingFreshTargetHasNoSeparateNotice() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let target = makeAccount(email: "target@example.com", active: true)
+        manager.accounts = [target]
+        manager.publishActivationState(confirmedState(for: target.id, at: now))
+        manager.linuxDevboxStatus = readyStatus(
+            activeEmail: target.email,
+            providerAccountId: target.accountId
+        )
+        try publishAuthority(manager: manager, target: target, previous: target, now: now)
+
+        let display = manager.displayReadModel(at: now)
+        #expect(display.currentAccountId == target.id)
+        #expect(display.macRuntime == .confirmed)
+        #expect(!display.showsPoolTargetSeparately)
+        #expect(display.poolTargetNote == nil)
+        #expect(PopoverContentView.syncNotices(for: display).isEmpty)
+        #expect(StatusBarController.currentScopeLabel(for: display)
+            == "Current: target@example.com")
+    }
+
+    @Test("A matching but unverified pool target is flagged, and no authority is explicit")
+    func unverifiedOrMissingAuthorityIsExplicit() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let target = makeAccount(email: "target@example.com", active: true)
+        manager.accounts = [target]
+        #expect(manager.displayReadModel(at: now).poolTargetNote == "VPS target unavailable")
+        #expect(manager.displayReadModel(at: now).currentAccountId == target.id)
+
+        // Fresh observation, but VPS readiness is not verified (for example a
+        // persistent credential-sync hold).
+        try publishAuthority(manager: manager, target: target, previous: target, now: now)
+        #expect(manager.displayReadModel(at: now).poolTargetNote
+            == "VPS target: target@example.com (VPS not verified)")
     }
 
     @Test("Stale or disconnected VPS evidence never remains current")

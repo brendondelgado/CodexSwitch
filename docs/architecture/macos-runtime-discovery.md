@@ -8,6 +8,7 @@ toc:
   - Race Handling
   - Reload Binding
   - Official Desktop Native Child
+  - Unmanaged Runtimes
   - Artifact Validation
   - Signal Authorization
   - Status Observation
@@ -30,7 +31,7 @@ cross_dependencies:
 version_control:
   branch: main
   status: canonical
-  last_updated: 2026-09-27
+  last_updated: 2026-09-28
 ---
 
 # macOS Runtime Discovery
@@ -221,6 +222,54 @@ The native-child contract is:
    initialize, full-token login, account verification, retained-writer, SIGHUP,
    ACK, and post-ACK verification transaction; neither may provide a signal-only
    shortcut for the managed bridge.
+
+## Unmanaged Runtimes
+
+Discovery classifies a stdio `codex app-server` as
+`official-desktop-stdio-child` only when its kernel parent chain (bounded
+`proc_pidinfo` and `proc_pidpath` reads, at most 16 ancestors) reaches the main
+executable of a top-level `/Applications/*.app` ChatGPT (or legacy Codex)
+bundle. When the chain is readable and ends at launchd without such a host, the
+process is an unmanaged runtime: typically an app-server that an IDE, T3 Code,
+or a terminal spawned from the prepared launcher. When the chain cannot be read
+completely, the classification stays strict and the process remains an
+official-child target, preserving the previous fail-closed behavior.
+
+Unmanaged runtimes follow these rules:
+
+1. They are never signalled. No request is written for them and no bootstrap is
+   attempted, because first-ACK bootstrap requires the official ChatGPT
+   ancestry that they cannot prove.
+2. They are neither reload targets nor typed blockers. They do not reduce the
+   acknowledged count, make a discovery snapshot incomplete, or appear in
+   runtime evidence. Activation confirms once every managed target
+   acknowledges, and read-only readiness treats them the same way.
+3. They are reported separately. The menu-bar app lists every unmanaged runtime
+   whose process start time precedes the last `~/.codex/auth.json` write,
+   including its PID, hosting application, and a shortened command. The warning
+   reads "restart it to switch" because such a process has not loaded the
+   committed credentials. Unmanaged runtimes started after that write read the
+   committed file at startup and produce no warning. The observation is
+   read-only and refreshed at most every 30 seconds, plus after every
+   convergence attempt.
+
+Rationale: before this rule, one foreign-hosted app-server (production PID
+81444, 2026-09-27) was classified as an official child, failed bootstrap on
+every attempt, and kept activation `CommittedDegraded` for about nine hours
+with 106 identical automatic retries. During that time automatic swaps,
+runtime-evidence renewal, and desktop readiness were all blocked, even though
+the ChatGPT desktop runtime had already acknowledged the new account. The
+signal-safety rule is unchanged: an unverifiable process is still never
+signalled. The only change is that a runtime CodexSwitch cannot manage no
+longer holds convergence hostage. The operator sees an explicit restart
+warning, so the old account is never silently presented as switched.
+
+Automatic same-target retries that fail with an identical outcome signature
+(divergence detail, runtime counts, and blocker set) for the same activation
+generation are spaced out in memory. The spacing doubles from ten minutes up to
+one hour, on top of the journal's capped five-minute cadence. A different
+outcome, a new activation generation, a confirmed runtime, an explicit
+operator retry, or an app relaunch restores the journal cadence.
 
 ## Artifact Validation
 

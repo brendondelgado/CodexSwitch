@@ -71,7 +71,8 @@ struct PopoverUXTests {
             contentsOfFile: "Sources/CodexSwitch/Views/PopoverContentView.swift",
             encoding: .utf8
         )
-        #expect(source?.contains("Text(Self.poolTargetLabel(") == true)
+        #expect(source?.contains("Text(Self.currentAccountLabel)") == true)
+        #expect(source?.contains("manager.displayReadModel(at: now)") == true)
         #expect(source?.contains("Self.macConvergenceLabel") == true)
         #expect(source?.contains("Self.vpsConvergenceLabel") == true)
     }

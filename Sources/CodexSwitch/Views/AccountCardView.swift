@@ -3,8 +3,10 @@ import SwiftUI
 
 struct AccountCardView: View {
     let account: CodexAccount
+    /// True for the account whose credentials are committed on the Mac.
     var isConfigured: Bool = false
-    var poolTargetFreshness: ActiveAccountAuthorityFreshness = .current
+    /// True when this non-current account is the VPS pool target.
+    var isVPSTarget: Bool = false
     var pollingError: String? = nil
     var rateLimitResetPresentation: RateLimitResetInventoryPresentation? = nil
     var rateLimitResetCoordinatorAuthorization: RateLimitResetCoordinatorAuthorization = .authorized
@@ -23,21 +25,9 @@ struct AccountCardView: View {
     }
 
     private static let activeGreen = Color(red: 0.15, green: 0.68, blue: 0.25)
-    static let poolTargetLabel = "Pool Target"
+    static let currentLabel = "Current"
+    static let vpsTargetLabel = "VPS Target"
     static let switchPoolTargetLabel = "Switch pool target to this account"
-
-    static func poolTargetLabel(
-        for freshness: ActiveAccountAuthorityFreshness
-    ) -> String {
-        switch freshness {
-        case .current:
-            return poolTargetLabel
-        case .stale:
-            return poolTargetLabel
-        case .unavailable:
-            return "Pool Target unavailable"
-        }
-    }
 
     private var poolTargetAccent: Color {
         Self.activeGreen
@@ -130,7 +120,8 @@ struct AccountCardView: View {
             return "\(QuotaWindowDisplay.label(for: exhausted)) exhausted"
         }
         if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 20 }) { return "Low quota" }
-        return isConfigured ? Self.poolTargetLabel(for: poolTargetFreshness) : "Idle"
+        if isConfigured { return Self.currentLabel }
+        return isVPSTarget ? Self.vpsTargetLabel : "Idle"
     }
 
     /// Higher contrast styles for the pool target card.
@@ -443,7 +434,7 @@ struct AccountCardView: View {
             return "Reauthenticate this account"
         }
         if isConfigured {
-            return "This account is the pool target"
+            return "This account is current on this Mac"
         }
         return Self.switchPoolTargetLabel
     }
@@ -526,12 +517,14 @@ struct AccountCardView: View {
 
 
             if isConfigured {
-                Label(
-                    Self.poolTargetLabel(for: poolTargetFreshness),
-                    systemImage: "scope"
-                )
+                Label(Self.currentLabel, systemImage: "checkmark.circle.fill")
                     .font(.system(size: 8.5, weight: .semibold))
                     .foregroundStyle(poolTargetAccent)
+                    .lineLimit(1)
+            } else if isVPSTarget {
+                Label(Self.vpsTargetLabel, systemImage: "server.rack")
+                    .font(.system(size: 8.5, weight: .semibold))
+                    .foregroundStyle(.orange)
                     .lineLimit(1)
             }
 

@@ -208,6 +208,67 @@ struct LinuxDevboxReadinessTaskContext: Equatable, Sendable {
     }
 }
 
+/// Spacing for SSH-backed historical-receipt recovery of one unresolved
+/// credential-sync operation. The hold itself is surfaced from the local
+/// journal without SSH; only the remote recovery probe is spaced out, from one
+/// minute doubling to thirty minutes, so a deterministic failure (for example
+/// a VPS CLI without `credential-import-status`) is not retried over SSH every
+/// authority poll forever.
+struct LinuxDevboxCredentialReconciliationBackoff: Equatable, Sendable {
+    static let baseDelay: TimeInterval = 60
+    static let maximumDelay: TimeInterval = 30 * 60
+
+    private(set) var operationID: String?
+    private(set) var failureCount = 0
+    private(set) var nextAttemptAt: Date?
+
+    func permitsAttempt(operationID: String, at date: Date) -> Bool {
+        guard self.operationID == operationID, let nextAttemptAt else { return true }
+        return date >= nextAttemptAt
+    }
+
+    mutating func recordUnresolved(operationID: String, at date: Date) {
+        if self.operationID != operationID {
+            self.operationID = operationID
+            failureCount = 0
+        }
+        failureCount = min(failureCount + 1, 32)
+        let delay = min(
+            Self.baseDelay * pow(2, Double(min(failureCount - 1, 16))),
+            Self.maximumDelay
+        )
+        nextAttemptAt = date.addingTimeInterval(delay)
+    }
+
+    mutating func reset() {
+        self = LinuxDevboxCredentialReconciliationBackoff()
+    }
+}
+
+/// The credential-sync hold most recently surfaced as the VPS status.
+///
+/// A persisted hold is re-surfaced by every authority poll, readiness check,
+/// and historical-receipt reconciliation (several times per minute) while it
+/// stays unresolved, and its human-readable reason alternates between those
+/// sources. Only a different hold (a new unresolved operation fingerprint) or a
+/// status that changed since the hold was surfaced is a semantic change that
+/// must discard an in-flight readiness check; re-surfacing the same hold only
+/// refreshes the displayed summary.
+struct LinuxDevboxSurfacedCredentialSyncHold: Equatable, Sendable {
+    let fingerprint: String
+    let publishedStatus: LinuxDevboxStatus
+
+    static func resurfaceIsUnchanged(
+        lastSurfaced: LinuxDevboxSurfacedCredentialSyncHold?,
+        currentStatus: LinuxDevboxStatus,
+        fingerprint: String
+    ) -> Bool {
+        guard let lastSurfaced else { return false }
+        return lastSurfaced.fingerprint == fingerprint
+            && lastSurfaced.publishedStatus == currentStatus
+    }
+}
+
 struct LinuxDevboxReadiness: Codable, Equatable, Sendable {
     let ready: Bool
     let summary: String
