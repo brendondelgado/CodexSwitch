@@ -443,6 +443,11 @@ fn discover_codex_processes_platform(include_app_server: bool) -> Result<Vec<Cod
             continue;
         }
         let Some(process) = read_linux_process_identity(pid) else {
+            if linux_unreadable_process_claims_codex(pid, current_uid, include_app_server) {
+                bail!(
+                    "live Codex process {pid} could not be fully identified; runtime discovery is incomplete"
+                );
+            }
             continue;
         };
         if process.owner_uid != current_uid {
@@ -454,6 +459,31 @@ fn discover_codex_processes_platform(include_app_server: bool) -> Result<Vec<Cod
         processes.push(process);
     }
     Ok(processes)
+}
+
+/// A same-user process whose command line claims a Codex runtime but whose
+/// executable or start identity cannot be read must not silently drop out of
+/// discovery: on Linux an empty result is proof that no runtime still holds
+/// older credentials. Unrelated processes with hidden executables (`sd-pam`)
+/// and processes that exit mid-scan are still skipped.
+#[cfg(target_os = "linux")]
+fn linux_unreadable_process_claims_codex(
+    pid: i32,
+    current_uid: u32,
+    include_app_server: bool,
+) -> bool {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let Ok(command_line) = read_cmdline(&proc_dir.join("cmdline")) else {
+        return false;
+    };
+    command_line_claims_codex_runtime(&command_line, include_app_server)
+        && fs::metadata(&proc_dir).is_ok_and(|metadata| metadata.uid() == current_uid)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn command_line_claims_codex_runtime(command_line: &str, include_app_server: bool) -> bool {
+    is_codex_cli_command_line(command_line)
+        || (include_app_server && is_codex_app_server_command_line(command_line))
 }
 
 #[cfg(target_os = "linux")]
@@ -4309,6 +4339,21 @@ unsafe fn libc_geteuid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_process_claims_only_codex_runtimes() {
+        let app_server = "/home/u/.local/share/codexswitch/current/patched-codex/codex -c features.code_mode_host=true app-server --listen unix://";
+        assert!(command_line_claims_codex_runtime(app_server, true));
+        assert!(!command_line_claims_codex_runtime("(sd-pam)", true));
+        assert!(!command_line_claims_codex_runtime(
+            "/usr/lib/systemd/systemd --user",
+            true
+        ));
+        assert!(!command_line_claims_codex_runtime(
+            "/home/u/.local/share/codexswitch/current/patched-codex/codex-code-mode-host",
+            true
+        ));
+    }
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
 

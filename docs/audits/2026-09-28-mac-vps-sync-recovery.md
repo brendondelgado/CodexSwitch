@@ -85,8 +85,9 @@ version_control:
   - The desktop app-server was stopped through `vps-codex-restart.py --stop-only`.
     ChatGPT on the Mac was quit so it would not respawn the server.
   - T3's app-server received one identity-checked SIGINT.
-  - `kittylitter.service` was stopped briefly because its app-server proxy has
-    held a shared runtime start/install lock since 2026-09-05.
+  - `kittylitter.service` was stopped briefly because its app-server proxy had
+    held a shared runtime start/install lock since 2026-09-05. It has since been
+    removed.
 - Mac:
   - macOS runtime artifacts from runs `36382686254` and `36392417071`;
   - app via `scripts/build-app.sh --install`, ad-hoc signed with
@@ -108,9 +109,23 @@ At 2026-09-28 07:55 UTC:
 
 ## Operational Findings
 
-- `kittylitter.service` keeps a shared hold on
+- `kittylitter.service` (the unused Alleycat bridge) kept a shared hold on
   `~/.local/share/codexswitch/runtime-start-install.lock` through a long-lived
-  `codex app-server proxy`. Every release activation must stop it briefly.
+  `codex app-server proxy`, blocking every release activation. It was removed on
+  2026-09-28, along with its npx cache, state and config, and its SSH key in
+  `authorized_keys`. The unit is backed up under
+  `~/.local/share/codexswitch/backups/removed-kittylitter-20260928`.
+- A Mac LaunchAgent `com.codexswitch.converge-f665-agent-20260728` ran
+  `codexswitch-cli swap brenchat7795` at every login. That was an automatic
+  account swap outside the coordinator. It was removed, together with a stale
+  doctor agent, a `codex-process-guard` agent that targeted a removed
+  `/Applications/Codex.app`, and `com.codexswitch.env`, which set
+  `CODEX_CLI_PATH` to a second launcher. The app is now the single owner of
+  `CODEX_CLI_PATH`.
+- On the VPS, about 22 GB of stale releases, staging caches, the old repository
+  copy in the install root, legacy build logs and old CLI binaries were deleted;
+  the disk went from 97% to 91%. On the Mac, stale state files, pid files, logs
+  and old backups were removed or archived.
 - Stale artifacts were archived to `~/Archive/CodexSwitch-scratch-20260928`, not
   deleted:
   - a July 30 desktop install journal in phase `validating`;
@@ -122,6 +137,9 @@ At 2026-09-28 07:55 UTC:
 
 ## Remaining Risk
 
+- Deliberately kept: the legacy `~/.local/share/codexswitch/patched-codex` build
+  (the SIGNUL `signul-launch-lane` script hard-codes it), the clodex bridge
+  (owner decision), and the Mac runtime rollback copy `swap-repair-20260927`.
 - Two hosts can still refresh the same chain inside one convergence round. The
   loser recovers within ~5 min when the newer generation arrives.
 - The VPS `hotswap-ack` directory scan exceeded its 250 ms budget once, under
