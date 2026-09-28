@@ -1248,7 +1248,8 @@ enum LinuxDevboxMonitor {
             if let bank = account.rateLimitResetBank {
                 updateHash(&hasher, String(bank.availableCount))
                 updateHash(&hasher, String(bank.totalEarnedCount))
-                updateHash(&hasher, fingerprintDate(bank.fetchedAt))
+                // Inventory observation time is not semantic: it advances on
+                // every ~30 s refresh and would defeat the unchanged-pool check.
                 for credit in bank.credits.sorted(by: { $0.id < $1.id }) {
                     updateHash(&hasher, credit.id)
                     updateHash(&hasher, credit.status)
