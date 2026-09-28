@@ -1,6 +1,6 @@
 ---
 title: Remote macOS runtime build
-description: Operator procedure for producing a provenance-locked CodexSwitch macOS arm64 runtime artifact with GitHub Actions.
+description: Operator procedure for producing provenance-locked CodexSwitch macOS arm64 runtime and app artifacts with GitHub Actions.
 toc:
   - Remote macOS Runtime Build
   - Purpose
@@ -10,17 +10,25 @@ toc:
   - Dispatch
   - Verify The Run
   - Download And Inspect
+  - App-Only Artifact
+  - Dispatch The App Build
+  - Verify The App Build
+  - Download And Install The App
   - Failure Handling
 cross_dependencies:
   - ../../.github/workflows/build-fork.yml
+  - ../../.github/workflows/build-macos-app.yml
   - ../../Tests/Fixtures/BuildFork/patch_codex_source.rs
+  - ../../scripts/build-app.sh
+  - ../../scripts/install-macos-app-artifact.sh
+  - ../../scripts/test_macos_app_artifact.py
   - ../architecture/macos-runtime-artifact.md
   - ../architecture/macos-cli-launcher.md
   - ../architecture/runtime-and-host-ownership.md
 version_control:
   branch: main
   status: operational
-  last_updated: 2026-07-13
+  last_updated: 2026-07-14
 ---
 
 # Remote macOS Runtime Build
@@ -81,6 +89,51 @@ CARGO_INCREMENTAL=0
 The Codex runtime build names both packages in one Cargo invocation:
 `codex-cli` and `codex-code-mode-host`. The ephemeral checkout and build targets
 are not uploaded.
+
+GitHub Actions uses two independent, repository-scoped Cargo caches:
+
+- A broad download-only cache may restore the Cargo registry index, registry
+  archives, and git database across source revisions. It never contains a Cargo
+  target directory. Restore and save failures are non-fatal, and a failed build
+  may still seed this cache because it contains downloads rather than compiled
+  release output.
+- An exact-only upstream target cache may restore `UPSTREAM_TARGET_DIR` only
+  when its complete v2 key matches. The key binds the runner architecture,
+  effective upstream Rust and Cargo versions, macOS and Xcode versions, SDK
+  version and path, Clang version, target triple, upstream SHA, patched-source
+  SHA-256, CodexSwitch SHA, build epoch, release profile, job count, codegen-unit
+  count, LTO setting, and incremental setting. It has no fallback restore key.
+  The control-plane target remains uncached.
+
+After patching and hashing the exact upstream source, the workflow normalizes
+every tracked upstream file mtime to `SOURCE_DATE_EPOCH` without following
+symlinks. This makes Cargo's mtime-based freshness inputs stable for one exact
+cache identity; it does not mean Cargo broadly revalidates every cached object
+against source content. Never broaden the compiled-target key or add fallback
+restore keys while mtime normalization is active.
+
+The workflow can create the exact upstream target cache only after source and
+binary validation, manifest verification, attestation, artifact upload, and
+build-evidence recording have all succeeded, and only when the exact key missed.
+It then removes the ephemeral target. A failed build can never seed compiled
+output. Cache transport failures remain non-fatal and do not change the exact
+four-member artifact contract.
+
+GitHub Actions caches are immutable optimization state, not signed provenance
+or verified build evidence. An actor able to write a repository-scoped cache is
+inside this cache's trust boundary, and the release validators do not turn a
+restored target into a cryptographically source-authenticated build. For a
+strict clean-room rebuild, bump or disable the target-cache namespace and accept
+a cold compile. The cache remains on GitHub infrastructure; no target directory
+is downloaded to or retained on the Mac.
+
+If the v3 patch adds a direct dependency to an upstream member crate, the patch
+driver updates that member's `Cargo.lock` entry in canonical sorted order before
+the workflow calculates the source-patch digest. The driver also reconciles
+source-local `0.0.0` lockfile placeholders with the release version declared in
+the root `[workspace.package]` table. It does not rewrite sourced packages or
+non-placeholder local versions. The runtime compile remains `--locked`; a
+lockfile that would change during compilation is a release failure.
 
 ## Resolve Provenance
 
@@ -154,7 +207,11 @@ The run must prove all of the following before upload:
    commit
    and build epoch, matches `codexSwitchBuildVersion`, and its help exposes both
    `activate-macos-runtime-artifact` and `install-prepared-codex` without
-   invoking either command.
+   invoking either command. Its hidden, read-only `macos-runtime-contract`
+   command must also return the exact artifact format, activation-journal
+   format, target, architecture, and command list as JSON. Do not substitute a
+   `strings` scan for this executable contract report; release optimization may
+   encode compared literals without preserving them as contiguous strings.
 10. `manifest.json` matches `codexswitch-macos-runtime-artifact-v1`, including
    the exact upstream commit, source-patch SHA-256, file names, byte lengths,
    and file SHA-256 values.
@@ -219,6 +276,113 @@ Do not merge binaries from different runs. Do not add notes, archives, checksum
 sidecars, or logs to this directory. The manifest is the only metadata member
 allowed by the canonical format.
 
+## App-Only Artifact
+
+Use the separate `Build macOS App Artifact` workflow when the menu-bar app must
+be updated without rebuilding or mixing it into the three-executable runtime
+set. The app workflow accepts only one input: the full CodexSwitch commit SHA
+selected by the dispatch ref. It requires `refs/heads/main`, a clean exact
+checkout, and a native arm64 `macos-15` runner.
+
+The workflow first runs the complete Swift suite with `--jobs 1 --no-parallel`
+in a private temporary directory. It then calls `scripts/build-app.sh` without
+`--install` using these deterministic values:
+
+```text
+CODEXSWITCH_BUILD_CONFIGURATION=release
+CODEXSWITCH_SWIFTPM_JOBS=1
+CODEXSWITCH_SOURCE_REVISION=<full dispatched commit>
+CODEXSWITCH_BUILD_NUMBER=<commit epoch>
+CODEXSWITCH_VERSION=1.0.0
+CODEXSWITCH_CODESIGN_IDENTITY=-
+```
+
+The resulting app is validated before packaging and after a fresh ZIP
+round-trip. `ditto` packages the bundle without resource forks, extended
+attributes, quarantine, or ACL metadata. The workflow uploads exactly
+`CodexSwitch.app.zip` and `manifest.json` as a dedicated artifact; it attests
+both members first and never uploads `.build`, `build`, test output, or runtime
+executables.
+
+## Dispatch The App Build
+
+Resolve and review the exact clean main commit:
+
+```bash
+DISPATCH_REF=main
+CODEXSWITCH_SHA="$(git rev-parse "${DISPATCH_REF}^{commit}")"
+test "${#CODEXSWITCH_SHA}" -eq 40
+test -z "$(git status --porcelain --untracked-files=normal)"
+```
+
+Dispatch the app-only workflow at that same ref:
+
+```bash
+gh workflow run build-macos-app.yml \
+  --ref "$DISPATCH_REF" \
+  -f codexswitch_git_sha="$CODEXSWITCH_SHA"
+```
+
+Moving branch tips do not silently change the selected source: the job requires
+the dispatch SHA, checked-out `HEAD`, and requested SHA to be identical before
+tests or compilation.
+
+## Verify The App Build
+
+The completed run must prove:
+
+1. The dispatch ref is `refs/heads/main`, and checkout SHA equals the requested
+   full SHA with no tracked or untracked changes.
+2. The runner is native arm64 and the serialized Swift suite passed before the
+   release app build began.
+3. `CFBundleSourceRevision` is the full SHA, `CFBundleVersion` is the commit
+   epoch, `CFBundleShortVersionString` is `1.0.0`, and the bundle identifier and
+   executable are canonical.
+4. The executable is a nonempty thin arm64 Mach-O within its size bound.
+5. Strict deep code-signature verification succeeds and reports an ad-hoc
+   signature.
+6. Bundled `patch-asar.py` exactly matches the dispatched source, and its hash
+   and the executable hash match the manifest.
+7. The executable contains none of `LINUX_DEVBOX_ACTIVE_PUSH`,
+   `pendingLinuxDevboxActive`, or `pushLinuxDevboxActiveAccount`.
+8. ZIP preflight accepts only bounded, relative, non-link entries under
+   `CodexSwitch.app`, and all bundle checks pass after extraction into a fresh
+   directory.
+9. The source checkout is clean at the exact SHA after build output has been
+   removed.
+10. Pinned official actions attest both exact members before the separate
+    artifact is uploaded.
+
+## Download And Install The App
+
+Locate and download the app-only artifact into an empty directory:
+
+```bash
+gh run list --workflow build-macos-app.yml --event workflow_dispatch
+gh run view <run-id>
+gh run download <run-id> --name <artifact-name> --dir <empty-directory>
+```
+
+The download directory must contain exactly:
+
+```text
+CodexSwitch.app.zip
+manifest.json
+```
+
+From a clean local `main` checkout at the manifest's exact commit, run:
+
+```bash
+scripts/install-macos-app-artifact.sh <empty-directory>
+```
+
+The installer snapshots and attests both members, validates the strict manifest
+and archive bounds, safely extracts the ZIP, and repeats the complete bundle
+contract before it creates an `/Applications` staging directory or asks the
+running app to quit. It never recompiles or re-signs the bundle. Replacement is
+transactional: validation or launch failure restores and relaunches the prior
+app, while a preactivation failure leaves the installed app unchanged.
+
 ## Failure Handling
 
 A provenance mismatch, changed upstream patch anchor, Cargo failure, missing
@@ -231,3 +395,11 @@ not authorize activation by itself. The workflow never executes
 `activate-macos-runtime-artifact` or `install-prepared-codex`; it uses only
 their `--help` paths to prove that the control plane exposes guarded activation
 and recovery commands.
+
+For the app-only path, a plist mismatch, non-arm64 executable, invalid
+signature, patcher drift, removed-code marker, unsafe ZIP entry, manifest
+mismatch, source-tree drift, or attestation failure likewise stops before
+upload or activation. Do not re-sign, edit, or repack a failed download. Build
+a new artifact from the corrected exact commit. If post-swap app validation or
+launch fails, retain the installer error and any reported recovery path; do not
+delete a preserved rollback directory by hand.

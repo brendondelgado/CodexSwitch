@@ -176,6 +176,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastCodexBrowserSessionRepairCheck: Date?
     private var lastLinuxDevboxAccountRefreshByKey: [String: Date] = [:]
     private var linuxDevboxCredentialSyncInFlight = false
+    private var linuxDevboxReauthInFlight = false
+    private var lastLinuxDevboxReauthAttempt: Date?
+    private var lastLinuxDevboxReauthAccountID: UUID?
     private var linuxDevboxCredentialSyncReconciliationInFlight = false
     private var pendingLinuxDevboxCredentialSyncFingerprint: String?
     private var lastLinuxDevboxCredentialSyncAttemptAt: Date?
@@ -1899,7 +1902,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
              "auth-json-token-import",
              "auth-json-sync",
              "load-restore",
-             "reauth-account",
              "reauth-added-different-account",
              "subscription-info",
              "reset-consumed",
@@ -4595,6 +4597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                             queueTelemetryPersistence(context: "reauth-account-validation")
                         }
                         startPollingForAccount(accountId)
+                        queueLinuxDevboxReauthentication(accountId)
                         refreshSubscriptionInfoIfNeeded(force: true)
                         statusBarController.updateIcon()
                         updatePopoverContent()
@@ -4677,6 +4680,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     // MARK: - Popover
+
+    private func queueLinuxDevboxReauthentication(_ accountId: UUID) {
+        guard LinuxDevboxMonitor.settings().isConfigured,
+              let account = accountManager.accounts.first(where: { $0.id == accountId }) else { return }
+        var queue = UserDefaults.standard.dictionary(forKey: LinuxDevboxReauthentication.queueKey) as? [String: String] ?? [:]
+        queue[accountId.uuidString] = LinuxDevboxReauthentication.fingerprint(account)
+        UserDefaults.standard.set(queue, forKey: LinuxDevboxReauthentication.queueKey)
+        deliverPendingLinuxDevboxReauthentication(force: true)
+    }
+
+    private func deliverPendingLinuxDevboxReauthentication(force: Bool = false) {
+        let settings = LinuxDevboxMonitor.settings()
+        guard !isExiting, settings.isConfigured, !linuxDevboxReauthInFlight,
+              !linuxDevboxCredentialSyncInFlight else { return }
+        if !force, let lastLinuxDevboxReauthAttempt,
+           Date().timeIntervalSince(lastLinuxDevboxReauthAttempt) < 60 { return }
+        var queue = UserDefaults.standard.dictionary(forKey: LinuxDevboxReauthentication.queueKey) as? [String: String] ?? [:]
+        let eligible = accountManager.accounts.filter {
+            queue[$0.id.uuidString] != nil && $0.hasCompleteRuntimeCredentials
+        }
+        guard !eligible.isEmpty else { return }
+        let previousIndex = eligible.firstIndex(where: { $0.id == lastLinuxDevboxReauthAccountID })
+        let account = eligible[previousIndex.map { ($0 + 1) % eligible.count } ?? 0]
+        let fingerprint = LinuxDevboxReauthentication.fingerprint(account)
+        queue[account.id.uuidString] = fingerprint
+        UserDefaults.standard.set(queue, forKey: LinuxDevboxReauthentication.queueKey)
+        linuxDevboxReauthInFlight = true
+        lastLinuxDevboxReauthAccountID = account.id
+        lastLinuxDevboxReauthAttempt = Date()
+        Task { @MainActor [weak self] in
+            let success = await Task.detached {
+                LinuxDevboxReauthentication.deliver(account, settings: settings)
+            }.value
+            guard let self else { return }
+            self.linuxDevboxReauthInFlight = false
+            var pending = UserDefaults.standard.dictionary(forKey: LinuxDevboxReauthentication.queueKey) as? [String: String] ?? [:]
+            if success, pending[account.id.uuidString] == fingerprint {
+                pending = LinuxDevboxReauthentication.acknowledge(
+                    pending, accountID: account.id.uuidString, fingerprint: fingerprint
+                )
+                UserDefaults.standard.set(pending, forKey: LinuxDevboxReauthentication.queueKey)
+                if self.accountManager.activationNotice == LinuxDevboxReauthentication.pendingNotice {
+                    self.accountManager.publishActivationNotice(nil)
+                }
+                SwapLog.append(.debug("LINUX_DEVBOX_REAUTH_VERIFIED account=\(account.id)"))
+            } else if !success {
+                self.accountManager.publishActivationNotice(
+                    LinuxDevboxReauthentication.pendingNotice
+                )
+                SwapLog.append(.debug("LINUX_DEVBOX_REAUTH_PENDING account=\(account.id)"))
+            }
+            self.updatePopoverContent()
+        }
+    }
 
     private func updatePopoverContent(forceRefresh: Bool = false) {
         publishRateLimitResetPresentations()
@@ -5093,6 +5150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func checkLinuxDevboxReadiness(force: Bool = false) {
+        deliverPendingLinuxDevboxReauthentication()
         let settings = LinuxDevboxMonitor.settings()
         guard settings.isConfigured else {
             lastLinuxDevboxReady = nil

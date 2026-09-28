@@ -9,21 +9,29 @@ toc:
   - Representation State Machine
   - Historical Access
   - Metrics
+  - Review Admission
   - Authorization Boundary
 cross_dependencies:
   - docs/plans/2026-07-12-runtime-storage-hardening.md
   - docs/runbooks/runtime-storage-hardening-deployment.md
-  - crates/codexswitch-cli/src/storage.rs
+  - crates/codexswitch-cli/src/runtime_storage.rs
   - patches/codex/0.144.1-runtime-storage-hardening.patch
 version_control:
   branch: main
   base_commit: 664edf6201fcd7dcdc299084392e3dad510ec9d7
   status: local_uncommitted
+  last_updated: 2026-07-17
 operator_boundary:
   status: OPERATOR_DIRECTIVE_ACTIVE
   sha256: 4416348576c92302dc3836955482bd6fd86c62b2aa9b66e5c7228b0161fc14fd
   lines: 58
   bytes: 2724
+review_contracts:
+  acceptance_json_sha256: 5deb0dead45e1dd5aebe3acff98655ef759d9df2dc1174a4576ad80aec0074c7
+  acceptance_md_sha256: 81ab0911c1c74790348bab768e05f8dde69e19b4abfc066b13071f23636baea7
+  adversarial_md_sha256: 91a91c98afac3965e533fd1e869ee5467c53222db0794d777c5f54e4fbc3d2fb
+  admission_json_sha256: ef6035dea4d11f762f0fb836b83ff80f246e85e70a4ff75cf6f04c6b073bb13c
+  admission_md_sha256: b7cd7da5dd6b3345c691124317af0f9ef307d7a87db1f82d35da853de6bc1d98
 ---
 
 # Permanent Session Retention Contract
@@ -156,6 +164,24 @@ Record exact before/after and rate metrics:
 - grace-window population and eviction eligibility;
 - local residency days and projected days to disk floor;
 - crash recovery, idempotent retry, lease contention, and catalog generation conflicts.
+
+## Review Admission
+
+This repository can qualify only for `ACCEPT_LOCAL_DISABLED_IMPLEMENTATION` while the legacy-descriptor boundary remains open. A process that opened a rollout with `O_APPEND` before participating in the patched lease protocol cannot be universally fenced by this patch alone. A successful synthetic review therefore does not authorize activation.
+
+Every mutator remains off by default. Any future activation requires exact global quiescence of every process that may hold a rollout descriptor, replacement with the reviewed patched binary, fresh mechanical evidence that no legacy descriptor survives, and separate operator authority. Missing, empty, malformed, unknown, case-variant, or conflicting activation values mean off.
+
+The frozen pre-freeze findings are part of the subject:
+
+- F1 postimage verification: `e5a33bd34afabbb4b12c79a90c99ad009f959e1665de90c13124a83030973d22` JSON; `c6092d269049857bacff3a5396cfb5a32b738996751a1d2c0cc297b51c8a5bee` Markdown.
+- F2 bundle-move crash recovery: `dfc9a3a61c638c0ce58c5d641ed12accf4b95b2c29e67e58c1d49a26aa041c6f`; `5735c6c4648afbecb412226536ede8f258d1ce3c0025ae07056a34bd9e457c0f`.
+- F3 equal-generation CAS: `9c112b3fe39af6c37b516e92fb9cf368a371930c49385931a60e5b8f2b0df710`; `0c5da906c8a1f2ac8881121f3e29edc255a519e505861fec8001fb95947c6380`.
+- F4 restore lifecycle: `09884ac202575731ad597d9fbdefbd0e7bc60ce3510f86e47943269e6ff32c74`; `ece50568092ea62531aa889c7fa5f6b944d27c18e02f456ebc34fd9aba54e00b`.
+- F5 path/open identity: `74a2ee187da779d3e8b77ed70235e6154b32846d8511eb0b3be17eaa1d255cc4`; `50e7b27ff370c026cca0f7a5e4ebc19ab14e2d104b6ef00e8aae642ee06e992e`. The default-off clarification audit is `3594010984ad5c24efcaf61d1d06dfdca8c0f67628dc07d2b5897ebde50508d0`.
+- F6 diagnostic completeness: `29afe6a0500072b6ec59b36b240e8db6460feeb5789169f3045e34978c3351d0`; `f37e458e8c69b5be43eb35eadfed0bdb1f56df0413bb64b6e158a750f88649cc`.
+- F7 observe-only log maintenance: static-audit SHA-256 `33216242f50f9b0939fe4cd39d358f40e9cbd01390d83ea7ea2325a7573983b8`; addendum SHA-256 `c8a271b14ced6c2516fe1075d20722c4e137d824af164177cf29801502345948`.
+
+The exact fourteen-row review-input denominator is SHA-256 `2ad1c4ddbc55593ee8ceacf74130e3168aee1c31cf302760bc2e19de6f63c546`. The pre-freeze gap audit SHA-256 `f6e34d0da0594f0ff4777ab7ec8c86aa52f043486f45b3f5a6f1d24f793383c7` remains the refusal baseline until the terminal subject, postimage denominator, and named nonzero tests are frozen. Every finding must map to immutable code and tests or remain explicitly incomplete.
 
 ## Authorization Boundary
 

@@ -225,9 +225,10 @@ digests are recorded in `release-manifest.tsv` and rechecked before activation
 or any separately requested post-commit start.
 
 The app-server unit executes the immutable runtime through `current` with
-`features.local_thread_store_compression=true`. The feature is admitted only
-for a lease-capable runtime; active writers retain their lease, and only
-inactive stable rollouts enter bounded lossless compression.
+`local_thread_store_compression` absent/off. The capability marker proves read
+and lease compatibility only; it does not activate a mutator. Future activation
+requires exact global quiescence, patched-binary replacement, fresh proof that
+no legacy append descriptor survives, and separate operator authority.
 
 ## Runtime Convergence Contract
 

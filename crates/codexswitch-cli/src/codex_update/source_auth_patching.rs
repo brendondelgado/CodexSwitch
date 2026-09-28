@@ -74,7 +74,7 @@ use std::sync::atomic::Ordering;"#,
     }
 
 "#,
-        "pub fn codexswitch_provider_account_id(&self)",
+        ".and_then(AuthDotJson::codexswitch_provider_account_id)",
     )?;
     patch_file_before(
         path,
@@ -244,7 +244,7 @@ use std::sync::atomic::Ordering;"#,
             .then(|| account_id.to_string())
     }
 "#,
-        "pub fn codexswitch_provider_account_id(&self)",
+        "self.tokens.as_ref()?.account_id.as_deref()?",
     )?;
     patch_file_after(
         path,
@@ -256,19 +256,6 @@ use std::sync::atomic::Ordering;"#,
         "self.auth_generation.fetch_add",
     )?;
     Ok(())
-}
-
-fn patch_workspace_dependency_if_present(path: &Path, dependency: &str) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let declaration = format!("{dependency} = {{ workspace = true }}");
-    patch_file_after(
-        path,
-        "[dependencies]",
-        &format!("\n{declaration}"),
-        &declaration,
-    )
 }
 
 fn patch_auth_generation_none_initializers(path: &Path) -> Result<()> {

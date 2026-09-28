@@ -11,6 +11,7 @@ mod quota;
 mod rate_limit_resets;
 mod readiness;
 mod reload;
+mod runtime_storage;
 mod secure_drop;
 mod secure_file;
 mod token_refresh;
@@ -83,6 +84,11 @@ enum Command {
         offline_file_only: bool,
     },
     Status,
+    #[command(name = "storage", visible_alias = "runtime-storage")]
+    RuntimeStorage {
+        #[command(subcommand)]
+        command: runtime_storage::RuntimeStorageCommand,
+    },
     Files {
         #[command(subcommand)]
         command: secure_drop::FilesCommand,
@@ -123,6 +129,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(name = "macos-runtime-contract", hide = true)]
+    MacOsRuntimeContract,
     InstallPreparedCodex {
         #[arg(long)]
         json: bool,
@@ -213,6 +221,7 @@ fn main() -> Result<()> {
             "Updated",
         ),
         Command::Status => status(&store_path),
+        Command::RuntimeStorage { command } => runtime_storage::run(command),
         Command::Files { command } => secure_drop::run(command),
         Command::AuthDiagnostics { json } => auth_diagnostics(&store_path, &auth_path, json),
         Command::CodexUpdateStatus { json } => codex_update_status(json),
@@ -228,6 +237,7 @@ fn main() -> Result<()> {
         Command::ActivateMacOsRuntimeArtifact { directory, json } => {
             activate_macos_runtime_artifact(&directory, json)
         }
+        Command::MacOsRuntimeContract => macos_runtime_contract(),
         Command::InstallPreparedCodex { json } => install_prepared_codex(json),
         Command::AutoInstallCodexUpdate { json } => auto_install_codex_update(json),
         Command::Swap { account } => swap(&store_path, &auth_path, &account),
@@ -491,6 +501,14 @@ pub(crate) fn activate_macos_runtime_artifact(directory: &Path, json_output: boo
             println!("installed version: {version}");
         }
     }
+    Ok(())
+}
+
+pub(crate) fn macos_runtime_contract() -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&codex_update::macos_runtime_contract_report())?
+    );
     Ok(())
 }
 

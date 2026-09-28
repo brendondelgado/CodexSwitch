@@ -10,8 +10,6 @@ struct AccountCardHostOwnershipLabels: Equatable, Sendable {
 struct AccountCardView: View {
     let account: CodexAccount
     var isConfigured: Bool = false
-    var isRuntimeCurrent: Bool = false
-    var vpsRuntimePresentation: VPSRuntimeAccountPresentation = .disconnected
     var pollingError: String? = nil
     var rateLimitResetPresentation: RateLimitResetInventoryPresentation? = nil
     let onReauthenticate: (() -> Void)?
@@ -19,6 +17,8 @@ struct AccountCardView: View {
     @State private var isHovering = false
 
     private static let activeGreen = Color(red: 0.15, green: 0.68, blue: 0.25)
+    static let poolTargetLabel = "Pool Target"
+    static let switchPoolTargetLabel = "Switch pool target to this account"
     private static let renewalFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.setLocalizedDateFormatFromTemplate("MMM d")
@@ -60,8 +60,7 @@ struct AccountCardView: View {
         if let weekly = snapshot.weekly, weekly.effectiveRemainingPercent < 20 { return .orange }
         if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 20 }) { return .orange }
         if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 50 }) { return .yellow }
-        if isRuntimeCurrent { return Self.activeGreen }
-        return isConfigured ? .orange : .gray.opacity(0.4)
+        return isConfigured ? Self.activeGreen : .gray.opacity(0.4)
     }
 
     private var statusDotLabel: String {
@@ -82,8 +81,7 @@ struct AccountCardView: View {
             return "\(QuotaWindowDisplay.label(for: exhausted)) exhausted"
         }
         if snapshot.windows.contains(where: { $0.effectiveRemainingPercent < 20 }) { return "Low quota" }
-        if isRuntimeCurrent { return "Mac Runtime Current" }
-        return isConfigured ? "Mac Configured" : "Idle"
+        return isConfigured ? Self.poolTargetLabel : "Idle"
     }
 
     static func vpsRuntimeLabel(_ presentation: VPSRuntimeAccountPresentation) -> String {
@@ -109,20 +107,12 @@ struct AccountCardView: View {
         )
     }
 
-    private var vpsRuntimeColor: Color {
-        switch vpsRuntimePresentation {
-        case .current: return .blue
-        case .notCurrent, .unknown: return .secondary
-        case .disconnected: return .orange
-        }
-    }
-
-    /// Higher contrast styles for the active card
+    /// Higher contrast styles for the pool target card.
     private var labelStyle: some ShapeStyle {
-        isRuntimeCurrent || isConfigured ? .primary : .secondary
+        isConfigured ? .primary : .secondary
     }
     private var sublabelStyle: some ShapeStyle {
-        isRuntimeCurrent || isConfigured ? .secondary : .tertiary
+        isConfigured ? .secondary : .tertiary
     }
 
     private var planLine: String {
@@ -271,7 +261,7 @@ struct AccountCardView: View {
             onReauthenticate()
             return true
         }
-        guard !isRuntimeCurrent, let onForceSwap else { return false }
+        guard !isConfigured, let onForceSwap else { return false }
         onForceSwap()
         return true
     }
@@ -300,7 +290,7 @@ struct AccountCardView: View {
                     Text(account.email)
                         .font(.system(
                             size: 11,
-                            weight: isRuntimeCurrent ? .bold : (isConfigured ? .semibold : .medium)
+                            weight: isConfigured ? .bold : .medium
                         ))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -319,33 +309,12 @@ struct AccountCardView: View {
                     .accessibilityLabel(statusDotLabel)
             }
 
-
-            VStack(alignment: .leading, spacing: 2) {
-                let ownership = Self.hostOwnershipLabels(
-                    isConfigured: isConfigured,
-                    isRuntimeCurrent: isRuntimeCurrent,
-                    vpsRuntimePresentation: vpsRuntimePresentation
-                )
-                Label(
-                    ownership.macConfigured,
-                    systemImage: "laptopcomputer"
-                )
-                .foregroundStyle(isConfigured ? .orange : .secondary)
-
-                Label(
-                    ownership.macRuntime,
-                    systemImage: "dot.radiowaves.left.and.right"
-                )
-                .foregroundStyle(isRuntimeCurrent ? Self.activeGreen : .secondary)
-
-                Label(
-                    ownership.vpsRuntime,
-                    systemImage: "server.rack"
-                )
-                .foregroundStyle(vpsRuntimeColor)
+            if isConfigured {
+                Label(Self.poolTargetLabel, systemImage: "scope")
+                    .font(.system(size: 8.5, weight: .semibold))
+                    .foregroundStyle(Self.activeGreen)
+                    .lineLimit(1)
             }
-            .font(.system(size: 8.5, weight: .medium))
-            .lineLimit(1)
 
             if let fiveHourPrimedLine {
                 HStack(spacing: 4) {
@@ -404,7 +373,7 @@ struct AccountCardView: View {
                             label: row.label,
                             percent: row.percent,
                             resetsAt: row.resetsAt,
-                            boostedContrast: isRuntimeCurrent
+                            boostedContrast: isConfigured
                         )
                     }
                 case .denied(let message, let rows):
@@ -418,7 +387,7 @@ struct AccountCardView: View {
                                 label: row.label,
                                 percent: snapshot.limitReached == true ? 0 : row.percent,
                                 resetsAt: row.resetsAt,
-                                boostedContrast: isRuntimeCurrent
+                                boostedContrast: isConfigured
                             )
                         }
                     }
@@ -464,7 +433,7 @@ struct AccountCardView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(
-                    isRuntimeCurrent ? Self.activeGreen : (isConfigured ? .orange : .clear),
+                    isConfigured ? Self.activeGreen : .clear,
                     lineWidth: 2.5
                 )
         )
@@ -475,9 +444,7 @@ struct AccountCardView: View {
             AccountCardHoverTrackingView(email: account.email, isHovering: $isHovering)
         }
         .shadow(
-            color: isRuntimeCurrent
-                ? Self.activeGreen.opacity(0.4)
-                : (isConfigured ? Color.orange.opacity(0.2) : .clear),
+            color: isConfigured ? Self.activeGreen.opacity(0.3) : .clear,
             radius: 5
         )
         .contentShape(RoundedRectangle(cornerRadius: 8))
@@ -495,8 +462,8 @@ struct AccountCardView: View {
                     onReauthenticate?()
                 }
             }
-            if !isRuntimeCurrent {
-                Button(isConfigured ? "Retry Mac runtime activation" : "Switch Mac to this account") {
+            if !isConfigured {
+                Button(Self.switchPoolTargetLabel) {
                     onForceSwap?()
                 }
             }

@@ -24,6 +24,20 @@ enum VPSRuntimeAccountPresentation: Equatable, Sendable {
     case disconnected
 }
 
+enum AccountHostConvergenceState: Equatable, Sendable {
+    case converged
+    case pending
+    case degraded
+    case unknown
+    case unavailable
+    case notConfigured
+}
+
+struct AccountHostConvergencePresentation: Equatable, Sendable {
+    let mac: AccountHostConvergenceState
+    let vps: AccountHostConvergenceState
+}
+
 @MainActor @Observable
 final class AccountManager {
     var accounts: [CodexAccount] = []
@@ -45,6 +59,10 @@ final class AccountManager {
 
     var configuredAccount: CodexAccount? {
         accounts.first(where: \.isActive)
+    }
+
+    func isConfigured(_ account: CodexAccount) -> Bool {
+        configuredAccount?.id == account.id
     }
 
     var runtimeCurrentAccount: CodexAccount? {
@@ -97,6 +115,60 @@ final class AccountManager {
         return account.accountId == currentProviderId
             ? .current
             : .notCurrent
+    }
+
+    func hostConvergencePresentation(
+        forPoolTarget account: CodexAccount,
+        now: Date = Date()
+    ) -> AccountHostConvergencePresentation {
+        guard isConfigured(account) else {
+            return AccountHostConvergencePresentation(
+                mac: .unknown,
+                vps: .unknown
+            )
+        }
+
+        let mac: AccountHostConvergenceState
+        if activationState?.runtimeIsCurrent(for: account.id, at: now) == true {
+            mac = .converged
+        } else if let activationState {
+            if activationState.configuredAccountId != nil,
+               activationState.configuredAccountId != account.id {
+                mac = .degraded
+            } else {
+                switch activationState.phase {
+                case .preparing:
+                    mac = .pending
+                case .committedDegraded, .manualReview, .confirmed:
+                    mac = .degraded
+                }
+            }
+        } else {
+            mac = .pending
+        }
+
+        let vps: AccountHostConvergenceState
+        switch linuxDevboxStatus.state {
+        case .notConfigured:
+            vps = .notConfigured
+        case .checking:
+            vps = .pending
+        case .notReady, .failed:
+            vps = .unavailable
+        case .ready:
+            switch vpsRuntimePresentation(for: account, now: now) {
+            case .current:
+                vps = .converged
+            case .notCurrent:
+                vps = .degraded
+            case .unknown:
+                vps = .unknown
+            case .disconnected:
+                vps = .unavailable
+            }
+        }
+
+        return AccountHostConvergencePresentation(mac: mac, vps: vps)
     }
 
     private static func boundedRemoteProviderAccountId(_ value: String?) -> String? {

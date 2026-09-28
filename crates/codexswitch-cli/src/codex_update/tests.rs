@@ -121,8 +121,6 @@ mod tests {
                 "--no-fork",
                 "/home/test/.codex/app-server-daemon/app-server.pid.lock",
                 "/home/test/.local/share/codexswitch/current/patched-codex/codex",
-                "-c",
-                "features.local_thread_store_compression=true",
                 "app-server",
                 "--remote-control",
                 "--listen",
@@ -3353,6 +3351,7 @@ impl AuthManager {
         .unwrap();
 
         patch_auth_manager_source(&manager).unwrap();
+        patch_auth_manager_source(&manager).unwrap();
 
         let patched = fs::read_to_string(manager).unwrap();
         assert!(patched.contains("use std::sync::atomic::AtomicU64;"));
@@ -3361,7 +3360,13 @@ impl AuthManager {
             .contains("auth_generation: AtomicU64::new(0),\n            auth_route_config: None,"));
         assert!(patched.contains("pub fn auth_generation(&self) -> u64"));
         assert!(patched.contains("pub fn codexswitch_auth_fingerprint(&self)"));
-        assert!(patched.contains("pub fn codexswitch_provider_account_id(&self)"));
+        assert_eq!(
+            patched
+                .matches("pub fn codexswitch_provider_account_id(&self)")
+                .count(),
+            2
+        );
+        assert!(patched.contains("self.tokens.as_ref()?.account_id.as_deref()?"));
         assert!(patched.contains("pub fn codexswitch_fingerprint(&self)"));
         assert!(patched.contains("fn codexswitch_read_auth_json_bounded("));
         assert!(patched.contains("libc::O_NOFOLLOW | libc::O_CLOEXEC"));
@@ -3516,6 +3521,96 @@ impl AuthManager {
                 "[dependencies]\nlibc = { workspace = true }\nserde = { workspace = true }"
             ));
         }
+    }
+
+    #[test]
+    fn source_patch_reconciles_placeholder_workspace_lock_versions_idempotently() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest = temp_dir.path().join("Cargo.toml");
+        let lockfile = temp_dir.path().join("Cargo.lock");
+        fs::write(
+            &manifest,
+            "[workspace]\nmembers = []\n\n[workspace.package]\nversion = \"0.144.4\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &lockfile,
+            r#"version = 4
+
+[[package]]
+name = "codex-app-server"
+version = "0.0.0"
+
+[[package]]
+name = "codex-login"
+version = "0.0.0"
+
+[[package]]
+name = "local-explicit-version"
+version = "7.8.9"
+
+[[package]]
+name = "registry-placeholder"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+"#,
+        )
+        .unwrap();
+
+        patch_placeholder_workspace_lock_versions_if_present(&manifest, &lockfile).unwrap();
+        patch_placeholder_workspace_lock_versions_if_present(&manifest, &lockfile).unwrap();
+
+        let patched = fs::read_to_string(lockfile).unwrap();
+        assert_eq!(patched.matches("version = \"0.144.4\"").count(), 2);
+        assert!(patched.contains("name = \"local-explicit-version\"\nversion = \"7.8.9\""));
+        assert!(patched.contains("name = \"registry-placeholder\"\nversion = \"0.0.0\"\nsource = "));
+    }
+
+    #[test]
+    fn source_patch_updates_injected_libc_lock_entries_idempotently() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile = temp_dir.path().join("Cargo.lock");
+        fs::write(
+            &lockfile,
+            r#"version = 4
+
+[[package]]
+name = "codex-app-server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "opentelemetry",
+]
+
+[[package]]
+name = "codex-login"
+version = "0.0.0"
+dependencies = [
+ "keyring",
+ "once_cell",
+]
+
+[[package]]
+name = "codex-mcp"
+version = "0.0.0"
+"#,
+        )
+        .unwrap();
+
+        for package in ["codex-app-server", "codex-login"] {
+            patch_lockfile_dependency_if_present(&lockfile, package, "libc").unwrap();
+            patch_lockfile_dependency_if_present(&lockfile, package, "libc").unwrap();
+        }
+
+        let patched = fs::read_to_string(lockfile).unwrap();
+        assert_eq!(patched.matches(" \"libc\",\n").count(), 2);
+        assert!(patched.contains(
+            "name = \"codex-app-server\"\nversion = \"0.0.0\"\ndependencies = [\n \"anyhow\",\n \"libc\",\n \"opentelemetry\",\n]"
+        ));
+        assert!(patched.contains(
+            "name = \"codex-login\"\nversion = \"0.0.0\"\ndependencies = [\n \"keyring\",\n \"libc\",\n \"once_cell\",\n]"
+        ));
     }
 
     #[test]

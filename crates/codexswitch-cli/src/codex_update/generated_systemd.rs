@@ -201,8 +201,6 @@ fn managed_systemd_owner_expectation() -> Result<SystemdOwnerExpectation> {
                 .join("current/patched-codex/codex")
                 .display()
                 .to_string(),
-            "-c".to_string(),
-            "features.local_thread_store_compression=true".to_string(),
             "app-server".to_string(),
             "--remote-control".to_string(),
             "--listen".to_string(),

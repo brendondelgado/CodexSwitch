@@ -359,7 +359,6 @@ observe_managed_systemd_owner() {
     /usr/bin/flock --exclusive --nonblock --no-fork \
     "$DAEMON_RESERVATION_GUARD" \
     "$CURRENT_LINK/patched-codex/codex" \
-    -c features.local_thread_store_compression=true \
     app-server --remote-control --listen ws://127.0.0.1:8390
 }
 

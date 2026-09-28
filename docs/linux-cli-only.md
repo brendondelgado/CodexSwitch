@@ -9,6 +9,8 @@ toc:
   - SecureDrop File Transfer
   - codex-vps Tunnel Stability
   - claude-vps Remote CLI Entry
+  - cmux Managed SSH And Image Uploads
+  - claude-vps Clodex Lane
   - signul ssh Terminal Stability
   - Implementation Plan
 cross_dependencies:
@@ -18,6 +20,10 @@ cross_dependencies:
   - scripts/securedrop/cs-autopush
   - scripts/codex-vps
   - scripts/claude-vps
+  - scripts/clodex-credential-helper.py
+  - scripts/patch-clodex-codexswitch.py
+  - scripts/configure-clodex-codexswitch.mjs
+  - scripts/install-clodex-vps.sh
   - scripts/signul
   - docs/runbooks/codex-vps-thread-tools-mcp.md
   - Sources/CodexSwitch/Services/SwapEngine.swift
@@ -31,7 +37,7 @@ cross_dependencies:
 version_control:
   branch: main
   commit: pending
-  last_updated: 2026-07-13
+  last_updated: 2026-08-26
 ---
 
 # Linux CLI-Only CodexSwitch
@@ -118,19 +124,99 @@ For this helper, avoid implicit Tailscale SSH browser-check fallback. Tailscale 
 
 ## claude-vps Remote CLI Entry
 
-The Mac-side `claude-vps` helper provides the same one-word VPS entrypoint for Claude Code that `codex-vps` provides for Codex. Plain `claude-vps` opens a persistent remote tmux session through CCS: it opens the protected VPS SSH lane, changes to `/home/signul/SIGNUL`, and launches `/usr/bin/ccs claude --continue` inside the managed `claude-vps` tmux session. This keeps CCS/CLIProxy account sharing in the model path while keeping the Claude Code process alive if the Mac sleeps, disconnects, or changes networks.
+The Mac-side `claude-vps` helper opens native Claude Code in a persistent VPS tmux session. It changes to `/home/signul/SIGNUL`, resolves the newest exact-title match for `backend agent`, and reconnects to its existing managed pane or launches `/home/signul/.local/bin/claude --resume <session-id>`. Use `ccs claude-vps` for the separate CCS lane. The preferred title is configurable with `CLAUDE_VPS_PREFERRED_SESSION_TITLE`; an empty value restores newest-file selection. A missing configured title fails closed. Session resolution happens on the VPS without copying history or session identifiers to the Mac.
 
-`--continue` is only a resume selector; it has no renderer-performance meaning. Plain `claude-vps` and `claude-vps --tmux` use the persistent tmux workflow; with no Claude arguments those modes add `--continue` so the latest `/home/signul/SIGNUL` conversation opens. Use `claude-vps --raw`, `claude-vps --terminal`, or `claude-vps --tui` only for deliberate direct-terminal debugging where renderer fidelity matters more than process persistence. Use `claude-vps --fullscreen` only to explicitly opt into Claude's fullscreen alternate-screen renderer.
+Live ownership uses Claude's VPS-local `~/.claude/sessions/<pid>.json` registration, validated against the process start ticks in `/proc`, because an in-process resume can change the thread without changing command-line arguments. A valid registration supersedes the original command-line session ID. Attaching an already-running managed owner is allowed even when another external owner exists, since attachment creates no writer. Multiple tmux owners remain ambiguous; an external-only owner still blocks a new resume.
 
-Use `claude-vps -yolo` when the persistent VPS session should launch Claude Code with `--dangerously-skip-permissions`. The `-yolo` flag is consumed by the Mac helper and forwarded through the tmux launch environment, so it keeps the persistent CCS-backed path instead of turning into a one-off raw terminal argument. `claude-vps --dangerously-skip-permissions` and `claude-vps --yolo` are accepted aliases for the same behavior. If a non-yolo `claude-vps` pane is already running, `-yolo` does not kill it implicitly; use `/exit` first or run `claude-vps --repair-scrollback -yolo` at a safe stopping point to recreate the managed pane with the yolo flag.
+Plain `claude-vps` and `claude-vps --tmux` use the persistent tmux workflow. Before attaching, the remote helper compares the selected preferred session with the exact session id owned by the live managed pane. A matching pane is attached unchanged. If a managed pane owns a different session, it is renamed under a timestamped `claude-vps-preserved-*` name rather than killed, and a fresh managed pane explicitly resumes the preferred session. If the preferred session is already owned by an unmanaged tmux or non-tmux process, the helper refuses to create a concurrent writer. `--continue` remains only a fallback when no repository session exists and no preferred title is configured.
 
-Remote Control is optional and not the default because it moves the UI to Claude web/mobile instead of the terminal TUI. Use `claude-vps --remote-control` only when that is intended; it launches `/usr/bin/ccs claude remote-control --name signul-vps --spawn=same-dir`. Remote Control can work with CCS shared-account routing, but CCS must not expose the proxy token through `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`; Claude Code treats those as API-key auth and may not activate Remote Control. The working contract is `ANTHROPIC_BASE_URL` pointed at the local CLIProxy path plus `ANTHROPIC_CUSTOM_HEADERS="Authorization: Bearer <ccs-token>"`, launched through the `remote-control` subcommand.
+Plain `claude-vps` honors Claude's persisted `/tui` mode and does not force `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. The VPS currently persists `tui: "fullscreen"`, so fullscreen remains active across managed pane creation and reconnection. Use `claude-vps --classic` or `claude-vps --native-scrollback` to explicitly force inline/native scrollback, and `claude-vps --fullscreen` to force fullscreen plus the no-flicker renderer. Use `claude-vps --raw`, `claude-vps --terminal`, or `claude-vps --tui` only for deliberate direct-terminal debugging where renderer fidelity matters more than process persistence.
 
-Like `codex-vps`, `claude-vps` must pass `ControlMaster=no`, `ControlPath=none`, and `ControlPersist=no` so interactive keystrokes do not share an old OpenSSH master connection. For the default `signul-vps` target, it should prefer Tailscale's userspace SSH transport with `ProxyCommand=/Applications/Tailscale.app/Contents/MacOS/Tailscale nc %h %p`, targeting `signul@signul-hostinger-kvm4`, because the normal OpenSSH host can still be affected by stale mux masters and other SSH traffic. The default remote host, repo, Claude launcher, launcher subcommand, Remote Control name, Remote Control spawn mode, and Tailscale target can be overridden with `CLAUDE_VPS_REMOTE_HOST`, `CLAUDE_VPS_REMOTE_REPO`, `CLAUDE_VPS_REMOTE_CLAUDE`, `CLAUDE_VPS_REMOTE_CLAUDE_SUBCOMMAND`, `CLAUDE_VPS_REMOTE_CONTROL_NAME`, `CLAUDE_VPS_REMOTE_CONTROL_SPAWN`, `CLAUDE_VPS_TAILSCALE_HOST`, and `CLAUDE_VPS_TAILSCALE_TARGET`; set `CLAUDE_VPS_REMOTE_CONTROL_DEFAULT=1` only to intentionally make web/mobile Remote Control the default, or set `CLAUDE_VPS_REMOTE_CLAUDE=/home/signul/.local/bin/claude` to intentionally bypass CCS and use native Claude. Set `CLAUDE_VPS_DISABLE_TAILSCALE_PROXY=1` to force the plain SSH host. Set `CLAUDE_VPS_DISABLE_TMUX=1` or use `claude-vps --raw` only for deliberate bare-terminal debugging; raw terminal sessions intentionally do not use the tmux auto-reconnect loop.
+Plain `claude-vps` launches the persistent VPS session with `--dangerously-skip-permissions` by explicit operator policy. `-yolo`, `--yolo`, and `--dangerously-skip-permissions` remain accepted aliases. Use `claude-vps --safe` or `claude-vps --ask-permissions` to opt back into normal permission prompts for a newly created pane. Changing the requested permission mode never kills a matching live pane implicitly; finish or exit that pane before recreating it when a mode change is required.
 
-`claude-vps` must also normalize the remote terminal contract before launching Claude Code. It should set `TERM=xterm-256color`, preserve truecolor via `COLORTERM=truecolor`, force full color depth with `FORCE_COLOR=3`, apply the local terminal size to the remote PTY with `stty rows <rows> cols <cols>` when available, and set `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` unless `--fullscreen` was explicitly requested. Claude Code is a terminal TUI; if it inherits a zero-sized PTY, a terminal type the remote runtime handles poorly, or an alternate-screen renderer that fights the outer terminal scrollback, redraws can repeat, wrap off-screen, drop chunks, and lose the anchored bottom statusline.
+Claude Code 2.1.219 and later recognize Claude Opus 5 as `claude-opus-5`, but CCS 8.8.1 shipped before that model was added to its static selector and its refreshed CLIProxy catalog can still omit it. Apply `scripts/patch-ccs-claude-model-catalog.py` on the VPS to add the exact model to both selector surfaces. The patch is pinned to the checked CCS version, validates its insertion anchor, installs atomically with backups, and is idempotent; it must refuse an unknown CCS version or source shape. CLIProxy v7.2.98 also lacks the Opus 5 provider-registry entry, so the selector-only patch is insufficient: `scripts/build-cliproxy-opus5.sh` builds a Linux amd64 binary from the exact upstream tag and models-file preimage with one additional `claude-opus-5` registry record. Install that binary only after zero-active-session verification, retain the prior binary as the executable rollback, restart the proxy, and require both `/v1/models` visibility and a real CCS-routed smoke request before claiming availability. These changes do not alter the default model, account pool, or routing policy. After both selector surfaces are verified, run `ccs claude --config` and select `Claude Opus 5` to persist the reconnect default in `~/.ccs/claude.settings.json`; otherwise an older explicit `ANTHROPIC_MODEL` pin can continue to force Opus 4.8 even though the catalog and proxy already advertise Opus 5.
 
-The managed remote tmux session is named `claude-vps` under `/home/signul/SIGNUL`; it keeps a large scrollback history, enables mouse scrolling, hides tmux's own status bar by default, and keeps tmux's alternate screen enabled. Mouse wheel events pass through to Claude Code's fullscreen renderer when Claude has mouse tracking active; forcing tmux copy-mode is an opt-in fallback via `CLAUDE_VPS_TMUX_FORCE_COPY_SCROLL=1`. If the managed `tmux` session still exists but all panes are dead after a Claude `/exit`, the helper respawns that dead pane with the same launch command instead of attaching to a `pane is dead` screen.
+## claude-vps Clodex Lane
+
+`claude-vps clodex` is the persistent VPS entrypoint for
+`@bman654/clodex`. It uses the same protected transport and session-ownership
+checks as `claude-vps`, but launches the pinned VPS-local Clodex binary in the
+separate `claude-vps-clodex` tmux session. Its default exact preferred title is
+`backend agent`; an explicitly empty
+`CLODEX_VPS_PREFERRED_SESSION_TITLE` selects the newest session regardless of
+title for `/home/signul/SIGNUL`.
+
+An active Claude Code background worker launched with `--fork-session` writes
+a real child history that may itself be the newest working thread. The child
+must remain the resume target rather than being silently replaced by its older
+parent. While the child background PTY is live it remains the sole writer and
+causes a fail-closed refusal. Changing backends requires an explicit,
+identity-verified stop of that exact worker at a safe restart point, followed
+by a fresh owner check and exact-session resume.
+
+The selected identity is exported in the pane's initial command so a cold tmux
+server cannot lose it and degrade to `--continue`. Post-creation tmux
+environment metadata is not an authority for which history was opened.
+
+The Clodex lane defaults to SSH so an early ownership or readiness refusal is
+printed instead of being hidden by a mosh startup teardown; set
+`CLODEX_VPS_TRANSPORT=mosh` to opt in. New Clodex panes default to
+`--dangerously-skip-permissions`, independently of the ordinary lane's
+environment override. `claude-vps clodex --safe` is the explicit opt-out.
+
+This is a composed CodexSwitch/CCS backend lane. Clodex proxy mode remains the
+outer selective gateway: selected Clodex models route to OpenAI, while
+ordinary Claude/Fable requests pass through to the loopback CCS endpoint.
+CCS then applies its current account order, affinity, retry, cooldown, and
+quota routing instead of allowing the request to bind to a single native
+Claude login. The wrapper labels the Clodex tmux session separately and fails
+closed if the pinned Clodex passthrough patch or CCS runtime-helper check is
+not ready.
+
+Clodex OpenAI authentication is a read-through view of the complete account
+that CodexSwitch has committed as active on the VPS. CodexSwitch remains the
+only account-selection and OAuth-refresh owner. The fixed
+`/home/signul/.local/bin/clodex-credential-helper` takes the shared
+CodexSwitch account-store lock, proves the active account and `auth.json`
+token sets match, and returns the credential only through the helper pipe.
+Clodex does not persist a second copy and its pinned runtime patch refuses to
+refresh, replace, or delete the managed credential. Each inference resolves
+the active account again so a later CodexSwitch hot swap is observed without
+restarting Clodex.
+
+For the Anthropic branch, the helper resolves only CCS's internal loopback API
+key into the VPS process environment; it never exposes a per-account
+Anthropic token. CLIProxy chooses the account per request. The default
+`CLODEX_VPS_ANTHROPIC_BACKEND=ccs` can be changed to `native` only as an
+explicit rollback/diagnostic mode for a newly created pane.
+
+Do not run Clodex's device-code login for this provider. Install and verify the
+pinned package, exact runtime patch, stable helper, and metadata-only provider
+configuration with `scripts/install-clodex-vps.sh`. The wrapper never copies
+tokens, provider metadata, or Claude session contents to the Mac. See
+`docs/architecture/clodex-codexswitch-credential-bridge.md` and
+`docs/runbooks/clodex-vps.md` for readiness, launch, rollback, and upgrade
+steps.
+
+Remote Control is optional and not the default because it moves the UI to Claude web/mobile instead of the terminal TUI. Use `claude-vps --remote-control` only when that is intended; the unprefixed command launches the native Claude binary. Use `ccs claude-vps --remote-control` only when shared-account routing is intentional. Remote Control can work with CCS shared-account routing, but CCS must not expose the proxy token through `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`; Claude Code treats those as API-key auth and may not activate Remote Control. The working contract is `ANTHROPIC_BASE_URL` pointed at the local CLIProxy path plus `ANTHROPIC_CUSTOM_HEADERS="Authorization: Bearer <ccs-token>"`, launched through the `remote-control` subcommand.
+
+Like `codex-vps`, `claude-vps` must pass `ControlMaster=no`, `ControlPath=none`, and `ControlPersist=no` so interactive keystrokes do not share an old OpenSSH master connection. The command contract is explicit: `claude-vps` launches `/home/signul/.local/bin/claude` with the VPS account's native Claude authentication, while `ccs claude-vps` launches `/usr/bin/ccs claude` through the CCS account pool. The two lanes use distinct managed tmux sessions (`claude-vps` and `claude-vps-ccs`) so invoking one command can never silently attach to the other backend. The Mac CCS wrapper is a narrow dispatcher: only the `claude-vps` and legacy `claude2` subcommands are intercepted, and every other argument is passed unchanged to the installed CCS CLI.
+
+Numbered native lanes use the short forms `claude-vps 2` and `claude-vps 3`. They map to tmux sessions `claude-vps-2` and `claude-vps-3`, default automatic continuation off, and therefore start fresh conversations without taking ownership of the primary lane's preferred thread. Repeating the same numbered command attaches to its existing numbered tmux session. An explicit `CLAUDE_VPS_AUTO_CONTINUE` override remains available for diagnostics, but concurrent-resume ownership checks still apply.
+
+## cmux Managed SSH And Image Uploads
+
+When `claude-vps` is invoked from a cmux terminal, it must use cmux's managed SSH workspace rather than spawning raw `mosh` directly. cmux's managed SSH connection owns the SCP upload lane used for dragged or pasted images and files; an ordinary mosh process nested in a cmux pane does not expose enough connection context for cmux to translate a local temporary path into a VPS path.
+
+The launcher first bootstraps or verifies the existing backend-specific VPS tmux session over its noninteractive management SSH lane. It then calls the bundled cmux CLI with `cmux ssh <host> --ssh-option RequestTTY=force -- tmux attach-session ...`. The forced PTY is required by tmux. This preserves the existing native, CCS, Clodex, and numbered tmux identities while making the visible outer connection cmux-managed and SCP-aware. Re-running a command selects an existing connected cmux workspace with the same managed-session title instead of creating a duplicate.
+
+This path uses the bundled CLI identified by `CMUX_BUNDLED_CLI_PATH` and is enabled automatically only when `CMUX_WORKSPACE_ID` is present. Set `CLAUDE_VPS_CMUX_MANAGED_SSH=0` to force the legacy inline SSH/mosh transport for diagnostics. Outside cmux, the existing transport selection is unchanged. cmux Remote tmux and `mosh-tmux` are optional newer capabilities, not prerequisites for image upload support in this launcher.
+
+For the default `signul-vps` target, the launcher should prefer Tailscale's userspace SSH transport with `ProxyCommand=/Applications/Tailscale.app/Contents/MacOS/Tailscale nc %h %p`, targeting `signul@signul-hostinger-kvm4`, because the normal OpenSSH host can still be affected by stale mux masters and other SSH traffic. The default remote host, repo, Claude launcher, launcher subcommand, Remote Control name, Remote Control spawn mode, and Tailscale target can be overridden with `CLAUDE_VPS_REMOTE_HOST`, `CLAUDE_VPS_REMOTE_REPO`, `CLAUDE_VPS_REMOTE_CLAUDE`, `CLAUDE_VPS_REMOTE_CLAUDE_SUBCOMMAND`, `CLAUDE_VPS_REMOTE_CONTROL_NAME`, `CLAUDE_VPS_REMOTE_CONTROL_SPAWN`, `CLAUDE_VPS_TAILSCALE_HOST`, and `CLAUDE_VPS_TAILSCALE_TARGET`; set `CLAUDE_VPS_REMOTE_CONTROL_DEFAULT=1` only to intentionally make web/mobile Remote Control the default. `CLAUDE_VPS_BACKEND_MODE=ccs` is the explicit low-level equivalent of the `ccs claude-vps` dispatcher and is not the default. Set `CLAUDE_VPS_DISABLE_TAILSCALE_PROXY=1` to force the plain SSH host. Set `CLAUDE_VPS_DISABLE_TMUX=1` or use `claude-vps --raw` only for deliberate bare-terminal debugging; raw terminal sessions intentionally do not use the tmux auto-reconnect loop.
+
+`claude-vps` must also normalize the remote terminal contract before launching Claude Code. It should set `TERM=xterm-256color`, preserve truecolor via `COLORTERM=truecolor`, force full color depth with `FORCE_COLOR=3`, apply the local terminal size to the remote PTY with `stty rows <rows> cols <cols>` when available, and leave `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` unset unless `--classic` was explicitly requested. Claude Code is a terminal TUI; if it inherits a zero-sized PTY, a terminal type the remote runtime handles poorly, or an alternate-screen override that disagrees with persisted `/tui` state, redraws can repeat, wrap off-screen, drop chunks, and lose the anchored bottom statusline.
+
+The native managed remote tmux session is named `claude-vps` and the CCS-routed session is named `claude-vps-ccs`, both under `/home/signul/SIGNUL`; each keeps a large scrollback history, enables mouse scrolling, hides tmux's own status bar by default, and keeps tmux's alternate screen enabled. Mouse wheel events pass through to Claude Code's fullscreen renderer when Claude has mouse tracking active; forcing tmux copy-mode is an opt-in fallback via `CLAUDE_VPS_TMUX_FORCE_COPY_SCROLL=1`. If a managed `tmux` session still exists but all panes are dead after a Claude `/exit`, the helper respawns that dead pane with the same backend-specific launch command instead of attaching to a `pane is dead` screen.
 
 To reduce redraw corruption during reconnects and scrollback, `claude-vps` should set tmux's session and window history limits before pane creation, detach stale clients on attach, enable focus/extended-key support, keep aggressive resize enabled for the managed window, and avoid `tmux pipe-pane` by default so the renderer is not shadowed by a terminal-frame transcript. Do not force Claude Code's fullscreen/no-flicker renderer by default; `CLAUDE_VPS_CLAUDE_CODE_NO_FLICKER=1` or `claude-vps --fullscreen` is an opt-in mode. Do not disable Claude Code virtual scroll by default; `CLAUDE_VPS_CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1` is an opt-in diagnostic for specific blank-region bugs, and it can remove useful in-app scrollback when combined with mouse passthrough. ANSI pane logging remains available with `CLAUDE_VPS_TMUX_LOG=1`, but `claude-vps-transcript` is the preferred reliable history path because it reads Claude's JSONL session store directly.
 
@@ -199,10 +285,10 @@ The checked-in persistent units enforce cgroup ceilings, not advisory watermarks
 alone. The maintenance daemon uses `MemoryMax=6G` and `MemorySwapMax=2G`; the
 session-bearing app-server uses `MemoryMax=14G`, `MemorySwapMax=2G`, and
 `MemoryLow=512M`. The app-server release must contain
-`codex-runtime-storage-leases-v1` and enables lease-aware local thread-store
-compression. Active sessions are never cleanup candidates; inactive stable
-rollouts move through bounded lossless hot retention, and over-budget state
-fails closed instead of deleting unarchived history.
+`codex-runtime-storage-leases-v1`, while every checked-in unit and installer
+observer leaves local thread-store compression absent/off. A future activation
+requires the separate quiescence and authorization contract; active sessions
+are never candidates, and over-budget state remains measurement-only.
 
 Codex updates must refresh both active VPS app-server lifecycles. The
 `signul-codex-app-server.service` WebSocket listener on `127.0.0.1:8390` serves

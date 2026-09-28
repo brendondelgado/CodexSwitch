@@ -13,10 +13,14 @@ toc:
   - VPS Contract
   - Remote Session Contract
   - Status And Repair
+  - Targeted Reauthentication Delivery
   - Update And Patch Contract
   - Storage Contract
   - Operational Proof
 cross_dependencies:
+  - ../../Sources/CodexSwitch/Services/LinuxDevboxReauthentication.swift
+  - ../../Tests/CodexSwitchTests/LinuxDevboxReauthenticationTests.swift
+  - ../../scripts/test_targeted_reauthentication.py
   - ../../Sources/CodexSwitch/Models/AccountActivationState.swift
   - ../../Sources/CodexSwitch/Models/AccountManager.swift
   - ../../Sources/CodexSwitch/Services/AccountImporter.swift
@@ -498,6 +502,28 @@ actor boundary on every supported Swift 6 toolchain.
 - Connection loss does not authorize app-server restart if health and ownership are unknown.
 
 ## Status And Repair
+
+### Targeted Reauthentication Delivery
+
+Successful Mac reauthentication of an existing provider identity queues a
+single-account VPS credential delivery independently of the legacy pool-export
+journal. The durable queue contains account UUIDs and credential fingerprints,
+never tokens. Retry on monitor ticks, including after app relaunch; remove a
+queue entry only after a matching remote acknowledgement for that generation.
+
+Deliver credentials over SSH stdin through an unlinked local private file.
+Never stage a bundle or passphrase remotely. Validate the candidate against the
+provider before mutation, then use the shared account-store lock and atomic,
+fsynced replacement. Match both email and provider identity. Preserve account
+order, unrelated records, remote active selection, auth.json, and live runtimes.
+An identical credential retry is idempotent. A newer remote credential wins.
+If the target is active remotely, defer to its activation owner instead of
+silently replacing live tokens. Unsupported identities, rejected credentials,
+and transport failures remain pending with a visible notice, not success.
+
+This removes stale whole-pool staging as a reauthentication dependency. It does
+not authorize clearing an unresolved pool journal when its baseline has drifted,
+or promise delivery during provider/network outages.
 
 Observational commands may read files, APIs, process metadata, health endpoints, and logs. They may not:
 

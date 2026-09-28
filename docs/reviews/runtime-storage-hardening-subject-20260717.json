@@ -1,0 +1,86 @@
+{
+  "schema": "codexswitch.runtime_storage_review_subject.v1",
+  "created_at": "2026-07-17",
+  "upstream_commit": "44918ea10c0f99151c6710411b4322c2f5c96bea",
+  "operator_boundary_sha256": "4416348576c92302dc3836955482bd6fd86c62b2aa9b66e5c7228b0161fc14fd",
+  "postimage_count": 31,
+  "authority": "local_disabled_review_only",
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "6ca5f4814eb75f5279613c9269361f22a9fff6d5fda1fc63f94192e46573a757"
+    },
+    {
+      "path": "crates/codexswitch-cli/Cargo.toml",
+      "sha256": "8691691ff8069210a8b31b0e8904df914a36a66d378ba65eccc2c3ae923d0ac3"
+    },
+    {
+      "path": "crates/codexswitch-cli/src/codex_update.rs",
+      "sha256": "27dfab2d888152aadd7bc3a3e617d5636cd0475ddb36a1c41d3bb282a8eb012f"
+    },
+    {
+      "path": "crates/codexswitch-cli/src/codex_update/generated_systemd.rs",
+      "sha256": "5eb8a5f7abf33868ec1abd96fb35587c29a756332a2d34e236be698203188f13"
+    },
+    {
+      "path": "crates/codexswitch-cli/src/codex_update/source_patching.rs",
+      "sha256": "dd15bcfb7a11717aea954c50ca77a0d082906bcab17ca2d5f663bb63322eaa25"
+    },
+    {
+      "path": "crates/codexswitch-cli/src/codex_update/source_runtime_storage_patching.rs",
+      "sha256": "c10a4693b98d233500d9f66cff5a3f6104b68c4222ee9ec4ccd2665ae0551fa4"
+    },
+    {
+      "path": "crates/codexswitch-cli/src/codex_update/tests.rs",
+      "sha256": "c6a2733a220de8d95e7bb6ddb869732a80a55670bd9628c99f2ffee6f24c2347"
+    },
+    {
+      "path": "crates/codexswitch-cli/src/main.rs",
+      "sha256": "145e2c67601df462d1bd2edaae618029c9ad46a7a87dbfe7be9b4a804327042b"
+    },
+    {
+      "path": "crates/codexswitch-cli/src/runtime_storage.rs",
+      "sha256": "405c7a4e1750be3e7ecd99bac9114b61359d115e3916d5a7583a254f3939f3ab"
+    },
+    {
+      "path": "crates/codexswitch-cli/systemd/signul-codex-app-server.service",
+      "sha256": "13f4379de5525ebbd4bf49d7dadc6d757804a74c13ef03ea8cbd9d76322f4a6c"
+    },
+    {
+      "path": "docs/architecture/session-retention-contract.md",
+      "sha256": "4e5033f1aa6a341bcbaf92055a0ef6fabd3ba9b57511245ff0af37d326f03139"
+    },
+    {
+      "path": "docs/linux-cli-only.md",
+      "sha256": "c1842ac51da7453c332fa809c9bc3af218b05e4fa4e1b7a1acf4cd52f62e3fad"
+    },
+    {
+      "path": "docs/plans/2026-07-12-runtime-storage-hardening.md",
+      "sha256": "421b63d414944472d1e0dd5053b864d8ae9aa4b258f76499810323e4ee1f93e2"
+    },
+    {
+      "path": "docs/runbooks/linux-repository-deployment.md",
+      "sha256": "e396ed10c0fd1ebe61ae506a9060198844f876b043badfc0faa23658ff3f17d4"
+    },
+    {
+      "path": "docs/runbooks/runtime-storage-hardening-deployment.md",
+      "sha256": "f12a006d0560cad3c99d381010d5fe6978ce8c0685bf79a03eb0adc220692f44"
+    },
+    {
+      "path": "patches/codex/0.144.1-runtime-storage-hardening.patch",
+      "sha256": "e632f5228cb897d157f435080664ac9e4efc0d488485b8c18e8a8d6134f5cabc"
+    },
+    {
+      "path": "scripts/lib/install-linux-common.sh",
+      "sha256": "41020fba91f7f176d58124ebc7fc96489750b83012872e9b699c6434bca43203"
+    },
+    {
+      "path": "scripts/manifests/linux-systemd-contract.tsv",
+      "sha256": "795e067f2f3d38eb3e35753d47173ec0f257f85570936f433e733f0bc50e52c3"
+    },
+    {
+      "path": "scripts/test_linux_resource_policy.py",
+      "sha256": "5a1494ffcef66bca24bd4b6f607f10f53ac86a2a23bc310d6ccc52790f0276aa"
+    }
+  ]
+}

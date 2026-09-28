@@ -11,6 +11,7 @@ toc:
   - CLI Update Storage Safety
   - Desktop Update Ownership
   - Account State Boundaries
+  - Reviewed Mac Selection Recovery
   - Menu App Process Boundaries
   - Quota Snapshot Validity
   - Runtime Blockers and Reauth
@@ -526,6 +527,34 @@ When the Mac menu app and VPS CLI disagree, compare safe evidence in this order:
 2. Live `wham/usage` primary and secondary windows for that token.
 3. `auth-diagnostics` active account and `auth.json` hash on the host that sent the request.
 4. The active Codex session's own `/status`, treating any "limits may be stale" warning as non-authoritative until rechecked.
+
+## Reviewed Mac Selection Recovery
+
+Before building an installed replacement, verify that the installed source
+commit is an ancestor of the checkout. The installer rejects missing, unknown,
+or divergent provenance before building or quitting the app. An intentional
+downgrade requires the reviewed `CODEXSWITCH_ALLOW_DOWNGRADE=1` override. Never
+assume the default checkout is the source of the running application.
+
+An `external_auth_conflict` journal can name an obsolete target while the durable
+store selects another account. Restarting correctly enters manual review and can
+clear the in-memory selection; this is not proof that the auth file is unusable.
+
+For an explicitly requested operator recovery, first prove a unique provider
+identity shared by the selected store record and `auth.json`, complete token
+claims, and a successful provider usage response. Preserve the auth file and all
+running Codex sessions. Quit only CodexSwitch, acquire the store, auth, and journal
+locks, and back up the original store and journal in a private local directory.
+Recheck exact source bytes before mutation. An ambiguous identity, older observed
+credential, changing source, or rejected provider response aborts recovery.
+
+Persist a manual-review barrier for the reviewed target before importing its
+newer observed token set into that one account record. Only after exact readback
+and unchanged auth evidence may the journal become `CommittedDegraded` for the
+same target, with no runtime-current identity or acknowledgement claims. Relaunch
+CodexSwitch and require its normal fresh runtime reconciliation. Do not delete
+the barrier, synthesize `Confirmed`, clear unrelated VPS holds, or modify other
+accounts. Report configured selection separately from runtime confirmation.
 
 ## Menu App Process Boundaries
 

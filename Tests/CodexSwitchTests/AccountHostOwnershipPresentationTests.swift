@@ -2,53 +2,90 @@ import Foundation
 import Testing
 @testable import CodexSwitch
 
-@Suite("Account host ownership presentation")
+@Suite("Pool target host convergence presentation")
 @MainActor
 struct AccountHostOwnershipPresentationTests {
-    @Test("Mac and VPS can report different runtime-current accounts")
-    func simultaneousHostOwnershipIsVisible() {
+    @Test("Host mismatches remain health details for one pool target")
+    func hostMismatchDoesNotCreateTwoPoolTargets() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let manager = AccountManager(userDefaults: isolatedDefaults())
-        let mac = makeAccount(email: "mac@example.com", active: true)
-        let vps = makeAccount(email: "vps@example.com")
-        manager.accounts = [mac, vps]
-        manager.publishActivationState(confirmedState(for: mac.id, at: now))
+        let target = makeAccount(email: "target@example.com", active: true)
+        let staleRuntime = makeAccount(email: "stale-runtime@example.com")
+        manager.accounts = [target, staleRuntime]
+        manager.publishActivationState(confirmedState(for: staleRuntime.id, at: now))
         manager.linuxDevboxStatus = readyStatus(
-            activeEmail: vps.email,
-            providerAccountId: vps.accountId
+            activeEmail: staleRuntime.email,
+            providerAccountId: staleRuntime.accountId
         )
         manager.applyLinuxDevboxAccountStates(
-            [remoteState(email: vps.email, providerAccountId: vps.accountId, active: true)],
+            [remoteState(
+                email: staleRuntime.email,
+                providerAccountId: staleRuntime.accountId,
+                active: true
+            )],
             observedAt: now
         )
 
-        #expect(manager.runtimeCurrentAccount?.id == mac.id)
-        #expect(manager.vpsRuntimePresentation(for: mac, now: now) == .notCurrent)
-        #expect(manager.vpsRuntimePresentation(for: vps, now: now) == .current)
-        let ownership = AccountCardView.hostOwnershipLabels(
-            isConfigured: true,
-            isRuntimeCurrent: true,
-            vpsRuntimePresentation: .notCurrent
+        #expect(manager.configuredAccount?.id == target.id)
+        #expect(manager.runtimeCurrentAccount?.id == staleRuntime.id)
+        #expect(manager.isConfigured(target))
+        #expect(!manager.isConfigured(staleRuntime))
+        #expect(manager.accounts.filter { manager.isConfigured($0) }.count == 1)
+        #expect(manager.vpsRuntimePresentation(for: staleRuntime, now: now) == .current)
+
+        let convergence = manager.hostConvergencePresentation(
+            forPoolTarget: target,
+            now: now
         )
-        #expect(ownership.macConfigured == "Mac Configured")
-        #expect(ownership.macRuntime == "Mac Runtime Current")
-        #expect(ownership.vpsRuntime == "VPS Not Current")
-        let vpsOwnership = AccountCardView.hostOwnershipLabels(
-            isConfigured: false,
-            isRuntimeCurrent: false,
-            vpsRuntimePresentation: .current
+        #expect(convergence.mac == .degraded)
+        #expect(convergence.vps == .degraded)
+        #expect(PopoverContentView.macConvergenceLabel(for: convergence.mac)
+            == "Mac convergence degraded")
+        #expect(PopoverContentView.vpsConvergenceLabel(for: convergence.vps)
+            == "VPS convergence degraded")
+    }
+
+    @Test("Matching host evidence converges the configured pool target")
+    func matchingHostEvidenceConvergesPoolTarget() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let manager = AccountManager(userDefaults: isolatedDefaults())
+        let target = makeAccount(email: "target@example.com", active: true)
+        manager.accounts = [target]
+        manager.publishActivationState(confirmedState(for: target.id, at: now))
+        manager.linuxDevboxStatus = readyStatus(
+            activeEmail: target.email,
+            providerAccountId: target.accountId
         )
-        #expect(vpsOwnership.macConfigured == "Mac Not Configured")
-        #expect(vpsOwnership.macRuntime == "Mac Runtime Not Current")
-        #expect(vpsOwnership.vpsRuntime == "VPS Runtime Current")
+        manager.applyLinuxDevboxAccountStates(
+            [remoteState(
+                email: target.email,
+                providerAccountId: target.accountId,
+                active: true
+            )],
+            observedAt: now
+        )
+
+        let convergence = manager.hostConvergencePresentation(
+            forPoolTarget: target,
+            now: now
+        )
+        #expect(convergence == AccountHostConvergencePresentation(
+            mac: .converged,
+            vps: .converged
+        ))
+        #expect(PopoverContentView.macConvergenceLabel(for: convergence.mac)
+            == "Mac converged")
+        #expect(PopoverContentView.vpsConvergenceLabel(for: convergence.vps)
+            == "VPS converged")
     }
 
     @Test("Stale or disconnected VPS evidence never remains current")
     func staleAndDisconnectedEvidenceFailClosed() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let manager = AccountManager(userDefaults: isolatedDefaults())
-        let account = makeAccount(email: "remote@example.com")
+        let account = makeAccount(email: "remote@example.com", active: true)
         manager.accounts = [account]
+        manager.publishActivationState(confirmedState(for: account.id, at: now))
         manager.linuxDevboxStatus = readyStatus(
             activeEmail: account.email,
             providerAccountId: account.accountId
@@ -64,21 +101,27 @@ struct AccountHostOwnershipPresentationTests {
             )
         )
 
-        #expect(manager.vpsRuntimePresentation(for: account, now: now) == .unknown)
+        #expect(manager.hostConvergencePresentation(
+            forPoolTarget: account,
+            now: now
+        ).vps == .unknown)
 
         manager.linuxDevboxStatus = LinuxDevboxStatus(
             state: .failed,
             summary: "unreachable",
             activeEmail: nil
         )
-        #expect(manager.vpsRuntimePresentation(for: account, now: now) == .disconnected)
+        #expect(manager.hostConvergencePresentation(
+            forPoolTarget: account,
+            now: now
+        ).vps == .unavailable)
     }
 
     @Test("Quota movement without explicit VPS active identity stays unknown")
     func quotaMovementDoesNotInferVPSOwnership() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let manager = AccountManager(userDefaults: isolatedDefaults())
-        let account = makeAccount(email: "quota@example.com")
+        let account = makeAccount(email: "quota@example.com", active: true)
         manager.accounts = [account]
         manager.linuxDevboxStatus = readyStatus(activeEmail: nil, providerAccountId: nil)
         manager.applyLinuxDevboxAccountStates(
@@ -86,14 +129,17 @@ struct AccountHostOwnershipPresentationTests {
             observedAt: now
         )
 
-        #expect(manager.vpsRuntimePresentation(for: account, now: now) == .unknown)
+        #expect(manager.hostConvergencePresentation(
+            forPoolTarget: account,
+            now: now
+        ).vps == .unknown)
     }
 
     @Test("Contradictory VPS status and account-state identity is unknown")
     func contradictoryRemoteIdentityFailsClosed() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let manager = AccountManager(userDefaults: isolatedDefaults())
-        let account = makeAccount(email: "state-active@example.com")
+        let account = makeAccount(email: "state-active@example.com", active: true)
         manager.accounts = [account]
         manager.linuxDevboxStatus = readyStatus(
             activeEmail: "status-active@example.com",
@@ -108,14 +154,17 @@ struct AccountHostOwnershipPresentationTests {
             observedAt: now
         )
 
-        #expect(manager.vpsRuntimePresentation(for: account, now: now) == .unknown)
+        #expect(manager.hostConvergencePresentation(
+            forPoolTarget: account,
+            now: now
+        ).vps == .unknown)
     }
 
     @Test("Missing VPS readiness identity cannot corroborate an active account state")
     func missingReadinessIdentityFailsClosed() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let manager = AccountManager(userDefaults: isolatedDefaults())
-        let account = makeAccount(email: "state-active@example.com")
+        let account = makeAccount(email: "state-active@example.com", active: true)
         manager.accounts = [account]
         manager.linuxDevboxStatus = readyStatus(activeEmail: nil, providerAccountId: nil)
         manager.applyLinuxDevboxAccountStates(
@@ -127,14 +176,17 @@ struct AccountHostOwnershipPresentationTests {
             observedAt: now
         )
 
-        #expect(manager.vpsRuntimePresentation(for: account, now: now) == .unknown)
+        #expect(manager.hostConvergencePresentation(
+            forPoolTarget: account,
+            now: now
+        ).vps == .unknown)
     }
 
     @Test("Readiness provider A plus account-state provider B remains unknown")
     func contradictoryProviderIdentityFailsClosed() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let manager = AccountManager(userDefaults: isolatedDefaults())
-        let account = makeAccount(email: "state-active@example.com")
+        let account = makeAccount(email: "state-active@example.com", active: true)
         manager.accounts = [account]
         manager.linuxDevboxStatus = readyStatus(
             activeEmail: account.email,
@@ -149,14 +201,17 @@ struct AccountHostOwnershipPresentationTests {
             observedAt: now
         )
 
-        #expect(manager.vpsRuntimePresentation(for: account, now: now) == .unknown)
+        #expect(manager.hostConvergencePresentation(
+            forPoolTarget: account,
+            now: now
+        ).vps == .unknown)
     }
 
     @Test("Duplicate display emails cannot identify a VPS runtime owner")
     func duplicateEmailsFailClosed() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let manager = AccountManager(userDefaults: isolatedDefaults())
-        let first = makeAccount(email: "duplicate@example.com")
+        let first = makeAccount(email: "duplicate@example.com", active: true)
         var second = makeAccount(email: "duplicate@example.com")
         second.accountId = "provider-duplicate-second"
         manager.accounts = [first, second]
@@ -173,8 +228,11 @@ struct AccountHostOwnershipPresentationTests {
             observedAt: now
         )
 
-        #expect(manager.vpsRuntimePresentation(for: first, now: now) == .unknown)
-        #expect(manager.vpsRuntimePresentation(for: second, now: now) == .unknown)
+        #expect(manager.hostConvergencePresentation(
+            forPoolTarget: first,
+            now: now
+        ).vps == .unknown)
+        #expect(!manager.isConfigured(second))
     }
 
     private func makeAccount(email: String, active: Bool = false) -> CodexAccount {

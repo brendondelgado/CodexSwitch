@@ -89,7 +89,7 @@ class LinuxDeploymentContractTests(unittest.TestCase):
             "/usr/bin/flock --exclusive --nonblock --no-fork "
             "%h/.codex/app-server-daemon/app-server.pid.lock "
             "%h/.local/share/codexswitch/current/patched-codex/codex "
-            "-c features.local_thread_store_compression=true app-server "
+            "app-server "
             "--remote-control --listen ws://127.0.0.1:8390",
             text,
         )
@@ -346,7 +346,7 @@ class LinuxDeploymentContractTests(unittest.TestCase):
         self.assertIn("100,000 files / 3,650 days / 64 GiB", text)
         self.assertIn("active lease", text)
         self.assertIn("fails closed", text)
-        self.assertIn("features.local_thread_store_compression=true", unit)
+        self.assertNotIn("local_thread_store_compression", unit)
         self.assertIn("not evidence of VPS deployment", text)
 
     def test_linux_setup_uses_only_immutable_full_sha_installer_flow(self):
@@ -1213,7 +1213,7 @@ PY
                   drifted-exec) active_state=inactive ;;
                   *) active_state="$observation" ;;
                 esac
-                exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $install_root/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork $runtime_storage_root/app-server-daemon/app-server.pid.lock $install_root/current/patched-codex/codex -c features.local_thread_store_compression=true app-server --remote-control --listen ws://127.0.0.1:8390 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+                exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $install_root/runtime-start-install.lock /usr/bin/flock --exclusive --nonblock --no-fork $runtime_storage_root/app-server-daemon/app-server.pid.lock $install_root/current/patched-codex/codex app-server --remote-control --listen ws://127.0.0.1:8390 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
                 if [ "$observation" = drifted-exec ]; then
                   exec_start="{ path=/usr/bin/flock ; argv[]=/usr/bin/flock --shared --no-fork $CODEXSWITCH_INSTALL_ROOT/other.lock $CODEXSWITCH_INSTALL_ROOT/current/patched-codex/codex app-server ; ignore_errors=no ; }"
                 fi

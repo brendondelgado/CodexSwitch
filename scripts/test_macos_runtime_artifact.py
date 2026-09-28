@@ -13,6 +13,10 @@ WORKFLOW = ROOT / ".github/workflows/build-fork.yml"
 INSTALLER = ROOT / "scripts/install-macos-cli-artifact.sh"
 BUILD_RS = ROOT / "crates/codexswitch-cli/build.rs"
 ACTIVATION = ROOT / "crates/codexswitch-cli/src/codex_update/macos_activation.rs"
+SOURCE_PATCHING = ROOT / "crates/codexswitch-cli/src/codex_update/source_patching.rs"
+SOURCE_CARGO_PATCHING = (
+    ROOT / "crates/codexswitch-cli/src/codex_update/source_cargo_patching.rs"
+)
 VERIFIER = ROOT / "scripts/verify_macos_runtime_artifact.py"
 
 
@@ -94,6 +98,166 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         )
         self.assertIn('rm -rf -- .build "$test_tmp"', swift_gate)
 
+    def test_workflow_keeps_download_cache_free_of_compiled_targets(self) -> None:
+        workflow = WORKFLOW.read_text()
+        restore = workflow.index("Restore remote Cargo downloads")
+        restore_end = workflow.index("Verify the Swift app and test suite", restore)
+        save = workflow.index("Save remote Cargo downloads")
+        restore_block = workflow[restore:restore_end]
+        save_block = workflow[save:]
+
+        self.assertIn(
+            "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+            restore_block,
+        )
+        self.assertIn(
+            "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+            save_block,
+        )
+        for block in (restore_block, save_block):
+            self.assertIn("~/.cargo/registry/index/", block)
+            self.assertIn("~/.cargo/registry/cache/", block)
+            self.assertIn("~/.cargo/git/db/", block)
+            self.assertNotIn("codexswitch-target", block)
+            self.assertNotIn("codex-target", block)
+            self.assertIn("continue-on-error: true", block)
+        self.assertIn("restore-keys:", restore_block)
+        self.assertIn("macos-runtime-downloads-v2-", restore_block)
+        self.assertIn(
+            "if: ${{ always() && steps.cargo_download_cache.outputs.cache-hit != 'true' }}",
+            save_block,
+        )
+
+    def test_workflow_normalizes_mtimes_before_exact_target_restore(self) -> None:
+        workflow = WORKFLOW.read_text()
+        patches = workflow.index("Apply the dispatched v3 source patches")
+        normalize = workflow.index("Normalize patched upstream source mtimes")
+        abi = workflow.index("Derive exact upstream target cache ABI")
+        restore = workflow.index("Restore exact upstream Cargo target cache")
+        build = workflow.index("Build the patched Codex runtime pair")
+
+        self.assertLess(patches, normalize)
+        self.assertLess(normalize, abi)
+        self.assertLess(abi, restore)
+        self.assertLess(restore, build)
+
+        normalize_block = workflow[normalize:abi]
+        self.assertIn(
+            'date -u -r "$SOURCE_DATE_EPOCH"',
+            normalize_block,
+        )
+        self.assertIn("export TZ=UTC", normalize_block)
+        self.assertIn(
+            "git ls-files -z | xargs -0 touch -h -t",
+            normalize_block,
+        )
+        self.assertIn("EXPECTED_PATCH_SHA256", normalize_block)
+        self.assertIn("mtime normalization changed the patched-source identity", normalize_block)
+
+        restore_block = workflow[restore:build]
+        target_key = (
+            "macos-runtime-target-v2-${{ runner.arch }}-"
+            "${{ steps.target_cache_abi.outputs.sha256 }}-"
+            "${{ steps.upstream.outputs.sha }}-"
+            "${{ steps.patches.outputs.sha256 }}-"
+            "${{ steps.provenance.outputs.source_sha }}"
+        )
+        self.assertIn("${{ runner.temp }}/codex-target/", restore_block)
+        self.assertIn(target_key, restore_block)
+        self.assertNotIn("restore-keys:", restore_block)
+        self.assertIn("continue-on-error: true", restore_block)
+
+    def test_workflow_target_cache_abi_binds_effective_build_inputs(self) -> None:
+        workflow = WORKFLOW.read_text()
+        abi = workflow.index("Derive exact upstream target cache ABI")
+        restore = workflow.index("Restore exact upstream Cargo target cache")
+        abi_block = workflow[abi:restore]
+
+        self.assertIn(
+            "working-directory: ${{ runner.temp }}/codex-upstream/codex-rs",
+            abi_block,
+        )
+        self.assertIn(
+            "PATCH_SHA256: ${{ steps.patches.outputs.sha256 }}",
+            abi_block,
+        )
+        self.assertIn(
+            "UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}",
+            abi_block,
+        )
+        for command in (
+            "rustc -Vv",
+            "cargo -V",
+            "sw_vers",
+            "xcodebuild -version",
+            "xcrun --sdk macosx --show-sdk-version",
+            "xcrun --sdk macosx --show-sdk-path",
+            "xcrun clang --version",
+        ):
+            self.assertIn(command, abi_block)
+        for value in (
+            "TARGET_TRIPLE",
+            "UPSTREAM_SHA",
+            "PATCH_SHA256",
+            "CODEXSWITCH_SOURCE_SHA",
+            "SOURCE_DATE_EPOCH",
+            "--locked --release --target",
+            "CARGO_BUILD_JOBS",
+            "CARGO_PROFILE_RELEASE_LTO",
+            "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+            "CARGO_INCREMENTAL",
+        ):
+            self.assertIn(value, abi_block)
+        self.assertIn('shasum -a 256 "$abi_input"', abi_block)
+
+    def test_workflow_saves_target_only_after_all_release_evidence(self) -> None:
+        workflow = WORKFLOW.read_text()
+        source_validation = workflow.index("Revalidate both source trees after compilation")
+        binary_validation = workflow.index("Validate architecture and runtime contracts")
+        manifest = workflow.index("Generate and verify the canonical manifest")
+        attestation = workflow.index("Attest all exact runtime artifact members")
+        upload = workflow.index("Upload the verified runtime artifact")
+        evidence = workflow.index("Record build evidence")
+        target_save = workflow.index("Save verified upstream Cargo target cache")
+        target_cleanup = workflow.index("Remove ephemeral upstream Cargo target")
+
+        self.assertLess(source_validation, binary_validation)
+        self.assertLess(binary_validation, manifest)
+        self.assertLess(manifest, attestation)
+        self.assertLess(attestation, upload)
+        self.assertLess(upload, evidence)
+        self.assertLess(evidence, target_save)
+        self.assertLess(target_save, target_cleanup)
+
+        save_block = workflow[target_save:target_cleanup]
+        self.assertIn(
+            "if: ${{ success() && steps.upstream_target_cache.outputs.cache-hit != 'true' }}",
+            save_block,
+        )
+        self.assertIn("continue-on-error: true", save_block)
+        self.assertIn("${{ runner.temp }}/codex-target/", save_block)
+        target_key = (
+            "macos-runtime-target-v2-${{ runner.arch }}-"
+            "${{ steps.target_cache_abi.outputs.sha256 }}-"
+            "${{ steps.upstream.outputs.sha }}-"
+            "${{ steps.patches.outputs.sha256 }}-"
+            "${{ steps.provenance.outputs.source_sha }}"
+        )
+        self.assertIn(target_key, save_block)
+        self.assertEqual(workflow.count(target_key), 2)
+        self.assertNotIn("restore-keys:", save_block)
+        pre_save_target_deletions = [
+            line
+            for line in workflow[:target_save].splitlines()
+            if "rm -rf" in line
+            and ("UPSTREAM_TARGET_DIR" in line or "codex-target" in line)
+        ]
+        self.assertEqual(pre_save_target_deletions, [])
+        self.assertIn(
+            'run: rm -rf -- "$RUNNER_TEMP/codex-target"',
+            workflow[target_cleanup:],
+        )
+
     def test_manifest_binds_full_source_upstream_and_patch_provenance(self) -> None:
         workflow = WORKFLOW.read_text()
         activation = ACTIVATION.read_text()
@@ -113,6 +277,32 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         self.assertIn('observed_patch_sha256=', workflow[post_build:manifest])
         self.assertIn('!= "$EXPECTED_PATCH_SHA256"', workflow[post_build:manifest])
 
+    def test_source_patch_updates_direct_dependencies_and_lockfile_together(self) -> None:
+        workflow = WORKFLOW.read_text()
+        build_step = workflow.index("Build the patched Codex runtime pair")
+        revalidation_step = workflow.index("Revalidate both source trees after compilation")
+        build_contract = workflow[build_step:revalidation_step]
+        source_patching = SOURCE_PATCHING.read_text()
+        source_cargo_patching = SOURCE_CARGO_PATCHING.read_text()
+
+        self.assertIn('source_dir.join("codex-rs/Cargo.toml")', source_patching)
+        self.assertIn('source_dir.join("codex-rs/Cargo.lock")', source_patching)
+        self.assertIn(
+            "patch_placeholder_workspace_lock_versions_if_present",
+            source_patching,
+        )
+        for package in ("codex-app-server", "codex-login"):
+            self.assertIn(
+                f'patch_lockfile_dependency_if_present(&lockfile, "{package}", "libc")',
+                source_patching,
+            )
+        self.assertIn("[workspace.package]", source_cargo_patching)
+        self.assertIn('placeholder = "\\nversion = \\"0.0.0\\"\\n"', source_cargo_patching)
+        self.assertIn('!package.contains("\\nsource = ")', source_cargo_patching)
+        self.assertIn("dependencies.sort();", source_cargo_patching)
+        self.assertIn("dependencies.dedup();", source_cargo_patching)
+        self.assertIn("--locked", build_contract)
+
     def test_installer_verifies_attestations_before_one_activation(self) -> None:
         installer = INSTALLER.read_text()
         snapshot = installer.index('"$artifact_verifier" snapshot')
@@ -128,6 +318,7 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         self.assertNotIn('report.get("preparedArtifactManifestSha256")', installer)
         self.assertNotIn('attestation verify "$download_dir/', installer)
         self.assertNotIn('--directory "$download_dir"', installer)
+        self.assertIn('"$control_cli" macos-runtime-contract', installer)
         self.assertEqual(installer.count('"$control_cli" activate-macos-runtime-artifact'), 1)
         self.assertNotIn('"$control_cli" stage-macos-runtime-artifact', installer)
         self.assertNotIn('"$control_cli" install-prepared-codex', installer)
@@ -140,6 +331,23 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
             "--deny-self-hosted-runners",
         ):
             self.assertIn(policy, installer)
+
+    def test_control_plane_contract_is_executable_and_optimizer_independent(self) -> None:
+        workflow = WORKFLOW.read_text()
+        installer = INSTALLER.read_text()
+        activation = ACTIVATION.read_text()
+
+        self.assertIn(
+            '"$ARTIFACT_DIR/codexswitch-cli" macos-runtime-contract', workflow
+        )
+        self.assertIn('"$control_cli" macos-runtime-contract', installer)
+        self.assertIn(
+            'Command::new(control_cli).arg("macos-runtime-contract")', activation
+        )
+        self.assertIn("codexswitch-macos-runtime-contract-v1", workflow)
+        self.assertIn("codexswitch-macos-runtime-contract-v1", installer)
+        self.assertNotIn("codexswitch-cli.strings", workflow)
+        self.assertNotIn("control-markers", installer)
 
     def test_private_snapshot_is_frozen_and_independent_of_download_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

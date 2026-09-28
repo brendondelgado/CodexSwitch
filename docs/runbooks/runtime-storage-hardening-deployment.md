@@ -15,20 +15,42 @@ toc:
 cross_dependencies:
   - docs/architecture/session-retention-contract.md
   - docs/plans/2026-07-12-runtime-storage-hardening.md
-  - patches/codex/0.144.1-runtime-storage-hardening.patch
-  - crates/codexswitch-cli/src/storage.rs
+  - crates/codexswitch-cli/src/runtime_storage.rs
   - crates/codexswitch-cli/src/codex_update.rs
-  - Sources/CodexSwitch/Services/LinuxDevboxMonitor.swift
+  - crates/codexswitch-cli/src/codex_update/source_runtime_storage_patching.rs
+  - patches/codex/0.144.1-runtime-storage-hardening.patch
 version_control:
   branch: main
-  base_commit: 664edf6201fcd7dcdc299084392e3dad510ec9d7
-  status: local_uncommitted
-  last_updated: 2026-07-13
+  base_commit: 462eda79a5545eef7630b37985ecec0bb4502020
+  status: local_review_in_progress
+  last_updated: 2026-07-17
 operator_boundary:
   status: OPERATOR_DIRECTIVE_ACTIVE
   sha256: 4416348576c92302dc3836955482bd6fd86c62b2aa9b66e5c7228b0161fc14fd
   lines: 58
   bytes: 2724
+review_contracts:
+  acceptance_json_sha256: 5deb0dead45e1dd5aebe3acff98655ef759d9df2dc1174a4576ad80aec0074c7
+  acceptance_md_sha256: 81ab0911c1c74790348bab768e05f8dde69e19b4abfc066b13071f23636baea7
+  adversarial_md_sha256: 91a91c98afac3965e533fd1e869ee5467c53222db0794d777c5f54e4fbc3d2fb
+  admission_json_sha256: ef6035dea4d11f762f0fb836b83ff80f246e85e70a4ff75cf6f04c6b073bb13c
+  admission_md_sha256: b7cd7da5dd6b3345c691124317af0f9ef307d7a87db1f82d35da853de6bc1d98
+  f1_json_sha256: e5a33bd34afabbb4b12c79a90c99ad009f959e1665de90c13124a83030973d22
+  f1_md_sha256: c6092d269049857bacff3a5396cfb5a32b738996751a1d2c0cc297b51c8a5bee
+  f2_json_sha256: dfc9a3a61c638c0ce58c5d641ed12accf4b95b2c29e67e58c1d49a26aa041c6f
+  f2_md_sha256: 5735c6c4648afbecb412226536ede8f258d1ce3c0025ae07056a34bd9e457c0f
+  f3_json_sha256: 9c112b3fe39af6c37b516e92fb9cf368a371930c49385931a60e5b8f2b0df710
+  f3_md_sha256: 0c5da906c8a1f2ac8881121f3e29edc255a519e505861fec8001fb95947c6380
+  f4_json_sha256: 09884ac202575731ad597d9fbdefbd0e7bc60ce3510f86e47943269e6ff32c74
+  f4_md_sha256: ece50568092ea62531aa889c7fa5f6b944d27c18e02f456ebc34fd9aba54e00b
+  f5_json_sha256: 74a2ee187da779d3e8b77ed70235e6154b32846d8511eb0b3be17eaa1d255cc4
+  f5_md_sha256: 50e7b27ff370c026cca0f7a5e4ebc19ab14e2d104b6ef00e8aae642ee06e992e
+  f5_default_off_audit_sha256: 3594010984ad5c24efcaf61d1d06dfdca8c0f67628dc07d2b5897ebde50508d0
+  f6_json_sha256: 29afe6a0500072b6ec59b36b240e8db6460feeb5789169f3045e34978c3351d0
+  f6_md_sha256: f37e458e8c69b5be43eb35eadfed0bdb1f56df0413bb64b6e158a750f88649cc
+  f7_static_audit_sha256: 33216242f50f9b0939fe4cd39d358f40e9cbd01390d83ea7ea2325a7573983b8
+  review_input_manifest_sha256: 2ad1c4ddbc55593ee8ceacf74130e3168aee1c31cf302760bc2e19de6f63c546
+  prefreeze_gap_audit_sha256: f6e34d0da0594f0ff4777ab7ec8c86aa52f043486f45b3f5a6f1d24f793383c7
 ---
 
 # Codex Runtime Storage Hardening Deployment Packet
@@ -91,36 +113,38 @@ Compression controls the burst but does not provide indefinite zero-growth reten
   not symlinks or special files. Each lease is opened with no-follow semantics;
   its device/inode/type must still match the preceding `lstat` result. An inode
   replacement during inspection fails closed.
-- Compression, materialization, stable readers, archive, unarchive, rearchive, restore, and any future plain-representation retirement use the same per-thread lease.
+- Compression, materialization, and stable readers use the same per-thread lease. The new bundle-aware archive/unarchive path is additionally gated by the same disabled feature; while absent/false, archive and unarchive execute the exact upstream plain-only path and never touch the bundle journal.
 - Compression never waits for an active lease; it records a skip and retries in a later pass.
-- A rollout is eligible only when it is a scoped regular file, its filename UUID matches the first canonical SessionMeta ID, no lease is held, and it is stable for at least fifteen minutes.
+- Only explicitly archived rollouts are candidates. A rollout is eligible only when it is a scoped regular file, its filename UUID matches the first canonical SessionMeta ID, no lease is held, it is stable for at least fifteen minutes, and its verified dual representation has completed a 24-hour grace window.
 - Compression uses zstd level 3 with frame checksum, exact decoded SHA-256/length validation, same-directory no-clobber installation, file and directory fsync, and source retirement only after durable verification.
-- Plain wins if both representations survive a crash. Doctor reports the dual state; it is never double counted.
-- Global log measurement and non-destructive maintenance are claimed through a singleton SQLite row. One process performs a due pass; other processes skip the cadence window.
-- `logs_2` rows are non-retirable until a separately reviewed VPS-local lossless archive contract and separate execution authorization exist. Passive WAL checkpoint and bounded incremental vacuum must not imply row-retirement authority.
+- If both representations survive a crash, readers verify both against the same manifest. Equal bytes may be read from the plain representation; any digest, length, generation, or metadata disagreement is a typed refusal and neither representation is mutated.
+- Global log observation is claimed through a singleton SQLite row. One process performs a due pass; other processes skip the cadence window, and completion/failure is fenced to the exact claim generation.
+- `logs_2` rows are non-retirable until a separately reviewed VPS-local lossless archive contract and separate execution authorization exist. This implementation executes no automatic checkpoint or incremental vacuum; both report `disabled`/`not_run` and require separate implementation review and authority.
 
 ## Feature Flags and Defaults
 
 | Setting | Value | Activation state |
 |---|---:|---|
-| Codex feature | `local_thread_store_compression` | enabled by the reviewed app-server unit on a separately authorized activation |
+| Codex feature | `local_thread_store_compression` | absent/false in checked-in units; future activation requires a separately reviewed release change |
 | Capability marker | `codex-runtime-storage-leases-v1` | required in every active Codex executable |
 | Compression level | 3 | private default |
 | Zstd frame checksum | enabled | mandatory |
-| Minimum inactivity | 15 minutes | private default |
+| Candidate inactivity | 15 minutes, archived root only | private default |
+| Plain-retirement grace | 24 hours after verified catalog install | mandatory minimum |
 | Coordinator interval | 5 minutes | private default |
 | Pass work budget | 15 minutes | private default |
 | Concurrent compression jobs | 2 | private default |
-| Rollout hot retention | 14 days / 32 GiB compressed addition ceiling | older objects remain losslessly retrievable in the VPS-local archive |
-| Log hot retention | 1 GiB / 250,000 rows | overflow becomes archive work; row retirement requires a verified local receipt |
+| Rollout hot-retention signal | 14 days / 32 GiB compressed addition ceiling | measurement only while activation and plain retirement are held |
+| Log hot-budget signal | 1 GiB / 250,000 rows | non-destructive telemetry only; no row retirement path exists in this release |
 | Total runtime plus archive admission | 100,000 files / 3,650 days / 64 GiB | installer fails closed; no session or archive object is deleted |
 | Global estimated log budget | 1 GiB | private default |
 | Global log row budget | 250,000 | private default |
 | Institutional-history eviction batch | 0 rows | disabled pending verified cold receipts and authorization |
 | Log maintenance cadence | 15 minutes | private default |
-| WAL journal size limit | 128 MiB | per-connection SQLite pragma |
-| WAL autocheckpoint | 1,000 pages | per-connection SQLite pragma |
-| Incremental vacuum budget | 4,096 pages/pass | post-commit best effort |
+| WAL journal size limit | 128 MiB configured | telemetry only; not an enforced ceiling |
+| WAL autocheckpoint | 0 | automatic physical maintenance disabled |
+| Passive checkpoint | disabled / not_run | no executable automatic path in this subject |
+| Incremental vacuum | disabled / not_run | no executable automatic path in this subject |
 
 Defaults are intentionally private in the first patch. There is no public
 tuning surface that can bypass the bounds. The coordinator makes progress
@@ -146,11 +170,11 @@ malformed tokens never alias a valid active lease.
 
 The VPS-local storage orchestrator consumes these versioned artifacts. They remain private on the VPS and are never sent to the Mac or an external service:
 
-- `RuntimeStorageStatusV1` from a VPS-local `codexswitch-cli storage status --json`: local representation counts/bytes, log DB/WAL/page metrics, lease-aware process inventory, and budget posture. A separate Mac-facing status projection may contain aggregate non-content measurements only, with no session identifiers, paths, titles, hashes, or catalog rows.
+- `RuntimeStorageStatusV1` from a VPS-local `codexswitch-cli storage status --json`: local representation counts/bytes, typed catalog availability/error, global log rows/estimated bytes/partition counts, log claim generation/status, observe-only budget posture, and explicit physical-maintenance disabled/not-run fields. A separate Mac-facing status projection may contain aggregate non-content measurements only, with no session identifiers, paths, titles, hashes, or catalog rows.
 - `LosslessArchiveManifestV1` JSONL: one independently retrievable VPS-local session/log object with thread ID, source host, project/cwd, timestamps/title, raw/compressed digests and lengths, codec contract, local object identity, local catalog generation, and restore/residency state.
 - `LosslessArchiveReceiptV1` JSON: local install/reopen/digest/decode/catalog/restore/grace/pin/lease/active gate evidence bound to the manifest generation.
 - `LosslessMigrationPlanV1`: exact selected object generations, before bytes, projected after bytes, hot-budget target, and zero default eviction count.
-- `RestoreResultV1`: isolated same-VPS target, local object identity, decoded digest/length, install result, latency, and catalog compare-and-set generation.
+- `RestoreResultV1` is a future native-runtime artifact: isolated same-VPS target, local object identity, decoded digest/length, install result, latency, and catalog compare-and-set generation. `codexswitch-cli storage restore` is unconditionally `HELD` and performs no path, catalog, or session mutation.
 - VPS-local key contract: `${CODEX_HOME}/archived_sessions/v1/sha256/<raw-sha256>/zstd-3/<compressed-sha256>.jsonl.zst`; future log segments use a separate VPS-local prefix and exact row-range identity.
 - VPS-local SQLite catalog contract: immutable object generations plus current-state rows keyed by stable thread/session or log-segment ID; it is never mirrored externally.
 - Private storage-root contract: archive objects, manifests, receipts, leases, and catalog live beneath a VPS-local root with permissions `0700` or stricter.
@@ -164,7 +188,7 @@ Use the authoritative Mac checkout with synthetic fixtures only. Do not receive 
 ```text
 cd /Users/brendondelgado/Developer/CodexSwitch
 git status --short --branch
-cargo test -p codexswitch-cli storage
+cargo test -p codexswitch-cli runtime_storage -- --nocapture
 swift test --filter LinuxDevboxMonitorTests
 ```
 
@@ -172,10 +196,14 @@ Replay the embedded patch in a clean Codex `0.144.1` checkout and run:
 
 ```text
 cd <clean-codex-0.144.1>/codex-rs
-just test -p codex-rollout
-just test -p codex-thread-store
-just test -p codex-state
-just test -p codex-cli
+cargo test -p codex-rollout 'compression::tests::' -- --nocapture
+cargo test -p codex-rollout bundle_move::tests -- --nocapture
+cargo test -p codex-rollout lease::tests -- --nocapture
+cargo test -p codex-rollout manifest::tests -- --nocapture
+cargo test -p codex-thread-store archive_thread -- --nocapture
+cargo test -p codex-thread-store unarchive_thread -- --nocapture
+cargo test -p codex-state runtime_storage -- --nocapture
+# Run each named F7 log-observer regression and the named log-retention test.
 just fix -p codex-rollout
 just fix -p codex-thread-store
 just fix -p codex-state
@@ -245,9 +273,9 @@ Capture status immediately before activation, after the first pass, at 30 minute
 - eligible uncompressed bytes and oldest eligible age;
 - source bytes, compressed bytes, ratio, reclaimed bytes, lease skips, and failures;
 - projected rollout bytes/day and days to disk floor;
-- log main/WAL bytes, page count, freelist count, live-page bytes;
+- log main/WAL bytes and the configured-but-non-enforced journal-size limit;
 - global log rows, estimated bytes, thread/process partition counts;
-- maintenance claimed/skipped/failed, over-budget posture, checkpoint state, and incremental-vacuum pages;
+- observation claimed/skipped/failed, over-budget posture, and explicit checkpoint/vacuum disabled/not-run state;
 - SQLite busy, locked, full, and queue-drop errors.
 
 Acceptance targets:
@@ -259,7 +287,7 @@ Acceptance targets:
 - observed compression ratio no more than 25%;
 - global log budget posture is measured consistently across partitions without retiring rows;
 - no increase in SQLite busy/locked/full errors;
-- quiesced WAL no more than 128 MiB;
+- WAL bytes are reported without claiming that the configured 128 MiB journal-size limit is an enforced ceiling;
 - after separately authorized offline physical compaction, main DB no more than 1.5 GiB.
 
 ## Rollback
@@ -281,10 +309,10 @@ The logs migration is additive and must remain on binary rollback. Do not down-m
 
 **Status:** repository policy and deployment wiring are active for review as of
 2026-07-13. The immutable runtime must contain
-`codex-runtime-storage-leases-v1`; the checked-in app-server definition enables
-`local_thread_store_compression` and applies bounded pass, inactivity, and hot
-storage defaults. This repository state is not evidence of VPS deployment or
-feature activation.
+`codex-runtime-storage-leases-v1`; checked-in app-server units leave
+`local_thread_store_compression` absent/off. Bounded pass, inactivity, and hot
+storage values are dormant implementation defaults until a separately reviewed
+release explicitly activates them. This repository state is not evidence of VPS deployment or feature activation.
 
 **External-write attestation:** Zero session/log bytes and zero per-session or content-derived session/log metadata were written to R2, Cloudflare, Neon, the Mac, SecureDrop, or any other external destination. No real VPS session/log contents were received or copied to the Mac. The frozen boundary packet and the earlier storage workpack were read-only policy/aggregate context; the temporary Mac file used to verify the boundary packet was removed. No live VPS compression, migration, plain-representation retirement, log-row retirement, deletion, restart, feature activation, or install occurred.
 
@@ -296,11 +324,17 @@ feature activation.
 
 All three bind to operator packet SHA-256 `4416348576c92302dc3836955482bd6fd86c62b2aa9b66e5c7228b0161fc14fd` and prohibit session/log bytes or per-session/content-derived metadata outside the VPS.
 
-**Verification state:** Linux deployment fixtures use synthetic runtime/session
-data only. They prove the capability marker requirement, immutable release
-retention, exact systemd resource policy, and non-live activation behavior.
-Native Codex rollout/thread-store/state tests and any live storage migration
-remain separate gates before an operator authorizes deployment.
+**Verification state:** The terminal local freeze is
+`docs/reviews/runtime-storage-hardening-freeze-20260717.md`; it records the
+nonzero native rollout/thread-store/state and durable-updater test denominator.
+Any independent review and every live storage action remain separate gates.
+
+**Local resume:** Repository implementation resumed on 2026-07-17 under the
+unchanged operator boundary. Work is limited to deterministic source patching,
+VPS-local command implementation, synthetic fixtures, and local verification.
+The generated prototype cache was absent at resume time, so the independent
+review artifact is the versioned CodexSwitch source-patcher implementation,
+not an untracked generated tree or a hand-maintained patch file.
 
 ## Authorization Holds
 

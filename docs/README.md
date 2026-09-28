@@ -19,6 +19,7 @@ cross_dependencies:
   - architecture/macos-runtime-discovery.md
   - architecture/macos-runtime-artifact.md
   - architecture/secure-drop-transport.md
+  - architecture/clodex-codexswitch-credential-bridge.md
 version_control:
   branch: main
   status: canonical
@@ -58,6 +59,7 @@ A deployed VPS binary may be older than the repository. A UI can also be stale w
 - [Subprocess execution](architecture/subprocess-execution.md): bounded output capture, timeout escalation, reaping, and actor-isolation rules.
 - [SecureDrop transport](architecture/secure-drop-transport.md): artifact integrity, staging, extraction, deletion safety, and retention.
 - [Session retention contract](architecture/session-retention-contract.md): preservation and representation of remote thread history.
+- [Clodex CodexSwitch credential bridge](architecture/clodex-codexswitch-credential-bridge.md): read-through use of the active VPS Codex account without a second OAuth refresh owner or token copy.
 
 ## Operations
 
@@ -67,6 +69,8 @@ A deployed VPS binary may be older than the repository. A UI can also be stale w
 - [VPS thread repair](runbooks/codex-vps-thread-state-heal.md): explicit thread-state recovery; status checks never heal.
 - [Runtime storage hardening](runbooks/runtime-storage-hardening-deployment.md): bounded rollout and runtime storage.
 - [SIGHUP safety](sighup-safety.md): signal target verification and historical failure modes.
+- [CCS Claude quota compatibility](runbooks/ccs-claude-quota-compatibility.md): version-guarded restoration of scoped model limits such as Fable after CCS upgrades.
+- [Clodex VPS lane](runbooks/clodex-vps.md): isolated `claude-vps clodex` launch, CodexSwitch-managed OpenAI credentials, newest-session resume, and rollback.
 
 ## Plans And Audits
 

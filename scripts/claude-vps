@@ -1,6 +1,27 @@
 #!/usr/bin/env zsh
 set -e
 
+REMOTE_BACKEND_MODE="${CLAUDE_VPS_BACKEND_MODE:-native}"
+REMOTE_SESSION_SLOT=""
+if [ "${1:-}" = "clodex" ]; then
+  REMOTE_BACKEND_MODE="clodex"
+  shift
+elif [ "${1:-}" = "2" ] || [ "${1:-}" = "3" ]; then
+  REMOTE_SESSION_SLOT="$1"
+  shift
+fi
+case "$REMOTE_BACKEND_MODE" in
+  native|ccs|clodex) ;;
+  *)
+    print -u2 -- "claude-vps: unsupported CLAUDE_VPS_BACKEND_MODE: ${REMOTE_BACKEND_MODE}"
+    exit 64
+    ;;
+esac
+if [ -n "$REMOTE_SESSION_SLOT" ] && [ "$REMOTE_BACKEND_MODE" != "native" ]; then
+  print -u2 -- "claude-vps: numbered sessions are available only for native Claude"
+  exit 64
+fi
+
 REMOTE_HOST="${CLAUDE_VPS_REMOTE_HOST:-signul-vps}"
 TAILSCALE_HOST="${CLAUDE_VPS_TAILSCALE_HOST:-signul-hostinger-kvm4}"
 TAILSCALE_TARGET="${CLAUDE_VPS_TAILSCALE_TARGET:-signul@${TAILSCALE_HOST}}"
@@ -8,25 +29,104 @@ TAILSCALE_TARGET_IP="${CLAUDE_VPS_TAILSCALE_TARGET_IP:-100.95.84.123}"
 TAILSCALE_BIN="${CLAUDE_VPS_TAILSCALE_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
 MOSH_BIN="${CLAUDE_VPS_MOSH_BIN:-mosh}"
 MOSH_PREDICT="${CLAUDE_VPS_MOSH_PREDICT:-never}"
-SESSION_TRANSPORT_REQUESTED="${CLAUDE_VPS_TRANSPORT:-auto}"
+CMUX_BIN="${CMUX_BUNDLED_CLI_PATH:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
+CMUX_MANAGED_SSH_REQUESTED="${CLAUDE_VPS_CMUX_MANAGED_SSH:-auto}"
+if [ "$REMOTE_BACKEND_MODE" = "clodex" ]; then
+  SESSION_TRANSPORT_REQUESTED="${CLODEX_VPS_TRANSPORT:-ssh}"
+else
+  SESSION_TRANSPORT_REQUESTED="${CLAUDE_VPS_TRANSPORT:-auto}"
+fi
 REMOTE_REPO="${CLAUDE_VPS_REMOTE_REPO:-/home/signul/SIGNUL}"
-if [ -n "${CLAUDE_VPS_REMOTE_CLAUDE:-}" ]; then
+CLAUDE_VPS_DEFAULT_PREFERRED_SESSION_TITLE="${CLAUDE_VPS_PREFERRED_SESSION_TITLE-backend agent}"
+if [ "$REMOTE_BACKEND_MODE" = "clodex" ]; then
+  REMOTE_PREFERRED_SESSION_TITLE="${CLODEX_VPS_PREFERRED_SESSION_TITLE-${CLAUDE_VPS_DEFAULT_PREFERRED_SESSION_TITLE}}"
+  REMOTE_CLAUDE="${CLODEX_VPS_REMOTE_CLODEX:-/home/signul/.local/bin/clodex}"
+  REMOTE_CLAUDE_SUBCOMMAND="claude"
+  REMOTE_CLODEX_CREDENTIAL_HELPER="${CLODEX_VPS_CREDENTIAL_HELPER:-/home/signul/.local/bin/clodex-credential-helper}"
+  REMOTE_CLODEX_CCS_RUNTIME_HELPER="${CLODEX_VPS_CCS_RUNTIME_HELPER:-/home/signul/.local/bin/clodex-ccs-runtime-helper}"
+  REMOTE_CLODEX_CONFIGURATOR="${CLODEX_VPS_CONFIGURATOR:-/home/signul/.local/bin/configure-clodex-codexswitch}"
+  REMOTE_CLODEX_PATCHER="${CLODEX_VPS_PATCHER:-/home/signul/.local/bin/patch-clodex-codexswitch}"
+  REMOTE_CLODEX_PACKAGE_ROOT="${CLODEX_VPS_PACKAGE_ROOT:-/home/signul/.local/lib/node_modules/@bman654/clodex}"
+  REMOTE_CLODEX_ISOLATED_BIN_DIR="${CLODEX_VPS_ISOLATED_BIN_DIR:-/home/signul/.local/share/clodex-codexswitch/bin}"
+  REMOTE_CLODEX_ISOLATED_CLAUDE="${CLODEX_VPS_ISOLATED_CLAUDE:-/home/signul/.local/share/clodex-codexswitch/bin/claude}"
+  REMOTE_CLODEX_ANTHROPIC_BACKEND="${CLODEX_VPS_ANTHROPIC_BACKEND:-ccs}"
+  REMOTE_CLODEX_CCS_BASE_URL="${CLODEX_VPS_CCS_BASE_URL:-http://127.0.0.1:8317}"
+elif [ -n "${CLAUDE_VPS_REMOTE_CLAUDE:-}" ]; then
+  REMOTE_PREFERRED_SESSION_TITLE="$CLAUDE_VPS_DEFAULT_PREFERRED_SESSION_TITLE"
   REMOTE_CLAUDE="$CLAUDE_VPS_REMOTE_CLAUDE"
   REMOTE_CLAUDE_SUBCOMMAND="${CLAUDE_VPS_REMOTE_CLAUDE_SUBCOMMAND:-}"
-else
+  REMOTE_CLODEX_CREDENTIAL_HELPER=""
+  REMOTE_CLODEX_CCS_RUNTIME_HELPER=""
+  REMOTE_CLODEX_CONFIGURATOR=""
+  REMOTE_CLODEX_PATCHER=""
+  REMOTE_CLODEX_PACKAGE_ROOT=""
+  REMOTE_CLODEX_ISOLATED_BIN_DIR=""
+  REMOTE_CLODEX_ISOLATED_CLAUDE=""
+  REMOTE_CLODEX_ANTHROPIC_BACKEND=""
+  REMOTE_CLODEX_CCS_BASE_URL=""
+elif [ "$REMOTE_BACKEND_MODE" = "ccs" ]; then
+  REMOTE_PREFERRED_SESSION_TITLE="$CLAUDE_VPS_DEFAULT_PREFERRED_SESSION_TITLE"
   REMOTE_CLAUDE="/usr/bin/ccs"
   REMOTE_CLAUDE_SUBCOMMAND="${CLAUDE_VPS_REMOTE_CLAUDE_SUBCOMMAND:-claude}"
+  REMOTE_CLODEX_CREDENTIAL_HELPER=""
+  REMOTE_CLODEX_CCS_RUNTIME_HELPER=""
+  REMOTE_CLODEX_CONFIGURATOR=""
+  REMOTE_CLODEX_PATCHER=""
+  REMOTE_CLODEX_PACKAGE_ROOT=""
+  REMOTE_CLODEX_ISOLATED_BIN_DIR=""
+  REMOTE_CLODEX_ISOLATED_CLAUDE=""
+  REMOTE_CLODEX_ANTHROPIC_BACKEND=""
+  REMOTE_CLODEX_CCS_BASE_URL=""
+else
+  REMOTE_PREFERRED_SESSION_TITLE="$CLAUDE_VPS_DEFAULT_PREFERRED_SESSION_TITLE"
+  REMOTE_CLAUDE="/home/signul/.local/bin/claude"
+  REMOTE_CLAUDE_SUBCOMMAND=""
+  REMOTE_CLODEX_CREDENTIAL_HELPER=""
+  REMOTE_CLODEX_CCS_RUNTIME_HELPER=""
+  REMOTE_CLODEX_CONFIGURATOR=""
+  REMOTE_CLODEX_PATCHER=""
+  REMOTE_CLODEX_PACKAGE_ROOT=""
+  REMOTE_CLODEX_ISOLATED_BIN_DIR=""
+  REMOTE_CLODEX_ISOLATED_CLAUDE=""
+  REMOTE_CLODEX_ANTHROPIC_BACKEND=""
+  REMOTE_CLODEX_CCS_BASE_URL=""
+fi
+if [ "$REMOTE_BACKEND_MODE" = "clodex" ]; then
+  case "$REMOTE_CLODEX_ANTHROPIC_BACKEND" in
+    ccs|native) ;;
+    *)
+      print -u2 -- \
+        "claude-vps: unsupported CLODEX_VPS_ANTHROPIC_BACKEND: ${REMOTE_CLODEX_ANTHROPIC_BACKEND}"
+      exit 64
+      ;;
+  esac
 fi
 REMOTE_TERM="${CLAUDE_VPS_REMOTE_TERM:-xterm-256color}"
 REMOTE_COLORTERM="${CLAUDE_VPS_REMOTE_COLORTERM:-truecolor}"
 REMOTE_FORCE_COLOR="${CLAUDE_VPS_FORCE_COLOR:-3}"
-REMOTE_AUTO_CONTINUE="${CLAUDE_VPS_AUTO_CONTINUE:-1}"
+if [ -n "$REMOTE_SESSION_SLOT" ]; then
+  REMOTE_AUTO_CONTINUE="${CLAUDE_VPS_AUTO_CONTINUE:-0}"
+else
+  REMOTE_AUTO_CONTINUE="${CLAUDE_VPS_AUTO_CONTINUE:-1}"
+fi
 REMOTE_CONTROL_DEFAULT="${CLAUDE_VPS_REMOTE_CONTROL_DEFAULT:-0}"
 REMOTE_CONTROL_NAME="${CLAUDE_VPS_REMOTE_CONTROL_NAME:-signul-vps}"
 REMOTE_CONTROL_SPAWN="${CLAUDE_VPS_REMOTE_CONTROL_SPAWN:-same-dir}"
 REMOTE_DISABLE_TMUX="${CLAUDE_VPS_DISABLE_TMUX:-0}"
-REMOTE_DANGEROUSLY_SKIP_PERMISSIONS="${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}"
-REMOTE_TMUX_SESSION="${CLAUDE_VPS_TMUX_SESSION:-claude-vps}"
+if [ "$REMOTE_BACKEND_MODE" = "clodex" ]; then
+  REMOTE_DANGEROUSLY_SKIP_PERMISSIONS="${CLODEX_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-1}"
+  REMOTE_TMUX_SESSION="${CLODEX_VPS_TMUX_SESSION:-claude-vps-clodex}"
+elif [ "$REMOTE_BACKEND_MODE" = "ccs" ]; then
+  REMOTE_DANGEROUSLY_SKIP_PERMISSIONS="${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-1}"
+  REMOTE_TMUX_SESSION="${CLAUDE_VPS_TMUX_SESSION:-claude-vps-ccs}"
+else
+  REMOTE_DANGEROUSLY_SKIP_PERMISSIONS="${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-1}"
+  if [ -n "$REMOTE_SESSION_SLOT" ]; then
+    REMOTE_TMUX_SESSION="${CLAUDE_VPS_TMUX_SESSION:-claude-vps-${REMOTE_SESSION_SLOT}}"
+  else
+    REMOTE_TMUX_SESSION="${CLAUDE_VPS_TMUX_SESSION:-claude-vps}"
+  fi
+fi
 REMOTE_TMUX_HISTORY_LIMIT="${CLAUDE_VPS_TMUX_HISTORY_LIMIT:-200000}"
 REMOTE_TMUX_TERM="${CLAUDE_VPS_TMUX_TERM:-tmux-256color}"
 REMOTE_TMUX_DETACH_OTHER_CLIENTS="${CLAUDE_VPS_TMUX_DETACH_OTHER_CLIENTS:-1}"
@@ -38,7 +138,7 @@ REMOTE_TMUX_STATUS_INTERVAL="${CLAUDE_VPS_TMUX_STATUS_INTERVAL:-5}"
 REMOTE_TMUX_FORCE_COPY_SCROLL="${CLAUDE_VPS_TMUX_FORCE_COPY_SCROLL:-0}"
 REMOTE_TRANSPORT_LABEL="${CLAUDE_VPS_TRANSPORT_LABEL:-ssh}"
 REMOTE_CLAUDE_NO_FLICKER="${CLAUDE_VPS_CLAUDE_CODE_NO_FLICKER:-0}"
-REMOTE_CLAUDE_DISABLE_ALTERNATE_SCREEN="${CLAUDE_VPS_CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}"
+REMOTE_CLAUDE_DISABLE_ALTERNATE_SCREEN="${CLAUDE_VPS_CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-0}"
 REMOTE_CLAUDE_SCROLL_SPEED="${CLAUDE_VPS_CLAUDE_CODE_SCROLL_SPEED:-3}"
 REMOTE_CLAUDE_DISABLE_MOUSE="${CLAUDE_VPS_CLAUDE_CODE_DISABLE_MOUSE:-0}"
 REMOTE_CLAUDE_DISABLE_VIRTUAL_SCROLL="${CLAUDE_VPS_CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL:-0}"
@@ -49,7 +149,7 @@ SSH_SERVER_ALIVE_COUNT_MAX="${CLAUDE_VPS_SERVER_ALIVE_COUNT_MAX:-6}"
 SSH_AUTO_RECONNECT="${CLAUDE_VPS_AUTO_RECONNECT:-1}"
 SSH_RECONNECT_DELAY="${CLAUDE_VPS_RECONNECT_DELAY:-2}"
 SSH_RECONNECT_MAX="${CLAUDE_VPS_RECONNECT_MAX:-0}"
-SYNC_DESKTOP_SESSION_INDEX="${CLAUDE_VPS_SYNC_DESKTOP_SESSION_INDEX:-1}"
+SYNC_DESKTOP_SESSION_INDEX="${CLAUDE_VPS_SYNC_DESKTOP_SESSION_INDEX:-0}"
 DESKTOP_SESSION_ROOT="${CLAUDE_VPS_DESKTOP_SESSION_ROOT:-$HOME/Library/Application Support/Claude/claude-code-sessions}"
 REMOTE_RESPAWN_PANE="${CLAUDE_VPS_RESPAWN_PANE:-0}"
 
@@ -74,6 +174,49 @@ log() {
 
 quote_zsh() {
   printf '%q' "$1"
+}
+
+use_cmux_managed_ssh() {
+  case "$CMUX_MANAGED_SSH_REQUESTED" in
+    1|true|yes|on) ;;
+    0|false|no|off) return 1 ;;
+    auto)
+      [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 1
+      ;;
+    *)
+      log "unsupported CLAUDE_VPS_CMUX_MANAGED_SSH=${CMUX_MANAGED_SSH_REQUESTED}"
+      return 1
+      ;;
+  esac
+  [ -x "$CMUX_BIN" ] || return 1
+  [ "$REMOTE_DISABLE_TMUX" != "1" ] || return 1
+  [ "$#" -eq 0 ] || return 1
+}
+
+launch_cmux_managed_ssh() {
+  local existing_workspace
+  local -a cmux_args
+  existing_workspace="$(
+    CMUX_QUIET=1 "$CMUX_BIN" workspace list 2>/dev/null |
+      awk -v name="$REMOTE_TMUX_SESSION" \
+        '$2 == name && $0 ~ /\[ssh:/ { print $1; exit }'
+  )"
+  if [ -n "$existing_workspace" ]; then
+    log "selecting existing cmux managed SSH workspace ${REMOTE_TMUX_SESSION}"
+    exec env CMUX_QUIET=1 "$CMUX_BIN" select-workspace --workspace "$existing_workspace"
+  fi
+
+  log "opening cmux managed SSH workspace ${REMOTE_TMUX_SESSION} (SCP image uploads enabled)"
+  cmux_args=(
+    ssh "$REMOTE_HOST"
+    --name "$REMOTE_TMUX_SESSION"
+    --ssh-option RequestTTY=force
+  )
+  case "${CLAUDE_VPS_CMUX_NO_FOCUS:-0}" in
+    1|true|yes|on) cmux_args+=(--no-focus) ;;
+  esac
+  cmux_args+=(-- /usr/bin/tmux attach-session -d -t "$REMOTE_TMUX_SESSION")
+  exec env CMUX_QUIET=1 "$CMUX_BIN" "${cmux_args[@]}"
 }
 
 terminal_size() {
@@ -107,10 +250,21 @@ remote_env_prefix() {
   if [ "$REMOTE_AUTO_CONTINUE" = "1" ]; then
     continue_arg="--continue"
   fi
-  printf 'REMOTE_REPO=%s REMOTE_CLAUDE=%s REMOTE_CLAUDE_SUBCOMMAND=%s TERM=%s COLORTERM=%s REMOTE_COLORTERM=%s FORCE_COLOR=%s REMOTE_FORCE_COLOR=%s CLAUDE_CODE_NO_FLICKER=%s CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=%s CLAUDE_CODE_SCROLL_SPEED=%s CLAUDE_CODE_DISABLE_MOUSE=%s CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=%s CLAUDE_VPS_CLAUDE_STATUSLINE=%s CLAUDE_VPS_AUTO_CONTINUE=%s REMOTE_AUTO_CONTINUE=%s CLAUDE_VPS_CONTINUE_ARG=%s CLAUDE_VPS_REMOTE_CONTROL_DEFAULT=%s CLAUDE_VPS_REMOTE_CONTROL_NAME=%s CLAUDE_VPS_REMOTE_CONTROL_SPAWN=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s CLAUDE_VPS_DISABLE_TMUX=%s CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS=%s CLAUDE_VPS_TMUX_SESSION=%s CLAUDE_VPS_TMUX_HISTORY_LIMIT=%s CLAUDE_VPS_TMUX_TERM=%s CLAUDE_VPS_TMUX_DETACH_OTHER_CLIENTS=%s CLAUDE_VPS_TMUX_LOG=%s CLAUDE_VPS_TMUX_LOG_DIR=%s CLAUDE_VPS_TMUX_STATUS=%s CLAUDE_VPS_TMUX_STATUS_POSITION=%s CLAUDE_VPS_TMUX_STATUS_INTERVAL=%s CLAUDE_VPS_TMUX_FORCE_COPY_SCROLL=%s CLAUDE_VPS_RESPAWN_PANE=%s CLAUDE_VPS_TRANSPORT_LABEL=%s' \
+  printf 'REMOTE_REPO=%s CLAUDE_VPS_BACKEND_MODE=%s CLAUDE_VPS_PREFERRED_SESSION_TITLE=%s REMOTE_CLAUDE=%s REMOTE_CLAUDE_SUBCOMMAND=%s CLODEX_CREDENTIAL_HELPER=%s CLODEX_CCS_RUNTIME_HELPER=%s CLODEX_CODEXSWITCH_CONFIGURATOR=%s CLODEX_CODEXSWITCH_PATCHER=%s CLODEX_CODEXSWITCH_PACKAGE_ROOT=%s CLODEX_ISOLATED_BIN_DIR=%s TWEAKCC_CC_INSTALLATION_PATH=%s CLODEX_ANTHROPIC_BACKEND=%s CLODEX_CCS_BASE_URL=%s TERM=%s COLORTERM=%s REMOTE_COLORTERM=%s FORCE_COLOR=%s REMOTE_FORCE_COLOR=%s CLAUDE_CODE_NO_FLICKER=%s CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=%s CLAUDE_CODE_SCROLL_SPEED=%s CLAUDE_CODE_DISABLE_MOUSE=%s CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=%s CLAUDE_VPS_CLAUDE_STATUSLINE=%s CLAUDE_VPS_AUTO_CONTINUE=%s REMOTE_AUTO_CONTINUE=%s CLAUDE_VPS_CONTINUE_ARG=%s CLAUDE_VPS_REMOTE_CONTROL_DEFAULT=%s CLAUDE_VPS_REMOTE_CONTROL_NAME=%s CLAUDE_VPS_REMOTE_CONTROL_SPAWN=%s CODEXSWITCH_REMOTE_TTY_ROWS=%s CODEXSWITCH_REMOTE_TTY_COLS=%s CLAUDE_VPS_DISABLE_TMUX=%s CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS=%s CLAUDE_VPS_TMUX_SESSION=%s CLAUDE_VPS_TMUX_HISTORY_LIMIT=%s CLAUDE_VPS_TMUX_TERM=%s CLAUDE_VPS_TMUX_DETACH_OTHER_CLIENTS=%s CLAUDE_VPS_TMUX_LOG=%s CLAUDE_VPS_TMUX_LOG_DIR=%s CLAUDE_VPS_TMUX_STATUS=%s CLAUDE_VPS_TMUX_STATUS_POSITION=%s CLAUDE_VPS_TMUX_STATUS_INTERVAL=%s CLAUDE_VPS_TMUX_FORCE_COPY_SCROLL=%s CLAUDE_VPS_RESPAWN_PANE=%s CLAUDE_VPS_TRANSPORT_LABEL=%s' \
     "$(quote_zsh "$REMOTE_REPO")" \
+    "$(quote_zsh "$REMOTE_BACKEND_MODE")" \
+    "$(quote_zsh "$REMOTE_PREFERRED_SESSION_TITLE")" \
     "$(quote_zsh "$REMOTE_CLAUDE")" \
     "$(quote_zsh "$REMOTE_CLAUDE_SUBCOMMAND")" \
+    "$(quote_zsh "$REMOTE_CLODEX_CREDENTIAL_HELPER")" \
+    "$(quote_zsh "$REMOTE_CLODEX_CCS_RUNTIME_HELPER")" \
+    "$(quote_zsh "$REMOTE_CLODEX_CONFIGURATOR")" \
+    "$(quote_zsh "$REMOTE_CLODEX_PATCHER")" \
+    "$(quote_zsh "$REMOTE_CLODEX_PACKAGE_ROOT")" \
+    "$(quote_zsh "$REMOTE_CLODEX_ISOLATED_BIN_DIR")" \
+    "$(quote_zsh "$REMOTE_CLODEX_ISOLATED_CLAUDE")" \
+    "$(quote_zsh "$REMOTE_CLODEX_ANTHROPIC_BACKEND")" \
+    "$(quote_zsh "$REMOTE_CLODEX_CCS_BASE_URL")" \
     "$(quote_zsh "$REMOTE_TERM")" \
     "$(quote_zsh "$REMOTE_COLORTERM")" \
     "$(quote_zsh "$REMOTE_COLORTERM")" \
@@ -336,6 +490,10 @@ while [ "$#" -gt 0 ]; do
       REMOTE_DANGEROUSLY_SKIP_PERMISSIONS=1
       shift
       ;;
+    --safe|--ask-permissions)
+      REMOTE_DANGEROUSLY_SKIP_PERMISSIONS=0
+      shift
+      ;;
     --remote-control|--rc|--web)
       REMOTE_CONTROL_DEFAULT=1
       REMOTE_DISABLE_TMUX=1
@@ -379,7 +537,7 @@ done
 
 if [ "${1:-}" = "--check" ]; then
   log "checking ${selected_host} Claude Code..."
-  ssh "${selected_ssh_opts[@]}" "$selected_host" "$(remote_env_prefix) bash -lc 'test -x \"\$REMOTE_CLAUDE\" && cd \"\$REMOTE_REPO\" && if [ -n \"\$REMOTE_CLAUDE_SUBCOMMAND\" ]; then printf \"claude-vps ready: %s %s in %s\\n\" \"\$REMOTE_CLAUDE\" \"\$REMOTE_CLAUDE_SUBCOMMAND\" \"\$PWD\" && \"\$REMOTE_CLAUDE\" \"\$REMOTE_CLAUDE_SUBCOMMAND\" --version; else printf \"claude-vps ready: %s in %s\\n\" \"\$REMOTE_CLAUDE\" \"\$PWD\" && \"\$REMOTE_CLAUDE\" --version; fi'"
+  ssh "${selected_ssh_opts[@]}" "$selected_host" "$(remote_env_prefix) bash -lc 'test -x \"\$REMOTE_CLAUDE\" && if [ \"\$CLAUDE_VPS_BACKEND_MODE\" = clodex ]; then test -x \"\$CLODEX_CREDENTIAL_HELPER\" && test -x \"\$CLODEX_CODEXSWITCH_CONFIGURATOR\" && test -x \"\$CLODEX_CODEXSWITCH_PATCHER\" && test -x \"\$TWEAKCC_CC_INSTALLATION_PATH\" && \"\$CLODEX_CODEXSWITCH_PATCHER\" --check --package-root \"\$CLODEX_CODEXSWITCH_PACKAGE_ROOT\" && \"\$CLODEX_CODEXSWITCH_CONFIGURATOR\" --check --package-root \"\$CLODEX_CODEXSWITCH_PACKAGE_ROOT\" --helper \"\$CLODEX_CREDENTIAL_HELPER\" && case \"\$CLODEX_ANTHROPIC_BACKEND\" in ccs) test -x \"\$CLODEX_CCS_RUNTIME_HELPER\" && \"\$CLODEX_CCS_RUNTIME_HELPER\" --check ;; native) : ;; *) exit 78 ;; esac && clodex_dry=\"\$(PATH=\"\$CLODEX_ISOLATED_BIN_DIR:\$PATH\" \"\$REMOTE_CLAUDE\" claude --proxy --dry-run 2>&1)\" && ! printf \"%s\\n\" \"\$clodex_dry\" | grep -Eq \"not patched|stale-patched\" && printf \"%s\\n\" \"\$clodex_dry\" | grep -q \"clodex:openai-oauth:\"; fi && cd \"\$REMOTE_REPO\" && if [ -n \"\$REMOTE_CLAUDE_SUBCOMMAND\" ]; then printf \"claude-vps ready: %s %s in %s\\n\" \"\$REMOTE_CLAUDE\" \"\$REMOTE_CLAUDE_SUBCOMMAND\" \"\$PWD\" && \"\$REMOTE_CLAUDE\" \"\$REMOTE_CLAUDE_SUBCOMMAND\" --version; else printf \"claude-vps ready: %s in %s\\n\" \"\$REMOTE_CLAUDE\" \"\$PWD\" && \"\$REMOTE_CLAUDE\" --version; fi'"
   exit 0
 fi
 
@@ -390,10 +548,227 @@ done
 
 selected_session_transport="ssh"
 select_session_transport "$@"
+if use_cmux_managed_ssh "$@"; then
+  selected_session_transport="cmux-ssh"
+fi
 REMOTE_TRANSPORT_LABEL="$selected_session_transport"
 
 remote_tmux_script() {
   cat <<'REMOTE_SCRIPT'
+resolve_latest_repo_session_id() {
+  python3 - "$REMOTE_REPO" "${CLAUDE_VPS_PREFERRED_SESSION_TITLE:-}" <<'PY'
+import glob
+import json
+import os
+import sys
+
+repo = sys.argv[1]
+preferred_title = " ".join(sys.argv[2].split()).casefold()
+project_key = repo.replace("/", "-")
+project_dir = os.path.expanduser(os.path.join("~", ".claude", "projects", project_key))
+paths = glob.glob(os.path.join(project_dir, "*.jsonl"))
+if not paths:
+    if preferred_title:
+        print("__CLAUDE_VPS_PREFERRED_TITLE_NOT_FOUND__")
+    raise SystemExit(0)
+
+selected_paths = paths
+if preferred_title:
+    selected_paths = []
+    for path in paths:
+        title = ""
+        try:
+            with open(path, "rb") as handle:
+                for raw_line in handle:
+                    if b"custom-title" not in raw_line:
+                        continue
+                    try:
+                        event = json.loads(raw_line)
+                    except Exception:
+                        continue
+                    if event.get("type") == "custom-title" and event.get("customTitle"):
+                        title = " ".join(str(event["customTitle"]).split()).casefold()
+        except OSError:
+            continue
+        if title == preferred_title:
+            selected_paths.append(path)
+    if not selected_paths:
+        print("__CLAUDE_VPS_PREFERRED_TITLE_NOT_FOUND__")
+        raise SystemExit(0)
+
+selected = max(selected_paths, key=os.path.getmtime)
+print(os.path.basename(selected)[:-len(".jsonl")])
+PY
+}
+
+resolve_live_session_owner() {
+  python3 - "$1" "${CLAUDE_VPS_TMUX_SESSION:-}" <<'PY'
+import glob
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+session_id = sys.argv[1]
+managed_session = sys.argv[2]
+parents = {}
+arguments = {}
+starts = {}
+for stat_path in glob.glob("/proc/[0-9]*/stat"):
+    try:
+        stat = pathlib.Path(stat_path).read_text()
+        end = stat.rfind(")")
+        fields = stat[end + 2 :].split()
+        pid = int(stat[: stat.find(" ")])
+        parents[pid] = int(fields[1])
+        starts[pid] = fields[19]
+        arguments[pid] = [
+            value.decode("utf-8", "replace")
+            for value in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if value
+        ]
+    except Exception:
+        continue
+
+target_pids = {
+    pid
+    for pid, args in arguments.items()
+    if pid != os.getpid() and session_id in args
+}
+# Claude can switch threads after startup. Only trust a registration for this
+# exact live process incarnation; a stale PID file must never redirect attach.
+for registration in pathlib.Path.home().joinpath(".claude", "sessions").glob("*.json"):
+    try:
+        record = json.loads(registration.read_text())
+        pid = int(record["pid"])
+        if pid == os.getpid() or pid not in starts:
+            continue
+        if str(record.get("procStart", "")) != starts[pid]:
+            continue
+        if not record.get("sessionId"):
+            continue
+        target_pids.discard(pid)
+        if record["sessionId"] == session_id:
+            target_pids.add(pid)
+    except (OSError, ValueError, KeyError, TypeError):
+        continue
+if not target_pids:
+    print("none")
+    raise SystemExit(0)
+
+panes = {}
+try:
+    output = subprocess.check_output(
+        ["tmux", "list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"],
+        text=True,
+    )
+    for line in output.splitlines():
+        name, pane_pid = line.split("\t", 1)
+        panes[int(pane_pid)] = name
+except Exception:
+    panes = {}
+
+owners = set()
+external = False
+for target_pid in target_pids:
+    pid = target_pid
+    seen = set()
+    owner = None
+    while pid in parents and pid not in seen:
+        if pid in panes:
+            owner = panes[pid]
+            break
+        seen.add(pid)
+        pid = parents[pid]
+    if owner is None:
+        external = True
+    else:
+        owners.add(owner)
+
+managed_owner = next(iter(owners)) if len(owners) == 1 else None
+if managed_session and managed_owner and (
+    managed_owner == managed_session
+    or managed_owner.startswith(managed_session + "-preserved-")
+):
+    print("tmux:" + managed_owner)
+elif external and owners or len(owners) > 1:
+    print("ambiguous")
+elif external:
+    print("external")
+elif len(owners) == 1:
+    print("tmux:" + next(iter(owners)))
+else:
+    print("none")
+PY
+}
+
+select_latest_managed_session() {
+  CLAUDE_VPS_RESUME_SESSION_ID=""
+  case "${CLAUDE_VPS_AUTO_CONTINUE:-1}" in
+    1|true|yes|on) ;;
+    *) return ;;
+  esac
+
+  latest_session_id="$(resolve_latest_repo_session_id)"
+  if [ "$latest_session_id" = "__CLAUDE_VPS_PREFERRED_TITLE_NOT_FOUND__" ]; then
+    printf "claude-vps: refusing fallback because the configured preferred session title was not found\n" >&2
+    exit 74
+  fi
+  if [ -z "$latest_session_id" ]; then
+    return
+  fi
+  case "$latest_session_id" in
+    *[!A-Za-z0-9._-]*)
+      printf "claude-vps: refusing invalid latest session identity\n" >&2
+      exit 72
+      ;;
+  esac
+
+  base_session="$CLAUDE_VPS_TMUX_SESSION"
+  owner="$(resolve_live_session_owner "$latest_session_id")"
+  case "$owner" in
+    "tmux:$base_session"|tmux:"$base_session"-preserved-*)
+      CLAUDE_VPS_TMUX_SESSION="${owner#tmux:}"
+      ;;
+    tmux:*)
+      printf "claude-vps: refusing concurrent resume; latest session is owned by unmanaged tmux %s\n" "${owner#tmux:}" >&2
+      exit 73
+      ;;
+    external)
+      printf "claude-vps: refusing concurrent resume; latest session is owned by a non-tmux process (including a Claude background agent). Stop that exact writer at a safe handoff point before changing backends.\n" >&2
+      exit 73
+      ;;
+    ambiguous)
+      printf "claude-vps: refusing concurrent resume; latest session has ambiguous live ownership\n" >&2
+      exit 73
+      ;;
+    none)
+      CLAUDE_VPS_RESUME_SESSION_ID="$latest_session_id"
+      if tmux has-session -t "$base_session" 2>/dev/null &&
+        tmux list-panes -t "$base_session" -F "#{pane_dead}" 2>/dev/null | grep -q "^0$"; then
+        preserved="${base_session}-preserved-$(date +%Y%m%dT%H%M%S)"
+        suffix=1
+        while tmux has-session -t "$preserved" 2>/dev/null; do
+          preserved="${base_session}-preserved-$(date +%Y%m%dT%H%M%S)-${suffix}"
+          suffix=$((suffix + 1))
+        done
+        tmux rename-session -t "$base_session" "$preserved"
+        printf "claude-vps: preserved mismatched live pane as %s\n" "$preserved" >&2
+      fi
+      CLAUDE_VPS_TMUX_SESSION="$base_session"
+      ;;
+  esac
+}
+
+bind_resume_to_launch_command() {
+  local launch_command="$1" quoted_resume_id
+  printf -v quoted_resume_id '%q' "${CLAUDE_VPS_RESUME_SESSION_ID:-}"
+  printf 'export CLAUDE_VPS_RESUME_SESSION_ID=%s; %s' \
+    "$quoted_resume_id" \
+    "$launch_command"
+}
+
 ensure_claude_vps_statusline() {
   case "${CLAUDE_VPS_CLAUDE_STATUSLINE:-1}" in
     0|off|false|no) return ;;
@@ -472,7 +847,7 @@ apply_claude_renderer_env() {
     1|true|yes|on) export CLAUDE_CODE_NO_FLICKER=1 ;;
     *) unset CLAUDE_CODE_NO_FLICKER ;;
   esac
-  case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" in
+  case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-0}" in
     1|true|yes|on) export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 ;;
     *) unset CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN ;;
   esac
@@ -486,6 +861,47 @@ apply_claude_renderer_env() {
   esac
 }
 
+check_clodex_runtime() {
+  if [ "${CLAUDE_VPS_BACKEND_MODE:-native}" != "clodex" ]; then
+    return
+  fi
+  test -x "$CLODEX_CODEXSWITCH_PATCHER"
+  "$CLODEX_CODEXSWITCH_PATCHER" \
+    --check \
+    --package-root "$CLODEX_CODEXSWITCH_PACKAGE_ROOT" >/dev/null
+  case "${CLODEX_ANTHROPIC_BACKEND:-ccs}" in
+    ccs)
+      test -x "$CLODEX_CCS_RUNTIME_HELPER"
+      "$CLODEX_CCS_RUNTIME_HELPER" --check >/dev/null
+      ;;
+    native) ;;
+    *) return 78 ;;
+  esac
+}
+
+prepare_clodex_anthropic_backend() {
+  local ccs_token
+  if [ "${CLAUDE_VPS_BACKEND_MODE:-native}" != "clodex" ]; then
+    return
+  fi
+  case "${CLODEX_ANTHROPIC_BACKEND:-ccs}" in
+    ccs)
+      ccs_token="$("$CLODEX_CCS_RUNTIME_HELPER" --token)" || return
+      if [ -z "$ccs_token" ]; then
+        return 78
+      fi
+      export ANTHROPIC_AUTH_TOKEN="$ccs_token"
+      export CLODEX_ANTHROPIC_PASSTHROUGH_BASE_URL="$CLODEX_CCS_BASE_URL"
+      unset ccs_token ANTHROPIC_API_KEY
+      ;;
+    native)
+      unset CLODEX_ANTHROPIC_PASSTHROUGH_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY
+      ;;
+    *) return 78 ;;
+  esac
+}
+
+check_clodex_runtime
 ensure_claude_vps_statusline
 cd "$REMOTE_REPO" || exit
 if [ -n "$CODEXSWITCH_REMOTE_TTY_ROWS" ] && [ -n "$CODEXSWITCH_REMOTE_TTY_COLS" ]; then
@@ -493,6 +909,7 @@ if [ -n "$CODEXSWITCH_REMOTE_TTY_ROWS" ] && [ -n "$CODEXSWITCH_REMOTE_TTY_COLS" 
 fi
 stty -ixon -ixoff 2>/dev/null || true
 if command -v tmux >/dev/null 2>&1; then
+  select_latest_managed_session
   tmux set-option -gq default-terminal "$CLAUDE_VPS_TMUX_TERM" >/dev/null 2>&1 || true
   tmux set-option -gq history-limit "$CLAUDE_VPS_TMUX_HISTORY_LIMIT" >/dev/null 2>&1 || true
   tmux set-window-option -gq history-limit "$CLAUDE_VPS_TMUX_HISTORY_LIMIT" >/dev/null 2>&1 || true
@@ -513,26 +930,38 @@ if command -v tmux >/dev/null 2>&1; then
     tmux bind-key -T copy-mode-vi WheelUpPane send-keys -X -N 5 scroll-up >/dev/null 2>&1 || true
     tmux bind-key -T copy-mode-vi WheelDownPane send-keys -X -N 5 scroll-down >/dev/null 2>&1 || true
   fi
-  tmux show-options -gqv terminal-features | grep -q "tmux-256color:RGB" || tmux set-option -gaq terminal-features ",tmux-256color:RGB" >/dev/null 2>&1 || true
-  tmux show-options -gqv terminal-features | grep -q "xterm-256color:RGB" || tmux set-option -gaq terminal-features ",xterm-256color:RGB" >/dev/null 2>&1 || true
-  tmux show-options -gqv terminal-overrides | grep -q "tmux-256color:RGB" || tmux set-option -gaq terminal-overrides ",tmux-256color:RGB" >/dev/null 2>&1 || true
-  tmux show-options -gqv terminal-overrides | grep -q "xterm-256color:RGB" || tmux set-option -gaq terminal-overrides ",xterm-256color:RGB" >/dev/null 2>&1 || true
-  tmux set-environment -g REMOTE_CLAUDE "$REMOTE_CLAUDE" >/dev/null
-  tmux set-environment -g REMOTE_CLAUDE_SUBCOMMAND "$REMOTE_CLAUDE_SUBCOMMAND" >/dev/null
-  tmux set-environment -g CLAUDE_VPS_TMUX_TERM "$CLAUDE_VPS_TMUX_TERM" >/dev/null
-  tmux set-environment -g REMOTE_COLORTERM "$REMOTE_COLORTERM" >/dev/null
-  tmux set-environment -g REMOTE_FORCE_COLOR "$REMOTE_FORCE_COLOR" >/dev/null
-  tmux set-environment -g CLAUDE_CODE_NO_FLICKER "$CLAUDE_CODE_NO_FLICKER" >/dev/null
-  tmux set-environment -g CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN "$CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" >/dev/null
-  tmux set-environment -g CLAUDE_CODE_SCROLL_SPEED "$CLAUDE_CODE_SCROLL_SPEED" >/dev/null
-  tmux set-environment -g CLAUDE_CODE_DISABLE_MOUSE "$CLAUDE_CODE_DISABLE_MOUSE" >/dev/null
-  tmux set-environment -g CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL "$CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL" >/dev/null
-  tmux set-environment -g CLAUDE_VPS_AUTO_CONTINUE "$CLAUDE_VPS_AUTO_CONTINUE" >/dev/null
-  tmux set-environment -g CLAUDE_VPS_CONTINUE_ARG "$CLAUDE_VPS_CONTINUE_ARG" >/dev/null
-  tmux set-environment -g CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS "$CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS" >/dev/null
-  tmux set-environment -g CLAUDE_VPS_TRANSPORT_LABEL "$CLAUDE_VPS_TRANSPORT_LABEL" >/dev/null
+  tmux show-options -gqv terminal-features 2>/dev/null | grep -q "tmux-256color:RGB" || tmux set-option -gaq terminal-features ",tmux-256color:RGB" >/dev/null 2>&1 || true
+  tmux show-options -gqv terminal-features 2>/dev/null | grep -q "xterm-256color:RGB" || tmux set-option -gaq terminal-features ",xterm-256color:RGB" >/dev/null 2>&1 || true
+  tmux show-options -gqv terminal-overrides 2>/dev/null | grep -q "tmux-256color:RGB" || tmux set-option -gaq terminal-overrides ",tmux-256color:RGB" >/dev/null 2>&1 || true
+  tmux show-options -gqv terminal-overrides 2>/dev/null | grep -q "xterm-256color:RGB" || tmux set-option -gaq terminal-overrides ",xterm-256color:RGB" >/dev/null 2>&1 || true
+  tmux set-environment -g REMOTE_CLAUDE "$REMOTE_CLAUDE" >/dev/null 2>&1 || true
+  tmux set-environment -g REMOTE_CLAUDE_SUBCOMMAND "$REMOTE_CLAUDE_SUBCOMMAND" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_VPS_BACKEND_MODE "$CLAUDE_VPS_BACKEND_MODE" >/dev/null 2>&1 || true
+  tmux set-environment -g CLODEX_CREDENTIAL_HELPER "$CLODEX_CREDENTIAL_HELPER" >/dev/null 2>&1 || true
+  tmux set-environment -g CLODEX_CCS_RUNTIME_HELPER "$CLODEX_CCS_RUNTIME_HELPER" >/dev/null 2>&1 || true
+  tmux set-environment -g CLODEX_CODEXSWITCH_CONFIGURATOR "$CLODEX_CODEXSWITCH_CONFIGURATOR" >/dev/null 2>&1 || true
+  tmux set-environment -g CLODEX_CODEXSWITCH_PATCHER "$CLODEX_CODEXSWITCH_PATCHER" >/dev/null 2>&1 || true
+  tmux set-environment -g CLODEX_CODEXSWITCH_PACKAGE_ROOT "$CLODEX_CODEXSWITCH_PACKAGE_ROOT" >/dev/null 2>&1 || true
+  tmux set-environment -g CLODEX_ISOLATED_BIN_DIR "$CLODEX_ISOLATED_BIN_DIR" >/dev/null 2>&1 || true
+  tmux set-environment -g TWEAKCC_CC_INSTALLATION_PATH "$TWEAKCC_CC_INSTALLATION_PATH" >/dev/null 2>&1 || true
+  tmux set-environment -g CLODEX_ANTHROPIC_BACKEND "$CLODEX_ANTHROPIC_BACKEND" >/dev/null 2>&1 || true
+  tmux set-environment -g CLODEX_CCS_BASE_URL "$CLODEX_CCS_BASE_URL" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_VPS_TMUX_TERM "$CLAUDE_VPS_TMUX_TERM" >/dev/null 2>&1 || true
+  tmux set-environment -g REMOTE_COLORTERM "$REMOTE_COLORTERM" >/dev/null 2>&1 || true
+  tmux set-environment -g REMOTE_FORCE_COLOR "$REMOTE_FORCE_COLOR" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_CODE_NO_FLICKER "$CLAUDE_CODE_NO_FLICKER" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN "$CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_CODE_SCROLL_SPEED "$CLAUDE_CODE_SCROLL_SPEED" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_CODE_DISABLE_MOUSE "$CLAUDE_CODE_DISABLE_MOUSE" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL "$CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_VPS_AUTO_CONTINUE "$CLAUDE_VPS_AUTO_CONTINUE" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_VPS_CONTINUE_ARG "$CLAUDE_VPS_CONTINUE_ARG" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_VPS_RESUME_SESSION_ID "$CLAUDE_VPS_RESUME_SESSION_ID" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS "$CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS" >/dev/null 2>&1 || true
+  tmux set-environment -g CLAUDE_VPS_TRANSPORT_LABEL "$CLAUDE_VPS_TRANSPORT_LABEL" >/dev/null 2>&1 || true
 
-  claude_vps_launch='stty -ixon -ixoff 2>/dev/null || true; unset NO_COLOR; case "${CLAUDE_CODE_NO_FLICKER:-0}" in 1|true|yes|on) export CLAUDE_CODE_NO_FLICKER=1 ;; *) unset CLAUDE_CODE_NO_FLICKER ;; esac; case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 ;; *) unset CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN ;; esac; case "${CLAUDE_CODE_DISABLE_MOUSE:-0}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_MOUSE=1 ;; *) unset CLAUDE_CODE_DISABLE_MOUSE ;; esac; case "${CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL:-0}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 ;; *) unset CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL ;; esac; claude_vps_permission_arg=""; case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}" in 1|true|yes|on) claude_vps_permission_arg="--dangerously-skip-permissions" ;; esac; if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then exec env TERM="$CLAUDE_VPS_TMUX_TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" $claude_vps_permission_arg $CLAUDE_VPS_CONTINUE_ARG; else exec env TERM="$CLAUDE_VPS_TMUX_TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" $claude_vps_permission_arg $CLAUDE_VPS_CONTINUE_ARG; fi'
+  claude_vps_launch='stty -ixon -ixoff 2>/dev/null || true; unset NO_COLOR; case "${CLAUDE_CODE_NO_FLICKER:-0}" in 1|true|yes|on) export CLAUDE_CODE_NO_FLICKER=1 ;; *) unset CLAUDE_CODE_NO_FLICKER ;; esac; case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-0}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 ;; *) unset CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN ;; esac; case "${CLAUDE_CODE_DISABLE_MOUSE:-0}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_MOUSE=1 ;; *) unset CLAUDE_CODE_DISABLE_MOUSE ;; esac; case "${CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL:-0}" in 1|true|yes|on) export CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 ;; *) unset CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL ;; esac; claude_vps_permission_arg=""; case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-1}" in 1|true|yes|on) claude_vps_permission_arg="--dangerously-skip-permissions" ;; esac; claude_vps_resume_args="$CLAUDE_VPS_CONTINUE_ARG"; if [ -n "${CLAUDE_VPS_RESUME_SESSION_ID:-}" ]; then claude_vps_resume_args="--resume $CLAUDE_VPS_RESUME_SESSION_ID"; fi; claude_vps_backend_arg=""; claude_vps_path="$PATH"; if [ "${CLAUDE_VPS_BACKEND_MODE:-native}" = "clodex" ]; then claude_vps_backend_arg="--proxy"; claude_vps_path="$CLODEX_ISOLATED_BIN_DIR:$PATH"; case "${CLODEX_ANTHROPIC_BACKEND:-ccs}" in ccs) ANTHROPIC_AUTH_TOKEN="$("$CLODEX_CCS_RUNTIME_HELPER" --token)" || exit; [ -n "$ANTHROPIC_AUTH_TOKEN" ] || exit 78; export ANTHROPIC_AUTH_TOKEN; export CLODEX_ANTHROPIC_PASSTHROUGH_BASE_URL="$CLODEX_CCS_BASE_URL"; unset ANTHROPIC_API_KEY ;; native) unset CLODEX_ANTHROPIC_PASSTHROUGH_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ;; *) exit 78 ;; esac; fi; if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then exec env PATH="$claude_vps_path" TWEAKCC_CC_INSTALLATION_PATH="$TWEAKCC_CC_INSTALLATION_PATH" TERM="$CLAUDE_VPS_TMUX_TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" $claude_vps_backend_arg $claude_vps_permission_arg $claude_vps_resume_args; else exec env PATH="$claude_vps_path" TERM="$CLAUDE_VPS_TMUX_TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" $claude_vps_permission_arg $claude_vps_resume_args; fi'
+  claude_vps_launch="$(bind_resume_to_launch_command "$claude_vps_launch")"
   if ! tmux has-session -t "$CLAUDE_VPS_TMUX_SESSION" 2>/dev/null; then
     tmux new-session -d -s "$CLAUDE_VPS_TMUX_SESSION" -c "$REMOTE_REPO" "$claude_vps_launch"
   elif [ "${CLAUDE_VPS_RESPAWN_PANE:-0}" = "1" ]; then
@@ -570,7 +999,7 @@ if command -v tmux >/dev/null 2>&1; then
   tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-right-length 110 >/dev/null
   tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-left '#[fg=colour82,bold] claude-vps #[fg=colour244]#{@claude-vps-backend}/#{@claude-vps-transport} #[fg=colour250]#S ' >/dev/null
   tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" status-right '#[fg=colour244]#{pane_current_command} #[fg=colour250]%H:%M #[fg=colour244]#{client_width}x#{client_height} ' >/dev/null
-  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" @claude-vps-backend "tmux" >/dev/null 2>&1 || true
+  tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" @claude-vps-backend "${CLAUDE_VPS_BACKEND_MODE:-native}" >/dev/null 2>&1 || true
   tmux set-option -t "$CLAUDE_VPS_TMUX_SESSION" @claude-vps-transport "${CLAUDE_VPS_TRANSPORT_LABEL:-ssh}" >/dev/null 2>&1 || true
   tmux set-window-option -t "${CLAUDE_VPS_TMUX_SESSION}:0" alternate-screen on >/dev/null
   tmux set-window-option -t "${CLAUDE_VPS_TMUX_SESSION}:0" aggressive-resize on >/dev/null 2>&1 || true
@@ -584,9 +1013,20 @@ if command -v tmux >/dev/null 2>&1; then
   tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL "$CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL" >/dev/null
   tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_AUTO_CONTINUE "$CLAUDE_VPS_AUTO_CONTINUE" >/dev/null
   tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_CONTINUE_ARG "$CLAUDE_VPS_CONTINUE_ARG" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_RESUME_SESSION_ID "$CLAUDE_VPS_RESUME_SESSION_ID" >/dev/null
   tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS "$CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS" >/dev/null
   tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" REMOTE_CLAUDE "$REMOTE_CLAUDE" >/dev/null
   tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" REMOTE_CLAUDE_SUBCOMMAND "$REMOTE_CLAUDE_SUBCOMMAND" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_BACKEND_MODE "$CLAUDE_VPS_BACKEND_MODE" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLODEX_CREDENTIAL_HELPER "$CLODEX_CREDENTIAL_HELPER" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLODEX_CCS_RUNTIME_HELPER "$CLODEX_CCS_RUNTIME_HELPER" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLODEX_CODEXSWITCH_CONFIGURATOR "$CLODEX_CODEXSWITCH_CONFIGURATOR" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLODEX_CODEXSWITCH_PATCHER "$CLODEX_CODEXSWITCH_PATCHER" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLODEX_CODEXSWITCH_PACKAGE_ROOT "$CLODEX_CODEXSWITCH_PACKAGE_ROOT" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLODEX_ISOLATED_BIN_DIR "$CLODEX_ISOLATED_BIN_DIR" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" TWEAKCC_CC_INSTALLATION_PATH "$TWEAKCC_CC_INSTALLATION_PATH" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLODEX_ANTHROPIC_BACKEND "$CLODEX_ANTHROPIC_BACKEND" >/dev/null
+  tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLODEX_CCS_BASE_URL "$CLODEX_CCS_BASE_URL" >/dev/null
   tmux set-environment -t "$CLAUDE_VPS_TMUX_SESSION" CLAUDE_VPS_TRANSPORT_LABEL "$CLAUDE_VPS_TRANSPORT_LABEL" >/dev/null
   if [ "$CLAUDE_VPS_TMUX_LOG" = "1" ]; then
     log_dir="${CLAUDE_VPS_TMUX_LOG_DIR:-$HOME/.claude-vps/logs}"
@@ -599,35 +1039,53 @@ if command -v tmux >/dev/null 2>&1; then
     tmux pipe-pane -t "${CLAUDE_VPS_TMUX_SESSION}:0" >/dev/null 2>&1 || true
     tmux set-option -u -t "$CLAUDE_VPS_TMUX_SESSION" @claude-vps-log >/dev/null 2>&1 || true
   fi
+  case "${CLAUDE_VPS_BOOTSTRAP_ONLY:-0}" in
+    1|true|yes|on)
+      printf "claude-vps: tmux session %s is ready\n" "$CLAUDE_VPS_TMUX_SESSION" >&2
+      exit 0
+      ;;
+  esac
   attach_flags=()
   if [ "${CLAUDE_VPS_TMUX_DETACH_OTHER_CLIENTS:-1}" = "1" ]; then
     attach_flags=(-d)
   fi
   tmux attach-session "${attach_flags[@]}" -t "$CLAUDE_VPS_TMUX_SESSION" || {
-    if [ -n "$CLAUDE_VPS_CONTINUE_ARG" ]; then
+    if [ -n "$CLAUDE_VPS_RESUME_SESSION_ID" ]; then
+      set -- --resume "$CLAUDE_VPS_RESUME_SESSION_ID"
+    elif [ -n "$CLAUDE_VPS_CONTINUE_ARG" ]; then
       set -- "$CLAUDE_VPS_CONTINUE_ARG"
     fi
-    case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}" in
+    case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-1}" in
       1|true|yes|on) set -- --dangerously-skip-permissions "$@" ;;
     esac
     unset NO_COLOR
     apply_claude_renderer_env
+    prepare_clodex_anthropic_backend
     if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then
+      if [ "${CLAUDE_VPS_BACKEND_MODE:-native}" = "clodex" ]; then
+        exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" --proxy "$@"
+      fi
       exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" "$@"
     fi
     exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$@"
   }
   exit 0
 fi
-if [ -n "$CLAUDE_VPS_CONTINUE_ARG" ]; then
+if [ -n "${CLAUDE_VPS_RESUME_SESSION_ID:-}" ]; then
+  set -- --resume "$CLAUDE_VPS_RESUME_SESSION_ID"
+elif [ -n "$CLAUDE_VPS_CONTINUE_ARG" ]; then
   set -- "$CLAUDE_VPS_CONTINUE_ARG"
 fi
-case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}" in
+case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-1}" in
   1|true|yes|on) set -- --dangerously-skip-permissions "$@" ;;
 esac
 unset NO_COLOR
 apply_claude_renderer_env
+prepare_clodex_anthropic_backend
 if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then
+  if [ "${CLAUDE_VPS_BACKEND_MODE:-native}" = "clodex" ]; then
+    exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" --proxy "$@"
+  fi
   exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" "$@"
 fi
 exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$@"
@@ -641,7 +1099,7 @@ apply_claude_renderer_env() {
     1|true|yes|on) export CLAUDE_CODE_NO_FLICKER=1 ;;
     *) unset CLAUDE_CODE_NO_FLICKER ;;
   esac
-  case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" in
+  case "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-0}" in
     1|true|yes|on) export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 ;;
     *) unset CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN ;;
   esac
@@ -655,6 +1113,47 @@ apply_claude_renderer_env() {
   esac
 }
 
+check_clodex_runtime() {
+  if [ "${CLAUDE_VPS_BACKEND_MODE:-native}" != "clodex" ]; then
+    return
+  fi
+  test -x "$CLODEX_CODEXSWITCH_PATCHER"
+  "$CLODEX_CODEXSWITCH_PATCHER" \
+    --check \
+    --package-root "$CLODEX_CODEXSWITCH_PACKAGE_ROOT" >/dev/null
+  case "${CLODEX_ANTHROPIC_BACKEND:-ccs}" in
+    ccs)
+      test -x "$CLODEX_CCS_RUNTIME_HELPER"
+      "$CLODEX_CCS_RUNTIME_HELPER" --check >/dev/null
+      ;;
+    native) ;;
+    *) return 78 ;;
+  esac
+}
+
+prepare_clodex_anthropic_backend() {
+  local ccs_token
+  if [ "${CLAUDE_VPS_BACKEND_MODE:-native}" != "clodex" ]; then
+    return
+  fi
+  case "${CLODEX_ANTHROPIC_BACKEND:-ccs}" in
+    ccs)
+      ccs_token="$("$CLODEX_CCS_RUNTIME_HELPER" --token)" || return
+      if [ -z "$ccs_token" ]; then
+        return 78
+      fi
+      export ANTHROPIC_AUTH_TOKEN="$ccs_token"
+      export CLODEX_ANTHROPIC_PASSTHROUGH_BASE_URL="$CLODEX_CCS_BASE_URL"
+      unset ccs_token ANTHROPIC_API_KEY
+      ;;
+    native)
+      unset CLODEX_ANTHROPIC_PASSTHROUGH_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY
+      ;;
+    *) return 78 ;;
+  esac
+}
+
+check_clodex_runtime
 cd "$REMOTE_REPO" || exit
 if [ -n "$CODEXSWITCH_REMOTE_TTY_ROWS" ] && [ -n "$CODEXSWITCH_REMOTE_TTY_COLS" ]; then
   stty rows "$CODEXSWITCH_REMOTE_TTY_ROWS" cols "$CODEXSWITCH_REMOTE_TTY_COLS" 2>/dev/null || true
@@ -676,12 +1175,16 @@ if [ "$#" -eq 0 ]; then
       ;;
   esac
 fi
-case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-0}" in
+case "${CLAUDE_VPS_DANGEROUSLY_SKIP_PERMISSIONS:-1}" in
   1|true|yes|on) set -- --dangerously-skip-permissions "$@" ;;
 esac
 unset NO_COLOR
 apply_claude_renderer_env
+prepare_clodex_anthropic_backend
 if [ -n "$REMOTE_CLAUDE_SUBCOMMAND" ]; then
+  if [ "${CLAUDE_VPS_BACKEND_MODE:-native}" = "clodex" ]; then
+    exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" --proxy "$@"
+  fi
   exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$REMOTE_CLAUDE_SUBCOMMAND" "$@"
 fi
 exec env TERM="$TERM" COLORTERM="$REMOTE_COLORTERM" FORCE_COLOR="$REMOTE_FORCE_COLOR" CLAUDE_CODE_SCROLL_SPEED="$CLAUDE_CODE_SCROLL_SPEED" "$REMOTE_CLAUDE" "$@"
@@ -701,7 +1204,15 @@ else
 fi
 
 if [ "$#" -eq 0 ] && [ "$REMOTE_DISABLE_TMUX" != "1" ]; then
-  log "connecting to Claude Code on ${selected_host} in tmux session ${REMOTE_TMUX_SESSION} via ${selected_session_transport}..."
+  if [ "$REMOTE_BACKEND_MODE" = "clodex" ]; then
+    if [[ "$REMOTE_DANGEROUSLY_SKIP_PERMISSIONS" =~ ^(1|true|yes|on)$ ]]; then
+      log "connecting to Clodex-backed Claude Code on ${selected_host} in tmux session ${REMOTE_TMUX_SESSION} via ${selected_session_transport} (bypass permissions enabled)..."
+    else
+      log "connecting to Clodex-backed Claude Code on ${selected_host} in tmux session ${REMOTE_TMUX_SESSION} via ${selected_session_transport} (permission prompts enabled)..."
+    fi
+  else
+    log "connecting to Claude Code on ${selected_host} in tmux session ${REMOTE_TMUX_SESSION} via ${selected_session_transport}..."
+  fi
 elif [ "$#" -eq 0 ] && [[ "$REMOTE_CONTROL_DEFAULT" =~ ^(1|true|yes|on)$ ]]; then
   log "connecting to Claude Code Remote Control on ${selected_host} through CCS..."
 elif [ "$#" -eq 0 ]; then
@@ -711,6 +1222,12 @@ else
 fi
 
 refresh_claude_desktop_session_index "$@" >/dev/null 2>&1 &
+
+if [ "$selected_session_transport" = "cmux-ssh" ]; then
+  ssh "${selected_ssh_opts[@]}" "$selected_host" \
+    "CLAUDE_VPS_BOOTSTRAP_ONLY=1 $remote_command"
+  launch_cmux_managed_ssh
+fi
 
 if [ "$selected_session_transport" = "mosh" ]; then
   exec "$MOSH_BIN" --experimental-remote-ip=remote --predict="$MOSH_PREDICT" --ssh="$(mosh_ssh_command)" "$selected_host" -- /bin/bash -lc "$remote_command"

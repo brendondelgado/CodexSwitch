@@ -1,0 +1,23 @@
+#!/usr/bin/env zsh
+set -e
+
+claude_vps="${CLAUDE_VPS_BIN:-${HOME}/.local/bin/claude-vps}"
+real_ccs="${CCS_REAL_BIN:-/opt/homebrew/bin/ccs}"
+
+if [[ "${1:-}" == "claude-vps" ]]; then
+  shift
+  exec env \
+    CLAUDE_VPS_BACKEND_MODE=ccs \
+    "$claude_vps" "$@"
+fi
+
+if [[ "${1:-}" == "claude2" ]]; then
+  shift
+  exec env \
+    CLAUDE_VPS_BACKEND_MODE=ccs \
+    CLAUDE_VPS_TMUX_SESSION=claude-vps-ccs-2 \
+    CLAUDE_VPS_AUTO_CONTINUE=0 \
+    "$claude_vps" "$@"
+fi
+
+exec "$real_ccs" "$@"

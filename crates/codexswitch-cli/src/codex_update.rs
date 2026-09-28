@@ -415,7 +415,9 @@ fn prepare_version_with_lock_held(version: &str) -> Result<CodexUpdateReport> {
     let workspace = source_dir.join("codex-rs");
     let result = run_with_build_target_cleanup(&workspace, || -> Result<()> {
         checkout_stable_source(version, &source_dir)?;
+        apply_runtime_storage_source_patch(version, &source_dir)?;
         patch_codex_source(&source_dir)?;
+        verify_runtime_storage_source_patch(&source_dir)?;
         let built_binary = patched_codex::build_codex(&workspace)?;
         stage_and_validate_prepared_runtime(&built_binary, &prepared_dir, version)?;
         Ok(())
