@@ -67,7 +67,7 @@ struct AccountCardView: View {
 
     /// Caption for a quota reading older than the freshness contract. The cached
     /// windows stay visible for context but are explicitly labeled as not current.
-    static func staleQuotaLabel(
+    nonisolated static func staleQuotaLabel(
         for snapshot: QuotaSnapshot,
         pollingError: String?,
         now: Date
