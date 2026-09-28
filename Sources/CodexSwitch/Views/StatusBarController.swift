@@ -46,6 +46,12 @@ final class StatusBarController {
             : "\(target); Mac Runtime Not Current"
     }
 
+    /// Tooltip suffix marking a cached reading older than the freshness contract.
+    static func staleQuotaTooltipSuffix(for snapshot: QuotaSnapshot, now: Date) -> String {
+        QuotaFreshnessPolicy.staleAgeLabel(fetchedAt: snapshot.fetchedAt, now: now)
+            .map { " (stale, \($0))" } ?? ""
+    }
+
     /// Update the menu bar icon — circular ring with percentage
     func updateIcon() {
         guard let button = statusItem.button else { return }
@@ -79,15 +85,16 @@ final class StatusBarController {
             return
         }
 
+        let staleSuffix = Self.staleQuotaTooltipSuffix(for: snapshot, now: now)
         if snapshot.isDenied {
             let quota = snapshot.limitReached == true ? "quota exhausted" : "quota unavailable"
-            button.toolTip = "\(scope): \(quota)"
+            button.toolTip = "\(scope): \(quota)\(staleSuffix)"
             applyRingIcon(button: button, percent: 0, color: .systemRed, text: "!")
             return
         }
 
         guard let window = urgentWindow(from: snapshot) else {
-            button.toolTip = "\(scope): quota unknown"
+            button.toolTip = "\(scope): quota unknown\(staleSuffix)"
             applyRingIcon(button: button, percent: 0, color: .secondaryLabelColor, text: "--")
             return
         }
@@ -95,13 +102,14 @@ final class StatusBarController {
         let remaining = window.effectiveRemainingPercent
         let color: NSColor
         switch remaining {
+        case _ where !staleSuffix.isEmpty: color = .secondaryLabelColor
         case 50...: color = .systemGreen
         case 20..<50: color = .systemYellow
         case 5..<20: color = .systemOrange
         default: color = .systemRed
         }
 
-        button.toolTip = "\(scope): \(QuotaWindowDisplay.label(for: window)) \(Int(remaining))% remaining"
+        button.toolTip = "\(scope): \(QuotaWindowDisplay.label(for: window)) \(Int(remaining))% remaining\(staleSuffix)"
         applyRingIcon(button: button, percent: remaining, color: color, text: "\(Int(remaining))")
     }
 
