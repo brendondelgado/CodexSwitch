@@ -205,12 +205,17 @@ A connected T3 client is an initialized frontend of the daemon. The VPS
 external idle proof therefore cannot acknowledge a reload while T3 is
 connected; the daemon must complete the normal `account/updated` write.
 
-## Open Questions
+## Verified Behavior And Limits
 
-- Whether `thread/resume` applies per-thread `config` when the thread is
-  already loaded in the daemon by another client has not been verified. If it
-  does not, T3's MCP server is attached only when T3 is first to load the
-  thread.
-- Whether the daemon persists thread `config` (including the literal
-  Authorization header) into session metadata has not been verified. T3's
-  token is a per-thread capability for a loopback MCP server.
+Live probes against the VPS daemon (Codex 0.153.2, 2026-09-28):
+
+- Per-thread `config` on `thread/start` attaches the MCP server to that thread
+  only (`mcpServer/startupStatus/updated` carries the thread id).
+- A literal Authorization header passed in `config` was not written to
+  sessions, `state_5.sqlite`, or any other Codex store, so T3's per-thread token
+  is not persisted.
+- `thread/resume` needs a materialized rollout; a thread with no turns reports
+  `no rollout found`. Codex logs `... override was provided and ignored while
+  running` for a thread that is already loaded, so when another client (for
+  example ChatGPT) already has the thread loaded, T3 shares it without a writer
+  conflict but its MCP tools attach only if T3 loads the thread first.
