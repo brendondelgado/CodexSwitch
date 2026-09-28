@@ -1882,6 +1882,7 @@ struct LinuxDevboxMonitorTests {
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "quota-primed"))
         #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "subscription-info"))
         #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "authority-reconciliation"))
+        #expect(AppDelegate.shouldSyncLinuxDevboxCredentials(for: "authority-status"))
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "linux-devbox-interactive-sync"))
         #expect(!AppDelegate.shouldSyncLinuxDevboxCredentials(for: "token-refresh-failed"))
     }
@@ -1899,6 +1900,8 @@ struct LinuxDevboxMonitorTests {
         #expect(AppDelegate.linuxDevboxCredentialSyncThrottleInterval(for: "queued-after-quota-update") == 60)
         #expect(AppDelegate.linuxDevboxCredentialSyncThrottleInterval(for: "load-restore") == 10 * 60)
         #expect(AppDelegate.linuxDevboxCredentialSyncThrottleInterval(for: "authority-reconciliation") == 60)
+        #expect(!AppDelegate.shouldBypassLinuxDevboxCredentialSyncThrottle(for: "authority-status"))
+        #expect(AppDelegate.linuxDevboxCredentialSyncThrottleInterval(for: "authority-status") == 60)
     }
 
     @Test("reauth validation rejects auth failures but tolerates transient usage errors")
