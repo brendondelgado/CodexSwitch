@@ -39,6 +39,79 @@ struct AccountHostConvergencePresentation: Equatable, Sendable {
     let vps: AccountHostConvergenceState
 }
 
+/// Mac runtime state for the account whose credentials are committed on the
+/// Mac (`~/.codex/auth.json`).
+enum MacCredentialRuntimeState: Equatable, Sendable {
+    case confirmed
+    case activating
+    case restartRequired
+    case configuredOnly
+    case manualReview
+    case unconfirmed
+}
+
+/// The one read model behind every Mac presentation surface: menu-bar ring,
+/// tooltip, popover header, cards, and the current-account section.
+///
+/// "Current" is the account whose credentials are committed on the Mac, which
+/// is what local Codex runtimes draw from. The VPS pool target is shown
+/// separately, and only when it differs from the current account or is not
+/// freshly verified, so an exhausted previous account is never presented as
+/// current after `auth.json` was committed to another account.
+struct AccountDisplayReadModel: Equatable, Sendable {
+    let currentAccountId: UUID?
+    let currentEmail: String?
+    let currentIsAmbiguous: Bool
+    let macRuntime: MacCredentialRuntimeState
+    let poolTargetAccountId: UUID?
+    let poolTargetEmail: String?
+    let poolTargetFreshness: ActiveAccountAuthorityFreshness
+    let poolTargetObservedAt: Date?
+    let unmanagedRuntimes: [CodexUnmanagedRuntime]
+    let now: Date
+
+    var showsPoolTargetSeparately: Bool {
+        poolTargetFreshness != .current || poolTargetAccountId != currentAccountId
+    }
+
+    var poolTargetNote: String? {
+        guard showsPoolTargetSeparately else { return nil }
+        switch poolTargetFreshness {
+        case .unavailable:
+            return "VPS target unavailable"
+        case .current:
+            return "VPS target: \(poolTargetEmail ?? "unknown account")"
+        case .stale:
+            let name = poolTargetEmail ?? "unknown account"
+            guard let poolTargetObservedAt else {
+                return "VPS target: \(name) (stale)"
+            }
+            let age = now.timeIntervalSince(poolTargetObservedAt)
+            if age > PoolAuthorityObservation.maximumFreshnessAge {
+                return "VPS target: \(name) (stale \(Self.compactAge(age)))"
+            }
+            return "VPS target: \(name) (VPS not verified)"
+        }
+    }
+
+    var unmanagedRuntimeWarning: String? {
+        guard let first = unmanagedRuntimes.first else { return nil }
+        let more = unmanagedRuntimes.count > 1
+            ? " (+\(unmanagedRuntimes.count - 1) more)"
+            : ""
+        return "Unmanaged Codex runtime pid \(first.pid) (\(first.host): \(first.command)) "
+            + "is still using the previous account — restart it to switch\(more)"
+    }
+
+    static func compactAge(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval))
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m" }
+        if seconds < 86_400 { return "\(seconds / 3_600)h" }
+        return "\(seconds / 86_400)d"
+    }
+}
+
 @MainActor @Observable
 final class AccountManager {
     var accounts: [CodexAccount] = []
@@ -91,6 +164,66 @@ final class AccountManager {
             epoch: retainedPoolAuthorityObservation.epoch,
             freshness: .stale
         )
+    }
+
+    /// The account whose credentials are committed on the Mac. Contradictory
+    /// local active flags fail closed to no current account.
+    var macCommittedAccount: CodexAccount? {
+        let active = accounts.filter(\.isActive)
+        return active.count == 1 ? active[0] : nil
+    }
+
+    func displayReadModel(at now: Date = Date()) -> AccountDisplayReadModel {
+        let readModel = activeAccountReadModel(at: now)
+        let current = macCommittedAccount
+        let poolTarget = logicalActiveAccount(using: readModel)
+        let observation = poolAuthorityObservation ?? retainedPoolAuthorityObservation
+        return AccountDisplayReadModel(
+            currentAccountId: current?.id,
+            currentEmail: current?.email,
+            currentIsAmbiguous: current == nil
+                && accounts.filter(\.isActive).count > 1,
+            macRuntime: current.map {
+                Self.macCredentialRuntimeState(
+                    activationState,
+                    accountId: $0.id,
+                    now: now
+                )
+            } ?? .unconfirmed,
+            poolTargetAccountId: poolTarget?.id,
+            poolTargetEmail: poolTarget?.email,
+            poolTargetFreshness: readModel.freshness,
+            poolTargetObservedAt: readModel.freshness == .unavailable
+                ? nil
+                : observation?.observedAt,
+            unmanagedRuntimes: unmanagedRuntimeWarnings,
+            now: now
+        )
+    }
+
+    nonisolated static func macCredentialRuntimeState(
+        _ state: AccountActivationState?,
+        accountId: UUID,
+        now: Date
+    ) -> MacCredentialRuntimeState {
+        guard let state, state.configuredAccountId == accountId else {
+            return .unconfirmed
+        }
+        if state.runtimeIsCurrent(for: accountId, at: now) {
+            return .confirmed
+        }
+        switch state.phase {
+        case .preparing:
+            return .activating
+        case .committedDegraded where state.detail == .noLocalRuntime:
+            return .configuredOnly
+        case .committedDegraded:
+            return .restartRequired
+        case .manualReview:
+            return .manualReview
+        case .confirmed:
+            return .unconfirmed
+        }
     }
 
     func logicalActiveAccount(
@@ -398,20 +531,26 @@ final class AccountManager {
 
     var sortedAccounts: [CodexAccount] {
         let now = Date()
-        let readModel = activeAccountReadModel(at: now)
-        return sortedAccounts(using: readModel, now: now)
+        return sortedAccounts(using: displayReadModel(at: now), now: now)
     }
 
     func sortedAccounts(
-        using readModel: ActiveAccountReadModel,
+        using displayModel: AccountDisplayReadModel,
+        now: Date
+    ) -> [CodexAccount] {
+        sortedAccounts(currentAccountId: displayModel.currentAccountId, now: now)
+    }
+
+    func sortedAccounts(
+        currentAccountId: UUID?,
         now: Date
     ) -> [CodexAccount] {
         return accounts.sorted { a, b in
             // Display tiers stay fixed even when a higher plan is unavailable.
             if a.planPriority != b.planPriority { return a.planPriority > b.planPriority }
-            let aIsPoolTarget = isPoolTarget(a, using: readModel)
-            let bIsPoolTarget = isPoolTarget(b, using: readModel)
-            if aIsPoolTarget != bIsPoolTarget { return aIsPoolTarget }
+            let aIsCurrent = currentAccountId != nil && a.id == currentAccountId
+            let bIsCurrent = currentAccountId != nil && b.id == currentAccountId
+            if aIsCurrent != bIsCurrent { return aIsCurrent }
             let aImmediatelyUsable = SwapEngine.isImmediatelyUsable(a, now: now)
             let bImmediatelyUsable = SwapEngine.isImmediatelyUsable(b, now: now)
             if aImmediatelyUsable != bImmediatelyUsable {

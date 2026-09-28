@@ -90,11 +90,11 @@ struct AccountManagerTests {
 
         #expect(!SwapEngine.isImmediatelyUsable(pro, now: now))
         #expect(SwapEngine.isImmediatelyUsable(free, now: now))
-        #expect(manager.sortedAccounts(using: .unavailable, now: now).map(\.id) == [pro.id, free.id])
+        #expect(manager.sortedAccounts(currentAccountId: nil, now: now).map(\.id) == [pro.id, free.id])
         #expect(SwapEngine.rankedEligibleCandidates(from: manager.accounts, now: now).isEmpty)
     }
 
-    @Test("Sorted accounts keep exhausted Pro above an active Free pool target")
+    @Test("Sorted accounts keep exhausted Pro above an active Free current account")
     func sortedAccountsKeepExhaustedProAboveActiveFree() throws {
         let manager = AccountManager()
         let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -108,7 +108,7 @@ struct AccountManagerTests {
 
         #expect(!SwapEngine.isImmediatelyUsable(pro, now: now))
         #expect(SwapEngine.isImmediatelyUsable(free, now: now))
-        #expect(manager.sortedAccounts(using: readModel, now: now).map(\.id) == [pro.id, plus.id, free.id])
+        #expect(manager.sortedAccounts(currentAccountId: free.id, now: now).map(\.id) == [pro.id, plus.id, free.id])
         #expect(manager.logicalActiveAccount(using: readModel)?.id == free.id)
         #expect(SwapEngine.rankedEligibleCandidates(from: manager.accounts, now: now).map(\.id) == [plus.id])
         #expect(manager.accounts.map(\.id) == [free.id, plus.id, pro.id])
@@ -126,7 +126,7 @@ struct AccountManagerTests {
         manager.accounts = [free, plus, pro]
 
         #expect(pro.requiresReauthentication(at: now))
-        #expect(manager.sortedAccounts(using: .unavailable, now: now).map(\.id) == [pro.id, plus.id, free.id])
+        #expect(manager.sortedAccounts(currentAccountId: nil, now: now).map(\.id) == [pro.id, plus.id, free.id])
         #expect(SwapEngine.rankedEligibleCandidates(from: manager.accounts, now: now).map(\.id) == [plus.id])
     }
 
@@ -152,10 +152,10 @@ struct AccountManagerTests {
         }
         manager.accounts = groups.reversed().flatMap { $0 }
 
-        #expect(manager.sortedAccounts(using: .unavailable, now: now).map(\.id) == groups.flatMap { $0 }.map(\.id))
+        #expect(manager.sortedAccounts(currentAccountId: nil, now: now).map(\.id) == groups.flatMap { $0 }.map(\.id))
     }
 
-    @Test("Sorted accounts preserve target, usability, score, and reset ordering within a tier")
+    @Test("Sorted accounts preserve current, usability, score, and reset ordering within a tier")
     func sortedAccountsPreserveWithinTierOrdering() throws {
         let manager = AccountManager()
         let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -174,7 +174,7 @@ struct AccountManagerTests {
         let readModel = ActiveAccountReadModel(providerAccountId: try #require(target.normalizedProviderAccountId), epoch: 1, freshness: .current)
         manager.accounts = [unavailable, laterReset, earlierReset, higherScore, target]
 
-        #expect(manager.sortedAccounts(using: readModel, now: now).map(\.id) == [
+        #expect(manager.sortedAccounts(currentAccountId: target.id, now: now).map(\.id) == [
             target.id, higherScore.id, earlierReset.id, laterReset.id, unavailable.id,
         ])
     }
@@ -190,7 +190,7 @@ struct AccountManagerTests {
 
         for accounts in [[first, second], [second, first]] {
             manager.accounts = accounts
-            #expect(manager.sortedAccounts(using: .unavailable, now: now).map(\.id) == accounts.map(\.id))
+            #expect(manager.sortedAccounts(currentAccountId: nil, now: now).map(\.id) == accounts.map(\.id))
         }
     }
 

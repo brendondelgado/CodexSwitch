@@ -271,17 +271,56 @@ struct PopoverContentView: View {
         hostConvergenceLabel(host: "VPS", state: state)
     }
 
-    static func poolTargetLabel(
-        for freshness: ActiveAccountAuthorityFreshness
+    static let currentAccountLabel = "Current (Mac)"
+
+    static func missingCurrentAccountLabel(
+        for display: AccountDisplayReadModel
     ) -> String {
-        switch freshness {
-        case .current:
-            return "Pool Target"
-        case .stale:
-            return "Pool Target"
-        case .unavailable:
-            return "Pool Target unavailable"
+        display.currentIsAmbiguous
+            ? "Mac committed account is ambiguous"
+            : "No account committed on this Mac"
+    }
+
+    /// Divergence notices shown under the header: the VPS target when it
+    /// differs from the current account or is not freshly verified, and any
+    /// unmanaged runtime that still uses the previous credentials.
+    static func syncNotices(for display: AccountDisplayReadModel) -> [String] {
+        [display.poolTargetNote, display.unmanagedRuntimeWarning].compactMap { $0 }
+    }
+
+    static func macConvergenceState(
+        for runtime: MacCredentialRuntimeState
+    ) -> AccountHostConvergenceState {
+        switch runtime {
+        case .confirmed:
+            return .converged
+        case .activating:
+            return .pending
+        case .restartRequired, .configuredOnly, .manualReview:
+            return .degraded
+        case .unconfirmed:
+            return .unknown
         }
+    }
+
+    /// Mac state always describes the current account. VPS state reuses the
+    /// pool-target presentation when the target is the current account;
+    /// otherwise the VPS is targeting a different account.
+    static func hostConvergence(
+        for display: AccountDisplayReadModel,
+        poolTargetPresentation: AccountHostConvergencePresentation?
+    ) -> AccountHostConvergencePresentation {
+        let mac = macConvergenceState(for: display.macRuntime)
+        if let poolTargetPresentation {
+            return AccountHostConvergencePresentation(
+                mac: mac,
+                vps: poolTargetPresentation.vps
+            )
+        }
+        return AccountHostConvergencePresentation(
+            mac: mac,
+            vps: display.poolTargetFreshness == .unavailable ? .unavailable : .degraded
+        )
     }
 
     private static func hostConvergenceLabel(
@@ -373,12 +412,12 @@ struct PopoverContentView: View {
     var body: some View {
         let _ = manager.uiRefreshRevision
         let now = Date()
-        let activeAccountReadModel = manager.activeAccountReadModel(at: now)
-        let logicalActiveAccount = manager.logicalActiveAccount(
-            using: activeAccountReadModel
-        )
+        let display = manager.displayReadModel(at: now)
+        let currentAccount = manager.accounts.first {
+            $0.id == display.currentAccountId
+        }
         let displayedAccounts = manager.sortedAccounts(
-            using: activeAccountReadModel,
+            using: display,
             now: now
         )
         let resetOverviewItems = RateLimitResetOverviewItem.make(
@@ -391,15 +430,14 @@ struct PopoverContentView: View {
                 Text("CodexSwitch")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                if let configured = logicalActiveAccount {
-                    Text("\(Self.poolTargetLabel(for: activeAccountReadModel.freshness)): \(configured.email)")
+                if let current = currentAccount {
+                    Text("\(Self.currentAccountLabel): \(current.email)")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .truncationMode(.middle)
                 } else {
-                    Text(Self.poolTargetLabel(
-                        for: activeAccountReadModel.freshness
-                    ))
+                    Text(Self.missingCurrentAccountLabel(for: display))
                     .font(.system(size: 10))
                     .foregroundStyle(.orange)
                     .lineLimit(1)
@@ -421,6 +459,22 @@ struct PopoverContentView: View {
             .padding(.horizontal, 12)
             .padding(.top, 10)
             .padding(.bottom, 6)
+
+            ForEach(Self.syncNotices(for: display), id: \.self) { notice in
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                    Text(notice)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.orange)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+            }
 
             // Connection status banner
             let status = connectionStatus
@@ -467,11 +521,9 @@ struct PopoverContentView: View {
                             ForEach(displayedAccounts) { account in
                                 AccountCardView(
                                     account: account,
-                                    isConfigured: manager.isPoolTarget(
-                                        account,
-                                        using: activeAccountReadModel
-                                    ),
-                                    poolTargetFreshness: activeAccountReadModel.freshness,
+                                    isConfigured: account.id == display.currentAccountId,
+                                    isVPSTarget: display.showsPoolTargetSeparately
+                                        && account.id == display.poolTargetAccountId,
                                     pollingError: manager.vpsReauthenticationNotice(
                                         for: account,
                                         now: now
@@ -515,13 +567,18 @@ struct PopoverContentView: View {
                     }
 
                     // Current account + CLI status + Next up
-                    if let active = logicalActiveAccount {
+                    if let active = currentAccount {
                         let cliStatus = CLIStatusChecker.cachedCLIStatus
                         let desktopStatus = CLIStatusChecker.cachedDesktopStatus
-                        let runtimeCurrent = manager.runtimeCurrentAccount?.id == active.id
-                        let convergence = manager.hostConvergencePresentation(
-                            forPoolTarget: active,
-                            now: now
+                        let runtimeCurrent = display.macRuntime == .confirmed
+                        let convergence = Self.hostConvergence(
+                            for: display,
+                            poolTargetPresentation: display.poolTargetAccountId == active.id
+                                ? manager.hostConvergencePresentation(
+                                    forPoolTarget: active,
+                                    now: now
+                                )
+                                : nil
                         )
                         Divider()
 
@@ -531,9 +588,7 @@ struct PopoverContentView: View {
                                 .foregroundStyle(.green)
                                 .font(.system(size: 11))
                             VStack(alignment: .leading, spacing: 1) {
-                                Text(Self.poolTargetLabel(
-                                    for: activeAccountReadModel.freshness
-                                ))
+                                Text(Self.currentAccountLabel)
                                     .font(.system(size: 8.5, weight: .medium))
                                     .foregroundStyle(.secondary)
                                 Text(active.email)
@@ -617,8 +672,8 @@ struct PopoverContentView: View {
                                             .font(.system(size: 9, weight: .semibold))
                                     }
                                     .buttonStyle(.plain)
-                                    .help("Retry pool target convergence")
-                                    .accessibilityLabel("Retry pool target convergence")
+                                    .help("Retry Mac runtime convergence")
+                                    .accessibilityLabel("Retry Mac runtime convergence")
                                 }
                                 Spacer(minLength: 0)
                             }
@@ -726,7 +781,7 @@ struct PopoverContentView: View {
                         .padding(.bottom, 6)
                     } else if let nextReset = Self.nextWeeklyResetAccount(
                         from: manager.accounts,
-                        activeProviderAccountId: activeAccountReadModel.providerAccountId
+                        activeProviderAccountId: currentAccount?.normalizedProviderAccountId
                     ) {
                         // All accounts weekly-exhausted — show which resets first
                         HStack(spacing: 6) {
