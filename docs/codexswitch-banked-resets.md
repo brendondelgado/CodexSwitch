@@ -153,7 +153,10 @@ Manual CLI redemption remains an explicit operator-controlled recovery through
 `redeem-reset <account>`. That command accepts one exact blocked paid account,
 requires its complete runtime credential set and normalized stable provider
 identity, consumes at most one credit, never activates the account, and replays
-an existing uncertain journal without submitting a second credit.
+an existing uncertain journal without submitting a second credit. It runs only
+on the VPS authority; the macOS CLI refuses it before any store, journal, or
+provider access (see the Manual Redemption contract in
+`architecture/quota-and-reset-policy.md`).
 
 Running two automatic owners is a correctness failure even though each consume
 request has its own idempotency key. Two owners can select different available
