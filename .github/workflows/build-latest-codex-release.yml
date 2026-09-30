@@ -1,0 +1,68 @@
+name: Build runtimes for the latest Codex release
+
+# Pre-build the Linux and macOS runtime artifacts as soon as a new stable Codex
+# release appears (or main changes), so deploys never wait on a cold compile and
+# patch breakage on a new upstream release surfaces immediately.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: build-latest-codex-release
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Dispatch missing runtime builds for main and the latest stable Codex
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api 'repos/openai/codex/releases?per_page=30' --jq \
+            '[.[] | select(.draft == false and .prerelease == false
+                    and (.tag_name | test("^rust-v[0-9]+\\.[0-9]+\\.[0-9]+$")))][0].tag_name')"
+          if [[ ! "$tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::no stable upstream Codex release tag found"
+            exit 1
+          fi
+          version="${tag#rust-v}"
+          read -r object_type object_sha < <(
+            gh api "repos/openai/codex/git/ref/tags/$tag" --jq '.object.type + " " + .object.sha'
+          )
+          if [[ "$object_type" == "tag" ]]; then
+            object_sha="$(gh api "repos/openai/codex/git/tags/$object_sha" --jq '.object.sha')"
+          fi
+          if [[ ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not peel $tag to a commit"
+            exit 1
+          fi
+          main_sha="$(gh api "repos/$REPOSITORY/commits/main" --jq '.sha')"
+          echo "latest stable Codex $version ($object_sha); main $main_sha"
+
+          for workflow in build-linux-runtime.yml build-fork.yml; do
+            # Build runs are named "<workflow> codex <version> @ <sha>". Any earlier
+            # run for this pair, including a failed one, suppresses a re-dispatch so
+            # a broken patch reports once instead of hourly.
+            if gh run list --repo "$REPOSITORY" --workflow "$workflow" \
+                --event workflow_dispatch --limit 100 --json displayTitle \
+                --jq '.[].displayTitle' \
+                | grep -Fq "codex $version @ $main_sha"; then
+              echo "$workflow already built codex $version @ $main_sha"
+              continue
+            fi
+            gh workflow run "$workflow" --repo "$REPOSITORY" --ref main \
+              -f codexswitch_git_sha="$main_sha" \
+              -f upstream_codex_version="$version" \
+              -f upstream_codex_git_sha="$object_sha"
+            echo "dispatched $workflow for codex $version @ $main_sha"
+          done
