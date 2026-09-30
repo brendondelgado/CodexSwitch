@@ -422,13 +422,17 @@ strict ACK proves backend convergence and a completed outbound transport write.
 An `external-app-server` with an eligible frontend requires positive completed
 frontend delivery. An idle current-release Linux VPS SSH/Unix listener may
 acknowledge only after it reloads the exact requested credential generation,
-reports zero initialized, skipped, eligible, rejected, and completed frontend
-writes, and marks itself ready for the next client. The retired Mac bridge wire kind may decode in historical
+reports zero eligible, rejected, and completed frontend writes, and marks itself
+ready for the next client. Initialized frontends may be present only as skipped
+frontends that opted out of `account/updated`, such as a ChatGPT remote-control
+client of the shared daemon; none of them is waiting for the write, and
+requiring an empty listener would leave the rotation `CommittedDegraded` for as
+long as remote control stays connected. The retired Mac bridge wire kind may decode in historical
 artifacts but can never classify a live runtime or authorize a signal.
 A positively classified `headless-remote-control-app-server` keeps its broader
 idle-listener policy because it has no desktop renderer contract; that separate
 policy may account for disconnected historical connections and is not the
-managed bridge's exact all-zero exception.
+managed bridge's opted-out-only exception.
 Interactive CLI ACKs carry no frontend accounting values. Canonical serializers
 omit all four keys; decoders also treat explicit JSON `null` as no value for
 backward-compatible parsing.

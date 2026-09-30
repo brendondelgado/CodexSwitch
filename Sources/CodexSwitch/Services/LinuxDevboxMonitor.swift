@@ -1197,7 +1197,7 @@ enum LinuxDevboxMonitor {
         let status: String
         let disposition: RemoteManualResetFailureDisposition
         let message: String
-        let accountId: String
+        let accountId: String?
         let requestId: UUID?
         let blockingRequestId: UUID?
     }
@@ -2637,8 +2637,17 @@ enum LinuxDevboxMonitor {
             guard response.schemaVersion == remoteManualResetFailureSchemaVersion,
                   response.status == "error",
                   let expected = normalizedRemoteProviderAccountId(expectedProviderAccountId),
-                  normalizedRemoteProviderAccountId(response.accountId) == expected,
                   expectedRequestID == nil || response.requestId == expectedRequestID else {
+                return fallback
+            }
+            // The VPS refuses some requests (for example an unconfirmed activation
+            // barrier) before it resolves the account, so the envelope has no
+            // account. Our own request ID still binds that refusal to this request.
+            let refusedBeforeAccountResolution = response.accountId == nil
+                && response.disposition == .rejected
+                && expectedRequestID != nil
+            guard refusedBeforeAccountResolution
+                    || response.accountId.flatMap(normalizedRemoteProviderAccountId) == expected else {
                 return fallback
             }
             switch response.disposition {

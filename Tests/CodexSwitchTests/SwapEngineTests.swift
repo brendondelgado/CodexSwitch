@@ -2451,7 +2451,7 @@ struct SwapEngineTests {
         }
     }
 
-    @Test("Managed bridge idle ACK exception is exact and external remains strict")
+    @Test("Managed bridge idle ACK requires no frontend awaiting the write; external remains strict")
     func managedBridgeIdleAcknowledgementIsStrictlyScoped() {
         let now: Int64 = 1_500_200
         let externalBinding = reloadBinding(
@@ -2513,12 +2513,16 @@ struct SwapEngineTests {
             candidate(managedBinding, 0, 0, 0, 0, false, 0, true)
         ))
 
-        let nonEmptyIdleShapes = [
-            candidate(managedBinding, 1, 1, 0, 0, false, 0, true),
+        // A frontend that opted out of account/updated is not awaiting the write.
+        #expect(isValid(
+            managedBinding,
+            candidate(managedBinding, 1, 1, 0, 0, false, 0, true)
+        ))
+        let awaitingWriteIdleShapes = [
             candidate(managedBinding, 1, 0, 0, 1, false, 0, true),
             candidate(managedBinding, 1, 0, 1, 0, false, 0, true),
         ]
-        for acknowledgement in nonEmptyIdleShapes {
+        for acknowledgement in awaitingWriteIdleShapes {
             #expect(!isValid(managedBinding, acknowledgement))
         }
 

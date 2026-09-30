@@ -3103,7 +3103,7 @@ enum SwapEngine {
         case .managedDesktopBridge:
             return externalAppServerAcknowledgementIsValid(
                 acknowledgement,
-                idlePolicy: .zeroInitializedFrontends
+                idlePolicy: .noFrontendAwaitingWrite
             )
         case .headlessRemoteControlAppServer:
             return externalAppServerAcknowledgementIsValid(
@@ -3125,7 +3125,8 @@ enum SwapEngine {
 
     private enum AppServerIdlePolicy {
         case never
-        case zeroInitializedFrontends
+        /// Idle only when every initialized frontend opted out of `account/updated`.
+        case noFrontendAwaitingWrite
         case noEligibleFrontends
     }
 
@@ -3159,8 +3160,8 @@ enum SwapEngine {
         let idleCountsAreAllowed = switch idlePolicy {
         case .never:
             false
-        case .zeroInitializedFrontends:
-            initialized == 0 && skipped == 0 && eligible == 0 && rejected == 0
+        case .noFrontendAwaitingWrite:
+            eligible == 0 && rejected == 0
         case .noEligibleFrontends:
             eligible == 0
         }

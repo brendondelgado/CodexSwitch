@@ -146,6 +146,27 @@ At 2026-09-28 07:55 UTC:
   deploy I/O load.
 - Linux releases do not record `installedVersion` in the updater state.
 
+## Follow-up 2026-09-29: Stuck Rotation Blocked Every Redeem
+
+- Symptom: a CodexSwitch redeem stayed "reconciling", a T3 redeem looked
+  successful, and no reset was spent. Both were refused with
+  `provider I/O is blocked by unresolved activation state CommittedDegraded`.
+- Cause: the VPS rotation to bd7349 (19:40Z) never confirmed. The shared daemon
+  logged `strict app-server has no eligible frontend writer` every minute: its
+  only initialized frontend was a ChatGPT remote-control client that opts out of
+  `account/updated`, and `external-app-server` acks required zero initialized
+  frontends. The rule now requires only that no frontend is awaiting the write
+  (zero eligible and zero rejected), in the runtime template, `reload.rs`, and
+  `SwapEngine`.
+- The Mac decoded the VPS refusal as `outcomeUnknown` because a refusal issued
+  before account resolution has `accountId: null`. A null-account `rejected`
+  envelope is now accepted when it carries the Mac's own request ID.
+- T3 received HTTP 409 from the hub but did not surface it clearly.
+- Quit could hang invisibly: the termination flush had no deadline, so the
+  process kept the single-instance lock with no status item. The flush is now
+  bounded to 3 s. The Restart helper waits up to 30 s for the old process,
+  retries `open` three times, and logs success or failure.
+
 ## Rollback
 
 - VPS: `~/.local/share/codexswitch/previous` points at the prior release. Follow
