@@ -531,6 +531,7 @@ fn patch_app_server_reload_template(
         })?;
         let in_process_anchors: &[&str] = if in_process_source
             .contains(SHARED_IN_PROCESS_AUTH_ANCHOR)
+            || in_process_source.contains("let auth_manager = bootstrap::configure(\n        &config_manager,\n        &mut args.config,\n        args.enable_codex_api_key_env,\n    )\n    .await?;")
         {
             &[SHARED_IN_PROCESS_OUTGOING_ANCHOR]
         } else {

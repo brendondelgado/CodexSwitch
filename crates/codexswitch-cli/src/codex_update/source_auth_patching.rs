@@ -2,9 +2,9 @@ fn patch_auth_manager_source(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    patch_file_after(
+    patch_file_after_any(
         path,
-        "use serde::Serialize;",
+        &["use serde::Serialize;", "use serde::Deserialize;"],
         r#"
 use sha2::Digest;
 use sha2::Sha256;"#,
@@ -222,6 +222,7 @@ use std::sync::atomic::Ordering;"#,
         "pub async fn codexswitch_reload_auth_json_verified",
     )?;
     normalize_auth_route_config_reference(path)?;
+    patch_auth_change_state_notifications(path)?;
     patch_file_after(
         path,
         "impl AuthDotJson {",
@@ -264,14 +265,17 @@ use std::sync::atomic::Ordering;"#,
 "#,
         "self.tokens.as_ref()?.account_id.as_deref()?",
     )?;
-    patch_file_after(
+    patch_file_after_any(
         path,
-        "            tracing::info!(\"Reloaded auth, changed: {changed}\");\n            guard.auth = new_auth;",
+        &[
+            "            tracing::info!(\"Reloaded auth, changed: {changed}\");\n            guard.auth = new_auth;",
+            "        tracing::info!(\"Reloaded auth, changed: {changed}\");\n        guard.auth = new_auth;",
+        ],
         r#"
             if auth_changed_for_refresh {
                 self.auth_generation.fetch_add(1, Ordering::AcqRel);
             }"#,
-        "self.auth_generation.fetch_add",
+        "guard.auth = new_auth;\n            if auth_changed_for_refresh {\n                self.auth_generation.fetch_add",
     )?;
     Ok(())
 }
@@ -362,4 +366,49 @@ fn normalize_auth_route_config_reference(path: &Path) -> Result<()> {
         "unsupported AuthManager route configuration shape in {}",
         path.display()
     )
+}
+
+// New upstream publishes owner changes and invalidates owner-bound networking.
+fn patch_auth_change_state_notifications(path: &Path) -> Result<()> {
+    let content = fs::read_to_string(path)?;
+    if !content.contains("auth_change_state_tx: watch::Sender<AuthChangeState>") {
+        return Ok(());
+    }
+    patch_file_before(
+        path,
+        "        let active_auth_hash = new_auth",
+        r#"        let allowed_login_methods = self.allowed_login_methods();
+        let effective_chatgpt_workspaces = self.effective_chatgpt_workspaces();
+        validate_auth_restrictions(
+            Some(&allowed_login_methods),
+            effective_chatgpt_workspaces.as_deref(),
+            &new_auth,
+        ).map_err(std::io::Error::other)?;
+"#,
+        "            &new_auth,\n        ).map_err(std::io::Error::other)?;",
+    )?;
+    patch_file_before(
+        path,
+        "        if changed_for_refresh {\n            cached.permanent_refresh_failure = None;",
+        r#"        let owner_changed = changed_for_refresh
+            && !same_owner(cached.auth.as_ref(), Some(&new_auth));
+        if owner_changed {
+            self.auth_route_config.http_client_factory().network_policy().invalidate();
+        }
+"#,
+        "&& !same_owner(cached.auth.as_ref(), Some(&new_auth))",
+    )?;
+    patch_file_after(
+        path,
+        "            self.auth_generation.fetch_add(1, Ordering::AcqRel);",
+        r#"
+            self.auth_change_state_tx.send_modify(|state| {
+                state.generation += 1;
+                if owner_changed {
+                    state.owner_generation += 1;
+                }
+            });"#,
+        "            self.auth_generation.fetch_add(1, Ordering::AcqRel);\n            self.auth_change_state_tx",
+    )?;
+    Ok(())
 }

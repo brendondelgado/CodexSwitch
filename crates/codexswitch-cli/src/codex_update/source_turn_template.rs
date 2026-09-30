@@ -280,6 +280,15 @@ fn patch_turn_auth_retry(path: &Path, direct_error_replacement: &str) -> Result<
         content.replacen(DIRECT_ERROR_ANCHOR, direct_error_replacement, 1)
     } else if content.contains(ERROR_DETAILS_ANCHOR) {
         content.replacen(ERROR_DETAILS_ANCHOR, ERROR_DETAILS_REPLACEMENT, 1)
+    } else if content.contains(&ERROR_DETAILS_ANCHOR.replace(
+        "if original_input.is_none() {",
+        "let original_input = original_input.get_or_insert(prompt.input);",
+    )) {
+        content.replacen(
+            &ERROR_DETAILS_ANCHOR.replace("if original_input.is_none() {", "let original_input = original_input.get_or_insert(prompt.input);"),
+            &ERROR_DETAILS_REPLACEMENT.replace("if original_input.is_none() {", "let original_input = original_input.get_or_insert(prompt.input);"),
+            1,
+        )
     } else {
         bail!(
             "authentication retry patch anchor not found in {}",

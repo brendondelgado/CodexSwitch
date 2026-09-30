@@ -13,6 +13,67 @@ fn patch_app_server_daemon_source(managed_install: &Path, update_loop: &Path) ->
         );
     }
 
+    let managed_source = fs::read_to_string(managed_install)?;
+    if managed_source.contains("let root = package_root(codex_home);") {
+        replace_source_anchor_once(
+            managed_install,
+            r#"pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
+    let root = package_root(codex_home);
+    let current = root.join("current");
+    let packaged = current.join("bin").join(managed_codex_file_name());
+    let legacy = current.join(managed_codex_file_name());
+    if packaged.is_file()
+        || !legacy.is_file() && (cfg!(windows) || root.ends_with("app-server-daemon"))
+    {
+        packaged
+    } else {
+        legacy
+    }
+}"#,
+            r#"#[cfg(target_os = "linux")]
+pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
+    // codexswitch-managed-daemon-current-v1
+    let Some(home) = std::env::var_os("HOME") else {
+        return codex_home.join("codexswitch-managed-runtime-home-unavailable");
+    };
+    PathBuf::from(home).join(".local/share/codexswitch/current/patched-codex/codex")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
+    let root = package_root(codex_home);
+    let current = root.join("current");
+    let packaged = current.join("bin").join(managed_codex_file_name());
+    let legacy = current.join(managed_codex_file_name());
+    if packaged.is_file()
+        || !legacy.is_file() && (cfg!(windows) || root.ends_with("app-server-daemon"))
+    {
+        packaged
+    } else {
+        legacy
+    }
+}"#,
+            MANAGED_DAEMON_RUNTIME_MARKER,
+        )?;
+        // Scheduled, manual, and migration paths share this fetch boundary.
+        // Refuse before downloading or executing an unmanaged installer.
+        return replace_source_anchor_once(
+            update_loop,
+            r#"async fn fetch_installer_script(http: &impl InstallerHttp) -> Result<Vec<u8>> {
+    match http.get(INSTALL_URL).await? {
+        InstallerResponse::Success(body) => Ok(body),
+        InstallerResponse::Unsuccessful { status } => {
+            anyhow::bail!("standalone Codex updater request failed with status {status}")
+        }
+    }
+}"#,
+            r#"async fn fetch_installer_script(_http: &impl InstallerHttp) -> Result<Vec<u8>> {
+    // codexswitch-managed-daemon-no-standalone-update-v1
+    anyhow::bail!("CodexSwitch owns runtime updates. Use the reviewed release installer.")
+}"#,
+            MANAGED_DAEMON_UPDATE_MARKER,
+        );
+    }
     replace_source_anchor_once(
         managed_install,
         r#"pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {

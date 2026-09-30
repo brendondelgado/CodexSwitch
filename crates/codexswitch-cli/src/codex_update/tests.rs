@@ -3530,6 +3530,30 @@ fn timestamped_server_notification(notification: ServerNotification) -> Outgoing
     }
 
     #[test]
+    fn preparation_retry_reports_latest_failure_and_backoff_after_round_trip() {
+        let now = automatic_update_test_time();
+        let mut state = automatic_update_test_state(UpdateStatus::Failed, now);
+        state.error = Some("git clone failed".to_string());
+        state.failed_prepare_version = Some("0.159.2".to_string());
+        state.prepare_retry_not_before = Some(now + ChronoDuration::hours(6));
+        record_unresolved_failure(&mut state, UpdateFailureKind::Preparation, now,
+            Some("0.159.2".to_string()), None);
+        let retry_at = now + ChronoDuration::hours(7);
+        state.error = Some("auth patch anchor missing".to_string());
+        state.prepare_retry_not_before = Some(retry_at + ChronoDuration::hours(6));
+        record_unresolved_failure(&mut state, UpdateFailureKind::Preparation, retry_at,
+            Some("0.159.2".to_string()), None);
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let mut restored: CodexUpdateState = serde_json::from_slice(&encoded).unwrap();
+        restore_unresolved_failure(&mut restored);
+        assert_eq!(restored.error.as_deref(), Some("auth patch anchor missing"));
+        assert_eq!(restored.prepare_retry_not_before, Some(retry_at + ChronoDuration::hours(6)));
+        assert_eq!(restored.unresolved_failure.as_ref().unwrap().failed_at, retry_at);
+        assert_eq!(restored.failed_prepare_version.as_deref(), Some("0.159.2"));
+        assert_eq!(restored.status, UpdateStatus::Failed);
+    }
+
+    #[test]
     fn preparation_failure_does_not_replace_prior_activation_failure() {
         let now = automatic_update_test_time();
         let mut state = automatic_update_test_state(UpdateStatus::Failed, now);
