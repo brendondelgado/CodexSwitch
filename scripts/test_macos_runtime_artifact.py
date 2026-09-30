@@ -99,9 +99,10 @@ class MacOsRuntimeArtifactContractTests(unittest.TestCase):
         )
         self.assertIn('rm -rf -- .build "$test_tmp"', swift_gate)
 
-    def test_workflow_uses_two_bounded_remote_cargo_jobs(self) -> None:
+    def test_workflow_uses_every_runner_core_for_cargo_jobs(self) -> None:
         workflow = WORKFLOW.read_text()
-        self.assertIn('CARGO_BUILD_JOBS: "2"', workflow)
+        self.assertIn('CARGO_BUILD_JOBS: "3"', workflow)
+        self.assertIn("RUSTC_WRAPPER=sccache", workflow)
         self.assertIn('--jobs "$CARGO_BUILD_JOBS"', workflow)
 
     def test_hot_swap_contract_runs_macos_runtime_workflow_assertions(self) -> None:

@@ -62,7 +62,8 @@ class LinuxRuntimeWorkflowContractTests(unittest.TestCase):
     def test_builds_patched_cli_and_fetches_exact_official_helper(self) -> None:
         self.assertIn("runs-on: ubuntu-24.04", self.workflow)
         self.assertIn("TARGET_TRIPLE: x86_64-unknown-linux-gnu", self.workflow)
-        self.assertIn('CARGO_BUILD_JOBS: "1"', self.workflow)
+        self.assertIn('CARGO_BUILD_JOBS: "4"', self.workflow)
+        self.assertIn("RUSTC_WRAPPER=sccache", self.workflow)
         self.assertIn('runner_arch" != "x86_64"', self.workflow)
         self.assertEqual(self.workflow.count("cargo build \\\n"), 2)
         self.assertEqual(

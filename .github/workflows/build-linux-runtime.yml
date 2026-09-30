@@ -1,5 +1,7 @@
 name: Build Linux x86_64 Runtime Artifact
 
+run-name: ${{ github.workflow }} codex ${{ inputs.upstream_codex_version }} @ ${{ inputs.codexswitch_git_sha }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -41,7 +43,7 @@ jobs:
     env:
       UPSTREAM_REPO_URL: https://github.com/openai/codex.git
       TARGET_TRIPLE: x86_64-unknown-linux-gnu
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "4"  # every runner core; host-local builds stay at one job
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       CARGO_INCREMENTAL: "0"
@@ -169,6 +171,20 @@ jobs:
           for command in cc file jq readelf sha256sum stat strings timeout; do
             command -v "$command" >/dev/null
           done
+
+      - name: Share compiled crates across Codex versions
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Route rustc through the content-addressed compiler cache
+        run: |
+          set -euo pipefail
+          # sccache keys on source contents, so it stays correct across upstream
+          # versions even though source mtimes are normalized to one epoch.
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "RUSTC_WRAPPER=sccache"
+          } >> "$GITHUB_ENV"
+          sccache --version
 
       - name: Restore remote Cargo downloads
         id: cargo_download_cache
@@ -450,6 +466,11 @@ jobs:
             --target "$TARGET_TRIPLE" \
             --jobs "$CARGO_BUILD_JOBS" \
             -p codex-cli
+
+      - name: Report compiler cache effectiveness
+        if: ${{ always() && inputs.base_runtime_run_id == '' }}
+        continue-on-error: true
+        run: sccache --show-stats
 
       - name: Reuse an attested unchanged upstream Linux codex
         if: ${{ inputs.base_runtime_run_id != '' }}
