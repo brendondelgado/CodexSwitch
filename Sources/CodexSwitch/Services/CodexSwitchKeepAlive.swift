@@ -53,13 +53,15 @@ enum CodexSwitchKeepAlive {
     static func disable() {
         do {
             let paths = try supportPaths()
-            _ = ProcessRunner.run(
+            let bootout = ProcessRunner.run(
                 executableURL: URL(fileURLWithPath: "/bin/launchctl"),
                 arguments: ["bootout", launchDomain(), paths.launchAgentURL.path],
                 timeout: 2
             )
             try? FileManager.default.removeItem(at: paths.launchAgentURL)
-            SwapLog.append(.debug("KEEPALIVE_DISABLED label=\(label)"))
+            SwapLog.append(.debug(
+                "KEEPALIVE_DISABLED label=\(label) bootout_status=\(bootout.terminationStatus) timed_out=\(bootout.timedOut)"
+            ))
         } catch {
             SwapLog.append(.debug("KEEPALIVE_DISABLE_FAILED error=\(error.localizedDescription)"))
         }

@@ -3343,14 +3343,14 @@ fn hot_swap_ack_matches_request_with_minimum_remaining(
         && match runtime_kind {
             HotSwapRuntimeKind::ExternalAppServer => external_app_server_ack_is_verified(
                 ack,
-                AppServerIdlePolicy::ZeroInitializedFrontends,
+                AppServerIdlePolicy::NoFrontendAwaitingWrite,
             ),
             HotSwapRuntimeKind::OfficialDesktopStdioChild => {
                 external_app_server_ack_is_verified(ack, AppServerIdlePolicy::Reject)
             }
             HotSwapRuntimeKind::ManagedDesktopBridge => external_app_server_ack_is_verified(
                 ack,
-                AppServerIdlePolicy::ZeroInitializedFrontends,
+                AppServerIdlePolicy::NoFrontendAwaitingWrite,
             ),
             HotSwapRuntimeKind::HeadlessRemoteControlAppServer => {
                 external_app_server_ack_is_verified(ack, AppServerIdlePolicy::NoEligibleFrontends)
@@ -3371,7 +3371,8 @@ fn hot_swap_ack_matches_request_with_minimum_remaining(
 #[derive(Clone, Copy)]
 enum AppServerIdlePolicy {
     Reject,
-    ZeroInitializedFrontends,
+    /// Idle only when every initialized frontend opted out of `account/updated`.
+    NoFrontendAwaitingWrite,
     NoEligibleFrontends,
 }
 
@@ -3394,9 +3395,7 @@ fn external_app_server_ack_is_verified(ack: &HotSwapAck, idle_policy: AppServerI
         && ack.frontend_write_count == eligible;
     let idle_counts_are_allowed = match idle_policy {
         AppServerIdlePolicy::Reject => false,
-        AppServerIdlePolicy::ZeroInitializedFrontends => {
-            initialized == 0 && skipped == 0 && eligible == 0 && rejected == 0
-        }
+        AppServerIdlePolicy::NoFrontendAwaitingWrite => eligible == 0 && rejected == 0,
         AppServerIdlePolicy::NoEligibleFrontends => eligible == 0,
     };
     let idle_listener = ack.idle_listener_ready
@@ -6272,10 +6271,12 @@ mod tests {
             strict_idle.acknowledged_at_unix_milliseconds,
         ));
 
+        // A remote-control frontend that opted out of account/updated is not
+        // waiting for the write, so the reloaded daemon is still ready.
         let mut external_skipped = strict_idle.clone();
         external_skipped.initialized_frontend_count = Some(1);
         external_skipped.skipped_frontend_count = Some(1);
-        assert!(!hot_swap_ack_matches_request(
+        assert!(hot_swap_ack_matches_request(
             &external_skipped,
             &strict_request,
             HotSwapRuntimeKind::ExternalAppServer,
@@ -6315,7 +6316,7 @@ mod tests {
         let mut managed_skipped = managed_idle.clone();
         managed_skipped.initialized_frontend_count = Some(1);
         managed_skipped.skipped_frontend_count = Some(1);
-        assert!(!hot_swap_ack_matches_request(
+        assert!(hot_swap_ack_matches_request(
             &managed_skipped,
             &managed_request,
             HotSwapRuntimeKind::ManagedDesktopBridge,

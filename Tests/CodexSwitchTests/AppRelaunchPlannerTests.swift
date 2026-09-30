@@ -20,6 +20,8 @@ struct AppRelaunchPlannerTests {
         #expect(command.contains("/usr/bin/open '/Applications/CodexSwitch.app'"))
         #expect(!command.contains("/usr/bin/open -n"))
         #expect(command.contains("relaunch retry"))
+        #expect(command.contains("relaunch succeeded"))
+        #expect(command.contains("relaunch aborted old_pid=31702 still running"))
         #expect(command.contains("relaunch.log"))
     }
 }

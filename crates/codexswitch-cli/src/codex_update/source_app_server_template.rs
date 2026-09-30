@@ -448,11 +448,11 @@ fn patch_app_server_reload_template(
                     }
                     let idle_listener_ready = match expected_runtime_kind {
                         "headless-remote-control-app-server" => eligible_frontend_count == 0,
+                        // Every initialized frontend opted out of account/updated
+                        // (for example a remote-control client), so no one is
+                        // waiting for the write; the reload itself is verified above.
                         "external-app-server" | "managed-desktop-bridge" => {
-                            initialized_frontend_count == 0
-                                && skipped_frontend_count == 0
-                                && eligible_frontend_count == 0
-                                && rejected_frontend_count == 0
+                            eligible_frontend_count == 0 && rejected_frontend_count == 0
                         }
                         _ => false,
                     };
@@ -891,10 +891,7 @@ mod managed_desktop_bridge_template_tests {
             ["arguments[4]", " == \"--analytics-default-enabled\""].concat();
         let strict_external_idle_policy = [
             "\"external-app-server\" | \"managed-desktop-bridge\" => {\n",
-            "                            initialized_frontend_count == 0\n",
-            "                                && skipped_frontend_count == 0\n",
-            "                                && eligible_frontend_count == 0\n",
-            "                                && rejected_frontend_count == 0\n",
+            "                            eligible_frontend_count == 0 && rejected_frontend_count == 0\n",
             "                        }",
         ]
         .concat();

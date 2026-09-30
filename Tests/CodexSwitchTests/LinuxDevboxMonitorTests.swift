@@ -1469,6 +1469,33 @@ struct LinuxDevboxMonitorTests {
             try JSONSerialization.data(withJSONObject: valid),
             expectedProviderAccountId: "provider-account-id"
         ).disposition == .rejected)
+
+        // A refusal issued before the VPS resolves the account carries a null
+        // account; only our own request ID may bind it.
+        let requestID = UUID()
+        var unresolved = base
+        unresolved["accountId"] = NSNull()
+        unresolved["requestId"] = requestID.uuidString
+        let refused = LinuxDevboxMonitor.decodeManualResetFailure(
+            try JSONSerialization.data(withJSONObject: unresolved),
+            expectedProviderAccountId: "provider-account-id",
+            expectedRequestID: requestID
+        )
+        #expect(refused.disposition == .rejected)
+        #expect(refused.message == LinuxDevboxMonitor.remoteManualResetRejectedMessage)
+        #expect(LinuxDevboxMonitor.decodeManualResetFailure(
+            try JSONSerialization.data(withJSONObject: unresolved),
+            expectedProviderAccountId: "provider-account-id",
+            expectedRequestID: UUID()
+        ).disposition == .outcomeUnknown)
+        var unresolvedUnknown = unresolved
+        unresolvedUnknown["disposition"] = "outcomeUnknown"
+        unresolvedUnknown["message"] = LinuxDevboxMonitor.remoteManualResetOutcomeUnknownMessage
+        #expect(LinuxDevboxMonitor.decodeManualResetFailure(
+            try JSONSerialization.data(withJSONObject: unresolvedUnknown),
+            expectedProviderAccountId: "provider-account-id",
+            expectedRequestID: requestID
+        ).reconciliationRequestID == nil)
     }
 
     @Test("reset failure blocker correlation requires the requested ID and account")

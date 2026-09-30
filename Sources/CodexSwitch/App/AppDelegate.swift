@@ -1612,11 +1612,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     "ACCOUNTS_PERSIST_FAILED context=termination-flush error=\(error.localizedDescription)"
                 ))
             }
-            self.terminationFlushCompleted = true
-            self.terminationFlushTask = nil
-            sender?.reply(toApplicationShouldTerminate: true)
+            self.finishTerminationFlush(sender, timedOut: false)
+        }
+        // The flush is telemetry only. A stalled drain must not leave an invisible
+        // process holding the single-instance lock, which blocks Quit and Restart.
+        Task { @MainActor [weak self, weak sender] in
+            try? await Task.sleep(for: .seconds(Self.terminationFlushDeadlineSeconds))
+            self?.finishTerminationFlush(sender, timedOut: true)
         }
         return .terminateLater
+    }
+
+    static let terminationFlushDeadlineSeconds: Double = 3
+
+    private func finishTerminationFlush(_ sender: NSApplication?, timedOut: Bool) {
+        guard !terminationFlushCompleted else { return }
+        terminationFlushCompleted = true
+        if timedOut {
+            terminationFlushTask?.cancel()
+            SwapLog.append(.debug(
+                "ACCOUNTS_PERSIST_FAILED context=termination-flush error=deadline_exceeded seconds=\(Self.terminationFlushDeadlineSeconds)"
+            ))
+        }
+        terminationFlushTask = nil
+        sender?.reply(toApplicationShouldTerminate: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -10512,7 +10531,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/sh")
         task.arguments = ["-c", script]
-        try? task.run()
+        do {
+            try task.run()
+            SwapLog.append(.debug("APP_RELAUNCH_SCHEDULED helper_pid=\(task.processIdentifier)"))
+        } catch {
+            SwapLog.append(.debug("APP_RELAUNCH_SCHEDULE_FAILED error=\(error.localizedDescription)"))
+        }
     }
 
     private func removeAllAccounts() {

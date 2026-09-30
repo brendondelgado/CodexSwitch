@@ -5123,9 +5123,7 @@ async fn run_turn() {
         assert!(patched
             .contains("\"headless-remote-control-app-server\" => eligible_frontend_count == 0"));
         assert!(patched.contains("\"external-app-server\" | \"managed-desktop-bridge\" => {"));
-        assert!(patched.contains("initialized_frontend_count == 0"));
-        assert!(patched.contains("skipped_frontend_count == 0"));
-        assert!(patched.contains("rejected_frontend_count == 0"));
+        assert!(patched.contains("eligible_frontend_count == 0 && rejected_frontend_count == 0"));
         assert!(patched.contains("frontend delivery proof failed"));
         assert!(patched.contains("strict app-server has no eligible frontend writer"));
         assert!(patched.contains("did not complete every eligible frontend write"));
