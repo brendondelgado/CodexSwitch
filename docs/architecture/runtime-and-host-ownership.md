@@ -2107,6 +2107,36 @@ without inventing a local replacement or a second target.
 
 ## Update And Patch Contract
 
+The CLI source patcher supports exact upstream 0.153.2 and 0.159.2 source
+shapes. In 0.159.2, native credential revisions and owner generations invalidate
+WebSocket connections and turn routing. The patcher adds the existing runtime marker log at owner-change reconnects,
+preserves native decisions, and refuses an incomplete recognized invalidation contract. Verified auth reload
+must also enforce upstream login/workspace restrictions, publish both revision
+notifications, and invalidate owner-bound network policy. Legacy source retains
+the generation-based reconnect patch. Both ordinary and verified reload paths
+increment the CodexSwitch auth generation.
+
+The package-layout daemon updater in 0.159.2 refuses the shared installer fetch
+boundary, covering scheduled, manual, and migration paths. Linux daemon runtime
+selection still resolves the reviewed CodexSwitch current release. This does not
+relax installation locks or permit a running process to activate a release.
+
+Repeated preparation attempts report the latest preparation error and retry
+backoff. A previous installation or activation failure remains sticky until its
+matching recovery succeeds; a new preparation failure cannot clear that hold.
+
+Run the real-source compatibility regression against a local upstream Git
+repository containing the pinned commits, without network or model calls:
+
+```bash
+python3 scripts/check_codex_source_compat.py --upstream-repo /path/to/codex
+```
+
+The check applies all production patches twice to exact upstream bytes and
+verifies idempotency and refusal on native invalidation drift. Compilation and
+runtime acceptance remain separate required checks.
+
+
 Every update or desktop patch follows:
 
 1. Discover and download into an owner-marked temporary workspace.

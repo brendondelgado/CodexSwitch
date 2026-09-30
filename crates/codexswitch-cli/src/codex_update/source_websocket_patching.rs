@@ -2,6 +2,70 @@ fn patch_client_websocket_source(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
+    let content = fs::read_to_string(path)?;
+    if content.contains("connection_key: Option<ResponsesConnectionKey>") {
+        // Codex 0.159 handles invalidation through native credential revisions.
+        // Refuse a partially recognized contract instead of skipping protection.
+        for required in [
+            "let auth_owner_generation = self.auth_owner_generation();",
+            ".map(|manager| manager.auth_change_receiver());",
+            "if auth_changes.as_ref().map(|changes| *changes.borrow()) != revision {",
+            "auth_revision: revision,",
+            "ResponsesConnectionKey::new(&api_provider, auth_revision)",
+            "self.websocket_session.connection_key.as_ref() != Some(&connection_key)",
+            "if needs_new || owner_changed {",
+            "self.websocket_session.reset(if owner_changed {",
+            "self.websocket_session.connection_key = Some(connection_key);",
+            "self.turn_state = Arc::new(OnceLock::new());",
+        ] {
+            if !content.contains(required) {
+                bail!("native WebSocket auth invalidation contract missing {required} in {}", path.display());
+            }
+        }
+        const OWNER_GENERATION: &str = r#"    fn auth_owner_generation(&self) -> Option<u64> {
+        self.auth_manager().map(|manager| {
+            manager
+                .auth_change_state_receiver()
+                .borrow()
+                .owner_generation
+        })
+    }"#;
+        const CONNECTION_KEY: &str = r#"#[derive(Debug, PartialEq, Eq)]
+pub struct ResponsesConnectionKey {
+    base_url: String,
+    routing_header: Option<HeaderValue>,
+    auth_revision: Option<u64>,
+}
+
+impl ResponsesConnectionKey {
+    pub fn new(provider: &codex_api::Provider, auth_revision: Option<u64>) -> Self {
+        Self {
+            base_url: provider.base_url.clone(),
+            routing_header: provider.headers.get(ACCOUNT_ROUTING_HEADER).cloned(),
+            auth_revision,
+        }
+    }
+}"#;
+        let workspace = path.parent().and_then(Path::parent).and_then(Path::parent)
+            .context("client source is outside the Codex workspace")?;
+        let key_path = workspace.join("model-provider/src/workspace_routing.rs");
+        let key_source = fs::read_to_string(&key_path)
+            .with_context(|| format!("failed to read {}", key_path.display()))?;
+        if !content.contains(OWNER_GENERATION) || !key_source.contains(CONNECTION_KEY) {
+            bail!("native WebSocket auth invalidation dependency contract drift in {}", path.display());
+        }
+        // Keep the established runtime marker on an actual owner-change path;
+        // native revision keys still decide when and how to reconnect.
+        return patch_file_after(
+            path,
+            "        if needs_new || owner_changed {",
+            r#"
+            if owner_changed {
+                tracing::info!("Auth changed, opening new WebSocket with fresh credentials");
+            }"#,
+            "Auth changed, opening new WebSocket with fresh credentials",
+        );
+    }
     patch_file_after(
         path,
         "    connection: Option<ApiWebSocketConnection>,",
