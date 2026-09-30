@@ -1237,7 +1237,11 @@ fn record_unresolved_failure(
     version: Option<String>,
     transaction_id: Option<String>,
 ) {
-    if state.unresolved_failure.is_some() {
+    // Report the latest preparation attempt and backoff. Stronger install and
+    // activation failures remain sticky until their matching recovery succeeds.
+    if state.unresolved_failure.as_ref().is_some_and(|prior| {
+        prior.kind != UpdateFailureKind::Preparation || kind != UpdateFailureKind::Preparation
+    }) {
         restore_unresolved_failure(state);
         return;
     }
