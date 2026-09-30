@@ -16,15 +16,15 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
@@ -42,8 +42,7 @@ const SOCKET_ENV: &str = "CODEXSWITCH_APP_SERVER_SOCKET";
 /// tungstenite's default message cap rather than a typical request size.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
-const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const STDIN_CHUNK_BYTES: usize = 64 * 1024;
 const CONFIG_METHODS: [&str; 3] = ["thread/start", "thread/resume", "thread/fork"];
@@ -367,8 +366,12 @@ fn connect_shared_daemon(
         Ok(stream) => stream,
         Err(error) if daemon_absent(&error) && target.may_start_daemon => {
             let codex = real_codex.context("no Codex runtime is available to start the daemon")?;
-            start_daemon(codex, &plan.secret_env)?;
-            wait_for_daemon(&target.path)?
+            let daemon = start_daemon(
+                codex,
+                &plan.secret_env,
+                target.path.parent().and_then(Path::parent),
+            )?;
+            wait_for_daemon(&target.path, daemon)?
         }
         Err(error) if daemon_absent(&error) => return Ok(None),
         Err(error) => {
@@ -386,13 +389,19 @@ fn daemon_absent(error: &io::Error) -> bool {
     )
 }
 
-/// Starts the shared daemon exactly the way ChatGPT's SSH remote does: a
-/// `codex app-server proxy` through the managed launcher auto-starts the
-/// daemon with the launcher's flags (for example `features.code_mode_host`),
-/// then exits when its stdin closes. On Linux it runs inside its own transient
-/// systemd user scope so the daemon never joins the calling frontend's service
-/// cgroup; restarting T3 must not kill the daemon every other client shares.
-fn start_daemon(codex: &Path, secret_env: &[String]) -> Result<()> {
+/// Starts the shared daemon as the long-lived `app-server --listen unix://`
+/// listener every frontend joins. Codex 0.159 no longer auto-starts a daemon
+/// from `app-server proxy`, and its `daemon start` only accepts Codex's own
+/// package directory, so the client launches the listener itself with the
+/// flags the desktop daemon has always run with. On Linux it runs inside its
+/// own transient systemd user scope so the daemon never joins the calling
+/// frontend's service cgroup; restarting T3 must not kill the daemon every
+/// other client shares. Readiness is proven by the socket accepting.
+fn start_daemon(
+    codex: &Path,
+    secret_env: &[String],
+    codex_home: Option<&Path>,
+) -> Result<Child> {
     let systemd_run = Path::new("/usr/bin/systemd-run");
     let mut command = if cfg!(target_os = "linux") && is_executable_file(systemd_run) {
         let mut command = Command::new(systemd_run);
@@ -404,12 +413,29 @@ fn start_daemon(codex: &Path, secret_env: &[String]) -> Result<()> {
         Command::new(codex)
     };
     command
-        .args(["app-server", "proxy"])
+        .args(DAEMON_ARGUMENTS)
         .env("CODEXSWITCH_SHARED_DAEMON_START", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .process_group(0);
+    let log = codex_home.and_then(|home| {
+        let directory = home.join("app-server-control");
+        fs::create_dir_all(&directory).ok()?;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(directory.join("app-server.log"))
+            .ok()
+    });
+    match log {
+        Some(log) => {
+            let stderr = log.try_clone().context("failed to share the daemon log")?;
+            command.stdout(log).stderr(stderr);
+        }
+        None => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     // The daemon outlives this client and serves every frontend; it must not
     // inherit this thread's credentials or pin the frontend's working tree.
     for variable in secret_env {
@@ -418,42 +444,50 @@ fn start_daemon(codex: &Path, secret_env: &[String]) -> Result<()> {
     if let Some(home) = env_path("HOME") {
         command.current_dir(home);
     }
-    let mut child = command
+    command
         .spawn()
-        .context("failed to run `codex app-server proxy` to start the daemon")?;
-    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
-    loop {
-        // The proxy's own exit status is not the signal: it may exit non-zero
-        // when stdin closes. Readiness is proven by the socket accepting.
-        if child
-            .try_wait()
-            .context("failed to wait for `codex app-server proxy`")?
-            .is_some()
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "`codex app-server proxy` did not start the daemon within {DAEMON_START_TIMEOUT:?}"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        .context("failed to launch the shared app-server daemon")
 }
 
-fn wait_for_daemon(path: &Path) -> Result<UnixStream> {
+/// The shared listener's argv after the Codex executable.
+const DAEMON_ARGUMENTS: [&str; 5] = [
+    "-c",
+    "features.code_mode_host=true",
+    "app-server",
+    "--listen",
+    "unix://",
+];
+
+/// Waits for the socket to accept. A launch that exits first either lost a
+/// start race to another client (the socket then accepts) or failed, in which
+/// case the caller falls back to a private app-server without waiting out the
+/// full deadline.
+fn wait_for_daemon(path: &Path, mut daemon: Child) -> Result<UnixStream> {
     let deadline = Instant::now() + DAEMON_READY_TIMEOUT;
+    let mut exited = false;
     loop {
         match UnixStream::connect(path) {
-            Ok(stream) => return Ok(stream),
-            Err(error) if daemon_absent(&error) && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
+            Ok(stream) => {
+                // Reap the long-lived daemon without blocking this session.
+                std::thread::spawn(move || {
+                    let _ = daemon.wait();
+                });
+                return Ok(stream);
+            }
+            Err(error) if daemon_absent(&error) && !exited && Instant::now() < deadline => {
+                exited = daemon
+                    .try_wait()
+                    .context("failed to observe the shared app-server daemon")?
+                    .is_some();
+                if !exited {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
             Err(error) => {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
                 return Err(error)
-                    .context("the started app-server daemon did not accept connections")
+                    .context("the started app-server daemon did not accept connections");
             }
         }
     }

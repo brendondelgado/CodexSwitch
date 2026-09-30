@@ -130,15 +130,20 @@ explicit socket is never started; if it is absent the client falls back.
 Otherwise, on Linux the socket is
 `$CODEX_HOME/app-server-control/app-server-control.sock` (`CODEX_HOME`
 defaults to `~/.codex`). If it is absent or refuses connections, the client
-starts it the way ChatGPT's SSH remote does, by running `<real codex> app-server
-proxy` once with stdin closed. The proxy auto-starts the daemon with the managed
-launcher's flags (such as `features.code_mode_host`), so the daemon has one
-configuration regardless of which frontend connects first. On Linux the proxy
-runs in its own transient `systemd-run --user --scope`, so the daemon never joins
-the frontend's service cgroup (restarting T3 must not kill the shared daemon):
+launches the daemon itself: `<real codex> -c features.code_mode_host=true
+app-server --listen unix://`, the exact listener the desktop daemon has always
+run, so the daemon has one configuration regardless of which frontend connects
+first. Codex 0.159 removed the auto-start from `app-server proxy`, and its
+`app-server daemon start` accepts only Codex's own package directory, so
+neither can start a CodexSwitch-managed runtime. On Linux the daemon runs in its
+own transient `systemd-run --user --scope`, so it never joins the frontend's
+service cgroup (restarting T3 must not kill the shared daemon):
 
-- bounded to 30 seconds, then up to 15 seconds for the socket to accept;
-- in its own process group with null stdio, so the daemon cannot hold the
+- the client waits up to 30 seconds for the socket to accept, and falls back at
+  once if the launch exits first without a socket (a launch that loses a start
+  race to another client simply finds the winner's socket);
+- in its own process group with null stdin and output appended to
+  `$CODEX_HOME/app-server-control/app-server.log`, so the daemon cannot hold the
   frontend's pipes open or receive the frontend's signals;
 - with `HOME` as its working directory and the converted token variables
   removed.
