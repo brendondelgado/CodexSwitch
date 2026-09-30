@@ -2304,6 +2304,24 @@ scan. This cross-process exclusion is required in addition to the Mac app's
 in-memory in-flight guard because terminating an SSH client does not prove that
 its already-started remote child exited.
 
+### Source-build sandboxed V8 dependencies
+
+For source preparation of Codex 0.159.2, the sandboxed V8 archive and generated
+bindings come from the official OpenAI release named by the locked V8 version.
+The source checkout pins the release checksum manifest; that manifest must name
+exactly the expected native-target archive and bindings. Both payloads are
+SHA-256 verified before Cargo receives their paired override paths. Downloads
+have time and size bounds and live in a private temporary directory retained for
+the build. Missing pins, ambiguous V8 versions, unexpected members, symlinks and
+digest mismatches fail before compilation. This does not disable V8 sandboxing.
+
+The preparer uses locked Cargo resolution and includes the dependency verifier
+in its build-recipe fingerprint. Only the explicitly supported legacy 0.153.2
+source layout may retain its existing recipe when the newer manifest pin file
+is absent. This compatibility exception does not authorize a missing pin for
+0.159.2 or subsequent versions. Attested CI artifacts and installation/activation
+guards remain separate requirements.
+
 ## Storage Contract
 
 All CodexSwitch-created storage has:

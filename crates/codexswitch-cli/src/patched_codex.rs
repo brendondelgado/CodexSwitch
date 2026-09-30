@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+#[path = "patched_codex_v8.rs"]
+mod v8_dependency;
+
 // Single-job release builds have exceeded one hour on a contended 8-core host.
 pub(crate) const BUILD_COMMAND_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 const INSTALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -338,8 +341,14 @@ pub fn build_codex(workspace: &Path) -> Result<PathBuf> {
         bail!("Codex Rust workspace not found at {}", workspace.display());
     }
     ensure_linux_build_prerequisites()?;
-    run_codex_build_command(workspace, codex_build_command(), BUILD_COMMAND_TIMEOUT)
-        .with_context(|| format!("failed to build Codex at {}", workspace.display()))?;
+    let v8 = v8_dependency::prepare(workspace)?;
+    run_codex_build_command(
+        workspace,
+        codex_build_command(),
+        BUILD_COMMAND_TIMEOUT,
+        v8.as_ref(),
+    )
+    .with_context(|| format!("failed to build Codex at {}", workspace.display()))?;
     let built_binary = workspace.join("target/release/codex");
     let built_code_mode_host = workspace.join("target/release/codex-code-mode-host");
     if !built_code_mode_host.is_file() {
@@ -357,14 +366,18 @@ pub fn build_codex(workspace: &Path) -> Result<PathBuf> {
     Ok(built_binary)
 }
 
-fn run_codex_build_command(workspace: &Path, script: &str, timeout: Duration) -> Result<()> {
-    let build_status = bounded_command::status_inherited(
-        Command::new("bash")
-            .arg("-lc")
-            .arg(script)
-            .current_dir(workspace),
-        timeout,
-    )?;
+fn run_codex_build_command(
+    workspace: &Path,
+    script: &str,
+    timeout: Duration,
+    v8: Option<&v8_dependency::VerifiedV8>,
+) -> Result<()> {
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script).current_dir(workspace);
+    if let Some(v8) = v8 {
+        v8.configure(&mut command);
+    }
+    let build_status = bounded_command::status_inherited(&mut command, timeout)?;
     if !build_status.success() {
         bail!("Codex build failed with {build_status}");
     }
@@ -378,9 +391,9 @@ fn codex_build_command() -> &'static str {
      export CARGO_BUILD_JOBS; \
      build_codex_with_limits() { \
        if command -v ionice >/dev/null 2>&1; then \
-         exec ionice -c 3 nice -n \"$CODEXSWITCH_BUILD_NICE\" cargo build --release --jobs \"$CARGO_BUILD_JOBS\" -p codex-cli -p codex-code-mode-host; \
+         exec ionice -c 3 nice -n \"$CODEXSWITCH_BUILD_NICE\" cargo build --release --locked --jobs \"$CARGO_BUILD_JOBS\" -p codex-cli -p codex-code-mode-host; \
        else \
-         exec nice -n \"$CODEXSWITCH_BUILD_NICE\" cargo build --release --jobs \"$CARGO_BUILD_JOBS\" -p codex-cli -p codex-code-mode-host; \
+         exec nice -n \"$CODEXSWITCH_BUILD_NICE\" cargo build --release --locked --jobs \"$CARGO_BUILD_JOBS\" -p codex-cli -p codex-code-mode-host; \
        fi; \
      }; \
      CARGO_TARGET_DIR=\"$PWD/target\" \
@@ -390,7 +403,12 @@ fn codex_build_command() -> &'static str {
 }
 
 pub(crate) fn build_recipe_fingerprint() -> String {
-    ring::digest::digest(&ring::digest::SHA256, codex_build_command().as_bytes())
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"codexswitch-verified-sandbox-v8-v1\0");
+    digest.update(include_bytes!("patched_codex_v8.rs"));
+    digest.update(codex_build_command().as_bytes());
+    digest
+        .finish()
         .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1116,7 +1134,7 @@ mod tests {
         assert!(command.contains("CODEXSWITCH_BUILD_NICE=\"${CODEXSWITCH_BUILD_NICE:-10}\""));
         assert!(command.contains("export CARGO_BUILD_JOBS"));
         assert!(command.contains("CARGO_TARGET_DIR=\"$PWD/target\""));
-        assert!(command.contains("cargo build --release --jobs \"$CARGO_BUILD_JOBS\""));
+        assert!(command.contains("cargo build --release --locked --jobs \"$CARGO_BUILD_JOBS\""));
         assert!(command.contains("-p codex-cli"));
         assert!(command.contains("-p codex-code-mode-host"));
         assert!(command.contains("exec ionice -c 3 nice -n \"$CODEXSWITCH_BUILD_NICE\""));
@@ -1133,8 +1151,9 @@ mod tests {
             shell_quote(&marker.display().to_string())
         );
 
-        let error = run_codex_build_command(temp.path(), &first_writer, Duration::from_millis(50))
-            .expect_err("the first writer must hit its bounded deadline");
+        let error =
+            run_codex_build_command(temp.path(), &first_writer, Duration::from_millis(50), None)
+                .expect_err("the first writer must hit its bounded deadline");
         assert!(format!("{error:#}").contains("deadline"));
 
         run_codex_build_command(
@@ -1144,6 +1163,7 @@ mod tests {
                 shell_quote(&marker.display().to_string())
             ),
             Duration::from_secs(10),
+            None,
         )?;
         std::thread::sleep(Duration::from_millis(350));
         assert_eq!(fs::read(&marker)?, b"new");
